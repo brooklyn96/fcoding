@@ -1,10 +1,12 @@
 import Foundation
 
 /// HTTP error from the server ({error:"code"}), or a client-side problem (status 0).
+/// `token` is the Bearer token the failing request carried (nil when unknown).
 struct APIError: Error {
     var status: Int
     var code: String
     var retryAfter: Int? = nil
+    var token: String? = nil
 }
 
 struct PairResponse: Decodable { let ok: Bool?; let token: String? }
@@ -42,6 +44,8 @@ struct API {
         req.setValue("1", forHTTPHeaderField: "X-PC")
         req.setValue("ios", forHTTPHeaderField: "X-PC-Client")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
+        // Bearer only: keep the pc_sid Set-Cookie from /api/pair out of HTTPCookieStorage (on disk).
+        req.httpShouldHandleCookies = false
         if !token.isEmpty { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         if let body = body {
             req.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -55,7 +59,7 @@ struct API {
               body: [String: Any]? = nil) async throws -> Data {
         let req = try request(method, path, query: query, body: body)
         let (data, resp) = try await URLSession.shared.data(for: req)
-        try API.check(resp, data)
+        try API.check(resp, data, token: token)
         return data
     }
 
@@ -63,14 +67,15 @@ struct API {
         try JSONDecoder().decode(T.self, from: try await call("GET", path))
     }
 
-    static func check(_ resp: URLResponse, _ data: Data) throws {
-        guard let http = resp as? HTTPURLResponse else { throw APIError(status: 0, code: "bad_response") }
+    static func check(_ resp: URLResponse, _ data: Data, token: String? = nil) throws {
+        guard let http = resp as? HTTPURLResponse else { throw APIError(status: 0, code: "bad_response", token: token) }
         guard (200..<300).contains(http.statusCode) else {
             let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             let header = http.value(forHTTPHeaderField: "Retry-After").flatMap { Int($0) }
             throw APIError(status: http.statusCode,
                            code: obj?["error"] as? String ?? "",
-                           retryAfter: header ?? (obj?["retryAfter"] as? Int))
+                           retryAfter: header ?? (obj?["retryAfter"] as? Int),
+                           token: token)
         }
     }
 }

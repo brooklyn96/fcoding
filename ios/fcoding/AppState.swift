@@ -12,17 +12,23 @@ final class AppState: ObservableObject {
     private static let tokenAccount = "deviceToken"
 
     init() {
-        AppState.removeLegacyCredentials()
         serverURL = UserDefaults.standard.string(forKey: AppState.serverKey) ?? ""
+        AppState.removeLegacyCredentials(server: serverURL)
         token = serverURL.isEmpty ? nil : Keychain.get(AppState.tokenAccount)
     }
 
-    /// Password-login leftovers: the old token (Keychain account "token" or UserDefaults) and
-    /// the cookie-mode flags. Idempotent, so it runs on every launch; the user re-pairs once.
-    private static func removeLegacyCredentials() {
+    /// Password-login leftovers: the old token (Keychain account "token" or UserDefaults), the
+    /// cookie-mode flags and any pc_sid cookie for the stored server (requests no longer use
+    /// the cookie jar). Idempotent, so it runs on every launch; the user re-pairs once.
+    private static func removeLegacyCredentials(server: String) {
         let defaults = UserDefaults.standard
         for key in ["token", "password", "cookieMode", "cookieModeNoticeShown"] { defaults.removeObject(forKey: key) }
         Keychain.delete("token")
+        if let url = URL(string: server) {
+            HTTPCookieStorage.shared.cookies(for: url)?
+                .filter { $0.name == "pc_sid" }
+                .forEach { HTTPCookieStorage.shared.deleteCookie($0) }
+        }
     }
 
     var api: API? {
@@ -72,7 +78,8 @@ final class AppState: ObservableObject {
             } catch let e as APIError where e.status == 401 {
                 // Already removed on the box: nothing left to undo there.
             } catch {
-                failure = "Đã xoá ghép trên iPhone này, nhưng box chưa nhận lệnh gỡ (\(vietnameseMessage(error) ?? "lỗi"))."
+                // Fixed text: this phone has no token left, so there is nothing to retry here.
+                failure = "Đã xoá ghép trên iPhone này, nhưng box chưa nhận lệnh gỡ (không kết nối được hoặc box báo lỗi)."
             }
         }
         signOutLocally(notice: failure)
@@ -89,16 +96,15 @@ final class AppState: ObservableObject {
 
     func signOutLocally(notice: String?) {
         Keychain.delete(AppState.tokenAccount)
-        if let url = URL(string: serverURL) {
-            HTTPCookieStorage.shared.cookies(for: url)?.forEach { HTTPCookieStorage.shared.deleteCookie($0) }
-        }
         self.notice = notice
         token = nil
     }
 
     /// Message for the user; a 401 means this device was revoked: back to the pairing screen.
+    /// A late 401 for a request sent with an older token (before a re-pair) is ignored.
     func report(_ error: Error) -> String? {
         if let e = error as? APIError, e.status == 401 {
+            if let sent = e.token, sent != token { return nil }
             if token != nil { signOutLocally(notice: unpairedNotice) }
             return unpairedNotice
         }

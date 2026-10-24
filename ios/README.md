@@ -33,6 +33,8 @@ Không có mật khẩu. Chỉ người có quyền vào dòng lệnh của box 
    - **Mã ghép**: gõ 6 số vừa thấy trên box.
 3. Bấm **Ghép iPhone này**.
 
+Mẹo: iPhone chỉ báo tên chung là "iPhone", nên mọi máy trong danh sách thiết bị của box đều mang tên đó. Muốn đặt tên riêng, trên box gõ kèm tên khi lấy mã, ví dụ `fcode-pair "iPhone X của tôi"`; box sẽ dùng tên này.
+
 Sau khi ghép, iPhone nhớ box trong Keychain; mở ứng dụng là vào thẳng danh sách dự án. Box khởi động lại thì không phải ghép lại.
 
 ## 4. Cách dùng
