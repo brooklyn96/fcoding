@@ -123,10 +123,14 @@ export function previewOf(text) {
   const lines = paneLines(text);
   return lines.length ? clip(lines.at(-1)) : null;
 }
-// the last 6 non-empty lines that match a prompt pattern, cleaned like a preview (so "│ ❯ 1. Yes │" counts)
-const promptLines = (text) => text.split('\n').map((l) => l.replace(ANSI_RE, '').replace(NAME_CTRL, '')).filter((l) => l.trim()).slice(-6).map(cleanLine)
-  .filter((l) => l && WAIT_PATTERNS.some((re) => re.test(l)));
+// the last 6 non-empty lines of the pane, cleaned like a preview (so "│ ❯ 1. Yes │" is "❯ 1. Yes")
+const tailLines = (text) => text.split('\n').map((l) => l.replace(ANSI_RE, '').replace(NAME_CTRL, '')).filter((l) => l.trim()).slice(-6).map(cleanLine);
+// of those, the ones that match a prompt pattern
+const promptLines = (text) => tailLines(text).filter((l) => l && WAIT_PATTERNS.some((re) => re.test(l)));
 const CHOICE_RE = /^[❯>›]?\s*\d+\.\s/; // a numbered option such as "❯ 1. Yes"
+// A5 update 6: a numbered menu is on screen (any of the last 6 lines, matched or not). The app then offers no y/n buttons,
+// because the letter + Enter would confirm the highlighted option.
+export const menuOf = (text) => tailLines(text).some((l) => CHOICE_RE.test(l));
 // the question for the preview: the last matching line that is not a numbered option; else the last option; null when none matches
 function promptLine(text) {
   const m = promptLines(text);
@@ -136,10 +140,10 @@ export function stateOf(text, activity, nowMs) {
   if (nowMs - activity * 1000 <= RUNNING_MS) return 'running';
   return promptLine(text) === null ? 'idle' : 'waiting';
 }
-// {state, preview}: when waiting, the preview is the matched prompt line (cleaned like any preview), so the app sees the y/n question
+// {state, preview, menu}: when waiting, the preview is the question line (cleaned like any preview), so the app sees the y/n question
 export function summarize(text, activity, nowMs) {
   const state = stateOf(text, activity, nowMs);
-  return { state, preview: state === 'waiting' ? clip(cleanLine(promptLine(text))) || previewOf(text) : previewOf(text) };
+  return { state, preview: state === 'waiting' ? clip(cleanLine(promptLine(text))) || previewOf(text) : previewOf(text), menu: menuOf(text) };
 }
 // " 2 files changed, 3 insertions(+), 1 deletion(-)" -> {files, add, del}; empty output = clean tree
 export function parseShortstat(out) {
@@ -512,12 +516,12 @@ export function createApp(opts = {}) {
       for (const name of cfg.projectNames) projects.push({ name, ...(await gitInfo(cfg.projects[name], ctx)) });
       const sessions = [];
       for (const x of await listSessions(ctx)) {
-        let state = null, preview = null;
+        let state = null, preview = null, menu = null; // nulls when this item fails
         try {
           const text = await run(ctx, ['capture-pane', '-p', '-J', '-t', pane(x.name)]); // the visible pane, no escapes
-          ({ state, preview } = summarize(text, x.activity, now()));
+          ({ state, preview, menu } = summarize(text, x.activity, now()));
         } catch (e) { if (gateStop(e)) throw e; }
-        sessions.push({ ...x, state, preview });
+        sessions.push({ ...x, state, preview, menu });
       }
       return { now: Math.floor(now() / 1000), projects, sessions };
     } finally { reads--; ctx.held = false; }
