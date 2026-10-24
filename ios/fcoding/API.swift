@@ -41,6 +41,8 @@ struct OverviewSession: Decodable, Identifiable, Hashable {
     /// "running" | "waiting" | "idle" (anything else is shown as idle).
     let state: String?
     let preview: String?
+    /// A numbered choice menu is on screen (A5 update 6); y/n pills are then hidden.
+    let menu: Bool?
     var id: String { name }
 }
 
