@@ -55,7 +55,7 @@ struct ProjectsView: View {
             } message: { _ in
                 Text("Chương trình đang chạy trong phiên này sẽ bị tắt.")
             }
-            .sheet(isPresented: $showSettings) { SettingsView().environmentObject(app) }
+            .sheet(isPresented: $showSettings) { DeviceSettingsView().environmentObject(app) }
         }
     }
 
