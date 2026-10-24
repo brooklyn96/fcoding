@@ -87,7 +87,12 @@ final class SessionModel: ObservableObject {
         var event = ""
         var buffer: [UInt8] = []
         for try await byte in bytes {
-            guard byte == 0x0A else { buffer.append(byte); continue }
+            guard byte == 0x0A else {
+                buffer.append(byte)
+                // A runaway line (no LF): give up on the stream; run() falls back to polling.
+                if buffer.count > 4 * 1024 * 1024 { throw URLError(.dataLengthExceedsMaximum) }
+                continue
+            }
             if buffer.last == 0x0D { buffer.removeLast() }
             let line = String(decoding: buffer, as: UTF8.self)
             buffer.removeAll(keepingCapacity: true)

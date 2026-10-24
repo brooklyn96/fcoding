@@ -36,7 +36,7 @@ Cập nhật bản mới: tải lại `fcoding.ipa` rồi làm lại bước 2. 
   - **A-** / **A+**: chữ nhỏ hơn / to hơn.
   - Chấm màu: xanh lá = đang kết nối trực tiếp, vàng = đang cập nhật định kỳ, cam = đang kết nối, đỏ = mất kết nối.
   - Gõ nội dung vào ô nhập rồi bấm **Gửi** (gửi và nhấn Enter) hoặc **Gửi không Enter**. Bấm **Gửi** khi ô trống = chỉ nhấn Enter.
-  - Nội dung đang soạn được giữ lại cho từng phiên (kể cả khi phải đăng nhập lại) và chỉ bị xoá sau khi gửi thành công.
+  - Nội dung đang soạn được giữ lại cho từng phiên (kể cả khi phải đăng nhập lại vì phiên hết hạn). Nó bị xoá khi gửi thành công, khi bạn xoá phiên đó, hoặc khi bạn tự đăng xuất (**Đăng xuất trên máy này** / **Đăng xuất mọi nơi**).
   - Hàng phím nhanh: Esc, Ctrl+C, mũi tên, Tab, ⇧Tab, Enter, y, n. Nút **/** chèn các lệnh hay dùng (/model, /clear, …). Các phím được gửi đúng thứ tự bạn bấm.
   - Khi xoay ngang: ô nhập thấp lại để màn hình còn chỗ; bấm nút **bàn phím** bên trái ô nhập để hiện / ẩn hàng phím nhanh.
   - Khi bạn chuyển sang ứng dụng khác, kết nối tạm dừng; mở lại ứng dụng là tự kết nối lại.

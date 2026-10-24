@@ -156,6 +156,7 @@ struct ProjectsView: View {
         do {
             try await api.call("DELETE", "api/sessions/\(s.name)")
             sessions.removeAll { $0.name == s.name }
+            UserDefaults.standard.removeObject(forKey: "draft.\(s.name)")
             errorText = nil
         } catch {
             errorText = app.report(error)

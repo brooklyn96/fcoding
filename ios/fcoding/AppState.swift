@@ -66,14 +66,24 @@ final class AppState: ObservableObject {
     /// "Đăng xuất trên máy này": forget the credentials on this phone only.
     func logoutHere() {
         signOutLocally(notice: nil)
+        AppState.removeDrafts()
     }
 
     /// "Đăng xuất mọi nơi": the server revokes every device first; local credentials are
     /// cleared only after a 2xx. Any failure is thrown so the caller can show it and retry.
     func logoutEverywhere() async throws {
-        guard let api = api else { return signOutLocally(notice: nil) }
+        guard let api = api else { signOutLocally(notice: nil); return AppState.removeDrafts() }
         try await api.call("POST", "api/logout", query: [URLQueryItem(name: "all", value: "1")])
         signOutLocally(notice: nil)
+        AppState.removeDrafts()
+    }
+
+    /// Composer drafts ("draft.<session>") go only on an explicit logout; a 401 keeps them.
+    static func removeDrafts() {
+        let defaults = UserDefaults.standard
+        for key in defaults.dictionaryRepresentation().keys where key.hasPrefix("draft.") {
+            defaults.removeObject(forKey: key)
+        }
     }
 
     func signOutLocally(notice: String?) {
