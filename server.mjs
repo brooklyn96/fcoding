@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// fcoding server: Node 22, built-ins only. See CONTRACT.md (S1-S8, A1-A4).
+// fcoding server: Node 22, built-ins only. See CONTRACT.md (S1-S8, A1-A5).
 import http from 'node:http';
 import net from 'node:net';
 import crypto from 'node:crypto';
@@ -25,6 +25,8 @@ const MAX_WAITING = 20; // mutation jobs waiting behind the active one
 const MAX_READS = 7; // 8 tmux children in all: one slot is reserved for the active mutation
 const DRAIN_TIMEOUT = 30000;
 const HARNESS_CHECK_MS = 400; // after create: is the harness still running?
+const RUNNING_MS = 8000; // overview: activity this recent = running
+const GIT_CACHE_MS = 10000; // overview: git results per project
 const NOT_FOUND_RE = /can't find|no such session|no server running|no sessions|error connecting to|no current/i;
 // JSON for an SSE data line: U+2028, U+2029 and U+0085 escaped (line breaks to some line readers; still valid JSON)
 const SSE_BREAKS = new RegExp(`[${String.fromCharCode(0x2028, 0x2029, 0x85)}]`, 'g');
@@ -103,6 +105,43 @@ export function parseDevices(text) {
 }
 const NAME_CTRL = /[\x00-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g; // C0, DEL, C1, bidi controls
 const cleanName = (n) => (typeof n === 'string' ? n.replace(NAME_CTRL, '').trim().slice(0, 64) : '');
+
+// --- overview (A5): session state and a one-line preview from the visible pane ---
+// approval / question prompts, matched case-insensitively against the last 6 non-empty lines
+export const WAIT_PATTERNS = [
+  /\(y\/n\)/i, /\[y\/n\]/i, /\[Y\/n\]/i, /\[y\/N\]/i, /\byes\/no\b/i, /\bdo you want\b/i, /\ballow\b/i, /\bapprove\b/i,
+  /\bproceed\?/i, /\bcontinue\?/i, /\bpress enter\b/i, /^\s*[❯>]\s*\d+\./,
+];
+const ANSI_RE = /\x1b\[[0-?]*[ -\/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[@-_]/g;
+const BOX_EDGE = /^[\s\u2500-\u259f|]+|[\s\u2500-\u259f|]+$/g; // box drawing + block elements at both ends
+const PROMPT_ONLY = /^[>❯›$#%»:]*$/; // a bare prompt symbol is chrome
+const cleanLine = (l) => l.replace(ANSI_RE, '').replace(/\t/g, ' ').replace(NAME_CTRL, '').replace(BOX_EDGE, '').trim();
+const paneLines = (text) => text.split('\n').map(cleanLine).filter((l) => l && !PROMPT_ONLY.test(l));
+// the last non-empty, non-chrome line, at most 160 code points; null when there is none
+const clip = (l) => Array.from(l).slice(0, 160).join('');
+export function previewOf(text) {
+  const lines = paneLines(text);
+  return lines.length ? clip(lines.at(-1)) : null;
+}
+// the last of the last 6 non-empty lines that matches a prompt pattern (ANSI and controls removed), or null
+function promptLine(text) {
+  const last = text.split('\n').map((l) => l.replace(ANSI_RE, '').replace(NAME_CTRL, '')).filter((l) => l.trim()).slice(-6);
+  return last.findLast((l) => WAIT_PATTERNS.some((re) => re.test(l))) ?? null;
+}
+export function stateOf(text, activity, nowMs) {
+  if (nowMs - activity * 1000 <= RUNNING_MS) return 'running';
+  return promptLine(text) === null ? 'idle' : 'waiting';
+}
+// {state, preview}: when waiting, the preview is the matched prompt line (cleaned like any preview), so the app sees the y/n question
+export function summarize(text, activity, nowMs) {
+  const state = stateOf(text, activity, nowMs);
+  return { state, preview: state === 'waiting' ? clip(cleanLine(promptLine(text))) || previewOf(text) : previewOf(text) };
+}
+// " 2 files changed, 3 insertions(+), 1 deletion(-)" -> {files, add, del}; empty output = clean tree
+export function parseShortstat(out) {
+  const n = (re) => Number(re.exec(out)?.[1] ?? 0);
+  return { files: n(/(\d+) files? changed/), add: n(/(\d+) insertions?\(\+\)/), del: n(/(\d+) deletions?\(-\)/) };
+}
 // admin.sock (unix socket, 600, in the 700 config dir); a named pipe on Windows (tests only)
 export const adminPath = (configDir) => (process.platform === 'win32'
   ? `\\\\.\\pipe\\fcoding-${crypto.createHash('sha256').update(path.resolve(configDir)).digest('hex').slice(0, 16)}`
@@ -143,6 +182,8 @@ export function createApp(opts = {}) {
   const pasteEnterDelay = opts.pasteEnterDelayMs ?? 120;
   const now = opts.now || Date.now;
   const writeFile = opts.writePrivate || writePrivate;
+  let gitSpec = opts.git ?? process.env.PC_GIT ?? 'git';
+  if (typeof gitSpec === 'string') gitSpec = gitSpec.startsWith('[') ? JSON.parse(gitSpec) : [gitSpec];
 
   secureConfigDir(configDir);
 
@@ -300,20 +341,21 @@ export function createApp(opts = {}) {
 
   // --- the one execution gate: every tmux child goes through run(ctx); execFile only, never a shell ---
   let running = 0, reads = 0;
-  function run(ctx, args, input) {
+  // spec: the binary (tmux by default; git for the overview). ctx.held: the job already holds one read slot.
+  function run(ctx, args, input, spec = tmuxSpec) {
     if (!ctx) throw new Error('run() without ctx');
-    const read = !ctx.mutation;
+    const read = !ctx.mutation && !ctx.held;
     if (read && reads >= MAX_READS) return Promise.reject(new HttpErr(503, 'busy')); // reads never queue
     if (!valid(ctx)) return Promise.reject(gateErr(ctx)); // checked after capacity, nothing awaited before execFile
     running++; if (read) reads++;
     let freed = false;
     const free = () => { if (!freed) { freed = true; running--; if (read) reads--; } };
     return new Promise((resolve, reject) => {
-      const [cmd, ...pre] = tmuxSpec;
+      const [cmd, ...pre] = spec;
       try {
         const child = execFile(cmd, [...pre, ...args], {
           encoding: 'utf8', timeout: 5000, maxBuffer: 16 << 20, windowsHide: true,
-          env: { ...process.env, LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8' },
+          env: { ...process.env, LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', ...(spec === gitSpec && { GIT_OPTIONAL_LOCKS: '0' }) },
         }, (err, stdout, stderr) => {
           free();
           if (!err) return resolve(stdout);
@@ -357,18 +399,19 @@ export function createApp(opts = {}) {
   async function listSessions(ctx) {
     let out;
     try {
-      out = await run(ctx, ['list-sessions', '-F', '#{session_name}|#{session_created}|#{session_attached}|#{session_activity}|#{@pc_harness}|#{@pc_project}']);
+      // activity = the later of session_activity (client input) and window_activity (pane output; tmux does not move session_activity on output)
+      out = await run(ctx, ['list-sessions', '-F', '#{session_name}|#{session_created}|#{session_attached}|#{session_activity}|#{window_activity}|#{@pc_harness}|#{@pc_project}']);
     } catch (e) {
       if (e.status === 404) return [];
       throw e;
     }
     const rows = [];
     for (const line of out.split('\n')) {
-      const [name, created, attached, activity, harness, ...rest] = line.split('|');
+      const [name, created, attached, sActivity, wActivity, harness, ...rest] = line.split('|');
       if (!NAME_RE.test(name || '')) continue;
       rows.push({
         name, project: rest.join('|') || null, harness: harness || null,
-        created: Number(created) || 0, attached: Number(attached) > 0, activity: Number(activity) || 0,
+        created: Number(created) || 0, attached: Number(attached) > 0, activity: Math.max(Number(sActivity) || 0, Number(wActivity) || 0),
       });
     }
     return rows;
@@ -411,6 +454,51 @@ export function createApp(opts = {}) {
     const hash = crypto.createHash('sha1').update(`${cols}x${rows}@${x},${y}\n${text}`).digest('hex').slice(0, 16);
     return { text, rows, cols, cursor: { x, y }, hash };
   }
+
+  // --- GET /api/overview: ONE read job holding one read slot; its tmux/git calls run one after another ---
+  const gitCache = new Map(); // dir -> {at, value}
+  const gateStop = (e) => e instanceof HttpErr && (e.status === 401 || e.status === 499);
+  async function gitInfo(dir, ctx) {
+    const hit = gitCache.get(dir);
+    if (hit && now() - hit.at < GIT_CACHE_MS) return hit.value;
+    const git = async (...args) => {
+      try { return (await run(ctx, ['-C', dir, ...args], undefined, gitSpec)).trim(); } catch (e) { if (gateStop(e)) throw e; return null; }
+    };
+    const branch = await git('rev-parse', '--abbrev-ref', 'HEAD');
+    let value = { branch: null, ahead: null, diff: null };
+    if (branch !== null) {
+      const diff = await git('diff', '--shortstat', 'HEAD');
+      const ahead = await git('rev-list', '--count', '@{upstream}..HEAD');
+      value = { branch, ahead: ahead !== null && /^\d+$/.test(ahead) ? Number(ahead) : null, diff: diff === null ? null : parseShortstat(diff) };
+    }
+    gitCache.set(dir, { at: now(), value });
+    return value;
+  }
+  async function overview(ctx) {
+    if (reads >= MAX_READS) throw new HttpErr(503, 'busy'); // reads never queue
+    if (!valid(ctx)) throw gateErr(ctx);
+    reads++; ctx.held = true;
+    try {
+      const projects = [];
+      for (const name of cfg.projectNames) projects.push({ name, ...(await gitInfo(cfg.projects[name], ctx)) });
+      const sessions = [];
+      for (const x of await listSessions(ctx)) {
+        let state = null, preview = null;
+        try {
+          const text = await run(ctx, ['capture-pane', '-p', '-J', '-t', pane(x.name)]); // the visible pane, no escapes
+          ({ state, preview } = summarize(text, x.activity, now()));
+        } catch (e) { if (gateStop(e)) throw e; }
+        sessions.push({ ...x, state, preview });
+      }
+      return { now: Math.floor(now() / 1000), projects, sessions };
+    } finally { reads--; ctx.held = false; }
+  }
+  // <base>, <base>-2, <base>-3, ...: always within the 32-char name limit (base is shortened, the suffix kept)
+  const freshName = (base, n) => {
+    if (n === 1) return base;
+    const suffix = `-${n}`;
+    return base.slice(0, 32 - suffix.length).replace(/-+$/, '') + suffix;
+  };
 
   // runs inside a mutation job; every step re-checks through run(ctx)
   async function sendText(name, text, enter, ctx) {
@@ -578,6 +666,7 @@ export function createApp(opts = {}) {
       return json(res, 200, { ok: true }, { 'Set-Cookie': setCookie('', 0) });
     }
     if (pathname === '/api/me') { want('GET'); return json(res, 200, { ok: true }); }
+    if (pathname === '/api/overview') { want('GET'); return json(res, 200, await overview(ctx)); }
     if (pathname === '/api/meta') {
       want('GET');
       return json(res, 200, { projects: cfg.projectNames, harnesses: Object.keys(HARNESSES), keys: KEYS });
@@ -592,10 +681,22 @@ export function createApp(opts = {}) {
     }
     if (pathname === '/api/open') {
       want('POST');
-      const { project, harness } = parseJson(req, body);
-      if (!validProject(project) || !validHarness(harness)) throw new HttpErr(400, 'invalid');
+      const { project, harness, fresh } = parseJson(req, body);
+      if (!validProject(project) || !validHarness(harness) || (fresh !== undefined && typeof fresh !== 'boolean')) throw new HttpErr(400, 'invalid');
       const name = `${project}-${harness}`.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+/, '').slice(0, 32);
       if (!NAME_RE.test(name)) throw new HttpErr(400, 'invalid');
+      if (fresh) { // A5 update 4: always a new session; the name is picked and created in the same job
+        const picked = await mutate(ctx, async () => {
+          const taken = new Set((await listSessions(ctx)).map((x) => x.name));
+          for (let n = 1; n <= 1000; n++) {
+            const cand = freshName(name, n);
+            if (taken.has(cand)) continue;
+            try { await createSession(cand, project, harness, ctx); return cand; } catch (e) { if (e.code !== 'exists') throw e; } // created outside us meanwhile
+          }
+          throw new HttpErr(409, 'exists');
+        });
+        return json(res, 200, { name: picked, created: true });
+      }
       const created = await mutate(ctx, async () => { // check-then-create in one job
         try { await createSession(name, project, harness, ctx); return true; } catch (e) {
           if (e.code !== 'exists') throw e;

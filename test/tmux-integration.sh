@@ -277,6 +277,32 @@ check "51st stream -> 503 busy" "$(curl -s -m 2 -o /dev/null -w '%{http_code}' -
 pkill -f "curl .*127.0.0.1:$PORT/api/stream" 2>/dev/null
 sleep 1
 
+# ---- A5: GET /api/overview on real tmux + git: a running, a waiting and an idle session; the project is a repo with a change ----
+if command -v git >/dev/null; then
+  G() { git -C "$RUN/work" -c user.name=t -c user.email=t@t -c commit.gpgsign=false "$@"; }
+  G init -q -b main && G commit -q --allow-empty -m init && printf 'x\n' >"$RUN/work/ov-change.txt" && G add ov-change.txt
+  T new-session -d -s ov-run -c "$RUN/work" 'while :; do echo tick; sleep 1; done'
+  T new-session -d -s ov-ask -c "$RUN/work" "printf 'Proceed? (y/n) '; exec sleep 600"
+  for s in ov-run ov-ask; do T set-option -t "=$s:" @pc_project work >/dev/null; T set-option -t "=$s:" @pc_harness shell >/dev/null; done
+  check "create idle shell ov-idle" "$(api POST /api/sessions '{"name":"ov-idle","project":"work","harness":"shell"}')" 201
+  sleep 9 # older than the 8 s running window, except ov-run (prints every second)
+  check "overview 200" "$(api GET /api/overview)" 200
+  ov() { jf "sessions.find(s=>s.name===\"$1\").$2" <"$RESP"; }
+  check "overview: sleep loop is running" "$(ov ov-run state)" running
+  check "overview: y/n prompt is waiting, preview = the prompt" "$(ov ov-ask state)|$(ov ov-ask preview)" "waiting|Proceed? (y/n)"
+  check "overview: shell is idle" "$(ov ov-idle state)" idle
+  check "overview: project and harness" "$(ov ov-ask project)/$(ov ov-ask harness)" "work/shell"
+  check "overview: git branch, diff, ahead" "$(jf 'projects[0].branch+"|"+JSON.stringify(j.projects[0].diff)+"|"+j.projects[0].ahead' <"$RESP")" 'main|{"files":1,"add":1,"del":0}|null'
+  check "overview: now/activity are epoch seconds" "$(jf 'sessions.every(s=>Number.isInteger(s.activity) && Number.isInteger(s.created)) && Number.isInteger(j.now) && Math.abs(j.now - Date.now()/1000) < 30' <"$RESP")" true
+  [ -e "$RUN/work/.git/index.lock" ] && bad "overview took no git index lock" || ok "overview took no git index lock"
+  # A5 update 4: fresh open never reuses (work-shell exists)
+  check "open fresh" "$(api POST /api/open '{"project":"work","harness":"shell","fresh":true}')" 200
+  check "open fresh -> work-shell-2, created" "$(jf 'name+"|"+j.created' <"$RESP")" "work-shell-2|true"
+  for s in ov-run ov-ask ov-idle work-shell-2; do check "delete $s" "$(api DELETE "/api/sessions/$s")" 200; done
+else
+  echo "skip - overview section (no git)"
+fi
+
 # ---- delete everything, server still fine ----
 check "delete it1" "$(api DELETE /api/sessions/it1)" 200
 check "delete work-shell" "$(api DELETE /api/sessions/work-shell)" 200

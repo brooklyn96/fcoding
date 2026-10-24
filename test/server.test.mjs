@@ -8,7 +8,7 @@ import { spawnSync, execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
-import { createApp, writePrivate, trimScreen, adminRequest, adminPath, KEYS } from '../server.mjs';
+import { createApp, writePrivate, trimScreen, adminRequest, adminPath, KEYS, stateOf, previewOf, summarize, WAIT_PATTERNS, parseShortstat } from '../server.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const FAKE = path.join(here, 'fake-tmux.mjs');
@@ -1403,4 +1403,248 @@ test('purge retry is throttled: at most one write per second from requests; admi
     assert.equal(w.attempts, 6); // nothing pending: no more writes
     await c.login({}, 'new');
   }, { now: () => t, writePrivate: w.fn });
+});
+
+// ======================= A5: GET /api/overview, POST /api/open fresh =======================
+const ESC = String.fromCharCode(27);
+const NO_GIT = [process.execPath, '-e', 'process.exit(128)']; // every git call fails: projects get nulls
+const fakeState = (c) => path.join(c.root, 'fake', 'state.json');
+const setSession = (c, name, fields) => { // edit the fake tmux session table directly
+  const st = JSON.parse(fs.readFileSync(fakeState(c), 'utf8'));
+  st.sessions[name] = { created: 1700000000, dir: ABS, cmd: 'x', opts: { '@pc_project': 'alpha', '@pc_harness': 'shell' }, ...st.sessions[name], ...fields };
+  fs.writeFileSync(fakeState(c), JSON.stringify(st));
+};
+const setProjects = (c, projects) => {
+  const f = path.join(c.configDir, 'config.json');
+  writePrivate(f, JSON.stringify({ ...JSON.parse(fs.readFileSync(f, 'utf8')), projects }));
+};
+
+test('overview state: running within 8 s of activity, then waiting for each prompt pattern, else idle', () => {
+  const act = 1_700_000_000;
+  assert.equal(stateOf('Proceed? (y/n)', act, act * 1000 + 8000), 'running'); // the 8 s boundary is still running
+  assert.equal(stateOf('plain output', act, act * 1000 + 8001), 'idle');
+  const samples = ['Overwrite? (y/n)', 'Apply [y/n]', 'Install [Y/n]', 'Delete [y/N]', 'Answer yes/no', 'Do you want to make this edit?',
+    'Allow this command?', 'Approve the plan', 'Proceed?', 'Continue? ', 'Press Enter to continue', '❯ 1. Yes', '> 1. Yes, allow once'];
+  assert.equal(samples.length, WAIT_PATTERNS.length + 1); // one per pattern, plus the "> 1." form
+  WAIT_PATTERNS.forEach((re, i) => assert.ok(re.test(samples[i]), String(re)));
+  assert.ok(WAIT_PATTERNS.at(-1).test(samples.at(-1)));
+  for (const line of samples) {
+    assert.equal(stateOf(`some output\n${line}\n\n`, act, act * 1000 + 9000), 'waiting', line);
+    assert.equal(stateOf(`${line.toUpperCase()}`, act, act * 1000 + 9000), 'waiting', line.toUpperCase());
+  }
+  // only the last 6 non-empty lines count
+  assert.equal(stateOf(['Proceed? (y/n)', '1', '2', '3', '4', '5', '6', ''].join('\n'), act, act * 1000 + 9000), 'idle');
+  assert.equal(stateOf(['Proceed? (y/n)', '1', '', '2', '3', '4', '5', '', ''].join('\n'), act, act * 1000 + 9000), 'waiting');
+  for (const plain of ['compiling src/main.rs', 'all tests passed', 'allowed = 3', 'continue', '$ ']) assert.equal(stateOf(plain, act, act * 1000 + 9000), 'idle', plain);
+});
+
+test('overview preview: ANSI, controls, box drawing, prompt chrome, long lines, code-point boundary', () => {
+  const ch = (...cps) => String.fromCodePoint(...cps);
+  assert.equal(previewOf(`${ESC}[1;31mError:${ESC}[0m build failed\n\n`), 'Error: build failed');
+  assert.equal(previewOf(`${ESC}]0;title${String.fromCharCode(7)}done`), 'done');
+  assert.equal(previewOf('Writing tests\n╭──────────╮\n│ >        │\n╰──────────╯\n  ❯ \n$\n'), 'Writing tests');
+  assert.equal(previewOf('│ Edited 3 files │'), 'Edited 3 files');
+  assert.equal(previewOf(`a${ch(0x85)}b${ch(0x202e)}c${ch(0x1)}d\tz`), 'abcd z');
+  assert.equal(previewOf(''), null);
+  assert.equal(previewOf('───\n>\n'), null);
+  const long = 'x'.repeat(500);
+  assert.equal(previewOf(long), 'x'.repeat(160));
+  const emoji = ch(0x1f600);
+  const p = previewOf('a'.repeat(159) + emoji + emoji);
+  assert.equal(Array.from(p).length, 160);
+  assert.ok(p.endsWith(emoji)); // never half a surrogate pair
+  // waiting: the preview is the last matched prompt line, cleaned; otherwise the last real line
+  const act = 1_700_000_000;
+  assert.deepEqual(summarize(`│ Do you want to proceed? │\n${ESC}[1m  Overwrite foo? (y/n)${ESC}[0m\n  some hint\n╰───╯\n`, act, act * 1000 + 9000), { state: 'waiting', preview: 'Overwrite foo? (y/n)' });
+  assert.deepEqual(summarize('│ Do you want to proceed? │\nchoose below\n', act, act * 1000 + 9000), { state: 'waiting', preview: 'Do you want to proceed?' });
+  assert.deepEqual(summarize('Proceed? (y/n)\n', act, act * 1000 + 1000), { state: 'running', preview: 'Proceed? (y/n)' });
+  assert.equal(summarize(`${'y'.repeat(170)} (y/n)`, act, act * 1000 + 9000).preview, 'y'.repeat(160));
+  assert.deepEqual(summarize('built ok\n$ \n', act, act * 1000 + 9000), { state: 'idle', preview: 'built ok' });
+  assert.deepEqual(parseShortstat(' 2 files changed, 3 insertions(+), 1 deletion(-)'), { files: 2, add: 3, del: 1 });
+  assert.deepEqual(parseShortstat(' 1 file changed, 1 deletion(-)'), { files: 1, add: 0, del: 1 });
+  assert.deepEqual(parseShortstat(''), { files: 0, add: 0, del: 0 });
+});
+
+test('GET /api/overview: sessions with state and preview, one bad item gives nulls, response 200', async () => {
+  let t = 1_700_000_200_000;
+  await withApp(async (c) => {
+    const { cookie } = await c.login();
+    assert.equal((await c.req('GET', '/api/overview')).status, 401);
+    let r = await c.req('GET', '/api/overview', { cookie });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.json.sessions, []);
+    assert.equal(r.json.now, 1_700_000_200);
+    assert.deepEqual(r.json.projects.map((x) => [x.name, x.branch, x.ahead, x.diff]), [['alpha', null, null, null], ['my.proj', null, null, null]]);
+    for (const n of ['busy', 'ask', 'rest', 'gone']) assert.equal((await mkSession(c, cookie, n)).status, 201);
+    setSession(c, 'busy', { activity: 1_700_000_195, screen: 'cargo build\n   Compiling foo\n' });
+    setSession(c, 'ask', { activity: 1_700_000_100, screen: `Edit file?\n${ESC}[7m❯ 1. Yes${ESC}[0m\n  2. No\n╰────╯\n` });
+    setSession(c, 'rest', { activity: 1_700_000_100, screen: 'done.\n$ \n', secret: 'never' });
+    setSession(c, 'gone', { activity: 1_700_000_100, windowActivity: 1_700_000_197 }); // pane output 3 s ago: running
+    r = await c.req('GET', '/api/overview', { cookie });
+    assert.equal(r.status, 200);
+    const by = Object.fromEntries(r.json.sessions.map((x) => [x.name, x]));
+    assert.deepEqual(Object.keys(by.busy).sort(), ['activity', 'attached', 'created', 'harness', 'name', 'preview', 'project', 'state']);
+    assert.deepEqual([by.busy.state, by.busy.preview, by.busy.project, by.busy.harness], ['running', 'Compiling foo', 'alpha', 'shell']);
+    assert.deepEqual([by.ask.state, by.ask.preview], ['waiting', '❯ 1. Yes']); // waiting: the matched prompt line
+    assert.deepEqual([by.rest.state, by.rest.preview], ['idle', 'done.']);
+    assert.deepEqual([by.gone.state, by.gone.activity], ['running', 1_700_000_197]); // window_activity counts
+    // capture of the visible pane only: no -S history, no -e escapes
+    const caps = c.calls().filter((x) => x.argv[0] === 'capture-pane' && x.argv.includes('=ask:'));
+    assert.deepEqual(caps.at(-1).argv, ['capture-pane', '-p', '-J', '-t', '=ask:']);
+    // a session that vanishes between list and capture: nulls for it, 200 for the rest
+    const st = JSON.parse(fs.readFileSync(fakeState(c), 'utf8'));
+    st.sessions.gone.screen = undefined;
+    fs.writeFileSync(fakeState(c), JSON.stringify(st));
+    await withEnv({ FAKE_TMUX_SCREEN_FILE: path.join(c.root, 'missing-file') }, async () => { // capture-pane fails for "gone" only
+      r = await c.req('GET', '/api/overview', { cookie });
+    });
+    assert.equal(r.status, 200);
+    const g = r.json.sessions.find((x) => x.name === 'gone');
+    assert.deepEqual([g.state, g.preview], [null, null]);
+    assert.equal(r.json.sessions.find((x) => x.name === 'ask').state, 'waiting');
+    assert.ok(!r.text.includes('never'));
+  }, { now: () => t, git: NO_GIT });
+});
+
+const git = (dir, ...args) => {
+  const r = spawnSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', ...args], { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  return r.stdout;
+};
+test('overview git: branch, diff and ahead parsed; a non-repo gives nulls; cached for 10 s per project', async () => {
+  let t = 1_700_000_200_000;
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-git-'));
+  try {
+    const repo = path.join(tmp, 'repo'); const plain = path.join(tmp, 'plain');
+    fs.mkdirSync(repo); fs.mkdirSync(plain);
+    git(repo, 'init', '-q', '-b', 'main');
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'one\ntwo\n');
+    git(repo, 'add', '.'); git(repo, 'commit', '-q', '-m', 'one');
+    git(repo, 'branch', 'base'); git(repo, 'branch', '--set-upstream-to=base');
+    fs.writeFileSync(path.join(repo, 'b.txt'), 'b\n');
+    git(repo, 'add', '.'); git(repo, 'commit', '-q', '-m', 'two');
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'one\nTWO\nthree\n'); // 2 insertions, 1 deletion
+    // a ceiling stops git from finding a repo above the plain dir
+    await withEnv({ GIT_CEILING_DIRECTORIES: tmp }, () => withApp(async (c) => {
+      const { cookie } = await c.login();
+      setProjects(c, { repo, plain });
+      const pr = async () => Object.fromEntries((await c.req('GET', '/api/overview', { cookie })).json.projects.map((x) => [x.name, x]));
+      let p = await pr();
+      assert.deepEqual(p.repo, { name: 'repo', branch: 'main', ahead: 1, diff: { files: 1, add: 2, del: 1 } });
+      assert.deepEqual(p.plain, { name: 'plain', branch: null, ahead: null, diff: null });
+      fs.writeFileSync(path.join(repo, 'b.txt'), 'b\nc\n');
+      t += 9999;
+      assert.deepEqual((await pr()).repo.diff, { files: 1, add: 2, del: 1 }); // cache hit
+      t += 1;
+      assert.deepEqual((await pr()).repo.diff, { files: 2, add: 3, del: 1 }); // refreshed after 10 s
+      git(repo, 'checkout', '-q', '-b', 'feature');
+      t += 10000;
+      p = await pr();
+      assert.equal(p.repo.branch, 'feature');
+      assert.equal(p.repo.ahead, null); // no upstream
+      assert.ok(!fs.existsSync(path.join(repo, '.git', 'index.lock')));
+    }, { now: () => t }));
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
+
+test('overview gate: one read slot for the whole job, 503 when the read slots are full', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  for (const n of ['s1', 's2', 's3']) await mkSession(c, cookie, n);
+  await withEnv({ FAKE_TMUX_DELAY_MS: '200' }, async () => {
+    const screens = Array.from({ length: 3 }, () => c.req('GET', '/api/screen/s1', { cookie })); // 6 read slots
+    assert.ok(await until(() => c.app.stats().reads === 6, 3000));
+    let maxReads = 0;
+    const iv = setInterval(() => { maxReads = Math.max(maxReads, c.app.stats().reads); }, 2);
+    const before = c.calls().length;
+    const ov = await c.req('GET', '/api/overview', { cookie });
+    clearInterval(iv);
+    assert.equal(ov.status, 200);
+    assert.equal(ov.json.sessions.length, 3);
+    assert.ok(maxReads <= 7, `reads=${maxReads}`);
+    assert.ok(maxOverlap(c.calls().slice(before).filter((x) => x.argv[0] === 'list-sessions' || (x.argv[0] === 'capture-pane' && !x.argv.includes('-S')))) <= 1);
+    await Promise.all(screens);
+    const full = [...Array.from({ length: 3 }, () => c.req('GET', '/api/screen/s1', { cookie })), c.req('GET', '/api/sessions', { cookie })];
+    assert.ok(await until(() => c.app.stats().reads === 7, 3000));
+    const busy = await c.req('GET', '/api/overview', { cookie });
+    assert.deepEqual([busy.status, busy.json], [503, { error: 'busy' }]);
+    await Promise.all(full);
+  });
+  assert.ok(await until(() => c.app.stats().reads === 0 && c.app.stats().running === 0));
+}, { git: NO_GIT }));
+
+test('overview gate: a revoke during the job stops it at the gate (401, no further child)', () => withApp(async (c) => {
+  const a = await c.login({}, 'victim');
+  for (const n of ['s1', 's2', 's3', 's4']) await mkSession(c, a.cookie, n);
+  await withEnv({ FAKE_TMUX_DELAY_MS: '250' }, async () => {
+    const before = c.calls().length;
+    const ov = c.req('GET', '/api/overview', { cookie: a.cookie });
+    assert.ok(await until(() => c.app.stats().running === 1, 3000));
+    assert.deepEqual(await adminRequest(c.configDir, { cmd: 'revoke', id: await c.deviceId('victim') }), { ok: true, revoked: 1 });
+    assert.equal((await ov).status, 401);
+    await sleep(400);
+    const caps = c.calls().slice(before).filter((x) => x.argv[0] === 'capture-pane');
+    assert.ok(caps.length <= 1, `captures after revoke: ${caps.length}`);
+  });
+  assert.ok(await until(() => c.app.stats().reads === 0 && c.app.stats().running === 0));
+}, { git: NO_GIT }));
+
+// ---- POST /api/open fresh:true (A5 update 4) ----
+const openReq = (c, cookie, body) => c.req('POST', '/api/open', { cookie, body: { project: 'alpha', harness: 'shell', ...body } });
+test('open fresh: base, then base-2, base-3; never reuses; without fresh the old reuse stays', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  const names = [];
+  for (let i = 0; i < 3; i++) {
+    const r = await openReq(c, cookie, { fresh: true });
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.equal(r.json.created, true);
+    names.push(r.json.name);
+  }
+  assert.deepEqual(names, ['alpha-shell', 'alpha-shell-2', 'alpha-shell-3']);
+  const old = await openReq(c, cookie, {});
+  assert.deepEqual(old.json, { name: 'alpha-shell', created: false }); // reuse, as before
+  assert.equal((await c.req('DELETE', '/api/sessions/alpha-shell-2', { cookie })).status, 200);
+  assert.equal((await openReq(c, cookie, { fresh: true })).json.name, 'alpha-shell-2'); // the first free name
+  assert.equal((await openReq(c, cookie, { fresh: 'yes' })).status, 400);
+  const st = JSON.parse(fs.readFileSync(fakeState(c), 'utf8'));
+  assert.deepEqual(Object.keys(st.sessions).sort(), ['alpha-shell', 'alpha-shell-2', 'alpha-shell-3']);
+  assert.equal(st.sessions['alpha-shell-3'].opts['@pc_project'], 'alpha');
+}));
+
+test('open fresh: long project names keep the suffix within 32 chars; concurrent fresh opens get different names', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  const long = 'a-very-long-project-name-for-tests-x';
+  setProjects(c, { [long]: ABS });
+  const o = (body) => c.req('POST', '/api/open', { cookie, body: { project: long, harness: 'claude', fresh: true, ...body } });
+  const r1 = await o(); const r2 = await o();
+  assert.equal(r1.json.name, 'a-very-long-project-name-for-tes');
+  assert.equal(r2.json.name, 'a-very-long-project-name-for-t-2');
+  for (let i = 3; i <= 10; i++) assert.equal((await o()).json.name, i < 10 ? `a-very-long-project-name-for-t-${i}` : 'a-very-long-project-name-for-10'); // a trailing "-" of the cut base is dropped
+  for (const n of [r1.json.name, r2.json.name]) assert.ok(n.length <= 32);
+  setProjects(c, { alpha: ABS });
+  const par = await Promise.all(Array.from({ length: 5 }, () => openReq(c, cookie, { fresh: true })));
+  assert.ok(par.every((r) => r.status === 200 && r.json.created === true));
+  assert.equal(new Set(par.map((r) => r.json.name)).size, 5);
+}));
+
+test('overview git: every call is execFile git -C <dir> with GIT_OPTIONAL_LOCKS=0, one round per project per 10 s', async () => {
+  let t = 1_700_000_200_000;
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-fgit-'));
+  const logFile = path.join(tmp, 'git.jsonl');
+  const fakeGit = path.join(tmp, 'git.cjs'); // logs argv + env, then fails like "not a git repository"
+  fs.writeFileSync(fakeGit, `require('fs').appendFileSync(${JSON.stringify(logFile)}, JSON.stringify({ argv: process.argv.slice(2), lock: process.env.GIT_OPTIONAL_LOCKS }) + String.fromCharCode(10)); process.exit(128);`);
+  const calls = () => { try { return fs.readFileSync(logFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l)); } catch { return []; } };
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      assert.equal((await c.req('GET', '/api/overview', { cookie })).status, 200);
+      // alpha and my.proj share one dir: the cache is per dir, so one call; a failed rev-parse stops that project's round
+      assert.deepEqual(calls(), [{ argv: ['-C', ABS, 'rev-parse', '--abbrev-ref', 'HEAD'], lock: '0' }]);
+      t += 9999;
+      await c.req('GET', '/api/overview', { cookie });
+      assert.equal(calls().length, 1); // cache hit
+      t += 1;
+      await c.req('GET', '/api/overview', { cookie });
+      assert.equal(calls().length, 2); // refreshed after 10 s
+    }, { now: () => t, git: [process.execPath, fakeGit] });
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
 });

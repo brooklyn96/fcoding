@@ -3,6 +3,8 @@
 // FAKE_TMUX_BIG, FAKE_TMUX_EXIT (new-session succeeds but the harness exits at once, like tmux 3.5a),
 // FAKE_TMUX_EXIT_AFTER_MS (the harness exits that many ms after new-session; seen by has-session only),
 // FAKE_TMUX_EXIT_AT_OPTION (the harness exits while that option is being set: set-option -> "no such session").
+// Per session in state.json (tests may edit it): activity (session_activity, unix s, default 1700000100),
+// windowActivity (window_activity, default 0), screen (capture-pane text).
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -56,7 +58,7 @@ switch (cmd) {
     if (!names.length) fail('no server running on /tmp/tmux-1000/default');
     for (const n of names) {
       const s = st.sessions[n];
-      console.log(`${n}|${s.created}|0|1700000100|${s.opts['@pc_harness'] || ''}|${s.opts['@pc_project'] || ''}`);
+      console.log(`${n}|${s.created}|0|${s.activity ?? 1700000100}|${s.windowActivity ?? 0}|${s.opts['@pc_harness'] || ''}|${s.opts['@pc_project'] || ''}`);
     }
     break;
   }
@@ -68,6 +70,7 @@ switch (cmd) {
       process.stdout.write(out);
     } else {
       const f = process.env.FAKE_TMUX_SCREEN_FILE;
+      if (st.sessions[target()].screen !== undefined) { process.stdout.write(st.sessions[target()].screen); break; }
       process.stdout.write(f ? fs.readFileSync(f, 'utf8') : process.env.FAKE_TMUX_SCREEN ? JSON.parse(process.env.FAKE_TMUX_SCREEN) : 'hello world\nline 2\n\n\n');
     }
     break;

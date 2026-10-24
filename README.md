@@ -56,9 +56,15 @@ Khi điện thoại chỉnh kích thước, cửa sổ tmux bị cố định th
 tmux set-option -wu window-size
 ```
 
+## Màn hình tổng quan của app
+
+App hỏi `GET /api/overview` mỗi 5 giây khi đang mở. Máy chủ trả về từng phiên với trạng thái: "đang chạy" (màn hình có thay đổi trong 8 giây gần nhất), "cần bạn" (vài dòng cuối là câu hỏi như `(y/n)`, `Do you want`, `Proceed?`) hoặc "đang nghỉ". Mỗi phiên chỉ kèm một dòng xem trước. Nếu phiên đang chờ bạn, dòng đó chính là câu hỏi. Với mỗi dự án, máy chủ trả thêm nhánh git, số dòng thay đổi và số commit chưa đẩy lên. Máy chủ chỉ đọc git, không bao giờ khóa git, nên không cản agent đang làm việc. Kết quả git được giữ 10 giây.
+
+Nút "+" trong app luôn tạo phiên mới (`fresh: true`), đặt tên `<dự án>-<harness>`, `-2`, `-3`, …, không bao giờ mở lại phiên cũ.
+
 ## Giới hạn
 
-- Tối đa 50 luồng xem màn hình cùng lúc và 8 tiến trình tmux đồng thời.
+- Tối đa 50 luồng xem màn hình cùng lúc và 8 tiến trình tmux đồng thời. Một lần lấy tổng quan chỉ dùng một chỗ đọc; các lệnh tmux và git bên trong chạy lần lượt.
 - Lệnh thay đổi (mở, tạo, xóa phiên, gửi chữ, phím, đổi kích thước) chạy lần lượt từng cái; tối đa 20 lệnh chờ, quá thì trả `503 busy`. Lệnh đọc (màn hình, danh sách) không phải chờ: hết chỗ thì trả `503 busy` ngay.
 - Tin nhắn tối đa 32 KB, thân yêu cầu tối đa 64 KB.
 - Ghép nối (`/api/pair`): tối đa 10 lần mỗi phút và 30 lần mỗi giờ cho cả hệ thống; quá thì trả `429` kèm `Retry-After`. Giới hạn này tính chung cho mọi người trên internet, nên người lạ có thể dùng hết 30 lượt trong một giờ; khi đó hãy chờ tối đa 1 giờ rồi ghép lại. Ghép nối hiếm khi cần, nên điều này được chấp nhận.
