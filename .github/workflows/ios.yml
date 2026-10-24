@@ -57,17 +57,19 @@ jobs:
           if-no-files-found: error
 
       - name: Publish pre-release "latest"
+        if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
           name: FCode (bản mới nhất)
-          body: "Bản dựng mới nhất của FCode cho iPhone. Tải fcode.ipa rồi cài bằng LiveContainer."
+          body: "Bản dựng mới nhất của FCode cho iPhone. Tải fcode.ipa rồi cài bằng Sideloadly."
           prerelease: true
           make_latest: false
           files: ios/fcode.ipa
           overwrite_files: true
 
       - name: Remove old fcoding.ipa asset
+        if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release delete-asset latest fcoding.ipa -y || true
