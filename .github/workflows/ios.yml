@@ -12,7 +12,8 @@ permissions:
   contents: write
 
 concurrency:
-  group: ios-build
+  # Per branch: a feature-branch build never cancels a main build.
+  group: ios-build-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
