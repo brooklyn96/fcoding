@@ -11,3 +11,7 @@ ios/*.xcodeproj/
 node_modules/
 findings-*.md
 replan-*.md
+facts-*.md
+review*.md
+report-*.md
+prompt-*.md

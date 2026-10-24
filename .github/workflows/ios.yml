@@ -1,4 +1,4 @@
-name: iOS build (fcoding)
+name: iOS build (FCode)
 
 on:
   workflow_dispatch:
@@ -43,26 +43,31 @@ jobs:
         run: |
           APP=build/Build/Products/Release-iphoneos/fcoding.app
           test -d "$APP"
-          rm -rf Payload fcoding.ipa
+          rm -rf Payload fcode.ipa
           mkdir Payload
           cp -R "$APP" Payload/
-          zip -qry fcoding.ipa Payload
-          ls -l fcoding.ipa
+          zip -qry fcode.ipa Payload
+          ls -l fcode.ipa
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: fcoding-ipa
-          path: ios/fcoding.ipa
+          name: fcode-ipa
+          path: ios/fcode.ipa
           if-no-files-found: error
 
       - name: Publish pre-release "latest"
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          name: fcoding (bản mới nhất)
-          body: "Bản dựng mới nhất của fcoding cho iPhone. Tải fcoding.ipa rồi cài bằng LiveContainer."
+          name: FCode (bản mới nhất)
+          body: "Bản dựng mới nhất của FCode cho iPhone. Tải fcode.ipa rồi cài bằng LiveContainer."
           prerelease: true
           make_latest: false
-          files: ios/fcoding.ipa
+          files: ios/fcode.ipa
           overwrite_files: true
+
+      - name: Remove old fcoding.ipa asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete-asset latest fcoding.ipa -y || true

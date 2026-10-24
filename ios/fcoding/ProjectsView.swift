@@ -34,7 +34,7 @@ struct ProjectsView: View {
                 projectSection
                 sessionSection
             }
-            .navigationTitle("fcoding")
+            .navigationTitle("FCode")
             .navigationDestination(for: String.self) { SessionView(name: $0) }
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
