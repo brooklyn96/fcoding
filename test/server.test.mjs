@@ -8,7 +8,7 @@ import { spawnSync, execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
-import { createApp, writePrivate, trimScreen, adminRequest, adminPath, KEYS, stateOf, previewOf, summarize, WAIT_PATTERNS, parseShortstat, acquireInstanceLock } from '../server.mjs';
+import { createApp, writePrivate, trimScreen, adminRequest, adminPath, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock } from '../server.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const FAKE = path.join(here, 'fake-tmux.mjs');
@@ -1435,11 +1435,11 @@ test('overview preview: ANSI, controls, box drawing, prompt chrome, long lines, 
   assert.ok(p.endsWith(emoji)); // never half a surrogate pair
   // waiting: the preview is the last matched prompt line, cleaned; otherwise the last real line
   const act = 1_700_000_000;
-  assert.deepEqual(summarize(`│ Do you want to proceed? │\n${ESC}[1m  Overwrite foo? (y/n)${ESC}[0m\n  some hint\n╰───╯\n`, act, act * 1000 + 9000), { state: 'waiting', preview: 'Overwrite foo? (y/n)' });
-  assert.deepEqual(summarize('│ Do you want to proceed? │\nchoose below\n', act, act * 1000 + 9000), { state: 'waiting', preview: 'Do you want to proceed?' });
-  assert.deepEqual(summarize('Proceed? (y/n)\n', act, act * 1000 + 1000), { state: 'running', preview: 'Proceed? (y/n)' });
+  assert.deepEqual(summarize(`│ Do you want to proceed? │\n${ESC}[1m  Overwrite foo? (y/n)${ESC}[0m\n  some hint\n╰───╯\n`, act, act * 1000 + 9000), { state: 'waiting', preview: 'Overwrite foo? (y/n)', menu: false });
+  assert.deepEqual(summarize('│ Do you want to proceed? │\nchoose below\n', act, act * 1000 + 9000), { state: 'waiting', preview: 'Do you want to proceed?', menu: false });
+  assert.deepEqual(summarize('Proceed? (y/n)\n', act, act * 1000 + 1000), { state: 'running', preview: 'Proceed? (y/n)', menu: false });
   assert.equal(summarize(`${'y'.repeat(170)} (y/n)`, act, act * 1000 + 9000).preview, 'y'.repeat(160));
-  assert.deepEqual(summarize('built ok\n$ \n', act, act * 1000 + 9000), { state: 'idle', preview: 'built ok' });
+  assert.deepEqual(summarize('built ok\n$ \n', act, act * 1000 + 9000), { state: 'idle', preview: 'built ok', menu: false });
   assert.deepEqual(parseShortstat(' 2 files changed, 3 insertions(+), 1 deletion(-)'), { files: 2, add: 3, del: 1 });
   assert.deepEqual(parseShortstat(' 1 file changed, 1 deletion(-)'), { files: 1, add: 0, del: 1 });
   assert.deepEqual(parseShortstat(' 1 file changed, 1 insertion(+)'), { files: 1, add: 1, del: 0 });
@@ -1465,10 +1465,10 @@ test('GET /api/overview: sessions with state and preview, one bad item gives nul
     r = await c.req('GET', '/api/overview', { cookie });
     assert.equal(r.status, 200);
     const by = Object.fromEntries(r.json.sessions.map((x) => [x.name, x]));
-    assert.deepEqual(Object.keys(by.busy).sort(), ['activity', 'attached', 'created', 'harness', 'name', 'preview', 'project', 'state']);
+    assert.deepEqual(Object.keys(by.busy).sort(), ['activity', 'attached', 'created', 'harness', 'menu', 'name', 'preview', 'project', 'state']);
     assert.deepEqual([by.busy.state, by.busy.preview, by.busy.project, by.busy.harness], ['running', 'Compiling foo', 'alpha', 'shell']);
-    assert.deepEqual([by.ask.state, by.ask.preview], ['waiting', '❯ 1. Yes']); // waiting: the matched prompt line
-    assert.deepEqual([by.rest.state, by.rest.preview], ['idle', 'done.']);
+    assert.deepEqual([by.ask.state, by.ask.preview, by.ask.menu], ['waiting', '❯ 1. Yes', true]); // waiting: the matched prompt line
+    assert.deepEqual([by.rest.state, by.rest.preview, by.rest.menu], ['idle', 'done.', false]);
     assert.deepEqual([by.gone.state, by.gone.activity], ['running', 1_700_000_197]); // window_activity counts
     // capture of the visible pane only: no -S history, no -e escapes
     const caps = c.calls().filter((x) => x.argv[0] === 'capture-pane' && x.argv.includes('=ask:'));
@@ -1482,7 +1482,7 @@ test('GET /api/overview: sessions with state and preview, one bad item gives nul
     });
     assert.equal(r.status, 200);
     const g = r.json.sessions.find((x) => x.name === 'gone');
-    assert.deepEqual([g.state, g.preview], [null, null]);
+    assert.deepEqual([g.state, g.preview, g.menu], [null, null, null]);
     assert.equal(r.json.sessions.find((x) => x.name === 'ask').state, 'waiting');
     assert.ok(!r.text.includes('never'));
   }, { now: () => t, git: NO_GIT });
@@ -1806,19 +1806,19 @@ test('names and previews lose U+061C, U+200B-U+200D, U+2060 and U+FEFF', () => w
 
 test('a numbered choice inside box drawing is waiting; the preview is the inner line', () => {
   const act = 1_700_000_000, t = act * 1000 + 9000;
-  assert.deepEqual(summarize('╭──────────╮\n│ Edit file? │\n│ ❯ 1. Yes   │\n│   2. No    │\n╰──────────╯\n', act, t), { state: 'waiting', preview: '❯ 1. Yes' });
-  assert.deepEqual(summarize('┃ > 2. Always allow ┃', act, t), { state: 'waiting', preview: '> 2. Always allow' });
+  assert.deepEqual(summarize('╭──────────╮\n│ Edit file? │\n│ ❯ 1. Yes   │\n│   2. No    │\n╰──────────╯\n', act, t), { state: 'waiting', preview: '❯ 1. Yes', menu: true });
+  assert.deepEqual(summarize('┃ > 2. Always allow ┃', act, t), { state: 'waiting', preview: '> 2. Always allow', menu: true });
   assert.equal(stateOf('│ step 1. done │', act, t), 'idle');
 });
 
 test('waiting preview: the question line, not a numbered option (plain and boxed)', () => {
   const act = 1_700_000_000, t = act * 1000 + 9000;
-  const want = { state: 'waiting', preview: 'Do you want to proceed?' };
+  const want = { state: 'waiting', preview: 'Do you want to proceed?', menu: true };
   assert.deepEqual(summarize('Do you want to proceed?\n❯ 1. Yes\n2. No\n', act, t), want);
   assert.deepEqual(summarize('╭───────────────────────────╮\n│ Do you want to proceed?   │\n│ ❯ 1. Yes                  │\n│   2. No                   │\n╰───────────────────────────╯\n', act, t), want);
-  assert.deepEqual(summarize('Allow this command?\n› 1. Yes\n> 2. Yes, and always allow\n', act, t), { state: 'waiting', preview: 'Allow this command?' });
+  assert.deepEqual(summarize('Allow this command?\n› 1. Yes\n> 2. Yes, and always allow\n', act, t), { state: 'waiting', preview: 'Allow this command?', menu: true });
   // only options match: the last of them
-  assert.deepEqual(summarize('Pick one\n❯ 1. Yes\n> 2. Always allow\n', act, t), { state: 'waiting', preview: '> 2. Always allow' });
+  assert.deepEqual(summarize('Pick one\n❯ 1. Yes\n> 2. Always allow\n', act, t), { state: 'waiting', preview: '> 2. Always allow', menu: true });
 });
 
 test('open fresh: a name created outside the server meanwhile moves on to base-2', () => withApp(async (c) => {
@@ -1848,3 +1848,24 @@ test('overview: a client disconnect mid-job frees the read slot and starts no la
     assert.equal(c.app.stats().reads, 0);
   });
 }, { git: NO_GIT }));
+
+// ======================= A5 update 6: menu flag =======================
+test('menu flag: a numbered menu on screen is menu:true even when a y/n line is the preview; line prompts are menu:false', () => {
+  const act = 1_700_000_000, t = act * 1000 + 9000;
+  // the two screens from the final r3 review: no y/n buttons may be offered on them
+  assert.deepEqual(summarize('Overwrite config? (y/n)\n❯ 1. Yes\n2. No\n', act, t), { state: 'waiting', preview: 'Overwrite config? (y/n)', menu: true });
+  assert.equal(summarize('Continue? [y/N] y\nPick a model\n❯ 1. Sonnet\n2. Opus\n', act, t).menu, true);
+  // real y/n line prompts keep menu:false
+  for (const [screen, preview] of [
+    ['Proceed? (y/n)', 'Proceed? (y/n)'],
+    ['After this operation, 12 MB will be used.\nDo you want to continue? [Y/n] ', 'Do you want to continue? [Y/n]'],
+    ["The authenticity of host 'box (1.2.3.4)' can't be established.\nAre you sure you want to continue connecting (yes/no/[fingerprint])? ", 'Are you sure you want to continue connecting (yes/no/[fingerprint])?'],
+  ]) assert.deepEqual(summarize(screen, act, t), { state: 'waiting', preview, menu: false }, screen);
+  // a boxed Claude Code permission menu
+  const boxed = '╭──────────────────────────────────────╮\n│ Bash command                         │\n│   rm -rf build                       │\n│ Do you want to proceed?              │\n│ ❯ 1. Yes                             │\n│   2. No, and tell Claude what to do  │\n╰──────────────────────────────────────╯\n';
+  assert.deepEqual(summarize(boxed, act, t), { state: 'waiting', preview: 'Do you want to proceed?', menu: true });
+  // the flag does not depend on the state; a numbered line older than the last 6 lines does not count
+  assert.equal(summarize('❯ 1. Yes', act, act * 1000).menu, true);
+  assert.equal(summarize(['❯ 1. Yes', 'a', 'b', 'c', 'd', 'e', 'Proceed? (y/n)'].join('\n'), act, t).menu, false);
+  assert.equal(menuOf('step 1.done\n12.items'), false); // needs "N. " with a space
+});
