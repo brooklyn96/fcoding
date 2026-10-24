@@ -123,10 +123,14 @@ export function previewOf(text) {
   const lines = paneLines(text);
   return lines.length ? clip(lines.at(-1)) : null;
 }
-// the last of the last 6 non-empty lines that matches a prompt pattern, cleaned like a preview (so "│ ❯ 1. Yes │" counts), or null
+// the last 6 non-empty lines that match a prompt pattern, cleaned like a preview (so "│ ❯ 1. Yes │" counts)
+const promptLines = (text) => text.split('\n').map((l) => l.replace(ANSI_RE, '').replace(NAME_CTRL, '')).filter((l) => l.trim()).slice(-6).map(cleanLine)
+  .filter((l) => l && WAIT_PATTERNS.some((re) => re.test(l)));
+const CHOICE_RE = /^[❯>›]?\s*\d+\.\s/; // a numbered option such as "❯ 1. Yes"
+// the question for the preview: the last matching line that is not a numbered option; else the last option; null when none matches
 function promptLine(text) {
-  const last = text.split('\n').map((l) => l.replace(ANSI_RE, '').replace(NAME_CTRL, '')).filter((l) => l.trim()).slice(-6).map(cleanLine);
-  return last.findLast((l) => l && WAIT_PATTERNS.some((re) => re.test(l))) ?? null;
+  const m = promptLines(text);
+  return m.findLast((l) => !CHOICE_RE.test(l)) ?? m.at(-1) ?? null;
 }
 export function stateOf(text, activity, nowMs) {
   if (nowMs - activity * 1000 <= RUNNING_MS) return 'running';
