@@ -294,7 +294,8 @@ struct ProjectsView: View {
             showProject: project == "all",
             unread: unread,
             time: model.relativeTime(s),
-            busy: model.busy.contains(s.name) || model.answered[s.name] != nil,
+            busy: model.busy.contains(s.name),
+            answered: model.answered[s.name] != nil,
             onOpen: { open(s.name) },
             onReply: { open(s.name, reply: true) },
             onAnswer: { text in Task { await model.answer(s, text, app: app) } }
@@ -319,6 +320,8 @@ struct SessionRow: View {
     let unread: Bool
     let time: String
     let busy: Bool
+    /// A y/n answer was sent and the refresh does not show it yet.
+    let answered: Bool
     let onOpen: () -> Void
     let onReply: () -> Void
     let onAnswer: (String) -> Void
@@ -408,20 +411,21 @@ struct SessionRow: View {
     }
 
     private var actions: some View {
+        // y/n stay off while an action runs or the sent answer is not yet reflected; the other
+        // buttons are off only while an action runs.
         HStack(spacing: 8) {
             if OverviewModel.isYesNo(session.preview) {
-                pill("y · Đồng ý", fill: Color(uiColor: .systemGreen), text: .black) { onAnswer("y") }
-                pill("n · Từ chối", fill: Color(uiColor: .tertiarySystemFill), text: .primary) { onAnswer("n") }
+                pill("y · Đồng ý", fill: Color(uiColor: .systemGreen), text: .black, off: busy || answered) { onAnswer("y") }
+                pill("n · Từ chối", fill: Color(uiColor: .tertiarySystemFill), text: .primary, off: busy || answered) { onAnswer("n") }
             } else {
-                pill("Trả lời", fill: Color(uiColor: .tertiarySystemFill), text: .accentColor, action: onReply)
+                pill("Trả lời", fill: Color(uiColor: .tertiarySystemFill), text: .accentColor, off: busy, action: onReply)
             }
-            pill("Mở", fill: Color(uiColor: .tertiarySystemFill), text: .accentColor, action: onOpen)
-            if busy { ProgressView().padding(.leading, 2) }
+            pill("Mở", fill: Color(uiColor: .tertiarySystemFill), text: .accentColor, off: busy, action: onOpen)
+            if busy || answered { ProgressView().padding(.leading, 2) }
         }
-        .disabled(busy)
     }
 
-    private func pill(_ title: String, fill: Color, text: Color, action: @escaping () -> Void) -> some View {
+    private func pill(_ title: String, fill: Color, text: Color, off: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             // 32 pt capsule look, 44 pt tall hit area.
             Text(title)
@@ -434,7 +438,8 @@ struct SessionRow: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .opacity(busy ? 0.5 : 1)
+        .disabled(off)
+        .opacity(off ? 0.5 : 1)
     }
 }
 
