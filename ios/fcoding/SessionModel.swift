@@ -77,8 +77,8 @@ final class SessionModel: ObservableObject {
                 body.append(byte)
                 if body.count > 8192 { break }
             }
-            try API.check(resp, body)
-            throw APIError(status: http.statusCode, code: "")
+            try API.check(resp, body, token: api.token)
+            throw APIError(status: http.statusCode, code: "", token: api.token)
         }
         link = .live
         // Split on LF (0x0A) only, dropping a trailing CR. Foundation's `bytes.lines` also ends a
@@ -127,7 +127,7 @@ final class SessionModel: ObservableObject {
         let obj = (try? JSONSerialization.jsonObject(with: Data(data.utf8))) as? [String: Any]
         switch obj?["reason"] as? String {
         case "auth":
-            errorText = app?.report(APIError(status: 401, code: "unauthorized"))
+            errorText = app?.report(APIError(status: 401, code: "unauthorized", token: api.token))
         case "session":
             gone = true
         default:

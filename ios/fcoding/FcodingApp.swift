@@ -18,7 +18,7 @@ struct RootView: View {
 
     var body: some View {
         if app.token == nil {
-            NavigationStack { LoginView() }
+            NavigationStack { PairView() }
         } else {
             ProjectsView()
         }
