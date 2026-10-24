@@ -61,7 +61,9 @@ Sau khi ghép, iPhone nhớ box trong Keychain; mở ứng dụng là vào thẳ
 - **Cài đặt** (bánh răng):
   - **Gỡ iPhone này**: gỡ điện thoại này khỏi box.
   - **Gỡ mọi thiết bị**: gỡ tất cả thiết bị đã ghép với box (có hỏi xác nhận).
-  - Cả hai đều xoá ghép trên iPhone này ngay, kể cả khi box không trả lời. Muốn dùng lại thì gõ `fcode-pair` trên box và ghép lại.
+  - **Gỡ iPhone này** xoá ghép trên iPhone này ngay, kể cả khi box không trả lời.
+  - **Gỡ mọi thiết bị** chỉ đăng xuất iPhone này khi box xác nhận; nếu lỗi, iPhone vẫn đăng nhập và có nút **Thử lại**.
+  - Muốn dùng lại thì gõ `fcode-pair` trên box và ghép lại.
 
 ## Khi gặp lỗi
 
