@@ -126,6 +126,7 @@ struct ProjectsView: View {
 
     private func open(_ project: String) async {
         guard let api = app.api else { return }
+        let harness = self.harness
         opening = project
         defer { opening = nil }
         do {
@@ -134,7 +135,11 @@ struct ProjectsView: View {
             errorText = nil
             path.append(reply.name)
         } catch {
-            errorText = app.report(error)
+            if let e = error as? APIError, e.status == 500, e.code == "harness_exited" {
+                errorText = "Không mở được \(harness) trên box (chương trình thoát ngay)."
+            } else {
+                errorText = app.report(error)
+            }
         }
     }
 
@@ -156,6 +161,7 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var confirmAll = false
     @State private var busy = false
+    @State private var errorText: String?
 
     var body: some View {
         NavigationStack {
@@ -164,12 +170,26 @@ struct SettingsView: View {
                     Text(app.serverURL).textSelection(.enabled)
                 }
                 Section {
-                    Button("Đăng xuất") { run(everywhere: false) }
-                    Button("Đăng xuất mọi nơi", role: .destructive) { confirmAll = true }
+                    Button("Đăng xuất trên máy này") { app.logoutHere() }
+                    Button(role: .destructive) { confirmAll = true } label: {
+                        HStack {
+                            Text("Đăng xuất mọi nơi")
+                            Spacer()
+                            if busy { ProgressView() }
+                        }
+                    }
                 } footer: {
-                    Text("“Đăng xuất mọi nơi” thu hồi đăng nhập trên tất cả thiết bị.")
+                    Text("“Đăng xuất trên máy này” chỉ xoá đăng nhập trên điện thoại này. “Đăng xuất mọi nơi” thu hồi đăng nhập trên tất cả thiết bị.")
                 }
                 .disabled(busy)
+                if let errorText = errorText {
+                    Section {
+                        Label(errorText, systemImage: "xmark.octagon").foregroundColor(.red)
+                        Button("Thử lại") { logoutEverywhere() }.disabled(busy)
+                    } header: {
+                        Text("Chưa đăng xuất mọi nơi")
+                    }
+                }
             }
             .navigationTitle("Cài đặt")
             .navigationBarTitleDisplayMode(.inline)
@@ -177,16 +197,23 @@ struct SettingsView: View {
                 ToolbarItem(placement: .confirmationAction) { Button("Đóng") { dismiss() } }
             }
             .confirmationDialog("Đăng xuất trên mọi thiết bị?", isPresented: $confirmAll, titleVisibility: .visible) {
-                Button("Đăng xuất mọi nơi", role: .destructive) { run(everywhere: true) }
+                Button("Đăng xuất mọi nơi", role: .destructive) { logoutEverywhere() }
                 Button("Huỷ", role: .cancel) {}
             }
         }
     }
 
-    private func run(everywhere: Bool) {
+    /// Local credentials stay until the server confirms; a 401 still goes back to login (via report).
+    private func logoutEverywhere() {
+        guard !busy else { return }
         busy = true
+        errorText = nil
         Task {
-            await app.logout(everywhere: everywhere)
+            do {
+                try await app.logoutEverywhere()
+            } catch {
+                errorText = app.report(error)
+            }
             busy = false
         }
     }

@@ -55,7 +55,7 @@ final class SessionModel: ObservableObject {
                 if Task.isCancelled || isTerminal(error) { return }
                 failures += 1
             }
-            if Task.isCancelled || gone { return }
+            if Task.isCancelled || gone || app?.api == nil { return }
             // Stream is down: keep the screen fresh by polling until the next reconnect attempt.
             let wait = failures == 0 ? 1.5 : min(30, pow(2, Double(failures)))
             let until = Date().addingTimeInterval(wait)
@@ -87,7 +87,7 @@ final class SessionModel: ObservableObject {
             if line.hasPrefix("event:") {
                 event = SessionModel.field(line, "event:")
             } else if line.hasPrefix("data:") {
-                if event == "gone" { gone = true; return }
+                if event == "gone" { await handleGone(SessionModel.field(line, "data:"), api); return }
                 if event.isEmpty || event == "screen" { apply(Data(SessionModel.field(line, "data:").utf8)) }
                 event = ""
             } else if line.isEmpty {
@@ -106,6 +106,26 @@ final class SessionModel: ObservableObject {
             if Task.isCancelled || isTerminal(error) { return false }
             link = .offline
             return true
+        }
+    }
+
+    /// `event: gone` data is {"reason":"auth"} (logged out: back to login) or {"reason":"session"}
+    /// (tmux session closed). Without a known reason, GET /api/me decides: 401 means logged out.
+    private func handleGone(_ data: String, _ api: API) async {
+        let obj = (try? JSONSerialization.jsonObject(with: Data(data.utf8))) as? [String: Any]
+        switch obj?["reason"] as? String {
+        case "auth":
+            errorText = app?.report(APIError(status: 401, code: "unauthorized"))
+        case "session":
+            gone = true
+        default:
+            do {
+                try await api.call("GET", "api/me")
+                gone = true
+            } catch {
+                // 401 goes to login; anything else: the reconnect/poll loop finds out (404 = closed).
+                _ = isTerminal(error)
+            }
         }
     }
 

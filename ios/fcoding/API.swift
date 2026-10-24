@@ -83,13 +83,13 @@ func vietnameseMessage(_ error: Error, login: Bool = false) -> String? {
         case 0:
             return e.code == "bad_url" ? "Địa chỉ máy chủ phải có dạng https://…" : "Máy chủ trả lời không hợp lệ."
         case 400: return e.code == "bad_key" ? "Phím không hợp lệ." : "Dữ liệu gửi đi không hợp lệ."
-        case 401: return login ? "Sai mật khẩu." : "Phiên đăng nhập đã hết hạn. Hãy đăng nhập lại."
+        case 401: return login ? "Sai mật khẩu." : "Máy chủ đã khởi động lại hoặc phiên hết hạn, đăng nhập lại."
         case 403: return "Máy chủ từ chối yêu cầu."
         case 404: return "Không tìm thấy (phiên có thể đã đóng)."
         case 409: return "Phiên này đã tồn tại."
         case 413: return "Nội dung quá dài."
         case 429: return "Thử lại sau \(e.retryAfter ?? 60) giây."
-        case 503: return e.code == "not_configured" ? "Máy chủ chưa đặt mật khẩu." : "Máy chủ đang bận, thử lại sau."
+        case 503: return e.code == "not_configured" ? "Máy chủ chưa đặt mật khẩu." : "Box đang bận, thử lại sau."
         case 500...: return "Máy chủ gặp lỗi (mã \(e.status))."
         default: return "Lỗi không rõ (mã \(e.status))."
         }

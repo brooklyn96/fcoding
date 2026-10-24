@@ -41,11 +41,16 @@ final class AppState: ObservableObject {
         token = newToken
     }
 
-    func logout(everywhere: Bool) async {
-        if let api = api {
-            let query = everywhere ? [URLQueryItem(name: "all", value: "1")] : []
-            _ = try? await api.call("POST", "api/logout", query: query)
-        }
+    /// "Đăng xuất trên máy này": forget the credentials on this phone only.
+    func logoutHere() {
+        signOutLocally(notice: nil)
+    }
+
+    /// "Đăng xuất mọi nơi": the server revokes every device first; local credentials are
+    /// cleared only after a 2xx. Any failure is thrown so the caller can show it and retry.
+    func logoutEverywhere() async throws {
+        guard let api = api else { return signOutLocally(notice: nil) }
+        try await api.call("POST", "api/logout", query: [URLQueryItem(name: "all", value: "1")])
         signOutLocally(notice: nil)
     }
 
