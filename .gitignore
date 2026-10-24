@@ -9,3 +9,5 @@ ios/*.xcodeproj/
 *.ipa
 .DS_Store
 node_modules/
+findings-*.md
+replan-*.md
