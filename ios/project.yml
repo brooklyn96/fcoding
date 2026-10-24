@@ -1,4 +1,4 @@
-name: BoxChat
+name: fcoding
 options:
   bundleIdPrefix: com.brooklyn96
   deploymentTarget:
@@ -12,28 +12,28 @@ settings:
     CODE_SIGN_IDENTITY: ""
     DEVELOPMENT_TEAM: ""
 targets:
-  BoxChat:
+  fcoding:
     type: application
     platform: iOS
     deploymentTarget: "16.0"
     sources:
-      - path: BoxChat
+      - path: fcoding
         excludes:
           - Info.plist
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.brooklyn96.boxchat
-        PRODUCT_NAME: BoxChat
+        PRODUCT_BUNDLE_IDENTIFIER: com.brooklyn96.fcoding
+        PRODUCT_NAME: fcoding
         TARGETED_DEVICE_FAMILY: "1"
         MARKETING_VERSION: "1.0"
         CURRENT_PROJECT_VERSION: "1"
         GENERATE_INFOPLIST_FILE: "NO"
         ENABLE_PREVIEWS: "NO"
     info:
-      path: BoxChat/Info.plist
+      path: fcoding/Info.plist
       properties:
-        CFBundleDisplayName: Box Chat
-        CFBundleName: BoxChat
+        CFBundleDisplayName: fcoding
+        CFBundleName: fcoding
         CFBundleExecutable: $(EXECUTABLE_NAME)
         CFBundleIdentifier: $(PRODUCT_BUNDLE_IDENTIFIER)
         CFBundlePackageType: APPL

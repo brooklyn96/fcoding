@@ -1,30 +1,30 @@
-# Box Chat cho iPhone
+# fcoding cho iPhone
 
-Ứng dụng Box Chat giúp bạn trò chuyện với các chương trình (omp, claude, codex, shell) đang chạy trên box, ngay trên iPhone. Gõ tiếng Việt (Telex) bình thường bằng bàn phím của iPhone.
+Ứng dụng fcoding giúp bạn trò chuyện với các chương trình (omp, claude, codex, shell) đang chạy trên box, ngay trên iPhone. Gõ tiếng Việt (Telex) bình thường bằng bàn phím của iPhone.
 
 Ứng dụng không có trên App Store. Bạn cài nó qua **LiveContainer**.
 
 ## 1. Tải file cài đặt
 
 1. Trên iPhone, mở **Safari**.
-2. Vào trang GitHub của dự án này, bấm **Releases**, chọn bản **"Box Chat (bản mới nhất)"** (nhãn `latest`).
-3. Bấm vào **BoxChat.ipa** để tải về. File sẽ nằm trong ứng dụng **Tệp** (Files), thư mục **Tải về** (Downloads).
+2. Vào trang GitHub của dự án này, bấm **Releases**, chọn bản **"fcoding (bản mới nhất)"** (nhãn `latest`).
+3. Bấm vào **fcoding.ipa** để tải về. File sẽ nằm trong ứng dụng **Tệp** (Files), thư mục **Tải về** (Downloads).
 
-Mỗi lần có thay đổi mới, GitHub tự dựng lại và thay file `BoxChat.ipa` ở cùng chỗ đó.
+Mỗi lần có thay đổi mới, GitHub tự dựng lại và thay file `fcoding.ipa` ở cùng chỗ đó.
 
 ## 2. Cài vào LiveContainer
 
 1. Mở **LiveContainer**.
 2. Ở thẻ **Ứng dụng** (Apps), bấm nút **+** ở góc trên.
-3. Chọn file **BoxChat.ipa** vừa tải (trong **Tải về**).
-4. Đợi vài giây, **Box Chat** sẽ hiện trong danh sách. Bấm vào để mở.
+3. Chọn file **fcoding.ipa** vừa tải (trong **Tải về**).
+4. Đợi vài giây, **fcoding** sẽ hiện trong danh sách. Bấm vào để mở.
 
-Cập nhật bản mới: tải lại `BoxChat.ipa` rồi làm lại bước 2. LiveContainer sẽ hỏi có thay bản cũ không, chọn đồng ý. Thông tin đăng nhập vẫn được giữ.
+Cập nhật bản mới: tải lại `fcoding.ipa` rồi làm lại bước 2. LiveContainer sẽ hỏi có thay bản cũ không, chọn đồng ý. Thông tin đăng nhập vẫn được giữ.
 
 ## 3. Đăng nhập lần đầu
 
 1. **Địa chỉ máy chủ**: địa chỉ công khai của box, bắt đầu bằng `https://` (người quản trị box đưa cho bạn).
-2. **Mật khẩu**: mật khẩu của Box Chat.
+2. **Mật khẩu**: mật khẩu của fcoding.
 3. Bấm **Đăng nhập**.
 
 ## 4. Cách dùng

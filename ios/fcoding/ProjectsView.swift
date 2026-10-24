@@ -26,7 +26,7 @@ struct ProjectsView: View {
                 projectSection
                 sessionSection
             }
-            .navigationTitle("Box Chat")
+            .navigationTitle("fcoding")
             .navigationDestination(for: String.self) { SessionView(name: $0) }
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {

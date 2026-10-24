@@ -3,7 +3,7 @@ import Security
 
 /// Minimal generic-password Keychain wrapper for the login token.
 enum Keychain {
-    private static let service = "com.brooklyn96.boxchat"
+    private static let service = "com.brooklyn96.fcoding"
 
     private static func base(_ account: String) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,

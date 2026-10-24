@@ -1,4 +1,4 @@
-name: iOS build (Box Chat)
+name: iOS build (fcoding)
 
 on:
   workflow_dispatch:
@@ -32,7 +32,7 @@ jobs:
       - name: Build (unsigned)
         working-directory: ios
         run: |
-          xcodebuild -project BoxChat.xcodeproj -scheme BoxChat \
+          xcodebuild -project fcoding.xcodeproj -scheme fcoding \
             -sdk iphoneos -destination 'generic/platform=iOS' \
             -configuration Release -derivedDataPath build \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
@@ -41,28 +41,28 @@ jobs:
       - name: Package IPA
         working-directory: ios
         run: |
-          APP=build/Build/Products/Release-iphoneos/BoxChat.app
+          APP=build/Build/Products/Release-iphoneos/fcoding.app
           test -d "$APP"
-          rm -rf Payload BoxChat.ipa
+          rm -rf Payload fcoding.ipa
           mkdir Payload
           cp -R "$APP" Payload/
-          zip -qry BoxChat.ipa Payload
-          ls -l BoxChat.ipa
+          zip -qry fcoding.ipa Payload
+          ls -l fcoding.ipa
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: BoxChat-ipa
-          path: ios/BoxChat.ipa
+          name: fcoding-ipa
+          path: ios/fcoding.ipa
           if-no-files-found: error
 
       - name: Publish pre-release "latest"
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          name: Box Chat (bản mới nhất)
-          body: "Bản dựng mới nhất của Box Chat cho iPhone. Tải BoxChat.ipa rồi cài bằng LiveContainer."
+          name: fcoding (bản mới nhất)
+          body: "Bản dựng mới nhất của fcoding cho iPhone. Tải fcoding.ipa rồi cài bằng LiveContainer."
           prerelease: true
           make_latest: false
-          files: ios/BoxChat.ipa
+          files: ios/fcoding.ipa
           overwrite_files: true

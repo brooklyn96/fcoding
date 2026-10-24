@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct BoxChatApp: App {
+struct FcodingApp: App {
     @StateObject private var app = AppState()
 
     var body: some Scene {
