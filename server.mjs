@@ -103,7 +103,7 @@ export function parseDevices(text) {
     || (d.secretTag !== undefined && !str(d.secretTag, /^[0-9a-f]{64}$/))) throw new Error('devices.json is invalid');
   return { secretTag: d.secretTag, devices: d.devices.map(({ id, name, keyHash, createdAt }) => ({ id, name, keyHash, createdAt })) };
 }
-const NAME_CTRL = /[\x00-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g; // C0, DEL, C1, bidi controls
+const NAME_CTRL = /[\x00-\x1f\x7f-\x9f\u061c\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/g; // C0, DEL, C1, bidi, zero-width, BOM
 const cleanName = (n) => (typeof n === 'string' ? n.replace(NAME_CTRL, '').trim().slice(0, 64) : '');
 
 // --- overview (A5): session state and a one-line preview from the visible pane ---
@@ -123,10 +123,10 @@ export function previewOf(text) {
   const lines = paneLines(text);
   return lines.length ? clip(lines.at(-1)) : null;
 }
-// the last of the last 6 non-empty lines that matches a prompt pattern (ANSI and controls removed), or null
+// the last of the last 6 non-empty lines that matches a prompt pattern, cleaned like a preview (so "│ ❯ 1. Yes │" counts), or null
 function promptLine(text) {
-  const last = text.split('\n').map((l) => l.replace(ANSI_RE, '').replace(NAME_CTRL, '')).filter((l) => l.trim()).slice(-6);
-  return last.findLast((l) => WAIT_PATTERNS.some((re) => re.test(l))) ?? null;
+  const last = text.split('\n').map((l) => l.replace(ANSI_RE, '').replace(NAME_CTRL, '')).filter((l) => l.trim()).slice(-6).map(cleanLine);
+  return last.findLast((l) => l && WAIT_PATTERNS.some((re) => re.test(l))) ?? null;
 }
 export function stateOf(text, activity, nowMs) {
   if (nowMs - activity * 1000 <= RUNNING_MS) return 'running';
@@ -463,23 +463,41 @@ export function createApp(opts = {}) {
   }
 
   // --- GET /api/overview: ONE read job holding one read slot; its tmux/git calls run one after another ---
-  const gitCache = new Map(); // dir -> {at, value}
+  const gitCache = new Map(); // dir -> {at, value} once done, {pending} while one overview runs git for it
   const gateStop = (e) => e instanceof HttpErr && (e.status === 401 || e.status === 499);
-  async function gitInfo(dir, ctx) {
-    const hit = gitCache.get(dir);
-    if (hit && now() - hit.at < GIT_CACHE_MS) return hit.value;
-    const git = async (...args) => {
-      try { return (await run(ctx, ['-C', dir, ...args], undefined, gitSpec)).trim(); } catch (e) { if (gateStop(e)) throw e; return null; }
+  async function gitRound(dir, ctx) {
+    const git = async (...args) => { // repo-local config cannot start an fsmonitor; no optional locks (env)
+      try { return (await run(ctx, ['-C', dir, '-c', 'core.fsmonitor=false', ...args], undefined, gitSpec)).trim(); } catch (e) { if (gateStop(e)) throw e; return null; }
     };
-    const branch = await git('rev-parse', '--abbrev-ref', 'HEAD');
+    const raw = await git('rev-parse', '--abbrev-ref', 'HEAD');
+    const branch = raw === null ? null : clip(cleanLine(raw)) || null;
     let value = { branch: null, ahead: null, diff: null };
     if (branch !== null) {
       const diff = await git('diff', '--shortstat', 'HEAD');
       const ahead = await git('rev-list', '--count', '@{upstream}..HEAD');
       value = { branch, ahead: ahead !== null && /^\d+$/.test(ahead) ? Number(ahead) : null, diff: diff === null ? null : parseShortstat(diff) };
     }
-    gitCache.set(dir, { at: now(), value });
+    if (!valid(ctx)) throw gateErr(ctx); // stopped while a git child ran: nothing of this round is cached
     return value;
+  }
+  async function gitInfo(dir, ctx) {
+    for (;;) {
+      const hit = gitCache.get(dir);
+      if (hit?.value && now() - hit.at < GIT_CACHE_MS) return hit.value;
+      if (hit?.pending) { // a concurrent cold overview already runs git here: share its result
+        try { return await hit.pending; } catch (e) { if (!gateStop(e)) throw e; continue; } // its owner was stopped: try again
+      }
+      const pending = gitRound(dir, ctx);
+      gitCache.set(dir, { pending });
+      try {
+        const value = await pending;
+        gitCache.set(dir, { at: now(), value });
+        return value;
+      } catch (e) {
+        if (gitCache.get(dir)?.pending === pending) gitCache.delete(dir);
+        throw e;
+      }
+    }
   }
   async function overview(ctx) {
     if (reads >= MAX_READS) throw new HttpErr(503, 'busy'); // reads never queue
