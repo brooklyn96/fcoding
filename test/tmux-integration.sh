@@ -140,6 +140,12 @@ start_server() {
 }
 start_server
 check "GET / body" "$(curl -s "$BASE/")" "fcoding ok"
+# ---- single instance (A4 update r3): a second server on the same config dir exits 1 and leaves admin.sock alone ----
+SOCK_ID=$(stat -c '%i %Y' "$PC_CONFIG_DIR/admin.sock")
+HOME="$RUN/home" PC_PORT=$((PORT + 2)) timeout 10 node "$ROOT/server.mjs" >"$RUN/twin.out" 2>&1; check "second instance on the same config -> exit 1" "$?" 1
+grep -q "Một máy chủ FCode khác đang dùng thư mục cấu hình này" "$RUN/twin.out" && ok "second instance says why" || bad "second instance message" "$(cat "$RUN/twin.out")"
+check "second instance left admin.sock alone" "$(stat -c '%i %Y' "$PC_CONFIG_DIR/admin.sock")" "$SOCK_ID"
+kill -0 "$SERVER_PID" 2>/dev/null && ok "first instance still running" || bad "first instance died"
 check "config dir mode repaired to 700" "$(stat -c %a "$PC_CONFIG_DIR")" "700"
 check "config.json mode repaired to 600" "$(stat -c %a "$PC_CONFIG_DIR/config.json")" "600"
 

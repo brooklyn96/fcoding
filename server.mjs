@@ -146,6 +146,21 @@ export function parseShortstat(out) {
 export const adminPath = (configDir) => (process.platform === 'win32'
   ? `\\\\.\\pipe\\fcoding-${crypto.createHash('sha256').update(path.resolve(configDir)).digest('hex').slice(0, 16)}`
   : path.join(configDir, 'admin.sock'));
+// --- single instance (A4 update r3): a lock held for the life of the process, taken before anything else ---
+// Linux: an abstract unix socket (no file; the kernel frees the name when the process dies). Windows (tests): a named pipe.
+export function lockName(configDir) {
+  let real;
+  try { real = fs.realpathSync(configDir); } catch { real = path.resolve(configDir); }
+  const h = crypto.createHash('sha256').update(real).digest('hex').slice(0, 32);
+  return process.platform === 'win32' ? `\\\\.\\pipe\\fcoding-lock-${h}` : `${String.fromCharCode(0)}fcoding-lock-${h}`;
+}
+export function acquireInstanceLock(configDir) {
+  return new Promise((resolve, reject) => {
+    const lock = net.createServer((s) => s.destroy()); // only holds the name; nobody needs to connect
+    lock.once('error', (e) => reject(e.code === 'EADDRINUSE' ? new Error('Một máy chủ FCode khác đang dùng thư mục cấu hình này') : e));
+    lock.listen(lockName(configDir), () => resolve(lock));
+  });
+}
 // one JSON request line -> one JSON response line. Rejects with code ENOSERVER when no server listens.
 export function adminRequest(configDir, req, timeoutMs = 5000) {
   return new Promise((resolve, reject) => {
@@ -318,16 +333,8 @@ export function createApp(opts = {}) {
     if (process.platform !== 'win32') {
       let st = null;
       try { st = fs.lstatSync(adminFile); } catch {}
-      if (st) {
+      if (st) { // only the instance-lock holder gets here (main): an old socket is always ours to replace
         if (!st.isSocket()) throw new Error(`unsafe admin socket path (not a socket): ${adminFile}`);
-        // stale only when nobody listens (ENOENT / ECONNREFUSED); a connect, a timeout or any other error: maybe another server
-        const stale = await new Promise((resolve) => {
-          const sock = net.connect(adminFile);
-          const t = setTimeout(() => { sock.destroy(); resolve(false); }, 1000);
-          sock.on('connect', () => { clearTimeout(t); sock.destroy(); resolve(false); });
-          sock.on('error', (e) => { clearTimeout(t); resolve(e.code === 'ENOENT' || e.code === 'ECONNREFUSED'); });
-        });
-        if (!stale) throw new Error('admin.sock đang được một máy chủ khác dùng');
         fs.unlinkSync(adminFile);
       }
     }
@@ -821,8 +828,10 @@ async function main() {
   };
   process.on('unhandledRejection', fatal('unhandledRejection'));
   process.on('uncaughtException', fatal('uncaughtException'));
+  const lock = await acquireInstanceLock(dir); // before config, devices or admin.sock are touched
   const app = createApp({ configDir: dir });
   const port = await app.listen();
+  void lock; // held until the process exits
   console.log(`fcoding listening on 0.0.0.0:${port}`);
 }
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

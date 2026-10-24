@@ -4,11 +4,11 @@ import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync, execFile } from 'node:child_process';
+import { spawnSync, execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
-import { createApp, writePrivate, trimScreen, adminRequest, adminPath, KEYS, stateOf, previewOf, summarize, WAIT_PATTERNS, parseShortstat } from '../server.mjs';
+import { createApp, writePrivate, trimScreen, adminRequest, adminPath, KEYS, stateOf, previewOf, summarize, WAIT_PATTERNS, parseShortstat, acquireInstanceLock } from '../server.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const FAKE = path.join(here, 'fake-tmux.mjs');
@@ -1028,7 +1028,7 @@ test('pairing: the code is compared with crypto.timingSafeEqual', () => withApp(
   assert.deepEqual(seen, [[6, 6], [6, 6]]);
 }));
 
-test('admin.sock: mode 600, a stale socket is removed, a live one or a non-socket is refused', async (t) => {
+test('admin.sock: mode 600, a stale socket is replaced, a non-socket is refused', async (t) => {
   if (process.platform === 'win32') return t.skip('unix sockets');
   const c = await boot();
   try {
@@ -1036,8 +1036,6 @@ test('admin.sock: mode 600, a stale socket is removed, a live one or a non-socke
     const st = fs.statSync(sock);
     assert.ok(st.isSocket());
     assert.equal(st.mode & 0o777, 0o600);
-    const twin = createApp({ configDir: c.configDir, tmux: [process.execPath, FAKE], log: () => {} });
-    await assert.rejects(twin.listen(0, '127.0.0.1'), /admin\.sock đang được một máy chủ khác dùng/);
     await c.app.close();
     assert.ok(!fs.existsSync(sock));
     // a server that died hard leaves its socket behind
@@ -1350,24 +1348,6 @@ test('device names lose C0, C1 and bidi control characters', () => withApp(async
 }));
 
 // ======================= A4 update r2 =======================
-test('admin.sock: a listener that accepts but never answers -> a second server exits 1, the socket is left alone', async (t) => {
-  if (process.platform === 'win32') return t.skip('unix sockets');
-  const c = await boot();
-  const stall = net.createServer(() => {}); // accepts, never answers
-  try {
-    await c.app.close();
-    const sock = adminPath(c.configDir);
-    await new Promise((resolve) => stall.listen(sock, resolve));
-    const ino = fs.statSync(sock).ino;
-    const r = await new Promise((resolve) => execFile(process.execPath, [SERVER], { env: { ...process.env, PC_CONFIG_DIR: c.configDir, PC_PORT: '0' }, encoding: 'utf8', timeout: 15000 },
-      (err, stdout, stderr) => resolve({ status: err ? err.code : 0, stderr })));
-    assert.equal(r.status, 1);
-    assert.match(r.stderr, /admin\.sock đang được một máy chủ khác dùng/);
-    assert.equal(fs.statSync(sock).ino, ino); // not unlinked
-    assert.ok(await new Promise((resolve) => { const s = net.connect(sock, () => { s.destroy(); resolve(true); }); s.on('error', () => resolve(false)); }));
-  } finally { await new Promise((r) => stall.close(r)); await c.app.close().catch(() => {}); fs.rmSync(c.root, { recursive: true, force: true }); }
-});
-
 test('purge retry is throttled: at most one write per second from requests; admin requests and config changes always retry', async () => {
   let t = 1_700_000_000_000;
   const w = failingWrites();
@@ -1647,4 +1627,91 @@ test('overview git: every call is execFile git -C <dir> with GIT_OPTIONAL_LOCKS=
       assert.equal(calls().length, 2); // refreshed after 10 s
     }, { now: () => t, git: [process.execPath, fakeGit] });
   } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
+
+// ======================= A4 update r3: single instance =======================
+const LOCK_MSG = /Một máy chủ FCode khác đang dùng thư mục cấu hình này/;
+const freePort = () => new Promise((resolve) => { const s = net.createServer().listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)); }); });
+// the real server as a child: resolves {listening, child} once it serves, or {code, err} when it exits first
+async function startServer(configDir) {
+  const port = await freePort();
+  const child = spawn(process.execPath, [SERVER], { env: { ...process.env, PC_CONFIG_DIR: configDir, PC_PORT: String(port) }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let out = '', err = '';
+  return new Promise((resolve) => {
+    child.stdout.on('data', (d) => { out += d; if (out.includes('fcoding listening')) resolve({ listening: true, child, port }); });
+    child.stderr.on('data', (d) => { err += d; });
+    child.on('exit', (code, signal) => resolve({ listening: false, code, signal, err, child }));
+  });
+}
+const stop = (r) => new Promise((resolve) => { if (r.child.exitCode !== null || r.child.signalCode) return resolve(); r.child.once('exit', () => resolve()); r.child.kill('SIGTERM'); });
+const fileId = (f) => { const st = fs.lstatSync(f); return `${st.ino}:${st.mtimeMs}`; };
+const freshDir = async () => { const c = await boot(); await c.login({}, 'phone'); await c.app.close(); return c; }; // config + devices.json, no server
+
+test('instance lock: in-process, a second lock on the same config dir is refused; another dir is fine; free after close', async () => {
+  const a = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-lock-')); const b = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-lock-'));
+  try {
+    const l1 = await acquireInstanceLock(a);
+    await assert.rejects(acquireInstanceLock(a), LOCK_MSG);
+    await assert.rejects(acquireInstanceLock(path.join(a, '.', '')), LOCK_MSG); // same real path
+    const l2 = await acquireInstanceLock(b);
+    await new Promise((r) => l1.close(r));
+    const l3 = await acquireInstanceLock(a);
+    await Promise.all([l2, l3].map((l) => new Promise((r) => l.close(r))));
+  } finally { for (const d of [a, b]) fs.rmSync(d, { recursive: true, force: true }); }
+});
+
+test('instance lock: a second server on the same config dir (sequential and concurrent) exits 1 and touches nothing', async (t) => {
+  if (process.platform === 'win32') return t.skip('spawns listening servers: box only');
+  const c = await freshDir();
+  const sock = adminPath(c.configDir); const dev = path.join(c.configDir, 'devices.json');
+  const running = [];
+  try {
+    const a = await startServer(c.configDir); running.push(a);
+    assert.ok(a.listening, a.err);
+    const before = [fileId(sock), fileId(dev)];
+    const b = await startServer(c.configDir); running.push(b);
+    assert.deepEqual([b.listening, b.code], [false, 1]);
+    assert.match(b.err, LOCK_MSG);
+    assert.deepEqual([fileId(sock), fileId(dev)], before);
+    assert.equal((await adminRequest(c.configDir, { cmd: 'devices' })).devices.length, 1); // the first one still answers
+    await stop(a);
+    const pair = await Promise.all([startServer(c.configDir), startServer(c.configDir)]); running.push(...pair);
+    const ok = pair.filter((r) => r.listening); const refused = pair.filter((r) => !r.listening);
+    assert.equal(ok.length, 1, pair.map((r) => r.err).join(' | '));
+    assert.deepEqual([refused[0].code, LOCK_MSG.test(refused[0].err)], [1, true]);
+    const id = fileId(sock);
+    await sleep(200);
+    assert.equal(fileId(sock), id); // the loser never unlinked the winner's socket
+    assert.equal((await adminRequest(c.configDir, { cmd: 'devices' })).devices.length, 1);
+  } finally { await Promise.all(running.map(stop)); fs.rmSync(c.root, { recursive: true, force: true }); }
+});
+
+test('instance lock: after SIGKILL a new start succeeds at once and replaces the stale admin.sock', async (t) => {
+  if (process.platform === 'win32') return t.skip('spawns listening servers: box only');
+  const c = await freshDir();
+  const sock = adminPath(c.configDir);
+  const running = [];
+  try {
+    const a = await startServer(c.configDir); running.push(a);
+    assert.ok(a.listening, a.err);
+    const ino = fs.lstatSync(sock).ino;
+    await new Promise((r) => { a.child.once('exit', r); a.child.kill('SIGKILL'); });
+    assert.ok(fs.lstatSync(sock).isSocket()); // left behind by the crash
+    const b = await startServer(c.configDir); running.push(b);
+    assert.ok(b.listening, b.err);
+    assert.notEqual(fs.lstatSync(sock).ino, ino);
+    assert.equal(fs.statSync(sock).mode & 0o777, 0o600);
+    assert.equal((await adminRequest(c.configDir, { cmd: 'pair' })).ok, true);
+  } finally { await Promise.all(running.map(stop)); fs.rmSync(c.root, { recursive: true, force: true }); }
+});
+
+test('instance lock: different config dirs run side by side', async (t) => {
+  if (process.platform === 'win32') return t.skip('spawns listening servers: box only');
+  const c1 = await freshDir(); const c2 = await freshDir();
+  const running = [];
+  try {
+    const rs = await Promise.all([startServer(c1.configDir), startServer(c2.configDir)]); running.push(...rs);
+    assert.ok(rs.every((r) => r.listening), rs.map((r) => r.err).join(' | '));
+    for (const c of [c1, c2]) assert.equal((await adminRequest(c.configDir, { cmd: 'devices' })).ok, true);
+  } finally { await Promise.all(running.map(stop)); for (const c of [c1, c2]) fs.rmSync(c.root, { recursive: true, force: true }); }
 });

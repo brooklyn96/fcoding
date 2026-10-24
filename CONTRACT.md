@@ -108,6 +108,10 @@ UI requirements (frontend): Vietnamese labels; login screen; session list (creat
 - install.sh quotes the paths in the fcode-pair wrapper and removes an obsolete passwordHash from config.json atomically (tmp, fsync, rename, mode 600; other fields kept).
 - Accepted: anyone on the internet can use up the global 30/h pairing limit; the owner then waits up to 1 h.
 
+### A4 update r3 (2026-10-25, review round 3: single instance; replaces every admin.sock probe)
+- Instance lock first: before it loads config, devices or anything else, the server binds a Linux abstract-namespace unix socket used only as a lock, named NUL + "fcoding-lock-" + sha256(realpath(configDir)) hex, first 32 characters. EADDRINUSE means another live server owns this config dir: exit 1 with "Một máy chủ FCode khác đang dùng thư mục cấu hình này", touching nothing. The kernel frees the name when the process dies, so there is no stale lock. Nobody connects to it. Windows (local tests only): a named pipe with the same derived name.
+- admin.sock: only the lock holder gets there. It unlinks any existing admin.sock and binds a new one (mode 600). There is no connect probe. A path that exists and is not a socket still refuses the start.
+
 ## Amendment A5 (2026-10-25, user decision): project list = attention-first inbox + harness dock
 - New read endpoint GET /api/overview (auth like other reads; it goes through the read gate as ONE read job; internal tmux/git calls run sequentially inside that job, each with the existing exec timeout). Response:
   `{ now, projects: [{ name, branch, ahead, diff: {files, add, del} | null }], sessions: [{ name, project, harness, created, activity, attached, state, preview }] }`
