@@ -1,0 +1,11 @@
+# internal working notes (briefs, reviews) stay local
+brief-*.md
+review-*.md
+rework-*.md
+astra-*.md
+# build output
+ios/build/
+ios/*.xcodeproj/
+*.ipa
+.DS_Store
+node_modules/

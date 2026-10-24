@@ -1,0 +1,68 @@
+name: iOS build (Box Chat)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "ios/**"
+      - ".github/workflows/ios.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Build (unsigned)
+        working-directory: ios
+        run: |
+          xcodebuild -project BoxChat.xcodeproj -scheme BoxChat \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            -configuration Release -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package IPA
+        working-directory: ios
+        run: |
+          APP=build/Build/Products/Release-iphoneos/BoxChat.app
+          test -d "$APP"
+          rm -rf Payload BoxChat.ipa
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry BoxChat.ipa Payload
+          ls -l BoxChat.ipa
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BoxChat-ipa
+          path: ios/BoxChat.ipa
+          if-no-files-found: error
+
+      - name: Publish pre-release "latest"
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Box Chat (bản mới nhất)
+          body: "Bản dựng mới nhất của Box Chat cho iPhone. Tải BoxChat.ipa rồi cài bằng LiveContainer."
+          prerelease: true
+          make_latest: false
+          files: ios/BoxChat.ipa
+          overwrite_files: true

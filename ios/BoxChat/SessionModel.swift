@@ -1,0 +1,184 @@
+import Foundation
+import UIKit
+
+/// Live screen of one tmux session: SSE stream with reconnect + backoff,
+/// polling GET /api/screen every 1.5 s while the stream is down.
+@MainActor
+final class SessionModel: ObservableObject {
+    enum Link { case connecting, live, polling, offline }
+
+    static let hPad: CGFloat = 6
+    static let vPad: CGFloat = 4
+
+    @Published private(set) var text = ""
+    @Published private(set) var link: Link = .connecting
+    @Published private(set) var gone = false
+    @Published var errorText: String?
+
+    let name: String
+    private weak var app: AppState?
+    private var loop: Task<Void, Never>?
+    private var resizeTask: Task<Void, Never>?
+    private var lastHash: String?
+    private var sentCols = 0
+    private var sentRows = 0
+
+    init(name: String) { self.name = name }
+
+    func start(app: AppState) {
+        self.app = app
+        guard loop == nil, !gone else { return }
+        loop = Task { [weak self] in await self?.run() }
+    }
+
+    func stop() {
+        loop?.cancel()
+        loop = nil
+    }
+
+    func restart() {
+        guard let app = app else { return }
+        stop()
+        start(app: app)
+    }
+
+    // MARK: - Screen updates
+
+    private func run() async {
+        var failures = 0
+        while !Task.isCancelled && !gone {
+            guard let api = app?.api else { return }
+            do {
+                try await readStream(api)
+                failures = 0
+            } catch {
+                if Task.isCancelled || isTerminal(error) { return }
+                failures += 1
+            }
+            if Task.isCancelled || gone { return }
+            // Stream is down: keep the screen fresh by polling until the next reconnect attempt.
+            let wait = failures == 0 ? 1.5 : min(30, pow(2, Double(failures)))
+            let until = Date().addingTimeInterval(wait)
+            repeat {
+                guard await pollOnce(api) else { return }
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+            } while Date() < until && !Task.isCancelled && !gone
+        }
+    }
+
+    private func readStream(_ api: API) async throws {
+        link = .connecting
+        var req = try api.request("GET", "api/stream/\(name)", timeout: 45)
+        req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        let (bytes, resp) = try await URLSession.shared.bytes(for: req)
+        if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
+            var body = Data()
+            for try await byte in bytes {
+                body.append(byte)
+                if body.count > 8192 { break }
+            }
+            try API.check(resp, body)
+            throw APIError(status: http.statusCode, code: "")
+        }
+        link = .live
+        // AsyncLineSequence may skip blank lines, so an event is dispatched on its "data:" line.
+        var event = ""
+        for try await line in bytes.lines {
+            if line.hasPrefix("event:") {
+                event = SessionModel.field(line, "event:")
+            } else if line.hasPrefix("data:") {
+                if event == "gone" { gone = true; return }
+                if event.isEmpty || event == "screen" { apply(Data(SessionModel.field(line, "data:").utf8)) }
+                event = ""
+            } else if line.isEmpty {
+                event = ""
+            }
+        }
+    }
+
+    /// Returns false when the loop must stop (session gone or logged out).
+    private func pollOnce(_ api: API) async -> Bool {
+        do {
+            apply(try await api.call("GET", "api/screen/\(name)"))
+            link = .polling
+            return true
+        } catch {
+            if Task.isCancelled || isTerminal(error) { return false }
+            link = .offline
+            return true
+        }
+    }
+
+    private func apply(_ data: Data) {
+        guard let screen = try? JSONDecoder().decode(Screen.self, from: data) else { return }
+        if screen.hash == nil || screen.hash != lastHash {
+            lastHash = screen.hash
+            if text != screen.text { text = screen.text }
+        }
+    }
+
+    private static func field(_ line: String, _ prefix: String) -> String {
+        var value = line.dropFirst(prefix.count)
+        if value.first == " " { value = value.dropFirst() }
+        return String(value)
+    }
+
+    /// 404 = session gone, 401 = back to login; both end the loop.
+    private func isTerminal(_ error: Error) -> Bool {
+        guard let e = error as? APIError else { return false }
+        if e.status == 404 { gone = true; return true }
+        if e.status == 401 { errorText = app?.report(error); return true }
+        return false
+    }
+
+    private func fail(_ error: Error) {
+        if let e = error as? APIError, e.status == 404 { gone = true; return }
+        errorText = app?.report(error)
+    }
+
+    // MARK: - Input
+
+    func send(_ text: String, enter: Bool) async -> Bool {
+        guard let api = app?.api else { return false }
+        do {
+            try await api.call("POST", "api/send/\(name)", body: ["text": text, "enter": enter])
+            errorText = nil
+            return true
+        } catch {
+            fail(error)
+            return false
+        }
+    }
+
+    func key(_ key: String) async {
+        guard let api = app?.api else { return }
+        do {
+            try await api.call("POST", "api/key/\(name)", body: ["key": key])
+            errorText = nil
+        } catch {
+            fail(error)
+        }
+    }
+
+    /// Tells tmux how many columns/rows fit in `size` at this font size (debounced, skipped if unchanged).
+    func resize(to size: CGSize, fontSize: Double) {
+        let font = UIFont.monospacedSystemFont(ofSize: CGFloat(fontSize), weight: .regular)
+        let charWidth = ("M" as NSString).size(withAttributes: [.font: font]).width
+        guard charWidth > 0, font.lineHeight > 0, size.width > 0, size.height > 0 else { return }
+        let cols = min(300, max(20, Int((size.width - 2 * SessionModel.hPad) / charWidth)))
+        let rows = min(200, max(10, Int((size.height - 2 * SessionModel.vPad) / font.lineHeight)))
+        guard cols != sentCols || rows != sentRows else { return }
+        resizeTask?.cancel()
+        resizeTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard let self = self, !Task.isCancelled, let api = self.app?.api else { return }
+            do {
+                try await api.call("POST", "api/resize/\(self.name)", body: ["cols": cols, "rows": rows])
+                self.sentCols = cols
+                self.sentRows = rows
+            } catch {
+                if !Task.isCancelled { self.fail(error) }
+            }
+        }
+    }
+}
