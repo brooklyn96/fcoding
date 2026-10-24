@@ -4,29 +4,26 @@ import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
-import { createApp, hashPassword, writePrivate, trimScreen, KEYS } from '../server.mjs';
+import { createApp, writePrivate, trimScreen, adminRequest, adminPath, KEYS } from '../server.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const FAKE = path.join(here, 'fake-tmux.mjs');
 const SERVER = path.join(here, '..', 'server.mjs');
-const PW = 'correct horse battery';
 const VN = 'Xin chào, tiếng Việt có dấu: ắ ẫ ợ ữ';
 const ABS = path.resolve(os.tmpdir());
-const PW_HASH = hashPassword(PW); // N = 2^14, the smallest the server accepts
 const HOME = os.homedir();
 const LAUNCH = `env LANG=C.UTF-8 LC_ALL=C.UTF-8 'PATH=${HOME}/.local/bin:${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin' `;
-const MONTH = 30 * 24 * 3600 * 1000;
 
 async function boot(opts = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-test-'));
   const fakeDir = path.join(root, 'fake'); fs.mkdirSync(fakeDir);
   const configDir = path.join(root, 'cfg'); fs.mkdirSync(configDir);
   fs.writeFileSync(path.join(configDir, 'config.json'), JSON.stringify({
-    passwordHash: PW_HASH, cookieSecret: Buffer.alloc(32, 7).toString('base64'),
+    cookieSecret: Buffer.alloc(32, 7).toString('base64'),
     projects: { alpha: ABS, 'my.proj': ABS }, port: 7681,
   }));
   process.env.FAKE_TMUX_DIR = fakeDir;
@@ -35,11 +32,14 @@ async function boot(opts = {}) {
   const port = await app.listen(0, '127.0.0.1');
   const ctx = { app, port, logs, root, configDir };
   ctx.req = (method, p, o = {}) => request(port, method, p, o);
-  ctx.login = async (headers = {}) => {
-    const r = await ctx.req('POST', '/api/login', { body: { password: PW }, headers });
-    assert.equal(r.status, 200);
-    return { cookie: r.headers['set-cookie'][0].split(';')[0], json: r.json };
+  // pair a device the way the app does: --pair over admin.sock, then POST /api/pair
+  ctx.login = async (headers = {}, name = 'test') => {
+    const p = await adminRequest(configDir, { cmd: 'pair', name });
+    const r = await ctx.req('POST', '/api/pair', { body: { code: p.code }, headers });
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    return { cookie: r.headers['set-cookie'][0].split(';')[0], json: r.json, token: r.json.token };
   };
+  ctx.deviceId = async (name) => (await adminRequest(configDir, { cmd: 'devices' })).devices.find((d) => d.name === name).id;
   ctx.calls = () => {
     try { return fs.readFileSync(path.join(fakeDir, 'log.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; }
   };
@@ -93,7 +93,7 @@ test('every protected route needs a session', () => withApp(async (c) => {
   const routes = [
     ['GET', '/api/me'], ['GET', '/api/meta'], ['GET', '/api/sessions'], ['GET', '/api/screen/work'], ['GET', '/api/stream/work'],
     ['POST', '/api/sessions'], ['POST', '/api/open'], ['POST', '/api/send/work'], ['POST', '/api/key/work'], ['POST', '/api/resize/work'],
-    ['POST', '/api/logout'], ['DELETE', '/api/sessions/work'], ['GET', '/api/nothing'], ['GET', '/other'],
+    ['POST', '/api/logout'], ['DELETE', '/api/sessions/work'], ['GET', '/api/nothing'], ['GET', '/other'], ['POST', '/api/login'],
   ];
   for (const [m, p] of routes) {
     const r = await c.req(m, p, { body: m === 'POST' ? {} : undefined });
@@ -102,68 +102,6 @@ test('every protected route needs a session', () => withApp(async (c) => {
   assert.equal((await c.req('GET', '/api/me', { cookie: 'pc_sid=forged' })).status, 401);
   assert.equal((await c.req('GET', '/api/me', { headers: { Authorization: 'Bearer forged' } })).status, 401);
   assert.equal(c.calls().length, 0); // nothing reached tmux
-}));
-
-test('login: bad password, ok, cookie flags', () => withApp(async (c) => {
-  const bad = await c.req('POST', '/api/login', { body: { password: 'nope' } });
-  assert.equal(bad.status, 401);
-  assert.deepEqual(bad.json, { error: 'bad_password' });
-  assert.equal((await c.req('POST', '/api/login', { body: { password: 5 } })).status, 400);
-  assert.equal((await c.req('POST', '/api/login', { body: {} })).status, 400);
-  const ok = await c.req('POST', '/api/login', { body: { password: PW } });
-  assert.equal(ok.status, 200);
-  assert.deepEqual(ok.json, { ok: true }); // no token without X-PC-Client: ios
-  const sc = ok.headers['set-cookie'][0];
-  assert.match(sc, /^pc_sid=[A-Za-z0-9_-]{43}; /);
-  for (const f of ['HttpOnly', 'Secure', 'SameSite=Strict', 'Path=/', 'Max-Age=2592000']) assert.ok(sc.includes(f), f);
-  const cookie = sc.split(';')[0];
-  assert.equal((await c.req('GET', '/api/me', { cookie })).status, 200);
-  const meta = await c.req('GET', '/api/meta', { cookie });
-  assert.deepEqual(meta.json.projects.sort(), ['alpha', 'my.proj']);
-  assert.deepEqual(meta.json.keys, KEYS);
-  assert.deepEqual(meta.json.harnesses, ['omp', 'claude', 'codex', 'shell']);
-}));
-
-test('ios client gets a Bearer token that works like the cookie', () => withApp(async (c) => {
-  const { cookie, json } = await c.login({ 'X-PC-Client': 'ios' });
-  assert.match(json.token, /^[A-Za-z0-9_-]{43}$/);
-  assert.equal(cookie, `pc_sid=${json.token}`);
-  const auth = { Authorization: `Bearer ${json.token}` };
-  assert.equal((await c.req('GET', '/api/me', { headers: auth })).status, 200);
-  const r = await c.req('POST', '/api/sessions', { headers: auth, body: { name: 'viabearer', project: 'alpha', harness: 'shell' } });
-  assert.equal(r.status, 201);
-  // revocation applies to both
-  assert.equal((await c.req('POST', '/api/logout', { headers: auth })).status, 200);
-  assert.equal((await c.req('GET', '/api/me', { headers: auth })).status, 401);
-  assert.equal((await c.req('GET', '/api/me', { cookie })).status, 401);
-  assert.ok(!c.logs.join('\n').includes(json.token));
-}));
-
-test('login rate limit per IP with Retry-After', () => withApp(async (c) => {
-  const xf = { 'X-Forwarded-For': '9.9.9.9, 10.0.0.1' };
-  for (let i = 0; i < 5; i++) assert.equal((await c.req('POST', '/api/login', { body: { password: 'x' + i }, headers: xf })).status, 401);
-  const r = await c.req('POST', '/api/login', { body: { password: PW }, headers: xf }); // even the right password
-  assert.equal(r.status, 429);
-  assert.equal(r.json.error, 'rate_limited');
-  assert.ok(r.json.retryAfter > 0 && r.json.retryAfter <= 900);
-  assert.equal(r.headers['retry-after'], String(r.json.retryAfter));
-  const other = await c.req('POST', '/api/login', { body: { password: PW }, headers: { 'X-Forwarded-For': '8.8.8.8' } });
-  assert.equal(other.status, 200);
-}));
-
-test('successful logins are not counted against the limit', () => withApp(async (c) => {
-  const xf = { 'X-Forwarded-For': '7.7.7.7' };
-  for (let i = 0; i < 4; i++) await c.req('POST', '/api/login', { body: { password: 'x' }, headers: xf });
-  for (let i = 0; i < 3; i++) assert.equal((await c.req('POST', '/api/login', { body: { password: PW }, headers: xf })).status, 200);
-}));
-
-test('global login limit 30/hour', () => withApp(async (c) => {
-  for (let ip = 1; ip <= 6; ip++) {
-    for (let i = 0; i < 5; i++) await c.req('POST', '/api/login', { body: { password: 'x' }, headers: { 'X-Forwarded-For': `1.1.1.${ip}` } });
-  }
-  const r = await c.req('POST', '/api/login', { body: { password: PW }, headers: { 'X-Forwarded-For': '2.2.2.2' } });
-  assert.equal(r.status, 429);
-  assert.ok(Number(r.headers['retry-after']) > 0 && Number(r.headers['retry-after']) <= 3600);
 }));
 
 test('logout and logout-all revoke', () => withApp(async (c) => {
@@ -179,16 +117,16 @@ test('logout and logout-all revoke', () => withApp(async (c) => {
   assert.equal((await c.req('GET', '/api/me', { cookie: d.cookie })).status, 401);
 }));
 
-test('restart logs everyone out: sessions live in memory only, nothing is written', async () => {
+test('paired devices survive a restart; only a keyed hash is stored', async () => {
   const c = await boot();
-  const { cookie, json } = await c.login({ 'X-PC-Client': 'ios' });
+  const { cookie, token } = await c.login({}, 'my phone');
   await c.app.close();
-  assert.deepEqual(fs.readdirSync(c.configDir), ['config.json']); // no sessions.json
+  const stored = fs.readFileSync(path.join(c.configDir, 'devices.json'), 'utf8');
+  assert.ok(!stored.includes(token));
   const app2 = createApp({ configDir: c.configDir, tmux: [process.execPath, FAKE], log: () => {} });
   const port = await app2.listen(0, '127.0.0.1');
-  assert.equal((await request(port, 'GET', '/api/me', { cookie })).status, 401);
-  assert.equal((await request(port, 'GET', '/api/me', { headers: { Authorization: `Bearer ${json.token}` } })).status, 401);
-  assert.equal((await request(port, 'POST', '/api/login', { body: { password: PW } })).status, 200);
+  assert.equal((await request(port, 'GET', '/api/me', { cookie })).status, 200);
+  assert.equal((await request(port, 'GET', '/api/me', { headers: { Authorization: `Bearer ${token}` } })).status, 200);
   await app2.close();
   fs.rmSync(c.root, { recursive: true, force: true });
 });
@@ -198,7 +136,7 @@ test('CSRF: X-PC header and Origin', () => withApp(async (c) => {
   const body = { name: 'csrf', project: 'alpha', harness: 'shell' };
   assert.equal((await c.req('POST', '/api/sessions', { cookie, body, pc: false })).status, 403);
   assert.equal((await c.req('POST', '/api/sessions', { cookie, body, headers: { 'X-PC': '0' } })).status, 403);
-  assert.equal((await c.req('POST', '/api/login', { body: { password: PW }, pc: false })).status, 403);
+  assert.equal((await c.req('POST', '/api/pair', { body: { code: '123456' }, pc: false })).status, 403);
   assert.equal((await c.req('DELETE', '/api/sessions/csrf', { cookie, pc: false })).status, 403);
   assert.equal((await c.req('POST', '/api/logout', { cookie, pc: false })).status, 403);
   const own = `https://127.0.0.1:${c.port}`;
@@ -210,7 +148,7 @@ test('CSRF: X-PC header and Origin', () => withApp(async (c) => {
   const fwd = { 'X-Forwarded-Host': 'box.example.com' };
   assert.equal((await c.req('POST', '/api/sessions', { cookie, body: { ...body, name: 'csrf2' }, headers: { ...fwd, Origin: 'https://box.example.com' } })).status, 201);
   assert.equal((await c.req('POST', '/api/sessions', { cookie, body: { ...body, name: 'csrf3' }, headers: { ...fwd, Origin: own } })).status, 403);
-  assert.equal((await c.req('POST', '/api/login', { body: { password: PW }, headers: { Origin: 'https://evil.example' } })).status, 403);
+  assert.equal((await c.req('POST', '/api/pair', { body: { code: '123456' }, headers: { Origin: 'https://evil.example' } })).status, 403);
   assert.equal((await c.req('GET', '/api/me', { cookie, pc: false })).status, 200); // GET needs no header
 }));
 
@@ -354,7 +292,7 @@ test('size limits: body 64 KB, text 32 KB', () => withApp(async (c) => {
   await mkSession(c, cookie);
   const big = await c.req('POST', '/api/send/work', { cookie, raw: JSON.stringify({ text: 'x'.repeat(70 * 1024) }), headers: JSON_CT });
   assert.equal(big.status, 413);
-  const huge = await c.req('POST', '/api/login', { raw: JSON.stringify({ password: 'x'.repeat(65 * 1024) }), headers: JSON_CT });
+  const huge = await c.req('POST', '/api/pair', { raw: JSON.stringify({ code: 'x'.repeat(65 * 1024) }), headers: JSON_CT });
   assert.equal(huge.status, 413);
   assert.equal((await c.req('POST', '/api/send/work', { cookie, body: { text: 'a'.repeat(32 * 1024 + 1) } })).status, 413);
   assert.equal((await c.req('POST', '/api/send/work', { cookie, body: { text: 'ắ'.repeat(11000) } })).status, 413); // 33000 bytes
@@ -366,7 +304,7 @@ test('security headers on every response', () => withApp(async (c) => {
   const csp = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'";
   const rs = [
     await c.req('GET', '/'), await c.req('GET', '/api/me'), await c.req('GET', '/api/me', { cookie }),
-    await c.req('POST', '/api/login', { body: { password: 'x' } }), await c.req('GET', '/nope', { cookie }),
+    await c.req('POST', '/api/pair', { body: { code: 'x' } }), await c.req('GET', '/nope', { cookie }),
     await c.req('POST', '/api/sessions', { cookie, pc: false }),
   ];
   for (const r of rs) {
@@ -414,82 +352,35 @@ test('SSE: retry, screen event, gone on logout', () => withApp(async (c) => {
 }));
 
 test('logs hold method, path, status, ms only', () => withApp(async (c) => {
-  const secret = 'Mật khẩu bí mật 12345 ắ';
-  await c.req('POST', '/api/login', { body: { password: secret } });
-  const { cookie, json } = await c.login({ 'X-PC-Client': 'ios' });
+  const secret = '987654';
+  await c.req('POST', '/api/pair', { body: { code: secret } });
+  const p = await adminRequest(c.configDir, { cmd: 'pair', name: 'logtest' });
+  const r = await c.req('POST', '/api/pair', { body: { code: p.code } });
+  const json = r.json; const cookie = r.headers['set-cookie'][0].split(';')[0];
   await mkSession(c, cookie);
   await c.req('POST', '/api/send/work', { cookie, body: { text: 'SENT-TEXT-xyz ' + VN, enter: true } });
   await c.req('POST', '/api/send/work', { cookie, body: { text: 'MULTI-xyz\nline', enter: false } });
   const all = c.logs.join('\n');
-  for (const s of [secret, PW, 'SENT-TEXT', 'MULTI-xyz', VN, cookie.slice(7), json.token, 'pc_sid']) assert.ok(!all.includes(s), s);
+  for (const s of [secret, p.code, 'SENT-TEXT', 'MULTI-xyz', VN, cookie.slice(7), json.token, 'pc_sid']) assert.ok(!all.includes(s), s);
   assert.ok(c.logs.length >= 5);
   for (const l of c.logs) assert.match(l, /^(GET|POST|DELETE) \/\S* \d{3} \d+ms$/);
 }));
 
-test('--set-password: reads stdin, writes scrypt hash, generate mode', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-pw-'));
-  try {
-    const cfgDir = path.join(dir, 'cfg');
-    const env = { ...process.env, PC_CONFIG_DIR: cfgDir };
-    const run = (input) => spawnSync(process.execPath, [SERVER, '--set-password'], { input, env, encoding: 'utf8' });
-    const r = run(`${PW}\n`);
-    assert.equal(r.status, 0, r.stderr);
-    assert.ok(!r.stdout.includes(PW));
-    const file = path.join(cfgDir, 'config.json');
-    const cfg = JSON.parse(fs.readFileSync(file, 'utf8'));
-    assert.equal(cfg.passwordHash.algo, 'scrypt');
-    for (const f of ['salt', 'hash', 'N', 'r', 'p']) assert.ok(cfg.passwordHash[f], f);
-    assert.ok(cfg.cookieSecret && cfg.projects && cfg.port === 7681);
-    if (process.platform !== 'win32') assert.equal(fs.statSync(file).mode & 0o777, 0o600);
-    assert.notEqual(run('abc\n').status, 0); // too short
-    assert.equal(run('  spaced pass  \r\n').status, 0); // only the line ending is stripped
-    {
-      const a = createApp({ configDir: cfgDir, log: () => {} });
-      const p = await a.listen(0, '127.0.0.1');
-      try {
-        assert.equal((await request(p, 'POST', '/api/login', { body: { password: '  spaced pass  ' } })).status, 200);
-        assert.equal((await request(p, 'POST', '/api/login', { body: { password: 'spaced pass' } })).status, 401);
-      } finally { await a.close(); }
-    }
-    const gen = run('');
-    assert.equal(gen.status, 0);
-    const pw = /: (\S{24})\s*$/.exec(gen.stdout)?.[1];
-    assert.ok(pw, gen.stdout);
-    const app = createApp({ configDir: cfgDir, log: () => {} });
-    const port = await app.listen(0, '127.0.0.1');
-    try {
-      assert.equal((await request(port, 'POST', '/api/login', { body: { password: PW } })).status, 401); // replaced
-      assert.equal((await request(port, 'POST', '/api/login', { body: { password: pw } })).status, 200);
-    } finally { await app.close(); }
-  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
-});
-
 // every config.json that must be refused at startup and ignored at reload (A3 + round 4 item 1)
 const badConfigs = (good) => {
-  const ph = good.passwordHash;
   const b = (n) => crypto.randomBytes(n).toString('base64');
   const variants = [
-    { passwordHash: undefined }, { passwordHash: null }, { passwordHash: 'x' },
-    { passwordHash: { ...ph, algo: 'bcrypt' } }, { passwordHash: { ...ph, algo: undefined } },
-    { passwordHash: { ...ph, hash: '' } }, { passwordHash: { ...ph, hash: 'AA==' } }, { passwordHash: { ...ph, hash: b(16) } },
-    { passwordHash: { ...ph, hash: ph.hash.replace(/=+$/, '') } }, // non-canonical: padding dropped
-    { passwordHash: { ...ph, hash: `${ph.hash.slice(0, 40)}\n${ph.hash.slice(40)}` } }, // non-canonical: newline inside
-    { passwordHash: { ...ph, salt: b(8) } }, { passwordHash: { ...ph, salt: ph.salt.replace(/=+$/, '') } },
-    { passwordHash: { ...ph, N: 2 ** 30 } }, { passwordHash: { ...ph, N: 2 ** 13 } }, { passwordHash: { ...ph, N: 20000 } }, { passwordHash: { ...ph, N: '16384' } },
-    { passwordHash: { ...ph, N: 65536, r: 1, p: 1 } }, // RFC 7914: N must be < 2^(16r)
-    { passwordHash: { ...ph, N: 2 ** 20, r: 32 } }, // 128*N*r = 4 GiB > 256 MiB
-    { passwordHash: { ...ph, r: 0 } }, { passwordHash: { ...ph, r: 33 } }, { passwordHash: { ...ph, p: 0 } }, { passwordHash: { ...ph, p: 17 } },
-    { cookieSecret: 5 }, { cookieSecret: b(16) }, { cookieSecret: b(32).replace(/=+$/, '') }, { cookieSecret: `${b(32)} ` },
+    { cookieSecret: undefined }, { cookieSecret: 5 }, { cookieSecret: b(16) }, { cookieSecret: b(32).replace(/=+$/, '') }, { cookieSecret: `${b(32)} ` },
     { projects: [] }, { projects: 'x' }, { port: 'x' }, { port: 70000 },
   ];
-  return ['{"passwordHash": {"salt": "SEKRET-abc"', '[]', 'null', ...variants.map((v) => JSON.stringify({ ...good, ...v }))];
+  return ['{"cookieSecret": "SEKRET-abc', '[]', 'null', ...variants.map((v) => JSON.stringify({ ...good, ...v }))];
 };
 
 test('startup refuses a missing or malformed config (createApp throws, the process exits 1)', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-nopw-'));
   try {
     assert.throws(() => createApp({ configDir: dir, log: () => {} }), /config\.json missing/);
-    const good = { passwordHash: PW_HASH, cookieSecret: Buffer.alloc(32, 1).toString('base64'), projects: {} };
+    const good = { cookieSecret: Buffer.alloc(32, 1).toString('base64'), projects: {} };
     fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify(good));
     createApp({ configDir: dir, log: () => {} }); // the good one is accepted
     const bad = badConfigs(good);
@@ -502,18 +393,6 @@ test('startup refuses a missing or malformed config (createApp throws, the proce
     assert.equal(r.status, 1);
     assert.match(r.stderr, /config\.json is not valid JSON/);
     assert.ok(!r.stderr.includes('SEKRET'));
-    // scrypt parameters Node would reject or that need too much memory: the process exits 1
-    for (const p of [{ N: 65536, r: 1, p: 1 }, { N: 2 ** 20, r: 32 }]) {
-      fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({ ...good, passwordHash: { ...good.passwordHash, ...p } }));
-      const x = spawnSync(process.execPath, [SERVER], { env: { ...process.env, PC_CONFIG_DIR: dir, PC_PORT: '0' }, encoding: 'utf8', timeout: 10000 });
-      assert.equal(x.status, 1, JSON.stringify(p));
-      assert.match(x.stderr, /passwordHash missing or invalid/);
-    }
-    // what setPassword writes (hashPassword defaults: N 2^14, r 8, p 1) is accepted
-    const d = hashPassword('default params ok');
-    assert.deepEqual([d.N, d.r, d.p], [2 ** 14, 8, 1]);
-    fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({ ...good, passwordHash: d }));
-    createApp({ configDir: dir, log: () => {} });
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -558,61 +437,6 @@ test('malformed request targets get 400 and the process survives', () => withApp
   assert.equal(ok.text, 'fcoding ok');
 }));
 
-test('expiry boundary for cookie and Bearer (opts.now)', async () => {
-  let t = 1_700_000_000_000;
-  await withApp(async (c) => {
-    const { cookie, json } = await c.login({ 'X-PC-Client': 'ios' });
-    const auth = { Authorization: `Bearer ${json.token}` };
-    const month = 30 * 24 * 3600 * 1000;
-    t += month - 1;
-    assert.equal((await c.req('GET', '/api/me', { cookie })).status, 200);
-    assert.equal((await c.req('GET', '/api/me', { headers: auth })).status, 200);
-    t += 1; // exactly at expiry
-    assert.equal((await c.req('GET', '/api/me', { cookie })).status, 401);
-    assert.equal((await c.req('GET', '/api/me', { headers: auth })).status, 401);
-  }, { now: () => t });
-});
-
-test('10 parallel bad logins from one IP: exactly 5 x 401, 5 x 429', () => withApp(async (c) => {
-  const xf = { 'X-Forwarded-For': '5.5.5.5' };
-  const rs = await Promise.all(Array.from({ length: 10 }, (_, i) => c.req('POST', '/api/login', { body: { password: `bad-${i}` }, headers: xf })));
-  const n = (s) => rs.filter((r) => r.status === s).length;
-  assert.equal(n(401), 5);
-  assert.equal(n(429), 5);
-  // the guesses were never verified past the limit, and a good password is blocked too
-  assert.equal((await c.req('POST', '/api/login', { body: { password: PW }, headers: xf })).status, 429);
-}));
-
-test('password change drops every session without a restart, and after one', async () => {
-  const c = await boot();
-  try {
-    const old = await c.login({ 'X-PC-Client': 'ios' });
-    const before = JSON.parse(fs.readFileSync(path.join(c.configDir, 'config.json'), 'utf8')).cookieSecret;
-    const env = { ...process.env, PC_CONFIG_DIR: c.configDir };
-    const NEW = 'brand new password 42';
-    const r = spawnSync(process.execPath, [SERVER, '--set-password'], { input: `${NEW}\n`, env, encoding: 'utf8' });
-    assert.equal(r.status, 0, r.stderr);
-    const after = JSON.parse(fs.readFileSync(path.join(c.configDir, 'config.json'), 'utf8'));
-    assert.notEqual(after.cookieSecret, before); // rotated
-    assert.deepEqual(after.projects, { alpha: ABS, 'my.proj': ABS }); // other settings kept
-    // running server: no restart
-    assert.equal((await c.req('GET', '/api/me', { cookie: old.cookie })).status, 401);
-    assert.equal((await c.req('GET', '/api/me', { headers: { Authorization: `Bearer ${old.json.token}` } })).status, 401);
-    assert.equal((await c.req('POST', '/api/login', { body: { password: PW } })).status, 401);
-    const fresh = await c.req('POST', '/api/login', { body: { password: NEW } });
-    assert.equal(fresh.status, 200);
-    const freshCookie = fresh.headers['set-cookie'][0].split(';')[0];
-    assert.equal((await c.req('GET', '/api/me', { cookie: freshCookie })).status, 200);
-    // the old token must not come back when the server restarts
-    await c.app.close();
-    const app2 = createApp({ configDir: c.configDir, tmux: [process.execPath, FAKE], log: () => {} });
-    const port = await app2.listen(0, '127.0.0.1');
-    assert.equal((await request(port, 'GET', '/api/me', { cookie: old.cookie })).status, 401);
-    assert.equal((await request(port, 'GET', '/api/me', { cookie: freshCookie })).status, 401); // memory only
-    await app2.close();
-  } finally { fs.rmSync(c.root, { recursive: true, force: true }); await c.app.close().catch(() => {}); }
-});
-
 test('config dir hygiene: modes repaired, symlinks refused', async (t) => {
   if (process.platform === 'win32') return t.skip('POSIX modes');
   const c = await boot();
@@ -623,8 +447,9 @@ test('config dir hygiene: modes repaired, symlinks refused', async (t) => {
     assert.equal(fs.statSync(c.configDir).mode & 0o777, 0o700);
     assert.equal(fs.statSync(path.join(c.configDir, 'config.json')).mode & 0o777, 0o600);
     const port = await app2.listen(0, '127.0.0.1');
-    const r = await request(port, 'POST', '/api/login', { body: { password: PW } });
-    assert.equal(r.status, 200);
+    const pr = await adminRequest(c.configDir, { cmd: 'pair' });
+    assert.equal((await request(port, 'POST', '/api/pair', { body: { code: pr.code } })).status, 200);
+    assert.equal(fs.statSync(path.join(c.configDir, 'devices.json')).mode & 0o777, 0o600);
     await app2.close();
     const link = path.join(c.root, 'link');
     fs.symlinkSync(c.configDir, link);
@@ -813,13 +638,11 @@ const rotate = (c) => {
 };
 
 for (const fill of [false, true]) {
-  for (const action of ['revoke', 'expire', 'rotate', 'disconnect']) {
+  for (const action of ['logout', 'admin-revoke', 'rotate', 'disconnect']) {
     test(`gate: ${action} while a job waits${fill ? ' and all 8 children are busy' : ''} -> no later child spawns`, async () => {
-      let t = 1_700_000_000_000;
       await withApp(async (c) => {
-        const victim = await c.login(); // logged in first: expires first
-        t += MONTH - 2000;
-        const owner = await c.login();
+        const victim = await c.login({}, 'victim');
+        const owner = await c.login({}, 'owner');
         await mkSession(c, owner.cookie);
         await withEnv({ FAKE_TMUX_DELAY_MS: '500' }, async () => {
           const blocker = c.req('POST', '/api/send/work', { cookie: owner.cookie, body: { text: 'BLOCKER', enter: false } });
@@ -835,8 +658,8 @@ for (const fill of [false, true]) {
           const v = rawPost(c.port, '/api/send/work', { text: 'VICTIM', enter: true }, victim.cookie);
           v.req.end(v.data);
           assert.ok(await until(() => c.app.stats().waiting === 1, 3000), 'victim job never queued');
-          if (action === 'revoke') assert.equal((await c.req('POST', '/api/logout', { cookie: victim.cookie })).status, 200);
-          if (action === 'expire') t += 3000;
+          if (action === 'logout') assert.equal((await c.req('POST', '/api/logout', { cookie: victim.cookie })).status, 200);
+          if (action === 'admin-revoke') assert.deepEqual(await adminRequest(c.configDir, { cmd: 'revoke', id: await c.deviceId('victim') }), { ok: true, revoked: 1 });
           if (action === 'rotate') rotate(c);
           if (action === 'disconnect') {
             v.req.destroy();
@@ -850,8 +673,8 @@ for (const fill of [false, true]) {
           assert.ok(await until(() => !c.app.stats().active && c.app.stats().waiting === 0 && c.app.stats().running === 0));
         });
         await sleep(150);
-        assert.ok(!victimRan(c), 'a child was spawned for the revoked/expired/rotated/disconnected job');
-      }, { now: () => t });
+        assert.ok(!victimRan(c), 'a child was spawned for the revoked/rotated/disconnected job');
+      });
     });
   }
 }
@@ -985,7 +808,6 @@ test('screen trim is linear: 2000 lines x 300 spaces < 50 ms and correct', () =>
   assert.equal(trimScreen(''), '');
 });
 
-let t = 1_700_000_000_000;
 test('malformed config at reload: the previous one stays; a repaired one is picked up', () => withApp(async (c) => {
   const { cookie } = await c.login();
   const f = path.join(c.configDir, 'config.json');
@@ -993,12 +815,8 @@ test('malformed config at reload: the previous one stays; a repaired one is pick
   const cfg = JSON.parse(good);
   for (const text of badConfigs(cfg)) {
     fs.writeFileSync(f, text);
-    t += 3600 * 1000; // stay under the 30/hour global login limit
-    assert.equal((await c.req('GET', '/api/me', { cookie })).status, 200, text);
-    assert.equal((await c.req('POST', '/api/login', { body: { password: 'wrong password' } })).status, 401, text); // e.g. hash "" must not match everything
-    assert.equal((await c.req('POST', '/api/login', { body: { password: PW } })).status, 200, text); // old config, never a crash
+    assert.equal((await c.req('GET', '/api/me', { cookie })).status, 200, text); // the previous config still rules
   }
-  assert.equal((await c.req('POST', '/api/login', { body: { password: PW } })).status, 200); // the previous config still rules
   assert.ok(c.logs.some((l) => l.startsWith('config reload failed')));
   assert.ok(!c.logs.join('\n').includes('SEKRET'));
   // a projects-only edit keeps the logins
@@ -1008,28 +826,10 @@ test('malformed config at reload: the previous one stays; a repaired one is pick
   // a repaired file with a new secret drops every session
   fs.writeFileSync(f, JSON.stringify({ ...cfg, cookieSecret: crypto.randomBytes(32).toString('base64') }));
   assert.equal((await c.req('GET', '/api/me', { cookie })).status, 401);
-  assert.equal((await c.req('POST', '/api/login', { body: { password: PW } })).status, 200);
-}, { now: () => t }));
-
-// ======================= round 4 =======================
-test('--set-password validates the whole new config: invalid port -> exit 1, nothing written, running server unchanged', () => withApp(async (c) => {
-  const { cookie } = await c.login();
-  const f = path.join(c.configDir, 'config.json');
-  const cfg = JSON.parse(fs.readFileSync(f, 'utf8'));
-  fs.writeFileSync(f, JSON.stringify({ ...cfg, port: 'x' })); // a bad edit the running server ignores
-  assert.equal((await c.req('GET', '/api/me', { cookie })).status, 200);
-  const before = fs.readFileSync(f);
-  const r = spawnSync(process.execPath, [SERVER, '--set-password'], { input: 'another password 1\n', env: { ...process.env, PC_CONFIG_DIR: c.configDir }, encoding: 'utf8' });
-  assert.equal(r.status, 1);
-  assert.match(r.stderr, /port invalid/);
-  assert.ok(!r.stderr.includes(cfg.cookieSecret) && !r.stdout.includes('another password'));
-  assert.ok(fs.readFileSync(f).equals(before), 'config.json changed');
-  assert.deepEqual(fs.readdirSync(c.configDir), ['config.json']); // no tmp file left
-  assert.equal((await c.req('GET', '/api/me', { cookie })).status, 200);
-  assert.equal((await c.req('POST', '/api/login', { body: { password: PW } })).status, 200);
-  assert.equal((await c.req('POST', '/api/login', { body: { password: 'another password 1' } })).status, 401);
+  await c.login(); // pairing still works with the new secret
 }));
 
+// ======================= round 4 =======================
 test('writePrivate removes its tmp file when the rename fails', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-wp-'));
   const rename = fs.renameSync;
@@ -1042,24 +842,6 @@ test('writePrivate removes its tmp file when the rename fails', () => {
     assert.equal(fs.readFileSync(path.join(dir, 'config.json'), 'utf8'), 'old');
   } finally { fs.renameSync = rename; fs.rmSync(dir, { recursive: true, force: true }); }
 });
-
-test('rotation while scrypt runs: that login is 401 without Set-Cookie, the next one is 200', () => withApp(async (c) => {
-  const f = path.join(c.configDir, 'config.json');
-  const cfg = JSON.parse(fs.readFileSync(f, 'utf8'));
-  writePrivate(f, JSON.stringify({ ...cfg, passwordHash: hashPassword(PW, { N: 2 ** 17 }) })); // slow hash: a wide window
-  assert.equal((await c.req('GET', '/api/me')).status, 401); // picks the new hash up
-  const t0 = Date.now();
-  const pending = c.req('POST', '/api/login', { body: { password: PW } });
-  await sleep(60);
-  rotate(c); // new cookie secret while the password is being hashed
-  const r = await pending;
-  assert.ok(Date.now() - t0 > 60);
-  assert.equal(r.status, 401);
-  assert.equal(r.headers['set-cookie'], undefined);
-  const ok = await c.req('POST', '/api/login', { body: { password: PW } });
-  assert.equal(ok.status, 200);
-  assert.ok(ok.headers['set-cookie']);
-}));
 
 test('harness that exits 0.2 s after start: 500 harness_exited (has-session after 400 ms)', () => withApp(async (c) => {
   const { cookie } = await c.login();
@@ -1127,4 +909,441 @@ test('SSE data lines escape U+2028, U+2029 and U+0085 and still parse to the sam
   for (const ch of ['\u2028', '\u2029', '\u0085']) assert.ok(!buf.includes(ch), `raw U+${ch.charCodeAt(0).toString(16)}`);
   assert.ok(line.includes('\\u2028') && line.includes('\\u2029') && line.includes('\\u0085'));
   assert.equal(JSON.parse(line.slice(6)).text, text);
+}));
+
+// ======================= A4: device pairing =======================
+// the admin CLI as a real child process (async: the server under test lives in this process)
+const cli = (configDir, args) => new Promise((resolve) => {
+  execFile(process.execPath, [SERVER, ...args], { env: { ...process.env, PC_CONFIG_DIR: configDir }, encoding: 'utf8', timeout: 15000, windowsHide: true },
+    (err, stdout, stderr) => resolve({ status: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stdout, stderr }));
+});
+const TAG = crypto.createHmac('sha256', Buffer.alloc(32, 7)).update('fcoding-devices').digest('hex'); // boot()'s secret
+const devicesFile = (c) => JSON.parse(fs.readFileSync(path.join(c.configDir, 'devices.json'), 'utf8')).devices;
+const pairReq = (c, code, extra = {}) => c.req('POST', '/api/pair', { body: { code, ...extra } });
+const otherCode = (code) => String((Number(code) + 1) % 1e6).padStart(6, '0');
+
+test('pairing: code from --pair, token once, cookie set, device persisted (keyed hash only) and survives a restart', async () => {
+  const c = await boot();
+  try {
+    const out = await cli(c.configDir, ['--pair', 'iPhone X']);
+    assert.equal(out.status, 0, out.stderr);
+    const code = /Mã ghép: (\d{6}) /.exec(out.stdout)?.[1];
+    assert.ok(code, out.stdout);
+    assert.match(out.stdout, /hết hạn sau 120 giây/);
+    assert.equal(c.logs.length, 0); // the code is never logged
+    const r = await pairReq(c, code, { name: 'ignored: the CLI name wins' });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.ok, true);
+    assert.match(r.json.token, /^[A-Za-z0-9_-]{43}$/);
+    const sc = r.headers['set-cookie'][0];
+    assert.equal(sc.split(';')[0], `pc_sid=${r.json.token}`);
+    for (const f of ['HttpOnly', 'Secure', 'SameSite=Strict', 'Path=/', 'Max-Age=2592000']) assert.ok(sc.includes(f), f);
+    assert.equal((await c.req('GET', '/api/me', { headers: { Authorization: `Bearer ${r.json.token}` } })).status, 200);
+    assert.equal((await pairReq(c, code)).status, 401); // single use
+    const [d] = devicesFile(c);
+    assert.equal(devicesFile(c).length, 1);
+    assert.deepEqual(Object.keys(d).sort(), ['createdAt', 'id', 'keyHash', 'name']);
+    assert.equal(d.name, 'iPhone X');
+    assert.equal(d.keyHash, crypto.createHmac('sha256', Buffer.alloc(32, 7)).update(r.json.token).digest('hex'));
+    assert.ok(!fs.readFileSync(path.join(c.configDir, 'devices.json'), 'utf8').includes(r.json.token));
+    if (process.platform !== 'win32') assert.equal(fs.statSync(path.join(c.configDir, 'devices.json')).mode & 0o777, 0o600);
+    assert.ok(!c.logs.join('\n').includes(r.json.token) && !c.logs.join('\n').includes(code));
+    // name from the app when the CLI gave none
+    const p2 = await adminRequest(c.configDir, { cmd: 'pair' });
+    assert.equal((await pairReq(c, p2.code, { name: 'Máy của An' })).status, 200);
+    assert.deepEqual(devicesFile(c).map((x) => x.name), ['iPhone X', 'Máy của An']);
+    await c.app.close();
+    const app2 = createApp({ configDir: c.configDir, tmux: [process.execPath, FAKE], log: () => {} });
+    const port = await app2.listen(0, '127.0.0.1');
+    assert.equal((await request(port, 'GET', '/api/me', { headers: { Authorization: `Bearer ${r.json.token}` } })).status, 200);
+    await app2.close();
+  } finally { await c.app.close().catch(() => {}); fs.rmSync(c.root, { recursive: true, force: true }); }
+});
+
+test('pairing: five wrong codes invalidate the pending code (four do not)', async () => {
+  let t = 1_700_000_000_000;
+  await withApp(async (c) => {
+  let p = await adminRequest(c.configDir, { cmd: 'pair' });
+  for (let i = 0; i < 4; i++) assert.deepEqual((await pairReq(c, otherCode(p.code))).json, { error: 'bad_code' });
+  assert.equal((await pairReq(c, p.code)).status, 200); // 4 wrong, then right: ok
+  t += 61000; // stay under 10/minute
+  p = await adminRequest(c.configDir, { cmd: 'pair' });
+  for (const bad of [otherCode(p.code), '12345', 'abcdef', 123456, '']) assert.equal((await pairReq(c, bad)).status, 401, String(bad));
+  assert.deepEqual((await pairReq(c, p.code)).json, { error: 'bad_code' }); // gone after 5 wrong ones
+  }, { now: () => t });
+});
+
+test('pairing: an expired code is rejected (120 s)', async () => {
+  let t = 1_700_000_000_000;
+  await withApp(async (c) => {
+    let p = await adminRequest(c.configDir, { cmd: 'pair' });
+    assert.equal(p.expiresAt, t + 120000);
+    t += 119999;
+    assert.equal((await pairReq(c, p.code)).status, 200);
+    p = await adminRequest(c.configDir, { cmd: 'pair' });
+    t += 120000;
+    assert.deepEqual([(await pairReq(c, p.code)).status, devicesFile(c).length], [401, 1]);
+  }, { now: () => t });
+});
+
+test('pairing: only one pending at a time; a new --pair replaces it', () => withApp(async (c) => {
+  let a = await adminRequest(c.configDir, { cmd: 'pair', name: 'A' });
+  let b = await adminRequest(c.configDir, { cmd: 'pair', name: 'B' });
+  while (b.code === a.code) b = await adminRequest(c.configDir, { cmd: 'pair', name: 'B' });
+  assert.equal((await pairReq(c, a.code)).status, 401);
+  assert.equal((await pairReq(c, b.code)).status, 200);
+  assert.deepEqual(devicesFile(c).map((d) => d.name), ['B']);
+}));
+
+test('pairing: global /api/pair limits 10/minute and 30/hour -> 429 with Retry-After', async () => {
+  let t = 1_700_000_000_000;
+  await withApp(async (c) => {
+    for (let i = 0; i < 10; i++) assert.equal((await pairReq(c, '000000')).status, 401);
+    let r = await pairReq(c, '000000');
+    assert.equal(r.status, 429);
+    assert.equal(r.json.error, 'rate_limited');
+    assert.ok(Number(r.headers['retry-after']) > 0 && Number(r.headers['retry-after']) <= 60);
+    // even the right code is refused while limited
+    const p = await adminRequest(c.configDir, { cmd: 'pair' });
+    assert.equal((await pairReq(c, p.code)).status, 429);
+    t += 61000;
+    assert.equal((await pairReq(c, p.code)).status, 200);
+    for (let k = 0; k < 2; k++) { for (let i = 0; i < 9; i++) await pairReq(c, '000000'); t += 61000; } // 10 + 1 + 18 = 29 counted this hour
+    assert.equal((await pairReq(c, '000000')).status, 401); // 30th
+    r = await pairReq(c, '000000');
+    assert.equal(r.status, 429);
+    assert.ok(Number(r.headers['retry-after']) > 60 && Number(r.headers['retry-after']) <= 3600, r.headers['retry-after']);
+  }, { now: () => t });
+});
+
+test('pairing: the code is compared with crypto.timingSafeEqual', () => withApp(async (c) => {
+  const orig = crypto.timingSafeEqual;
+  const seen = [];
+  crypto.timingSafeEqual = (a, b) => { seen.push([a.length, b.length]); return orig(a, b); };
+  try {
+    const p = await adminRequest(c.configDir, { cmd: 'pair' });
+    assert.equal((await pairReq(c, otherCode(p.code))).status, 401);
+    assert.equal((await pairReq(c, p.code)).status, 200);
+  } finally { crypto.timingSafeEqual = orig; }
+  assert.deepEqual(seen, [[6, 6], [6, 6]]);
+}));
+
+test('admin.sock: mode 600, a stale socket is removed, a live one or a non-socket is refused', async (t) => {
+  if (process.platform === 'win32') return t.skip('unix sockets');
+  const c = await boot();
+  try {
+    const sock = adminPath(c.configDir);
+    const st = fs.statSync(sock);
+    assert.ok(st.isSocket());
+    assert.equal(st.mode & 0o777, 0o600);
+    const twin = createApp({ configDir: c.configDir, tmux: [process.execPath, FAKE], log: () => {} });
+    await assert.rejects(twin.listen(0, '127.0.0.1'), /another fcoding server/);
+    await c.app.close();
+    assert.ok(!fs.existsSync(sock));
+    // a server that died hard leaves its socket behind
+    const k = spawnSync(process.execPath, ['-e', `require('net').createServer().listen(${JSON.stringify(sock)}, () => process.kill(process.pid, 'SIGKILL'))`]);
+    assert.equal(k.signal, 'SIGKILL');
+    assert.ok(fs.lstatSync(sock).isSocket());
+    const app2 = createApp({ configDir: c.configDir, tmux: [process.execPath, FAKE], log: () => {} });
+    await app2.listen(0, '127.0.0.1');
+    assert.equal(fs.statSync(sock).mode & 0o777, 0o600);
+    assert.equal((await adminRequest(c.configDir, { cmd: 'pair' })).ok, true);
+    await app2.close();
+    fs.writeFileSync(sock, 'not a socket');
+    const app3 = createApp({ configDir: c.configDir, tmux: [process.execPath, FAKE], log: () => {} });
+    await assert.rejects(app3.listen(0, '127.0.0.1'), /not a socket/);
+  } finally { await c.app.close().catch(() => {}); fs.rmSync(c.root, { recursive: true, force: true }); }
+});
+
+test('CLI: --pair, --devices and --revoke exit 1 when the server is not running', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-cli-'));
+  try {
+    for (const args of [['--pair'], ['--devices'], ['--revoke', 'all']]) {
+      const r = await cli(dir, args);
+      assert.equal(r.status, 1, args.join(' '));
+      assert.match(r.stderr, /not running/);
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('CLI: --devices lists, --revoke <id> and --revoke all revoke through admin.sock', () => withApp(async (c) => {
+  const a = await c.login({}, 'phone A'); const b = await c.login({}, 'phone B');
+  const ls = await cli(c.configDir, ['--devices']);
+  assert.equal(ls.status, 0, ls.stderr);
+  const idA = await c.deviceId('phone A');
+  assert.match(ls.stdout, new RegExp(`^${idA}  \\d{4}-\\d\\d-\\d\\dT[^ ]+  phone A$`, 'm'));
+  assert.match(ls.stdout, /  phone B$/m);
+  assert.ok(!ls.stdout.includes(a.token) && !ls.stdout.includes('keyHash') && !ls.stdout.includes(devicesFile(c)[0].keyHash));
+  const r1 = await cli(c.configDir, ['--revoke', idA]);
+  assert.deepEqual([r1.status, r1.stdout.trim()], [0, 'revoked: 1']);
+  assert.equal((await c.req('GET', '/api/me', { cookie: a.cookie })).status, 401);
+  assert.equal((await c.req('GET', '/api/me', { cookie: b.cookie })).status, 200);
+  assert.deepEqual(devicesFile(c).map((d) => d.name), ['phone B']);
+  const bad = await cli(c.configDir, ['--revoke', 'ffffffffffffffff']);
+  assert.equal(bad.status, 1);
+  assert.match(bad.stderr, /no such device/);
+  const all = await cli(c.configDir, ['--revoke', 'all']);
+  assert.deepEqual([all.status, all.stdout.trim()], [0, 'revoked: 1']);
+  assert.equal((await c.req('GET', '/api/me', { cookie: b.cookie })).status, 401);
+  assert.deepEqual(devicesFile(c), []);
+  assert.match((await cli(c.configDir, ['--devices'])).stdout, /no paired devices/);
+}));
+
+// a server whose devices.json writes can be made to fail
+const failingWrites = () => {
+  const w = { failing: false };
+  w.fn = (f, d) => {
+    if (w.failing && f.endsWith('devices.json')) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' });
+    writePrivate(f, d);
+    if (w.afterRename && f.endsWith('devices.json')) throw Object.assign(new Error('EIO'), { code: 'EIO', committed: true }); // dir fsync failed
+  };
+  return w;
+};
+
+test('revoke: a failed devices.json write -> CLI exit 1, nothing changes', async () => {
+  const w = failingWrites();
+  await withApp(async (c) => {
+    const a = await c.login({}, 'keep');
+    const before = fs.readFileSync(path.join(c.configDir, 'devices.json'));
+    w.failing = true;
+    for (const id of [await c.deviceId('keep'), 'all']) {
+      const r = await cli(c.configDir, ['--revoke', id]);
+      assert.equal(r.status, 1);
+      assert.match(r.stderr, /storage: ENOSPC/);
+    }
+    assert.equal((await c.req('GET', '/api/me', { cookie: a.cookie })).status, 200);
+    assert.ok(fs.readFileSync(path.join(c.configDir, 'devices.json')).equals(before));
+    // logout with a failed write: 500 storage, the device stays
+    assert.deepEqual((await c.req('POST', '/api/logout', { cookie: a.cookie })).json, { error: 'storage' });
+    assert.equal((await c.req('POST', '/api/logout?all=1', { cookie: a.cookie })).status, 500);
+    assert.equal((await c.req('GET', '/api/me', { cookie: a.cookie })).status, 200);
+    w.failing = false;
+    assert.equal((await cli(c.configDir, ['--revoke', 'all'])).status, 0);
+    assert.equal((await c.req('GET', '/api/me', { cookie: a.cookie })).status, 401);
+  }, { writePrivate: w.fn });
+});
+
+test('pairing: a failed devices.json write -> 500 storage, no token, no cookie, no device', async () => {
+  const w = failingWrites();
+  await withApp(async (c) => {
+    w.failing = true;
+    const p = await adminRequest(c.configDir, { cmd: 'pair' });
+    const r = await pairReq(c, p.code);
+    assert.deepEqual([r.status, r.json], [500, { error: 'storage' }]);
+    assert.equal(r.headers['set-cookie'], undefined);
+    assert.ok(!r.text.includes('token'));
+    assert.ok(!fs.existsSync(path.join(c.configDir, 'devices.json')));
+    assert.deepEqual((await adminRequest(c.configDir, { cmd: 'devices' })).devices, []);
+    w.failing = false;
+    await c.login(); // a new --pair works
+  }, { writePrivate: w.fn });
+});
+
+test('logout removes only the calling device; logout?all removes every device (memory and devices.json)', () => withApp(async (c) => {
+  const a = await c.login({}, 'a'); const b = await c.login({}, 'b'); const d = await c.login({}, 'd');
+  assert.equal((await c.req('POST', '/api/logout', { headers: { Authorization: `Bearer ${a.token}` } })).status, 200);
+  assert.equal((await c.req('GET', '/api/me', { cookie: a.cookie })).status, 401);
+  assert.deepEqual(devicesFile(c).map((x) => x.name), ['b', 'd']);
+  assert.equal((await c.req('POST', '/api/logout?all=1', { cookie: b.cookie })).status, 200);
+  for (const x of [b, d]) assert.equal((await c.req('GET', '/api/me', { cookie: x.cookie })).status, 401);
+  assert.deepEqual(devicesFile(c), []);
+}));
+
+test('startup refuses an invalid devices.json (exit 1, nothing of the file printed); a missing one is empty', async () => {
+  const c = await boot();
+  await c.app.close();
+  try {
+    const f = path.join(c.configDir, 'devices.json');
+    const ok = { id: '0123456789abcdef', name: 'x', keyHash: 'a'.repeat(64), createdAt: 1 };
+    const bad = ['{"devices": [SEKRET', '[]', '{}', '{"devices": {}}', ...[
+      { ...ok, id: 'xyz' }, { ...ok, id: 5 }, { ...ok, id: 1234567890123456 }, { ...ok, keyHash: 'SEKRET' }, { ...ok, keyHash: 1e63 }, { ...ok, createdAt: [1] }, { ...ok, name: 'n'.repeat(65) }, { ...ok, name: 7 }, { ...ok, createdAt: 'x' },
+    ].map((d) => JSON.stringify({ devices: [d] })), JSON.stringify({ devices: [ok, ok] }), JSON.stringify({ secretTag: 5, devices: [] }), JSON.stringify({ secretTag: 'SEKRET', devices: [] })];
+    for (const text of bad) {
+      fs.writeFileSync(f, text);
+      assert.throws(() => createApp({ configDir: c.configDir, log: () => {} }), /devices\.json/, text);
+    }
+    fs.writeFileSync(f, bad[0]);
+    const r = spawnSync(process.execPath, [SERVER], { env: { ...process.env, PC_CONFIG_DIR: c.configDir, PC_PORT: '0' }, encoding: 'utf8', timeout: 10000 });
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /devices\.json is not valid JSON/);
+    assert.ok(!r.stderr.includes('SEKRET'));
+    for (const keyHash of [1234567890123456, 1e63]) { // numeric fields: the real server exits 1 too
+      fs.writeFileSync(f, JSON.stringify({ devices: [{ ...ok, keyHash, id: 1234567890123456 }] }));
+      assert.equal(spawnSync(process.execPath, [SERVER], { env: { ...process.env, PC_CONFIG_DIR: c.configDir, PC_PORT: '0' }, timeout: 10000 }).status, 1);
+    }
+    fs.writeFileSync(f, JSON.stringify({ secretTag: TAG, devices: [ok] }));
+    assert.equal(createApp({ configDir: c.configDir, log: () => {} }).devices.size, 1);
+    fs.writeFileSync(f, JSON.stringify({ devices: [] })); // first-run file without a tag: valid
+    assert.equal(createApp({ configDir: c.configDir, log: () => {} }).devices.size, 0);
+    fs.rmSync(f);
+    assert.equal(createApp({ configDir: c.configDir, log: () => {} }).devices.size, 0);
+  } finally { fs.rmSync(c.root, { recursive: true, force: true }); }
+});
+
+test('rotating cookieSecret invalidates every device and rewrites devices.json empty', async () => {
+  const c = await boot();
+  try {
+    const a = await c.login({}, 'a'); const b = await c.login({}, 'b');
+    rotate(c);
+    for (const x of [a, b]) assert.equal((await c.req('GET', '/api/me', { cookie: x.cookie })).status, 401);
+    assert.deepEqual(devicesFile(c), []);
+    const n = await c.login({}, 'new');
+    assert.equal((await c.req('GET', '/api/me', { cookie: n.cookie })).status, 200);
+    await c.app.close();
+    const app2 = createApp({ configDir: c.configDir, tmux: [process.execPath, FAKE], log: () => {} });
+    const port = await app2.listen(0, '127.0.0.1');
+    assert.equal((await request(port, 'GET', '/api/me', { cookie: a.cookie })).status, 401);
+    assert.equal((await request(port, 'GET', '/api/me', { cookie: n.cookie })).status, 200);
+    await app2.close();
+  } finally { await c.app.close().catch(() => {}); fs.rmSync(c.root, { recursive: true, force: true }); }
+});
+
+// ======================= A4 update r1 =======================
+test('writePrivate: a failed directory fsync after the rename carries committed: true', (t) => {
+  if (process.platform === 'win32') return t.skip('no directory fsync on Windows');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-wp-'));
+  const fsync = fs.fsyncSync;
+  let n = 0;
+  try {
+    fs.fsyncSync = (fd) => { if (++n === 2) throw Object.assign(new Error('EIO'), { code: 'EIO' }); return fsync(fd); }; // 1 = file, 2 = dir
+    let err; try { writePrivate(path.join(dir, 'devices.json'), 'newer'); } catch (x) { err = x; }
+    fs.fsyncSync = fsync;
+    assert.equal(err?.committed, true);
+    assert.equal(fs.readFileSync(path.join(dir, 'devices.json'), 'utf8'), 'newer');
+  } finally { fs.fsyncSync = fsync; fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('commit point is the rename: pair, revoke and logout succeed when only the dir fsync fails', async () => {
+  const w = failingWrites();
+  await withApp(async (c) => {
+    w.afterRename = true;
+    const a = await c.login({}, 'a'); // 200 + token although the write threw after the rename
+    assert.equal((await c.req('GET', '/api/me', { cookie: a.cookie })).status, 200);
+    const b = await c.login({}, 'b');
+    const d = await c.login({}, 'd');
+    assert.deepEqual(await adminRequest(c.configDir, { cmd: 'revoke', id: await c.deviceId('a') }), { ok: true, revoked: 1 });
+    assert.equal((await c.req('GET', '/api/me', { cookie: a.cookie })).status, 401);
+    assert.equal((await c.req('POST', '/api/logout', { cookie: b.cookie })).status, 200);
+    assert.equal((await c.req('GET', '/api/me', { cookie: b.cookie })).status, 401);
+    assert.deepEqual(devicesFile(c).map((x) => x.name), ['d']); // memory and file agree
+    assert.equal((await c.req('POST', '/api/logout?all=1', { cookie: d.cookie })).status, 200);
+    assert.deepEqual(devicesFile(c), []);
+    assert.ok(c.logs.some((l) => l.startsWith('devices.json directory fsync failed: EIO')));
+  }, { writePrivate: w.fn });
+});
+
+test('secretTag: a cookieSecret rotated while the server was stopped purges every device at startup', async () => {
+  const c = await boot();
+  try {
+    const a = await c.login({}, 'a');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(c.configDir, 'devices.json'), 'utf8')).secretTag, TAG);
+    await c.app.close();
+    rotate(c);
+    const newTag = crypto.createHmac('sha256', Buffer.from(JSON.parse(fs.readFileSync(path.join(c.configDir, 'config.json'), 'utf8')).cookieSecret, 'base64')).update('fcoding-devices').digest('hex');
+    const app2 = createApp({ configDir: c.configDir, tmux: [process.execPath, FAKE], log: () => {} });
+    assert.equal(app2.devices.size, 0);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(c.configDir, 'devices.json'), 'utf8')), { secretTag: newTag, devices: [] });
+    const port = await app2.listen(0, '127.0.0.1');
+    assert.equal((await request(port, 'GET', '/api/me', { cookie: a.cookie })).status, 401);
+    await app2.close();
+    // an old file without a tag but with devices counts as a mismatch
+    fs.writeFileSync(path.join(c.configDir, 'devices.json'), JSON.stringify({ devices: devicesFile(c).concat([{ id: '0123456789abcdef', name: 'x', keyHash: 'a'.repeat(64), createdAt: 1 }]) }));
+    assert.equal(createApp({ configDir: c.configDir, log: () => {} }).devices.size, 0);
+    assert.deepEqual(devicesFile(c), []);
+  } finally { await c.app.close().catch(() => {}); fs.rmSync(c.root, { recursive: true, force: true }); }
+});
+
+test('secretTag: a failed purge after a rotation blocks auth and pairing, and is retried without another config edit', async () => {
+  const w = failingWrites();
+  await withApp(async (c) => {
+    const a = await c.login({}, 'a');
+    const before = fs.readFileSync(path.join(c.configDir, 'devices.json'), 'utf8');
+    w.failing = true;
+    rotate(c);
+    assert.equal((await c.req('GET', '/api/me', { cookie: a.cookie })).status, 401);
+    assert.equal(fs.readFileSync(path.join(c.configDir, 'devices.json'), 'utf8'), before); // still the old file
+    assert.ok(c.logs.some((l) => l.startsWith('devices.json purge failed')));
+    const p = await adminRequest(c.configDir, { cmd: 'pair' });
+    const r = await c.req('POST', '/api/pair', { body: { code: p.code } });
+    assert.deepEqual([r.status, r.json, r.headers['set-cookie']], [500, { error: 'storage' }, undefined]);
+    w.failing = false; // storage is back: the next admin request purges
+    assert.deepEqual((await adminRequest(c.configDir, { cmd: 'devices' })).devices, []);
+    const f = JSON.parse(fs.readFileSync(path.join(c.configDir, 'devices.json'), 'utf8'));
+    assert.deepEqual(f.devices, []);
+    assert.notEqual(f.secretTag, TAG);
+    const n = await c.login({}, 'new');
+    assert.equal((await c.req('GET', '/api/me', { cookie: n.cookie })).status, 200);
+    assert.equal((await c.req('GET', '/api/me', { cookie: a.cookie })).status, 401);
+  }, { writePrivate: w.fn });
+});
+
+test('/api/pair is counted before the body: 10 oversized bodies use up the minute', async () => {
+  let t = 1_700_000_000_000;
+  await withApp(async (c) => {
+    const big = JSON.stringify({ code: 'x'.repeat(65 * 1024) });
+    for (let i = 0; i < 10; i++) assert.equal((await c.req('POST', '/api/pair', { raw: big, headers: JSON_CT })).status, 413);
+    assert.equal((await c.req('POST', '/api/pair', { raw: big, headers: JSON_CT })).status, 429);
+    const p = await adminRequest(c.configDir, { cmd: 'pair' });
+    assert.equal((await pairReq(c, p.code)).status, 429);
+    assert.equal((await c.req('POST', '/api/pair', { raw: '{bad json', headers: JSON_CT })).status, 429);
+  }, { now: () => t });
+});
+
+test('/api/pair: concurrent requests never exceed the quota', async () => {
+  let t = 1_700_000_000_000;
+  await withApp(async (c) => {
+    const rs = await Promise.all(Array.from({ length: 25 }, () => pairReq(c, '000000')));
+    assert.equal(rs.filter((r) => r.status !== 429).length, 10);
+    t += 61000;
+    const rs2 = await Promise.all(Array.from({ length: 30 }, () => pairReq(c, '000000')));
+    assert.equal(rs2.filter((r) => r.status !== 429).length, 10);
+    t += 61000;
+    const rs3 = await Promise.all(Array.from({ length: 30 }, () => pairReq(c, '000000')));
+    assert.equal(rs3.filter((r) => r.status !== 429).length, 10); // 30 in the hour
+    t += 61000;
+    assert.equal((await pairReq(c, '000000')).status, 429);
+  }, { now: () => t });
+});
+
+test('admin.sock handles only the first line of a connection', { skip: process.platform === 'win32' && 'unix sockets' }, () => withApp(async (c) => {
+  const orig = crypto.randomInt;
+  let calls = 0;
+  crypto.randomInt = (...a) => { calls++; return orig(...a); };
+  try {
+    const reply = await new Promise((resolve, reject) => {
+      const s = net.connect({ path: adminPath(c.configDir), allowHalfOpen: true }); // keeps writing after the server's reply
+      let buf = '';
+      s.on('data', (d) => { buf += d; });
+      s.on('end', () => { s.end('{"cmd":"pair","name":"two"}\n'); setTimeout(() => resolve(buf), 100); }); // a second chunk on the same connection
+      s.on('error', reject); // Windows pipes cannot half-close (EPIPE): POSIX only
+      s.on('connect', () => s.write('{"cmd":"pair","name":"one"}\n'));
+    });
+    await sleep(100);
+    assert.equal(reply.trim().split('\n').length, 1);
+    assert.equal(calls, 1);
+    assert.equal((await pairReq(c, JSON.parse(reply).code)).status, 200); // the first code is still the pending one
+    assert.deepEqual(devicesFile(c).map((d) => d.name), ['one']);
+  } finally { crypto.randomInt = orig; }
+}));
+
+test('pairing: the code comes from crypto.randomInt(0, 1000000), zero-padded', () => withApp(async (c) => {
+  const orig = crypto.randomInt;
+  const seen = [];
+  crypto.randomInt = (...a) => { seen.push(a); return 42; };
+  let p;
+  try { p = await adminRequest(c.configDir, { cmd: 'pair' }); } finally { crypto.randomInt = orig; }
+  assert.deepEqual(seen, [[0, 1e6]]);
+  assert.equal(p.code, '000042');
+  assert.equal(p.expiresIn, 120);
+  assert.equal((await pairReq(c, '000042')).status, 200);
+}));
+
+test('device names lose C0, C1 and bidi control characters', () => withApp(async (c) => {
+  const ch = (...cps) => String.fromCharCode(...cps);
+  const raw = `a${ch(0x85)}b${ch(0x202e)}c${ch(0x2066)}d${ch(0x200f)}e${ch(0x1, 0x7f, 0x9f, 0x200e, 0x202a, 0x2069)}f`;
+  await c.login({}, raw);
+  assert.deepEqual(devicesFile(c).map((d) => d.name), ['abcdef']);
+  const p = await adminRequest(c.configDir, { cmd: 'pair' }); // the app-sent name too
+  assert.equal((await pairReq(c, p.code, { name: `x${ch(0x202d)}y` })).status, 200);
+  assert.deepEqual(devicesFile(c).map((d) => d.name), ['abcdef', 'xy']);
 }));

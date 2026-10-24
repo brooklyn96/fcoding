@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// fcoding server: Node 22, built-ins only. See CONTRACT.md (S1-S8, A1, A2, A3).
+// fcoding server: Node 22, built-ins only. See CONTRACT.md (S1-S8, A1-A4).
 import http from 'node:http';
+import net from 'node:net';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -17,8 +18,8 @@ const COOKIE_MAX_AGE = 30 * 24 * 3600;
 const BODY_LIMIT = 64 * 1024;
 const TEXT_LIMIT = 32 * 1024;
 const LONG_TEXT = 500; // bytes; longer single lines are pasted, not typed
-const IP_FAILS = 5, IP_WINDOW = 15 * 60 * 1000;
-const GLOBAL_FAILS = 30, GLOBAL_WINDOW = 3600 * 1000;
+const PAIR_TTL = 120 * 1000, PAIR_ATTEMPTS = 5;
+const PAIR_PER_MINUTE = 10, PAIR_MINUTE = 60 * 1000, PAIR_PER_HOUR = 30, PAIR_HOUR = 3600 * 1000;
 const MAX_STREAMS = 50;
 const MAX_WAITING = 20; // mutation jobs waiting behind the active one
 const MAX_READS = 7; // 8 tmux children in all: one slot is reserved for the active mutation
@@ -43,23 +44,12 @@ class HttpErr extends Error {
   constructor(status, code, extra = {}) { super(code); this.status = status; this.code = code; Object.assign(this, extra); }
 }
 
-// ---------- password / config ----------
-export function hashPassword(pw, { N = 16384, r = 8, p = 1 } = {}) {
-  const salt = crypto.randomBytes(16);
-  const hash = crypto.scryptSync(pw, salt, 64, { N, r, p, maxmem: 256 * N * r });
-  return { algo: 'scrypt', salt: salt.toString('base64'), hash: hash.toString('base64'), N, r, p };
-}
-const scryptAsync = (pw, salt, len, o) => new Promise((res, rej) => crypto.scrypt(pw, salt, len, o, (e, k) => (e ? rej(e) : res(k))));
-async function verifyPassword(pw, ph) {
-  const want = Buffer.from(ph.hash, 'base64');
-  const got = await scryptAsync(pw, Buffer.from(ph.salt, 'base64'), want.length, { N: ph.N, r: ph.r, p: ph.p, maxmem: 256 * ph.N * ph.r });
-  return got.length === want.length && crypto.timingSafeEqual(got, want);
-}
+// ---------- config / devices / admin socket ----------
 export function defaultConfigDir() {
   if (process.env.PC_CONFIG_DIR) return process.env.PC_CONFIG_DIR;
   return fs.existsSync('/data/home') ? '/data/home/.fcoding' : path.join(os.homedir(), '.fcoding');
 }
-// tmp file, fsync, rename, directory fsync
+// tmp file, fsync, rename, directory fsync. The rename is the commit point: an error after it carries committed: true.
 export function writePrivate(file, data) {
   const dir = path.dirname(file);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -69,9 +59,10 @@ export function writePrivate(file, data) {
     try { fs.writeFileSync(fd, data); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
     fs.renameSync(tmp, file);
   } catch (e) { try { fs.unlinkSync(tmp); } catch {} throw e; }
-  if (process.platform !== 'win32') { const d = fs.openSync(dir, 'r'); try { fs.fsyncSync(d); } finally { fs.closeSync(d); } }
+  if (process.platform === 'win32') return;
+  try { const d = fs.openSync(dir, 'r'); try { fs.fsyncSync(d); } finally { fs.closeSync(d); } } catch (e) { e.committed = true; throw e; }
 }
-// Config dir must be a real directory owned by us (0700); config.json real, ours, 0600. Throws otherwise.
+// Config dir must be a real directory owned by us (0700); config.json and devices.json real, ours, 0600. Throws otherwise.
 export function secureConfigDir(dir) {
   const uid = process.getuid?.();
   const check = (p, wantDir) => {
@@ -82,53 +73,54 @@ export function secureConfigDir(dir) {
     if (process.platform !== 'win32') fs.chmodSync(p, wantDir ? 0o700 : 0o600);
     return true;
   };
-  if (check(dir, true)) check(path.join(dir, 'config.json'), false);
+  if (check(dir, true)) for (const f of ['config.json', 'devices.json']) check(path.join(dir, f), false);
 }
 // Parse + validate a complete candidate. Error messages never quote the file (it holds the secret).
 export function parseConfig(text) {
   let c;
   try { c = JSON.parse(text); } catch { throw new Error('config.json is not valid JSON'); }
   if (!c || typeof c !== 'object' || Array.isArray(c)) throw new Error('config.json is not an object');
-  const ph = c.passwordHash;
-  // canonical base64 (re-encoding gives the same text) of at least min bytes
-  const b64 = (s, min) => typeof s === 'string' && Buffer.from(s, 'base64').length >= min && Buffer.from(s, 'base64').toString('base64') === s;
-  const int = (n, lo, hi) => Number.isInteger(n) && n >= lo && n <= hi;
-  if (!ph || typeof ph !== 'object' || ph.algo !== 'scrypt' || !b64(ph.salt, 16) || !b64(ph.hash, 32)
-    || !int(ph.N, 2 ** 14, 2 ** 20) || (ph.N & (ph.N - 1)) || !int(ph.r, 1, 32) || !int(ph.p, 1, 16)
-    || ph.N >= 2 ** (16 * ph.r) || 128 * ph.N * ph.r > 256 * 2 ** 20) { // RFC 7914 N < 2^(16r); memory 128*N*r <= 256 MiB
-    throw new Error('config.json: passwordHash missing or invalid (run --set-password)');
-  }
-  if (!b64(c.cookieSecret, 32)) throw new Error('config.json: cookieSecret missing or invalid');
+  const s = c.cookieSecret; // canonical base64 (re-encoding gives the same text) of at least 32 bytes
+  if (typeof s !== 'string' || Buffer.from(s, 'base64').length < 32 || Buffer.from(s, 'base64').toString('base64') !== s) throw new Error('config.json: cookieSecret missing or invalid');
   const projects = c.projects ?? {};
   if (typeof projects !== 'object' || projects === null || Array.isArray(projects)) throw new Error('config.json: projects must be an object');
   if (c.port !== undefined && !(Number.isInteger(c.port) && c.port > 0 && c.port < 65536)) throw new Error('config.json: port invalid');
   return {
-    passwordHash: ph, hashText: JSON.stringify(ph), secret: Buffer.from(c.cookieSecret, 'base64'), port: c.port, projects,
+    secret: Buffer.from(s, 'base64'), port: c.port, projects,
     projectNames: Object.keys(projects).filter((k) => typeof projects[k] === 'string' && path.isAbsolute(projects[k])),
   };
 }
-function randomPassword(n = 24) {
-  const abc = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
-  let s = '';
-  for (let i = 0; i < n; i++) s += abc[crypto.randomInt(abc.length)];
-  return s;
+// devices.json: {secretTag, devices:[{id, name, keyHash, createdAt}]}; invalid -> throw (no content in the message)
+export function parseDevices(text) {
+  let d;
+  try { d = JSON.parse(text); } catch { throw new Error('devices.json is not valid JSON'); }
+  const str = (v, re) => typeof v === 'string' && re.test(v);
+  const ok = (x) => x && typeof x === 'object' && str(x.id, /^[0-9a-f]{16}$/) && typeof x.name === 'string' && x.name.length <= 64
+    && str(x.keyHash, /^[0-9a-f]{64}$/) && typeof x.createdAt === 'number' && Number.isFinite(x.createdAt);
+  if (!d || typeof d !== 'object' || !Array.isArray(d.devices) || !d.devices.every(ok) || new Set(d.devices.map((x) => x.id)).size !== d.devices.length
+    || (d.secretTag !== undefined && !str(d.secretTag, /^[0-9a-f]{64}$/))) throw new Error('devices.json is invalid');
+  return { secretTag: d.secretTag, devices: d.devices.map(({ id, name, keyHash, createdAt }) => ({ id, name, keyHash, createdAt })) };
 }
-export function setPassword(configDir, pw) {
-  secureConfigDir(configDir);
-  const file = path.join(configDir, 'config.json');
-  let cfg = {};
-  if (fs.existsSync(file)) {
-    try { cfg = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { cfg = null; }
-    if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) throw new Error('config.json is not valid JSON; fix or remove it first');
-  }
-  cfg.passwordHash = hashPassword(pw);
-  cfg.cookieSecret = crypto.randomBytes(32).toString('base64'); // rotate: every old session key becomes unverifiable
-  cfg.projects ||= { home: process.env.HOME || os.homedir() };
-  cfg.port ||= 7681;
-  const text = JSON.stringify(cfg, null, 2);
-  parseConfig(text); // the whole new config must be valid, or nothing is written
-  writePrivate(file, text);
-  secureConfigDir(configDir);
+const NAME_CTRL = /[\x00-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g; // C0, DEL, C1, bidi controls
+const cleanName = (n) => (typeof n === 'string' ? n.replace(NAME_CTRL, '').trim().slice(0, 64) : '');
+// admin.sock (unix socket, 600, in the 700 config dir); a named pipe on Windows (tests only)
+export const adminPath = (configDir) => (process.platform === 'win32'
+  ? `\\\\.\\pipe\\fcoding-${crypto.createHash('sha256').update(path.resolve(configDir)).digest('hex').slice(0, 16)}`
+  : path.join(configDir, 'admin.sock'));
+// one JSON request line -> one JSON response line. Rejects with code ENOSERVER when no server listens.
+export function adminRequest(configDir, req, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const s = net.connect(adminPath(configDir));
+    let buf = '';
+    const t = setTimeout(() => { s.destroy(); reject(new Error('admin socket timeout')); }, timeoutMs);
+    s.on('connect', () => s.end(`${JSON.stringify(req)}\n`));
+    s.on('data', (d) => { buf += d; });
+    s.on('end', () => { clearTimeout(t); try { resolve(JSON.parse(buf)); } catch { reject(new Error('bad admin reply')); } });
+    s.on('error', (e) => {
+      clearTimeout(t);
+      reject(['ENOENT', 'ECONNREFUSED'].includes(e.code) ? Object.assign(new Error('the fcoding server is not running'), { code: 'ENOSERVER' }) : e);
+    });
+  });
 }
 // trailing blank lines only, linear: spaces on the last real line stay
 export function trimScreen(s) {
@@ -150,6 +142,7 @@ export function createApp(opts = {}) {
   const drainTimeout = opts.drainTimeoutMs ?? DRAIN_TIMEOUT;
   const pasteEnterDelay = opts.pasteEnterDelayMs ?? 120;
   const now = opts.now || Date.now;
+  const writeFile = opts.writePrivate || writePrivate;
 
   secureConfigDir(configDir);
 
@@ -158,48 +151,140 @@ export function createApp(opts = {}) {
   const stampOf = () => { try { const s = fs.statSync(cfgFile); return `${s.mtimeMs}:${s.size}:${s.ino}`; } catch { return ''; } };
   let cfgStamp = stampOf();
   let text;
-  try { text = fs.readFileSync(cfgFile, 'utf8'); } catch { throw new Error(`config.json missing or unreadable in ${configDir} (run --set-password)`); }
+  try { text = fs.readFileSync(cfgFile, 'utf8'); } catch { throw new Error(`config.json missing or unreadable in ${configDir} (run install.sh)`); }
   let cfg = parseConfig(text);
-  let gen = 0; // bumped whenever the password hash or the cookie secret changes
+  let gen = 0; // bumped whenever the cookie secret changes
 
-  // --- sessions: memory only, keyed by HMAC-SHA256(secret, sid); a restart logs everyone out ---
-  const sessions = new Map();
+  // --- devices: persisted in devices.json, keyed by HMAC-SHA256(secret, token); the token itself is never stored ---
+  const devFile = path.join(configDir, 'devices.json');
+  let devText = null;
+  try { devText = fs.readFileSync(devFile, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') throw new Error('devices.json unreadable'); }
+  const devices = new Map(); // id -> device; removing an id is that device's generation bump (ids are random, never reused)
+  const byKey = new Map(); // keyHash -> id
+  const load = (list) => { devices.clear(); byKey.clear(); for (const d of list) { devices.set(d.id, d); byKey.set(d.keyHash, d.id); } };
+  const tagOf = (secret) => crypto.createHmac('sha256', secret).update('fcoding-devices').digest('hex');
+  // write the list; the rename is the commit point (a later dir-fsync error is only logged). Throws when nothing changed.
+  function writeDevices(list) {
+    try { writeFile(devFile, JSON.stringify({ secretTag: tagOf(cfg.secret), devices: list }, null, 2)); } catch (e) {
+      if (!e.committed) throw e;
+      log(`devices.json directory fsync failed: ${e.code || 'error'}`);
+    }
+  }
+  // devices.json written for another cookieSecret: devices are dropped from memory first, then the file is rewritten empty
+  let purgePending = false;
+  function purge() {
+    try { writeDevices([]); purgePending = false; } catch (e) { purgePending = true; log(`devices.json purge failed: ${e.code || 'error'}`); }
+    return !purgePending;
+  }
+  const stored = devText === null ? { devices: [] } : parseDevices(devText);
+  if (stored.secretTag === undefined ? stored.devices.length > 0 : stored.secretTag !== tagOf(cfg.secret)) purge();
+  else load(stored.devices);
+  // durable first, memory second: when the write fails before the rename nothing changes (the caller answers 500 / exit 1)
+  function commitDevices(list) {
+    if (purgePending && !purge()) throw new Error('purge pending');
+    writeDevices(list);
+    load(list);
+  }
   function refreshConfig() {
+    if (purgePending) purge();
     const st = stampOf();
     if (st === cfgStamp) return;
     cfgStamp = st; // a bad file is retried on its next change
     let next;
     try { next = parseConfig(fs.readFileSync(cfgFile, 'utf8')); } catch (e) { log(`config reload failed, keeping the previous one: ${e.code || e.message}`); return; }
-    if (next.hashText !== cfg.hashText || !next.secret.equals(cfg.secret)) { sessions.clear(); gen++; }
+    const rotated = !next.secret.equals(cfg.secret);
     cfg = next;
+    if (rotated) { gen++; load([]); purge(); } // no old keyHash may match any more
   }
-  const sidKey = (sid) => crypto.createHmac('sha256', cfg.secret).update(sid).digest('hex');
-  // ctx = {cancelled, key, gen}: the request is alive, its session valid and unexpired, the config generation unchanged
+  const keyOf = (token) => crypto.createHmac('sha256', cfg.secret).update(token).digest('hex');
+  // ctx = {cancelled, device, gen}: the request is alive, its device still paired, the config generation unchanged
   function valid(ctx) {
     refreshConfig();
-    const exp = ctx.key ? sessions.get(ctx.key) : undefined;
-    return !ctx.cancelled && ctx.gen === gen && exp > now();
+    return !ctx.cancelled && ctx.gen === gen && !purgePending && !!ctx.device && devices.has(ctx.device);
   }
   const gateErr = (ctx) => (ctx.cancelled ? new HttpErr(499, 'cancelled') : new HttpErr(401, 'unauthorized'));
 
-  // --- login rate limits ---
-  const ipFails = new Map();
-  let globalFails = [];
-  const prune = (a, win, t) => { while (a.length && a[0] <= t - win) a.shift(); return a; };
-  function rateLimited(ip, t) {
-    if (ipFails.size > 5000) for (const [k, a] of ipFails) if (!prune(a, IP_WINDOW, t).length) ipFails.delete(k);
-    const a = prune(ipFails.get(ip) || [], IP_WINDOW, t);
-    if (a.length >= IP_FAILS) return Math.max(1, Math.ceil((a[0] + IP_WINDOW - t) / 1000));
-    prune(globalFails, GLOBAL_WINDOW, t);
-    if (globalFails.length >= GLOBAL_FAILS) return Math.max(1, Math.ceil((globalFails[0] + GLOBAL_WINDOW - t) / 1000));
+  // --- pairing: one pending 6-digit code, 120 s, 5 wrong attempts; /api/pair limited to 10/min and 30/h ---
+  let pending = null; // {code, name, expiresAt, attempts}
+  const pairHits = [];
+  function pairLimited(t) {
+    while (pairHits.length && pairHits[0] <= t - PAIR_HOUR) pairHits.shift();
+    const minute = pairHits.filter((x) => x > t - PAIR_MINUTE);
+    if (minute.length >= PAIR_PER_MINUTE) return Math.max(1, Math.ceil((minute[0] + PAIR_MINUTE - t) / 1000));
+    if (pairHits.length >= PAIR_PER_HOUR) return Math.max(1, Math.ceil((pairHits[0] + PAIR_HOUR - t) / 1000));
+    pairHits.push(t);
     return 0;
   }
-  // an attempt is counted up front (so parallel guesses cannot dodge the limit) and refunded on success
-  const reserve = (ip, t) => { if (!ipFails.has(ip)) ipFails.set(ip, []); ipFails.get(ip).push(t); globalFails.push(t); };
-  const refund = (ip, t) => {
-    const a = ipFails.get(ip); const i = a ? a.indexOf(t) : -1; if (i >= 0) a.splice(i, 1);
-    const j = globalFails.indexOf(t); if (j >= 0) globalFails.splice(j, 1);
-  };
+  // constant-time: the comparison never depends on where the digits differ
+  const codeMatches = (code) => typeof code === 'string' && /^\d{6}$/.test(code) && crypto.timingSafeEqual(Buffer.from(code), Buffer.from(pending.code));
+  function pair(code, name) {
+    const t = now();
+    if (!pending || t >= pending.expiresAt) { pending = null; throw new HttpErr(401, 'bad_code'); }
+    if (!codeMatches(code)) {
+      if (++pending.attempts >= PAIR_ATTEMPTS) pending = null;
+      throw new HttpErr(401, 'bad_code');
+    }
+    const devName = pending.name || cleanName(name) || 'device';
+    pending = null; // single use, even if the write below fails
+    refreshConfig();
+    if (purgePending) throw new HttpErr(500, 'storage');
+    const token = crypto.randomBytes(32).toString('base64url');
+    const dev = { id: crypto.randomBytes(8).toString('hex'), name: devName, keyHash: keyOf(token), createdAt: t };
+    try { commitDevices([...devices.values(), dev]); } catch { throw new HttpErr(500, 'storage'); }
+    return token;
+  }
+  function revoke(ids) { // throws on a failed write; nothing changes then
+    commitDevices([...devices.values()].filter((d) => !ids.includes(d.id)));
+  }
+  function admin(req) {
+    refreshConfig(); // a rotation or a pending purge is handled before any answer
+    if (req?.cmd === 'pair') {
+      pending = { code: String(crypto.randomInt(0, 1e6)).padStart(6, '0'), name: cleanName(req.name), expiresAt: now() + PAIR_TTL, attempts: 0 };
+      return { ok: true, code: pending.code, expiresAt: pending.expiresAt, expiresIn: PAIR_TTL / 1000 };
+    }
+    if (req?.cmd === 'devices') return { ok: true, devices: [...devices.values()].map(({ id, name, createdAt }) => ({ id, name, createdAt })) };
+    if (req?.cmd === 'revoke') {
+      const ids = req.id === 'all' ? [...devices.keys()] : [req.id];
+      if (req.id !== 'all' && !devices.has(req.id)) return { ok: false, error: 'no such device' };
+      try { revoke(ids); } catch (e) { return { ok: false, error: `storage: ${e.code || 'write failed'}` }; }
+      return { ok: true, revoked: ids.length };
+    }
+    return { ok: false, error: 'unknown command' };
+  }
+  const adminServer = net.createServer((sock) => {
+    let buf = '', done = false; // only the first line of a connection is handled
+    sock.setTimeout(5000, () => sock.destroy());
+    sock.on('error', () => {});
+    sock.on('data', (d) => {
+      if (done) return;
+      buf += d;
+      if (buf.length > 4096) return sock.destroy();
+      const i = buf.indexOf('\n');
+      if (i < 0) return;
+      done = true;
+      let req; try { req = JSON.parse(buf.slice(0, i)); } catch { req = null; }
+      sock.end(`${JSON.stringify(admin(req))}\n`);
+    });
+  });
+  const adminFile = adminPath(configDir);
+  async function listenAdmin() {
+    if (process.platform !== 'win32') {
+      let st = null;
+      try { st = fs.lstatSync(adminFile); } catch {}
+      if (st) {
+        if (!st.isSocket()) throw new Error(`unsafe admin socket path (not a socket): ${adminFile}`);
+        const alive = await adminRequest(configDir, { cmd: 'ping' }, 1000).then(() => true, () => false);
+        if (alive) throw new Error('another fcoding server is using admin.sock');
+        fs.unlinkSync(adminFile); // stale
+      }
+    }
+    await new Promise((resolve, reject) => {
+      adminServer.once('error', reject);
+      const old = process.umask(0o177); // the socket is born 600
+      try { adminServer.listen(adminFile, resolve); } finally { process.umask(old); }
+    });
+    if (process.platform !== 'win32') fs.chmodSync(adminFile, 0o600);
+  }
 
   // --- the one execution gate: every tmux child goes through run(ctx); execFile only, never a shell ---
   let running = 0, reads = 0;
@@ -369,11 +454,6 @@ export function createApp(opts = {}) {
     return null;
   }
   const setCookie = (sid, maxAge) => `${COOKIE}=${sid}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${maxAge}`;
-  function clientIp(req) {
-    const xf = req.headers['x-forwarded-for']; // the instabox proxy overwrites this with the real client IP
-    const first = typeof xf === 'string' ? xf.split(',')[0].trim() : '';
-    return (first || req.socket.remoteAddress || 'unknown').slice(0, 64);
-  }
   function csrfOk(req) {
     if (req.headers['x-pc'] !== '1') return false;
     const o = req.headers.origin;
@@ -456,44 +536,33 @@ export function createApp(opts = {}) {
     if (method !== 'GET' && method !== 'HEAD' && !csrfOk(req)) throw new HttpErr(403, 'forbidden');
 
     const seg = pathname.split('/');
-    const isLogin = pathname === '/api/login';
-    if (!isLogin) {
+    const isPair = pathname === '/api/pair';
+    if (!isPair) {
       refreshConfig(); // before deriving the key
-      const sid = requestSid(req);
-      ctx.key = sid && sid.length < 128 ? sidKey(sid) : null;
+      const tok = requestSid(req);
+      ctx.device = tok && tok.length < 128 ? byKey.get(keyOf(tok)) ?? null : null;
       ctx.gen = gen;
       if (!valid(ctx)) throw new HttpErr(401, 'unauthorized');
     }
     if (!isApi) throw new HttpErr(404, 'not_found');
+    if (isPair) { // counted before the body: oversized, slow and invalid bodies use up the quota too
+      if (method !== 'POST') throw new HttpErr(405, 'method');
+      const wait = pairLimited(now());
+      if (wait) return json(res, 429, { error: 'rate_limited', retryAfter: wait }, { 'Retry-After': String(wait) });
+    }
 
     const body = method === 'GET' ? null : await readBody(req);
-    if (!isLogin && !valid(ctx)) throw gateErr(ctx); // re-checked once the body is in
+    if (!isPair && !valid(ctx)) throw gateErr(ctx); // re-checked once the body is in
     const want = (m) => { if (method !== m) throw new HttpErr(405, 'method'); };
 
-    if (isLogin) {
-      want('POST');
-      const { password } = parseJson(req, body);
-      if (typeof password !== 'string' || !password || password.length > 256) throw new HttpErr(400, 'invalid');
-      refreshConfig();
-      const t = now(); const ip = clientIp(req);
-      const wait = rateLimited(ip, t);
-      if (wait) return json(res, 429, { error: 'rate_limited', retryAfter: wait }, { 'Retry-After': String(wait) });
-      reserve(ip, t);
-      const g0 = gen;
-      if (!(await verifyPassword(password, cfg.passwordHash))) throw new HttpErr(401, 'bad_password');
-      refund(ip, t);
-      refreshConfig();
-      if (gen !== g0) throw new HttpErr(401, 'bad_password'); // password changed while we were hashing
-      for (const [k, exp] of sessions) if (exp <= t) sessions.delete(k);
-      while (sessions.size >= 200) sessions.delete(sessions.keys().next().value);
-      const sid = crypto.randomBytes(32).toString('base64url');
-      sessions.set(sidKey(sid), t + COOKIE_MAX_AGE * 1000);
-      const out = req.headers['x-pc-client'] === 'ios' ? { ok: true, token: sid } : { ok: true };
-      return json(res, 200, out, { 'Set-Cookie': setCookie(sid, COOKIE_MAX_AGE) });
+    if (isPair) {
+      const { code, name } = parseJson(req, body);
+      const token = pair(code, name);
+      return json(res, 200, { ok: true, token }, { 'Set-Cookie': setCookie(token, COOKIE_MAX_AGE) });
     }
     if (pathname === '/api/logout') {
       want('POST');
-      if (url.searchParams.get('all') === '1') sessions.clear(); else sessions.delete(ctx.key);
+      try { revoke(url.searchParams.get('all') === '1' ? [...devices.keys()] : [ctx.device]); } catch { throw new HttpErr(500, 'storage'); }
       return json(res, 200, { ok: true }, { 'Set-Cookie': setCookie('', 0) });
     }
     if (pathname === '/api/me') { want('GET'); return json(res, 200, { ok: true }); }
@@ -574,7 +643,7 @@ export function createApp(opts = {}) {
   // The handler never rejects: every failure path ends in a response (or a closed socket).
   const server = http.createServer(async (req, res) => {
     const t0 = Date.now();
-    const ctx = { cancelled: false, key: null, gen: -1 };
+    const ctx = { cancelled: false, device: null, gen: -1 };
     res.on('close', () => { if (!res.writableFinished) { ctx.cancelled = true; ctx.onCancel?.(); } });
     let target = '(bad-target)';
     try {
@@ -600,27 +669,35 @@ export function createApp(opts = {}) {
   });
   server.requestTimeout = 15000;
   server.headersTimeout = 10000;
-  const listen = (port = Number(process.env.PC_PORT) || cfg.port || 7681, host = '0.0.0.0') =>
-    new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, host, () => resolve(server.address().port)); });
-  const close = () => new Promise((resolve) => { server.close(() => resolve()); server.closeAllConnections(); });
-  return { server, listen, close, sessions, stats: () => ({ streams, running, reads, waiting: queue.length, active: !!active }) };
+  const listen = async (port = Number(process.env.PC_PORT) || cfg.port || 7681, host = '0.0.0.0') => {
+    await listenAdmin();
+    try {
+      return await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, host, () => resolve(server.address().port)); });
+    } catch (e) { adminServer.close(); throw e; }
+  };
+  const close = () => Promise.all([
+    new Promise((resolve) => { server.close(() => resolve()); server.closeAllConnections(); }),
+    new Promise((resolve) => (adminServer.listening ? adminServer.close(() => resolve()) : resolve())),
+  ]);
+  return { server, listen, close, devices, stats: () => ({ streams, running, reads, waiting: queue.length, active: !!active }) };
 }
 
 // ---------- CLI ----------
 async function main() {
   const dir = defaultConfigDir();
-  if (process.argv.includes('--set-password')) {
-    let pw = '';
-    if (!process.stdin.isTTY) {
-      const chunks = [];
-      for await (const c of process.stdin) chunks.push(c);
-      pw = Buffer.concat(chunks).toString('utf8').replace(/\r?\n$/, ''); // only the line ending; spaces are part of it
-    }
-    const generated = !pw;
-    if (generated) pw = randomPassword();
-    else if (pw.length < 8 || pw.length > 256) { console.error('password must be 8-256 characters'); process.exit(1); }
-    setPassword(dir, pw);
-    console.log(generated ? `Password set. Generated password (shown once): ${pw}` : 'Password set.');
+  const arg = (f) => { const i = process.argv.indexOf(f); return i < 0 ? undefined : process.argv[i + 1] ?? ''; };
+  const req = process.argv.includes('--pair') ? { cmd: 'pair', name: arg('--pair') }
+    : process.argv.includes('--devices') ? { cmd: 'devices' }
+      : process.argv.includes('--revoke') ? { cmd: 'revoke', id: arg('--revoke') } : null;
+  if (req) { // admin CLI: talks to the RUNNING server over admin.sock
+    let r;
+    try { r = await adminRequest(dir, req); } catch (e) { console.error(e.code === 'ENOSERVER' ? `${e.message} (no ${adminPath(dir)})` : `admin socket: ${e.message}`); process.exit(1); }
+    if (!r.ok) { console.error(`error: ${r.error}`); process.exit(1); }
+    if (req.cmd === 'pair') console.log(`Mã ghép: ${r.code} (hết hạn sau ${r.expiresIn} giây)\nNhập mã này vào app. Chạy lại lệnh sẽ thay mã cũ.`);
+    else if (req.cmd === 'devices') {
+      if (!r.devices.length) console.log('(no paired devices)');
+      for (const d of r.devices) console.log(`${d.id}  ${new Date(d.createdAt).toISOString()}  ${d.name}`);
+    } else console.log(`revoked: ${r.revoked}`);
     return;
   }
   // a bug must not leave the process half-alive: log the type only (never data) and let systemd restart us

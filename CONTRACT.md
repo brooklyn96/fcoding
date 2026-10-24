@@ -65,3 +65,60 @@ UI requirements (frontend): Vietnamese labels; login screen; session list (creat
 - Harness launch: the command runs as `env PATH=<HOME>/.local/bin:<HOME>/.bun/bin:/usr/local/bin:/usr/bin:/bin <harness>` (no reliance on the tmux server's or the unit's PATH). If the session is gone right after new-session, /api/open and POST /api/sessions return 500 {"error":"harness_exited"}. NOT_FOUND also matches "no such session".
 - Screen trim: linear backward scan; removes only trailing blank lines.
 - iOS: logout shows failure and offers retry; "Đăng xuất trên máy này" clears only local credentials, "Đăng xuất mọi nơi" clears locally only after the server confirms. On SSE gone with reason auth (or a 401 from /api/me) go to login; with reason session show "Phiên đã đóng".
+
+## Amendment A4 (2026-10-25, user decision): device pairing replaces the password
+
+- No password. Remove POST /api/login, passwordHash in the config, --set-password, scrypt and the login rate limiter. config.json keeps cookieSecret, projects and port.
+- Only someone with a shell on the box can start a pairing.
+  - The command is `node server.mjs --pair [device-name]`. install.sh also installs the wrapper `~/.local/bin/fcode-pair`, which runs it.
+  - The CLI talks to the RUNNING server over the unix socket <configDir>/admin.sock. The socket has mode 600 and is usable by its owner only. The server creates it at start and removes a stale one.
+  - The server creates one pending pairing. Its 6-digit code comes from crypto.randomInt. The code is valid for 120 s and allows at most 5 wrong attempts. Only one pairing can be pending; a new --pair replaces it.
+  - The CLI prints the code and the expiry time, then exits.
+  - If the server is not running, the CLI says so and exits 1.
+- POST /api/pair {code, name} requires X-PC: 1 and no other auth.
+  - Success: 200 {ok:true, token} and Set-Cookie pc_sid, with the same flags as before.
+  - Wrong or expired code: 401 {error:"bad_code"}. Five wrong attempts invalidate the pending code.
+  - Global limit on /api/pair: 10 per minute and 30 per hour. Over the limit: 429 with Retry-After.
+  - Codes are compared in constant time.
+- Devices are stored in <configDir>/devices.json, mode 600.
+  - Only the server writes the file, using the atomic write: tmp file, fsync, rename, directory fsync.
+  - Format: {devices:[{id, name, keyHash: HMAC-SHA256(cookieSecret, token), createdAt}]}.
+  - The token is returned once. It is never stored or logged.
+  - A pairing succeeds only after the durable write succeeds. Otherwise: 500 {error:"storage"} and no token.
+  - Devices survive server restarts. They do not expire; a device stays until it is revoked.
+- Revocation:
+  - `node server.mjs --devices` lists id, name and createdAt.
+  - `--revoke <id>` and `--revoke all` go through admin.sock. The server writes devices.json first, then removes the device from memory and bumps gen for that device. In-flight jobs for that device stop at the gate.
+  - If the write fails, the CLI prints the error and exits 1, and nothing changes.
+  - POST /api/logout removes the calling device the same way. On failure: 500 storage.
+  - POST /api/logout?all=1 removes all devices.
+- Startup: if devices.json is missing, the device list is empty. If it is present but invalid, the server refuses to start: exit 1, with no secrets in the message.
+- The run(ctx) gate checks that the device id still exists and gen is unchanged. This replaces the memory-session check.
+- Rotating cookieSecret (a manual config edit) invalidates every device, because keyHash no longer matches. The server then rewrites devices.json as an empty list.
+- Client (iOS): the token is stored in the Keychain. When the app is signed by Sideloadly, it has a normal keychain.
+
+### A4 update r1 (2026-10-25, review round 1)
+- Commit point = the rename of devices.json. After it succeeds, the change is committed: memory follows, a directory-fsync error is only logged (pair returns the token, revoke/logout succeed). A failure before or at the rename changes nothing (storage error).
+- devices.json has `secretTag` = HMAC-SHA256(cookieSecret, "fcoding-devices") hex. At startup and on every config reload, a tag that does not match the current secret clears the devices from memory first, then rewrites devices.json empty with the new tag. If that rewrite fails, `purgePending` is set: the purge is retried before any other devices.json write, on every admin request and on each config refresh; meanwhile no device authenticates and pairing answers 500 storage. No tag + empty list = valid (first run); no tag + devices = mismatch.
+- /api/pair counts against 10/min and 30/h before the body is read (oversized, slow and invalid bodies count too).
+- parseDevices checks exact types (strings for id, name, keyHash, secretTag; number for createdAt) before any pattern check.
+- admin.sock handles only the first line of a connection; admin() calls refreshConfig() first.
+- The CLI prints the remaining time: "Mã ghép: 482913 (hết hạn sau 120 giây)".
+- Device names lose C0, DEL, C1 (U+0080–U+009F) and bidi controls (U+200E/U+200F, U+202A–U+202E, U+2066–U+2069).
+- install.sh quotes the paths in the fcode-pair wrapper and removes an obsolete passwordHash from config.json atomically (tmp, fsync, rename, mode 600; other fields kept).
+- Accepted: anyone on the internet can use up the global 30/h pairing limit; the owner then waits up to 1 h.
+
+## Amendment A5 (2026-10-25, user decision): project list = attention-first inbox + harness dock
+- New read endpoint GET /api/overview (auth like other reads; it goes through the read gate as ONE read job; internal tmux/git calls run sequentially inside that job, each with the existing exec timeout). Response:
+  `{ now, projects: [{ name, branch, ahead, diff: {files, add, del} | null }], sessions: [{ name, project, harness, created, activity, attached, state, preview }] }`
+  - `state`: "running" if session_activity is within 8 s of now; otherwise "waiting" if the last 6 non-empty lines of the visible pane match an approval/question pattern (case-insensitive: `(y/n)`, `[y/n]`, `[Y/n]`, `[y/N]`, `yes/no`, `do you want`, `allow`, `approve`, `proceed?`, `continue?`, `press enter`, a numbered choice line like `❯ 1.` or `> 1.`); otherwise "idle". The pattern list lives in one constant.
+  - `preview`: the last non-empty pane line that is not prompt/box-drawing chrome, ANSI-stripped, control chars removed, trimmed, at most 160 chars (cut on a code-point boundary).
+  - `branch`: `git -C <dir> rev-parse --abbrev-ref HEAD`; `diff`: from `git -C <dir> diff --shortstat HEAD` (null if not a git repo or on error); `ahead`: commits ahead of upstream or null. Git results are cached per project for 10 s.
+  - Never include secrets or file contents beyond the preview line. Errors in one project/session give nulls for that item, not a failed response.
+- Unread is client-side: the app stores the last `activity` it has seen per session.
+- Inline answers use the existing POST /api/key and /api/send (e.g. send text "y" with enter).
+- iOS: screen = inbox (header "FCode", subtitle "N phiên đang chờ bạn" when N>0, gear left, "+" right), project filter pills, sections "Cần bạn" (waiting; full preview + buttons: y/n prompts get "y · Đồng ý", "n · Từ chối", "Mở"; others "Trả lời", "Mở"), "Đang chạy" (project · branch · diff, one-line preview, thin activity bar), "Đang nghỉ" (compact, dimmed). Bottom: floating translucent harness dock (Tất cả / omp / claude / codex / shell, icon + label) filtering the list; "+" opens a sheet that skips the harness step when the dock has a harness selected. Poll /api/overview every 5 s while visible (pause in background), pull to refresh, swipe left on a row: "Đã đọc/Chưa đọc", "Xoá" (kill session with confirmation).
+- A5 update (user, 2026-10-25): "Cần bạn" is always expanded. "Đang chạy" and "Đang nghỉ" are collapsed by default: one header row each (name, count, the harness badges of its sessions, chevron); tapping the row expands/collapses it with an animation. The expanded/collapsed state is remembered per section (UserDefaults). An empty section is hidden.
+- A5 update 2 (user, 2026-10-25): the project filter row uses Cây A's chip rail instead of Cây B's pills: horizontal scrolling capsules "Tất cả", then each project; a chip shows an orange badge with the number of sessions waiting for the user, or a grey session count when none wait; the selected chip is white with dark text.
+- A5 update 3 (user, 2026-10-25): harness colours — claude orange (#D97757), omp purple (#A78BFA), codex blue (#5AC8FA-like, as in the preview), shell grey. The codex glyph matches the official Codex mark (drawn as a vector, not a downloaded image).
+- A5 update 4 (user, 2026-10-25): "+" always STARTS A NEW SESSION (it never reopens an old one; existing sessions are opened from the list). Server: POST /api/open accepts an optional `fresh: true`. With fresh, inside ONE mutation job the server picks the first free name among `<base>`, `<base>-2`, `<base>-3`, … (base = the existing project-harness name rule; the suffix is kept within the 32-char limit by shortening base) and creates it; it never reuses an existing session. Response `{name, created:true}`. Without fresh the old behaviour stays. iOS: the "+" sheet's project rows say "Phiên mới · đang có N phiên <harness>" (or "Phiên mới" when none) and call /api/open with fresh:true, then open the new session.

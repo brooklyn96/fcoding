@@ -9,25 +9,27 @@ Máy chủ nhỏ chạy trên box instabox để app iOS điều khiển các ph
 bash /tmp/fcoding/install.sh
 ```
 
-Script chép `server.mjs` vào `/data/home/fcoding`, tạo thư mục cấu hình `/data/home/.fcoding` (quyền 700) và bật dịch vụ `fcoding.service` (systemd --user, tự chạy lại khi lỗi, cổng 7681). Chạy lại script nhiều lần vẫn an toàn. Lần cài đầu tiên: đặt mật khẩu (bên dưới) rồi chạy `systemctl --user restart fcoding`; khi chưa có `config.json` hợp lệ, máy chủ không chạy.
+Script chép `server.mjs` vào `/data/home/fcoding`, tạo thư mục cấu hình `/data/home/.fcoding` (quyền 700) và bật dịch vụ `fcoding.service` (systemd --user, tự chạy lại khi lỗi, cổng 7681). Chạy lại script nhiều lần vẫn an toàn. Lần cài đầu, script tạo `config.json` với một khóa bí mật ngẫu nhiên và cài lệnh `~/.local/bin/fcode-pair`.
 
-Đăng nhập chỉ lưu trong bộ nhớ: mỗi lần dịch vụ khởi động lại, mọi thiết bị phải đăng nhập lại.
+## Ghép nối điện thoại (không có mật khẩu)
 
-## Đặt mật khẩu
-
-Để máy chủ tự tạo mật khẩu ngẫu nhiên (chỉ hiện MỘT lần, hãy ghi lại):
+Chỉ người có shell trên box mới ghép được thiết bị. Trên box chạy:
 
 ```sh
-PC_CONFIG_DIR=/data/home/.fcoding node /data/home/fcoding/server.mjs --set-password </dev/null
+fcode-pair "iPhone"
 ```
 
-Hoặc tự chọn (không để lại trong lịch sử lệnh; chỉ ký tự xuống dòng cuối bị bỏ, dấu cách đầu/cuối được giữ):
+Lệnh in ra mã 6 số. Nhập mã vào app trong 120 giây. Mã dùng được một lần; nhập sai 5 lần thì mã bị hủy; chạy lại lệnh sẽ thay mã cũ. Máy chủ phải đang chạy (nếu không, lệnh báo lỗi).
+
+Thiết bị đã ghép được lưu trong `/data/home/.fcoding/devices.json` (chỉ lưu dạng băm, không lưu mã đăng nhập) và vẫn còn sau khi máy chủ khởi động lại.
 
 ```sh
-read -rs PW; printf '%s\n' "$PW" | PC_CONFIG_DIR=/data/home/.fcoding node /data/home/fcoding/server.mjs --set-password; unset PW
+PC_CONFIG_DIR=/data/home/.fcoding node /data/home/fcoding/server.mjs --devices          # danh sách thiết bị
+PC_CONFIG_DIR=/data/home/.fcoding node /data/home/fcoding/server.mjs --revoke <id>      # gỡ một thiết bị
+PC_CONFIG_DIR=/data/home/.fcoding node /data/home/fcoding/server.mjs --revoke all       # gỡ tất cả
 ```
 
-Đổi mật khẩu có hiệu lực ngay, không cần khởi động lại; mọi phiên đăng nhập cũ bị đăng xuất.
+Đổi `cookieSecret` trong `config.json` sẽ gỡ mọi thiết bị (kể cả khi đổi lúc máy chủ đang tắt); sau đó phải ghép lại từng điện thoại.
 
 Danh sách dự án nằm trong `/data/home/.fcoding/config.json` (`"projects": {"tên": "/đường/dẫn/tuyệt/đối"}`). Máy chủ tự đọc lại file sau khi sửa, không cần khởi động lại; nếu file bị lỗi cú pháp, máy chủ giữ cấu hình cũ cho tới khi file được sửa đúng.
 
@@ -39,7 +41,7 @@ Các harness chạy với PATH cố định: `~/.local/bin`, `~/.bun/bin`, `/usr
 instabox port publish <tên-box> 7681
 ```
 
-Lệnh in ra địa chỉ công khai; nhập địa chỉ đó và mật khẩu vào app. Mở `GET /` sẽ thấy dòng `fcoding ok`.
+Lệnh in ra địa chỉ công khai; nhập địa chỉ đó và mã ghép nối vào app. Mở `GET /` sẽ thấy dòng `fcoding ok`.
 
 ## Nối từ laptop vào cùng phiên
 
@@ -59,7 +61,7 @@ tmux set-option -wu window-size
 - Tối đa 50 luồng xem màn hình cùng lúc và 8 tiến trình tmux đồng thời.
 - Lệnh thay đổi (mở, tạo, xóa phiên, gửi chữ, phím, đổi kích thước) chạy lần lượt từng cái; tối đa 20 lệnh chờ, quá thì trả `503 busy`. Lệnh đọc (màn hình, danh sách) không phải chờ: hết chỗ thì trả `503 busy` ngay.
 - Tin nhắn tối đa 32 KB, thân yêu cầu tối đa 64 KB.
-- Đăng nhập sai: khóa 15 phút sau 5 lần theo từng địa chỉ IP, và 30 lần mỗi giờ cho cả hệ thống.
+- Ghép nối (`/api/pair`): tối đa 10 lần mỗi phút và 30 lần mỗi giờ cho cả hệ thống; quá thì trả `429` kèm `Retry-After`. Giới hạn này tính chung cho mọi người trên internet, nên người lạ có thể dùng hết 30 lượt trong một giờ; khi đó hãy chờ tối đa 1 giờ rồi ghép lại. Ghép nối hiếm khi cần, nên điều này được chấp nhận.
 
 ## Kiểm thử
 
