@@ -1811,6 +1811,16 @@ test('a numbered choice inside box drawing is waiting; the preview is the inner 
   assert.equal(stateOf('│ step 1. done │', act, t), 'idle');
 });
 
+test('waiting preview: the question line, not a numbered option (plain and boxed)', () => {
+  const act = 1_700_000_000, t = act * 1000 + 9000;
+  const want = { state: 'waiting', preview: 'Do you want to proceed?' };
+  assert.deepEqual(summarize('Do you want to proceed?\n❯ 1. Yes\n2. No\n', act, t), want);
+  assert.deepEqual(summarize('╭───────────────────────────╮\n│ Do you want to proceed?   │\n│ ❯ 1. Yes                  │\n│   2. No                   │\n╰───────────────────────────╯\n', act, t), want);
+  assert.deepEqual(summarize('Allow this command?\n› 1. Yes\n> 2. Yes, and always allow\n', act, t), { state: 'waiting', preview: 'Allow this command?' });
+  // only options match: the last of them
+  assert.deepEqual(summarize('Pick one\n❯ 1. Yes\n> 2. Always allow\n', act, t), { state: 'waiting', preview: '> 2. Always allow' });
+});
+
 test('open fresh: a name created outside the server meanwhile moves on to base-2', () => withApp(async (c) => {
   const { cookie } = await c.login();
   await withEnv({ FAKE_TMUX_DUP_ONCE: 'alpha-shell' }, async () => {
