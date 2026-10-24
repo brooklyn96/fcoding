@@ -171,8 +171,9 @@ export function createApp(opts = {}) {
     }
   }
   // devices.json written for another cookieSecret: devices are dropped from memory first, then the file is rewritten empty
-  let purgePending = false;
+  let purgePending = false, purgeAt = -Infinity;
   function purge() {
+    purgeAt = now();
     try { writeDevices([]); purgePending = false; } catch (e) { purgePending = true; log(`devices.json purge failed: ${e.code || 'error'}`); }
     return !purgePending;
   }
@@ -185,16 +186,21 @@ export function createApp(opts = {}) {
     writeDevices(list);
     load(list);
   }
-  function refreshConfig() {
-    if (purgePending) purge();
+  // force: an admin request. A pending purge is retried on force, on a config change, else at most once per second.
+  function refreshConfig(force = false) {
     const st = stampOf();
-    if (st === cfgStamp) return;
-    cfgStamp = st; // a bad file is retried on its next change
-    let next;
-    try { next = parseConfig(fs.readFileSync(cfgFile, 'utf8')); } catch (e) { log(`config reload failed, keeping the previous one: ${e.code || e.message}`); return; }
-    const rotated = !next.secret.equals(cfg.secret);
-    cfg = next;
-    if (rotated) { gen++; load([]); purge(); } // no old keyHash may match any more
+    const changed = st !== cfgStamp;
+    if (changed) {
+      cfgStamp = st; // a bad file is retried on its next change
+      let next = null;
+      try { next = parseConfig(fs.readFileSync(cfgFile, 'utf8')); } catch (e) { log(`config reload failed, keeping the previous one: ${e.code || e.message}`); }
+      if (next) {
+        const rotated = !next.secret.equals(cfg.secret);
+        cfg = next;
+        if (rotated) { gen++; load([]); purge(); return; } // no old keyHash may match any more
+      }
+    }
+    if (purgePending && (force || changed || now() - purgeAt >= 1000)) purge();
   }
   const keyOf = (token) => crypto.createHmac('sha256', cfg.secret).update(token).digest('hex');
   // ctx = {cancelled, device, gen}: the request is alive, its device still paired, the config generation unchanged
@@ -237,7 +243,7 @@ export function createApp(opts = {}) {
     commitDevices([...devices.values()].filter((d) => !ids.includes(d.id)));
   }
   function admin(req) {
-    refreshConfig(); // a rotation or a pending purge is handled before any answer
+    refreshConfig(true); // a rotation or a pending purge is handled before any answer
     if (req?.cmd === 'pair') {
       pending = { code: String(crypto.randomInt(0, 1e6)).padStart(6, '0'), name: cleanName(req.name), expiresAt: now() + PAIR_TTL, attempts: 0 };
       return { ok: true, code: pending.code, expiresAt: pending.expiresAt, expiresIn: PAIR_TTL / 1000 };
@@ -273,9 +279,15 @@ export function createApp(opts = {}) {
       try { st = fs.lstatSync(adminFile); } catch {}
       if (st) {
         if (!st.isSocket()) throw new Error(`unsafe admin socket path (not a socket): ${adminFile}`);
-        const alive = await adminRequest(configDir, { cmd: 'ping' }, 1000).then(() => true, () => false);
-        if (alive) throw new Error('another fcoding server is using admin.sock');
-        fs.unlinkSync(adminFile); // stale
+        // stale only when nobody listens (ENOENT / ECONNREFUSED); a connect, a timeout or any other error: maybe another server
+        const stale = await new Promise((resolve) => {
+          const sock = net.connect(adminFile);
+          const t = setTimeout(() => { sock.destroy(); resolve(false); }, 1000);
+          sock.on('connect', () => { clearTimeout(t); sock.destroy(); resolve(false); });
+          sock.on('error', (e) => { clearTimeout(t); resolve(e.code === 'ENOENT' || e.code === 'ECONNREFUSED'); });
+        });
+        if (!stale) throw new Error('admin.sock đang được một máy chủ khác dùng');
+        fs.unlinkSync(adminFile);
       }
     }
     await new Promise((resolve, reject) => {

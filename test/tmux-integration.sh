@@ -62,6 +62,14 @@ APP="$ROOT" CFG="$PC_CONFIG_DIR" WRAPBODY="$WRAPBODY" bash -c 'eval "cat <<WRAP
 $WRAPBODY
 WRAP"' >"$RUN/fcode-pair"; chmod 755 "$RUN/fcode-pair"
 grep -q -- "--pair" "$RUN/fcode-pair" || { echo "fcode-pair wrapper not found in install.sh"; exit 2; }
+grep -q '^strip_password_hash "\$CFG/config.json"$' "$ROOT/install.sh" && ok "install.sh runs strip_password_hash on \$CFG/config.json" || bad "install.sh calls strip_password_hash"
+# the wrapper with CFG and APP paths that contain a space: both reach node intact
+mkdir -p "$RUN/app dir" "$RUN/cfg dir"; cp "$ROOT/server.mjs" "$RUN/app dir/server.mjs"
+APP="$RUN/app dir" CFG="$RUN/cfg dir" WRAPBODY="$WRAPBODY" bash -c 'eval "cat <<WRAP
+$WRAPBODY
+WRAP"' >"$RUN/fcode-pair-sp"; chmod 755 "$RUN/fcode-pair-sp"
+"$RUN/fcode-pair-sp" "my phone" >"$RUN/sp.out" 2>&1; check "wrapper with spaced paths: no server -> exit 1" "$?" 1
+grep -qF "not running (no $RUN/cfg dir/admin.sock)" "$RUN/sp.out" && ok "wrapper passes spaced CFG and APP intact" || bad "spaced wrapper" "$(cat "$RUN/sp.out")"
 # install.sh on an older install: passwordHash is dropped atomically, cookieSecret and the rest kept; a second run is a no-op
 eval "$(sed -n '/^strip_password_hash() {/,/^}$/p' "$ROOT/install.sh")"
 node -e '
@@ -76,6 +84,31 @@ BEFORE=$(stat -c '%i %Y %s' "$RUN/old.json"; sha256sum <"$RUN/old.json")
 sleep 1.1; strip_password_hash "$RUN/old.json"
 check "second strip is a no-op" "$(stat -c '%i %Y %s' "$RUN/old.json"; sha256sum <"$RUN/old.json")" "$BEFORE"
 [ -e "$RUN/old.json.tmp" ] && bad "no tmp file left" || ok "no tmp file left"
+# a short write (half the bytes per call) still gives the whole file; a failing write keeps the original byte-identical
+cat >"$RUN/inject.cjs" <<'JS'
+const fs = require('fs'), orig = fs.writeSync, mode = process.env.PC_INJECT;
+fs.writeSync = function (fd, buf, off = 0, len = buf.length - off, ...rest) {
+  if (fd <= 2) return orig.call(fs, fd, buf, off, len, ...rest); // stdout/stderr unchanged
+  const n = orig.call(fs, fd, buf, off, Math.max(1, len >> 1), ...rest);
+  if (mode === 'fail') throw Object.assign(new Error('EIO'), { code: 'EIO' });
+  return n;
+};
+JS
+node -e '
+  const fs=require("fs"),c=JSON.parse(fs.readFileSync(process.argv[1]));c.passwordHash={salt:"x".repeat(5000),hash:"y"};
+  fs.writeFileSync(process.argv[2],JSON.stringify(c),{mode:0o600})' "$PC_CONFIG_DIR/config.json" "$RUN/old2.json"
+cp "$RUN/old2.json" "$RUN/old2.orig"
+PC_INJECT=fail NODE_OPTIONS="--require $RUN/inject.cjs" strip_password_hash "$RUN/old2.json" 2>"$RUN/strip.err"; check "failing write -> exit 1" "$?" 1
+cmp -s "$RUN/old2.json" "$RUN/old2.orig" && ok "failing write keeps the original byte-identical" || bad "original changed"
+[ -e "$RUN/old2.json.tmp" ] && bad "failing write leaves no tmp" || ok "failing write leaves no tmp"
+PC_INJECT=short NODE_OPTIONS="--require $RUN/inject.cjs" strip_password_hash "$RUN/old2.json"; check "short writes -> exit 0" "$?" 0
+check "short writes still give the whole file" "$(node -e '
+  const fs=require("fs"),o=JSON.parse(fs.readFileSync(process.argv[1])),c=JSON.parse(fs.readFileSync(process.argv[2]));
+  console.log(!("passwordHash" in o) && o.cookieSecret===c.cookieSecret)' "$RUN/old2.json" "$PC_CONFIG_DIR/config.json")" true
+printf '{"cookieSecret":"SEKRET-strip' >"$RUN/bad.json"; cp "$RUN/bad.json" "$RUN/bad.orig"
+strip_password_hash "$RUN/bad.json" >"$RUN/strip.out" 2>&1; check "malformed config -> exit 1" "$?" 1
+check "malformed config: fixed message" "$(cat "$RUN/strip.out")" "config.json không hợp lệ, không sửa"
+cmp -s "$RUN/bad.json" "$RUN/bad.orig" && ok "malformed config untouched" || bad "malformed config changed"
 
 # ---- config dir hygiene: loose modes are repaired, a symlinked dir is refused ----
 chmod 777 "$PC_CONFIG_DIR"; chmod 666 "$PC_CONFIG_DIR/config.json"

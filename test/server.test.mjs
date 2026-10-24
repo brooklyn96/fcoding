@@ -1037,7 +1037,7 @@ test('admin.sock: mode 600, a stale socket is removed, a live one or a non-socke
     assert.ok(st.isSocket());
     assert.equal(st.mode & 0o777, 0o600);
     const twin = createApp({ configDir: c.configDir, tmux: [process.execPath, FAKE], log: () => {} });
-    await assert.rejects(twin.listen(0, '127.0.0.1'), /another fcoding server/);
+    await assert.rejects(twin.listen(0, '127.0.0.1'), /admin\.sock đang được một máy chủ khác dùng/);
     await c.app.close();
     assert.ok(!fs.existsSync(sock));
     // a server that died hard leaves its socket behind
@@ -1091,8 +1091,9 @@ test('CLI: --devices lists, --revoke <id> and --revoke all revoke through admin.
 
 // a server whose devices.json writes can be made to fail
 const failingWrites = () => {
-  const w = { failing: false };
+  const w = { failing: false, attempts: 0 };
   w.fn = (f, d) => {
+    if (f.endsWith('devices.json')) w.attempts++;
     if (w.failing && f.endsWith('devices.json')) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' });
     writePrivate(f, d);
     if (w.afterRename && f.endsWith('devices.json')) throw Object.assign(new Error('EIO'), { code: 'EIO', committed: true }); // dir fsync failed
@@ -1347,3 +1348,59 @@ test('device names lose C0, C1 and bidi control characters', () => withApp(async
   assert.equal((await pairReq(c, p.code, { name: `x${ch(0x202d)}y` })).status, 200);
   assert.deepEqual(devicesFile(c).map((d) => d.name), ['abcdef', 'xy']);
 }));
+
+// ======================= A4 update r2 =======================
+test('admin.sock: a listener that accepts but never answers -> a second server exits 1, the socket is left alone', async (t) => {
+  if (process.platform === 'win32') return t.skip('unix sockets');
+  const c = await boot();
+  const stall = net.createServer(() => {}); // accepts, never answers
+  try {
+    await c.app.close();
+    const sock = adminPath(c.configDir);
+    await new Promise((resolve) => stall.listen(sock, resolve));
+    const ino = fs.statSync(sock).ino;
+    const r = await new Promise((resolve) => execFile(process.execPath, [SERVER], { env: { ...process.env, PC_CONFIG_DIR: c.configDir, PC_PORT: '0' }, encoding: 'utf8', timeout: 15000 },
+      (err, stdout, stderr) => resolve({ status: err ? err.code : 0, stderr })));
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /admin\.sock đang được một máy chủ khác dùng/);
+    assert.equal(fs.statSync(sock).ino, ino); // not unlinked
+    assert.ok(await new Promise((resolve) => { const s = net.connect(sock, () => { s.destroy(); resolve(true); }); s.on('error', () => resolve(false)); }));
+  } finally { await new Promise((r) => stall.close(r)); await c.app.close().catch(() => {}); fs.rmSync(c.root, { recursive: true, force: true }); }
+});
+
+test('purge retry is throttled: at most one write per second from requests; admin requests and config changes always retry', async () => {
+  let t = 1_700_000_000_000;
+  const w = failingWrites();
+  await withApp(async (c) => {
+    const a = await c.login({}, 'a');
+    w.failing = true;
+    rotate(c);
+    w.attempts = 0;
+    for (let i = 0; i < 20; i++) assert.equal((await c.req('GET', '/api/me', { cookie: a.cookie })).status, 401);
+    assert.equal(w.attempts, 1); // the purge that the rotation started; no retry within the same second
+    const failLogs = () => c.logs.filter((l) => l.startsWith('devices.json purge failed')).length;
+    assert.equal(failLogs(), 1);
+    t += 999;
+    await c.req('GET', '/api/me', { cookie: a.cookie });
+    assert.equal(w.attempts, 1);
+    t += 1;
+    for (let i = 0; i < 5; i++) await c.req('GET', '/api/me', { cookie: a.cookie });
+    assert.equal(w.attempts, 2); // one retry after 1 s
+    await adminRequest(c.configDir, { cmd: 'devices' });
+    await adminRequest(c.configDir, { cmd: 'devices' });
+    assert.equal(w.attempts, 4); // every admin request retries
+    const f = path.join(c.configDir, 'config.json');
+    writePrivate(f, JSON.stringify({ ...JSON.parse(fs.readFileSync(f, 'utf8')), projects: { beta: ABS } })); // same secret, new stamp
+    await c.req('GET', '/api/me', { cookie: a.cookie });
+    assert.equal(w.attempts, 5); // a config change retries
+    assert.equal(failLogs(), 5); // one log line per attempt
+    w.failing = false;
+    t += 1000;
+    await c.req('GET', '/api/me', { cookie: a.cookie });
+    assert.equal(w.attempts, 6);
+    assert.deepEqual(devicesFile(c), []);
+    for (let i = 0; i < 5; i++) await c.req('GET', '/api/me', { cookie: a.cookie });
+    assert.equal(w.attempts, 6); // nothing pending: no more writes
+    await c.login({}, 'new');
+  }, { now: () => t, writePrivate: w.fn });
+});

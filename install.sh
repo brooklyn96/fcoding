@@ -24,14 +24,20 @@ if [ ! -f "$CFG/config.json" ]; then
 fi
 chmod 600 "$CFG/config.json"
 # older installs: drop the obsolete passwordHash; every other field (the cookieSecret too) stays. No-op when absent.
-strip_password_hash() { # strip_password_hash CONFIG_FILE  (tmp file, fsync, rename; mode 600)
+strip_password_hash() { # strip_password_hash CONFIG_FILE  (tmp file, full write, fsync, rename; mode 600; the original is kept on any error)
   node -e '
-    const fs = require("fs"), f = process.argv[1], c = JSON.parse(fs.readFileSync(f, "utf8"));
+    const fs = require("fs"), f = process.argv[1], tmp = f + ".tmp";
+    let c;
+    try { c = JSON.parse(fs.readFileSync(f, "utf8")); if (!c || typeof c !== "object" || Array.isArray(c)) throw 0; }
+    catch { console.error("config.json không hợp lệ, không sửa"); process.exit(1); }
     if (!Object.hasOwn(c, "passwordHash")) process.exit(0);
     delete c.passwordHash;
-    const tmp = f + ".tmp"; fs.rmSync(tmp, { force: true });
-    const fd = fs.openSync(tmp, "wx", 0o600); fs.writeSync(fd, JSON.stringify(c, null, 2)); fs.fsyncSync(fd); fs.closeSync(fd);
-    fs.renameSync(tmp, f);' "$1"
+    try {
+      fs.rmSync(tmp, { force: true });
+      const fd = fs.openSync(tmp, "wx", 0o600);
+      try { fs.writeFileSync(fd, Buffer.from(JSON.stringify(c, null, 2))); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      fs.renameSync(tmp, f);
+    } catch (e) { fs.rmSync(tmp, { force: true }); console.error("không sửa được config.json: " + (e.code || "lỗi")); process.exit(1); }' "$1"
 }
 strip_password_hash "$CFG/config.json"
 [ ! -f "$CFG/devices.json" ] || chmod 600 "$CFG/devices.json"
