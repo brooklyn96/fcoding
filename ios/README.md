@@ -39,8 +39,16 @@ Sau khi ghép, iPhone nhớ box trong Keychain; mở ứng dụng là vào thẳ
 
 ## 4. Cách dùng
 
-- **Mở dự án**: chọn chương trình ở thanh phía trên (mặc định `omp`), rồi chạm vào tên dự án. Nếu phiên đã có thì ứng dụng mở lại phiên đó.
-- **Phiên đang chạy**: chạm để mở; vuốt sang trái (hoặc nhấn giữ) để **Xoá**.
+- **Màn hình chính** gom mọi phiên trên box, việc cần bạn lên đầu. Danh sách tự cập nhật mỗi 5 giây; kéo xuống để cập nhật ngay.
+  - Dòng chữ cam dưới **FCode** cho biết bao nhiêu phiên đang chờ bạn.
+  - **Hàng dự án** (trượt ngang): chạm **Tất cả** hoặc một dự án để chỉ xem phiên của dự án đó. Số cam = số phiên đang chờ bạn; số xám = số phiên.
+  - **Cần bạn**: phiên đang hỏi bạn, luôn mở sẵn, hiện đầy đủ câu hỏi. Câu hỏi có/không có nút **y · Đồng ý** và **n · Từ chối** (gửi y hoặc n kèm Enter); câu khác có nút **Trả lời** (mở phiên, con trỏ ở ô nhập). Nút **Mở** mở phiên.
+  - **Đang chạy** và **Đang nghỉ**: mặc định thu gọn thành một dòng; chạm để mở hoặc thu gọn. Ứng dụng nhớ lựa chọn này.
+  - Chấm xanh dương cạnh tên = có thay đổi bạn chưa xem. Mở phiên là tính đã đọc.
+  - Vuốt trái một phiên: **Đã đọc / Chưa đọc**, hoặc **Xoá** (có hỏi xác nhận; chương trình trong phiên bị tắt).
+  - **Thanh dưới cùng** (Tất cả / omp / claude / codex / shell): chỉ xem phiên của một chương trình.
+- **Phiên mới** (nút **+** góc phải): luôn tạo một phiên MỚI, không mở lại phiên cũ (phiên cũ mở từ danh sách). Chọn chương trình rồi chọn dự án; nếu thanh dưới đang chọn một chương trình thì bỏ qua bước chọn chương trình.
+- **Cài đặt**: nút bánh răng góc trái.
 - **Trong phiên**:
   - Màn hình tự cuộn xuống dòng mới nhất. Nếu bạn cuộn lên để đọc, bấm **Xuống cuối** để quay lại.
   - **A-** / **A+**: chữ nhỏ hơn / to hơn.

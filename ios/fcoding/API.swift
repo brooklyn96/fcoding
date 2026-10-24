@@ -15,6 +15,45 @@ struct SessionsResponse: Decodable { let sessions: [SessionInfo] }
 struct OpenResponse: Decodable { let name: String; let created: Bool? }
 struct Screen: Decodable { let text: String; let rows: Int?; let cols: Int?; let hash: String? }
 
+/// GET /api/overview (CONTRACT A5). Per-item failures arrive as nulls, so most fields are optional.
+struct Overview: Decodable {
+    let now: Double
+    let projects: [ProjectInfo]
+    let sessions: [OverviewSession]
+}
+
+struct ProjectInfo: Decodable, Hashable {
+    let name: String
+    let branch: String?
+    let ahead: Int?
+    let diff: DiffStat?
+}
+
+struct DiffStat: Decodable, Hashable { let files: Int; let add: Int; let del: Int }
+
+struct OverviewSession: Decodable, Identifiable, Hashable {
+    let name: String
+    let project: String?
+    let harness: String?
+    let created: Double?
+    let activity: Double?
+    let attached: Bool?
+    /// "running" | "waiting" | "idle" (anything else is shown as idle).
+    let state: String?
+    let preview: String?
+    var id: String { name }
+}
+
+extension API {
+    func overview() async throws -> Overview { try await get("api/overview", as: Overview.self) }
+
+    /// POST /api/open with fresh:true: always a new session (CONTRACT A5 update 4).
+    func openFresh(project: String, harness: String) async throws -> OpenResponse {
+        let data = try await call("POST", "api/open", body: ["project": project, "harness": harness, "fresh": true])
+        return try JSONDecoder().decode(OpenResponse.self, from: data)
+    }
+}
+
 struct SessionInfo: Decodable, Identifiable, Hashable {
     let name: String
     let project: String?
