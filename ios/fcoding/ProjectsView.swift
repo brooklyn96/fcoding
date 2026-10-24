@@ -20,6 +20,14 @@ struct ProjectsView: View {
     var body: some View {
         NavigationStack(path: $path) {
             List {
+                if let notice = app.notice {
+                    Section {
+                        Button { app.notice = nil } label: {
+                            Label(notice, systemImage: "exclamationmark.circle").foregroundColor(.orange)
+                        }
+                        .accessibilityHint("Chạm để ẩn")
+                    }
+                }
                 if let errorText = errorText {
                     Section { Label(errorText, systemImage: "exclamationmark.triangle").foregroundColor(.red) }
                 }

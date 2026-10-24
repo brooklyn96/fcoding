@@ -10,10 +10,19 @@ final class AppState: ObservableObject {
 
     private static let serverKey = "serverURL"
     private static let tokenKey = "token"
+    /// Set when the Keychain refused the token (e.g. LiveContainer entitlements): the app then
+    /// relies on the persistent pc_sid cookie in HTTPCookieStorage (token "").
+    private static let cookieModeKey = "cookieMode"
+    private static let cookieNoticeShownKey = "cookieModeNoticeShown"
 
     init() {
         serverURL = UserDefaults.standard.string(forKey: AppState.serverKey) ?? ""
-        token = serverURL.isEmpty ? nil : Keychain.get(AppState.tokenKey)
+        if serverURL.isEmpty {
+            token = nil
+        } else {
+            token = Keychain.get(AppState.tokenKey)
+                ?? (UserDefaults.standard.bool(forKey: AppState.cookieModeKey) ? "" : nil)
+        }
     }
 
     var api: API? {
@@ -36,9 +45,22 @@ final class AppState: ObservableObject {
         let newToken = reply.token ?? ""
         serverURL = base.absoluteString
         UserDefaults.standard.set(serverURL, forKey: AppState.serverKey)
-        Keychain.set(newToken, for: AppState.tokenKey) // if this fails the token lives in memory only
-        notice = nil
-        token = newToken
+        let defaults = UserDefaults.standard
+        if Keychain.set(newToken, for: AppState.tokenKey) {
+            defaults.removeObject(forKey: AppState.cookieModeKey)
+            notice = nil
+            token = newToken
+        } else {
+            // Cookie mode: survives a cold start through the persistent session cookie.
+            defaults.set(true, forKey: AppState.cookieModeKey)
+            if defaults.bool(forKey: AppState.cookieNoticeShownKey) {
+                notice = nil
+            } else {
+                defaults.set(true, forKey: AppState.cookieNoticeShownKey)
+                notice = "Không lưu được mật khẩu đăng nhập an toàn; app sẽ dùng cookie."
+            }
+            token = ""
+        }
     }
 
     /// "Đăng xuất trên máy này": forget the credentials on this phone only.
@@ -56,6 +78,7 @@ final class AppState: ObservableObject {
 
     func signOutLocally(notice: String?) {
         Keychain.delete(AppState.tokenKey)
+        UserDefaults.standard.removeObject(forKey: AppState.cookieModeKey)
         if let url = URL(string: serverURL) {
             HTTPCookieStorage.shared.cookies(for: url)?.forEach { HTTPCookieStorage.shared.deleteCookie($0) }
         }

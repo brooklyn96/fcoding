@@ -7,6 +7,7 @@ struct SessionView: View {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model: SessionModel
     @AppStorage("fontSize") private var fontSize: Double = 13
+    @State private var stoppedInBackground = false
 
     init(name: String) {
         self.name = name
@@ -38,8 +39,9 @@ struct SessionView: View {
 
             Divider()
             ComposerView(
-                onSend: { text, enter in await model.send(text, enter: enter) },
-                onKey: { key in _ = Task { await model.key(key) } }
+                draftKey: "draft.\(name)",
+                onSend: { text, enter in model.send(text, enter: enter) },
+                onKey: { key in model.key(key) }
             )
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
@@ -62,7 +64,15 @@ struct SessionView: View {
         .onAppear { model.start(app: app) }
         .onDisappear { model.stop() }
         .onChange(of: scenePhase) { phase in
-            if phase == .active { model.restart() }
+            // Background: close the stream and polling so the server frees its slot.
+            // Back to active: restart only if it was the background that stopped it.
+            if phase == .background {
+                model.stop()
+                stoppedInBackground = true
+            } else if phase == .active, stoppedInBackground {
+                stoppedInBackground = false
+                model.restart()
+            }
         }
     }
 
@@ -195,41 +205,49 @@ private let quickKeys: [QuickKey] = [
 
 private let slashCommands = ["/model", "/clear", "/compact", "/help", "/resume", "/exit"]
 
-/// The draft lives only here and is only written by the keyboard, except: cleared after a
-/// successful send (if unchanged) and appended to by the "/" menu. Never rewritten while typing.
+/// The draft lives only here and is only written by the keyboard, except: restored from
+/// UserDefaults when the view appears (if empty), cleared after a successful send (if unchanged)
+/// and appended to by the "/" menu. Never rewritten while typing. Every change is mirrored to
+/// UserDefaults (`draftKey`) so a 401 / re-login does not lose it.
 struct ComposerView: View {
-    let onSend: (String, Bool) async -> Bool
+    let draftKey: String
+    /// Queues the send synchronously (FIFO with key presses); the task says whether it succeeded.
+    let onSend: (String, Bool) -> Task<Bool, Never>
     let onKey: (String) -> Void
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     @State private var draft = ""
     @State private var sending = false
+    @State private var showKeys = false
+
+    /// Landscape on iPhone: short editor, buttons side by side, key row behind a toggle.
+    private var compact: Bool { verticalSizeClass == .compact }
+    private var buttonLayout: AnyLayout {
+        compact ? AnyLayout(HStackLayout(spacing: 6)) : AnyLayout(VStackLayout(spacing: 6))
+    }
 
     var body: some View {
         VStack(spacing: 6) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 6) {
-                    Menu {
-                        ForEach(slashCommands, id: \.self) { cmd in
-                            Button(cmd) { draft = draft.isEmpty ? cmd : draft + cmd }
-                        }
-                    } label: {
-                        keyLabel("/")
-                    }
-                    .accessibilityLabel("Lệnh gạch chéo")
-                    ForEach(quickKeys, id: \.key) { k in
-                        Button { onKey(k.key) } label: { keyLabel(k.title) }
-                            .accessibilityLabel(k.label)
-                    }
-                }
-            }
+            if !compact || showKeys { keyRow }
 
             HStack(alignment: .bottom, spacing: 8) {
+                if compact {
+                    Button { showKeys.toggle() } label: {
+                        Image(systemName: "keyboard")
+                            .font(.system(size: 17, weight: .semibold))
+                            .frame(width: 44, height: 44)
+                            .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8))
+                            .foregroundColor(showKeys ? Color.accentColor : Color.primary)
+                    }
+                    .accessibilityLabel(showKeys ? "Ẩn phím nhanh" : "Hiện phím nhanh")
+                }
+
                 ZStack(alignment: .topLeading) {
                     TextEditor(text: $draft)
                         .font(.system(size: 17))
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .scrollContentBackground(.hidden)
-                        .frame(height: 84)
+                        .frame(height: compact ? 44 : 84)
                     if draft.isEmpty {
                         Text("Nhập tin nhắn…")
                             .font(.system(size: 17))
@@ -243,7 +261,7 @@ struct ComposerView: View {
                 .padding(.horizontal, 4)
                 .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 10))
 
-                VStack(spacing: 6) {
+                buttonLayout {
                     Button { submit(enter: true) } label: {
                         Group {
                             if sending { ProgressView() } else { Text("Gửi").font(.headline) }
@@ -257,12 +275,41 @@ struct ComposerView: View {
                         Text("Gửi không Enter")
                             .font(.caption2)
                             .multilineTextAlignment(.center)
-                            .frame(width: 84, height: 30)
+                            .frame(width: 84, height: compact ? 44 : 30)
                     }
                     .buttonStyle(.bordered)
                     .disabled(draft.isEmpty)
                 }
                 .disabled(sending)
+            }
+        }
+        .onAppear {
+            if draft.isEmpty, let saved = UserDefaults.standard.string(forKey: draftKey) { draft = saved }
+        }
+        .onChange(of: draft) { value in
+            if value.isEmpty {
+                UserDefaults.standard.removeObject(forKey: draftKey)
+            } else {
+                UserDefaults.standard.set(value, forKey: draftKey)
+            }
+        }
+    }
+
+    private var keyRow: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                Menu {
+                    ForEach(slashCommands, id: \.self) { cmd in
+                        Button(cmd) { draft = draft.isEmpty ? cmd : draft + cmd }
+                    }
+                } label: {
+                    keyLabel("/")
+                }
+                .accessibilityLabel("Lệnh gạch chéo")
+                ForEach(quickKeys, id: \.key) { k in
+                    Button { onKey(k.key) } label: { keyLabel(k.title) }
+                        .accessibilityLabel(k.label)
+                }
             }
         }
     }
@@ -280,8 +327,9 @@ struct ComposerView: View {
         let text = draft
         guard !sending, enter || !text.isEmpty else { return }
         sending = true
+        let job = onSend(text, enter) // queued now, in tap order with the quick keys
         Task {
-            if await onSend(text, enter), draft == text { draft = "" }
+            if await job.value, draft == text { draft = "" }
             sending = false
         }
     }

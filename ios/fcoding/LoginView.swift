@@ -43,7 +43,7 @@ struct LoginView: View {
                 Section { Label(errorText, systemImage: "xmark.octagon").foregroundColor(.red) }
             }
         }
-        .navigationTitle("Cài đặt")
+        .navigationTitle("Đăng nhập")
         .onAppear { if server.isEmpty { server = app.serverURL } }
     }
 

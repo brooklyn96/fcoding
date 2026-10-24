@@ -36,12 +36,20 @@ Cập nhật bản mới: tải lại `fcoding.ipa` rồi làm lại bước 2. 
   - **A-** / **A+**: chữ nhỏ hơn / to hơn.
   - Chấm màu: xanh lá = đang kết nối trực tiếp, vàng = đang cập nhật định kỳ, cam = đang kết nối, đỏ = mất kết nối.
   - Gõ nội dung vào ô nhập rồi bấm **Gửi** (gửi và nhấn Enter) hoặc **Gửi không Enter**. Bấm **Gửi** khi ô trống = chỉ nhấn Enter.
-  - Hàng phím nhanh: Esc, Ctrl+C, mũi tên, Tab, ⇧Tab, Enter, y, n. Nút **/** chèn các lệnh hay dùng (/model, /clear, …).
-- **Cài đặt** (bánh răng): **Đăng xuất**, hoặc **Đăng xuất mọi nơi** để thoát trên tất cả thiết bị.
+  - Nội dung đang soạn được giữ lại cho từng phiên (kể cả khi phải đăng nhập lại) và chỉ bị xoá sau khi gửi thành công.
+  - Hàng phím nhanh: Esc, Ctrl+C, mũi tên, Tab, ⇧Tab, Enter, y, n. Nút **/** chèn các lệnh hay dùng (/model, /clear, …). Các phím được gửi đúng thứ tự bạn bấm.
+  - Khi xoay ngang: ô nhập thấp lại để màn hình còn chỗ; bấm nút **bàn phím** bên trái ô nhập để hiện / ẩn hàng phím nhanh.
+  - Khi bạn chuyển sang ứng dụng khác, kết nối tạm dừng; mở lại ứng dụng là tự kết nối lại.
+- **Cài đặt** (bánh răng):
+  - **Đăng xuất trên máy này**: chỉ xoá đăng nhập trên điện thoại này.
+  - **Đăng xuất mọi nơi**: thu hồi đăng nhập trên tất cả thiết bị. Điện thoại chỉ đăng xuất sau khi máy chủ xác nhận; nếu lỗi, bấm **Thử lại**.
 
 ## Khi gặp lỗi
 
 - *"Sai mật khẩu."*: kiểm tra lại mật khẩu.
 - *"Thử lại sau N giây."*: nhập sai nhiều lần, đợi đủ thời gian rồi thử lại.
-- *"Phiên đăng nhập đã hết hạn."*: đăng nhập lại.
+- *"Máy chủ đã khởi động lại hoặc phiên hết hạn, đăng nhập lại."*: đăng nhập lại (máy chủ khởi động lại thì mọi thiết bị đều phải đăng nhập lại).
+- *"Phiên đã đóng."*: chương trình trong phiên đã thoát; bấm **Quay lại** rồi mở lại dự án.
+- *"Box đang bận, thử lại sau."*: đợi vài giây rồi thử lại.
+- *"Không lưu được mật khẩu đăng nhập an toàn; app sẽ dùng cookie."*: điện thoại không cho lưu vào Keychain (thường gặp với LiveContainer). App vẫn dùng được và vẫn nhớ đăng nhập; chạm vào thông báo để ẩn.
 - *"Không tìm thấy máy chủ."* / *"Không kết nối được máy chủ."*: kiểm tra mạng và địa chỉ máy chủ.

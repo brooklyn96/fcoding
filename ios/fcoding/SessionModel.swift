@@ -81,9 +81,16 @@ final class SessionModel: ObservableObject {
             throw APIError(status: http.statusCode, code: "")
         }
         link = .live
-        // AsyncLineSequence may skip blank lines, so an event is dispatched on its "data:" line.
+        // Split on LF (0x0A) only, dropping a trailing CR. Foundation's `bytes.lines` also ends a
+        // line at U+0085 / U+2028 / U+2029, which JSON leaves unescaped and would cut a data line.
+        // An event is dispatched on its "data:" line (the server sends one data line per event).
         var event = ""
-        for try await line in bytes.lines {
+        var buffer: [UInt8] = []
+        for try await byte in bytes {
+            guard byte == 0x0A else { buffer.append(byte); continue }
+            if buffer.last == 0x0D { buffer.removeLast() }
+            let line = String(decoding: buffer, as: UTF8.self)
+            buffer.removeAll(keepingCapacity: true)
             if line.hasPrefix("event:") {
                 event = SessionModel.field(line, "event:")
             } else if line.hasPrefix("data:") {
@@ -158,25 +165,46 @@ final class SessionModel: ObservableObject {
 
     // MARK: - Input
 
-    func send(_ text: String, enter: Bool) async -> Bool {
-        guard let api = app?.api else { return false }
-        do {
-            try await api.call("POST", "api/send/\(name)", body: ["text": text, "enter": enter])
-            errorText = nil
-            return true
-        } catch {
-            fail(error)
-            return false
+    /// One FIFO chain for keys and sends: each request starts only after the previous one
+    /// finished, so "↓ then Enter" reaches tmux in tap order. Enqueued synchronously by the caller.
+    private var inputTail: Task<Bool, Never>?
+
+    private func enqueue(_ op: @escaping @MainActor () async -> Bool) -> Task<Bool, Never> {
+        let previous = inputTail
+        let job = Task { @MainActor () async -> Bool in
+            _ = await previous?.value
+            return await op()
+        }
+        inputTail = job
+        return job
+    }
+
+    /// Queues the text; the returned task's value is true when the server accepted it.
+    func send(_ text: String, enter: Bool) -> Task<Bool, Never> {
+        enqueue { [weak self] in
+            guard let self = self, let api = self.app?.api else { return false }
+            do {
+                try await api.call("POST", "api/send/\(self.name)", body: ["text": text, "enter": enter])
+                self.errorText = nil
+                return true
+            } catch {
+                self.fail(error)
+                return false
+            }
         }
     }
 
-    func key(_ key: String) async {
-        guard let api = app?.api else { return }
-        do {
-            try await api.call("POST", "api/key/\(name)", body: ["key": key])
-            errorText = nil
-        } catch {
-            fail(error)
+    func key(_ key: String) {
+        _ = enqueue { [weak self] in
+            guard let self = self, let api = self.app?.api else { return false }
+            do {
+                try await api.call("POST", "api/key/\(self.name)", body: ["key": key])
+                self.errorText = nil
+                return true
+            } catch {
+                self.fail(error)
+                return false
+            }
         }
     }
 
