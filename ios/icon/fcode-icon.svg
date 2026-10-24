@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1024" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#171536"/>
+      <stop offset=".5" stop-color="#241547"/>
+      <stop offset="1" stop-color="#100D23"/>
+    </linearGradient>
+    <linearGradient id="paper" x1="0" y1="190" x2="0" y2="834" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FBF9FF"/>
+      <stop offset=".52" stop-color="#E9E3FF"/>
+      <stop offset="1" stop-color="#CFC2FF"/>
+    </linearGradient>
+    <linearGradient id="violet" x1="416" y1="450" x2="694" y2="630" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#C7ADFF"/>
+      <stop offset="1" stop-color="#9A75F8"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" fill="url(#bg)"/>
+  <g fill="url(#paper)">
+    <rect x="270" y="190" width="180" height="644" rx="90"/>
+    <rect x="270" y="190" width="490" height="180" rx="90"/>
+  </g>
+  <path d="M416 450H582L694 540L582 630H416Z" fill="url(#violet)" stroke="url(#violet)" stroke-width="28" stroke-linejoin="round"/>
+  <path d="M340 210H670" stroke="#FFFFFF" stroke-opacity=".24" stroke-width="14" stroke-linecap="round"/>
+</svg>

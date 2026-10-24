@@ -18,7 +18,6 @@ export PC_TMUX="[\"tmux\",\"-L\",\"$SOCK\"]"
 export PC_CONFIG_DIR="$RUN/cfg"
 export PC_PORT=$PORT
 export LANG=C.UTF-8 LC_ALL=C.UTF-8
-PW='integration-test-password'
 BASE="http://127.0.0.1:$PORT"
 OUT="$RUN/out.txt"; EXP="$RUN/expected.txt"; RESP="$RUN/resp.txt"
 PASS=0; FAIL=0; SERVER_PID=""
@@ -52,11 +51,64 @@ printf '#!/bin/sh\necho "FAKE-CODEX-UP P=$PATH"\nexec sleep 600\n' >"$RUN/home/.
 printf '#!/bin/sh\nsleep 0.2\nexit 3\n' >"$RUN/home/.local/bin/claude"                     # exits after 0.2 s
 chmod +x "$RUN/home/.local/bin/omp" "$RUN/home/.local/bin/codex" "$RUN/home/.local/bin/claude"
 
-# ---- config: password + one project ----
-node "$ROOT/server.mjs" --set-password <<<"$PW" >/dev/null || { echo "set-password failed"; exit 2; }
+# ---- config: random cookie secret + one project (no password: devices are paired, A4) ----
+mkdir -p "$PC_CONFIG_DIR"; chmod 700 "$PC_CONFIG_DIR"
 node -e '
-  const fs=require("fs"),f=process.env.PC_CONFIG_DIR+"/config.json",c=JSON.parse(fs.readFileSync(f));
-  c.projects={work:process.argv[1]};fs.writeFileSync(f,JSON.stringify(c),{mode:0o600})' "$RUN/work"
+  const fs=require("fs"),c={cookieSecret:require("crypto").randomBytes(32).toString("base64"),projects:{work:process.argv[1]},port:7681};
+  fs.writeFileSync(process.env.PC_CONFIG_DIR+"/config.json",JSON.stringify(c),{mode:0o600})' "$RUN/work"
+# the fcode-pair wrapper exactly as install.sh writes it, pointed at this run's config and server
+WRAPBODY=$(sed -n '/^cat > "\$HOME\/.local\/bin\/fcode-pair" <<WRAP$/,/^WRAP$/p' "$ROOT/install.sh" | sed '1d;$d')
+APP="$ROOT" CFG="$PC_CONFIG_DIR" WRAPBODY="$WRAPBODY" bash -c 'eval "cat <<WRAP
+$WRAPBODY
+WRAP"' >"$RUN/fcode-pair"; chmod 755 "$RUN/fcode-pair"
+grep -q -- "--pair" "$RUN/fcode-pair" || { echo "fcode-pair wrapper not found in install.sh"; exit 2; }
+grep -q '^strip_password_hash "\$CFG/config.json"$' "$ROOT/install.sh" && ok "install.sh runs strip_password_hash on \$CFG/config.json" || bad "install.sh calls strip_password_hash"
+# the wrapper with CFG and APP paths that contain a space: both reach node intact
+mkdir -p "$RUN/app dir" "$RUN/cfg dir"; cp "$ROOT/server.mjs" "$RUN/app dir/server.mjs"
+APP="$RUN/app dir" CFG="$RUN/cfg dir" WRAPBODY="$WRAPBODY" bash -c 'eval "cat <<WRAP
+$WRAPBODY
+WRAP"' >"$RUN/fcode-pair-sp"; chmod 755 "$RUN/fcode-pair-sp"
+"$RUN/fcode-pair-sp" "my phone" >"$RUN/sp.out" 2>&1; check "wrapper with spaced paths: no server -> exit 1" "$?" 1
+grep -qF "not running (no $RUN/cfg dir/admin.sock)" "$RUN/sp.out" && ok "wrapper passes spaced CFG and APP intact" || bad "spaced wrapper" "$(cat "$RUN/sp.out")"
+# install.sh on an older install: passwordHash is dropped atomically, cookieSecret and the rest kept; a second run is a no-op
+eval "$(sed -n '/^strip_password_hash() {/,/^}$/p' "$ROOT/install.sh")"
+node -e '
+  const fs=require("fs"),c=JSON.parse(fs.readFileSync(process.argv[1]));c.passwordHash={salt:"x",hash:"y"};
+  fs.writeFileSync(process.argv[2],JSON.stringify(c),{mode:0o644})' "$PC_CONFIG_DIR/config.json" "$RUN/old.json"
+strip_password_hash "$RUN/old.json"
+check "install.sh drops passwordHash, keeps cookieSecret and projects" "$(node -e '
+  const fs=require("fs"),o=JSON.parse(fs.readFileSync(process.argv[1])),c=JSON.parse(fs.readFileSync(process.argv[2]));
+  console.log(!("passwordHash" in o) && o.cookieSecret===c.cookieSecret && JSON.stringify(o.projects)===JSON.stringify(c.projects))' "$RUN/old.json" "$PC_CONFIG_DIR/config.json")" true
+check "rewritten config is mode 600" "$(stat -c %a "$RUN/old.json")" 600
+BEFORE=$(stat -c '%i %Y %s' "$RUN/old.json"; sha256sum <"$RUN/old.json")
+sleep 1.1; strip_password_hash "$RUN/old.json"
+check "second strip is a no-op" "$(stat -c '%i %Y %s' "$RUN/old.json"; sha256sum <"$RUN/old.json")" "$BEFORE"
+[ -e "$RUN/old.json.tmp" ] && bad "no tmp file left" || ok "no tmp file left"
+# a short write (half the bytes per call) still gives the whole file; a failing write keeps the original byte-identical
+cat >"$RUN/inject.cjs" <<'JS'
+const fs = require('fs'), orig = fs.writeSync, mode = process.env.PC_INJECT;
+fs.writeSync = function (fd, buf, off = 0, len = buf.length - off, ...rest) {
+  if (fd <= 2) return orig.call(fs, fd, buf, off, len, ...rest); // stdout/stderr unchanged
+  const n = orig.call(fs, fd, buf, off, Math.max(1, len >> 1), ...rest);
+  if (mode === 'fail') throw Object.assign(new Error('EIO'), { code: 'EIO' });
+  return n;
+};
+JS
+node -e '
+  const fs=require("fs"),c=JSON.parse(fs.readFileSync(process.argv[1]));c.passwordHash={salt:"x".repeat(5000),hash:"y"};
+  fs.writeFileSync(process.argv[2],JSON.stringify(c),{mode:0o600})' "$PC_CONFIG_DIR/config.json" "$RUN/old2.json"
+cp "$RUN/old2.json" "$RUN/old2.orig"
+PC_INJECT=fail NODE_OPTIONS="--require $RUN/inject.cjs" strip_password_hash "$RUN/old2.json" 2>"$RUN/strip.err"; check "failing write -> exit 1" "$?" 1
+cmp -s "$RUN/old2.json" "$RUN/old2.orig" && ok "failing write keeps the original byte-identical" || bad "original changed"
+[ -e "$RUN/old2.json.tmp" ] && bad "failing write leaves no tmp" || ok "failing write leaves no tmp"
+PC_INJECT=short NODE_OPTIONS="--require $RUN/inject.cjs" strip_password_hash "$RUN/old2.json"; check "short writes -> exit 0" "$?" 0
+check "short writes still give the whole file" "$(node -e '
+  const fs=require("fs"),o=JSON.parse(fs.readFileSync(process.argv[1])),c=JSON.parse(fs.readFileSync(process.argv[2]));
+  console.log(!("passwordHash" in o) && o.cookieSecret===c.cookieSecret)' "$RUN/old2.json" "$PC_CONFIG_DIR/config.json")" true
+printf '{"cookieSecret":"SEKRET-strip' >"$RUN/bad.json"; cp "$RUN/bad.json" "$RUN/bad.orig"
+strip_password_hash "$RUN/bad.json" >"$RUN/strip.out" 2>&1; check "malformed config -> exit 1" "$?" 1
+check "malformed config: fixed message" "$(cat "$RUN/strip.out")" "config.json không hợp lệ, không sửa"
+cmp -s "$RUN/bad.json" "$RUN/bad.orig" && ok "malformed config untouched" || bad "malformed config changed"
 
 # ---- config dir hygiene: loose modes are repaired, a symlinked dir is refused ----
 chmod 777 "$PC_CONFIG_DIR"; chmod 666 "$PC_CONFIG_DIR/config.json"
@@ -88,13 +140,33 @@ start_server() {
 }
 start_server
 check "GET / body" "$(curl -s "$BASE/")" "fcoding ok"
+# ---- single instance (A4 update r3): a second server on the same config dir exits 1 and leaves admin.sock alone ----
+SOCK_ID=$(stat -c '%i %Y' "$PC_CONFIG_DIR/admin.sock")
+HOME="$RUN/home" PC_PORT=$((PORT + 2)) timeout 10 node "$ROOT/server.mjs" >"$RUN/twin.out" 2>&1; check "second instance on the same config -> exit 1" "$?" 1
+grep -q "Một máy chủ FCode khác đang dùng thư mục cấu hình này" "$RUN/twin.out" && ok "second instance says why" || bad "second instance message" "$(cat "$RUN/twin.out")"
+check "second instance left admin.sock alone" "$(stat -c '%i %Y' "$PC_CONFIG_DIR/admin.sock")" "$SOCK_ID"
+kill -0 "$SERVER_PID" 2>/dev/null && ok "first instance still running" || bad "first instance died"
 check "config dir mode repaired to 700" "$(stat -c %a "$PC_CONFIG_DIR")" "700"
 check "config.json mode repaired to 600" "$(stat -c %a "$PC_CONFIG_DIR/config.json")" "600"
 
-# ---- login (Bearer token, as the iOS app does) ----
-LOGIN=$(curl -s -X POST -H 'X-PC: 1' -H 'X-PC-Client: ios' -H 'Content-Type: application/json' -d "{\"password\":\"$PW\"}" "$BASE/api/login")
+# ---- pairing via the CLI (fcode-pair), then the Bearer token as the iOS app uses it ----
+check "admin.sock mode 600" "$(stat -c %a "$PC_CONFIG_DIR/admin.sock")" 600
+pair_token() { # pair_token BASEURL PAIRCMD... -> prints the token
+  local base=$1; shift
+  local code; code=$("$@" | sed -n 's/^Mã ghép: \([0-9]\{6\}\) .*/\1/p')
+  curl -s -X POST -H 'X-PC: 1' -H 'Content-Type: application/json' -d "{\"code\":\"$code\"}" "$base/api/pair" | jf token
+}
+CODE=$("$RUN/fcode-pair" it phone | sed -n 's/^Mã ghép: \([0-9]\{6\}\) .*/\1/p')
+[ -n "$CODE" ] && ok "fcode-pair prints a 6-digit code" || bad "fcode-pair code"
+WRONG=$(( (10#$CODE + 1) % 1000000 )); WRONG=$(printf '%06d' "$WRONG")
+check "wrong code -> 401" "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'X-PC: 1' -H 'Content-Type: application/json' -d "{\"code\":\"$WRONG\"}" "$BASE/api/pair")" 401
+LOGIN=$(curl -s -X POST -H 'X-PC: 1' -H 'Content-Type: application/json' -d "{\"code\":\"$CODE\"}" "$BASE/api/pair")
 TOKEN=$(printf '%s' "$LOGIN" | jf token)
-[ -n "$TOKEN" ] && [ "$TOKEN" != undefined ] && ok "login gives a token" || { bad "login" "$LOGIN"; exit 1; }
+[ -n "$TOKEN" ] && [ "$TOKEN" != undefined ] && ok "pairing gives a token" || { bad "pairing" "$LOGIN"; exit 1; }
+check "the code is single use" "$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'X-PC: 1' -H 'Content-Type: application/json' -d "{\"code\":\"$CODE\"}" "$BASE/api/pair")" 401
+check "devices.json mode 600" "$(stat -c %a "$PC_CONFIG_DIR/devices.json")" 600
+grep -q "$TOKEN" "$PC_CONFIG_DIR/devices.json" && bad "devices.json holds no token" || ok "devices.json holds no token"
+node "$ROOT/server.mjs" --devices | grep -q '  it phone$' && ok "--devices lists the phone" || bad "--devices"
 api() { # api METHOD PATH [JSON]  -> prints the HTTP status, body in $RESP
   curl -s -o "$RESP" -w '%{http_code}' -X "$1" -H 'X-PC: 1' -H "Authorization: Bearer $TOKEN" \
     ${3:+-H 'Content-Type: application/json' --data-binary "$3"} "$BASE$2"
@@ -211,6 +283,35 @@ check "51st stream -> 503 busy" "$(curl -s -m 2 -o /dev/null -w '%{http_code}' -
 pkill -f "curl .*127.0.0.1:$PORT/api/stream" 2>/dev/null
 sleep 1
 
+# ---- A5: GET /api/overview on real tmux + git: a running, a waiting and an idle session; the project is a repo with a change ----
+if command -v git >/dev/null; then
+  G() { git -C "$RUN/work" -c user.name=t -c user.email=t@t -c commit.gpgsign=false "$@"; }
+  G init -q -b main && G commit -q --allow-empty -m init && printf 'x\n' >"$RUN/work/ov-change.txt" && G add ov-change.txt
+  T new-session -d -s ov-run -c "$RUN/work" 'while :; do echo tick; sleep 1; done'
+  T new-session -d -s ov-ask -c "$RUN/work" "printf 'Proceed? (y/n) '; exec sleep 600"
+  T new-session -d -s ov-menu -c "$RUN/work" "printf 'Overwrite config? (y/n)\\n❯ 1. Yes\\n  2. No\\n'; exec sleep 600" # a y/n line beside a numbered menu
+  for s in ov-run ov-ask ov-menu; do T set-option -t "=$s:" @pc_project work >/dev/null; T set-option -t "=$s:" @pc_harness shell >/dev/null; done
+  check "create idle shell ov-idle" "$(api POST /api/sessions '{"name":"ov-idle","project":"work","harness":"shell"}')" 201
+  sleep 9 # older than the 8 s running window, except ov-run (prints every second)
+  check "overview 200" "$(api GET /api/overview)" 200
+  ov() { jf "sessions.find(s=>s.name===\"$1\").$2" <"$RESP"; }
+  check "overview: sleep loop is running" "$(ov ov-run state)" running
+  check "overview: y/n prompt is waiting, preview = the prompt" "$(ov ov-ask state)|$(ov ov-ask preview)" "waiting|Proceed? (y/n)"
+  check "overview: menu flag is false for a y/n line prompt and a shell" "$(ov ov-ask menu)|$(ov ov-idle menu)" "false|false"
+  check "overview: y/n line beside a numbered menu -> menu true" "$(ov ov-menu state)|$(ov ov-menu preview)|$(ov ov-menu menu)" "waiting|Overwrite config? (y/n)|true"
+  check "overview: shell is idle" "$(ov ov-idle state)" idle
+  check "overview: project and harness" "$(ov ov-ask project)/$(ov ov-ask harness)" "work/shell"
+  check "overview: git branch, diff, ahead" "$(jf 'projects[0].branch+"|"+JSON.stringify(j.projects[0].diff)+"|"+j.projects[0].ahead' <"$RESP")" 'main|{"files":1,"add":1,"del":0}|null'
+  check "overview: now/activity are epoch seconds" "$(jf 'sessions.every(s=>Number.isInteger(s.activity) && Number.isInteger(s.created)) && Number.isInteger(j.now) && Math.abs(j.now - Date.now()/1000) < 30' <"$RESP")" true
+  [ -e "$RUN/work/.git/index.lock" ] && bad "overview took no git index lock" || ok "overview took no git index lock"
+  # A5 update 4: fresh open never reuses (work-shell exists)
+  check "open fresh" "$(api POST /api/open '{"project":"work","harness":"shell","fresh":true}')" 200
+  check "open fresh -> work-shell-2, created" "$(jf 'name+"|"+j.created' <"$RESP")" "work-shell-2|true"
+  for s in ov-run ov-ask ov-menu ov-idle work-shell-2; do check "delete $s" "$(api DELETE "/api/sessions/$s")" 200; done
+else
+  echo "skip - overview section (no git)"
+fi
+
 # ---- delete everything, server still fine ----
 check "delete it1" "$(api DELETE /api/sessions/it1)" 200
 check "delete work-shell" "$(api DELETE /api/sessions/work-shell)" 200
@@ -225,12 +326,18 @@ check "logout" "$(api POST /api/logout)" 200
 check "token dead after logout" "$(api GET /api/me)" 401
 kill -0 "$SERVER_PID" 2>/dev/null && ok "server process alive at the end" || bad "server died"
 
-# ---- restart logs everyone out ----
-TOKEN=$(curl -s -X POST -H 'X-PC: 1' -H 'X-PC-Client: ios' -H 'Content-Type: application/json' -d "{\"password\":\"$PW\"}" "$BASE/api/login" | jf token)
-check "fresh token works" "$(api GET /api/me)" 200
-kill "$SERVER_PID"; wait "$SERVER_PID" 2>/dev/null; start_server
-check "after restart the old token -> 401" "$(api GET /api/me)" 401
-grep -qiE "password|$TOKEN|Xin chào|SCREEN-MARK" "$RUN/server.log" && bad "server log contains secrets/text" || ok "server log is clean"
+# ---- paired devices survive a restart; --revoke goes through admin.sock ----
+TOKEN=$(pair_token "$BASE" "$RUN/fcode-pair" second phone)
+check "fresh pairing works" "$(api GET /api/me)" 200
+kill "$SERVER_PID"; wait "$SERVER_PID" 2>/dev/null
+"$RUN/fcode-pair" x >"$RUN/down.out" 2>&1; check "fcode-pair with the server down -> exit 1" "$?" 1
+grep -q "not running" "$RUN/down.out" && ok "fcode-pair says the server is not running" || bad "server-down message" "$(cat "$RUN/down.out")"
+start_server
+check "after restart the token still works" "$(api GET /api/me)" 200
+DEV=$(node "$ROOT/server.mjs" --devices | awk '/  second phone$/ {print $1}')
+check "--revoke <id>" "$(node "$ROOT/server.mjs" --revoke "$DEV")" "revoked: 1"
+check "revoked token -> 401" "$(api GET /api/me)" 401
+grep -qiE "password|$TOKEN|$CODE|Xin chào|SCREEN-MARK" "$RUN/server.log" && bad "server log contains secrets/text" || ok "server log is clean"
 
 kill "$SERVER_PID" 2>/dev/null; SERVER_PID=""
 T kill-server 2>/dev/null
@@ -252,7 +359,8 @@ UNIT"' | sed "s|^\[Service\]\$|[Service]\nEnvironment='PC_TMUX=[\"tmux\",\"-L\",
     [ "${pid:-0}" -gt 0 ] || { echo "FATAL - $UNIT has no MainPID"; exit 1; }
     await_ready "$UPORT" "$pid" "$UNIT"
     local tok st
-    tok=$(curl -s -X POST -H 'X-PC: 1' -H 'X-PC-Client: ios' -H 'Content-Type: application/json' -d "{\"password\":\"$PW\"}" "$UBASE/api/login" | jf token)
+    tok=$(pair_token "$UBASE" env PC_CONFIG_DIR="$RUN/unitcfg" node "$ROOT/server.mjs" --pair "unit $1")
+    [ -n "$tok" ] && [ "$tok" != undefined ] && ok "unit, $1: paired through admin.sock" || bad "unit, $1: pairing"
     st=$(curl -s -o "$RESP" -w '%{http_code}' -X POST -H 'X-PC: 1' -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' -d '{"project":"work","harness":"omp"}' "$UBASE/api/open")
     check "unit, $1: open omp" "$st" 200
     sleep 5

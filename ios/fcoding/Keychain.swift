@@ -1,7 +1,7 @@
 import Foundation
 import Security
 
-/// Minimal generic-password Keychain wrapper for the login token.
+/// Minimal generic-password Keychain wrapper for the device token from pairing.
 enum Keychain {
     private static let service = "com.brooklyn96.fcoding"
 
@@ -16,7 +16,7 @@ enum Keychain {
         SecItemDelete(base(account) as CFDictionary)
         var add = base(account)
         add[kSecValueData as String] = Data(value.utf8)
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
     }
 

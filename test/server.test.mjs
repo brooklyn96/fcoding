@@ -4,29 +4,26 @@ import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
-import { createApp, hashPassword, writePrivate, trimScreen, KEYS } from '../server.mjs';
+import { createApp, writePrivate, trimScreen, adminRequest, adminPath, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock } from '../server.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const FAKE = path.join(here, 'fake-tmux.mjs');
 const SERVER = path.join(here, '..', 'server.mjs');
-const PW = 'correct horse battery';
 const VN = 'Xin chào, tiếng Việt có dấu: ắ ẫ ợ ữ';
 const ABS = path.resolve(os.tmpdir());
-const PW_HASH = hashPassword(PW); // N = 2^14, the smallest the server accepts
 const HOME = os.homedir();
 const LAUNCH = `env LANG=C.UTF-8 LC_ALL=C.UTF-8 'PATH=${HOME}/.local/bin:${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin' `;
-const MONTH = 30 * 24 * 3600 * 1000;
 
 async function boot(opts = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-test-'));
   const fakeDir = path.join(root, 'fake'); fs.mkdirSync(fakeDir);
   const configDir = path.join(root, 'cfg'); fs.mkdirSync(configDir);
   fs.writeFileSync(path.join(configDir, 'config.json'), JSON.stringify({
-    passwordHash: PW_HASH, cookieSecret: Buffer.alloc(32, 7).toString('base64'),
+    cookieSecret: Buffer.alloc(32, 7).toString('base64'),
     projects: { alpha: ABS, 'my.proj': ABS }, port: 7681,
   }));
   process.env.FAKE_TMUX_DIR = fakeDir;
@@ -35,11 +32,14 @@ async function boot(opts = {}) {
   const port = await app.listen(0, '127.0.0.1');
   const ctx = { app, port, logs, root, configDir };
   ctx.req = (method, p, o = {}) => request(port, method, p, o);
-  ctx.login = async (headers = {}) => {
-    const r = await ctx.req('POST', '/api/login', { body: { password: PW }, headers });
-    assert.equal(r.status, 200);
-    return { cookie: r.headers['set-cookie'][0].split(';')[0], json: r.json };
+  // pair a device the way the app does: --pair over admin.sock, then POST /api/pair
+  ctx.login = async (headers = {}, name = 'test') => {
+    const p = await adminRequest(configDir, { cmd: 'pair', name });
+    const r = await ctx.req('POST', '/api/pair', { body: { code: p.code }, headers });
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    return { cookie: r.headers['set-cookie'][0].split(';')[0], json: r.json, token: r.json.token };
   };
+  ctx.deviceId = async (name) => (await adminRequest(configDir, { cmd: 'devices' })).devices.find((d) => d.name === name).id;
   ctx.calls = () => {
     try { return fs.readFileSync(path.join(fakeDir, 'log.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; }
   };
@@ -93,7 +93,7 @@ test('every protected route needs a session', () => withApp(async (c) => {
   const routes = [
     ['GET', '/api/me'], ['GET', '/api/meta'], ['GET', '/api/sessions'], ['GET', '/api/screen/work'], ['GET', '/api/stream/work'],
     ['POST', '/api/sessions'], ['POST', '/api/open'], ['POST', '/api/send/work'], ['POST', '/api/key/work'], ['POST', '/api/resize/work'],
-    ['POST', '/api/logout'], ['DELETE', '/api/sessions/work'], ['GET', '/api/nothing'], ['GET', '/other'],
+    ['POST', '/api/logout'], ['DELETE', '/api/sessions/work'], ['GET', '/api/nothing'], ['GET', '/other'], ['POST', '/api/login'],
   ];
   for (const [m, p] of routes) {
     const r = await c.req(m, p, { body: m === 'POST' ? {} : undefined });
@@ -102,68 +102,6 @@ test('every protected route needs a session', () => withApp(async (c) => {
   assert.equal((await c.req('GET', '/api/me', { cookie: 'pc_sid=forged' })).status, 401);
   assert.equal((await c.req('GET', '/api/me', { headers: { Authorization: 'Bearer forged' } })).status, 401);
   assert.equal(c.calls().length, 0); // nothing reached tmux
-}));
-
-test('login: bad password, ok, cookie flags', () => withApp(async (c) => {
-  const bad = await c.req('POST', '/api/login', { body: { password: 'nope' } });
-  assert.equal(bad.status, 401);
-  assert.deepEqual(bad.json, { error: 'bad_password' });
-  assert.equal((await c.req('POST', '/api/login', { body: { password: 5 } })).status, 400);
-  assert.equal((await c.req('POST', '/api/login', { body: {} })).status, 400);
-  const ok = await c.req('POST', '/api/login', { body: { password: PW } });
-  assert.equal(ok.status, 200);
-  assert.deepEqual(ok.json, { ok: true }); // no token without X-PC-Client: ios
-  const sc = ok.headers['set-cookie'][0];
-  assert.match(sc, /^pc_sid=[A-Za-z0-9_-]{43}; /);
-  for (const f of ['HttpOnly', 'Secure', 'SameSite=Strict', 'Path=/', 'Max-Age=2592000']) assert.ok(sc.includes(f), f);
-  const cookie = sc.split(';')[0];
-  assert.equal((await c.req('GET', '/api/me', { cookie })).status, 200);
-  const meta = await c.req('GET', '/api/meta', { cookie });
-  assert.deepEqual(meta.json.projects.sort(), ['alpha', 'my.proj']);
-  assert.deepEqual(meta.json.keys, KEYS);
-  assert.deepEqual(meta.json.harnesses, ['omp', 'claude', 'codex', 'shell']);
-}));
-
-test('ios client gets a Bearer token that works like the cookie', () => withApp(async (c) => {
-  const { cookie, json } = await c.login({ 'X-PC-Client': 'ios' });
-  assert.match(json.token, /^[A-Za-z0-9_-]{43}$/);
-  assert.equal(cookie, `pc_sid=${json.token}`);
-  const auth = { Authorization: `Bearer ${json.token}` };
-  assert.equal((await c.req('GET', '/api/me', { headers: auth })).status, 200);
-  const r = await c.req('POST', '/api/sessions', { headers: auth, body: { name: 'viabearer', project: 'alpha', harness: 'shell' } });
-  assert.equal(r.status, 201);
-  // revocation applies to both
-  assert.equal((await c.req('POST', '/api/logout', { headers: auth })).status, 200);
-  assert.equal((await c.req('GET', '/api/me', { headers: auth })).status, 401);
-  assert.equal((await c.req('GET', '/api/me', { cookie })).status, 401);
-  assert.ok(!c.logs.join('\n').includes(json.token));
-}));
-
-test('login rate limit per IP with Retry-After', () => withApp(async (c) => {
-  const xf = { 'X-Forwarded-For': '9.9.9.9, 10.0.0.1' };
-  for (let i = 0; i < 5; i++) assert.equal((await c.req('POST', '/api/login', { body: { password: 'x' + i }, headers: xf })).status, 401);
-  const r = await c.req('POST', '/api/login', { body: { password: PW }, headers: xf }); // even the right password
-  assert.equal(r.status, 429);
-  assert.equal(r.json.error, 'rate_limited');
-  assert.ok(r.json.retryAfter > 0 && r.json.retryAfter <= 900);
-  assert.equal(r.headers['retry-after'], String(r.json.retryAfter));
-  const other = await c.req('POST', '/api/login', { body: { password: PW }, headers: { 'X-Forwarded-For': '8.8.8.8' } });
-  assert.equal(other.status, 200);
-}));
-
-test('successful logins are not counted against the limit', () => withApp(async (c) => {
-  const xf = { 'X-Forwarded-For': '7.7.7.7' };
-  for (let i = 0; i < 4; i++) await c.req('POST', '/api/login', { body: { password: 'x' }, headers: xf });
-  for (let i = 0; i < 3; i++) assert.equal((await c.req('POST', '/api/login', { body: { password: PW }, headers: xf })).status, 200);
-}));
-
-test('global login limit 30/hour', () => withApp(async (c) => {
-  for (let ip = 1; ip <= 6; ip++) {
-    for (let i = 0; i < 5; i++) await c.req('POST', '/api/login', { body: { password: 'x' }, headers: { 'X-Forwarded-For': `1.1.1.${ip}` } });
-  }
-  const r = await c.req('POST', '/api/login', { body: { password: PW }, headers: { 'X-Forwarded-For': '2.2.2.2' } });
-  assert.equal(r.status, 429);
-  assert.ok(Number(r.headers['retry-after']) > 0 && Number(r.headers['retry-after']) <= 3600);
 }));
 
 test('logout and logout-all revoke', () => withApp(async (c) => {
@@ -179,16 +117,16 @@ test('logout and logout-all revoke', () => withApp(async (c) => {
   assert.equal((await c.req('GET', '/api/me', { cookie: d.cookie })).status, 401);
 }));
 
-test('restart logs everyone out: sessions live in memory only, nothing is written', async () => {
+test('paired devices survive a restart; only a keyed hash is stored', async () => {
   const c = await boot();
-  const { cookie, json } = await c.login({ 'X-PC-Client': 'ios' });
+  const { cookie, token } = await c.login({}, 'my phone');
   await c.app.close();
-  assert.deepEqual(fs.readdirSync(c.configDir), ['config.json']); // no sessions.json
+  const stored = fs.readFileSync(path.join(c.configDir, 'devices.json'), 'utf8');
+  assert.ok(!stored.includes(token));
   const app2 = createApp({ configDir: c.configDir, tmux: [process.execPath, FAKE], log: () => {} });
   const port = await app2.listen(0, '127.0.0.1');
-  assert.equal((await request(port, 'GET', '/api/me', { cookie })).status, 401);
-  assert.equal((await request(port, 'GET', '/api/me', { headers: { Authorization: `Bearer ${json.token}` } })).status, 401);
-  assert.equal((await request(port, 'POST', '/api/login', { body: { password: PW } })).status, 200);
+  assert.equal((await request(port, 'GET', '/api/me', { cookie })).status, 200);
+  assert.equal((await request(port, 'GET', '/api/me', { headers: { Authorization: `Bearer ${token}` } })).status, 200);
   await app2.close();
   fs.rmSync(c.root, { recursive: true, force: true });
 });
@@ -198,7 +136,7 @@ test('CSRF: X-PC header and Origin', () => withApp(async (c) => {
   const body = { name: 'csrf', project: 'alpha', harness: 'shell' };
   assert.equal((await c.req('POST', '/api/sessions', { cookie, body, pc: false })).status, 403);
   assert.equal((await c.req('POST', '/api/sessions', { cookie, body, headers: { 'X-PC': '0' } })).status, 403);
-  assert.equal((await c.req('POST', '/api/login', { body: { password: PW }, pc: false })).status, 403);
+  assert.equal((await c.req('POST', '/api/pair', { body: { code: '123456' }, pc: false })).status, 403);
   assert.equal((await c.req('DELETE', '/api/sessions/csrf', { cookie, pc: false })).status, 403);
   assert.equal((await c.req('POST', '/api/logout', { cookie, pc: false })).status, 403);
   const own = `https://127.0.0.1:${c.port}`;
@@ -210,7 +148,7 @@ test('CSRF: X-PC header and Origin', () => withApp(async (c) => {
   const fwd = { 'X-Forwarded-Host': 'box.example.com' };
   assert.equal((await c.req('POST', '/api/sessions', { cookie, body: { ...body, name: 'csrf2' }, headers: { ...fwd, Origin: 'https://box.example.com' } })).status, 201);
   assert.equal((await c.req('POST', '/api/sessions', { cookie, body: { ...body, name: 'csrf3' }, headers: { ...fwd, Origin: own } })).status, 403);
-  assert.equal((await c.req('POST', '/api/login', { body: { password: PW }, headers: { Origin: 'https://evil.example' } })).status, 403);
+  assert.equal((await c.req('POST', '/api/pair', { body: { code: '123456' }, headers: { Origin: 'https://evil.example' } })).status, 403);
   assert.equal((await c.req('GET', '/api/me', { cookie, pc: false })).status, 200); // GET needs no header
 }));
 
@@ -354,7 +292,7 @@ test('size limits: body 64 KB, text 32 KB', () => withApp(async (c) => {
   await mkSession(c, cookie);
   const big = await c.req('POST', '/api/send/work', { cookie, raw: JSON.stringify({ text: 'x'.repeat(70 * 1024) }), headers: JSON_CT });
   assert.equal(big.status, 413);
-  const huge = await c.req('POST', '/api/login', { raw: JSON.stringify({ password: 'x'.repeat(65 * 1024) }), headers: JSON_CT });
+  const huge = await c.req('POST', '/api/pair', { raw: JSON.stringify({ code: 'x'.repeat(65 * 1024) }), headers: JSON_CT });
   assert.equal(huge.status, 413);
   assert.equal((await c.req('POST', '/api/send/work', { cookie, body: { text: 'a'.repeat(32 * 1024 + 1) } })).status, 413);
   assert.equal((await c.req('POST', '/api/send/work', { cookie, body: { text: 'ắ'.repeat(11000) } })).status, 413); // 33000 bytes
@@ -366,7 +304,7 @@ test('security headers on every response', () => withApp(async (c) => {
   const csp = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'";
   const rs = [
     await c.req('GET', '/'), await c.req('GET', '/api/me'), await c.req('GET', '/api/me', { cookie }),
-    await c.req('POST', '/api/login', { body: { password: 'x' } }), await c.req('GET', '/nope', { cookie }),
+    await c.req('POST', '/api/pair', { body: { code: 'x' } }), await c.req('GET', '/nope', { cookie }),
     await c.req('POST', '/api/sessions', { cookie, pc: false }),
   ];
   for (const r of rs) {
@@ -414,82 +352,35 @@ test('SSE: retry, screen event, gone on logout', () => withApp(async (c) => {
 }));
 
 test('logs hold method, path, status, ms only', () => withApp(async (c) => {
-  const secret = 'Mật khẩu bí mật 12345 ắ';
-  await c.req('POST', '/api/login', { body: { password: secret } });
-  const { cookie, json } = await c.login({ 'X-PC-Client': 'ios' });
+  const secret = '987654';
+  await c.req('POST', '/api/pair', { body: { code: secret } });
+  const p = await adminRequest(c.configDir, { cmd: 'pair', name: 'logtest' });
+  const r = await c.req('POST', '/api/pair', { body: { code: p.code } });
+  const json = r.json; const cookie = r.headers['set-cookie'][0].split(';')[0];
   await mkSession(c, cookie);
   await c.req('POST', '/api/send/work', { cookie, body: { text: 'SENT-TEXT-xyz ' + VN, enter: true } });
   await c.req('POST', '/api/send/work', { cookie, body: { text: 'MULTI-xyz\nline', enter: false } });
   const all = c.logs.join('\n');
-  for (const s of [secret, PW, 'SENT-TEXT', 'MULTI-xyz', VN, cookie.slice(7), json.token, 'pc_sid']) assert.ok(!all.includes(s), s);
+  for (const s of [secret, p.code, 'SENT-TEXT', 'MULTI-xyz', VN, cookie.slice(7), json.token, 'pc_sid']) assert.ok(!all.includes(s), s);
   assert.ok(c.logs.length >= 5);
   for (const l of c.logs) assert.match(l, /^(GET|POST|DELETE) \/\S* \d{3} \d+ms$/);
 }));
 
-test('--set-password: reads stdin, writes scrypt hash, generate mode', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-pw-'));
-  try {
-    const cfgDir = path.join(dir, 'cfg');
-    const env = { ...process.env, PC_CONFIG_DIR: cfgDir };
-    const run = (input) => spawnSync(process.execPath, [SERVER, '--set-password'], { input, env, encoding: 'utf8' });
-    const r = run(`${PW}\n`);
-    assert.equal(r.status, 0, r.stderr);
-    assert.ok(!r.stdout.includes(PW));
-    const file = path.join(cfgDir, 'config.json');
-    const cfg = JSON.parse(fs.readFileSync(file, 'utf8'));
-    assert.equal(cfg.passwordHash.algo, 'scrypt');
-    for (const f of ['salt', 'hash', 'N', 'r', 'p']) assert.ok(cfg.passwordHash[f], f);
-    assert.ok(cfg.cookieSecret && cfg.projects && cfg.port === 7681);
-    if (process.platform !== 'win32') assert.equal(fs.statSync(file).mode & 0o777, 0o600);
-    assert.notEqual(run('abc\n').status, 0); // too short
-    assert.equal(run('  spaced pass  \r\n').status, 0); // only the line ending is stripped
-    {
-      const a = createApp({ configDir: cfgDir, log: () => {} });
-      const p = await a.listen(0, '127.0.0.1');
-      try {
-        assert.equal((await request(p, 'POST', '/api/login', { body: { password: '  spaced pass  ' } })).status, 200);
-        assert.equal((await request(p, 'POST', '/api/login', { body: { password: 'spaced pass' } })).status, 401);
-      } finally { await a.close(); }
-    }
-    const gen = run('');
-    assert.equal(gen.status, 0);
-    const pw = /: (\S{24})\s*$/.exec(gen.stdout)?.[1];
-    assert.ok(pw, gen.stdout);
-    const app = createApp({ configDir: cfgDir, log: () => {} });
-    const port = await app.listen(0, '127.0.0.1');
-    try {
-      assert.equal((await request(port, 'POST', '/api/login', { body: { password: PW } })).status, 401); // replaced
-      assert.equal((await request(port, 'POST', '/api/login', { body: { password: pw } })).status, 200);
-    } finally { await app.close(); }
-  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
-});
-
 // every config.json that must be refused at startup and ignored at reload (A3 + round 4 item 1)
 const badConfigs = (good) => {
-  const ph = good.passwordHash;
   const b = (n) => crypto.randomBytes(n).toString('base64');
   const variants = [
-    { passwordHash: undefined }, { passwordHash: null }, { passwordHash: 'x' },
-    { passwordHash: { ...ph, algo: 'bcrypt' } }, { passwordHash: { ...ph, algo: undefined } },
-    { passwordHash: { ...ph, hash: '' } }, { passwordHash: { ...ph, hash: 'AA==' } }, { passwordHash: { ...ph, hash: b(16) } },
-    { passwordHash: { ...ph, hash: ph.hash.replace(/=+$/, '') } }, // non-canonical: padding dropped
-    { passwordHash: { ...ph, hash: `${ph.hash.slice(0, 40)}\n${ph.hash.slice(40)}` } }, // non-canonical: newline inside
-    { passwordHash: { ...ph, salt: b(8) } }, { passwordHash: { ...ph, salt: ph.salt.replace(/=+$/, '') } },
-    { passwordHash: { ...ph, N: 2 ** 30 } }, { passwordHash: { ...ph, N: 2 ** 13 } }, { passwordHash: { ...ph, N: 20000 } }, { passwordHash: { ...ph, N: '16384' } },
-    { passwordHash: { ...ph, N: 65536, r: 1, p: 1 } }, // RFC 7914: N must be < 2^(16r)
-    { passwordHash: { ...ph, N: 2 ** 20, r: 32 } }, // 128*N*r = 4 GiB > 256 MiB
-    { passwordHash: { ...ph, r: 0 } }, { passwordHash: { ...ph, r: 33 } }, { passwordHash: { ...ph, p: 0 } }, { passwordHash: { ...ph, p: 17 } },
-    { cookieSecret: 5 }, { cookieSecret: b(16) }, { cookieSecret: b(32).replace(/=+$/, '') }, { cookieSecret: `${b(32)} ` },
+    { cookieSecret: undefined }, { cookieSecret: 5 }, { cookieSecret: b(16) }, { cookieSecret: b(32).replace(/=+$/, '') }, { cookieSecret: `${b(32)} ` },
     { projects: [] }, { projects: 'x' }, { port: 'x' }, { port: 70000 },
   ];
-  return ['{"passwordHash": {"salt": "SEKRET-abc"', '[]', 'null', ...variants.map((v) => JSON.stringify({ ...good, ...v }))];
+  return ['{"cookieSecret": "SEKRET-abc', '[]', 'null', ...variants.map((v) => JSON.stringify({ ...good, ...v }))];
 };
 
 test('startup refuses a missing or malformed config (createApp throws, the process exits 1)', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-nopw-'));
   try {
     assert.throws(() => createApp({ configDir: dir, log: () => {} }), /config\.json missing/);
-    const good = { passwordHash: PW_HASH, cookieSecret: Buffer.alloc(32, 1).toString('base64'), projects: {} };
+    const good = { cookieSecret: Buffer.alloc(32, 1).toString('base64'), projects: {} };
     fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify(good));
     createApp({ configDir: dir, log: () => {} }); // the good one is accepted
     const bad = badConfigs(good);
@@ -502,18 +393,6 @@ test('startup refuses a missing or malformed config (createApp throws, the proce
     assert.equal(r.status, 1);
     assert.match(r.stderr, /config\.json is not valid JSON/);
     assert.ok(!r.stderr.includes('SEKRET'));
-    // scrypt parameters Node would reject or that need too much memory: the process exits 1
-    for (const p of [{ N: 65536, r: 1, p: 1 }, { N: 2 ** 20, r: 32 }]) {
-      fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({ ...good, passwordHash: { ...good.passwordHash, ...p } }));
-      const x = spawnSync(process.execPath, [SERVER], { env: { ...process.env, PC_CONFIG_DIR: dir, PC_PORT: '0' }, encoding: 'utf8', timeout: 10000 });
-      assert.equal(x.status, 1, JSON.stringify(p));
-      assert.match(x.stderr, /passwordHash missing or invalid/);
-    }
-    // what setPassword writes (hashPassword defaults: N 2^14, r 8, p 1) is accepted
-    const d = hashPassword('default params ok');
-    assert.deepEqual([d.N, d.r, d.p], [2 ** 14, 8, 1]);
-    fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({ ...good, passwordHash: d }));
-    createApp({ configDir: dir, log: () => {} });
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -558,61 +437,6 @@ test('malformed request targets get 400 and the process survives', () => withApp
   assert.equal(ok.text, 'fcoding ok');
 }));
 
-test('expiry boundary for cookie and Bearer (opts.now)', async () => {
-  let t = 1_700_000_000_000;
-  await withApp(async (c) => {
-    const { cookie, json } = await c.login({ 'X-PC-Client': 'ios' });
-    const auth = { Authorization: `Bearer ${json.token}` };
-    const month = 30 * 24 * 3600 * 1000;
-    t += month - 1;
-    assert.equal((await c.req('GET', '/api/me', { cookie })).status, 200);
-    assert.equal((await c.req('GET', '/api/me', { headers: auth })).status, 200);
-    t += 1; // exactly at expiry
-    assert.equal((await c.req('GET', '/api/me', { cookie })).status, 401);
-    assert.equal((await c.req('GET', '/api/me', { headers: auth })).status, 401);
-  }, { now: () => t });
-});
-
-test('10 parallel bad logins from one IP: exactly 5 x 401, 5 x 429', () => withApp(async (c) => {
-  const xf = { 'X-Forwarded-For': '5.5.5.5' };
-  const rs = await Promise.all(Array.from({ length: 10 }, (_, i) => c.req('POST', '/api/login', { body: { password: `bad-${i}` }, headers: xf })));
-  const n = (s) => rs.filter((r) => r.status === s).length;
-  assert.equal(n(401), 5);
-  assert.equal(n(429), 5);
-  // the guesses were never verified past the limit, and a good password is blocked too
-  assert.equal((await c.req('POST', '/api/login', { body: { password: PW }, headers: xf })).status, 429);
-}));
-
-test('password change drops every session without a restart, and after one', async () => {
-  const c = await boot();
-  try {
-    const old = await c.login({ 'X-PC-Client': 'ios' });
-    const before = JSON.parse(fs.readFileSync(path.join(c.configDir, 'config.json'), 'utf8')).cookieSecret;
-    const env = { ...process.env, PC_CONFIG_DIR: c.configDir };
-    const NEW = 'brand new password 42';
-    const r = spawnSync(process.execPath, [SERVER, '--set-password'], { input: `${NEW}\n`, env, encoding: 'utf8' });
-    assert.equal(r.status, 0, r.stderr);
-    const after = JSON.parse(fs.readFileSync(path.join(c.configDir, 'config.json'), 'utf8'));
-    assert.notEqual(after.cookieSecret, before); // rotated
-    assert.deepEqual(after.projects, { alpha: ABS, 'my.proj': ABS }); // other settings kept
-    // running server: no restart
-    assert.equal((await c.req('GET', '/api/me', { cookie: old.cookie })).status, 401);
-    assert.equal((await c.req('GET', '/api/me', { headers: { Authorization: `Bearer ${old.json.token}` } })).status, 401);
-    assert.equal((await c.req('POST', '/api/login', { body: { password: PW } })).status, 401);
-    const fresh = await c.req('POST', '/api/login', { body: { password: NEW } });
-    assert.equal(fresh.status, 200);
-    const freshCookie = fresh.headers['set-cookie'][0].split(';')[0];
-    assert.equal((await c.req('GET', '/api/me', { cookie: freshCookie })).status, 200);
-    // the old token must not come back when the server restarts
-    await c.app.close();
-    const app2 = createApp({ configDir: c.configDir, tmux: [process.execPath, FAKE], log: () => {} });
-    const port = await app2.listen(0, '127.0.0.1');
-    assert.equal((await request(port, 'GET', '/api/me', { cookie: old.cookie })).status, 401);
-    assert.equal((await request(port, 'GET', '/api/me', { cookie: freshCookie })).status, 401); // memory only
-    await app2.close();
-  } finally { fs.rmSync(c.root, { recursive: true, force: true }); await c.app.close().catch(() => {}); }
-});
-
 test('config dir hygiene: modes repaired, symlinks refused', async (t) => {
   if (process.platform === 'win32') return t.skip('POSIX modes');
   const c = await boot();
@@ -623,8 +447,9 @@ test('config dir hygiene: modes repaired, symlinks refused', async (t) => {
     assert.equal(fs.statSync(c.configDir).mode & 0o777, 0o700);
     assert.equal(fs.statSync(path.join(c.configDir, 'config.json')).mode & 0o777, 0o600);
     const port = await app2.listen(0, '127.0.0.1');
-    const r = await request(port, 'POST', '/api/login', { body: { password: PW } });
-    assert.equal(r.status, 200);
+    const pr = await adminRequest(c.configDir, { cmd: 'pair' });
+    assert.equal((await request(port, 'POST', '/api/pair', { body: { code: pr.code } })).status, 200);
+    assert.equal(fs.statSync(path.join(c.configDir, 'devices.json')).mode & 0o777, 0o600);
     await app2.close();
     const link = path.join(c.root, 'link');
     fs.symlinkSync(c.configDir, link);
@@ -813,13 +638,11 @@ const rotate = (c) => {
 };
 
 for (const fill of [false, true]) {
-  for (const action of ['revoke', 'expire', 'rotate', 'disconnect']) {
+  for (const action of ['logout', 'admin-revoke', 'rotate', 'disconnect']) {
     test(`gate: ${action} while a job waits${fill ? ' and all 8 children are busy' : ''} -> no later child spawns`, async () => {
-      let t = 1_700_000_000_000;
       await withApp(async (c) => {
-        const victim = await c.login(); // logged in first: expires first
-        t += MONTH - 2000;
-        const owner = await c.login();
+        const victim = await c.login({}, 'victim');
+        const owner = await c.login({}, 'owner');
         await mkSession(c, owner.cookie);
         await withEnv({ FAKE_TMUX_DELAY_MS: '500' }, async () => {
           const blocker = c.req('POST', '/api/send/work', { cookie: owner.cookie, body: { text: 'BLOCKER', enter: false } });
@@ -835,8 +658,8 @@ for (const fill of [false, true]) {
           const v = rawPost(c.port, '/api/send/work', { text: 'VICTIM', enter: true }, victim.cookie);
           v.req.end(v.data);
           assert.ok(await until(() => c.app.stats().waiting === 1, 3000), 'victim job never queued');
-          if (action === 'revoke') assert.equal((await c.req('POST', '/api/logout', { cookie: victim.cookie })).status, 200);
-          if (action === 'expire') t += 3000;
+          if (action === 'logout') assert.equal((await c.req('POST', '/api/logout', { cookie: victim.cookie })).status, 200);
+          if (action === 'admin-revoke') assert.deepEqual(await adminRequest(c.configDir, { cmd: 'revoke', id: await c.deviceId('victim') }), { ok: true, revoked: 1 });
           if (action === 'rotate') rotate(c);
           if (action === 'disconnect') {
             v.req.destroy();
@@ -850,8 +673,8 @@ for (const fill of [false, true]) {
           assert.ok(await until(() => !c.app.stats().active && c.app.stats().waiting === 0 && c.app.stats().running === 0));
         });
         await sleep(150);
-        assert.ok(!victimRan(c), 'a child was spawned for the revoked/expired/rotated/disconnected job');
-      }, { now: () => t });
+        assert.ok(!victimRan(c), 'a child was spawned for the revoked/rotated/disconnected job');
+      });
     });
   }
 }
@@ -985,7 +808,6 @@ test('screen trim is linear: 2000 lines x 300 spaces < 50 ms and correct', () =>
   assert.equal(trimScreen(''), '');
 });
 
-let t = 1_700_000_000_000;
 test('malformed config at reload: the previous one stays; a repaired one is picked up', () => withApp(async (c) => {
   const { cookie } = await c.login();
   const f = path.join(c.configDir, 'config.json');
@@ -993,12 +815,8 @@ test('malformed config at reload: the previous one stays; a repaired one is pick
   const cfg = JSON.parse(good);
   for (const text of badConfigs(cfg)) {
     fs.writeFileSync(f, text);
-    t += 3600 * 1000; // stay under the 30/hour global login limit
-    assert.equal((await c.req('GET', '/api/me', { cookie })).status, 200, text);
-    assert.equal((await c.req('POST', '/api/login', { body: { password: 'wrong password' } })).status, 401, text); // e.g. hash "" must not match everything
-    assert.equal((await c.req('POST', '/api/login', { body: { password: PW } })).status, 200, text); // old config, never a crash
+    assert.equal((await c.req('GET', '/api/me', { cookie })).status, 200, text); // the previous config still rules
   }
-  assert.equal((await c.req('POST', '/api/login', { body: { password: PW } })).status, 200); // the previous config still rules
   assert.ok(c.logs.some((l) => l.startsWith('config reload failed')));
   assert.ok(!c.logs.join('\n').includes('SEKRET'));
   // a projects-only edit keeps the logins
@@ -1008,28 +826,10 @@ test('malformed config at reload: the previous one stays; a repaired one is pick
   // a repaired file with a new secret drops every session
   fs.writeFileSync(f, JSON.stringify({ ...cfg, cookieSecret: crypto.randomBytes(32).toString('base64') }));
   assert.equal((await c.req('GET', '/api/me', { cookie })).status, 401);
-  assert.equal((await c.req('POST', '/api/login', { body: { password: PW } })).status, 200);
-}, { now: () => t }));
-
-// ======================= round 4 =======================
-test('--set-password validates the whole new config: invalid port -> exit 1, nothing written, running server unchanged', () => withApp(async (c) => {
-  const { cookie } = await c.login();
-  const f = path.join(c.configDir, 'config.json');
-  const cfg = JSON.parse(fs.readFileSync(f, 'utf8'));
-  fs.writeFileSync(f, JSON.stringify({ ...cfg, port: 'x' })); // a bad edit the running server ignores
-  assert.equal((await c.req('GET', '/api/me', { cookie })).status, 200);
-  const before = fs.readFileSync(f);
-  const r = spawnSync(process.execPath, [SERVER, '--set-password'], { input: 'another password 1\n', env: { ...process.env, PC_CONFIG_DIR: c.configDir }, encoding: 'utf8' });
-  assert.equal(r.status, 1);
-  assert.match(r.stderr, /port invalid/);
-  assert.ok(!r.stderr.includes(cfg.cookieSecret) && !r.stdout.includes('another password'));
-  assert.ok(fs.readFileSync(f).equals(before), 'config.json changed');
-  assert.deepEqual(fs.readdirSync(c.configDir), ['config.json']); // no tmp file left
-  assert.equal((await c.req('GET', '/api/me', { cookie })).status, 200);
-  assert.equal((await c.req('POST', '/api/login', { body: { password: PW } })).status, 200);
-  assert.equal((await c.req('POST', '/api/login', { body: { password: 'another password 1' } })).status, 401);
+  await c.login(); // pairing still works with the new secret
 }));
 
+// ======================= round 4 =======================
 test('writePrivate removes its tmp file when the rename fails', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-wp-'));
   const rename = fs.renameSync;
@@ -1042,24 +842,6 @@ test('writePrivate removes its tmp file when the rename fails', () => {
     assert.equal(fs.readFileSync(path.join(dir, 'config.json'), 'utf8'), 'old');
   } finally { fs.renameSync = rename; fs.rmSync(dir, { recursive: true, force: true }); }
 });
-
-test('rotation while scrypt runs: that login is 401 without Set-Cookie, the next one is 200', () => withApp(async (c) => {
-  const f = path.join(c.configDir, 'config.json');
-  const cfg = JSON.parse(fs.readFileSync(f, 'utf8'));
-  writePrivate(f, JSON.stringify({ ...cfg, passwordHash: hashPassword(PW, { N: 2 ** 17 }) })); // slow hash: a wide window
-  assert.equal((await c.req('GET', '/api/me')).status, 401); // picks the new hash up
-  const t0 = Date.now();
-  const pending = c.req('POST', '/api/login', { body: { password: PW } });
-  await sleep(60);
-  rotate(c); // new cookie secret while the password is being hashed
-  const r = await pending;
-  assert.ok(Date.now() - t0 > 60);
-  assert.equal(r.status, 401);
-  assert.equal(r.headers['set-cookie'], undefined);
-  const ok = await c.req('POST', '/api/login', { body: { password: PW } });
-  assert.equal(ok.status, 200);
-  assert.ok(ok.headers['set-cookie']);
-}));
 
 test('harness that exits 0.2 s after start: 500 harness_exited (has-session after 400 ms)', () => withApp(async (c) => {
   const { cookie } = await c.login();
@@ -1128,3 +910,962 @@ test('SSE data lines escape U+2028, U+2029 and U+0085 and still parse to the sam
   assert.ok(line.includes('\\u2028') && line.includes('\\u2029') && line.includes('\\u0085'));
   assert.equal(JSON.parse(line.slice(6)).text, text);
 }));
+
+// ======================= A4: device pairing =======================
+// the admin CLI as a real child process (async: the server under test lives in this process)
+const cli = (configDir, args) => new Promise((resolve) => {
+  execFile(process.execPath, [SERVER, ...args], { env: { ...process.env, PC_CONFIG_DIR: configDir }, encoding: 'utf8', timeout: 15000, windowsHide: true },
+    (err, stdout, stderr) => resolve({ status: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stdout, stderr }));
+});
+const TAG = crypto.createHmac('sha256', Buffer.alloc(32, 7)).update('fcoding-devices').digest('hex'); // boot()'s secret
+const devicesFile = (c) => JSON.parse(fs.readFileSync(path.join(c.configDir, 'devices.json'), 'utf8')).devices;
+const pairReq = (c, code, extra = {}) => c.req('POST', '/api/pair', { body: { code, ...extra } });
+const otherCode = (code) => String((Number(code) + 1) % 1e6).padStart(6, '0');
+
+test('pairing: code from --pair, token once, cookie set, device persisted (keyed hash only) and survives a restart', async () => {
+  const c = await boot();
+  try {
+    const out = await cli(c.configDir, ['--pair', 'iPhone X']);
+    assert.equal(out.status, 0, out.stderr);
+    const code = /Mã ghép: (\d{6}) /.exec(out.stdout)?.[1];
+    assert.ok(code, out.stdout);
+    assert.match(out.stdout, /hết hạn sau 120 giây/);
+    assert.equal(c.logs.length, 0); // the code is never logged
+    const r = await pairReq(c, code, { name: 'ignored: the CLI name wins' });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.ok, true);
+    assert.match(r.json.token, /^[A-Za-z0-9_-]{43}$/);
+    const sc = r.headers['set-cookie'][0];
+    assert.equal(sc.split(';')[0], `pc_sid=${r.json.token}`);
+    for (const f of ['HttpOnly', 'Secure', 'SameSite=Strict', 'Path=/', 'Max-Age=2592000']) assert.ok(sc.includes(f), f);
+    assert.equal((await c.req('GET', '/api/me', { headers: { Authorization: `Bearer ${r.json.token}` } })).status, 200);
+    assert.equal((await pairReq(c, code)).status, 401); // single use
+    const [d] = devicesFile(c);
+    assert.equal(devicesFile(c).length, 1);
+    assert.deepEqual(Object.keys(d).sort(), ['createdAt', 'id', 'keyHash', 'name']);
+    assert.equal(d.name, 'iPhone X');
+    assert.equal(d.keyHash, crypto.createHmac('sha256', Buffer.alloc(32, 7)).update(r.json.token).digest('hex'));
+    assert.ok(!fs.readFileSync(path.join(c.configDir, 'devices.json'), 'utf8').includes(r.json.token));
+    if (process.platform !== 'win32') assert.equal(fs.statSync(path.join(c.configDir, 'devices.json')).mode & 0o777, 0o600);
+    assert.ok(!c.logs.join('\n').includes(r.json.token) && !c.logs.join('\n').includes(code));
+    // name from the app when the CLI gave none
+    const p2 = await adminRequest(c.configDir, { cmd: 'pair' });
+    assert.equal((await pairReq(c, p2.code, { name: 'Máy của An' })).status, 200);
+    assert.deepEqual(devicesFile(c).map((x) => x.name), ['iPhone X', 'Máy của An']);
+    await c.app.close();
+    const app2 = createApp({ configDir: c.configDir, tmux: [process.execPath, FAKE], log: () => {} });
+    const port = await app2.listen(0, '127.0.0.1');
+    assert.equal((await request(port, 'GET', '/api/me', { headers: { Authorization: `Bearer ${r.json.token}` } })).status, 200);
+    await app2.close();
+  } finally { await c.app.close().catch(() => {}); fs.rmSync(c.root, { recursive: true, force: true }); }
+});
+
+test('pairing: five wrong codes invalidate the pending code (four do not)', async () => {
+  let t = 1_700_000_000_000;
+  await withApp(async (c) => {
+  let p = await adminRequest(c.configDir, { cmd: 'pair' });
+  for (let i = 0; i < 4; i++) assert.deepEqual((await pairReq(c, otherCode(p.code))).json, { error: 'bad_code' });
+  assert.equal((await pairReq(c, p.code)).status, 200); // 4 wrong, then right: ok
+  t += 61000; // stay under 10/minute
+  p = await adminRequest(c.configDir, { cmd: 'pair' });
+  for (const bad of [otherCode(p.code), '12345', 'abcdef', 123456, '']) assert.equal((await pairReq(c, bad)).status, 401, String(bad));
+  assert.deepEqual((await pairReq(c, p.code)).json, { error: 'bad_code' }); // gone after 5 wrong ones
+  }, { now: () => t });
+});
+
+test('pairing: an expired code is rejected (120 s)', async () => {
+  let t = 1_700_000_000_000;
+  await withApp(async (c) => {
+    let p = await adminRequest(c.configDir, { cmd: 'pair' });
+    assert.equal(p.expiresAt, t + 120000);
+    t += 119999;
+    assert.equal((await pairReq(c, p.code)).status, 200);
+    p = await adminRequest(c.configDir, { cmd: 'pair' });
+    t += 120000;
+    assert.deepEqual([(await pairReq(c, p.code)).status, devicesFile(c).length], [401, 1]);
+  }, { now: () => t });
+});
+
+test('pairing: only one pending at a time; a new --pair replaces it', () => withApp(async (c) => {
+  let a = await adminRequest(c.configDir, { cmd: 'pair', name: 'A' });
+  let b = await adminRequest(c.configDir, { cmd: 'pair', name: 'B' });
+  while (b.code === a.code) b = await adminRequest(c.configDir, { cmd: 'pair', name: 'B' });
+  assert.equal((await pairReq(c, a.code)).status, 401);
+  assert.equal((await pairReq(c, b.code)).status, 200);
+  assert.deepEqual(devicesFile(c).map((d) => d.name), ['B']);
+}));
+
+test('pairing: global /api/pair limits 10/minute and 30/hour -> 429 with Retry-After', async () => {
+  let t = 1_700_000_000_000;
+  await withApp(async (c) => {
+    for (let i = 0; i < 10; i++) assert.equal((await pairReq(c, '000000')).status, 401);
+    let r = await pairReq(c, '000000');
+    assert.equal(r.status, 429);
+    assert.equal(r.json.error, 'rate_limited');
+    assert.ok(Number(r.headers['retry-after']) > 0 && Number(r.headers['retry-after']) <= 60);
+    // even the right code is refused while limited
+    const p = await adminRequest(c.configDir, { cmd: 'pair' });
+    assert.equal((await pairReq(c, p.code)).status, 429);
+    t += 61000;
+    assert.equal((await pairReq(c, p.code)).status, 200);
+    for (let k = 0; k < 2; k++) { for (let i = 0; i < 9; i++) await pairReq(c, '000000'); t += 61000; } // 10 + 1 + 18 = 29 counted this hour
+    assert.equal((await pairReq(c, '000000')).status, 401); // 30th
+    r = await pairReq(c, '000000');
+    assert.equal(r.status, 429);
+    assert.ok(Number(r.headers['retry-after']) > 60 && Number(r.headers['retry-after']) <= 3600, r.headers['retry-after']);
+  }, { now: () => t });
+});
+
+test('pairing: the code is compared with crypto.timingSafeEqual', () => withApp(async (c) => {
+  const orig = crypto.timingSafeEqual;
+  const seen = [];
+  crypto.timingSafeEqual = (a, b) => { seen.push([a.length, b.length]); return orig(a, b); };
+  try {
+    const p = await adminRequest(c.configDir, { cmd: 'pair' });
+    assert.equal((await pairReq(c, otherCode(p.code))).status, 401);
+    assert.equal((await pairReq(c, p.code)).status, 200);
+  } finally { crypto.timingSafeEqual = orig; }
+  assert.deepEqual(seen, [[6, 6], [6, 6]]);
+}));
+
+test('admin.sock: mode 600, a stale socket is replaced, a non-socket is refused', async (t) => {
+  if (process.platform === 'win32') return t.skip('unix sockets');
+  const c = await boot();
+  try {
+    const sock = adminPath(c.configDir);
+    const st = fs.statSync(sock);
+    assert.ok(st.isSocket());
+    assert.equal(st.mode & 0o777, 0o600);
+    await c.app.close();
+    assert.ok(!fs.existsSync(sock));
+    // a server that died hard leaves its socket behind
+    const k = spawnSync(process.execPath, ['-e', `require('net').createServer().listen(${JSON.stringify(sock)}, () => process.kill(process.pid, 'SIGKILL'))`]);
+    assert.equal(k.signal, 'SIGKILL');
+    assert.ok(fs.lstatSync(sock).isSocket());
+    const app2 = createApp({ configDir: c.configDir, tmux: [process.execPath, FAKE], log: () => {} });
+    await app2.listen(0, '127.0.0.1');
+    assert.equal(fs.statSync(sock).mode & 0o777, 0o600);
+    assert.equal((await adminRequest(c.configDir, { cmd: 'pair' })).ok, true);
+    await app2.close();
+    fs.writeFileSync(sock, 'not a socket');
+    const app3 = createApp({ configDir: c.configDir, tmux: [process.execPath, FAKE], log: () => {} });
+    await assert.rejects(app3.listen(0, '127.0.0.1'), /not a socket/);
+  } finally { await c.app.close().catch(() => {}); fs.rmSync(c.root, { recursive: true, force: true }); }
+});
+
+test('CLI: --pair, --devices and --revoke exit 1 when the server is not running', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-cli-'));
+  try {
+    for (const args of [['--pair'], ['--devices'], ['--revoke', 'all']]) {
+      const r = await cli(dir, args);
+      assert.equal(r.status, 1, args.join(' '));
+      assert.match(r.stderr, /not running/);
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('CLI: --devices lists, --revoke <id> and --revoke all revoke through admin.sock', () => withApp(async (c) => {
+  const a = await c.login({}, 'phone A'); const b = await c.login({}, 'phone B');
+  const ls = await cli(c.configDir, ['--devices']);
+  assert.equal(ls.status, 0, ls.stderr);
+  const idA = await c.deviceId('phone A');
+  assert.match(ls.stdout, new RegExp(`^${idA}  \\d{4}-\\d\\d-\\d\\dT[^ ]+  phone A$`, 'm'));
+  assert.match(ls.stdout, /  phone B$/m);
+  assert.ok(!ls.stdout.includes(a.token) && !ls.stdout.includes('keyHash') && !ls.stdout.includes(devicesFile(c)[0].keyHash));
+  const r1 = await cli(c.configDir, ['--revoke', idA]);
+  assert.deepEqual([r1.status, r1.stdout.trim()], [0, 'revoked: 1']);
+  assert.equal((await c.req('GET', '/api/me', { cookie: a.cookie })).status, 401);
+  assert.equal((await c.req('GET', '/api/me', { cookie: b.cookie })).status, 200);
+  assert.deepEqual(devicesFile(c).map((d) => d.name), ['phone B']);
+  const bad = await cli(c.configDir, ['--revoke', 'ffffffffffffffff']);
+  assert.equal(bad.status, 1);
+  assert.match(bad.stderr, /no such device/);
+  const all = await cli(c.configDir, ['--revoke', 'all']);
+  assert.deepEqual([all.status, all.stdout.trim()], [0, 'revoked: 1']);
+  assert.equal((await c.req('GET', '/api/me', { cookie: b.cookie })).status, 401);
+  assert.deepEqual(devicesFile(c), []);
+  assert.match((await cli(c.configDir, ['--devices'])).stdout, /no paired devices/);
+}));
+
+// a server whose devices.json writes can be made to fail
+const failingWrites = () => {
+  const w = { failing: false, attempts: 0 };
+  w.fn = (f, d) => {
+    if (f.endsWith('devices.json')) w.attempts++;
+    if (w.failing && f.endsWith('devices.json')) throw Object.assign(new Error('ENOSPC'), { code: 'ENOSPC' });
+    writePrivate(f, d);
+    if (w.afterRename && f.endsWith('devices.json')) throw Object.assign(new Error('EIO'), { code: 'EIO', committed: true }); // dir fsync failed
+  };
+  return w;
+};
+
+test('revoke: a failed devices.json write -> CLI exit 1, nothing changes', async () => {
+  const w = failingWrites();
+  await withApp(async (c) => {
+    const a = await c.login({}, 'keep');
+    const before = fs.readFileSync(path.join(c.configDir, 'devices.json'));
+    w.failing = true;
+    for (const id of [await c.deviceId('keep'), 'all']) {
+      const r = await cli(c.configDir, ['--revoke', id]);
+      assert.equal(r.status, 1);
+      assert.match(r.stderr, /storage: ENOSPC/);
+    }
+    assert.equal((await c.req('GET', '/api/me', { cookie: a.cookie })).status, 200);
+    assert.ok(fs.readFileSync(path.join(c.configDir, 'devices.json')).equals(before));
+    // logout with a failed write: 500 storage, the device stays
+    assert.deepEqual((await c.req('POST', '/api/logout', { cookie: a.cookie })).json, { error: 'storage' });
+    assert.equal((await c.req('POST', '/api/logout?all=1', { cookie: a.cookie })).status, 500);
+    assert.equal((await c.req('GET', '/api/me', { cookie: a.cookie })).status, 200);
+    w.failing = false;
+    assert.equal((await cli(c.configDir, ['--revoke', 'all'])).status, 0);
+    assert.equal((await c.req('GET', '/api/me', { cookie: a.cookie })).status, 401);
+  }, { writePrivate: w.fn });
+});
+
+test('pairing: a failed devices.json write -> 500 storage, no token, no cookie, no device', async () => {
+  const w = failingWrites();
+  await withApp(async (c) => {
+    w.failing = true;
+    const p = await adminRequest(c.configDir, { cmd: 'pair' });
+    const r = await pairReq(c, p.code);
+    assert.deepEqual([r.status, r.json], [500, { error: 'storage' }]);
+    assert.equal(r.headers['set-cookie'], undefined);
+    assert.ok(!r.text.includes('token'));
+    assert.ok(!fs.existsSync(path.join(c.configDir, 'devices.json')));
+    assert.deepEqual((await adminRequest(c.configDir, { cmd: 'devices' })).devices, []);
+    w.failing = false;
+    await c.login(); // a new --pair works
+  }, { writePrivate: w.fn });
+});
+
+test('logout removes only the calling device; logout?all removes every device (memory and devices.json)', () => withApp(async (c) => {
+  const a = await c.login({}, 'a'); const b = await c.login({}, 'b'); const d = await c.login({}, 'd');
+  assert.equal((await c.req('POST', '/api/logout', { headers: { Authorization: `Bearer ${a.token}` } })).status, 200);
+  assert.equal((await c.req('GET', '/api/me', { cookie: a.cookie })).status, 401);
+  assert.deepEqual(devicesFile(c).map((x) => x.name), ['b', 'd']);
+  assert.equal((await c.req('POST', '/api/logout?all=1', { cookie: b.cookie })).status, 200);
+  for (const x of [b, d]) assert.equal((await c.req('GET', '/api/me', { cookie: x.cookie })).status, 401);
+  assert.deepEqual(devicesFile(c), []);
+}));
+
+test('startup refuses an invalid devices.json (exit 1, nothing of the file printed); a missing one is empty', async () => {
+  const c = await boot();
+  await c.app.close();
+  try {
+    const f = path.join(c.configDir, 'devices.json');
+    const ok = { id: '0123456789abcdef', name: 'x', keyHash: 'a'.repeat(64), createdAt: 1 };
+    const bad = ['{"devices": [SEKRET', '[]', '{}', '{"devices": {}}', ...[
+      { ...ok, id: 'xyz' }, { ...ok, id: 5 }, { ...ok, id: 1234567890123456 }, { ...ok, keyHash: 'SEKRET' }, { ...ok, keyHash: 1e63 }, { ...ok, createdAt: [1] }, { ...ok, name: 'n'.repeat(65) }, { ...ok, name: 7 }, { ...ok, createdAt: 'x' },
+    ].map((d) => JSON.stringify({ devices: [d] })), JSON.stringify({ devices: [ok, ok] }), JSON.stringify({ secretTag: 5, devices: [] }), JSON.stringify({ secretTag: 'SEKRET', devices: [] })];
+    for (const text of bad) {
+      fs.writeFileSync(f, text);
+      assert.throws(() => createApp({ configDir: c.configDir, log: () => {} }), /devices\.json/, text);
+    }
+    fs.writeFileSync(f, bad[0]);
+    const r = spawnSync(process.execPath, [SERVER], { env: { ...process.env, PC_CONFIG_DIR: c.configDir, PC_PORT: '0' }, encoding: 'utf8', timeout: 10000 });
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /devices\.json is not valid JSON/);
+    assert.ok(!r.stderr.includes('SEKRET'));
+    for (const keyHash of [1234567890123456, 1e63]) { // numeric fields: the real server exits 1 too
+      fs.writeFileSync(f, JSON.stringify({ devices: [{ ...ok, keyHash, id: 1234567890123456 }] }));
+      assert.equal(spawnSync(process.execPath, [SERVER], { env: { ...process.env, PC_CONFIG_DIR: c.configDir, PC_PORT: '0' }, timeout: 10000 }).status, 1);
+    }
+    fs.writeFileSync(f, JSON.stringify({ secretTag: TAG, devices: [ok] }));
+    assert.equal(createApp({ configDir: c.configDir, log: () => {} }).devices.size, 1);
+    fs.writeFileSync(f, JSON.stringify({ devices: [] })); // first-run file without a tag: valid
+    assert.equal(createApp({ configDir: c.configDir, log: () => {} }).devices.size, 0);
+    fs.rmSync(f);
+    assert.equal(createApp({ configDir: c.configDir, log: () => {} }).devices.size, 0);
+  } finally { fs.rmSync(c.root, { recursive: true, force: true }); }
+});
+
+test('rotating cookieSecret invalidates every device and rewrites devices.json empty', async () => {
+  const c = await boot();
+  try {
+    const a = await c.login({}, 'a'); const b = await c.login({}, 'b');
+    rotate(c);
+    for (const x of [a, b]) assert.equal((await c.req('GET', '/api/me', { cookie: x.cookie })).status, 401);
+    assert.deepEqual(devicesFile(c), []);
+    const n = await c.login({}, 'new');
+    assert.equal((await c.req('GET', '/api/me', { cookie: n.cookie })).status, 200);
+    await c.app.close();
+    const app2 = createApp({ configDir: c.configDir, tmux: [process.execPath, FAKE], log: () => {} });
+    const port = await app2.listen(0, '127.0.0.1');
+    assert.equal((await request(port, 'GET', '/api/me', { cookie: a.cookie })).status, 401);
+    assert.equal((await request(port, 'GET', '/api/me', { cookie: n.cookie })).status, 200);
+    await app2.close();
+  } finally { await c.app.close().catch(() => {}); fs.rmSync(c.root, { recursive: true, force: true }); }
+});
+
+// ======================= A4 update r1 =======================
+test('writePrivate: a failed directory fsync after the rename carries committed: true', (t) => {
+  if (process.platform === 'win32') return t.skip('no directory fsync on Windows');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-wp-'));
+  const fsync = fs.fsyncSync;
+  let n = 0;
+  try {
+    fs.fsyncSync = (fd) => { if (++n === 2) throw Object.assign(new Error('EIO'), { code: 'EIO' }); return fsync(fd); }; // 1 = file, 2 = dir
+    let err; try { writePrivate(path.join(dir, 'devices.json'), 'newer'); } catch (x) { err = x; }
+    fs.fsyncSync = fsync;
+    assert.equal(err?.committed, true);
+    assert.equal(fs.readFileSync(path.join(dir, 'devices.json'), 'utf8'), 'newer');
+  } finally { fs.fsyncSync = fsync; fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('commit point is the rename: pair, revoke and logout succeed when only the dir fsync fails', async () => {
+  const w = failingWrites();
+  await withApp(async (c) => {
+    w.afterRename = true;
+    const a = await c.login({}, 'a'); // 200 + token although the write threw after the rename
+    assert.equal((await c.req('GET', '/api/me', { cookie: a.cookie })).status, 200);
+    const b = await c.login({}, 'b');
+    const d = await c.login({}, 'd');
+    assert.deepEqual(await adminRequest(c.configDir, { cmd: 'revoke', id: await c.deviceId('a') }), { ok: true, revoked: 1 });
+    assert.equal((await c.req('GET', '/api/me', { cookie: a.cookie })).status, 401);
+    assert.equal((await c.req('POST', '/api/logout', { cookie: b.cookie })).status, 200);
+    assert.equal((await c.req('GET', '/api/me', { cookie: b.cookie })).status, 401);
+    assert.deepEqual(devicesFile(c).map((x) => x.name), ['d']); // memory and file agree
+    assert.equal((await c.req('POST', '/api/logout?all=1', { cookie: d.cookie })).status, 200);
+    assert.deepEqual(devicesFile(c), []);
+    assert.ok(c.logs.some((l) => l.startsWith('devices.json directory fsync failed: EIO')));
+  }, { writePrivate: w.fn });
+});
+
+test('secretTag: a cookieSecret rotated while the server was stopped purges every device at startup', async () => {
+  const c = await boot();
+  try {
+    const a = await c.login({}, 'a');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(c.configDir, 'devices.json'), 'utf8')).secretTag, TAG);
+    await c.app.close();
+    rotate(c);
+    const newTag = crypto.createHmac('sha256', Buffer.from(JSON.parse(fs.readFileSync(path.join(c.configDir, 'config.json'), 'utf8')).cookieSecret, 'base64')).update('fcoding-devices').digest('hex');
+    const app2 = createApp({ configDir: c.configDir, tmux: [process.execPath, FAKE], log: () => {} });
+    assert.equal(app2.devices.size, 0);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(c.configDir, 'devices.json'), 'utf8')), { secretTag: newTag, devices: [] });
+    const port = await app2.listen(0, '127.0.0.1');
+    assert.equal((await request(port, 'GET', '/api/me', { cookie: a.cookie })).status, 401);
+    await app2.close();
+    // an old file without a tag but with devices counts as a mismatch
+    fs.writeFileSync(path.join(c.configDir, 'devices.json'), JSON.stringify({ devices: devicesFile(c).concat([{ id: '0123456789abcdef', name: 'x', keyHash: 'a'.repeat(64), createdAt: 1 }]) }));
+    assert.equal(createApp({ configDir: c.configDir, log: () => {} }).devices.size, 0);
+    assert.deepEqual(devicesFile(c), []);
+  } finally { await c.app.close().catch(() => {}); fs.rmSync(c.root, { recursive: true, force: true }); }
+});
+
+test('secretTag: a failed purge after a rotation blocks auth and pairing, and is retried without another config edit', async () => {
+  const w = failingWrites();
+  await withApp(async (c) => {
+    const a = await c.login({}, 'a');
+    const before = fs.readFileSync(path.join(c.configDir, 'devices.json'), 'utf8');
+    w.failing = true;
+    rotate(c);
+    assert.equal((await c.req('GET', '/api/me', { cookie: a.cookie })).status, 401);
+    assert.equal(fs.readFileSync(path.join(c.configDir, 'devices.json'), 'utf8'), before); // still the old file
+    assert.ok(c.logs.some((l) => l.startsWith('devices.json purge failed')));
+    const p = await adminRequest(c.configDir, { cmd: 'pair' });
+    const r = await c.req('POST', '/api/pair', { body: { code: p.code } });
+    assert.deepEqual([r.status, r.json, r.headers['set-cookie']], [500, { error: 'storage' }, undefined]);
+    w.failing = false; // storage is back: the next admin request purges
+    assert.deepEqual((await adminRequest(c.configDir, { cmd: 'devices' })).devices, []);
+    const f = JSON.parse(fs.readFileSync(path.join(c.configDir, 'devices.json'), 'utf8'));
+    assert.deepEqual(f.devices, []);
+    assert.notEqual(f.secretTag, TAG);
+    const n = await c.login({}, 'new');
+    assert.equal((await c.req('GET', '/api/me', { cookie: n.cookie })).status, 200);
+    assert.equal((await c.req('GET', '/api/me', { cookie: a.cookie })).status, 401);
+  }, { writePrivate: w.fn });
+});
+
+test('/api/pair is counted before the body: 10 oversized bodies use up the minute', async () => {
+  let t = 1_700_000_000_000;
+  await withApp(async (c) => {
+    const big = JSON.stringify({ code: 'x'.repeat(65 * 1024) });
+    for (let i = 0; i < 10; i++) assert.equal((await c.req('POST', '/api/pair', { raw: big, headers: JSON_CT })).status, 413);
+    assert.equal((await c.req('POST', '/api/pair', { raw: big, headers: JSON_CT })).status, 429);
+    const p = await adminRequest(c.configDir, { cmd: 'pair' });
+    assert.equal((await pairReq(c, p.code)).status, 429);
+    assert.equal((await c.req('POST', '/api/pair', { raw: '{bad json', headers: JSON_CT })).status, 429);
+  }, { now: () => t });
+});
+
+test('/api/pair: concurrent requests never exceed the quota', async () => {
+  let t = 1_700_000_000_000;
+  await withApp(async (c) => {
+    const rs = await Promise.all(Array.from({ length: 25 }, () => pairReq(c, '000000')));
+    assert.equal(rs.filter((r) => r.status !== 429).length, 10);
+    t += 61000;
+    const rs2 = await Promise.all(Array.from({ length: 30 }, () => pairReq(c, '000000')));
+    assert.equal(rs2.filter((r) => r.status !== 429).length, 10);
+    t += 61000;
+    const rs3 = await Promise.all(Array.from({ length: 30 }, () => pairReq(c, '000000')));
+    assert.equal(rs3.filter((r) => r.status !== 429).length, 10); // 30 in the hour
+    t += 61000;
+    assert.equal((await pairReq(c, '000000')).status, 429);
+  }, { now: () => t });
+});
+
+test('admin.sock handles only the first line of a connection', { skip: process.platform === 'win32' && 'unix sockets' }, () => withApp(async (c) => {
+  const orig = crypto.randomInt;
+  let calls = 0;
+  crypto.randomInt = (...a) => { calls++; return orig(...a); };
+  try {
+    const reply = await new Promise((resolve, reject) => {
+      const s = net.connect({ path: adminPath(c.configDir), allowHalfOpen: true }); // keeps writing after the server's reply
+      let buf = '';
+      s.on('data', (d) => { buf += d; });
+      s.on('end', () => { s.end('{"cmd":"pair","name":"two"}\n'); setTimeout(() => resolve(buf), 100); }); // a second chunk on the same connection
+      s.on('error', reject); // Windows pipes cannot half-close (EPIPE): POSIX only
+      s.on('connect', () => s.write('{"cmd":"pair","name":"one"}\n'));
+    });
+    await sleep(100);
+    assert.equal(reply.trim().split('\n').length, 1);
+    assert.equal(calls, 1);
+    assert.equal((await pairReq(c, JSON.parse(reply).code)).status, 200); // the first code is still the pending one
+    assert.deepEqual(devicesFile(c).map((d) => d.name), ['one']);
+  } finally { crypto.randomInt = orig; }
+}));
+
+test('pairing: the code comes from crypto.randomInt(0, 1000000), zero-padded', () => withApp(async (c) => {
+  const orig = crypto.randomInt;
+  const seen = [];
+  crypto.randomInt = (...a) => { seen.push(a); return 42; };
+  let p;
+  try { p = await adminRequest(c.configDir, { cmd: 'pair' }); } finally { crypto.randomInt = orig; }
+  assert.deepEqual(seen, [[0, 1e6]]);
+  assert.equal(p.code, '000042');
+  assert.equal(p.expiresIn, 120);
+  assert.equal((await pairReq(c, '000042')).status, 200);
+}));
+
+test('device names lose C0, C1 and bidi control characters', () => withApp(async (c) => {
+  const ch = (...cps) => String.fromCharCode(...cps);
+  const raw = `a${ch(0x85)}b${ch(0x202e)}c${ch(0x2066)}d${ch(0x200f)}e${ch(0x1, 0x7f, 0x9f, 0x200e, 0x202a, 0x2069)}f`;
+  await c.login({}, raw);
+  assert.deepEqual(devicesFile(c).map((d) => d.name), ['abcdef']);
+  const p = await adminRequest(c.configDir, { cmd: 'pair' }); // the app-sent name too
+  assert.equal((await pairReq(c, p.code, { name: `x${ch(0x202d)}y` })).status, 200);
+  assert.deepEqual(devicesFile(c).map((d) => d.name), ['abcdef', 'xy']);
+}));
+
+// ======================= A4 update r2 =======================
+test('purge retry is throttled: at most one write per second from requests; admin requests and config changes always retry', async () => {
+  let t = 1_700_000_000_000;
+  const w = failingWrites();
+  await withApp(async (c) => {
+    const a = await c.login({}, 'a');
+    w.failing = true;
+    rotate(c);
+    w.attempts = 0;
+    for (let i = 0; i < 20; i++) assert.equal((await c.req('GET', '/api/me', { cookie: a.cookie })).status, 401);
+    assert.equal(w.attempts, 1); // the purge that the rotation started; no retry within the same second
+    const failLogs = () => c.logs.filter((l) => l.startsWith('devices.json purge failed')).length;
+    assert.equal(failLogs(), 1);
+    t += 999;
+    await c.req('GET', '/api/me', { cookie: a.cookie });
+    assert.equal(w.attempts, 1);
+    t += 1;
+    for (let i = 0; i < 5; i++) await c.req('GET', '/api/me', { cookie: a.cookie });
+    assert.equal(w.attempts, 2); // one retry after 1 s
+    await adminRequest(c.configDir, { cmd: 'devices' });
+    await adminRequest(c.configDir, { cmd: 'devices' });
+    assert.equal(w.attempts, 4); // every admin request retries
+    const f = path.join(c.configDir, 'config.json');
+    writePrivate(f, JSON.stringify({ ...JSON.parse(fs.readFileSync(f, 'utf8')), projects: { beta: ABS } })); // same secret, new stamp
+    await c.req('GET', '/api/me', { cookie: a.cookie });
+    assert.equal(w.attempts, 5); // a config change retries
+    assert.equal(failLogs(), 5); // one log line per attempt
+    w.failing = false;
+    t += 1000;
+    await c.req('GET', '/api/me', { cookie: a.cookie });
+    assert.equal(w.attempts, 6);
+    assert.deepEqual(devicesFile(c), []);
+    for (let i = 0; i < 5; i++) await c.req('GET', '/api/me', { cookie: a.cookie });
+    assert.equal(w.attempts, 6); // nothing pending: no more writes
+    await c.login({}, 'new');
+  }, { now: () => t, writePrivate: w.fn });
+});
+
+// ======================= A5: GET /api/overview, POST /api/open fresh =======================
+const ESC = String.fromCharCode(27);
+const NO_GIT = [process.execPath, '-e', 'process.exit(128)']; // every git call fails: projects get nulls
+const fakeState = (c) => path.join(c.root, 'fake', 'state.json');
+const setSession = (c, name, fields) => { // edit the fake tmux session table directly
+  const st = JSON.parse(fs.readFileSync(fakeState(c), 'utf8'));
+  st.sessions[name] = { created: 1700000000, dir: ABS, cmd: 'x', opts: { '@pc_project': 'alpha', '@pc_harness': 'shell' }, ...st.sessions[name], ...fields };
+  fs.writeFileSync(fakeState(c), JSON.stringify(st));
+};
+const setProjects = (c, projects) => {
+  const f = path.join(c.configDir, 'config.json');
+  writePrivate(f, JSON.stringify({ ...JSON.parse(fs.readFileSync(f, 'utf8')), projects }));
+};
+
+test('overview state: running within 8 s of activity, then waiting for each prompt pattern, else idle', () => {
+  const act = 1_700_000_000;
+  assert.equal(stateOf('Proceed? (y/n)', act, act * 1000 + 8000), 'running'); // the 8 s boundary is still running
+  assert.equal(stateOf('plain output', act, act * 1000 + 8001), 'idle');
+  const samples = ['Overwrite? (y/n)', 'Apply [y/n]', 'Install [Y/n]', 'Delete [y/N]', 'Answer yes/no', 'Do you want to make this edit?',
+    'Allow this command?', 'Approve the plan', 'Proceed?', 'Continue? ', 'Press Enter to continue', '❯ 1. Yes', '> 1. Yes, allow once'];
+  assert.equal(samples.length, WAIT_PATTERNS.length + 1); // one per pattern, plus the "> 1." form
+  WAIT_PATTERNS.forEach((re, i) => assert.ok(re.test(samples[i]), String(re)));
+  assert.ok(WAIT_PATTERNS.at(-1).test(samples.at(-1)));
+  for (const line of samples) {
+    assert.equal(stateOf(`some output\n${line}\n\n`, act, act * 1000 + 9000), 'waiting', line);
+    assert.equal(stateOf(`${line.toUpperCase()}`, act, act * 1000 + 9000), 'waiting', line.toUpperCase());
+  }
+  // only the last 6 non-empty lines count
+  assert.equal(stateOf(['Proceed? (y/n)', '1', '2', '3', '4', '5', '6', ''].join('\n'), act, act * 1000 + 9000), 'idle');
+  assert.equal(stateOf(['Proceed? (y/n)', '1', '', '2', '3', '4', '5', '', ''].join('\n'), act, act * 1000 + 9000), 'waiting');
+  for (const plain of ['compiling src/main.rs', 'all tests passed', 'allowed = 3', 'continue', '$ ']) assert.equal(stateOf(plain, act, act * 1000 + 9000), 'idle', plain);
+});
+
+test('overview preview: ANSI, controls, box drawing, prompt chrome, long lines, code-point boundary', () => {
+  const ch = (...cps) => String.fromCodePoint(...cps);
+  assert.equal(previewOf(`${ESC}[1;31mError:${ESC}[0m build failed\n\n`), 'Error: build failed');
+  assert.equal(previewOf(`${ESC}]0;title${String.fromCharCode(7)}done`), 'done');
+  assert.equal(previewOf('Writing tests\n╭──────────╮\n│ >        │\n╰──────────╯\n  ❯ \n$\n'), 'Writing tests');
+  assert.equal(previewOf('│ Edited 3 files │'), 'Edited 3 files');
+  assert.equal(previewOf(`a${ch(0x85)}b${ch(0x202e)}c${ch(0x1)}d\tz`), 'abcd z');
+  assert.equal(previewOf(''), null);
+  assert.equal(previewOf('───\n>\n'), null);
+  const long = 'x'.repeat(500);
+  assert.equal(previewOf(long), 'x'.repeat(160));
+  const emoji = ch(0x1f600);
+  const p = previewOf('a'.repeat(159) + emoji + emoji);
+  assert.equal(Array.from(p).length, 160);
+  assert.ok(p.endsWith(emoji)); // never half a surrogate pair
+  // waiting: the preview is the last matched prompt line, cleaned; otherwise the last real line
+  const act = 1_700_000_000;
+  assert.deepEqual(summarize(`│ Do you want to proceed? │\n${ESC}[1m  Overwrite foo? (y/n)${ESC}[0m\n  some hint\n╰───╯\n`, act, act * 1000 + 9000), { state: 'waiting', preview: 'Overwrite foo? (y/n)', menu: false });
+  assert.deepEqual(summarize('│ Do you want to proceed? │\nchoose below\n', act, act * 1000 + 9000), { state: 'waiting', preview: 'Do you want to proceed?', menu: false });
+  assert.deepEqual(summarize('Proceed? (y/n)\n', act, act * 1000 + 1000), { state: 'running', preview: 'Proceed? (y/n)', menu: false });
+  assert.equal(summarize(`${'y'.repeat(170)} (y/n)`, act, act * 1000 + 9000).preview, 'y'.repeat(160));
+  assert.deepEqual(summarize('built ok\n$ \n', act, act * 1000 + 9000), { state: 'idle', preview: 'built ok', menu: false });
+  assert.deepEqual(parseShortstat(' 2 files changed, 3 insertions(+), 1 deletion(-)'), { files: 2, add: 3, del: 1 });
+  assert.deepEqual(parseShortstat(' 1 file changed, 1 deletion(-)'), { files: 1, add: 0, del: 1 });
+  assert.deepEqual(parseShortstat(' 1 file changed, 1 insertion(+)'), { files: 1, add: 1, del: 0 });
+  assert.deepEqual(parseShortstat(' 1 file changed, 1 insertion(+), 1 deletion(-)'), { files: 1, add: 1, del: 1 });
+  assert.deepEqual(parseShortstat(''), { files: 0, add: 0, del: 0 });
+});
+
+test('GET /api/overview: sessions with state and preview, one bad item gives nulls, response 200', async () => {
+  let t = 1_700_000_200_000;
+  await withApp(async (c) => {
+    const { cookie } = await c.login();
+    assert.equal((await c.req('GET', '/api/overview')).status, 401);
+    let r = await c.req('GET', '/api/overview', { cookie });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.json.sessions, []);
+    assert.equal(r.json.now, 1_700_000_200);
+    assert.deepEqual(r.json.projects.map((x) => [x.name, x.branch, x.ahead, x.diff]), [['alpha', null, null, null], ['my.proj', null, null, null]]);
+    for (const n of ['busy', 'ask', 'rest', 'gone']) assert.equal((await mkSession(c, cookie, n)).status, 201);
+    setSession(c, 'busy', { activity: 1_700_000_195, screen: 'cargo build\n   Compiling foo\n' });
+    setSession(c, 'ask', { activity: 1_700_000_100, screen: `Edit file?\n${ESC}[7m❯ 1. Yes${ESC}[0m\n  2. No\n╰────╯\n` });
+    setSession(c, 'rest', { activity: 1_700_000_100, screen: 'done.\n$ \n', secret: 'never' });
+    setSession(c, 'gone', { activity: 1_700_000_100, windowActivity: 1_700_000_197 }); // pane output 3 s ago: running
+    r = await c.req('GET', '/api/overview', { cookie });
+    assert.equal(r.status, 200);
+    const by = Object.fromEntries(r.json.sessions.map((x) => [x.name, x]));
+    assert.deepEqual(Object.keys(by.busy).sort(), ['activity', 'attached', 'created', 'harness', 'menu', 'name', 'preview', 'project', 'state']);
+    assert.deepEqual([by.busy.state, by.busy.preview, by.busy.project, by.busy.harness], ['running', 'Compiling foo', 'alpha', 'shell']);
+    assert.deepEqual([by.ask.state, by.ask.preview, by.ask.menu], ['waiting', '❯ 1. Yes', true]); // waiting: the matched prompt line
+    assert.deepEqual([by.rest.state, by.rest.preview, by.rest.menu], ['idle', 'done.', false]);
+    assert.deepEqual([by.gone.state, by.gone.activity], ['running', 1_700_000_197]); // window_activity counts
+    // capture of the visible pane only: no -S history, no -e escapes
+    const caps = c.calls().filter((x) => x.argv[0] === 'capture-pane' && x.argv.includes('=ask:'));
+    assert.deepEqual(caps.at(-1).argv, ['capture-pane', '-p', '-J', '-t', '=ask:']);
+    // a session that vanishes between list and capture: nulls for it, 200 for the rest
+    const st = JSON.parse(fs.readFileSync(fakeState(c), 'utf8'));
+    st.sessions.gone.screen = undefined;
+    fs.writeFileSync(fakeState(c), JSON.stringify(st));
+    await withEnv({ FAKE_TMUX_SCREEN_FILE: path.join(c.root, 'missing-file') }, async () => { // capture-pane fails for "gone" only
+      r = await c.req('GET', '/api/overview', { cookie });
+    });
+    assert.equal(r.status, 200);
+    const g = r.json.sessions.find((x) => x.name === 'gone');
+    assert.deepEqual([g.state, g.preview, g.menu], [null, null, null]);
+    assert.equal(r.json.sessions.find((x) => x.name === 'ask').state, 'waiting');
+    assert.ok(!r.text.includes('never'));
+  }, { now: () => t, git: NO_GIT });
+});
+
+const git = (dir, ...args) => {
+  const r = spawnSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', ...args], { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  return r.stdout;
+};
+test('overview git: branch, diff and ahead parsed; a non-repo gives nulls; cached for 10 s per project', async () => {
+  let t = 1_700_000_200_000;
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-git-'));
+  try {
+    const repo = path.join(tmp, 'repo'); const plain = path.join(tmp, 'plain');
+    fs.mkdirSync(repo); fs.mkdirSync(plain);
+    git(repo, 'init', '-q', '-b', 'main');
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'one\ntwo\n');
+    git(repo, 'add', '.'); git(repo, 'commit', '-q', '-m', 'one');
+    git(repo, 'branch', 'base'); git(repo, 'branch', '--set-upstream-to=base');
+    fs.writeFileSync(path.join(repo, 'b.txt'), 'b\n');
+    git(repo, 'add', '.'); git(repo, 'commit', '-q', '-m', 'two');
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'one\nTWO\nthree\n'); // 2 insertions, 1 deletion
+    // a ceiling stops git from finding a repo above the plain dir
+    await withEnv({ GIT_CEILING_DIRECTORIES: tmp }, () => withApp(async (c) => {
+      const { cookie } = await c.login();
+      setProjects(c, { repo, plain });
+      const pr = async () => Object.fromEntries((await c.req('GET', '/api/overview', { cookie })).json.projects.map((x) => [x.name, x]));
+      let p = await pr();
+      assert.deepEqual(p.repo, { name: 'repo', branch: 'main', ahead: 1, diff: { files: 1, add: 2, del: 1 } });
+      assert.deepEqual(p.plain, { name: 'plain', branch: null, ahead: null, diff: null });
+      fs.writeFileSync(path.join(repo, 'b.txt'), 'b\nc\n');
+      t += 9999;
+      assert.deepEqual((await pr()).repo.diff, { files: 1, add: 2, del: 1 }); // cache hit
+      t += 1;
+      assert.deepEqual((await pr()).repo.diff, { files: 2, add: 3, del: 1 }); // refreshed after 10 s
+      git(repo, 'checkout', '-q', '-b', 'feature');
+      t += 10000;
+      p = await pr();
+      assert.equal(p.repo.branch, 'feature');
+      assert.equal(p.repo.ahead, null); // no upstream
+      assert.ok(!fs.existsSync(path.join(repo, '.git', 'index.lock')));
+    }, { now: () => t }));
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
+
+test('overview gate: one read slot for the whole job, 503 when the read slots are full', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  for (const n of ['s1', 's2', 's3']) await mkSession(c, cookie, n);
+  // screens hold their 2 slots for 3 s; each overview capture takes 250 ms
+  await withEnv({ FAKE_TMUX_DELAYS: JSON.stringify({ 'display-message': 3000, 'capture-pane -S': 3000, 'capture-pane': 250 }) }, async () => {
+    const screens = Array.from({ length: 3 }, () => c.req('GET', '/api/screen/s1', { cookie }));
+    assert.ok(await until(() => c.app.stats().reads === 6, 3000));
+    const before = c.calls().length;
+    const ov = c.req('GET', '/api/overview', { cookie });
+    assert.ok(await until(() => c.app.stats().reads === 7, 1000), `reads=${c.app.stats().reads}`); // 6 screens + the overview
+    const samples = [];
+    const iv = setInterval(() => samples.push(c.app.stats().reads), 2);
+    const second = await c.req('GET', '/api/overview', { cookie }); // while the first one runs
+    assert.deepEqual([second.status, second.json], [503, { error: 'busy' }]);
+    const r = await ov;
+    clearInterval(iv);
+    assert.equal(r.status, 200);
+    assert.equal(r.json.sessions.length, 3);
+    // 7 for the whole job (one held slot, never per child), then 6 once it has released it
+    const six = samples.indexOf(6) < 0 ? samples.length : samples.indexOf(6);
+    assert.ok(six > 10 && samples.slice(0, six).every((x) => x === 7) && samples.slice(six).every((x) => x === 6), `reads during the overview: ${samples.join(',')}`);
+    assert.equal(c.app.stats().reads, 6); // the screens still hold theirs
+    assert.ok(maxOverlap(c.calls().slice(before).filter((x) => x.argv[0] === 'list-sessions' || (x.argv[0] === 'capture-pane' && !x.argv.includes('-S')))) <= 1);
+    await Promise.all(screens);
+  });
+  assert.ok(await until(() => c.app.stats().reads === 0 && c.app.stats().running === 0));
+}, { git: NO_GIT }));
+
+test('overview gate: a revoke during the job stops it at the gate (401, no further child)', () => withApp(async (c) => {
+  const a = await c.login({}, 'victim');
+  for (const n of ['s1', 's2', 's3', 's4']) await mkSession(c, a.cookie, n);
+  await withEnv({ FAKE_TMUX_DELAY_MS: '250' }, async () => {
+    const before = c.calls().length;
+    const ov = c.req('GET', '/api/overview', { cookie: a.cookie });
+    assert.ok(await until(() => c.app.stats().running === 1, 3000));
+    assert.deepEqual(await adminRequest(c.configDir, { cmd: 'revoke', id: await c.deviceId('victim') }), { ok: true, revoked: 1 });
+    assert.equal((await ov).status, 401);
+    await sleep(400);
+    const caps = c.calls().slice(before).filter((x) => x.argv[0] === 'capture-pane');
+    assert.ok(caps.length <= 1, `captures after revoke: ${caps.length}`);
+  });
+  assert.ok(await until(() => c.app.stats().reads === 0 && c.app.stats().running === 0));
+}, { git: NO_GIT }));
+
+// ---- POST /api/open fresh:true (A5 update 4) ----
+const openReq = (c, cookie, body) => c.req('POST', '/api/open', { cookie, body: { project: 'alpha', harness: 'shell', ...body } });
+test('open fresh: base, then base-2, base-3; never reuses; without fresh the old reuse stays', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  const names = [];
+  for (let i = 0; i < 3; i++) {
+    const r = await openReq(c, cookie, { fresh: true });
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.equal(r.json.created, true);
+    names.push(r.json.name);
+  }
+  assert.deepEqual(names, ['alpha-shell', 'alpha-shell-2', 'alpha-shell-3']);
+  const old = await openReq(c, cookie, {});
+  assert.deepEqual(old.json, { name: 'alpha-shell', created: false }); // reuse, as before
+  assert.equal((await c.req('DELETE', '/api/sessions/alpha-shell-2', { cookie })).status, 200);
+  assert.equal((await openReq(c, cookie, { fresh: true })).json.name, 'alpha-shell-2'); // the first free name
+  assert.equal((await openReq(c, cookie, { fresh: 'yes' })).status, 400);
+  const st = JSON.parse(fs.readFileSync(fakeState(c), 'utf8'));
+  assert.deepEqual(Object.keys(st.sessions).sort(), ['alpha-shell', 'alpha-shell-2', 'alpha-shell-3']);
+  assert.equal(st.sessions['alpha-shell-3'].opts['@pc_project'], 'alpha');
+}));
+
+test('open fresh: long project names keep the suffix within 32 chars; concurrent fresh opens get different names', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  const long = 'a-very-long-project-name-for-tests-x';
+  setProjects(c, { [long]: ABS });
+  const o = (body) => c.req('POST', '/api/open', { cookie, body: { project: long, harness: 'claude', fresh: true, ...body } });
+  const r1 = await o(); const r2 = await o();
+  assert.equal(r1.json.name, 'a-very-long-project-name-for-tes');
+  assert.equal(r2.json.name, 'a-very-long-project-name-for-t-2');
+  for (let i = 3; i <= 10; i++) assert.equal((await o()).json.name, i < 10 ? `a-very-long-project-name-for-t-${i}` : 'a-very-long-project-name-for-10'); // a trailing "-" of the cut base is dropped
+  for (const n of [r1.json.name, r2.json.name]) assert.ok(n.length <= 32);
+  setProjects(c, { alpha: ABS });
+  const par = await Promise.all(Array.from({ length: 5 }, () => openReq(c, cookie, { fresh: true })));
+  assert.ok(par.every((r) => r.status === 200 && r.json.created === true));
+  assert.equal(new Set(par.map((r) => r.json.name)).size, 5);
+}));
+
+test('overview git: every call is execFile git -C <dir> with GIT_OPTIONAL_LOCKS=0, one round per project per 10 s', async () => {
+  let t = 1_700_000_200_000;
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-fgit-'));
+  const logFile = path.join(tmp, 'git.jsonl');
+  const fakeGit = path.join(tmp, 'git.cjs'); // logs argv + env, then fails like "not a git repository"
+  fs.writeFileSync(fakeGit, `require('fs').appendFileSync(${JSON.stringify(logFile)}, JSON.stringify({ argv: process.argv.slice(2), lock: process.env.GIT_OPTIONAL_LOCKS }) + String.fromCharCode(10)); process.exit(128);`);
+  const calls = () => { try { return fs.readFileSync(logFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l)); } catch { return []; } };
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      assert.equal((await c.req('GET', '/api/overview', { cookie })).status, 200);
+      // alpha and my.proj share one dir: the cache is per dir, so one call; a failed rev-parse stops that project's round
+      assert.deepEqual(calls(), [{ argv: ['-C', ABS, '-c', 'core.fsmonitor=false', 'rev-parse', '--abbrev-ref', 'HEAD'], lock: '0' }]);
+      t += 9999;
+      await c.req('GET', '/api/overview', { cookie });
+      assert.equal(calls().length, 1); // cache hit
+      t += 1;
+      await c.req('GET', '/api/overview', { cookie });
+      assert.equal(calls().length, 2); // refreshed after 10 s
+    }, { now: () => t, git: [process.execPath, fakeGit] });
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
+
+// ======================= A4 update r3: single instance =======================
+const LOCK_MSG = /Một máy chủ FCode khác đang dùng thư mục cấu hình này/;
+const freePort = () => new Promise((resolve) => { const s = net.createServer().listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)); }); });
+// the real server as a child: resolves {listening, child} once it serves, or {code, err} when it exits first
+async function startServer(configDir) {
+  const port = await freePort();
+  const child = spawn(process.execPath, [SERVER], { env: { ...process.env, PC_CONFIG_DIR: configDir, PC_PORT: String(port) }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let out = '', err = '';
+  return new Promise((resolve) => {
+    child.stdout.on('data', (d) => { out += d; if (out.includes('fcoding listening')) resolve({ listening: true, child, port }); });
+    child.stderr.on('data', (d) => { err += d; });
+    child.on('exit', (code, signal) => resolve({ listening: false, code, signal, err, child }));
+  });
+}
+const stop = (r) => new Promise((resolve) => { if (r.child.exitCode !== null || r.child.signalCode) return resolve(); r.child.once('exit', () => resolve()); r.child.kill('SIGTERM'); });
+const fileId = (f) => { const st = fs.lstatSync(f); return `${st.ino}:${st.mtimeMs}`; };
+const freshDir = async () => { const c = await boot(); await c.login({}, 'phone'); await c.app.close(); return c; }; // config + devices.json, no server
+
+test('instance lock: in-process, a second lock on the same config dir is refused; another dir is fine; free after close', async () => {
+  const a = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-lock-')); const b = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-lock-'));
+  try {
+    const l1 = await acquireInstanceLock(a);
+    await assert.rejects(acquireInstanceLock(a), LOCK_MSG);
+    await assert.rejects(acquireInstanceLock(path.join(a, '.', '')), LOCK_MSG); // same real path
+    const l2 = await acquireInstanceLock(b);
+    await new Promise((r) => l1.close(r));
+    const l3 = await acquireInstanceLock(a);
+    await Promise.all([l2, l3].map((l) => new Promise((r) => l.close(r))));
+  } finally { for (const d of [a, b]) fs.rmSync(d, { recursive: true, force: true }); }
+});
+
+test('instance lock: a second server on the same config dir (sequential and concurrent) exits 1 and touches nothing', async (t) => {
+  if (process.platform === 'win32') return t.skip('spawns listening servers: box only');
+  const c = await freshDir();
+  const sock = adminPath(c.configDir); const dev = path.join(c.configDir, 'devices.json');
+  const running = [];
+  try {
+    const a = await startServer(c.configDir); running.push(a);
+    assert.ok(a.listening, a.err);
+    const before = [fileId(sock), fileId(dev)];
+    const b = await startServer(c.configDir); running.push(b);
+    assert.deepEqual([b.listening, b.code], [false, 1]);
+    assert.match(b.err, LOCK_MSG);
+    assert.deepEqual([fileId(sock), fileId(dev)], before);
+    assert.equal((await adminRequest(c.configDir, { cmd: 'devices' })).devices.length, 1); // the first one still answers
+    await stop(a);
+    const pair = await Promise.all([startServer(c.configDir), startServer(c.configDir)]); running.push(...pair);
+    const ok = pair.filter((r) => r.listening); const refused = pair.filter((r) => !r.listening);
+    assert.equal(ok.length, 1, pair.map((r) => r.err).join(' | '));
+    assert.deepEqual([refused[0].code, LOCK_MSG.test(refused[0].err)], [1, true]);
+    const id = fileId(sock);
+    await sleep(200);
+    assert.equal(fileId(sock), id); // the loser never unlinked the winner's socket
+    assert.equal((await adminRequest(c.configDir, { cmd: 'devices' })).devices.length, 1);
+  } finally { await Promise.all(running.map(stop)); fs.rmSync(c.root, { recursive: true, force: true }); }
+});
+
+test('instance lock: after SIGKILL a new start succeeds at once and replaces the stale admin.sock', async (t) => {
+  if (process.platform === 'win32') return t.skip('spawns listening servers: box only');
+  const c = await freshDir();
+  const sock = adminPath(c.configDir);
+  const running = [];
+  try {
+    const a = await startServer(c.configDir); running.push(a);
+    assert.ok(a.listening, a.err);
+    const ino = fs.lstatSync(sock).ino;
+    await new Promise((r) => { a.child.once('exit', r); a.child.kill('SIGKILL'); });
+    assert.ok(fs.lstatSync(sock).isSocket()); // left behind by the crash
+    const b = await startServer(c.configDir); running.push(b);
+    assert.ok(b.listening, b.err);
+    assert.notEqual(fs.lstatSync(sock).ino, ino);
+    assert.equal(fs.statSync(sock).mode & 0o777, 0o600);
+    assert.equal((await adminRequest(c.configDir, { cmd: 'pair' })).ok, true);
+  } finally { await Promise.all(running.map(stop)); fs.rmSync(c.root, { recursive: true, force: true }); }
+});
+
+test('instance lock: different config dirs run side by side', async (t) => {
+  if (process.platform === 'win32') return t.skip('spawns listening servers: box only');
+  const c1 = await freshDir(); const c2 = await freshDir();
+  const running = [];
+  try {
+    const rs = await Promise.all([startServer(c1.configDir), startServer(c2.configDir)]); running.push(...rs);
+    assert.ok(rs.every((r) => r.listening), rs.map((r) => r.err).join(' | '));
+    for (const c of [c1, c2]) assert.equal((await adminRequest(c.configDir, { cmd: 'devices' })).ok, true);
+  } finally { await Promise.all(running.map(stop)); for (const c of [c1, c2]) fs.rmSync(c.root, { recursive: true, force: true }); }
+});
+
+// ======================= A5 rework r1 =======================
+// a fake git: logs argv; rev-parse prints `branch` (or fails like a non-repo), diff prints nothing, rev-list fails
+const fakeGitIn = (tmp, { branch = null, sleepMs = 0 } = {}) => {
+  const logFile = path.join(tmp, 'git.jsonl'); const file = path.join(tmp, 'git.cjs');
+  fs.writeFileSync(file, `const fs = require('fs'), a = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(logFile)}, JSON.stringify(a) + String.fromCharCode(10));
+if (${sleepMs}) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ${sleepMs});
+const sub = a[4];
+if (sub === 'rev-parse') { if (${JSON.stringify(branch)} === null) process.exit(128); process.stdout.write(${JSON.stringify(branch)} + String.fromCharCode(10)); }
+else if (sub === 'rev-list') process.exit(128);`);
+  return { spec: [process.execPath, file], calls: () => { try { return fs.readFileSync(logFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l)); } catch { return []; } } };
+};
+
+test('overview git: a revoke during a slow git call caches nothing; the next overview runs git again', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-fgit-'));
+  const g = fakeGitIn(tmp, { sleepMs: 400 });
+  try {
+    await withApp(async (c) => {
+      const a = await c.login({}, 'victim');
+      const ov = c.req('GET', '/api/overview', { cookie: a.cookie });
+      assert.ok(await until(() => g.calls().length === 1 && c.app.stats().running === 1, 3000));
+      assert.deepEqual(await adminRequest(c.configDir, { cmd: 'revoke', id: await c.deviceId('victim') }), { ok: true, revoked: 1 });
+      assert.equal((await ov).status, 401);
+      const b = await c.login({}, 'next');
+      assert.equal((await c.req('GET', '/api/overview', { cookie: b.cookie })).status, 200);
+      assert.equal(g.calls().length, 2); // git ran again: the stopped round was not cached
+      assert.equal((await c.req('GET', '/api/overview', { cookie: b.cookie })).status, 200);
+      assert.equal(g.calls().length, 2); // the completed round is
+    }, { git: g.spec });
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
+
+test('overview git: concurrent cold overviews share one git run per dir; a stopped owner hands over', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-fgit-'));
+  const g = fakeGitIn(tmp, { branch: 'main', sleepMs: 300 });
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login({}, 'one');
+      const rs = await Promise.all(Array.from({ length: 4 }, () => c.req('GET', '/api/overview', { cookie })));
+      assert.ok(rs.every((r) => r.status === 200 && r.json.projects[0].branch === 'main'));
+      assert.equal(g.calls().filter((x) => x[4] === 'rev-parse').length, 1); // one round for ABS, shared
+      // the owner of a cold round is revoked mid-way: a waiting overview runs its own round
+      fs.rmSync(path.join(tmp, 'git.jsonl'));
+      const f = path.join(c.configDir, 'config.json');
+      writePrivate(f, JSON.stringify({ ...JSON.parse(fs.readFileSync(f, 'utf8')), projects: { fresh: tmp } })); // a cold dir
+      const victim = await c.login({}, 'victim');
+      const first = c.req('GET', '/api/overview', { cookie: victim.cookie });
+      assert.ok(await until(() => g.calls().length === 1, 3000));
+      const second = c.req('GET', '/api/overview', { cookie });
+      await sleep(50);
+      await adminRequest(c.configDir, { cmd: 'revoke', id: await c.deviceId('victim') });
+      assert.equal((await first).status, 401);
+      const s2 = await second;
+      assert.equal(s2.status, 200);
+      assert.equal(s2.json.projects[0].branch, 'main');
+    }, { git: g.spec });
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
+
+test('overview git: the branch name is cleaned like a preview (bidi, zero-width, 160 code points)', async () => {
+  const ch = (...cps) => String.fromCodePoint(...cps);
+  for (const [raw, want] of [[`main${ch(0x202e)}evil`, 'mainevil'], [`fe${ch(0x200b, 0xfeff)}at`, 'feat'], ['b'.repeat(300), 'b'.repeat(160)], [ch(0x202e), null]]) {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-fgit-'));
+    const g = fakeGitIn(tmp, { branch: raw });
+    try {
+      await withApp(async (c) => {
+        const { cookie } = await c.login();
+        const p = (await c.req('GET', '/api/overview', { cookie })).json.projects[0];
+        assert.equal(p.branch, want);
+        if (want) assert.deepEqual(p.diff, { files: 0, add: 0, del: 0 });
+      }, { git: g.spec });
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  }
+});
+
+test('names and previews lose U+061C, U+200B-U+200D, U+2060 and U+FEFF', () => withApp(async (c) => {
+  const ch = (...cps) => String.fromCharCode(...cps);
+  const raw = `a${ch(0x61c)}b${ch(0x200b)}c${ch(0x200c)}d${ch(0x200d)}e${ch(0x2060)}f${ch(0xfeff)}g`;
+  assert.equal(previewOf(raw), 'abcdefg');
+  await c.login({}, raw);
+  assert.deepEqual(devicesFile(c).map((d) => d.name), ['abcdefg']);
+}));
+
+test('a numbered choice inside box drawing is waiting; the preview is the inner line', () => {
+  const act = 1_700_000_000, t = act * 1000 + 9000;
+  assert.deepEqual(summarize('╭──────────╮\n│ Edit file? │\n│ ❯ 1. Yes   │\n│   2. No    │\n╰──────────╯\n', act, t), { state: 'waiting', preview: '❯ 1. Yes', menu: true });
+  assert.deepEqual(summarize('┃ > 2. Always allow ┃', act, t), { state: 'waiting', preview: '> 2. Always allow', menu: true });
+  assert.equal(stateOf('│ step 1. done │', act, t), 'idle');
+});
+
+test('waiting preview: the question line, not a numbered option (plain and boxed)', () => {
+  const act = 1_700_000_000, t = act * 1000 + 9000;
+  const want = { state: 'waiting', preview: 'Do you want to proceed?', menu: true };
+  assert.deepEqual(summarize('Do you want to proceed?\n❯ 1. Yes\n2. No\n', act, t), want);
+  assert.deepEqual(summarize('╭───────────────────────────╮\n│ Do you want to proceed?   │\n│ ❯ 1. Yes                  │\n│   2. No                   │\n╰───────────────────────────╯\n', act, t), want);
+  assert.deepEqual(summarize('Allow this command?\n› 1. Yes\n> 2. Yes, and always allow\n', act, t), { state: 'waiting', preview: 'Allow this command?', menu: true });
+  // only options match: the last of them
+  assert.deepEqual(summarize('Pick one\n❯ 1. Yes\n> 2. Always allow\n', act, t), { state: 'waiting', preview: '> 2. Always allow', menu: true });
+});
+
+test('open fresh: a name created outside the server meanwhile moves on to base-2', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  await withEnv({ FAKE_TMUX_DUP_ONCE: 'alpha-shell' }, async () => {
+    const r = await openReq(c, cookie, { fresh: true });
+    assert.deepEqual([r.status, r.json], [200, { name: 'alpha-shell-2', created: true }]);
+  });
+  const st = JSON.parse(fs.readFileSync(fakeState(c), 'utf8'));
+  assert.deepEqual(Object.keys(st.sessions), ['alpha-shell-2']);
+  assert.ok(c.calls().some((x) => x.argv[0] === 'new-session' && x.argv.includes('alpha-shell')));
+}));
+
+test('overview: a client disconnect mid-job frees the read slot and starts no later capture', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  for (const n of ['s1', 's2', 's3', 's4']) await mkSession(c, cookie, n);
+  await withEnv({ FAKE_TMUX_DELAYS: JSON.stringify({ 'capture-pane': 400 }) }, async () => {
+    const req = http.get({ host: '127.0.0.1', port: c.port, path: '/api/overview', headers: { 'X-PC': '1', Cookie: cookie } });
+    req.on('error', () => {});
+    assert.ok(await until(() => c.calls().length >= 0 && c.app.stats().running === 1 && c.app.stats().reads === 1, 3000));
+    await sleep(150); // inside list-sessions or the first, delayed capture
+    req.destroy();
+    assert.ok(await until(() => c.app.stats().reads === 0 && c.app.stats().running === 0, 3000), JSON.stringify(c.app.stats()));
+    await sleep(900);
+    const caps = c.calls().filter((x) => x.argv[0] === 'capture-pane');
+    assert.ok(caps.length <= 1, `captures: ${caps.length} (at most the one in flight; 4 without the gate)`);
+    assert.equal(c.app.stats().reads, 0);
+  });
+}, { git: NO_GIT }));
+
+// ======================= A5 update 6: menu flag =======================
+test('menu flag: a numbered menu on screen is menu:true even when a y/n line is the preview; line prompts are menu:false', () => {
+  const act = 1_700_000_000, t = act * 1000 + 9000;
+  // the two screens from the final r3 review: no y/n buttons may be offered on them
+  assert.deepEqual(summarize('Overwrite config? (y/n)\n❯ 1. Yes\n2. No\n', act, t), { state: 'waiting', preview: 'Overwrite config? (y/n)', menu: true });
+  assert.equal(summarize('Continue? [y/N] y\nPick a model\n❯ 1. Sonnet\n2. Opus\n', act, t).menu, true);
+  // real y/n line prompts keep menu:false
+  for (const [screen, preview] of [
+    ['Proceed? (y/n)', 'Proceed? (y/n)'],
+    ['After this operation, 12 MB will be used.\nDo you want to continue? [Y/n] ', 'Do you want to continue? [Y/n]'],
+    ["The authenticity of host 'box (1.2.3.4)' can't be established.\nAre you sure you want to continue connecting (yes/no/[fingerprint])? ", 'Are you sure you want to continue connecting (yes/no/[fingerprint])?'],
+  ]) assert.deepEqual(summarize(screen, act, t), { state: 'waiting', preview, menu: false }, screen);
+  // a boxed Claude Code permission menu
+  const boxed = '╭──────────────────────────────────────╮\n│ Bash command                         │\n│   rm -rf build                       │\n│ Do you want to proceed?              │\n│ ❯ 1. Yes                             │\n│   2. No, and tell Claude what to do  │\n╰──────────────────────────────────────╯\n';
+  assert.deepEqual(summarize(boxed, act, t), { state: 'waiting', preview: 'Do you want to proceed?', menu: true });
+  // the flag does not depend on the state; a numbered line older than the last 6 lines does not count
+  assert.equal(summarize('❯ 1. Yes', act, act * 1000).menu, true);
+  assert.equal(summarize(['❯ 1. Yes', 'a', 'b', 'c', 'd', 'e', 'Proceed? (y/n)'].join('\n'), act, t).menu, false);
+  assert.equal(menuOf('step 1.done\n12.items'), false); // needs "N. " with a space
+});

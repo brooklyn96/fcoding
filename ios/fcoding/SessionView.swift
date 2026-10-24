@@ -8,9 +8,12 @@ struct SessionView: View {
     @StateObject private var model: SessionModel
     @AppStorage("fontSize") private var fontSize: Double = 13
     @State private var stoppedInBackground = false
+    /// "Trả lời" from the inbox: focus the composer when the view appears.
+    private let focusComposer: Bool
 
-    init(name: String) {
+    init(name: String, focusComposer: Bool = false) {
         self.name = name
+        self.focusComposer = focusComposer
         _model = StateObject(wrappedValue: SessionModel(name: name))
     }
 
@@ -41,7 +44,8 @@ struct SessionView: View {
             ComposerView(
                 draftKey: "draft.\(name)",
                 onSend: { text, enter in model.send(text, enter: enter) },
-                onKey: { key in model.key(key) }
+                onKey: { key in model.key(key) },
+                autoFocus: focusComposer
             )
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
@@ -214,6 +218,8 @@ struct ComposerView: View {
     /// Queues the send synchronously (FIFO with key presses); the task says whether it succeeded.
     let onSend: (String, Bool) -> Task<Bool, Never>
     let onKey: (String) -> Void
+    var autoFocus = false
+    @FocusState private var editorFocused: Bool
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     @State private var draft = ""
     @State private var sending = false
@@ -247,6 +253,7 @@ struct ComposerView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .scrollContentBackground(.hidden)
+                        .focused($editorFocused)
                         .frame(height: compact ? 44 : 84)
                     if draft.isEmpty {
                         Text("Nhập tin nhắn…")
@@ -285,6 +292,8 @@ struct ComposerView: View {
         }
         .onAppear {
             if draft.isEmpty, let saved = UserDefaults.standard.string(forKey: draftKey) { draft = saved }
+            // After the push animation, so the keyboard does not fight the transition.
+            if autoFocus { DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { editorFocused = true } }
         }
         .onChange(of: draft) { value in
             if value.isEmpty {

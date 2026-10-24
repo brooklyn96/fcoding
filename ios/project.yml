@@ -29,11 +29,12 @@ targets:
         CURRENT_PROJECT_VERSION: "1"
         GENERATE_INFOPLIST_FILE: "NO"
         ENABLE_PREVIEWS: "NO"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     info:
       path: fcoding/Info.plist
       properties:
-        CFBundleDisplayName: fcoding
-        CFBundleName: fcoding
+        CFBundleDisplayName: FCode
+        CFBundleName: FCode
         CFBundleExecutable: $(EXECUTABLE_NAME)
         CFBundleIdentifier: $(PRODUCT_BUNDLE_IDENTIFIER)
         CFBundlePackageType: APPL
