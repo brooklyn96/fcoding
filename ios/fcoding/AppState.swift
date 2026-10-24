@@ -58,31 +58,51 @@ final class AppState: ObservableObject {
         token = newToken
     }
 
-    /// "Gỡ iPhone này": POST /api/logout. The token is deleted here even if the request fails.
+    /// "Gỡ iPhone này": POST /api/logout. The token is deleted here even if the request fails
+    /// (unless a new pairing replaced it meanwhile).
     /// Returns the task so a caller can await it (and show a spinner) or fire and forget.
     @discardableResult
     func logoutHere() -> Task<Void, Never> {
         Task { await unpair(query: []) }
     }
 
-    /// "Gỡ mọi thiết bị": POST /api/logout?all=1. The token is deleted here even if the request fails.
-    func logoutEverywhere() async {
-        await unpair(query: [URLQueryItem(name: "all", value: "1")])
+    /// "Gỡ mọi thiết bị": POST /api/logout?all=1 (A3 semantics, Architect decision). The phone
+    /// signs out only after a confirmed 2xx, or on a 401 (already gone). Any other failure keeps
+    /// the token and returns the message for the inline error with "Thử lại"; nil means done.
+    func logoutEverywhere() async -> String? {
+        guard let api = api else { clearIfCurrent(nil, notice: nil); return nil }
+        do {
+            try await api.call("POST", "api/logout", query: [URLQueryItem(name: "all", value: "1")])
+        } catch let e as APIError where e.status == 401 {
+            // Already removed on the box: sign out below.
+        } catch {
+            let reason = (vietnameseMessage(error) ?? "lỗi").trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+            return "Box chưa gỡ được các thiết bị (\(reason)). Thử lại."
+        }
+        clearIfCurrent(api.token, notice: nil)
+        return nil
     }
 
+    /// "Gỡ iPhone này": always signs out here, with a notice when the box did not confirm.
     private func unpair(query: [URLQueryItem]) async {
+        guard let api = api else { clearIfCurrent(nil, notice: nil); return }
         var failure: String?
-        if let api = api {
-            do {
-                try await api.call("POST", "api/logout", query: query)
-            } catch let e as APIError where e.status == 401 {
-                // Already removed on the box: nothing left to undo there.
-            } catch {
-                // Fixed text: this phone has no token left, so there is nothing to retry here.
-                failure = "Đã xoá ghép trên iPhone này, nhưng box chưa nhận lệnh gỡ (không kết nối được hoặc box báo lỗi)."
-            }
+        do {
+            try await api.call("POST", "api/logout", query: query)
+        } catch let e as APIError where e.status == 401 {
+            // Already removed on the box: nothing left to undo there.
+        } catch {
+            // Fixed text: this phone has no token left, so there is nothing to retry here.
+            failure = "Đã xoá ghép trên iPhone này, nhưng box chưa nhận lệnh gỡ (không kết nối được hoặc box báo lỗi)."
         }
-        signOutLocally(notice: failure)
+        clearIfCurrent(api.token, notice: failure)
+    }
+
+    /// Clears credentials and drafts only if the token that started the request is still the
+    /// current one: a logout finishing after a new pairing must not wipe that pairing.
+    private func clearIfCurrent(_ started: String?, notice: String?) {
+        guard started == nil || token == started else { return }
+        signOutLocally(notice: notice)
         AppState.removeDrafts()
     }
 

@@ -7,6 +7,9 @@ final class OverviewModel: ObservableObject {
     @Published private(set) var overview: Overview?
     @Published var errorText: String?
     @Published private(set) var busy: Set<String> = []
+    /// Prompts answered with y/n: session name -> its `activity` when the answer was sent. The
+    /// buttons stay disabled until a successful refresh shows newer activity or a non-waiting state.
+    @Published private(set) var answered: [String: Double] = [:]
     @Published private(set) var seen: [String: Double]
     /// Marked read after the next successful load (the session that was just closed).
     var pendingRead: String?
@@ -49,6 +52,10 @@ final class OverviewModel: ObservableObject {
             overview = fresh
             errorText = nil
             syncSeen(fresh)
+            answered = answered.filter { name, sentAt in
+                guard let s = fresh.sessions.first(where: { $0.name == name }) else { return false }
+                return s.state == "waiting" && (s.activity ?? 0) <= sentAt
+            }
             if let name = pendingRead {
                 pendingRead = nil
                 markRead(name)
@@ -111,8 +118,12 @@ final class OverviewModel: ObservableObject {
 
     /// y / n on a waiting prompt: POST /api/send/<name> {text, enter:true}.
     func answer(_ s: OverviewSession, _ text: String, app: AppState) async {
+        let sentAt = s.activity ?? 0
         let sent = await perform(s.name, app) { api in
             _ = try await api.call("POST", "api/send/\(s.name)", body: ["text": text, "enter": true])
+            // Before the follow-up load, so that load can already release it. A failed refresh
+            // keeps it (and the error row); the next successful poll decides.
+            self.answered[s.name] = sentAt
         }
         if sent { markRead(s.name) }
     }

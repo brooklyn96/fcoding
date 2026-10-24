@@ -294,7 +294,7 @@ struct ProjectsView: View {
             showProject: project == "all",
             unread: unread,
             time: model.relativeTime(s),
-            busy: model.busy.contains(s.name),
+            busy: model.busy.contains(s.name) || model.answered[s.name] != nil,
             onOpen: { open(s.name) },
             onReply: { open(s.name, reply: true) },
             onAnswer: { text in Task { await model.answer(s, text, app: app) } }
