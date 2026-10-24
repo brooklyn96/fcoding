@@ -414,7 +414,8 @@ struct SessionRow: View {
         // y/n stay off while an action runs or the sent answer is not yet reflected; the other
         // buttons are off only while an action runs.
         HStack(spacing: 8) {
-            if OverviewModel.isYesNo(session.preview) {
+            // Not beside a numbered menu: there "n" + Enter would confirm the highlighted option.
+            if OverviewModel.isYesNo(session.preview) && session.menu != true {
                 pill("y · Đồng ý", fill: Color(uiColor: .systemGreen), text: .black, off: busy || answered) { onAnswer("y") }
                 pill("n · Từ chối", fill: Color(uiColor: .tertiarySystemFill), text: .primary, off: busy || answered) { onAnswer("n") }
             } else {
