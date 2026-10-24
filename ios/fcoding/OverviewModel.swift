@@ -11,18 +11,39 @@ final class OverviewModel: ObservableObject {
     /// Marked read after the next successful load (the session that was just closed).
     var pendingRead: String?
 
-    private var loading = false
+    /// The one load in flight; a load() call during it asks for exactly one more (`reloadAfter`).
+    private var current: Task<Void, Never>?
+    private var reloadAfter = false
     private static let seenKey = "inbox.seen"
 
     init() {
         seen = UserDefaults.standard.dictionary(forKey: OverviewModel.seenKey) as? [String: Double] ?? [:]
     }
 
-    /// Keeps the last data on failure; a 401 goes back to pairing through `app.report`.
+    /// One request at a time. A call while one is in flight is not dropped: it schedules one
+    /// follow-up load and returns only when that follow-up is done (so callers see fresh data).
     func load(_ app: AppState) async {
-        guard let api = app.api, !loading else { return }
-        loading = true
-        defer { loading = false }
+        if let running = current {
+            reloadAfter = true
+            await running.value
+            return
+        }
+        let task = Task { await self.loadLoop(app) }
+        current = task
+        await task.value
+    }
+
+    private func loadLoop(_ app: AppState) async {
+        repeat {
+            reloadAfter = false
+            await fetchOnce(app)
+        } while reloadAfter
+        current = nil
+    }
+
+    /// Keeps the last data on failure; a 401 goes back to pairing through `app.report`.
+    private func fetchOnce(_ app: AppState) async {
+        guard let api = app.api else { return }
         do {
             let fresh = try await api.overview()
             overview = fresh
@@ -39,13 +60,10 @@ final class OverviewModel: ObservableObject {
 
     // MARK: - Time
 
-    /// tmux reports seconds; accept milliseconds too in case `now` comes from Date.now().
-    nonisolated static func seconds(_ value: Double) -> Double { value > 100_000_000_000 ? value / 1000 : value }
-
-    /// "vừa xong", "N phút", "N giờ", "hôm qua", "N ngày" from now - activity.
+    /// "vừa xong", "N phút", "N giờ", "hôm qua", "N ngày" from now - activity (epoch seconds, A5 update 5).
     func relativeTime(_ s: OverviewSession) -> String {
         guard let now = overview?.now, let activity = s.activity else { return "" }
-        let d = max(0, OverviewModel.seconds(now) - OverviewModel.seconds(activity))
+        let d = max(0, now - activity)
         switch d {
         case ..<60: return "vừa xong"
         case ..<3600: return "\(Int(d / 60)) phút"
@@ -59,19 +77,19 @@ final class OverviewModel: ObservableObject {
 
     func isUnread(_ s: OverviewSession) -> Bool {
         guard let activity = s.activity, let last = seen[s.name] else { return false }
-        return OverviewModel.seconds(activity) > last
+        return activity > last
     }
 
     func markRead(_ name: String) {
         guard let activity = overview?.sessions.first(where: { $0.name == name })?.activity else { return }
-        seen[name] = OverviewModel.seconds(activity)
+        seen[name] = activity
         saveSeen()
     }
 
     /// "Đã đọc" / "Chưa đọc" from the swipe actions.
     func toggleRead(_ s: OverviewSession) {
         guard let activity = s.activity else { return }
-        seen[s.name] = OverviewModel.seconds(activity) - (isUnread(s) ? 0 : 1)
+        seen[s.name] = activity - (isUnread(s) ? 0 : 1)
         saveSeen()
     }
 
@@ -79,7 +97,7 @@ final class OverviewModel: ObservableObject {
     private func syncSeen(_ o: Overview) {
         var next: [String: Double] = [:]
         for s in o.sessions {
-            next[s.name] = seen[s.name] ?? s.activity.map(OverviewModel.seconds) ?? 0
+            next[s.name] = seen[s.name] ?? s.activity ?? 0
         }
         if next != seen {
             seen = next
@@ -93,22 +111,24 @@ final class OverviewModel: ObservableObject {
 
     /// y / n on a waiting prompt: POST /api/send/<name> {text, enter:true}.
     func answer(_ s: OverviewSession, _ text: String, app: AppState) async {
-        await perform(s.name, app) { api in
+        let sent = await perform(s.name, app) { api in
             _ = try await api.call("POST", "api/send/\(s.name)", body: ["text": text, "enter": true])
         }
-        markRead(s.name)
+        if sent { markRead(s.name) }
     }
 
     /// Kills the tmux session; its draft goes with it (as before).
     func delete(_ name: String, app: AppState) async {
-        await perform(name, app) { api in
+        _ = await perform(name, app) { api in
             try await api.call("DELETE", "api/sessions/\(name)")
             UserDefaults.standard.removeObject(forKey: "draft.\(name)")
         }
     }
 
-    private func perform(_ name: String, _ app: AppState, _ op: (API) async throws -> Void) async {
-        guard let api = app.api, !busy.contains(name) else { return }
+    /// Runs one action for `name`; `busy` stays set until the post-action data is in, so the
+    /// buttons cannot fire twice on a stale row. Returns true when the request succeeded.
+    private func perform(_ name: String, _ app: AppState, _ op: (API) async throws -> Void) async -> Bool {
+        guard let api = app.api, !busy.contains(name) else { return false }
         busy.insert(name)
         defer { busy.remove(name) }
         do {
@@ -116,9 +136,10 @@ final class OverviewModel: ObservableObject {
             errorText = nil
         } catch {
             errorText = app.report(error)
-            return
+            return false
         }
         await load(app)
+        return true
     }
 
     /// A waiting prompt that takes y/n gets the "y · Đồng ý" / "n · Từ chối" buttons.

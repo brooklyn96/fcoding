@@ -75,12 +75,12 @@ struct HarnessBadge: View {
         let c = HarnessStyle.color(harness)
         HStack(spacing: 3) {
             HarnessGlyph(harness: harness, size: 9)
-            Text(harness).font(.system(size: 11, weight: .semibold, design: .monospaced))
+            Text(harness).font(.system(.caption2, design: .monospaced, weight: .semibold))
         }
         .foregroundColor(c)
         .lineLimit(1)
         .padding(.horizontal, 6)
-        .frame(height: 17)
+        .frame(minHeight: 17)
         .background(c.opacity(0.17), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
     }
 }

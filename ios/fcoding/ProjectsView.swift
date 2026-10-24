@@ -11,6 +11,7 @@ struct Route: Hashable {
 struct ProjectsView: View {
     @EnvironmentObject private var app: AppState
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var model = OverviewModel()
     @State private var path: [Route] = []
     @State private var project = "all"
@@ -22,6 +23,8 @@ struct ProjectsView: View {
     @State private var openAfterSheet: String?
     @State private var pendingDelete: OverviewSession?
     @State private var lastOpened: String?
+    /// Distance from the screen edge to the list's content edge, so the chip rail can bleed.
+    @State private var railInset: CGFloat = 16
 
     /// Poll only while the list itself is on screen and the app is in the foreground.
     private var polling: Bool { path.isEmpty && scenePhase == .active }
@@ -29,7 +32,8 @@ struct ProjectsView: View {
     private var allSessions: [OverviewSession] { model.overview?.sessions ?? [] }
     private var projectNames: [String] { model.overview?.projects.map(\.name) ?? [] }
 
-    private func matchesHarness(_ s: OverviewSession) -> Bool { harness == "all" || s.harness == harness }
+    /// A session without a harness tag counts as "shell" everywhere (avatar, badges, filter).
+    private func matchesHarness(_ s: OverviewSession) -> Bool { harness == "all" || (s.harness ?? "shell") == harness }
 
     private var visible: [OverviewSession] {
         allSessions
@@ -92,6 +96,10 @@ struct ProjectsView: View {
                     try? await Task.sleep(nanoseconds: 5_000_000_000)
                 }
             }
+            .onChange(of: showNew) { presented in
+                // A new "+" sheet never inherits a name from an earlier one.
+                if presented { openAfterSheet = nil }
+            }
             .onChange(of: path) { newPath in
                 // Back on the list: what was read inside the session counts as read.
                 if newPath.isEmpty, let name = lastOpened {
@@ -117,7 +125,8 @@ struct ProjectsView: View {
                     open(name)
                 }
             }) {
-                NewSessionSheet(projects: projectNames,
+                NewSessionSheet(projects: model.overview == nil ? nil : projectNames,
+                                loadError: model.errorText,
                                 sessions: allSessions,
                                 fixedHarness: harness == "all" ? nil : harness,
                                 onOpened: { openAfterSheet = $0 })
@@ -135,24 +144,31 @@ struct ProjectsView: View {
     // MARK: - Header: subtitle + project chips
 
     private var topSection: some View {
-        let waiting = allSessions.filter { matchesHarness($0) && $0.state == "waiting" }.count
+        // Same filtered set as "Cần bạn · N" (project chip + dock), so the numbers agree.
+        let waiting = sessions("waiting").count
         return Section {
+            // Zero row insets put this content on the large title's leading edge; the rail then
+            // extends by `railInset` on both sides so it scrolls edge to edge like the mockup.
             VStack(alignment: .leading, spacing: 10) {
                 if waiting > 0 {
                     Text("\(waiting) phiên đang chờ bạn")
-                        .font(.system(size: 15))
+                        .font(.subheadline)
                         .foregroundColor(.orange)
-                        .padding(.horizontal, 20)
                 }
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         chip("all", label: "Tất cả")
                         ForEach(projectNames, id: \.self) { chip($0, label: $0) }
                     }
-                    .padding(.horizontal, 16)
+                    .padding(.horizontal, railInset)
                     .padding(.vertical, 2)
                 }
+                .padding(.horizontal, -railInset)
             }
+            .background(GeometryReader { geo in
+                Color.clear.preference(key: RailInsetKey.self, value: geo.frame(in: .global).minX)
+            })
+            .onPreferenceChange(RailInsetKey.self) { if $0 >= 0 { railInset = $0 } }
             .listRowInsets(EdgeInsets())
             .listRowBackground(Color.clear)
         }
@@ -163,26 +179,26 @@ struct ProjectsView: View {
         let waiting = inChip.filter { $0.state == "waiting" }.count
         let selected = project == value
         return Button {
-            withAnimation(.easeOut(duration: 0.2)) { project = value }
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) { project = value }
         } label: {
             HStack(spacing: 7) {
-                Text(label).font(.system(size: 15, weight: .medium))
+                Text(label).font(.subheadline.weight(.medium))
                 if waiting > 0 {
                     Text("\(waiting)")
-                        .font(.system(size: 12, weight: .bold))
+                        .font(.caption.weight(.bold))
                         .foregroundColor(.black)
                         .padding(.horizontal, 5)
                         .frame(minWidth: 19, minHeight: 19)
                         .background(Color.orange, in: Capsule())
                 } else {
                     Text("\(inChip.count)")
-                        .font(.system(size: 15))
+                        .font(.subheadline)
                         .foregroundColor(selected ? Color.black.opacity(0.55) : .secondary)
                 }
             }
             .foregroundColor(selected ? .black : .primary)
             .padding(.horizontal, 14)
-            .frame(height: 36)
+            .frame(minHeight: 36)
             .background(selected ? Color.white : Color(uiColor: .secondarySystemGroupedBackground), in: Capsule())
         }
         .buttonStyle(.plain)
@@ -215,25 +231,26 @@ struct ProjectsView: View {
         if !rows.isEmpty {
             Section {
                 Button {
-                    withAnimation(.easeInOut(duration: 0.3)) { isOpen.wrappedValue.toggle() }
+                    // Reduce Motion: expand / collapse and the chevron change without animation.
+                    withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.3)) { isOpen.wrappedValue.toggle() }
                 } label: {
                     HStack(spacing: 8) {
                         StatusDot(state: state).padding(.trailing, 3)
                         Text(title).font(.body.weight(.semibold)).foregroundColor(.primary).fixedSize()
-                        Text("\(rows.count)").font(.system(size: 15, weight: .medium)).foregroundColor(.secondary)
+                        Text("\(rows.count)").font(.subheadline.weight(.medium)).foregroundColor(.secondary)
                         HStack(spacing: 4) {
                             ForEach(Array(rows.prefix(3).enumerated()), id: \.offset) { item in
                                 HarnessBadge(harness: item.element.harness ?? "shell")
                             }
                             if rows.count > 3 {
-                                Text("+\(rows.count - 3)").font(.system(size: 12, weight: .medium)).foregroundColor(.secondary)
+                                Text("+\(rows.count - 3)").font(.caption.weight(.medium)).foregroundColor(.secondary)
                             }
                         }
                         .padding(.leading, 4)
                         .clipped()
                         Spacer(minLength: 4)
                         Image(systemName: "chevron.right")
-                            .font(.system(size: 13, weight: .semibold))
+                            .font(.footnote.weight(.semibold))
                             .foregroundColor(Color(uiColor: .tertiaryLabel))
                             .rotationEffect(.degrees(isOpen.wrappedValue ? 90 : 0))
                     }
@@ -259,7 +276,7 @@ struct ProjectsView: View {
         } else if visible.isEmpty {
             Section {
                 Text("Chưa có phiên \(harness == "all" ? "" : harness + " ")nào\(project == "all" ? "" : " trong " + project).")
-                    .font(.system(size: 15))
+                    .font(.subheadline)
                     .foregroundColor(.secondary)
             }
         } else {
@@ -322,12 +339,12 @@ struct SessionRow: View {
     private var content: some View {
         let idle = state == "idle"
         return HStack(alignment: .top, spacing: 12) {
-            HarnessAvatar(harness: session.harness, side: idle ? 28 : 34)
+            HarnessAvatar(harness: session.harness ?? "shell", side: idle ? 28 : 34)
                 .opacity(idle ? 0.7 : 1)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Text(session.name)
-                        .font(.system(size: 15, weight: idle ? .medium : .semibold, design: .monospaced))
+                        .font(.system(.subheadline, design: .monospaced, weight: idle ? .medium : .semibold))
                         .foregroundColor(idle ? .secondary : .primary)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -344,12 +361,13 @@ struct SessionRow: View {
                 if !idle { meta }
                 if state == "waiting" {
                     if let preview = session.preview, !preview.isEmpty {
-                        Text(preview).font(.system(size: 15)).foregroundColor(.primary).padding(.top, 4)
+                        Text(preview).font(.subheadline).foregroundColor(.primary).padding(.top, 4)
                     }
-                    actions.padding(.top, 8)
+                    // The pills' 44 pt hit areas add 6 pt above them, so less padding here.
+                    actions.padding(.top, 2)
                 } else if state == "running" {
                     if let preview = session.preview, !preview.isEmpty {
-                        Text(preview).font(.system(size: 15)).foregroundColor(.secondary).lineLimit(1).padding(.top, 2)
+                        Text(preview).font(.subheadline).foregroundColor(.secondary).lineLimit(1).padding(.top, 2)
                     }
                     LiveBar().padding(.top, 6)
                 }
@@ -368,17 +386,17 @@ struct SessionRow: View {
             }
             if let branch = info?.branch, !branch.isEmpty {
                 HStack(spacing: 3) {
-                    Image(systemName: "arrow.triangle.branch").font(.system(size: 10))
-                    Text(branch).font(.system(size: 12, design: .monospaced))
+                    Image(systemName: "arrow.triangle.branch").font(.caption2)
+                    Text(branch).font(.system(.caption, design: .monospaced))
                 }
                 .lineLimit(1)
             }
             if state == "running", let diff = info?.diff {
                 (Text("+\(diff.add)").foregroundColor(Color(uiColor: .systemGreen))
                     + Text(" −\(diff.del)").foregroundColor(Color(uiColor: .systemRed)))
-                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .font(.system(.caption, design: .monospaced, weight: .medium))
                     .padding(.horizontal, 6)
-                    .frame(height: 17)
+                    .frame(minHeight: 17)
                     .background(Color(uiColor: .quaternarySystemFill), in: RoundedRectangle(cornerRadius: 5))
                     .fixedSize()
                     .accessibilityLabel("thêm \(diff.add) dòng, bớt \(diff.del) dòng")
@@ -405,12 +423,15 @@ struct SessionRow: View {
 
     private func pill(_ title: String, fill: Color, text: Color, action: @escaping () -> Void) -> some View {
         Button(action: action) {
+            // 32 pt capsule look, 44 pt tall hit area.
             Text(title)
-                .font(.system(size: 14, weight: .semibold))
+                .font(.subheadline.weight(.semibold))
                 .foregroundColor(text)
                 .padding(.horizontal, 14)
-                .frame(height: 32)
+                .frame(minHeight: 32)
                 .background(fill, in: Capsule())
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .opacity(busy ? 0.5 : 1)
@@ -477,7 +498,10 @@ struct HarnessDock: View {
                 } label: {
                     VStack(spacing: 3) {
                         HarnessGlyph(harness: h, size: 16).frame(height: 20)
-                        Text(h == "all" ? "Tất cả" : h).font(.system(size: 10, weight: .medium))
+                        Text(h == "all" ? "Tất cả" : h)
+                            .font(.caption2.weight(.medium))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.7)
                     }
                     .foregroundColor(selected ? color : .secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -505,26 +529,38 @@ struct HarnessDock: View {
 /// "+" sheet: always a NEW session (A5 update 4). Step 1 picks the harness, unless the dock
 /// already filters one; step 2 picks the project and calls POST /api/open {fresh:true}.
 struct NewSessionSheet: View {
-    let projects: [String]
+    /// nil while the overview has not loaded (or failed to load).
+    let projects: [String]?
+    let loadError: String?
     let sessions: [OverviewSession]
     let fixedHarness: String?
     let onOpened: (String) -> Void
     @EnvironmentObject private var app: AppState
     @Environment(\.dismiss) private var dismiss
+    /// The project whose POST /api/open is in flight; the sheet cannot be closed meanwhile.
+    @State private var opening: String?
 
     var body: some View {
         NavigationStack {
             Group {
                 if let h = fixedHarness {
-                    NewSessionProjects(harness: h, skipped: true, projects: projects, sessions: sessions, onOpened: finish)
+                    projectStep(h, skipped: true)
                 } else {
                     harnessStep
                 }
             }
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Huỷ") { dismiss() } }
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Huỷ") { dismiss() }.disabled(opening != nil)
+                }
             }
         }
+        .interactiveDismissDisabled(opening != nil)
+    }
+
+    private func projectStep(_ h: String, skipped: Bool) -> some View {
+        NewSessionProjects(harness: h, skipped: skipped, projects: projects, loadError: loadError,
+                           sessions: sessions, opening: $opening, onOpened: finish)
     }
 
     private func finish(_ name: String) {
@@ -540,7 +576,7 @@ struct NewSessionSheet: View {
                         HStack(spacing: 12) {
                             HarnessAvatar(harness: h)
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(h).font(.system(size: 17, weight: .semibold, design: .monospaced))
+                                Text(h).font(.system(.body, design: .monospaced, weight: .semibold))
                                 Text(HarnessStyle.description(h)).font(.footnote).foregroundColor(.secondary)
                             }
                         }
@@ -553,33 +589,39 @@ struct NewSessionSheet: View {
         }
         .navigationTitle("Phiên mới")
         .navigationBarTitleDisplayMode(.inline)
-        .navigationDestination(for: String.self) { h in
-            NewSessionProjects(harness: h, skipped: false, projects: projects, sessions: sessions, onOpened: finish)
-        }
+        .navigationDestination(for: String.self) { h in projectStep(h, skipped: false) }
     }
 }
 
 private struct NewSessionProjects: View {
     let harness: String
     let skipped: Bool
-    let projects: [String]
+    let projects: [String]?
+    let loadError: String?
     let sessions: [OverviewSession]
+    @Binding var opening: String?
     let onOpened: (String) -> Void
     @EnvironmentObject private var app: AppState
-    @State private var opening: String?
     @State private var errorText: String?
 
     var body: some View {
         List {
             Section {
-                if projects.isEmpty {
+                if projects == nil {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Chưa tải được danh sách dự án").foregroundColor(.secondary)
+                        if let loadError = loadError {
+                            Text(loadError).font(.footnote).foregroundColor(.red)
+                        }
+                    }
+                } else if projects?.isEmpty == true {
                     Text("Chưa có dự án nào trong cấu hình máy chủ.").foregroundColor(.secondary)
                 }
-                ForEach(projects, id: \.self) { p in
+                ForEach(projects ?? [], id: \.self) { p in
                     Button { Task { await open(p) } } label: {
                         HStack(spacing: 12) {
                             Image(systemName: "folder")
-                                .font(.system(size: 17))
+                                .font(.body)
                                 .foregroundColor(.accentColor)
                                 .frame(width: 34, height: 34)
                                 .background(Color.accentColor.opacity(0.16), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
@@ -592,7 +634,7 @@ private struct NewSessionProjects: View {
                                 ProgressView()
                             } else {
                                 Image(systemName: "chevron.right")
-                                    .font(.system(size: 13, weight: .semibold))
+                                    .font(.footnote.weight(.semibold))
                                     .foregroundColor(Color(uiColor: .tertiaryLabel))
                             }
                         }
@@ -617,10 +659,11 @@ private struct NewSessionProjects: View {
         }
         .navigationTitle("Phiên \(harness) mới")
         .navigationBarTitleDisplayMode(.inline)
+        .navigationBarBackButtonHidden(opening != nil)
     }
 
     private func detail(_ project: String) -> String {
-        let n = sessions.filter { $0.project == project && $0.harness == harness }.count
+        let n = sessions.filter { $0.project == project && ($0.harness ?? "shell") == harness }.count
         return n > 0 ? "Phiên mới · đang có \(n) phiên \(harness)" : "Phiên mới"
     }
 
@@ -640,4 +683,10 @@ private struct NewSessionProjects: View {
             }
         }
     }
+}
+
+/// Global leading edge of the inbox header row (see `railInset`).
+private struct RailInsetKey: PreferenceKey {
+    static var defaultValue: CGFloat = -1
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
