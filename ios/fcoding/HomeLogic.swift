@@ -1,0 +1,688 @@
+import Foundation
+
+// MARK: - GET /api/home (contract home v2), decoded leniently
+
+/// Every field is optional or defaults to empty: a missing or malformed part of the reply gives
+/// an empty or stale state, never a decoding failure of the whole screen.
+struct HomeData: Decodable {
+    var generatedAt: Date?
+    var box: HomeBox?
+    var accounts: [QuotaAccount] = []
+    var totals: HomeTotals?
+    var projects: [HomeProject] = []
+
+    init() {}
+
+    private enum K: String, CodingKey { case generatedAt, box, accounts, totals, projects }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        generatedAt = c.date(.generatedAt)
+        box = c.value(.box)
+        let all: [QuotaAccount] = c.list(.accounts)
+        accounts = all.filter { !$0.harness.isEmpty }
+        totals = c.value(.totals)
+        projects = c.list(.projects)
+    }
+}
+
+struct HomeBox: Decodable {
+    var state: String?
+    var sleepsAt: Date?
+    var maxRunMinutes: Double?
+    var idlePauseMinutes: Double?
+    var cooldownMinutes: Double?
+
+    init(state: String? = "running", sleepsAt: Date?, maxRunMinutes: Double? = 480,
+         idlePauseMinutes: Double? = 30, cooldownMinutes: Double? = 10) {
+        self.state = state
+        self.sleepsAt = sleepsAt
+        self.maxRunMinutes = maxRunMinutes
+        self.idlePauseMinutes = idlePauseMinutes
+        self.cooldownMinutes = cooldownMinutes
+    }
+
+    private enum K: String, CodingKey { case state, sleepsAt, maxRunMinutes, idlePauseMinutes, cooldownMinutes }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        state = c.value(.state)
+        sleepsAt = c.date(.sleepsAt)
+        maxRunMinutes = c.value(.maxRunMinutes)
+        idlePauseMinutes = c.value(.idlePauseMinutes)
+        cooldownMinutes = c.value(.cooldownMinutes)
+    }
+}
+
+struct QuotaWindow: Decodable {
+    var key: String
+    var label: String
+    /// nil = "not reported": the window is hidden everywhere.
+    var usedPercent: Double?
+    var resetsAt: Date?
+    var periodSeconds: Double?
+
+    init(key: String = "", label: String, usedPercent: Double?, resetsAt: Date?, periodSeconds: Double?) {
+        self.key = key
+        self.label = label
+        self.usedPercent = usedPercent
+        self.resetsAt = resetsAt
+        self.periodSeconds = periodSeconds
+    }
+
+    private enum K: String, CodingKey { case key, label, usedPercent, resetsAt, periodSeconds }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        key = c.value(.key) ?? ""
+        label = c.value(.label) ?? key
+        usedPercent = c.value(.usedPercent)
+        resetsAt = c.date(.resetsAt)
+        periodSeconds = c.value(.periodSeconds)
+    }
+}
+
+struct SpendAmount: Decodable {
+    var usd: Double = 0
+    var tokens: Double = 0
+
+    init(usd: Double, tokens: Double) { self.usd = usd; self.tokens = tokens }
+
+    private enum K: String, CodingKey { case usd, tokens }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        usd = c.value(.usd) ?? 0
+        tokens = c.value(.tokens) ?? 0
+    }
+}
+
+struct DailySpend: Decodable {
+    var date: String
+    var usd: Double
+    var tokens: Double
+
+    private enum K: String, CodingKey { case date, usd, tokens }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        date = c.value(.date) ?? ""
+        usd = c.value(.usd) ?? 0
+        tokens = c.value(.tokens) ?? 0
+    }
+}
+
+struct Spend: Decodable {
+    var today: SpendAmount?
+    var yesterday: SpendAmount?
+    var last30: SpendAmount?
+    var weeklyEstimate: SpendAmount?
+    /// Oldest first.
+    var daily30: [DailySpend] = []
+
+    private enum K: String, CodingKey { case today, yesterday, last30, weeklyEstimate, daily30 }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        today = c.value(.today)
+        yesterday = c.value(.yesterday)
+        last30 = c.value(.last30)
+        weeklyEstimate = c.value(.weeklyEstimate)
+        let days: [DailySpend] = c.list(.daily30)
+        daily30 = days.sorted { $0.date < $1.date }
+    }
+}
+
+struct QuotaAccount: Decodable, Identifiable {
+    var id: String
+    var harness: String
+    var email: String
+    var org: String?
+    var plan: String?
+    var fetchedAt: Date?
+    var stale = false
+    var rateLimited = false
+    var windows: [QuotaWindow] = []
+    var resetsAvailable = 0
+    var spend: Spend?
+
+    init(id: String, harness: String, email: String, plan: String?, windows: [QuotaWindow]) {
+        self.id = id
+        self.harness = harness
+        self.email = email
+        self.plan = plan
+        self.windows = windows
+    }
+
+    private enum K: String, CodingKey { case id, harness, email, org, plan, fetchedAt, stale, rateLimited, windows, resets, spend }
+    private enum R: String, CodingKey { case available }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        email = c.value(.email) ?? ""
+        harness = (c.value(.harness) ?? "").lowercased()
+        id = c.value(.id) ?? "\(harness)/\(email)"
+        org = c.value(.org)
+        plan = c.value(.plan)
+        fetchedAt = c.date(.fetchedAt)
+        stale = c.value(.stale) ?? false
+        rateLimited = c.value(.rateLimited) ?? false
+        windows = c.list(.windows)
+        resetsAvailable = (try? c.nestedContainer(keyedBy: R.self, forKey: .resets))
+            .flatMap { r -> Int? in (try? r.decodeIfPresent(Int.self, forKey: .available)) ?? nil } ?? 0
+        spend = c.value(.spend)
+    }
+
+    /// Windows with a value; "not reported" ones are hidden (never branch on plan).
+    var shown: [QuotaWindow] { windows.filter { $0.usedPercent != nil } }
+    /// A weekly-or-longer window exists, so the weekly estimate row is shown.
+    var hasWeekly: Bool { shown.contains { ($0.periodSeconds ?? 0) >= 6 * 86400 } }
+}
+
+struct HarnessSpend: Decodable {
+    var harness: String
+    var usd: Double
+
+    private enum K: String, CodingKey { case harness, usd }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        harness = (c.value(.harness) ?? "").lowercased()
+        usd = c.value(.usd) ?? 0
+    }
+}
+
+struct HomeTotals: Decodable {
+    var spend: Spend?
+    var byHarness: [HarnessSpend] = []
+
+    private enum K: String, CodingKey { case spend, byHarness }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        spend = c.value(.spend)
+        byHarness = c.list(.byHarness)
+    }
+}
+
+struct HomePR: Decodable {
+    var number: Int
+    var title: String
+    /// "success" | "failure" | "pending" | "none"
+    var checks: String
+
+    private enum K: String, CodingKey { case number, title, checks }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        number = c.value(.number) ?? 0
+        title = c.value(.title) ?? ""
+        checks = c.value(.checks) ?? "none"
+    }
+}
+
+struct HomeRun: Decodable {
+    var workflow: String
+    /// "success" | "failure" | "in_progress"
+    var status: String
+    var at: Date?
+    var url: String?
+
+    init(status: String, at: Date?) { workflow = ""; self.status = status; self.at = at }
+
+    private enum K: String, CodingKey { case workflow, status, at, url }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        workflow = c.value(.workflow) ?? ""
+        status = c.value(.status) ?? ""
+        at = c.date(.at)
+        url = c.value(.url)
+    }
+}
+
+struct HomeProject: Decodable {
+    var name: String
+    var branch: String?
+    /// nil = the server could not read them (gh failed).
+    var prs: [HomePR]?
+    var lastRun: HomeRun?
+
+    private enum K: String, CodingKey { case name, branch, prs, lastRun }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        name = c.value(.name) ?? ""
+        branch = c.value(.branch)
+        let list: [HomePR] = c.list(.prs)
+        prs = c.contains(.prs) && !((try? c.decodeNil(forKey: .prs)) ?? true) ? list : nil
+        lastRun = c.value(.lastRun)
+    }
+}
+
+/// POST /api/codex-reset reply.
+struct CodexResetReply: Decodable {
+    var result: String
+    var message: String?
+
+    private enum K: String, CodingKey { case result, message }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        result = c.value(.result) ?? "error"
+        message = c.value(.message)
+    }
+}
+
+/// One element that may fail to decode on its own.
+private struct Failable<T: Decodable>: Decodable {
+    let value: T?
+    init(from decoder: Decoder) throws { value = try? T(from: decoder) }
+}
+
+private extension KeyedDecodingContainer {
+    func value<T: Decodable>(_ key: Key) -> T? { (try? decodeIfPresent(T.self, forKey: key)) ?? nil }
+    func list<T: Decodable>(_ key: Key) -> [T] {
+        ((try? decodeIfPresent([Failable<T>].self, forKey: key)) ?? nil)?.compactMap(\.value) ?? []
+    }
+    func date(_ key: Key) -> Date? { value(key).flatMap(HomeLogic.parseDate) }
+}
+
+// MARK: - Pure rules (Pane spec, mockup home.html)
+
+enum HomeLogic {
+    static func parseDate(_ s: String) -> Date? {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = f.date(from: s) { return d }
+        f.formatOptions = [.withInternetDateTime]
+        return f.date(from: s)
+    }
+
+    // MARK: Numbers
+
+    /// 1.5K / 227.9M / 5.6B; below 1000 the rounded number.
+    static func compact(_ n: Double) -> String {
+        if n >= 1e9 { return String(format: "%.1fB", n / 1e9) }
+        if n >= 1e6 { return String(format: "%.1fM", n / 1e6) }
+        if n >= 1e3 { return String(format: "%.1fK", n / 1e3) }
+        return String(Int(n.rounded()))
+    }
+
+    static func usd(_ n: Double) -> String { n < 1000 ? String(format: "$%.2f", n) : "$" + compact(n) }
+    static func tokens(_ n: Double) -> String { compact(n) + " tokens" }
+    /// Pane spend row: "$105.81 · 227.9M tokens" ("≈ " first for the weekly estimate).
+    static func spendLine(_ a: SpendAmount, approx: Bool = false) -> String {
+        (approx ? "≈ " : "") + usd(a.usd) + " · " + tokens(a.tokens)
+    }
+
+    static func clampPercent(_ n: Double?) -> Double { max(0, min(100, n ?? 0)) }
+
+    // MARK: Time
+
+    private static func pad2(_ n: Int) -> String { n < 10 ? "0\(n)" : "\(n)" }
+
+    /// Pane fmtDuration: "2d 10h" / "3h 05m" / "49m".
+    static func duration(_ seconds: TimeInterval) -> String {
+        let m = Int(max(0, seconds) / 60), d = m / 1440, h = m % 1440 / 60, mm = m % 60
+        if d > 0 { return "\(d)d \(h)h" }
+        if h > 0 { return "\(h)h \(pad2(mm))m" }
+        return "\(mm)m"
+    }
+
+    /// "hôm nay lúc 14:30" / "ngày mai lúc 09:05" / "28/10 lúc 07:00".
+    static func exactAt(_ date: Date, now: Date, calendar: Calendar = .current) -> String {
+        let k = calendar.dateComponents([.day], from: calendar.startOfDay(for: now), to: calendar.startOfDay(for: date)).day ?? 0
+        let c = calendar.dateComponents([.day, .month, .hour, .minute], from: date)
+        let day = k == 0 ? "hôm nay" : k == 1 ? "ngày mai" : "\(pad2(c.day ?? 0))/\(pad2(c.month ?? 0))"
+        return "\(day) lúc \(pad2(c.hour ?? 0)):\(pad2(c.minute ?? 0))"
+    }
+
+    /// "HH:MM" for the ring (hours may pass 99 only in theory; then they are just longer).
+    static func hhmm(_ seconds: Int) -> String {
+        let s = max(0, seconds)
+        return "\(pad2(s / 3600)):\(pad2(s % 3600 / 60))"
+    }
+
+    static func hms(_ seconds: Int) -> String {
+        let s = max(0, seconds)
+        return "\(pad2(s / 3600)):\(pad2(s % 3600 / 60)):\(pad2(s % 60))"
+    }
+
+    /// Wall clock "9:41".
+    static func clock(_ date: Date, calendar: Calendar = .current) -> String {
+        let c = calendar.dateComponents([.hour, .minute], from: date)
+        return "\(c.hour ?? 0):\(pad2(c.minute ?? 0))"
+    }
+
+    /// "vừa xong" / "N phút trước" / "N giờ trước" / "N ngày trước".
+    static func ago(_ seconds: TimeInterval) -> String {
+        let m = Int(max(0, seconds) / 60)
+        if m < 1 { return "vừa xong" }
+        if m < 60 { return "\(m) phút trước" }
+        if m < 1440 { return "\(m / 60) giờ trước" }
+        return "\(m / 1440) ngày trước"
+    }
+
+    // MARK: Pace (Pane computePace)
+
+    enum Level: Int, Comparable {
+        case normal = 0, warn, low
+        static func < (a: Level, b: Level) -> Bool { a.rawValue < b.rawValue }
+    }
+
+    struct Pace: Equatable {
+        var level: Level = .normal
+        var note = ""
+        var title = ""
+        /// Even-pace mark in percent of the bar; shown only when 1 < tick < 99.
+        var tick: Double = 0
+        var flame = false
+    }
+
+    static func pace(_ w: QuotaWindow, now: Date) -> Pace {
+        let used = clampPercent(w.usedPercent), left = 100 - used
+        var r = Pace()
+        func byLevel() -> Pace {
+            r.level = left <= 10 ? .low : used >= 80 ? .warn : .normal
+            return r
+        }
+        if left < 0.5 {
+            r.level = .low
+            r.note = "Đã chạm giới hạn"
+            r.flame = true
+            return r
+        }
+        guard let period = w.periodSeconds, period > 0, let resetsAt = w.resetsAt else { return byLevel() }
+        let remain = max(0, resetsAt.timeIntervalSince(now)), elapsed = period - remain, frac = elapsed / period
+        if frac < 0.05 || elapsed < 300 || used < 5 { return byLevel() }
+        let projected = used / frac
+        r.tick = max(0, min(100, frac * 100))
+        if projected >= 100 {
+            r.level = .low
+            r.flame = true
+            let out = left * elapsed / used
+            if out < remain - 60 {
+                r.note = "Chạm giới hạn sau " + duration(out)
+                r.title = "~\(Int((projected - 100).rounded()))% vượt giới hạn lúc reset"
+            } else {
+                r.title = "~100% đã dùng lúc reset"
+            }
+            return r
+        }
+        if projected >= 90 {
+            r.level = .warn
+            r.note = "~\(max(1, Int((100 - projected).rounded())))% dư"
+            r.title = "~\(Int(projected.rounded()))% đã dùng lúc reset"
+            return r
+        }
+        r.tick = 0
+        return r
+    }
+
+    /// "Còn 52%" (default) or "Đã dùng 48%".
+    static func headline(_ w: QuotaWindow, showUsed: Bool) -> String {
+        let u = Int(clampPercent(w.usedPercent).rounded())
+        return showUsed ? "Đã dùng \(u)%" : "Còn \(100 - u)%"
+    }
+
+    /// "Reset sau 3h 10m", "Sắp reset", "Reset hôm nay lúc 12:51", "Chưa bắt đầu"; "" when the
+    /// reset time is unknown.
+    static func resetText(_ w: QuotaWindow, now: Date, exact: Bool, calendar: Calendar = .current) -> String {
+        guard let at = w.resetsAt else { return "" }
+        let remain = at.timeIntervalSince(now)
+        if let period = w.periodSeconds, period <= 6 * 3600, clampPercent(w.usedPercent) <= 1, remain >= period * 0.98 {
+            return "Chưa bắt đầu"
+        }
+        if exact { return "Reset " + exactAt(at, now: now, calendar: calendar) }
+        return remain < 60 ? "Sắp reset" : "Reset sau " + duration(remain)
+    }
+
+    /// The tile shows the window in the worst state: pace colour first, then the least left.
+    static func worst(_ windows: [QuotaWindow], now: Date) -> QuotaWindow? {
+        windows.reduce(nil) { m, w in
+            guard let m = m else { return w }
+            let a = pace(w, now: now).level, b = pace(m, now: now).level
+            return a > b || (a == b && clampPercent(w.usedPercent) > clampPercent(m.usedPercent)) ? w : m
+        }
+    }
+
+    /// "data.int@x.vn" stays; a local part over 7 characters becomes its first 6 + "…".
+    static func shortMail(_ e: String) -> String {
+        guard let at = e.firstIndex(of: "@") else { return e }
+        let user = e[..<at]
+        return (user.count > 7 ? String(user.prefix(6)) + "…" : String(user)) + String(e[at...])
+    }
+
+    // MARK: Box ring
+
+    enum RingMode: Hashable { case run, warn, paused, unknown }
+
+    struct Ring: Equatable {
+        var mode: RingMode
+        /// Seconds to the next change (sleep, or wake while paused).
+        var seconds: Int
+        /// Arc length, 0...1.
+        var fraction: Double
+        var changeAt: Date?
+    }
+
+    /// Running: counts down to `sleepsAt` (warn under 10 min). Once that moment passes (the box
+    /// is then asleep and cannot answer), counts the cooldown down to the estimated wake.
+    static func ring(_ box: HomeBox?, now: Date) -> Ring {
+        guard let box = box, let sleeps = box.sleepsAt else { return Ring(mode: .unknown, seconds: 0, fraction: 0) }
+        let maxRun = max(60, (box.maxRunMinutes ?? 480) * 60), cooldown = max(60, (box.cooldownMinutes ?? 10) * 60)
+        let left = sleeps.timeIntervalSince(now)
+        if left > 0 && (box.state ?? "running") == "running" {
+            let s = Int(left.rounded(.up))
+            return Ring(mode: s < 600 ? .warn : .run, seconds: s, fraction: max(0, min(1, left / maxRun)), changeAt: sleeps)
+        }
+        let wake = (left > 0 ? now : sleeps).addingTimeInterval(cooldown)
+        let rest = wake.timeIntervalSince(now)
+        guard rest > 0 else { return Ring(mode: .unknown, seconds: 0, fraction: 0) }
+        return Ring(mode: .paused, seconds: Int(rest.rounded(.up)), fraction: max(0, min(1, rest / cooldown)), changeAt: wake)
+    }
+
+    // MARK: Projects
+
+    enum Tone { case ok, fail, pending, none }
+
+    /// Third line of a project card.
+    static func deployLine(_ run: HomeRun?, now: Date) -> (text: String, tone: Tone) {
+        guard let run = run else { return ("deploy: chưa có", .none) }
+        let when = run.at.map { ago(now.timeIntervalSince($0)) }
+        switch run.status {
+        case "success": return ("✓ deploy " + (when ?? ""), .ok)
+        case "failure": return ("✗ deploy lỗi" + (when.map { " · " + $0 } ?? ""), .fail)
+        case "in_progress", "queued", "pending": return ("◷ đang deploy", .pending)
+        default: return ("deploy: \(run.status)", .none)
+        }
+    }
+
+    /// Second line of a project card: the worst PR checks result.
+    static func checksLine(_ prs: [HomePR]?, branch: String?) -> (text: String, tone: Tone) {
+        let checks = (prs ?? []).map(\.checks)
+        if checks.contains("failure") { return ("✗ checks PR lỗi", .fail) }
+        if checks.contains("pending") { return ("◷ checks PR đang chạy", .pending) }
+        if checks.contains("success") { return ("✓ checks PR đạt", .ok) }
+        return (branch.map { "nhánh " + $0 } ?? "", .none)
+    }
+
+    // MARK: Spend donut
+
+    struct Wedge: Equatable {
+        var key: String
+        var name: String
+        var usd: Double
+        /// Angles in radians, clockwise from 12 o'clock, gap included.
+        var start: Double
+        var end: Double
+        var parts: String = ""
+    }
+
+    /// Pane donut: parts under `fold` dollars fold into one "Khác" wedge when there are 2 or more,
+    /// every wedge gets at least 7 %, and a 2.2/37 rad gap separates wedges.
+    static func donut(_ input: [(key: String, name: String, usd: Double)], fold: Double = 10) -> [Wedge] {
+        var parts = input.filter { $0.usd > 0 }
+        let small = parts.filter { $0.usd < fold }
+        var other: (key: String, name: String, usd: Double)?
+        var otherNames = ""
+        if small.count > 1 {
+            parts = parts.filter { $0.usd >= fold }
+            other = ("other", "Khác", small.reduce(0) { $0 + $1.usd })
+            otherNames = small.map { "\($0.name) \(usd($0.usd))" }.joined(separator: ", ")
+        }
+        if let o = other { parts.append(o) }
+        let total = parts.reduce(0) { $0 + $1.usd }
+        guard total > 0 else { return [] }
+        if parts.count == 1 { return [Wedge(key: parts[0].key, name: parts[0].name, usd: parts[0].usd, start: 0, end: 2 * .pi)] }
+        let fr = parts.map { max(0.07, $0.usd / total) }, sum = fr.reduce(0, +), pad = 2.2 / 37
+        var a0 = 0.0
+        return parts.enumerated().map { i, p in
+            let a1 = a0 + fr[i] / sum * 2 * .pi
+            defer { a0 = a1 }
+            return Wedge(key: p.key, name: p.name, usd: p.usd, start: a0 + pad / 2, end: a1 - pad / 2,
+                         parts: p.key == "other" ? otherNames : "")
+        }
+    }
+
+    // MARK: Codex reset reply
+
+    /// done = the reset happened (or had already); canRetry = "Thử lại" may help.
+    static func codexOutcome(_ reply: CodexResetReply) -> (done: Bool, canRetry: Bool, text: String) {
+        let msg = reply.message?.trimmingCharacters(in: .whitespaces).isEmpty == false ? reply.message! : nil
+        switch reply.result {
+        case "reset", "already": return (true, false, msg ?? "Đã reset")
+        case "nothing_to_reset": return (false, false, msg ?? "Chưa cần reset: hạn mức vẫn còn")
+        case "no_credit": return (false, false, msg ?? "Không reset được: chưa có lượt reset")
+        default: return (false, true, msg ?? "Không reset được, thử lại")
+        }
+    }
+
+    /// Session names the server accepts (NAME_RE): lowercase letters, digits and "-", 1-32.
+    static func validSessionName(_ s: String) -> Bool {
+        s.range(of: "^[a-z0-9][a-z0-9-]{0,31}$", options: .regularExpression) != nil
+    }
+
+    // MARK: - Self-test
+
+    /// Fixed cases; one line per failure (empty = all pass). Run by the CI self-test step.
+    static func selfTest() -> [String] {
+        var failures: [String] = []
+        func eq<T: Equatable>(_ name: String, _ got: T, _ want: T) {
+            if got != want { failures.append("\(name): got \(got), want \(want)") }
+        }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let hr = 3600.0, day = 86400.0
+        func win(_ used: Double?, rem: Double?, per: Double?) -> QuotaWindow {
+            QuotaWindow(label: "w", usedPercent: used, resetsAt: rem.map { now.addingTimeInterval($0) }, periodSeconds: per)
+        }
+
+        // Numbers
+        eq("compact 999", compact(999), "999")
+        eq("compact K", compact(1500), "1.5K")
+        eq("compact M", compact(227.9e6), "227.9M")
+        eq("compact B", compact(5.6e9), "5.6B")
+        eq("usd small", usd(105.81), "$105.81")
+        eq("usd zero", usd(0), "$0.00")
+        eq("usd big", usd(2480), "$2.5K")
+        eq("spend", spendLine(SpendAmount(usd: 3.1, tokens: 8.2e6)), "$3.10 · 8.2M tokens")
+        eq("spend approx", spendLine(SpendAmount(usd: 4900, tokens: 12.1e9), approx: true), "≈ $4.9K · 12.1B tokens")
+
+        // Durations and reset text
+        eq("dur days", duration(2 * day + 10 * hr), "2d 10h")
+        eq("dur hours", duration(3 * hr + 5 * 60), "3h 05m")
+        eq("dur mins", duration(49 * 60 + 30), "49m")
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        eq("reset countdown", resetText(win(48, rem: 3 * hr + 600, per: 5 * hr), now: now, exact: false), "Reset sau 3h 10m")
+        eq("reset soon", resetText(win(48, rem: 30, per: 5 * hr), now: now, exact: false), "Sắp reset")
+        eq("not started", resetText(win(0, rem: 5 * hr, per: 5 * hr), now: now, exact: false), "Chưa bắt đầu")
+        eq("weekly 0% starts", resetText(win(0, rem: 7 * day, per: 7 * day), now: now, exact: false), "Reset sau 7d 0h")
+        eq("no reset time", resetText(win(10, rem: nil, per: 5 * hr), now: now, exact: false), "")
+        // 1_800_000_000 = 2027-01-15 08:00 UTC
+        eq("exact today", resetText(win(10, rem: 2 * hr, per: 5 * hr), now: now, exact: true, calendar: cal), "Reset hôm nay lúc 10:00")
+        eq("exact tomorrow", resetText(win(10, rem: 20 * hr, per: 7 * day), now: now, exact: true, calendar: cal), "Reset ngày mai lúc 04:00")
+        eq("exact date", resetText(win(10, rem: 3 * day, per: 7 * day), now: now, exact: true, calendar: cal), "Reset 18/01 lúc 08:00")
+
+        // Pace
+        eq("pace normal", pace(win(20, rem: 3 * hr, per: 5 * hr), now: now).level, .normal)
+        eq("pace normal no tick", pace(win(20, rem: 3 * hr, per: 5 * hr), now: now).tick, 0)
+        let warn = pace(win(72, rem: hr + 300, per: 5 * hr), now: now)   // frac 0.78, projected 92
+        eq("pace warn", warn.level, .warn)
+        eq("pace warn note", warn.note, "~8% dư")
+        let low = pace(win(82, rem: 19 * hr + 600, per: 7 * day), now: now)   // frac ~0.887, projected ~92
+        eq("pace weekly warn", low.level, .warn)
+        let over = pace(win(60, rem: 4 * hr, per: 5 * hr), now: now)   // frac 0.2, projected 300
+        eq("pace over", over.level, .low)
+        eq("pace over flame", over.flame, true)
+        eq("pace over note", over.note, "Chạm giới hạn sau 40m")
+        eq("pace limit", pace(win(99.6, rem: hr, per: 5 * hr), now: now).note, "Đã chạm giới hạn")
+        eq("fallback low", pace(win(91, rem: nil, per: nil), now: now).level, .low)
+        eq("fallback warn", pace(win(80, rem: nil, per: nil), now: now).level, .warn)
+        eq("early gate", pace(win(30, rem: 4.9 * hr, per: 5 * hr), now: now).level, .normal)
+        eq("headline left", headline(win(48.4, rem: nil, per: nil), showUsed: false), "Còn 52%")
+        eq("headline used", headline(win(48.6, rem: nil, per: nil), showUsed: true), "Đã dùng 49%")
+        eq("worst", worst([win(20, rem: 3 * hr, per: 5 * hr), win(72, rem: hr + 300, per: 5 * hr)], now: now)?.usedPercent, 72)
+        eq("worst empty", worst([], now: now)?.usedPercent, nil)
+
+        // Window hiding
+        let acc = QuotaAccount(id: "a", harness: "claude", email: "data.int@example.vn", plan: "Team",
+                               windows: [win(7, rem: hr, per: 5 * hr), win(nil, rem: nil, per: 7 * day), win(44, rem: day, per: 7 * day)])
+        eq("hide null window", acc.shown.count, 2)
+        eq("has weekly", acc.hasWeekly, true)
+        eq("short mail", shortMail("an.nguyen.dev@gmail.com"), "an.ngu…@gmail.com")
+        eq("short mail cut 8", shortMail("data.int@example.vn"), "data.i…@example.vn")
+        eq("short mail keep", shortMail("box@x.vn"), "box@x.vn")
+
+        // Ring
+        let r1 = ring(HomeBox(sleepsAt: now.addingTimeInterval(2 * hr + 14 * 60 + 5)), now: now)
+        eq("ring run", r1.mode, .run)
+        eq("ring hhmm", hhmm(r1.seconds), "02:14")
+        eq("ring warn", ring(HomeBox(sleepsAt: now.addingTimeInterval(7 * 60)), now: now).mode, .warn)
+        let r3 = ring(HomeBox(sleepsAt: now.addingTimeInterval(-50)), now: now)
+        eq("ring paused", r3.mode, .paused)
+        eq("ring paused secs", r3.seconds, 550)
+        eq("ring woke", ring(HomeBox(sleepsAt: now.addingTimeInterval(-700)), now: now).mode, .unknown)
+        eq("ring no data", ring(nil, now: now).mode, .unknown)
+        eq("hms", hms(9 * 60 + 12), "00:09:12")
+
+        // Projects
+        eq("deploy ok", deployLine(HomeRun(status: "success", at: now.addingTimeInterval(-3 * hr)), now: now).text, "✓ deploy 3 giờ trước")
+        eq("deploy none", deployLine(nil, now: now).text, "deploy: chưa có")
+        eq("ago", ago(55 * 60), "55 phút trước")
+
+        // Donut
+        let d = donut([("claude", "Claude", 6242), ("codex", "Codex", 58.4)])
+        eq("donut count", d.count, 2)
+        eq("donut min share", d[1].end - d[1].start > 0.3, true)
+        eq("donut fold", donut([("a", "A", 3), ("b", "B", 4), ("c", "C", 50)]).map(\.name), ["C", "Khác"])
+        eq("donut one", donut([("a", "A", 3)]).first?.end, Double.pi * 2)
+        eq("donut empty", donut([("a", "A", 0)]).count, 0)
+
+        // Lenient decoding
+        let json = """
+        {"box":{"state":"running","sleepsAt":"2027-01-15T10:00:00.000Z","maxRunMinutes":480},
+         "accounts":[{"id":"x","harness":"Codex","email":"e@x","windows":[{"key":"5h","label":"5 giờ","usedPercent":18,"resetsAt":"2027-01-15T09:00:00Z","periodSeconds":18000},{"key":"7d","label":"7 ngày","usedPercent":null}],"resets":{"available":1},"spend":{"today":{"usd":3.1,"tokens":8200000},"daily30":[{"date":"2027-01-02","usd":1,"tokens":2},{"date":"2027-01-01","usd":1,"tokens":1}]}},
+                     {"harness":5}],
+         "projects":[{"name":"deal-sync","prs":null,"lastRun":null},{"name":"b","prs":[{"number":6,"checks":"failure"}]}],
+         "totals":"broken"}
+        """
+        if let h = try? JSONDecoder().decode(HomeData.self, from: Data(json.utf8)) {
+            eq("decode accounts", h.accounts.count, 1)
+            eq("decode harness", h.accounts.first?.harness, "codex")
+            eq("decode shown", h.accounts.first?.shown.count, 1)
+            eq("decode resets", h.accounts.first?.resetsAvailable, 1)
+            eq("decode daily sorted", h.accounts.first?.spend?.daily30.map(\.tokens), [1, 2])
+            eq("decode bad totals", h.totals == nil, true)
+            eq("decode prs null", h.projects.first?.prs == nil, true)
+            eq("decode checks", checksLine(h.projects.last?.prs, branch: nil).text, "✗ checks PR lỗi")
+            eq("decode sleeps", h.box?.sleepsAt, now.addingTimeInterval(2 * hr))
+        } else {
+            failures.append("decode: lenient JSON failed")
+        }
+        eq("decode empty", (try? JSONDecoder().decode(HomeData.self, from: Data("{}".utf8)))?.accounts.count, 0)
+
+        // Codex reset replies
+        func reply(_ r: String, _ m: String? = nil) -> CodexResetReply {
+            let body = m.map { "{\"result\":\"\(r)\",\"message\":\"\($0)\"}" } ?? "{\"result\":\"\(r)\"}"
+            return try! JSONDecoder().decode(CodexResetReply.self, from: Data(body.utf8))
+        }
+        eq("codex reset", codexOutcome(reply("reset")).done, true)
+        eq("codex already", codexOutcome(reply("already")).done, true)
+        eq("codex no credit final", codexOutcome(reply("no_credit")).canRetry, false)
+        eq("codex error retry", codexOutcome(reply("error")).canRetry, true)
+        eq("codex message", codexOutcome(reply("error", "Mở codex trên box")).text, "Mở codex trên box")
+        eq("name ok", validSessionName("deal-sync-omp-2"), true)
+        eq("name upper", validSessionName("Deal"), false)
+        eq("name dash first", validSessionName("-a"), false)
+        return failures
+    }
+}

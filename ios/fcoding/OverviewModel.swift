@@ -128,12 +128,43 @@ final class OverviewModel: ObservableObject {
         if sent { markRead(s.name) }
     }
 
-    /// Kills the tmux session; its draft goes with it (as before).
-    func delete(_ name: String, app: AppState) async {
-        _ = await perform(name, app) { api in
+    /// "Đóng": kills the tmux session; its draft goes with it (as before). True when it closed.
+    @discardableResult
+    func delete(_ name: String, app: AppState) async -> Bool {
+        await perform(name, app) { api in
             try await api.call("DELETE", "api/sessions/\(name)")
             UserDefaults.standard.removeObject(forKey: "draft.\(name)")
         }
+    }
+
+    /// "Đổi tên": PATCH /api/sessions/<name> {name}. Returns the error text, nil when renamed.
+    /// The draft and the read mark move with the session.
+    func rename(_ name: String, to newName: String, app: AppState) async -> String? {
+        guard let api = app.api else { return unpairedNotice }
+        guard !busy.contains(name) else { return "Phiên đang bận, thử lại." }
+        busy.insert(name)
+        defer { busy.remove(name) }
+        do {
+            try await api.call("PATCH", "api/sessions/\(name)", body: ["name": newName])
+        } catch let e as APIError where [404, 405, 501].contains(e.status) && e.code != "not_found" {
+            return "Máy chủ chưa hỗ trợ đổi tên, cập nhật máy chủ trước."
+        } catch let e as APIError where e.status == 409 {
+            return "Đã có phiên tên này."
+        } catch {
+            return app.report(error) ?? "Chưa đổi được tên, thử lại."
+        }
+        let defaults = UserDefaults.standard
+        if let draft = defaults.string(forKey: "draft.\(name)") {
+            defaults.set(draft, forKey: "draft.\(newName)")
+            defaults.removeObject(forKey: "draft.\(name)")
+        }
+        if let mark = seen[name] {
+            seen[newName] = mark
+            seen[name] = nil
+            saveSeen()
+        }
+        await load(app)
+        return nil
     }
 
     /// Runs one action for `name`; `busy` stays set until the post-action data is in, so the
