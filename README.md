@@ -24,7 +24,7 @@ Tính năng chính:
 - Trò chuyện với **omp**, **Claude Code**, **Codex** hoặc **shell** (bash) chạy trong tmux trên box.
 - **Hộp thư tổng quan**: mọi phiên được chia thành **Cần bạn**, **Đang chạy** và **Đang nghỉ**. Việc cần bạn trả lời luôn nằm trên cùng.
 - **Trả lời y/n ngay trên danh sách**, không cần mở phiên.
-- **Hàng phím nhanh**: Esc, Ctrl+C, mũi tên, Tab, Shift+Tab, Enter, y, n và nút `/` cho các lệnh hay dùng.
+- **Hàng phím nhanh**: Esc, **Agents**, Ctrl+C, mũi tên, Tab, Shift+Tab, Enter, y, n, **^O** và nút `/` cho các lệnh hay dùng.
 - **Gõ tiếng Việt** bình thường bằng bàn phím iPhone; chữ được gửi nguyên vẹn lên box.
 - **Phiên mới bằng nút +**: chọn chương trình và dự án, luôn tạo phiên mới.
 - Ghép máy bằng **mã 6 số**, không có mật khẩu.
@@ -217,15 +217,15 @@ Muốn dùng lại sau khi bị gỡ thì chạy `fcode-pair` trên box và ghé
 
 **Trong một phiên**:
 
-- Màn hình tự cuộn xuống dòng mới nhất. Nếu bạn cuộn lên để đọc, bấm **Xuống cuối** để quay lại. **A-** / **A+** đổi cỡ chữ.
+- Khi bạn đang ở cuối, màn hình tự cuộn theo dòng mới. Nếu bạn cuộn lên để đọc, màn hình đứng yên dù có chữ mới; bấm nút tròn **↓** (hoặc cuộn về cuối) để theo lại. Gửi tin nhắn cũng đưa về cuối. **A-** / **A+** đổi cỡ chữ.
 - Chấm màu báo kết nối: xanh lá là trực tiếp, vàng là cập nhật định kỳ, cam là đang kết nối, đỏ là mất kết nối.
-- **Ô nhập mặc định được ẩn** để màn hình rộng hơn. Chạm nút **bàn phím** tròn ở góc dưới bên phải: ô nhập hiện ra và bàn phím bật lên ngay, chỉ cần một lần chạm.
+- **Ô nhập mặc định được ẩn** để màn hình rộng hơn. Chạm nút **bàn phím** tròn ở góc dưới bên phải: ô nhập hiện ra và bàn phím bật lên ngay, chỉ cần một lần chạm. Muốn dời nút **bàn phím**: giữ và kéo nó đi, thả ra thì nút tự dạt vào mép trái hoặc phải gần nhất. Ứng dụng nhớ chỗ này.
 - Gõ vào ô nhập rồi chạm nút gửi tròn ở mép phải ô: chữ được gửi kèm Enter. **Nhấn giữ** nút gửi để chọn **Gửi không Enter**. Chạm gửi khi ô trống chỉ gửi một lần Enter. Nội dung đang soạn được giữ lại cho từng phiên.
 - Gửi xong, ô nhập **tự ẩn lại**. Muốn ẩn bằng tay: chạm nút **⌄** trên ô nhập, hoặc vuốt xuống ở thanh kéo (vạch nhỏ ở đầu ô) hay nền ô nhập.
 - Nút **ghim** trên ô nhập: khi ghim, ô nhập hiện sẵn mỗi lần mở phiên và vẫn ở lại sau khi gửi. Bấm lần nữa để bỏ ghim. App nhớ lựa chọn này.
 - **Màu và biểu tượng**: màn hình hiện đúng màu của chương trình (chữ, nền, đậm, nghiêng, gạch chân), nên dễ phân biệt lỗi, phần thêm/xóa của diff hay mục đang chọn. Các biểu tượng đặc biệt (nhánh git, thư mục…) hiện đúng nhờ font Nerd Font đi kèm app. Tên phiên ở thanh trên nằm trong nhãn màu theo chương trình (claude cam, omp tím, codex xanh).
-- Hàng phím nhanh: Esc, Ctrl+C, mũi tên, Tab, ⇧Tab, Enter, y, n. Nút `/` chèn các lệnh hay dùng như `/model`, `/clear`. Phím được gửi đúng thứ tự bạn bấm.
-- Agents (Alt+A): mở danh sách subagent của omp; trong đó dùng ↑↓ chọn, Enter mở, Esc đóng.
+- Hàng phím nhanh: Esc, **Agents**, Ctrl+C, mũi tên, Tab, ⇧Tab, Enter, y, n, **^O**. Nút `/` chèn các lệnh hay dùng như `/model`, `/clear`. Phím được gửi đúng thứ tự bạn bấm.
+- **Agents** (Alt+A): mở danh sách subagent của omp; trong đó dùng ↑↓ chọn, Enter mở, Esc đóng. **^O** (Ctrl+O) mở rộng nội dung. Hai phím **Agents** và **^O** chỉ hiện trong phiên omp.
 - Khi chuyển sang app khác, kết nối tạm dừng; mở lại là tự kết nối lại.
 
 **Khi gặp lỗi**
