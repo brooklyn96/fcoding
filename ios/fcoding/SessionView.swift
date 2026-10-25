@@ -43,6 +43,7 @@ struct SessionView: View {
                 TerminalView(model: model, fontSize: fontSize, viewportHeight: geo.size.height,
                              bottomRequest: bottomRequest,
                              pinRequest: pinRequest,
+                             joinWraps: chipHarness == "omp",
                              // Never under the keyboard button: the opposite edge while it shows.
                              jumpOnLeft: !composerShown && !kbLeft)
             }
@@ -349,6 +350,8 @@ struct TerminalView: View {
     var bottomRequest = 0
     /// Changes when the app returns to the foreground: pin to the bottom again.
     var pinRequest = 0
+    /// omp session: join URLs that omp hard-wraps across lines.
+    var joinWraps = false
     /// Put the jump button on the left (the keyboard button is on the right).
     var jumpOnLeft = false
     @StateObject private var scroll = ScrollState()
@@ -381,7 +384,7 @@ struct TerminalView: View {
                 VStack(alignment: .leading, spacing: 0) {
                     // Every run of the styled text carries its own font and colour; these two
                     // modifiers only style the loading line.
-                    Text(model.text.isEmpty ? AttributedString("Đang tải màn hình…") : model.styled(fontSize: fontSize))
+                    Text(model.text.isEmpty ? AttributedString("Đang tải màn hình…") : model.styled(fontSize: fontSize, joinWraps: joinWraps))
                         .font(.system(size: CGFloat(fontSize), design: .monospaced))
                         .foregroundColor(.gray)
                         .textSelection(.enabled)

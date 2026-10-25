@@ -53,7 +53,7 @@ Sau khi ghép, iPhone nhớ box trong Keychain; mở ứng dụng là vào thẳ
   - Thanh trên cùng: nhãn tên phiên có màu theo chương trình (cam = claude, tím = omp, xanh = codex). Tên dài thì bị cắt ở giữa.
   - Chữ trên màn hình có màu như trên laptop; các biểu tượng nhỏ (nhánh git, thư mục, …) hiện đúng nhờ font biểu tượng đi kèm ứng dụng.
   - Khi bạn đang ở cuối, màn hình tự cuộn theo dòng mới. Nếu bạn cuộn lên để đọc, màn hình đứng yên dù có chữ mới; bấm nút tròn **↓** (hoặc cuộn về cuối) để theo lại. Gửi tin nhắn cũng đưa về cuối.
-  - Đường link (http/https) trên màn hình được gạch chân: chạm để mở bằng Safari. Link dài bị ngắt sang dòng dưới vẫn mở đúng cả link.
+  - Link trong màn hình được gạch chân; chạm để mở trong trình duyệt. Link dài bị omp cắt xuống dòng thường vẫn mở đúng cả link. Nhấn giữ để chép chữ trên màn hình.
   - Link bị cắt ngay trước một chữ thường (không có - / _ …) có thể chỉ mở được phần đầu.
   - **A-** / **A+**: chữ nhỏ hơn / to hơn.
   - Chấm màu: xanh lá = đang kết nối trực tiếp, vàng = đang cập nhật định kỳ, cam = đang kết nối, đỏ = mất kết nối.

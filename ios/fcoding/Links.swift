@@ -21,10 +21,10 @@ enum Links {
         }
     }
 
-    /// Links in `text` (screen lines separated by "\n"). A URL that ends a line at the right
-    /// margin (`cols` or `cols - 1` cells: omp hard-wraps long URLs one cell early and indents the
-    /// rest) continues on the next line when that line's first word looks like the rest of a URL.
-    static func find(in text: String, cols: Int) -> [Link] {
+    /// Links in `text` (screen lines separated by "\n"). With `joinWraps` (omp sessions only: omp
+    /// hard-wraps long URLs at the margin and indents the rest), a URL may continue on the next
+    /// line; see `continuation` for the exact rule. Other sessions never join.
+    static func find(in text: String, cols: Int, joinWraps: Bool) -> [Link] {
         guard let detector = detector, text.contains("http") else { return [] }
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         var starts: [Int] = []
@@ -49,13 +49,16 @@ enum Links {
                 var full = matched
                 var pieces = [(starts[i] + lo)..<(starts[i] + hi)]
                 var cur = i
+                var begin = lo
                 var end = hi
-                while cur + 1 < lines.count,
-                      let cont = continuation(of: lines[cur], urlEnd: end, url: full, next: lines[cur + 1], cols: cols) {
+                while joinWraps, cur + 1 < lines.count,
+                      let cont = continuation(of: lines[cur], urlStart: begin, urlEnd: end, url: full,
+                                              next: lines[cur + 1], cols: cols) {
                     full += cont.text
                     pieces.append((starts[cur + 1] + cont.range.lowerBound)..<(starts[cur + 1] + cont.range.upperBound))
                     consumed[cur + 1] = cont.range.upperBound
                     cur += 1
+                    begin = cont.range.lowerBound
                     end = cont.range.upperBound
                 }
                 guard let url = URL(string: full), ["http", "https"].contains(url.scheme?.lowercased() ?? "") else { continue }
@@ -65,21 +68,26 @@ enum Links {
         return out
     }
 
-    /// The part of `next` that continues `url`, which ends at scalar offset `urlEnd` of `line`, or nil.
-    /// Joins only when the URL ends `line` at exactly `cols` or `cols - 1` cells (a wider line was
-    /// already joined by `capture-pane -J` and is never joined again), and the first word of `next`
-    /// looks like the rest of a URL: it has one of `/ ? # = & % _ -`, or a "." with more after it,
-    /// or it is the only word on its line and nothing was stripped from it. Trailing `.,;:!?` and an
-    /// unbalanced `)` or `]` are dropped, as NSDataDetector does on the first line.
-    /// Accepted ambiguities: a bare word alone on the next line (`…/pull/12` then `merged`) joins,
-    /// because omp's real wraps look the same; a plain word followed by prose (`…/box/p` then
-    /// `ending, hoặc …`) does not join, so only the first part of that link opens.
-    static func continuation(of line: String, urlEnd: Int, url: String, next: String, cols: Int) -> (text: String, range: Range<Int>)? {
+    /// The part of `next` that continues `url` (on `line` at scalar offsets `urlStart..<urlEnd`), or
+    /// nil. Joins only when all of these hold:
+    /// - the URL is the whole visible text of `line`: only an indent of at least 1 space before it,
+    ///   nothing after it (so `Link: https://…` and `remote:   https://…` never join);
+    /// - `line` is exactly `cols` or `cols - 1` cells wide (a wider line was already joined by
+    ///   `capture-pane -J` and is never joined again);
+    /// - `next` has exactly the same indent;
+    /// - the first word of `next`, after dropping trailing `.,;:!?` and an unbalanced `)` or `]` (as
+    ///   NSDataDetector does on the first line), looks like the rest of a URL: it has one of
+    ///   `/ ? # = & % _ -`, or a "." with more after it.
+    /// Accepted miss: a wrap right before a plain word (`…/box/p` then `ending, …`) does not join,
+    /// so only the first part of that link opens.
+    static func continuation(of line: String, urlStart: Int, urlEnd: Int, url: String, next: String,
+                             cols: Int) -> (text: String, range: Range<Int>)? {
         guard cols > 0 else { return nil }
         let scalars = Array(line.unicodeScalars)
         var end = scalars.count
         while end > 0, scalars[end - 1] == " " { end -= 1 }
-        guard urlEnd == end, end > 0 else { return nil }
+        guard urlEnd == end, urlStart >= 1, urlStart < end,
+              scalars[0..<urlStart].allSatisfy({ $0 == " " }) else { return nil }
         // Width in cells: one per character (the screen is monospaced).
         let width = String(String.UnicodeScalarView(scalars[0..<end])).count
         guard width == cols || width == cols - 1 else { return nil }
@@ -87,14 +95,13 @@ enum Links {
         let n = Array(next.unicodeScalars)
         var start = 0
         while start < n.count, n[start] == " " { start += 1 }
+        guard start == urlStart else { return nil }
         var stop = start
         while stop < n.count, isURLChar(n[stop]) { stop += 1 }
         // The next character after the token must end it (a space or the end of the line).
         guard stop > start, stop == n.count || n[stop] == " " else { return nil }
-        let alone = !n[stop...].contains(where: { $0 != " " })
 
         var tok = Array(n[start..<stop])
-        let raw = tok.count
         func count(_ c: Unicode.Scalar) -> Int {
             url.unicodeScalars.filter { $0 == c }.count + tok.filter { $0 == c }.count
         }
@@ -110,7 +117,7 @@ enum Links {
         if token.lowercased().hasPrefix("http") { return nil } // a new URL, not the rest of this one
         let urlish = token.unicodeScalars.contains { "/?#=&%_-".unicodeScalars.contains($0) }
             || token.dropLast().contains(".")
-        guard urlish || (alone && tok.count == raw) else { return nil }
+        guard urlish else { return nil }
         return (token, start..<(start + tok.count))
     }
 
@@ -152,38 +159,43 @@ enum Links {
     /// every configuration so the Release CI build type-checks it; it runs only in Debug.
     static func selfTest() -> [String] {
         var failures: [String] = []
-        func check(_ name: String, _ text: String, cols: Int, _ urls: [String], pieces: [Int]? = nil) {
-            let got = find(in: text, cols: cols)
+        func check(_ name: String, _ text: String, cols: Int, omp: Bool = true, _ urls: [String],
+                   pieces: [Int]? = nil) {
+            let got = find(in: text, cols: cols, joinWraps: omp)
             if got.map(\.url.absoluteString) != urls {
                 failures.append("\(name): urls \(got.map(\.url.absoluteString))")
             } else if let pieces = pieces, got.first?.pieces.map(\.count) != pieces {
                 failures.append("\(name): pieces \(got.first?.pieces.map(\.count) ?? [])")
             }
         }
-        // omp hard-wrap on the iPhone (46 cols): the URL fills the line, the rest is alone below.
+        let pr = "https://github.com/brooklyn96/BD-Team-Project/pull/new/box/p"
+        let prFull = "https://github.com/brooklyn96/BD-Team-Project/pull/new/box/pending-fixes"
+        // Real omp wraps: they join.
         check("omp 46", "  https://github.com/b96/fcodes/pull/new/box/p\n  ending-fixes", cols: 46,
               ["https://github.com/b96/fcodes/pull/new/box/pending-fixes"], pieces: [44, 12])
-        // Real capture: wrap at cols - 1, then a comma and prose after the token.
-        check("omp 65 comma",
-              "    https://github.com/brooklyn96/BD-Team-Project/pull/new/box/p\n    ending-fixes, hoặc đăng nhập gh …",
-              cols: 65, ["https://github.com/brooklyn96/BD-Team-Project/pull/new/box/pending-fixes"], pieces: [60, 12])
-        // Prose: a URL near the margin, then an ordinary word-wrapped line.
+        check("omp 65 comma", "    \(pr)\n    ending-fixes, hoặc đăng nhập gh …", cols: 65, [prFull], pieces: [60, 12])
+        check("omp paren", "    \(pr)\n    ending-fixes).", cols: 65, [prFull], pieces: [60, 12])
+        // Not omp: the same lines never join.
+        check("not omp", "    \(pr)\n    ending-fixes, hoặc đăng nhập gh …", cols: 65, omp: false, [pr])
+        // Text before the URL on its line: never joins.
         check("readme", "  Docs: https://github.com/brooklyn96/fcoding/blob/main/README\n  for the setup steps.", cols: 63,
               ["https://github.com/brooklyn96/fcoding/blob/main/README"], pieces: [54])
-        // capture-pane -J already joined a tmux soft wrap: the line is wider than cols.
-        check("-J", "remote:      https://github.com/brooklyn96/BD-Team-Project/pull/new/box/pending-fixes\nremote:",
-              cols: 65, ["https://github.com/brooklyn96/BD-Team-Project/pull/new/box/pending-fixes"], pieces: [72])
-        // Table row: the border ends the line, not the URL.
+        check("remote 64", "remote: https://github.com/brooklyn96/BD-Team-Project/pull/new/b\nremote:", cols: 65,
+              ["https://github.com/brooklyn96/BD-Team-Project/pull/new/b"], pieces: [56])
+        check("Link: 65", "Link: https://github.com/brooklyn96/BD-Team-Project/pull/new/bx/p\n  done", cols: 65,
+              ["https://github.com/brooklyn96/BD-Team-Project/pull/new/bx/p"])
         check("table", "│ https://example.com/a/b │\n│ more/x │", cols: 27, ["https://example.com/a/b"], pieces: [23])
-        // Punctuation after a URL, on the first line and on a continuation.
-        check("paren", "See (https://example.com/x).", cols: 80, ["https://example.com/x"])
-        check("paren cont", "(see https://github.com/b96/fcode/pull/new/box/p\nending-fixes).", cols: 48,
-              ["https://github.com/b96/fcode/pull/new/box/pending-fixes"], pieces: [43, 12])
-        // A bare word alone below joins only when nothing was stripped from it.
+        // capture-pane -J already joined a tmux soft wrap: the line is wider than cols.
+        check("-J", "remote:      \(prFull)\nremote:", cols: 65, [prFull], pieces: [72])
+        // A different indent below (a prompt, an ls listing): never joins.
+        check("prompt", "    \(pr)\nquoc@coder:/data/workspace/deal-sync$ ls", cols: 65, [pr], pieces: [60])
+        check("ls 65", "https://github.com/brooklyn96/BD-Team-Project/pull/new/box/pendin\nREADME.md  install.sh  server.mjs",
+              cols: 65, ["https://github.com/brooklyn96/BD-Team-Project/pull/new/box/pendin"], pieces: [65])
+        // A plain word below: never joins.
         check("done.", "  https://github.com/brooklyn96/fcoding/pull/12\n  done.", cols: 47,
               ["https://github.com/brooklyn96/fcoding/pull/12"], pieces: [45])
-        check("alone", "https://x.example/pull/new/box/p\nending-fixes", cols: 32,
-              ["https://x.example/pull/new/box/pending-fixes"], pieces: [32, 12])
+        // Punctuation on the first line, and two URLs on one line.
+        check("paren", "See (https://example.com/x).", cols: 80, ["https://example.com/x"])
         check("two", "a https://a.example/x and https://b.example/y", cols: 80,
               ["https://a.example/x", "https://b.example/y"])
         return failures
