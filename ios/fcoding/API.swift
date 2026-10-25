@@ -46,7 +46,46 @@ struct OverviewSession: Decodable, Identifiable, Hashable {
     var id: String { name }
 }
 
+/// POST /api/pair-code: a one-time code for another device, with its QR / share links.
+struct PairCodeResponse: Decodable {
+    let code: String
+    let expiresAt: Date
+    let appLink: String
+    let shareLink: String
+
+    private enum Key: String, CodingKey { case code, expiresAt, appLink, shareLink }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: Key.self)
+        code = try c.decode(String.self, forKey: .code)
+        appLink = try c.decode(String.self, forKey: .appLink)
+        shareLink = try c.decode(String.self, forKey: .shareLink)
+        let raw = try c.decode(String.self, forKey: .expiresAt)
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        guard let date = iso.date(from: raw) ?? ISO8601DateFormatter().date(from: raw) else {
+            throw DecodingError.dataCorruptedError(forKey: .expiresAt, in: c, debugDescription: "expiresAt")
+        }
+        expiresAt = date
+    }
+}
+
 extension API {
+    /// Returns the reply and its expiry on THIS phone's clock: receipt time + (expiresAt − the
+    /// response's Date header), so a phone clock that is off does not skew the countdown.
+    func pairCode() async throws -> (reply: PairCodeResponse, expires: Date) {
+        let req = try request("POST", "api/pair-code", body: [:])
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        try API.check(resp, data, token: token)
+        let reply = try JSONDecoder().decode(PairCodeResponse.self, from: data)
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        guard let header = (resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "Date"),
+              let serverNow = fmt.date(from: header) else { return (reply, reply.expiresAt) }
+        return (reply, Date().addingTimeInterval(reply.expiresAt.timeIntervalSince(serverNow)))
+    }
+
     func overview() async throws -> Overview { try await get("api/overview", as: Overview.self) }
 
     /// POST /api/open with fresh:true: always a new session (CONTRACT A5 update 4).
@@ -77,9 +116,14 @@ struct API {
 
     func request(_ method: String, _ path: String, query: [URLQueryItem] = [],
                  body: [String: Any]? = nil, timeout: TimeInterval = 20) throws -> URLRequest {
-        var comps = URLComponents(url: base.appendingPathComponent(path), resolvingAgainstBaseURL: false)
-        if !query.isEmpty { comps?.queryItems = query }
-        guard let url = comps?.url else { throw APIError(status: 0, code: "bad_url") }
+        // The canonical origin STRING + "/" + encoded path + encoded query, through URL(string:):
+        // nothing of `base` beyond https://host[:port], and no URLComponents host/scheme setters.
+        var q = URLComponents()
+        q.queryItems = query.isEmpty ? nil : query
+        guard let origin = PairLink.origin(base.absoluteString)?.absoluteString,
+              let encodedPath = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+              let url = URL(string: origin + "/" + encodedPath + (q.percentEncodedQuery.map { "?" + $0 } ?? ""))
+        else { throw APIError(status: 0, code: "bad_url") }
         var req = URLRequest(url: url, timeoutInterval: timeout)
         req.httpMethod = method
         req.setValue("1", forHTTPHeaderField: "X-PC")
