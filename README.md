@@ -186,7 +186,7 @@ Không cần gõ địa chỉ máy chủ: iPhone mới quét mã QR bằng Camer
    "publicUrl": "https://<địa-chỉ-công-khai>"
    ```
 
-   Máy chủ chỉ tạo link từ địa chỉ này, không bao giờ lấy từ yêu cầu gửi tới. Chưa đặt thì không tạo được link và mã QR. Máy chủ tự đọc lại file, không cần khởi động lại.
+   Địa chỉ phải là tên miền chữ không dấu có ít nhất một dấu chấm (ví dụ `box.example.com`), hoặc địa chỉ IP, và chỉ có thể kèm số cổng. Tên có chữ có dấu (`xn--…`), tên không có dấu chấm (`localhost`), chữ `_` thì app từ chối, và lệnh `fcode-pair --qr` báo "publicUrl trong config.json không hợp lệ cho app" thay vì in mã QR không dùng được. Máy chủ chỉ tạo link từ địa chỉ này, không bao giờ lấy từ yêu cầu gửi tới. Chưa đặt thì không tạo được link và mã QR. Máy chủ tự đọc lại file, không cần khởi động lại.
 2. Trên box, chạy `fcode-pair "iPhone mới" --qr`. Lệnh in mã QR (cần chương trình `qrencode`, cài bằng `sudo apt install qrencode`; thiếu thì in link và nhắc "cài qrencode để hiện mã QR"), link chia sẻ, rồi **mã 6 số cỡ lớn** và một dòng báo mã hết hạn sau 2 phút.
 3. Trên iPhone mới, mở Camera và quét mã QR. Link chia sẻ (`<địa chỉ>/pair`) gửi qua AirDrop hay Zalo cũng được: mở nó sẽ ra trang có nút **Mở FCode**. Link không có mã nên gửi cho ai cũng không lộ gì ngoài địa chỉ máy chủ.
 4. Trong app, gõ mã 6 số rồi bấm **Ghép**.

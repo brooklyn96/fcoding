@@ -77,6 +77,26 @@ export function secureConfigDir(dir) {
   };
   if (check(dir, true)) for (const f of ['config.json', 'devices.json']) check(path.join(dir, f), false);
 }
+// The server origin the app accepts in a pairing link (the same rule as the iOS PairLink parser): "https://" + host [+ ":" port] [+ "/"], nothing else.
+// host = lowercase ASCII LDH name (labels 1-63, no leading or trailing "-", no "xn--" label, at least one dot, at most 253 chars, one trailing dot
+// dropped, last label not all digits and not "0x...") OR 4 decimal octets without leading zeros OR a bracketed IPv6 address. port 1-65535.
+// Returns the canonical origin (443 left out) or null. A host written another way (IDN, "localhost", "192.168.001.010", "1.2.3.0x4") gives a QR no phone can use.
+export function strictOrigin(raw) {
+  if (typeof raw !== 'string' || /[^\x21-\x7e]/.test(raw)) return null; // ASCII, no space or control character (checked before any lowercasing)
+  const m = /^https:\/\/(\[[0-9a-fA-F:.]+\]|[^:/[\]]+)(?::(\d{1,5}))?\/?$/.exec(raw);
+  if (!m) return null;
+  let host = m[1].toLowerCase();
+  const port = m[2] === undefined ? null : Number(m[2]);
+  if (port !== null && !(port >= 1 && port <= 65535)) return null;
+  const origin = `https://${host}${port === null || port === 443 ? '' : `:${port}`}`;
+  if (host.startsWith('[')) return net.isIPv6(host.slice(1, -1)) ? origin : null;
+  if (/^(0|[1-9]\d{0,2})(\.(0|[1-9]\d{0,2})){3}$/.test(host)) return host.split('.').every((o) => Number(o) <= 255) ? origin : null;
+  if (host.endsWith('.')) host = host.slice(0, -1);
+  const labels = host.split('.');
+  if (host.length > 253 || labels.length < 2 || !labels.every((l) => /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(l) && !l.startsWith('xn--'))) return null;
+  if (/^(0x[0-9a-f]*|[0-9]+)$/.test(labels.at(-1))) return null; // read as a number by the system resolver
+  return `https://${host}${port === null || port === 443 ? '' : `:${port}`}`;
+}
 // Parse + validate a complete candidate. Error messages never quote the file (it holds the secret).
 export function parseConfig(text) {
   let c;
@@ -96,8 +116,10 @@ export function parseConfig(text) {
       publicUrl = u.origin;
     } catch { throw new Error('config.json: publicUrl invalid (want an https origin such as https://box.example.com)'); }
   }
+  // publicOrigin: publicUrl in the exact form the app accepts, or null (then no pairing link is made; see strictOrigin)
+  const publicOrigin = publicUrl === undefined ? null : strictOrigin(c.publicUrl);
   return {
-    secret: Buffer.from(s, 'base64'), port: c.port, projects, publicUrl,
+    secret: Buffer.from(s, 'base64'), port: c.port, projects, publicUrl, publicOrigin,
     projectNames: Object.keys(projects).filter((k) => typeof projects[k] === 'string' && path.isAbsolute(projects[k])),
   };
 }
@@ -253,7 +275,7 @@ export function trimAnsiScreen(s) {
 // GET /pair: a tiny page with one button that opens the app link. Nothing from the request reaches it (no code, no query).
 const escHtml = (t) => t.replace(/[&<>"']/g, (ch) => `&#${ch.charCodeAt(0)};`);
 export function pairPage(appLink) {
-  const body = !appLink ? '<p>Máy chủ chưa đặt địa chỉ công khai, nên chưa mở được app từ link này.</p>'
+  const body = !appLink ? '<p>Máy chủ chưa đặt địa chỉ công khai hợp lệ, nên chưa mở được app từ link này.</p>'
     : `<a class="btn" href="${escHtml(appLink)}">Mở FCode</a><p>Sau khi app mở, gõ mã 6 số đang hiện trên iPhone cũ hoặc trên máy tính.</p><p class="s">Chưa cài FCode? Cài file fcode.ipa trước.</p>`;
   return `<!doctype html><html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Ghép FCode</title><style>body{margin:0;font:17px/1.5 -apple-system,system-ui,sans-serif;background:#111;color:#eee;text-align:center}main{padding:48px 24px}.btn{display:block;max-width:320px;margin:24px auto;padding:16px;border-radius:14px;background:#0a84ff;color:#fff;font-size:20px;font-weight:600;text-decoration:none}.s{color:#999;font-size:15px}</style></head><body><main><h1>Ghép iPhone với FCode</h1>${body}</main></body></html>`;
 }
@@ -388,10 +410,10 @@ export function createApp(opts = {}) {
     while (pendings.length > PAIR_PENDING) pendings.splice(pendings.findIndex((x) => x.issuer !== 'shell'), 1);
     return p;
   }
-  // {appLink, shareLink} from cfg.publicUrl only; null when it is not configured. Never a code, a name or anything from a request:
+  // {appLink, shareLink} from cfg.publicOrigin (publicUrl as the app accepts it) only; null when it is not configured or not usable. Never a code, a name or anything from a request:
   // a link can be intercepted (the fcode scheme is not exclusive), so the user types the code.
   function pairLinks() {
-    const o = cfg.publicUrl;
+    const o = cfg.publicOrigin;
     return o ? { appLink: `fcode://pair?server=${encodeURIComponent(o)}`, shareLink: `${o}/pair` } : null;
   }
   function admin(req) { // an exception must never leave the socket callback: it would take the server down
@@ -400,6 +422,7 @@ export function createApp(opts = {}) {
   function adminCmd(req) {
     refreshConfig(true); // a rotation or a pending purge is handled before any answer
     if (req?.cmd === 'pair') {
+      if (req.links && cfg.publicUrl && !cfg.publicOrigin) return { ok: false, error: 'public_url_invalid' }; // no code is made for a QR that cannot work
       const p = newPairing(req.name, 'shell');
       return { ok: true, code: p.code, expiresAt: p.expiresAt, expiresIn: PAIR_TTL / 1000, ...(req.links && { links: pairLinks() }) };
     }
@@ -805,6 +828,7 @@ export function createApp(opts = {}) {
       const b = body.length ? parseJson(req, body) : {};
       if (b.name !== undefined && typeof b.name !== 'string') throw new HttpErr(400, 'invalid');
       if (!cfg.publicUrl) throw new HttpErr(409, 'no_public_url'); // no code is made when no link can be built
+      if (!cfg.publicOrigin) { log('pair-code refused: publicUrl is not a server address the app accepts'); throw new HttpErr(500, 'public_url_invalid'); }
       const p = newPairing(b.name, ctx.device);
       return json(res, 200, { code: p.code, expiresAt: new Date(p.expiresAt).toISOString(), ...pairLinks() });
     }
@@ -963,7 +987,10 @@ async function main() {
   if (req) { // admin CLI: talks to the RUNNING server over admin.sock
     let r;
     try { r = await adminRequest(dir, req); } catch (e) { console.error(e.code === 'ENOSERVER' ? `${e.message} (no ${adminPath(dir)})` : `admin socket: ${e.message}`); process.exit(1); }
-    if (!r.ok) { console.error(`error: ${r.error}`); process.exit(1); }
+    if (!r.ok) {
+      console.error(r.error === 'public_url_invalid' ? 'publicUrl trong config.json không hợp lệ cho app (cần https://tên-miền-ASCII)' : `error: ${r.error}`);
+      process.exit(1);
+    }
     if (req.cmd === 'pair') {
       if (qr) printQr(r);
       else console.log(`Mã ghép: ${r.code} (hết hạn sau ${r.expiresIn} giây)\nNhập mã này vào app. Chạy lại lệnh sẽ thay mã cũ của lệnh này.`);
