@@ -7,14 +7,18 @@ final class AppState: ObservableObject {
     @Published private(set) var serverURL: String
     @Published private(set) var token: String?
     @Published var notice: String?
-    /// A `fcode://pair` link waiting for the user's tap on "Ghép" (QR from another device).
+    /// A `fcode://pair` link (server only) waiting for the typed code and the tap on "Ghép".
     @Published var pairLink: PairLink?
+    /// One-off message shown as an alert over whatever screen is up (link and re-pair results).
+    @Published var popup: String?
 
     private static let serverKey = "serverURL"
     private static let tokenAccount = "deviceToken"
 
     init() {
-        serverURL = UserDefaults.standard.string(forKey: AppState.serverKey) ?? ""
+        // Stored as an origin only (older builds could keep a path or query).
+        let stored = UserDefaults.standard.string(forKey: AppState.serverKey) ?? ""
+        serverURL = PairLink.origin(stored)?.absoluteString ?? stored
         AppState.removeLegacyCredentials(server: serverURL)
         token = serverURL.isEmpty ? nil : Keychain.get(AppState.tokenAccount)
     }
@@ -38,42 +42,54 @@ final class AppState: ObservableObject {
         return API(base: url, token: token)
     }
 
-    nonisolated static func normalize(_ input: String) -> URL? {
-        var s = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !s.contains("://") { s = "https://" + s }
-        while s.hasSuffix("/") { s.removeLast() }
-        guard let url = URL(string: s), url.scheme?.lowercased() == "https", url.host != nil else { return nil }
-        return url
-    }
+    /// The https origin (`https://host[:port]`) of what the user typed; nil if not https.
+    nonisolated static func normalize(_ input: String) -> URL? { PairLink.origin(input) }
 
-    /// `fcode://pair?server=<https origin>&code=<6 digits>&name=<optional>` (QR / share link).
-    /// Only fills the pairing screen: pairing itself always waits for the user's tap.
+    /// `fcode://pair?server=<https origin>` (QR / share link). Only fills the server on the
+    /// pairing screen; the user types the code and taps "Ghép".
     func open(_ url: URL) {
         guard url.scheme?.lowercased() == "fcode", url.host?.lowercased() == "pair" else { return }
-        if let link = PairLink(url) {
+        guard let link = PairLink(url) else {
+            popup = "Link ghép không hợp lệ. Quét lại mã QR trên iPhone cũ."
+            return
+        }
+        if token != nil && link.server == serverURL {
+            popup = "iPhone này đã ghép với máy chủ \(PairLink.label(link.server)) rồi."
+        } else {
             pairLink = link
-        } else if token == nil {
-            notice = "Link ghép không hợp lệ. Quét lại mã QR mới."
         }
     }
 
-    /// POST /api/pair {code, name}; the token from the body goes to the Keychain.
-    /// A token this phone held before (re-pair from a link) is logged out on its box afterwards.
-    func pair(server: String, code: String, name: String? = nil) async throws {
+    /// POST /api/pair {code, name}; the token from the body goes to the Keychain. On a move to
+    /// another box the old box's drafts and read marks go. A token held before is then logged
+    /// out on ITS box (never sent to the new one); a failure is reported, naming that box.
+    func pair(server: String, code: String) async throws {
         guard let base = AppState.normalize(server) else { throw APIError(status: 0, code: "bad_url") }
         let previous = api
         let data = try await API(base: base, token: "")
-            .call("POST", "api/pair", body: ["code": code, "name": name ?? UIDevice.current.name])
+            .call("POST", "api/pair", body: ["code": code, "name": UIDevice.current.name])
         let reply = try JSONDecoder().decode(PairResponse.self, from: data)
         guard let newToken = reply.token, !newToken.isEmpty else { throw APIError(status: 0, code: "bad_response") }
         guard Keychain.set(newToken, for: AppState.tokenAccount) else { throw APIError(status: 0, code: "keychain") }
+        if !serverURL.isEmpty && serverURL != base.absoluteString {
+            AppState.removeDrafts()
+            UserDefaults.standard.removeObject(forKey: "inbox.seen")
+        }
         serverURL = base.absoluteString
         UserDefaults.standard.set(serverURL, forKey: AppState.serverKey)
         notice = nil
         pairLink = nil
         token = newToken
-        if let previous = previous, previous.token != newToken {
-            Task { try? await previous.call("POST", "api/logout") }
+        guard let previous = previous else { return }
+        do {
+            try await previous.call("POST", "api/logout")
+        } catch let e as APIError where e.status == 401 {
+            // Already gone on the old box.
+        } catch {
+            // A fast failure could land while the pairing sheet is still closing; an alert
+            // presented during that animation is dropped, so wait it out first.
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            popup = "Chưa gỡ được iPhone này khỏi máy chủ cũ \(PairLink.label(previous.base.absoluteString)); vào máy chủ cũ để gỡ."
         }
     }
 
@@ -148,27 +164,5 @@ final class AppState: ObservableObject {
             return unpairedNotice
         }
         return vietnameseMessage(error)
-    }
-}
-
-/// A validated pairing link: an https server origin and exactly six ASCII digits.
-struct PairLink: Equatable {
-    let server: String
-    let code: String
-    let name: String?
-
-    init?(_ url: URL) {
-        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
-        func value(_ key: String) -> String? {
-            items.first { $0.name == key }?.value?.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        guard let raw = value("server"), raw.lowercased().hasPrefix("https://"),
-              let base = AppState.normalize(raw), base.user == nil, base.password == nil,
-              let code = value("code"), code.utf8.count == 6, code.utf8.allSatisfy({ (48...57).contains($0) })
-        else { return nil }
-        server = base.absoluteString
-        self.code = code
-        let label = String((value("name") ?? "").prefix(64))
-        name = label.isEmpty ? nil : label
     }
 }

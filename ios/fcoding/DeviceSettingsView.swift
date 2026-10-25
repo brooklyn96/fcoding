@@ -76,11 +76,14 @@ struct DeviceSettingsView: View {
     }
 }
 
-/// "Thêm thiết bị (mã QR)": POST /api/pair-code, then a QR of the app link for the new
-/// iPhone's Camera, the 6-digit code, a live countdown and a share link.
+/// "Thêm thiết bị (mã QR)": on the tap of "Tạo mã", POST /api/pair-code. The QR holds only
+/// the server (contract DECISION r2); the 6-digit code is shown in big digits for the user to
+/// type on the new iPhone. Live countdown on this phone's clock; a share link with the server.
 struct AddDeviceView: View {
     @EnvironmentObject private var app: AppState
     @State private var reply: PairCodeResponse?
+    /// Expiry on this phone's clock (see API.pairCode).
+    @State private var expires = Date()
     @State private var qr: UIImage?
     @State private var minutes = 0
     @State private var loading = false
@@ -92,70 +95,86 @@ struct AddDeviceView: View {
     var body: some View {
         Form {
             if let reply = reply {
-                let left = Int(reply.expiresAt.timeIntervalSince(now).rounded(.up))
+                let left = Int(expires.timeIntervalSince(now).rounded(.up))
                 Section {
-                    VStack(spacing: 16) {
-                        if let qr = qr {
-                            Image(uiImage: qr)
-                                .interpolation(.none)
-                                .resizable()
-                                .scaledToFit()
-                                .frame(maxWidth: 240, maxHeight: 240)
-                                .padding(24)
-                                .background(Color.white)
-                                .clipShape(RoundedRectangle(cornerRadius: 12))
-                                .opacity(left > 0 ? 1 : 0.15)
-                                .accessibilityLabel("Mã QR để ghép iPhone mới")
-                        }
-                        Text(spaced(reply.code))
-                            .font(.system(size: 40, weight: .bold, design: .monospaced))
-                            .foregroundColor(left > 0 ? .primary : .secondary)
-                            .accessibilityLabel("Mã ghép " + reply.code.map(String.init).joined(separator: " "))
-                        Text(left > 0 ? "còn \(left / 60):" + String(format: "%02d", left % 60) : "Mã đã hết hạn")
-                            .font(.headline.monospacedDigit())
-                            .foregroundColor(left > 0 ? .secondary : .orange)
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 20) { qrView(left); codeView(reply.code, left) }
+                        VStack(spacing: 16) { qrView(left); codeView(reply.code, left) }
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 12)
                 } footer: {
-                    Text("Quét mã bằng Camera của iPhone mới, rồi bấm Ghép trong app FCode. Mã dùng 1 lần, hết hạn sau \(minutes) phút.")
+                    Text("Mở Camera trên iPhone mới, quét mã QR, rồi nhập mã này. Mã dùng 1 lần, hết hạn sau \(minutes) phút.")
                 }
                 Section {
                     if left > 0 {
                         if let link = URL(string: reply.shareLink) {
-                            ShareLink(item: link, message: Text("Mở link này trên iPhone mới để ghép với FCode.")) {
+                            ShareLink(item: link, message: Text("Mở link này trên iPhone mới để mở FCode với địa chỉ máy chủ.")) {
                                 Label("Gửi link", systemImage: "square.and.arrow.up")
                             }
                         }
                     } else {
-                        newCodeButton
+                        makeButton
                     }
+                } footer: {
+                    if left > 0 { Text("Link chỉ có địa chỉ máy chủ, không có mã.") }
                 }
-            } else if loading {
+            } else {
                 Section {
-                    HStack(spacing: 10) {
-                        ProgressView()
-                        Text("Đang tạo mã…").foregroundColor(.secondary)
-                    }
+                    makeButton
+                } footer: {
+                    Text("Tạo mã 6 số và mã QR để ghép một iPhone mới với box này. Mã dùng 1 lần.")
                 }
             }
             if let errorText = errorText {
-                Section {
-                    Label(errorText, systemImage: "xmark.octagon").foregroundColor(.red)
-                    if reply == nil { newCodeButton }
-                }
+                Section { Label(errorText, systemImage: "xmark.octagon").foregroundColor(.red) }
             }
         }
         .navigationTitle("Thêm thiết bị")
         .navigationBarTitleDisplayMode(.inline)
         .onReceive(tick) { now = $0 }
-        .task { if reply == nil && !loading { await load() } }
     }
 
-    private var newCodeButton: some View {
+    private func qrView(_ left: Int) -> some View {
+        Group {
+            if let qr = qr {
+                Image(uiImage: qr)
+                    .interpolation(.none)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 220, height: 220)
+                    .padding(22)
+                    .background(Color.white)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .opacity(left > 0 ? 1 : 0.15)
+                    .accessibilityLabel(left > 0 ? "Mã QR địa chỉ máy chủ, để quét bằng iPhone mới"
+                                                 : "Mã QR đã hết hạn")
+            }
+        }
+    }
+
+    private func codeView(_ code: String, _ left: Int) -> some View {
+        VStack(spacing: 8) {
+            Text(spaced(code))
+                .font(.system(size: 40, weight: .bold, design: .monospaced))
+                .foregroundColor(left > 0 ? .primary : .secondary)
+                .accessibilityLabel((left > 0 ? "Mã ghép " : "Mã đã hết hạn ") + code.map(String.init).joined(separator: " "))
+            Text(left > 0 ? "còn \(left / 60):" + String(format: "%02d", left % 60) : "Mã đã hết hạn")
+                .font(.headline.monospacedDigit())
+                .foregroundColor(left > 0 ? .secondary : .orange)
+                .accessibilityAddTraits(.updatesFrequently)
+            if left > 0 {
+                Label("Chỉ đọc mã này cho chính bạn", systemImage: "lock")
+                    .font(.footnote)
+                    .foregroundColor(.orange)
+            }
+        }
+    }
+
+    private var makeButton: some View {
         Button { Task { await load() } } label: {
             HStack {
-                Text(reply == nil ? "Thử lại" : "Tạo mã mới")
+                Label(reply == nil ? "Tạo mã" : "Tạo mã mới", systemImage: "qrcode")
                 Spacer()
                 if loading { ProgressView() }
             }
@@ -169,10 +188,11 @@ struct AddDeviceView: View {
         errorText = nil
         do {
             let r = try await api.pairCode()
-            qr = AddDeviceView.qrImage(r.appLink)
-            minutes = max(1, Int((r.expiresAt.timeIntervalSinceNow / 60).rounded()))
+            qr = AddDeviceView.qrImage(r.reply.appLink)
+            minutes = max(1, Int((r.expires.timeIntervalSinceNow / 60).rounded()))
+            expires = r.expires
             now = Date()
-            reply = r
+            reply = r.reply
         } catch let e as APIError where [404, 405, 501].contains(e.status) {
             errorText = "Máy chủ chưa hỗ trợ, cập nhật máy chủ trước."
         } catch let e as APIError where e.status == 409 && e.code == "no_public_url" {

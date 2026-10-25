@@ -1,8 +1,9 @@
 import SwiftUI
 
 /// "Ghép máy": server address + the 6-digit code that `fcode-pair` prints on the box.
-/// A `fcode://pair` link (QR) pre-fills both and asks "Ghép với máy chủ <host>?"; pairing
-/// still waits for the tap. While paired, it first asks whether to re-pair at all.
+/// A `fcode://pair` link (QR) fills only the server and asks "Ghép với máy chủ <host>?"; the
+/// user types the code shown on the old device and taps "Ghép". While paired (shown as a
+/// sheet), it first asks whether to re-pair at all.
 struct PairView: View {
     @EnvironmentObject private var app: AppState
     @State private var server = ""
@@ -15,8 +16,11 @@ struct PairView: View {
     private enum Field { case server, code }
 
     private var canPair: Bool { !busy && code.count == 6 && AppState.normalize(server) != nil }
-    /// Host of the address in the field, for the link confirmation.
-    private var linkHost: String? { app.pairLink == nil ? nil : AppState.normalize(server)?.host }
+    /// host[:port] of the address in the field, for the link confirmation.
+    private var linkHost: String? {
+        guard app.pairLink != nil, let url = AppState.normalize(server) else { return nil }
+        return PairLink.label(url.absoluteString)
+    }
 
     var body: some View {
         Form {
@@ -55,7 +59,11 @@ struct PairView: View {
             } header: {
                 Text("Mã ghép")
             } footer: {
-                Text("Trên box gõ: ") + Text("fcode-pair").font(.footnote.monospaced()) + Text(" — mã có hạn 2 phút")
+                if app.pairLink != nil {
+                    Text("Nhập mã 6 số đang hiện trên iPhone cũ (hoặc trên máy tính). Hết hạn thì tạo mã mới trên iPhone cũ.")
+                } else {
+                    Text("Trên box gõ: ") + Text("fcode-pair").font(.footnote.monospaced()) + Text(" — mã có hạn 2 phút")
+                }
             }
             .disabled(busy)
             if let errorText = errorText {
@@ -91,25 +99,30 @@ struct PairView: View {
         .alert("Thiết bị này đã ghép. Ghép lại với máy chủ mới?", isPresented: $askRepair) {
             Button("Ghép lại") {}
             Button("Huỷ", role: .cancel) { app.pairLink = nil }
+        } message: {
+            Text("Đang ghép với \(PairLink.label(app.serverURL)). Máy chủ mới: \(PairLink.label(app.pairLink?.server ?? "")).")
         }
+        .interactiveDismissDisabled(busy)
         .onAppear {
             if app.pairLink != nil { applyLink(); return }
             if server.isEmpty { server = app.serverURL }
             focus = server.isEmpty ? .server : .code
         }
         .onChange(of: app.pairLink) { _ in applyLink() }
+        // After "Ghép lại", straight to the code with the number pad.
+        .onChange(of: askRepair) { asking in if !asking && app.pairLink != nil { focus = .code } }
     }
 
     private var pairTitle: String { app.pairLink == nil ? "Ghép iPhone này" : "Ghép" }
 
-    /// Fills the fields from the pending link; never pairs by itself.
+    /// Fills the server from the pending link and asks for the code; never pairs by itself.
     private func applyLink() {
         guard let link = app.pairLink, !busy else { return }
         server = link.server
-        code = link.code
+        code = ""
         errorText = nil
-        focus = nil
         askRepair = app.token != nil
+        focus = askRepair ? nil : .code
     }
 
     /// Six boxes (3 + 3) drawn over a hidden numeric TextField that holds the real input,
@@ -163,10 +176,11 @@ struct PairView: View {
         focus = nil
         Task {
             do {
-                try await app.pair(server: server, code: code, name: app.pairLink?.name)
+                try await app.pair(server: server, code: code)
             } catch {
                 errorText = vietnameseMessage(error, pairing: true)
                 if let e = error as? APIError, e.status == 401 {
+                    if app.pairLink != nil { errorText = "Mã sai hoặc đã hết hạn. Tạo mã mới trên iPhone cũ rồi nhập lại." }
                     code = ""
                     focus = .code
                 }

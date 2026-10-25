@@ -27,20 +27,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The app has no test target: build Links.swift for macOS with a tiny main and run its selfTest.
-      - name: Links self-test
+      # The app has no test target: build Links.swift + PairLink.swift for macOS with a tiny main and run its selfTest.
+      - name: Links + PairLink self-test
         run: |
           T=$(mktemp -d)
-          cp ios/fcoding/Links.swift "$T/"
+          cp ios/fcoding/Links.swift ios/fcoding/PairLink.swift "$T/"
           cat > "$T/main.swift" <<'EOF'
           import Foundation
-          let failures = Links.selfTest()
+          let failures = Links.selfTest() + PairLink.selfTest().map { "PairLink " + $0 }
           for f in failures { print("FAIL \(f)") }
-          print(failures.isEmpty ? "Links self-test: all passed" : "Links self-test: \(failures.count) failed")
+          print(failures.isEmpty ? "Self-test: all passed" : "Self-test: \(failures.count) failed")
           exit(failures.isEmpty ? 0 : 1)
           EOF
           cd "$T"
-          xcrun -sdk macosx swiftc -o linktest Links.swift main.swift
+          xcrun -sdk macosx swiftc -o linktest Links.swift PairLink.swift main.swift
           ./linktest
 
       - name: Install XcodeGen

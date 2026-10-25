@@ -71,9 +71,19 @@ struct PairCodeResponse: Decodable {
 }
 
 extension API {
-    func pairCode() async throws -> PairCodeResponse {
-        let data = try await call("POST", "api/pair-code", body: [:])
-        return try JSONDecoder().decode(PairCodeResponse.self, from: data)
+    /// Returns the reply and its expiry on THIS phone's clock: receipt time + (expiresAt − the
+    /// response's Date header), so a phone clock that is off does not skew the countdown.
+    func pairCode() async throws -> (reply: PairCodeResponse, expires: Date) {
+        let req = try request("POST", "api/pair-code", body: [:])
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        try API.check(resp, data, token: token)
+        let reply = try JSONDecoder().decode(PairCodeResponse.self, from: data)
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        guard let header = (resp as? HTTPURLResponse)?.value(forHTTPHeaderField: "Date"),
+              let serverNow = fmt.date(from: header) else { return (reply, reply.expiresAt) }
+        return (reply, Date().addingTimeInterval(reply.expiresAt.timeIntervalSince(serverNow)))
     }
 
     func overview() async throws -> Overview { try await get("api/overview", as: Overview.self) }
@@ -106,9 +116,16 @@ struct API {
 
     func request(_ method: String, _ path: String, query: [URLQueryItem] = [],
                  body: [String: Any]? = nil, timeout: TimeInterval = 20) throws -> URLRequest {
-        var comps = URLComponents(url: base.appendingPathComponent(path), resolvingAgainstBaseURL: false)
-        if !query.isEmpty { comps?.queryItems = query }
-        guard let url = comps?.url else { throw APIError(status: 0, code: "bad_url") }
+        // Origin + explicit path + explicit query: nothing of `base` beyond scheme://host[:port].
+        var origin = URLComponents()
+        origin.scheme = base.scheme
+        origin.host = base.host
+        origin.port = base.port
+        guard let root = origin.url,
+              var comps = URLComponents(url: root.appendingPathComponent(path), resolvingAgainstBaseURL: false)
+        else { throw APIError(status: 0, code: "bad_url") }
+        comps.queryItems = query.isEmpty ? nil : query
+        guard let url = comps.url else { throw APIError(status: 0, code: "bad_url") }
         var req = URLRequest(url: url, timeoutInterval: timeout)
         req.httpMethod = method
         req.setValue("1", forHTTPHeaderField: "X-PC")
