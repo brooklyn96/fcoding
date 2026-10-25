@@ -17,8 +17,10 @@ struct SessionView: View {
     /// Floating keyboard button: which edge, and how far down that edge (0 = top, 1 = bottom).
     @AppStorage("kbButtonLeft") private var kbLeft = false
     @AppStorage("kbButtonY") private var kbY: Double = 1
-    /// Live drag translation, nil when not dragging (or still under the 10 pt threshold).
-    @State private var kbDrag: CGSize?
+    /// Live drag translation, nil when not dragging (or still under the 10 pt threshold). A
+    /// GestureState resets by itself when the gesture is cancelled (a call, the app backgrounded).
+    @GestureState(resetTransaction: Transaction(animation: .spring(response: 0.3, dampingFraction: 0.8)))
+    private var kbDrag: CGSize?
     /// Bumped on every send: the terminal jumps to the bottom and follows again.
     @State private var bottomRequest = 0
     @State private var stoppedInBackground = false
@@ -71,6 +73,7 @@ struct SessionView: View {
                     onKey: { key in model.key(key) },
                     focused: $composerFocused,
                     pinned: $composerPinned,
+                    isOmp: chipHarness == "omp",
                     onHide: hideComposer,
                     onSent: { if !composerPinned { hideComposer() } }
                 )
@@ -140,12 +143,12 @@ struct SessionView: View {
 
     /// Centre of the keyboard button in the terminal area (below the top bar, above the home
     /// indicator, inside the side safe areas): 14 pt from the edge, 8 pt from top and bottom.
-    private func kbCenter(in size: CGSize) -> CGPoint {
+    private func kbCenter(in size: CGSize, drag: CGSize? = nil) -> CGPoint {
         let r: CGFloat = 22
         let minY = 8 + r, maxY = max(minY, size.height - 8 - r)
         var p = CGPoint(x: kbLeft ? 14 + r : size.width - 14 - r,
                         y: minY + CGFloat(min(1, max(0, kbY))) * (maxY - minY))
-        if let d = kbDrag {
+        if let d = drag {
             p.x = min(size.width - r, max(r, p.x + d.width))
             p.y = min(maxY, max(minY, p.y + d.height))
         }
@@ -167,19 +170,20 @@ struct SessionView: View {
             .gesture(
                 // Global space: the button moves under the finger, so local translation would jitter.
                 DragGesture(minimumDistance: 0, coordinateSpace: .global)
-                    .onChanged { v in
-                        if kbDrag != nil || hypot(v.translation.width, v.translation.height) >= 10 {
-                            kbDrag = v.translation
+                    .updating($kbDrag) { v, state, _ in
+                        if state != nil || hypot(v.translation.width, v.translation.height) >= 10 {
+                            state = v.translation
                         }
                     }
-                    .onEnded { _ in
-                        guard kbDrag != nil else { showComposer(); return }
-                        let p = kbCenter(in: size)
+                    .onEnded { v in
+                        // Edge and height are committed only here; under 10 pt it was a tap.
+                        guard hypot(v.translation.width, v.translation.height) >= 10 else { showComposer(); return }
+                        let p = kbCenter(in: size, drag: v.translation)
                         let minY: CGFloat = 30, maxY = max(minY, size.height - 30)
-                        withAnimation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.8)) {
+                        // Same spring as the GestureState reset, so the button glides to the edge.
+                        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
                             kbLeft = p.x < size.width / 2
                             kbY = maxY > minY ? Double((p.y - minY) / (maxY - minY)) : 1
-                            kbDrag = nil
                         }
                     }
             )
@@ -188,7 +192,7 @@ struct SessionView: View {
             .accessibilityHint("Kéo để dời nút sang chỗ khác")
             .accessibilityAddTraits(.isButton)
             .accessibilityAction { showComposer() }
-            .position(kbCenter(in: size))
+            .position(kbCenter(in: size, drag: kbDrag))
             .transition(.opacity)
     }
 
@@ -323,11 +327,19 @@ struct TerminalView: View {
             .onPreferenceChange(ContentFrameKey.self) { [scroll, viewportHeight, proxy] frame in
                 let moved = frame.minY != scroll.minY
                 let grew = frame.height != scroll.contentHeight
+                let oldMinY = scroll.minY
+                let shrank = frame.height < scroll.contentHeight
                 scroll.minY = frame.minY
                 scroll.contentHeight = frame.height
                 if moved, Date() >= scroll.programmaticUntil {
-                    let nearBottom = frame.maxY <= viewportHeight + 24
-                    if scroll.atBottom != nearBottom { scroll.atBottom = nearBottom }
+                    // Content moving down = the user scrolling up: off at once, so a streaming jump
+                    // never fights the finger. Not when the content shrank (the clamp moves it) or
+                    // while the bottom is still inside the viewport (the bounce settling back).
+                    if frame.minY > oldMinY, !shrank, frame.maxY > viewportHeight + 0.5 {
+                        if scroll.atBottom { scroll.atBottom = false }
+                    } else if frame.maxY <= viewportHeight + 24, !scroll.atBottom {
+                        scroll.atBottom = true // landed back at the bottom
+                    }
                 }
                 // Decided by the state from before this update; scrolled up = never moved.
                 if grew, scroll.atBottom { TerminalView.jump(scroll, proxy) }
@@ -365,12 +377,14 @@ private struct QuickKey {
     let key: String
     let label: String
     var symbol: String? = nil
+    /// Only for omp: in bash C-o runs the line, in claude it toggles the transcript.
+    var ompOnly = false
 }
 
 private let quickKeys: [QuickKey] = [
     QuickKey(title: "Esc", key: "Escape", label: "Phím Escape"),
     // omp agent hub (Alt+A): ↑/↓ chọn, Enter mở, Esc đóng.
-    QuickKey(title: "Agents", key: "M-a", label: "Mở danh sách agent của omp", symbol: "person.2"),
+    QuickKey(title: "Agents", key: "M-a", label: "Mở danh sách agent của omp", symbol: "person.2", ompOnly: true),
     QuickKey(title: "Ctrl+C", key: "C-c", label: "Control C, dừng"),
     QuickKey(title: "↑", key: "Up", label: "Mũi tên lên"),
     QuickKey(title: "↓", key: "Down", label: "Mũi tên xuống"),
@@ -381,10 +395,12 @@ private let quickKeys: [QuickKey] = [
     QuickKey(title: "Enter", key: "Enter", label: "Phím Enter"),
     QuickKey(title: "y", key: "y", label: "Chữ y, đồng ý"),
     QuickKey(title: "n", key: "n", label: "Chữ n, từ chối"),
-    QuickKey(title: "^O", key: "C-o", label: "Control O, mở rộng"),
+    QuickKey(title: "^O", key: "C-o", label: "Control O, mở rộng", ompOnly: true),
 ]
 
-private let slashCommands = ["/model", "/clear", "/compact", "/help", "/resume", "/hub", "/exit"]
+private let slashCommands = ["/model", "/clear", "/compact", "/help", "/resume", "/exit"]
+/// omp's agent hub; only offered in omp sessions.
+private let ompSlashCommands = ["/hub"]
 
 /// The draft lives only here and is only written by the keyboard, except: restored from
 /// UserDefaults when the view appears (if empty), cleared after a successful send (if unchanged)
@@ -396,6 +412,8 @@ struct ComposerView: View {
     let onSend: (String, Bool) -> Task<Bool, Never>
     let onKey: (String) -> Void
     var focused: FocusState<Bool>.Binding
+    /// omp session: show the agent-hub keys (Agents, ^O) and /hub.
+    var isOmp = false
     @Binding var pinned: Bool
     let onHide: () -> Void
     /// After a successful send that emptied the draft.
@@ -408,6 +426,9 @@ struct ComposerView: View {
     /// The text just sent and cleared. If the old field writes it back (an IME commit on resign),
     /// onChange drops it instead of storing it again. Reset by the next real edit.
     @State private var justSent: String?
+    /// The guard above holds only until then (the rebuild has settled); after it, typing the same
+    /// text again is a real edit.
+    @State private var justSentUntil = Date.distantPast
     @State private var showKeys = false
 
     /// Landscape on iPhone: no grab handle, a 1–2 line field, key row behind a toggle.
@@ -464,7 +485,7 @@ struct ComposerView: View {
         .onChange(of: draft) { value in
             if let sent = justSent, !value.isEmpty {
                 justSent = nil
-                if value == sent { draft = ""; return }
+                if value == sent, Date() < justSentUntil { draft = ""; return }
             }
             if value.isEmpty {
                 UserDefaults.standard.removeObject(forKey: draftKey)
@@ -559,14 +580,14 @@ struct ComposerView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
                 Menu {
-                    ForEach(slashCommands, id: \.self) { cmd in
+                    ForEach(isOmp ? slashCommands + ompSlashCommands : slashCommands, id: \.self) { cmd in
                         Button(cmd) { draft = draft.isEmpty ? cmd : draft + cmd }
                     }
                 } label: {
                     keyLabel("/")
                 }
                 .accessibilityLabel("Lệnh gạch chéo")
-                ForEach(quickKeys, id: \.key) { k in
+                ForEach(quickKeys.filter { isOmp || !$0.ompOnly }, id: \.key) { k in
                     Button { onKey(k.key) } label: { keyLabel(k.title, symbol: k.symbol) }
                         .accessibilityLabel(k.label)
                 }
@@ -601,16 +622,24 @@ struct ComposerView: View {
         let job = onSend(snapshot, enter) // queued now, in tap order with the quick keys
         Task {
             let ok = await job.value
-            guard ok, draft == snapshot else { sending = false; return } // failed, or edited meanwhile
+            guard ok else { sending = false; return }
+            let unchanged = draft == snapshot
             let stayOpen = pinned
-            focused.wrappedValue = false
-            try? await Task.sleep(nanoseconds: 150_000_000)
-            if draft == snapshot {
-                justSent = snapshot.isEmpty ? nil : snapshot
-                draft = ""
-                UserDefaults.standard.removeObject(forKey: draftKey)
-                fieldID += 1
+            if unchanged {
+                focused.wrappedValue = false
+                try? await Task.sleep(nanoseconds: 150_000_000)
             }
+            // The stored copy is decided on its own (works even if the screen was left mid-send):
+            // remove it when it is still exactly what was sent.
+            if UserDefaults.standard.string(forKey: draftKey) == snapshot {
+                UserDefaults.standard.removeObject(forKey: draftKey)
+            }
+            // The field is cleared only if the user did not change it while sending.
+            guard unchanged, draft == snapshot else { sending = false; return }
+            justSent = snapshot.isEmpty ? nil : snapshot
+            justSentUntil = Date().addingTimeInterval(0.3)
+            draft = ""
+            fieldID += 1
             sending = false
             if !draft.isEmpty { return }
             if stayOpen {
