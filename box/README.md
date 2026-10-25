@@ -63,6 +63,6 @@ fcode-update --resume claude                  # cho phép cập nhật tiếp
 | claude | `DISABLE_AUTOUPDATER=1` trong `/etc/claude-code/managed-settings.json` (box instabox đã có sẵn); nếu thiếu, script thêm `env.DISABLE_AUTOUPDATER` vào `~/.claude/settings.json` |
 | omp | không cần: tự cập nhật chỉ khi gọi `omp update` |
 
-### Việc cần làm ở `install.sh` (do người khác phụ trách)
+### Cài cùng `install.sh`
 
-Thêm một dòng gọi `bash "$(dirname "$0")/box/install-autoupdate.sh"` sau khi cài `fcode-pair`.
+`install.sh` tự chạy `box/install-autoupdate.sh` sau khi cài `fcode-pair` (nếu có thư mục `box/` cạnh nó). Nếu bước này lỗi (ví dụ thiếu sudo không mật khẩu) thì chỉ cảnh báo, việc cài fcoding vẫn tiếp tục.

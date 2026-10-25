@@ -55,6 +55,11 @@ exec env PC_CONFIG_DIR="$CFG" "$(command -v node)" "$APP/server.mjs" --pair "\$n
 WRAP
 chmod 755 "$HOME/.local/bin/fcode-pair"
 
+# box auto-update (omp, claude, codex timer): idempotent, runs as this user; a failure (e.g. no passwordless sudo) must not abort the install
+if [ -f "$SRC/box/install-autoupdate.sh" ]; then
+  bash "$SRC/box/install-autoupdate.sh" || echo "warning: box auto-update was not installed (see box/README.md)" >&2
+fi
+
 # KillMode=process: the tmux server (and every harness session) is started by this service;
 # restarting or crashing the service must not take it down. StartLimitIntervalSec=0: always restart.
 # PATH for the harnesses is set by server.mjs itself (~/.local/bin, ~/.bun/bin, system dirs).
