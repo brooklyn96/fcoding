@@ -54,6 +54,7 @@ Sau khi ghép, iPhone nhớ box trong Keychain; mở ứng dụng là vào thẳ
   - Chữ trên màn hình có màu như trên laptop; các biểu tượng nhỏ (nhánh git, thư mục, …) hiện đúng nhờ font biểu tượng đi kèm ứng dụng.
   - Khi bạn đang ở cuối, màn hình tự cuộn theo dòng mới. Nếu bạn cuộn lên để đọc, màn hình đứng yên dù có chữ mới; bấm nút tròn **↓** (hoặc cuộn về cuối) để theo lại. Gửi tin nhắn cũng đưa về cuối.
   - Đường link (http/https) trên màn hình được gạch chân: chạm để mở bằng Safari. Link dài bị ngắt sang dòng dưới vẫn mở đúng cả link.
+  - Link bị cắt ngay trước một chữ thường (không có - / _ …) có thể chỉ mở được phần đầu.
   - **A-** / **A+**: chữ nhỏ hơn / to hơn.
   - Chấm màu: xanh lá = đang kết nối trực tiếp, vàng = đang cập nhật định kỳ, cam = đang kết nối, đỏ = mất kết nối.
   - Khung gõ mặc định được ẩn để màn hình rộng hơn. Bấm nút tròn **bàn phím** ở góc phải dưới: khung gõ hiện ra và bàn phím iPhone bật lên luôn.

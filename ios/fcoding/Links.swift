@@ -69,8 +69,11 @@ enum Links {
     /// Joins only when the URL ends `line` at exactly `cols` or `cols - 1` cells (a wider line was
     /// already joined by `capture-pane -J` and is never joined again), and the first word of `next`
     /// looks like the rest of a URL: it has one of `/ ? # = & % _ -`, or a "." with more after it,
-    /// or it is the only word on its line. Trailing `.,;:!?` and an unbalanced `)` or `]` are
-    /// dropped, as NSDataDetector does on the first line.
+    /// or it is the only word on its line and nothing was stripped from it. Trailing `.,;:!?` and an
+    /// unbalanced `)` or `]` are dropped, as NSDataDetector does on the first line.
+    /// Accepted ambiguities: a bare word alone on the next line (`…/pull/12` then `merged`) joins,
+    /// because omp's real wraps look the same; a plain word followed by prose (`…/box/p` then
+    /// `ending, hoặc …`) does not join, so only the first part of that link opens.
     static func continuation(of line: String, urlEnd: Int, url: String, next: String, cols: Int) -> (text: String, range: Range<Int>)? {
         guard cols > 0 else { return nil }
         let scalars = Array(line.unicodeScalars)
@@ -91,6 +94,7 @@ enum Links {
         let alone = !n[stop...].contains(where: { $0 != " " })
 
         var tok = Array(n[start..<stop])
+        let raw = tok.count
         func count(_ c: Unicode.Scalar) -> Int {
             url.unicodeScalars.filter { $0 == c }.count + tok.filter { $0 == c }.count
         }
@@ -106,7 +110,7 @@ enum Links {
         if token.lowercased().hasPrefix("http") { return nil } // a new URL, not the rest of this one
         let urlish = token.unicodeScalars.contains { "/?#=&%_-".unicodeScalars.contains($0) }
             || token.dropLast().contains(".")
-        guard urlish || alone else { return nil }
+        guard urlish || (alone && tok.count == raw) else { return nil }
         return (token, start..<(start + tok.count))
     }
 
@@ -173,8 +177,13 @@ enum Links {
         check("table", "│ https://example.com/a/b │\n│ more/x │", cols: 27, ["https://example.com/a/b"], pieces: [23])
         // Punctuation after a URL, on the first line and on a continuation.
         check("paren", "See (https://example.com/x).", cols: 80, ["https://example.com/x"])
-        check("paren cont", "(see https://github.com/b96/fcode/pull/new/box/p\nending).", cols: 48,
-              ["https://github.com/b96/fcode/pull/new/box/pending"], pieces: [43, 6])
+        check("paren cont", "(see https://github.com/b96/fcode/pull/new/box/p\nending-fixes).", cols: 48,
+              ["https://github.com/b96/fcode/pull/new/box/pending-fixes"], pieces: [43, 12])
+        // A bare word alone below joins only when nothing was stripped from it.
+        check("done.", "  https://github.com/brooklyn96/fcoding/pull/12\n  done.", cols: 47,
+              ["https://github.com/brooklyn96/fcoding/pull/12"], pieces: [45])
+        check("alone", "https://x.example/pull/new/box/p\nending-fixes", cols: 32,
+              ["https://x.example/pull/new/box/pending-fixes"], pieces: [32, 12])
         check("two", "a https://a.example/x and https://b.example/y", cols: 80,
               ["https://a.example/x", "https://b.example/y"])
         return failures

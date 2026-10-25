@@ -128,14 +128,16 @@ struct SessionView: View {
         .onDisappear { model.stop() }
         .onChange(of: scenePhase) { phase in
             // Background: close the stream and polling so the server frees its slot.
-            // Back to active: restart only if it was the background that stopped it.
+            // Back to active from the background: restart and pin to the bottom again. Not after
+            // .inactive alone (Control Center, app switcher peek, paste prompt, Face ID): a
+            // scrolled-up view never moves.
             if phase == .background {
                 model.stop()
                 stoppedInBackground = true
             }
-            if phase == .active { pinRequest += 1 }
             if phase == .active, stoppedInBackground {
                 stoppedInBackground = false
+                pinRequest += 1
                 model.restart()
             }
         }
@@ -324,8 +326,11 @@ final class ScrollState: ObservableObject {
     /// While pinned, every size change and every frame that is not at the bottom jumps again, so a
     /// jump that landed short (layout still settling) is corrected.
     var pinned = true
-    /// Layout settling after a pin: offset changes then are not the user's.
+    /// Layout settling after a pin: offset changes then are not the user's. Ends early once a jump
+    /// has landed, or on a move bigger than a jump's correction (a real drag).
     var settleUntil = Date.distantPast
+    /// How far the last pinned jump had to move the content (pt).
+    var correction: CGFloat = 0
 }
 
 /// Monospaced, selectable, coloured screen text.
@@ -401,6 +406,12 @@ struct TerminalView: View {
                 scroll.minY = frame.minY
                 scroll.contentHeight = frame.height
                 let nearBottom = frame.maxY <= viewportHeight + 24
+                if Date() < scroll.settleUntil, Date() >= scroll.programmaticUntil,
+                   nearBottom || (!shrank && frame.minY - oldMinY > max(scroll.correction, 24)) {
+                    // Landed at the bottom, or the content moved down further than a jump would
+                    // correct (the user dragging): settling is over, the normal unpin rule applies.
+                    scroll.settleUntil = .distantPast
+                }
                 if moved, Date() >= max(scroll.programmaticUntil, scroll.settleUntil) {
                     // Content moving down = the user scrolling up: off at once, so a streaming jump
                     // never fights the finger. Not when the content shrank (the clamp moves it) or
@@ -415,7 +426,10 @@ struct TerminalView: View {
                 }
                 if scroll.pinned {
                     // Any size change, or a landing short of the bottom: jump (again).
-                    if grew || !nearBottom { TerminalView.jump(scroll, proxy) }
+                    if grew || !nearBottom {
+                        scroll.correction = max(0, frame.maxY - viewportHeight)
+                        TerminalView.jump(scroll, proxy)
+                    }
                 } else if grew, scroll.atBottom {
                     // Decided by the state from before this update; scrolled up = never moved.
                     TerminalView.jump(scroll, proxy)
