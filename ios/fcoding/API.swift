@@ -117,10 +117,14 @@ struct API {
     func request(_ method: String, _ path: String, query: [URLQueryItem] = [],
                  body: [String: Any]? = nil, timeout: TimeInterval = 20) throws -> URLRequest {
         // Origin + explicit path + explicit query: nothing of `base` beyond scheme://host[:port].
-        var origin = URLComponents()
-        origin.scheme = base.scheme
-        origin.host = base.host
-        origin.port = base.port
+        // The authority is kept as parsed (IPv6 brackets, punycode); `URL.host` would drop them.
+        guard var origin = URLComponents(url: base, resolvingAgainstBaseURL: false)
+        else { throw APIError(status: 0, code: "bad_url") }
+        origin.user = nil
+        origin.password = nil
+        origin.path = ""
+        origin.query = nil
+        origin.fragment = nil
         guard let root = origin.url,
               var comps = URLComponents(url: root.appendingPathComponent(path), resolvingAgainstBaseURL: false)
         else { throw APIError(status: 0, code: "bad_url") }

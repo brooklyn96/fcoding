@@ -107,15 +107,13 @@ struct AddDeviceView: View {
                     .padding(.vertical, 12)
                 }
                 Section {
-                    if left > 0 {
-                        if let link = URL(string: reply.shareLink) {
-                            ShareLink(item: link, message: Text("Mở link này trên iPhone mới để mở FCode với địa chỉ máy chủ.")) {
-                                Label("Gửi link", systemImage: "square.and.arrow.up")
-                            }
+                    if left > 0, let link = URL(string: reply.shareLink) {
+                        ShareLink(item: link, message: Text("Mở link này trên iPhone mới để mở FCode với địa chỉ máy chủ.")) {
+                            Label("Gửi link", systemImage: "square.and.arrow.up")
                         }
-                    } else {
-                        makeButton
                     }
+                    // Always there: a new code replaces this phone's live one on the box.
+                    makeButton
                 }
             } else {
                 Section { makeButton }
@@ -164,6 +162,11 @@ struct AddDeviceView: View {
                 .font(.headline.monospacedDigit())
                 .foregroundColor(left > 0 ? .secondary : .orange)
                 .accessibilityAddTraits(.updatesFrequently)
+            if left > 0 {
+                Label("Không gửi mã cho người khác", systemImage: "lock")
+                    .font(.caption)
+                    .foregroundColor(.orange)
+            }
         }
     }
 

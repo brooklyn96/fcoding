@@ -19,10 +19,10 @@ struct PairView: View {
     private enum Field { case server, code }
 
     private var canPair: Bool { !busy && code.count == 6 && AppState.normalize(server) != nil }
-    /// host[:port] of the address in the field, for the link confirmation.
-    private var linkHost: String? {
+    /// Origin of the address in the field, for the link confirmation.
+    private var linkServer: String? {
         guard app.pairLink != nil, let url = AppState.normalize(server) else { return nil }
-        return PairLink.label(url.absoluteString)
+        return url.absoluteString
     }
 
     /// Paired and a link is waiting for the "Ghép lại?" answer: only that question is shown.
@@ -73,14 +73,22 @@ struct PairView: View {
         if let notice = app.notice {
             Section { Label(notice, systemImage: "exclamationmark.circle").foregroundColor(.orange) }
         }
-        if let host = linkHost {
+        if let linked = linkServer {
             Section {
+                // The host exactly as connected to (punycode, never decoded), with the safety
+                // line as part of the question itself.
                 Label {
-                    Text("Ghép với máy chủ ") + Text(host).bold() + Text("?")
+                    VStack(alignment: .leading, spacing: 4) {
+                        (Text("Ghép với máy chủ ") + Text(PairLink.host(linked)).bold() + Text("?"))
+                            .font(.headline)
+                        if let tag = PairLink.idnTag(linked) {
+                            Text(tag).font(.caption).foregroundColor(.orange)
+                        }
+                        Text("Chỉ ghép nếu đây là box của bạn.").font(.subheadline).foregroundColor(.secondary)
+                    }
                 } icon: {
                     Image(systemName: "qrcode")
                 }
-                .font(.headline)
             }
         }
         Section {
@@ -190,7 +198,7 @@ struct PairView: View {
             } catch {
                 errorText = vietnameseMessage(error, pairing: true)
                 if let e = error as? APIError, e.status == 401 {
-                    if app.pairLink != nil { errorText = "Mã sai hoặc đã hết hạn. Tạo mã mới trên iPhone cũ rồi nhập lại." }
+                    if app.pairLink != nil { errorText = "Mã sai hoặc đã hết hạn. Gõ lại mã đang hiện trên iPhone cũ; hết hạn thì bấm “Tạo mã mới” ở đó." }
                     code = ""
                     focus = .code
                 }
@@ -219,7 +227,8 @@ struct PairGuideView: View {
         ]),
         ("Mã ghép hết hạn", [
             "Mỗi mã chỉ dùng được 1 lần và hết hạn sau 2 phút. Đồng hồ trên iPhone cũ cho biết còn bao lâu.",
-            "Hết hạn hoặc gõ sai: bấm “Tạo mã mới” trên iPhone cũ (hoặc gõ lại fcode-pair), rồi nhập mã mới.",
+            "Gõ sai: gõ lại mã đang hiện trên iPhone cũ.",
+            "Hết hạn hoặc muốn đổi mã: bấm “Tạo mã mới” trên iPhone cũ (hoặc gõ lại fcode-pair). Mã cũ không dùng được nữa; nhập mã mới.",
         ]),
         ("An toàn", [
             "Ai có mã cũng vào được box của bạn. Chỉ đọc mã cho chính bạn; không gửi mã qua tin nhắn.",
