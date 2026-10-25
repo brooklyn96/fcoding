@@ -24,7 +24,7 @@ struct DeviceSettingsView: View {
                     HeaderTextButton(title: "Đóng", bold: true) { dismiss() }
                 }
                 Section("Máy chủ") {
-                    Text(app.serverURL).textSelection(.enabled)
+                    Text(PairLink.label(app.serverURL)).textSelection(.enabled)
                 }
                 Section {
                     NavigationLink { AddDeviceView() } label: {
@@ -95,6 +95,8 @@ struct AddDeviceView: View {
     @State private var expires = Date()
     @State private var qr: UIImage?
     @State private var showGuide = false
+    /// A code was made on this screen before, so the button says "Tạo mã mới".
+    @State private var made = false
     @State private var loading = false
     @State private var errorText: String?
     @State private var now = Date()
@@ -119,15 +121,13 @@ struct AddDeviceView: View {
                     .padding(.vertical, 12)
                 }
                 Section {
-                    if left > 0 {
-                        if let link = URL(string: reply.shareLink) {
-                            ShareLink(item: link, message: Text("Mở link này trên iPhone mới để mở FCode với địa chỉ máy chủ.")) {
-                                Label("Gửi link", systemImage: "square.and.arrow.up")
-                            }
+                    if left > 0, let link = URL(string: reply.shareLink) {
+                        ShareLink(item: link, message: Text("Mở link này trên iPhone mới để mở FCode với địa chỉ máy chủ.")) {
+                            Label("Gửi link", systemImage: "square.and.arrow.up")
                         }
-                    } else {
-                        makeButton
                     }
+                    // Always there: a new code replaces this phone's live one on the box.
+                    makeButton
                 }
             } else {
                 Section { makeButton }
@@ -171,13 +171,18 @@ struct AddDeviceView: View {
                 .font(.headline.monospacedDigit())
                 .foregroundColor(left > 0 ? .secondary : .orange)
                 .accessibilityAddTraits(.updatesFrequently)
+            if left > 0 {
+                Label("Không gửi mã cho người khác", systemImage: "lock")
+                    .font(.caption)
+                    .foregroundColor(.orange)
+            }
         }
     }
 
     private var makeButton: some View {
         Button { Task { await load() } } label: {
             HStack {
-                Label(reply == nil ? "Tạo mã" : "Tạo mã mới", systemImage: "qrcode")
+                Label(made ? "Tạo mã mới" : "Tạo mã", systemImage: "qrcode")
                 Spacer()
                 if loading { ProgressView() }
             }
@@ -195,12 +200,27 @@ struct AddDeviceView: View {
             expires = r.expires
             now = Date()
             reply = r.reply
-        } catch let e as APIError where [404, 405, 501].contains(e.status) {
-            errorText = "Máy chủ chưa hỗ trợ, cập nhật máy chủ trước."
-        } catch let e as APIError where e.status == 409 && e.code == "no_public_url" {
-            errorText = "Máy chủ chưa đặt địa chỉ công khai (publicUrl), cập nhật cấu hình máy chủ trước."
+            made = true
         } catch {
-            errorText = app.report(error)
+            var message: String?
+            var config = true   // a server or configuration problem: its own text stays
+            if let e = error as? APIError, [404, 405, 501].contains(e.status) {
+                message = "Máy chủ chưa hỗ trợ, cập nhật máy chủ trước."
+            } else if let e = error as? APIError, e.status == 409, e.code == "no_public_url" {
+                message = "Máy chủ chưa đặt địa chỉ công khai (publicUrl), cập nhật cấu hình máy chủ trước."
+            } else if let e = error as? APIError, e.code == "public_url_invalid" {
+                message = "Địa chỉ máy chủ (publicUrl) trong cấu hình box không hợp lệ cho app. Dùng https:// với tên miền ASCII."
+            } else {
+                message = app.report(error)
+                config = false
+            }
+            if reply != nil {
+                // The box may already have replaced the old code: never leave it on screen.
+                reply = nil
+                qr = nil
+                if message != nil && !config { message = "Không tạo được mã mới. Bấm Tạo mã mới để thử lại." }
+            }
+            errorText = message
         }
         loading = false
     }

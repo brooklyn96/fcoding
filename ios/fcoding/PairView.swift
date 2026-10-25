@@ -19,14 +19,17 @@ struct PairView: View {
     private enum Field { case server, code }
 
     private var canPair: Bool { !busy && code.count == 6 && AppState.normalize(server) != nil }
-    /// host[:port] of the address in the field, for the link confirmation.
-    private var linkHost: String? {
+    /// Origin of the address in the field, for the link confirmation.
+    private var linkServer: String? {
         guard app.pairLink != nil, let url = AppState.normalize(server) else { return nil }
-        return PairLink.label(url.absoluteString)
+        return url.absoluteString
     }
 
     /// Paired and a link is waiting for the "Ghép lại?" answer: only that question is shown.
-    private var asking: Bool { app.token != nil && app.pairLink != nil && !repairOK }
+    /// Not from the unsupported-server card: the card already says why pairing again is needed.
+    private var asking: Bool {
+        app.token != nil && app.pairLink != nil && app.unsupportedServer == nil && !repairOK
+    }
 
     var body: some View {
         Form {
@@ -36,7 +39,7 @@ struct PairView: View {
                     Text("Đang ghép với \(PairLink.label(app.serverURL)). Máy chủ mới: \(PairLink.label(app.pairLink?.server ?? "")).")
                         .foregroundColor(.secondary)
                     Button("Ghép lại") { repairOK = true }
-                    Button("Huỷ", role: .cancel) { app.pairLink = nil }
+                    Button("Huỷ", role: .cancel) { app.cancelPairing() }
                 }
             } else {
                 fields
@@ -49,7 +52,7 @@ struct PairView: View {
             // Re-pair from a link while paired: a way back without pairing.
             if app.token != nil {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Huỷ") { app.pairLink = nil }.disabled(busy)
+                    Button("Huỷ") { app.cancelPairing() }.disabled(busy)
                 }
             }
             ToolbarItem(placement: .navigationBarTrailing) {
@@ -73,14 +76,19 @@ struct PairView: View {
         if let notice = app.notice {
             Section { Label(notice, systemImage: "exclamationmark.circle").foregroundColor(.orange) }
         }
-        if let host = linkHost {
+        if let linked = linkServer {
             Section {
+                // The host exactly as connected to (ASCII only), with the safety line as part of
+                // the question itself.
                 Label {
-                    Text("Ghép với máy chủ ") + Text(host).bold() + Text("?")
+                    VStack(alignment: .leading, spacing: 4) {
+                        (Text("Ghép với máy chủ ") + Text(PairLink.label(linked)).bold() + Text("?"))
+                            .font(.headline)
+                        Text("Chỉ ghép nếu đây là box của bạn.").font(.subheadline).foregroundColor(.secondary)
+                    }
                 } icon: {
                     Image(systemName: "qrcode")
                 }
-                .font(.headline)
             }
         }
         Section {
@@ -189,13 +197,63 @@ struct PairView: View {
                 try await app.pair(server: server, code: code)
             } catch {
                 errorText = vietnameseMessage(error, pairing: true)
+                app.card(.pairFail)   // from the card: nothing is deleted
                 if let e = error as? APIError, e.status == 401 {
-                    if app.pairLink != nil { errorText = "Mã sai hoặc đã hết hạn. Tạo mã mới trên iPhone cũ rồi nhập lại." }
+                    if app.pairLink != nil { errorText = "Mã sai hoặc đã hết hạn. Gõ lại mã đang hiện trên iPhone cũ; hết hạn thì bấm “Tạo mã mới” ở đó." }
                     code = ""
                     focus = .code
                 }
             }
             busy = false
+        }
+    }
+}
+
+/// Full-screen card when an older build paired this iPhone to an address this build no
+/// longer accepts. Both buttons are local only: nothing is sent to that server.
+struct UnsupportedServerView: View {
+    @EnvironmentObject private var app: AppState
+    let address: String
+
+    var body: some View {
+        VStack(spacing: 20) {
+            Spacer()
+            Image(systemName: "exclamationmark.triangle")
+                .font(.system(size: 44, weight: .semibold))
+                .foregroundColor(.orange)
+                .accessibilityHidden(true)
+            (Text("Địa chỉ máy chủ đã lưu không còn được hỗ trợ (") + Text(address).font(.body.monospaced())
+                + Text("). Ghép lại để tiếp tục."))
+                .multilineTextAlignment(.center)
+            Text("Chỉ dùng được tên miền chữ thường không dấu, có dấu chấm (ví dụ box.instabox.tech), hoặc địa chỉ IP.")
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+            Spacer()
+            // Only opens pairing; Huỷ there comes back here with everything kept.
+            Button { app.card(.pairAgain) } label: {
+                Text("Ghép lại").bold().frame(maxWidth: .infinity, minHeight: 32)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            Button("Đăng xuất", role: .destructive) { app.card(.signOut) }
+                .controlSize(.large)
+        }
+        .padding(24)
+        .frame(maxWidth: 520)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(.systemBackground).ignoresSafeArea())
+        .alert("Xoá đăng nhập trên iPhone này?",
+               // Rule: the buttons send their events synchronously. The setter sends nothing
+               // itself; on close it only queues .signOutCancel for the next main-loop turn. After
+               // "Xoá đăng nhập" that cancel lands in .left (absorbed), after "Huỷ" in .card (no-op),
+               // and after any other close it brings the card back. It never cleans up.
+               isPresented: Binding(get: { app.cardState == .confirmSignOut },
+                                    set: { if !$0 { DispatchQueue.main.async { app.card(.signOutCancel) } } })) {
+            Button("Xoá đăng nhập", role: .destructive) { app.card(.signOutConfirm) }
+            Button("Huỷ", role: .cancel) { app.card(.signOutCancel) }
+        } message: {
+            Text("Box cũ vẫn giữ iPhone này trong danh sách thiết bị.")
         }
     }
 }
@@ -219,7 +277,8 @@ struct PairGuideView: View {
         ]),
         ("Mã ghép hết hạn", [
             "Mỗi mã chỉ dùng được 1 lần và hết hạn sau 2 phút. Đồng hồ trên iPhone cũ cho biết còn bao lâu.",
-            "Hết hạn hoặc gõ sai: bấm “Tạo mã mới” trên iPhone cũ (hoặc gõ lại fcode-pair), rồi nhập mã mới.",
+            "Gõ sai: gõ lại mã đang hiện trên iPhone cũ.",
+            "Hết hạn hoặc muốn đổi mã: bấm “Tạo mã mới” trên iPhone cũ (hoặc gõ lại fcode-pair). Mã cũ không dùng được nữa; nhập mã mới.",
         ]),
         ("An toàn", [
             "Ai có mã cũng vào được box của bạn. Chỉ đọc mã cho chính bạn; không gửi mã qua tin nhắn.",
