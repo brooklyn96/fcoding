@@ -516,9 +516,10 @@ enum HomeLogic {
         let known = projects.compactMap(\.prs)
         let reading = projects.contains { $0.loading }
         if known.isEmpty && !projects.isEmpty { return reading ? "đang đọc…" : "chưa đọc được GitHub" }
-        let line = "**\(known.reduce(0) { $0 + $1.count })** PR đang mở"
-        if known.count == projects.count { return line }
-        return line + (reading ? " · còn đang đọc" : " · chưa đọc được một số dự án")
+        let n = known.reduce(0) { $0 + $1.count }
+        if known.count == projects.count { return "**\(n)** PR đang mở" }
+        // Short enough for the card's 158 pt line at 12.5 pt.
+        return "**\(n)** PR · " + (reading ? "đang đọc" : "thiếu \(projects.count - known.count) dự án")
     }
 
     /// Second line of a project card: the worst PR checks result.
@@ -840,8 +841,8 @@ enum HomeLogic {
         eq("all failed", allPrLine(projects(fail + "," + fail)), "chưa đọc được GitHub")
         eq("all loading and failed", allPrLine(projects(ld + "," + fail)), "đang đọc…")
         eq("all known", allPrLine(projects(two + "," + none)), "**2** PR đang mở")
-        eq("all part loading", allPrLine(projects(two + "," + ld + "," + fail)), "**2** PR đang mở · còn đang đọc")
-        eq("all part failed", allPrLine(projects(two + "," + fail)), "**2** PR đang mở · chưa đọc được một số dự án")
+        eq("all part loading", allPrLine(projects(two + "," + ld + "," + fail)), "**2** PR · đang đọc")
+        eq("all part failed", allPrLine(projects(two + "," + fail)), "**2** PR · thiếu 1 dự án")
         eq("all no projects", allPrLine([]), "**0** PR đang mở")
         eq("decode empty", (try? JSONDecoder().decode(HomeData.self, from: Data("{}".utf8)))?.accounts.count, 0)
 

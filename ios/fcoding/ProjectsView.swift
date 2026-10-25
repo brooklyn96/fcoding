@@ -589,6 +589,7 @@ struct ProjectCard: View {
                     .scaledFont(12.5)
                     .foregroundColor(lines[i].color)
                     .lineLimit(1)
+                    .minimumScaleFactor(0.85)
             }
         }
         .padding(.top, 11).padding(.horizontal, 12).padding(.bottom, 10)
