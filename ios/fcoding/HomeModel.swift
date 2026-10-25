@@ -10,6 +10,11 @@ final class HomeModel: ObservableObject {
     /// The last refresh failed; shown as "⚠ Cũ" next to the numbers.
     @Published private(set) var failed = false
     @Published private(set) var loading = false
+    /// Server clock minus this phone's clock, from `generatedAt` (0 until a reply has one).
+    @Published private(set) var offset: TimeInterval = 0
+
+    /// Now on the server's clock: compare server times (sleepsAt, resetsAt, run times) with this.
+    func serverNow(_ date: Date = Date()) -> Date { date.addingTimeInterval(offset) }
 
     private var current: Task<Void, Never>?
 
@@ -27,8 +32,14 @@ final class HomeModel: ObservableObject {
         loading = true
         defer { loading = false }
         do {
-            home = try await api.get("api/home", as: HomeData.self)
-            loadedAt = Date()
+            let sent = Date()
+            let reply = try await api.get("api/home", as: HomeData.self)
+            let received = Date()
+            if reply.generatedAt != nil {
+                offset = HomeLogic.clockOffset(generatedAt: reply.generatedAt, sent: sent, received: received)
+            }
+            home = reply
+            loadedAt = received
             failed = false
         } catch {
             // A 401 goes back to pairing; anything else keeps the last data, marked old.

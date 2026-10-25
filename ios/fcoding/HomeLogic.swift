@@ -296,11 +296,14 @@ enum HomeLogic {
         return String(Int(n.rounded()))
     }
 
-    static func usd(_ n: Double) -> String { n < 1000 ? String(format: "$%.2f", n) : "$" + compact(n) }
+    /// Pane fmtMoney: "$105.81" below $1000, else "$2.5K".
+    static func usd(_ n: Double) -> String { n < 1000 ? String(format: "$%.2f", n) : String(format: "$%.1fK", n / 1000) }
+    /// Pane fmtEstMoney: whole dollars from $100 ("$218"), for estimates.
+    static func estUsd(_ n: Double) -> String { n >= 100 && n < 1000 ? String(format: "$%.0f", n) : usd(n) }
     static func tokens(_ n: Double) -> String { compact(n) + " tokens" }
     /// Pane spend row: "$105.81 · 227.9M tokens" ("≈ " first for the weekly estimate).
     static func spendLine(_ a: SpendAmount, approx: Bool = false) -> String {
-        (approx ? "≈ " : "") + usd(a.usd) + " · " + tokens(a.tokens)
+        (approx ? "≈ " + estUsd(a.usd) : usd(a.usd)) + " · " + tokens(a.tokens)
     }
 
     static func clampPercent(_ n: Double?) -> Double { max(0, min(100, n ?? 0)) }
@@ -309,9 +312,9 @@ enum HomeLogic {
 
     private static func pad2(_ n: Int) -> String { n < 10 ? "0\(n)" : "\(n)" }
 
-    /// Pane fmtDuration: "2d 10h" / "3h 05m" / "49m".
+    /// Pane fmtDuration: rounded minutes, at least 1: "2d 10h" / "3h 05m" / "50m".
     static func duration(_ seconds: TimeInterval) -> String {
-        let m = Int(max(0, seconds) / 60), d = m / 1440, h = m % 1440 / 60, mm = m % 60
+        let m = max(1, Int((max(0, seconds) / 60).rounded())), d = m / 1440, h = m % 1440 / 60, mm = m % 60
         if d > 0 { return "\(d)d \(h)h" }
         if h > 0 { return "\(h)h \(pad2(mm))m" }
         return "\(mm)m"
@@ -418,7 +421,10 @@ enum HomeLogic {
     static func resetText(_ w: QuotaWindow, now: Date, exact: Bool, calendar: Calendar = .current) -> String {
         guard let at = w.resetsAt else { return "" }
         let remain = at.timeIntervalSince(now)
-        if let period = w.periodSeconds, period <= 6 * 3600, clampPercent(w.usedPercent) <= 1, remain >= period * 0.98 {
+        // Pane: a rolling window (period <= 6 h) still at full length has not begun; grace
+        // max(60 s, period / 100), only while the reset is ahead.
+        if let period = w.periodSeconds, period <= 6 * 3600, clampPercent(w.usedPercent) <= 1, remain > 0,
+           remain >= period - max(60, period / 100) {
             return "Chưa bắt đầu"
         }
         if exact { return "Reset " + exactAt(at, now: now, calendar: calendar) }
@@ -454,17 +460,18 @@ enum HomeLogic {
         var changeAt: Date?
     }
 
-    /// Running: counts down to `sleepsAt` (warn under 10 min). Once that moment passes (the box
-    /// is then asleep and cannot answer), counts the cooldown down to the estimated wake.
+    /// Derived from `sleepsAt` alone (the server only sends state "running"). Before it: counts
+    /// down to sleep (warn under 10 min). After it (the box is asleep and cannot answer): counts
+    /// down to the estimated wake, sleepsAt + cooldown. `now` is the server clock.
     static func ring(_ box: HomeBox?, now: Date) -> Ring {
         guard let box = box, let sleeps = box.sleepsAt else { return Ring(mode: .unknown, seconds: 0, fraction: 0) }
         let maxRun = max(60, (box.maxRunMinutes ?? 480) * 60), cooldown = max(60, (box.cooldownMinutes ?? 10) * 60)
         let left = sleeps.timeIntervalSince(now)
-        if left > 0 && (box.state ?? "running") == "running" {
+        if left > 0 {
             let s = Int(left.rounded(.up))
             return Ring(mode: s < 600 ? .warn : .run, seconds: s, fraction: max(0, min(1, left / maxRun)), changeAt: sleeps)
         }
-        let wake = (left > 0 ? now : sleeps).addingTimeInterval(cooldown)
+        let wake = sleeps.addingTimeInterval(cooldown)
         let rest = wake.timeIntervalSince(now)
         guard rest > 0 else { return Ring(mode: .unknown, seconds: 0, fraction: 0) }
         return Ring(mode: .paused, seconds: Int(rest.rounded(.up)), fraction: max(0, min(1, rest / cooldown)), changeAt: wake)
@@ -507,30 +514,55 @@ enum HomeLogic {
         var parts: String = ""
     }
 
-    /// Pane donut: parts under `fold` dollars fold into one "Khác" wedge when there are 2 or more,
-    /// every wedge gets at least 7 %, and a 2.2/37 rad gap separates wedges.
+    /// Pane donutEntries: spenders over $0.005, biggest first. Those under `fold` dollars fold
+    /// into one "Khác" wedge, even a lone one, unless every spender is under it.
+    static func donutEntries(_ input: [(key: String, name: String, usd: Double)], fold: Double = 10) -> [(key: String, name: String, usd: Double, parts: String)] {
+        let sorted: [(key: String, name: String, usd: Double)] = input.filter { $0.usd > 0.005 }.sorted { $0.usd > $1.usd }
+        let all: [(key: String, name: String, usd: Double, parts: String)] = sorted.map { (key: $0.key, name: $0.name, usd: $0.usd, parts: "") }
+        let small = all.filter { $0.usd < fold }
+        if small.isEmpty || small.count == all.count { return all }
+        let names: [String] = small.map { "\($0.name) \(usd($0.usd))" }
+        let other: (key: String, name: String, usd: Double, parts: String) =
+            (key: "other", name: "Khác", usd: small.reduce(0) { $0 + $1.usd }, parts: names.joined(separator: ", "))
+        let big = all.filter { $0.usd >= fold }
+        return (big + [other]).sorted { $0.usd > $1.usd }
+    }
+
+    /// Pane donutGeometry: spans share the circle less a 2.2/37 rad gap per wedge; a span under
+    /// 0.07 rad grows to 0.07 and the excess comes off the biggest one; the first starts at gap/2.
     static func donut(_ input: [(key: String, name: String, usd: Double)], fold: Double = 10) -> [Wedge] {
-        var parts = input.filter { $0.usd > 0 }
-        let small = parts.filter { $0.usd < fold }
-        var other: (key: String, name: String, usd: Double)?
-        var otherNames = ""
-        if small.count > 1 {
-            parts = parts.filter { $0.usd >= fold }
-            other = ("other", "Khác", small.reduce(0) { $0 + $1.usd })
-            otherNames = small.map { "\($0.name) \(usd($0.usd))" }.joined(separator: ", ")
-        }
-        if let o = other { parts.append(o) }
+        let parts = donutEntries(input, fold: fold)
         let total = parts.reduce(0) { $0 + $1.usd }
-        guard total > 0 else { return [] }
-        if parts.count == 1 { return [Wedge(key: parts[0].key, name: parts[0].name, usd: parts[0].usd, start: 0, end: 2 * .pi)] }
-        let fr = parts.map { max(0.07, $0.usd / total) }, sum = fr.reduce(0, +), pad = 2.2 / 37
-        var a0 = 0.0
-        return parts.enumerated().map { i, p in
-            let a1 = a0 + fr[i] / sum * 2 * .pi
-            defer { a0 = a1 }
-            return Wedge(key: p.key, name: p.name, usd: p.usd, start: a0 + pad / 2, end: a1 - pad / 2,
-                         parts: p.key == "other" ? otherNames : "")
+        guard total > 0, !parts.isEmpty else { return [] }
+        if parts.count == 1 {
+            return [Wedge(key: parts[0].key, name: parts[0].name, usd: parts[0].usd, start: 0, end: 2 * .pi, parts: parts[0].parts)]
         }
+        let pad = 2.2 / 37, minSpan = 0.07
+        let avail = 2 * Double.pi - Double(parts.count) * pad
+        var spans: [Double] = parts.map { $0.usd / total * avail }
+        var excess = 0.0
+        for i in spans.indices where spans[i] < minSpan {
+            excess += minSpan - spans[i]
+            spans[i] = minSpan
+        }
+        if excess > 0, let big = spans.indices.max(by: { spans[$0] < spans[$1] }) {
+            spans[big] = max(minSpan, spans[big] - excess)
+        }
+        var wedges: [Wedge] = []
+        var a = pad / 2
+        for (i, p) in parts.enumerated() {
+            wedges.append(Wedge(key: p.key, name: p.name, usd: p.usd, start: a, end: a + spans[i], parts: p.parts))
+            a += spans[i] + pad
+        }
+        return wedges
+    }
+
+    // MARK: Server clock
+
+    /// Server clock minus phone clock; `generatedAt` is taken as the middle of the request.
+    static func clockOffset(generatedAt: Date?, sent: Date, received: Date) -> TimeInterval {
+        guard let g = generatedAt else { return 0 }
+        return g.timeIntervalSince(sent.addingTimeInterval(received.timeIntervalSince(sent) / 2))
     }
 
     // MARK: Codex reset reply
@@ -579,12 +611,19 @@ enum HomeLogic {
         // Durations and reset text
         eq("dur days", duration(2 * day + 10 * hr), "2d 10h")
         eq("dur hours", duration(3 * hr + 5 * 60), "3h 05m")
-        eq("dur mins", duration(49 * 60 + 30), "49m")
+        eq("dur mins", duration(49 * 60 + 30), "50m")
+        eq("dur round", duration(3 * hr + 10 * 60 + 40), "3h 11m")
+        eq("dur min 1", duration(20), "1m")
+        eq("est whole", spendLine(SpendAmount(usd: 218.4, tokens: 1e6), approx: true), "≈ $218 · 1.0M tokens")
+        eq("est small", estUsd(58.4), "$58.40")
+        eq("usd million", usd(1.2e6), "$1200.0K")
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = TimeZone(identifier: "UTC")!
         eq("reset countdown", resetText(win(48, rem: 3 * hr + 600, per: 5 * hr), now: now, exact: false), "Reset sau 3h 10m")
         eq("reset soon", resetText(win(48, rem: 30, per: 5 * hr), now: now, exact: false), "Sắp reset")
         eq("not started", resetText(win(0, rem: 5 * hr, per: 5 * hr), now: now, exact: false), "Chưa bắt đầu")
+        eq("grace ends", resetText(win(0, rem: 4 * hr + 55 * 60, per: 5 * hr), now: now, exact: false), "Reset sau 4h 55m")
+        eq("grace 1%", resetText(win(1, rem: 4 * hr + 57 * 60, per: 5 * hr), now: now, exact: false), "Chưa bắt đầu")
         eq("weekly 0% starts", resetText(win(0, rem: 7 * day, per: 7 * day), now: now, exact: false), "Reset sau 7d 0h")
         eq("no reset time", resetText(win(10, rem: nil, per: 5 * hr), now: now, exact: false), "")
         // 1_800_000_000 = 2027-01-15 08:00 UTC
@@ -630,6 +669,15 @@ enum HomeLogic {
         let r3 = ring(HomeBox(sleepsAt: now.addingTimeInterval(-50)), now: now)
         eq("ring paused", r3.mode, .paused)
         eq("ring paused secs", r3.seconds, 550)
+        let paused = HomeBox(state: "paused", sleepsAt: now.addingTimeInterval(-100))
+        eq("ring paused counts", ring(paused, now: now).seconds - ring(paused, now: now.addingTimeInterval(30)).seconds, 30)
+        eq("ring ignores state", ring(HomeBox(state: "paused", sleepsAt: now.addingTimeInterval(hr)), now: now).mode, .run)
+        // Phone 4 min fast: the server clock (phone + offset) still sees 2 h before sleep.
+        let phone = now.addingTimeInterval(240)
+        let off = clockOffset(generatedAt: now.addingTimeInterval(0.5), sent: phone, received: phone.addingTimeInterval(1))
+        eq("clock offset", off, -240)
+        eq("ring skew", ring(HomeBox(sleepsAt: now.addingTimeInterval(2 * hr)), now: phone.addingTimeInterval(off)).seconds, 7200)
+        eq("clock no date", clockOffset(generatedAt: nil, sent: now, received: now), 0)
         eq("ring woke", ring(HomeBox(sleepsAt: now.addingTimeInterval(-700)), now: now).mode, .unknown)
         eq("ring no data", ring(nil, now: now).mode, .unknown)
         eq("hms", hms(9 * 60 + 12), "00:09:12")
@@ -640,10 +688,22 @@ enum HomeLogic {
         eq("ago", ago(55 * 60), "55 phút trước")
 
         // Donut
-        let d = donut([("claude", "Claude", 6242), ("codex", "Codex", 58.4)])
+        let pad = 2.2 / 37
+        let d = donut([("codex", "Codex", 58.4), ("claude", "Claude", 6242)])
         eq("donut count", d.count, 2)
-        eq("donut min share", d[1].end - d[1].start > 0.3, true)
+        eq("donut sorted", d.map(\.key), ["claude", "codex"])
+        eq("donut start", abs(d[0].start - pad / 2) < 1e-9, true)
+        eq("donut 58.4 is 0.07 rad", abs((d[1].end - d[1].start) - 0.07) < 1e-9, true)
+        let mid = donut([("claude", "Claude", 600), ("codex", "Codex", 200)])
+        eq("donut real share", abs((mid[1].end - mid[1].start) - 0.25 * (2 * Double.pi - 2 * pad)) < 1e-9, true)
+        let tiny = donut([("claude", "Claude", 6242), ("codex", "Codex", 10.5)])
+        eq("donut min span", abs((tiny[1].end - tiny[1].start) - 0.07) < 1e-9, true)
+        eq("donut excess off big", abs((tiny[0].end - tiny[0].start) - (2 * Double.pi - 2 * pad - 0.07)) < 1e-9, true)
+        eq("donut closes", abs(tiny[1].end + pad / 2 - 2 * Double.pi) < 1e-9, true)
         eq("donut fold", donut([("a", "A", 3), ("b", "B", 4), ("c", "C", 50)]).map(\.name), ["C", "Khác"])
+        eq("donut fold lone", donut([("a", "A", 3), ("c", "C", 50)]).map(\.name), ["C", "Khác"])
+        eq("donut all small", donut([("a", "A", 3), ("b", "B", 4)]).map(\.name), ["B", "A"])
+        eq("donut floor", donut([("a", "A", 0.004), ("c", "C", 50)]).map(\.name), ["C"])
         eq("donut one", donut([("a", "A", 3)]).first?.end, Double.pi * 2)
         eq("donut empty", donut([("a", "A", 0)]).count, 0)
 
