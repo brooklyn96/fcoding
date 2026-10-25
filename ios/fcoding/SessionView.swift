@@ -2,30 +2,47 @@ import SwiftUI
 
 struct SessionView: View {
     let name: String
+    /// From the inbox; nil (e.g. a session just made from "+") falls back to the name's suffix.
+    let harness: String?
     @EnvironmentObject private var app: AppState
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var model: SessionModel
     @AppStorage("fontSize") private var fontSize: Double = 13
+    /// Pinned: the composer is shown on open and stays open after a send.
+    @AppStorage("composerPinned") private var composerPinned = false
+    @State private var composerShown: Bool
+    @FocusState private var composerFocused: Bool
     @State private var stoppedInBackground = false
-    /// "Trả lời" from the inbox: focus the composer when the view appears.
+    /// "Trả lời" from the inbox: open and focus the composer when the view appears.
     private let focusComposer: Bool
 
-    init(name: String, focusComposer: Bool = false) {
+    init(name: String, harness: String? = nil, focusComposer: Bool = false) {
         self.name = name
+        self.harness = harness
         self.focusComposer = focusComposer
         _model = StateObject(wrappedValue: SessionModel(name: name))
+        _composerShown = State(initialValue: focusComposer || UserDefaults.standard.bool(forKey: "composerPinned"))
+    }
+
+    private var chipHarness: String? {
+        harness ?? HarnessStyle.all.first { name.split(separator: "-").contains(Substring($0)) }
     }
 
     var body: some View {
         VStack(spacing: 0) {
             GeometryReader { geo in
-                TerminalView(model: model, fontSize: fontSize, viewportHeight: geo.size.height)
+                TerminalView(model: model, fontSize: fontSize, viewportHeight: geo.size.height,
+                             trailingInset: composerShown ? 0 : 58)
                     .onAppear { model.resize(to: geo.size, fontSize: fontSize) }
                     .onChange(of: geo.size.width) { _ in model.resize(to: geo.size, fontSize: fontSize) }
+                    // Composer or keyboard shown / hidden: new row count (resize() debounces).
+                    .onChange(of: geo.size.height) { _ in model.resize(to: geo.size, fontSize: fontSize) }
                     .onChange(of: fontSize) { newSize in model.resize(to: geo.size, fontSize: newSize) }
             }
             .background(Color.black)
+            .overlay(alignment: .bottomTrailing) { if !composerShown { keyboardButton } }
 
             if let errorText = model.errorText {
                 Button { model.errorText = nil } label: {
@@ -40,21 +57,28 @@ struct SessionView: View {
                 .accessibilityHint("Chạm để ẩn")
             }
 
-            Divider()
-            ComposerView(
-                draftKey: "draft.\(name)",
-                onSend: { text, enter in model.send(text, enter: enter) },
-                onKey: { key in model.key(key) },
-                autoFocus: focusComposer
-            )
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
-            .background(.bar)
+            if composerShown {
+                ComposerView(
+                    draftKey: "draft.\(name)",
+                    onSend: { text, enter in model.send(text, enter: enter) },
+                    onKey: { key in model.key(key) },
+                    focused: $composerFocused,
+                    pinned: $composerPinned,
+                    onHide: hideComposer,
+                    onSent: { if !composerPinned { hideComposer() } }
+                )
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
         }
+        .background(Color.black.ignoresSafeArea())
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: composerShown)
         .overlay { if model.gone { goneView } }
         .navigationTitle(name)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbarBackground(Color(white: 0.086), for: .navigationBar)
+        .toolbarBackground(.visible, for: .navigationBar)
         .toolbar {
+            ToolbarItem(placement: .principal) { titleChip }
             ToolbarItemGroup(placement: .navigationBarTrailing) {
                 linkDot
                 Button { fontSize = max(9, fontSize - 1) } label: { Text("A-").font(.callout.bold()) }
@@ -65,7 +89,11 @@ struct SessionView: View {
                     .disabled(fontSize >= 24)
             }
         }
-        .onAppear { model.start(app: app) }
+        .onAppear {
+            model.start(app: app)
+            // After the push animation, so the keyboard does not fight the transition.
+            if focusComposer { DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { composerFocused = true } }
+        }
         .onDisappear { model.stop() }
         .onChange(of: scenePhase) { phase in
             // Background: close the stream and polling so the server frees its slot.
@@ -78,6 +106,54 @@ struct SessionView: View {
                 model.restart()
             }
         }
+    }
+
+    /// Opens the composer and focuses the field, so the keyboard comes up in one tap.
+    private func showComposer() {
+        composerShown = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { composerFocused = true }
+    }
+
+    private func hideComposer() {
+        composerFocused = false
+        composerShown = false
+    }
+
+    private var keyboardButton: some View {
+        Button(action: showComposer) {
+            Image(systemName: "keyboard")
+                .font(.system(size: 19, weight: .medium))
+                .foregroundColor(.accentColor)
+                .frame(width: 44, height: 44)
+                .background(Color(white: 0.17).opacity(0.92), in: Circle())
+                .overlay(Circle().stroke(Color.white.opacity(0.14), lineWidth: 0.5))
+                .shadow(color: .black.opacity(0.55), radius: 9, y: 6)
+        }
+        .padding(.trailing, 14)
+        .padding(.bottom, 8)
+        .accessibilityLabel("Mở khung gõ")
+        .transition(.opacity)
+    }
+
+    /// The session name in a harness-coloured chip (as HarnessBadge), cut in the middle when long.
+    private var titleChip: some View {
+        let h = chipHarness
+        let c = HarnessStyle.color(h)
+        return HStack(spacing: 5) {
+            HarnessGlyph(harness: h, size: 13)
+            Text(name)
+                .font(.system(size: 15, weight: .semibold, design: .monospaced))
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .foregroundColor(c)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 3)
+        .background(c.opacity(0.17), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .frame(maxWidth: 190)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(h.map { "\(name), \($0)" } ?? name)
+        .accessibilityAddTraits(.isHeader)
     }
 
     private var linkDot: some View {
@@ -126,20 +202,24 @@ final class ScrollState: ObservableObject {
     var contentHeight: CGFloat = 0
 }
 
-/// Monospaced, selectable screen text. Sticks to the bottom unless the user scrolls up.
+/// Monospaced, selectable, coloured screen text. Sticks to the bottom unless the user scrolls up.
 struct TerminalView: View {
     @ObservedObject var model: SessionModel
     let fontSize: Double
     let viewportHeight: CGFloat
+    /// Room kept on the right for the floating keyboard button.
+    var trailingInset: CGFloat = 0
     @StateObject private var scroll = ScrollState()
 
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: 0) {
-                    Text(model.text.isEmpty ? "Đang tải màn hình…" : model.text)
+                    // Every run of the styled text carries its own font and colour; these two
+                    // modifiers only style the loading line.
+                    Text(model.text.isEmpty ? AttributedString("Đang tải màn hình…") : model.styled(fontSize: fontSize))
                         .font(.system(size: CGFloat(fontSize), design: .monospaced))
-                        .foregroundColor(model.text.isEmpty ? .gray : Color(white: 0.92))
+                        .foregroundColor(.gray)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, SessionModel.hPad)
@@ -179,6 +259,7 @@ struct TerminalView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .padding(10)
+                    .padding(.trailing, trailingInset)
                 }
             }
         }
@@ -212,88 +293,72 @@ private let slashCommands = ["/model", "/clear", "/compact", "/help", "/resume",
 /// The draft lives only here and is only written by the keyboard, except: restored from
 /// UserDefaults when the view appears (if empty), cleared after a successful send (if unchanged)
 /// and appended to by the "/" menu. Never rewritten while typing. Every change is mirrored to
-/// UserDefaults (`draftKey`) so a 401 / re-login does not lose it.
+/// UserDefaults (`draftKey`) so a 401 / re-login, or hiding the composer, does not lose it.
 struct ComposerView: View {
     let draftKey: String
     /// Queues the send synchronously (FIFO with key presses); the task says whether it succeeded.
     let onSend: (String, Bool) -> Task<Bool, Never>
     let onKey: (String) -> Void
-    var autoFocus = false
-    @FocusState private var editorFocused: Bool
+    var focused: FocusState<Bool>.Binding
+    @Binding var pinned: Bool
+    let onHide: () -> Void
+    /// After a successful send that emptied the draft.
+    let onSent: () -> Void
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     @State private var draft = ""
     @State private var sending = false
     @State private var showKeys = false
 
-    /// Landscape on iPhone: short editor, buttons side by side, key row behind a toggle.
+    /// Landscape on iPhone: no grab handle, a 1–2 line field, key row behind a toggle.
     private var compact: Bool { verticalSizeClass == .compact }
-    private var buttonLayout: AnyLayout {
-        compact ? AnyLayout(HStackLayout(spacing: 6)) : AnyLayout(VStackLayout(spacing: 6))
+
+    private var swipeDown: some Gesture {
+        DragGesture(minimumDistance: 10).onEnded { v in
+            if v.translation.height > 30, v.translation.height > abs(v.translation.width) { onHide() }
+        }
     }
 
     var body: some View {
         VStack(spacing: 6) {
-            if !compact || showKeys { keyRow }
+            if !compact {
+                Capsule()
+                    .fill(Color(white: 0.28))
+                    .frame(width: 36, height: 5)
+                    .frame(maxWidth: .infinity, minHeight: 12)
+                    .contentShape(Rectangle())
+                    .gesture(swipeDown)
+                    .accessibilityHidden(true)
+                HStack(spacing: 6) {
+                    keyScroll
+                    pinButton
+                    hideButton
+                }
+            } else if showKeys {
+                keyScroll
+            }
 
-            HStack(alignment: .bottom, spacing: 8) {
+            HStack(alignment: .bottom, spacing: 6) {
+                if compact { keysToggle }
+                field
                 if compact {
-                    Button { showKeys.toggle() } label: {
-                        Image(systemName: "keyboard")
-                            .font(.system(size: 17, weight: .semibold))
-                            .frame(width: 44, height: 44)
-                            .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8))
-                            .foregroundColor(showKeys ? Color.accentColor : Color.primary)
-                    }
-                    .accessibilityLabel(showKeys ? "Ẩn phím nhanh" : "Hiện phím nhanh")
+                    pinButton
+                    hideButton
                 }
-
-                ZStack(alignment: .topLeading) {
-                    TextEditor(text: $draft)
-                        .font(.system(size: 17))
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .scrollContentBackground(.hidden)
-                        .focused($editorFocused)
-                        .frame(height: compact ? 44 : 84)
-                    if draft.isEmpty {
-                        Text("Nhập tin nhắn…")
-                            .font(.system(size: 17))
-                            .foregroundColor(.secondary)
-                            .padding(.top, 8)
-                            .padding(.leading, 5)
-                            .allowsHitTesting(false)
-                            .accessibilityHidden(true)
-                    }
-                }
-                .padding(.horizontal, 4)
-                .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 10))
-
-                buttonLayout {
-                    Button { submit(enter: true) } label: {
-                        Group {
-                            if sending { ProgressView() } else { Text("Gửi").font(.headline) }
-                        }
-                        .frame(width: 84, height: 44)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .accessibilityHint("Gửi nội dung rồi nhấn Enter")
-
-                    Button { submit(enter: false) } label: {
-                        Text("Gửi không Enter")
-                            .font(.caption2)
-                            .multilineTextAlignment(.center)
-                            .frame(width: 84, height: compact ? 44 : 30)
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(draft.isEmpty)
-                }
-                .disabled(sending)
             }
         }
+        .padding(.horizontal, 8)
+        .padding(.top, compact ? 6 : 2)
+        .padding(.bottom, 6)
+        .background {
+            // Swipe down on the background (not the field or the key row) hides the composer.
+            Color(uiColor: .secondarySystemBackground)
+                .ignoresSafeArea(edges: .bottom)
+                .contentShape(Rectangle())
+                .gesture(swipeDown)
+        }
+        .overlay(alignment: .top) { Divider() }
         .onAppear {
             if draft.isEmpty, let saved = UserDefaults.standard.string(forKey: draftKey) { draft = saved }
-            // After the push animation, so the keyboard does not fight the transition.
-            if autoFocus { DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { editorFocused = true } }
         }
         .onChange(of: draft) { value in
             if value.isEmpty {
@@ -304,7 +369,86 @@ struct ComposerView: View {
         }
     }
 
-    private var keyRow: some View {
+    private var field: some View {
+        HStack(alignment: .bottom, spacing: 4) {
+            TextField("Nhập tin nhắn…", text: $draft, axis: .vertical)
+                .font(.system(size: 17))
+                .lineLimit(compact ? 1...2 : 1...4)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .focused(focused)
+                .padding(.vertical, 8)
+            sendButton
+        }
+        .padding(.leading, 14)
+        .frame(minHeight: 38)
+        .background(Color(uiColor: .tertiarySystemBackground), in: RoundedRectangle(cornerRadius: 19, style: .continuous))
+    }
+
+    /// Tap: send with Enter. Long press: a menu with "Gửi không Enter".
+    private var sendButton: some View {
+        Menu {
+            Button { submit(enter: true) } label: { Label("Gửi", systemImage: "return") }
+            Button { submit(enter: false) } label: { Label("Gửi không Enter", systemImage: "text.cursor") }
+                .disabled(draft.isEmpty)
+        } label: {
+            ZStack {
+                Circle().fill(Color.accentColor)
+                if sending {
+                    ProgressView().tint(.white).scaleEffect(0.7)
+                } else {
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundColor(.white)
+                }
+            }
+            .frame(width: 30, height: 30)
+            .frame(width: 38, height: 38)
+            .contentShape(Rectangle())
+        } primaryAction: {
+            submit(enter: true)
+        }
+        .disabled(sending)
+        .accessibilityLabel("Gửi")
+        .accessibilityHint("Gửi rồi nhấn Enter. Giữ lâu để chọn Gửi không Enter.")
+        .accessibilityAction(named: "Gửi không Enter") { submit(enter: false) }
+    }
+
+    private var pinButton: some View {
+        Button { pinned.toggle() } label: {
+            Image(systemName: pinned ? "pin.fill" : "pin")
+                .font(.system(size: 15, weight: .semibold))
+                .frame(width: 44, height: 36)
+                .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8))
+                .foregroundColor(pinned ? Color.accentColor : Color.secondary)
+        }
+        .accessibilityLabel(pinned ? "Bỏ ghim khung gõ" : "Ghim khung gõ")
+        .accessibilityHint("Khi ghim, khung gõ luôn hiện và không tự ẩn sau khi gửi")
+    }
+
+    private var hideButton: some View {
+        Button(action: onHide) {
+            Image(systemName: "chevron.down")
+                .font(.system(size: 16, weight: .bold))
+                .frame(width: 44, height: 36)
+                .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8))
+                .foregroundColor(.accentColor)
+        }
+        .accessibilityLabel("Ẩn khung gõ")
+    }
+
+    private var keysToggle: some View {
+        Button { showKeys.toggle() } label: {
+            Image(systemName: "keyboard.badge.ellipsis")
+                .font(.system(size: 16, weight: .semibold))
+                .frame(width: 44, height: 36)
+                .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8))
+                .foregroundColor(showKeys ? Color.accentColor : Color.primary)
+        }
+        .accessibilityLabel(showKeys ? "Ẩn phím nhanh" : "Hiện phím nhanh")
+    }
+
+    private var keyScroll: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
                 Menu {
@@ -338,8 +482,10 @@ struct ComposerView: View {
         sending = true
         let job = onSend(text, enter) // queued now, in tap order with the quick keys
         Task {
-            if await job.value, draft == text { draft = "" }
+            let ok = await job.value
+            if ok, draft == text { draft = "" }
             sending = false
+            if ok, draft.isEmpty { onSent() }
         }
     }
 }

@@ -9,6 +9,8 @@ final class SessionModel: ObservableObject {
 
     static let hPad: CGFloat = 6
     static let vPad: CGFloat = 4
+    /// Ask for SGR colour escapes in the screen text (an older server ignores it).
+    static let ansi = [URLQueryItem(name: "ansi", value: "1")]
 
     @Published private(set) var text = ""
     @Published private(set) var link: Link = .connecting
@@ -24,6 +26,16 @@ final class SessionModel: ObservableObject {
     private var sentRows = 0
 
     init(name: String) { self.name = name }
+
+    private var styledCache: (text: String, fontSize: Double, value: AttributedString)?
+
+    /// The screen text with its SGR colours, parsed once per text and font size.
+    func styled(fontSize: Double) -> AttributedString {
+        if let c = styledCache, c.fontSize == fontSize, c.text == text { return c.value }
+        let value = ANSI.attributed(ANSI.runs(text), fonts: ANSI.Fonts(size: CGFloat(fontSize)))
+        styledCache = (text, fontSize, value)
+        return value
+    }
 
     func start(app: AppState) {
         self.app = app
@@ -68,7 +80,7 @@ final class SessionModel: ObservableObject {
 
     private func readStream(_ api: API) async throws {
         link = .connecting
-        var req = try api.request("GET", "api/stream/\(name)", timeout: 45)
+        var req = try api.request("GET", "api/stream/\(name)", query: SessionModel.ansi, timeout: 45)
         req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         let (bytes, resp) = try await URLSession.shared.bytes(for: req)
         if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
@@ -111,7 +123,7 @@ final class SessionModel: ObservableObject {
     /// Returns false when the loop must stop (session gone or logged out).
     private func pollOnce(_ api: API) async -> Bool {
         do {
-            apply(try await api.call("GET", "api/screen/\(name)"))
+            apply(try await api.call("GET", "api/screen/\(name)", query: SessionModel.ansi))
             link = .polling
             return true
         } catch {
@@ -220,8 +232,9 @@ final class SessionModel: ObservableObject {
         guard charWidth > 0, font.lineHeight > 0, size.width > 0, size.height > 0 else { return }
         let cols = min(300, max(20, Int((size.width - 2 * SessionModel.hPad) / charWidth)))
         let rows = min(200, max(10, Int((size.height - 2 * SessionModel.vPad) / font.lineHeight)))
-        guard cols != sentCols || rows != sentRows else { return }
+        // Cancel first: a size that returns to the sent one must also drop a pending resize.
         resizeTask?.cancel()
+        guard cols != sentCols || rows != sentRows else { return }
         resizeTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 300_000_000)
             guard let self = self, !Task.isCancelled, let api = self.app?.api else { return }

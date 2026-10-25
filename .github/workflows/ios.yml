@@ -7,6 +7,10 @@ on:
     paths:
       - "ios/**"
       - ".github/workflows/ios.yml"
+  pull_request:
+    paths:
+      - "ios/**"
+      - ".github/workflows/ios.yml"
 
 permissions:
   contents: write
@@ -51,6 +55,7 @@ jobs:
           ls -l fcode.ipa
 
       - name: Upload artifact
+        if: github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:
           name: fcode-ipa
@@ -58,7 +63,7 @@ jobs:
           if-no-files-found: error
 
       - name: Publish pre-release "latest"
-        if: github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
@@ -70,7 +75,7 @@ jobs:
           overwrite_files: true
 
       - name: Remove old fcoding.ipa asset
-        if: github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release delete-asset latest fcoding.ipa -y || true

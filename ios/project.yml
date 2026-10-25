@@ -20,6 +20,7 @@ targets:
       - path: fcoding
         excludes:
           - Info.plist
+          - Fonts/LICENSE
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.brooklyn96.fcoding
@@ -44,6 +45,8 @@ targets:
         CFBundleInfoDictionaryVersion: "6.0"
         LSRequiresIPhoneOS: true
         UILaunchScreen: {}
+        UIAppFonts:
+          - SymbolsNerdFontMono-Regular.ttf
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
         UIRequiredDeviceCapabilities:
