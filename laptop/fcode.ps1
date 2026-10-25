@@ -323,7 +323,7 @@ function Show-Help {
   Write-Host '      Thêm một project GitHub vào box để omp làm việc và app FCode hiện trong danh sách.'
   Write-Host '      Ví dụ: fcode add ten-tai-khoan/ten-repo    hoặc    fcode add ten-tai-khoan/ten-repo ten-ngan'
   Write-Host '  fcode pair [tên thiết bị]'
-  Write-Host '      Tạo mã ghép (kèm mã QR) để ghép một iPhone mới với server FCode. Mã dùng 1 lần, hết hạn sau 5 phút.'
+  Write-Host '      Tạo mã ghép (kèm mã QR) để ghép một iPhone mới với server FCode. Mã dùng 1 lần và hết hạn nhanh.'
   Write-Host '      Ví dụ: fcode pair    hoặc    fcode pair iPhone của Mẹ'
   Write-Host '  fcode help'
   Write-Host '      In bảng này (cũng là fcode -h, fcode --help, fcode /?).'
@@ -444,7 +444,7 @@ function Invoke-Pair {
     return 1
   }
   Write-Host ''
-  Write-Host 'Mở Camera trên iPhone mới, quét mã, rồi bấm Ghép trong app FCode. Mã hết hạn sau 5 phút.'
+  Write-Host 'Mở Camera trên iPhone mới, quét mã, rồi bấm Ghép trong app FCode.'
   return 0
 }
 
