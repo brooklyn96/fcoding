@@ -72,8 +72,8 @@ struct SessionView: View {
                     },
                     onKey: { key in model.key(key) },
                     focused: $composerFocused,
-                    pinned: $composerPinned,
                     isOmp: chipHarness == "omp",
+                    pinned: $composerPinned,
                     onHide: hideComposer,
                     onSent: { if !composerPinned { hideComposer() } }
                 )
