@@ -17,13 +17,6 @@ struct SessionView: View {
     /// Floating keyboard button: which edge, and how far down that edge (0 = top, 1 = bottom).
     @AppStorage("kbButtonLeft") private var kbLeft = false
     @AppStorage("kbButtonY") private var kbY: Double = 1
-    /// Live drag translation, nil when not dragging (or still under the 10 pt threshold). A
-    /// GestureState resets by itself when the gesture is cancelled (a call, the app backgrounded).
-    /// Its reset glides with the snap spring, or is instant with Reduce Motion (set in init).
-    @GestureState private var kbDrag: CGSize?
-    /// This gesture moved 10 pt or more, so its release is a drag (snap), never a tap.
-    @State private var dragArmed = false
-    private static let snapSpring = Animation.spring(response: 0.3, dampingFraction: 0.8)
     /// Bumped on every send: the terminal jumps to the bottom and follows again.
     @State private var bottomRequest = 0
     @State private var stoppedInBackground = false
@@ -35,8 +28,6 @@ struct SessionView: View {
         self.harness = harness
         self.focusComposer = focusComposer
         _model = StateObject(wrappedValue: SessionModel(name: name))
-        _kbDrag = GestureState(wrappedValue: nil, resetTransaction:
-            Transaction(animation: UIAccessibility.isReduceMotionEnabled ? nil : SessionView.snapSpring))
         _composerShown = State(initialValue: focusComposer || UserDefaults.standard.bool(forKey: "composerPinned"))
     }
 
@@ -53,7 +44,17 @@ struct SessionView: View {
                              jumpOnLeft: !composerShown && !kbLeft)
             }
             .background(Color.black)
-            .overlay { if !composerShown { GeometryReader { area in keyboardButton(in: area.size) } } }
+            .overlay {
+                if !composerShown {
+                    GeometryReader { area in
+                        // Keyed by the setting, so its GestureState reset is rebuilt when it changes.
+                        KeyboardButton(size: area.size, left: $kbLeft, y: $kbY,
+                                       reduceMotion: reduceMotion, onTap: showComposer)
+                            .id(reduceMotion)
+                    }
+                    .transition(.opacity)
+                }
+            }
 
             if let errorText = model.errorText {
                 Button { model.errorText = nil } label: {
@@ -146,73 +147,6 @@ struct SessionView: View {
         composerShown = false
     }
 
-    /// Centre of the keyboard button in the terminal area (below the top bar, above the home
-    /// indicator, inside the side safe areas): 14 pt from the edge, 8 pt from top and bottom.
-    private func kbCenter(in size: CGSize, drag: CGSize? = nil) -> CGPoint {
-        let r: CGFloat = 22
-        let minY = 8 + r, maxY = max(minY, size.height - 8 - r)
-        var p = CGPoint(x: kbLeft ? 14 + r : size.width - 14 - r,
-                        y: minY + CGFloat(min(1, max(0, kbY))) * (maxY - minY))
-        if let d = drag {
-            p.x = min(size.width - r, max(r, p.x + d.width))
-            p.y = min(maxY, max(minY, p.y + d.height))
-        }
-        return p
-    }
-
-    /// Tap opens the composer; a drag (from 10 pt of movement) moves the button, and on release
-    /// it snaps to the nearer side edge. Not a Button: a Button would also fire its tap on release.
-    private func keyboardButton(in size: CGSize) -> some View {
-        Image(systemName: "keyboard")
-            .font(.system(size: 19, weight: .medium))
-            .foregroundColor(.accentColor)
-            .frame(width: 44, height: 44)
-            .background(Color(white: 0.17).opacity(0.92), in: Circle())
-            .overlay(Circle().stroke(Color.white.opacity(0.14), lineWidth: 0.5))
-            .shadow(color: .black.opacity(0.55), radius: 9, y: 6)
-            .scaleEffect(kbDrag == nil ? 1 : 1.08)
-            .contentShape(Circle())
-            .gesture(
-                // Global space: the button moves under the finger, so local translation would jitter.
-                DragGesture(minimumDistance: 0, coordinateSpace: .global)
-                    .updating($kbDrag) { v, state, _ in
-                        if state != nil || hypot(v.translation.width, v.translation.height) >= 10 {
-                            state = v.translation
-                        }
-                    }
-                    .onChanged { v in
-                        // kbDrag is nil only before this gesture armed, so this also resets a stale
-                        // flag from a cancelled gesture.
-                        if hypot(v.translation.width, v.translation.height) >= 10 {
-                            if !dragArmed { dragArmed = true }
-                        } else if kbDrag == nil, dragArmed {
-                            dragArmed = false
-                        }
-                    }
-                    .onEnded { v in
-                        // Edge and height are committed only here. A drag that came back near its
-                        // start still snaps (back); only an unarmed gesture is a tap.
-                        let armed = dragArmed
-                        dragArmed = false
-                        guard armed else { showComposer(); return }
-                        let p = kbCenter(in: size, drag: v.translation)
-                        let minY: CGFloat = 30, maxY = max(minY, size.height - 30)
-                        // Same spring as the GestureState reset, so the button glides to the edge.
-                        withAnimation(reduceMotion ? nil : SessionView.snapSpring) {
-                            kbLeft = p.x < size.width / 2
-                            kbY = maxY > minY ? Double((p.y - minY) / (maxY - minY)) : 1
-                        }
-                    }
-            )
-            .accessibilityElement()
-            .accessibilityLabel("Mở khung gõ")
-            .accessibilityHint("Kéo để dời nút sang chỗ khác")
-            .accessibilityAddTraits(.isButton)
-            .accessibilityAction { showComposer() }
-            .position(kbCenter(in: size, drag: kbDrag))
-            .transition(.opacity)
-    }
-
     /// The session name in a harness-coloured chip (as HarnessBadge), cut in the middle when long.
     private var titleChip: some View {
         let h = chipHarness
@@ -258,6 +192,104 @@ struct SessionView: View {
         }
         .padding(24)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+    }
+}
+
+// MARK: - Floating keyboard button
+
+/// Tap opens the composer; a drag (from 10 pt of movement) moves the button, and on release it
+/// snaps to the nearer side edge. It owns the drag state so its reset follows Reduce Motion: the
+/// parent keys it with `.id(reduceMotion)`, which rebuilds it (and the reset transaction) when the
+/// setting changes.
+private struct KeyboardButton: View {
+    let size: CGSize
+    /// Stored edge and relative height (SessionView's @AppStorage).
+    @Binding var left: Bool
+    @Binding var y: Double
+    let reduceMotion: Bool
+    let onTap: () -> Void
+    /// Live drag translation, nil when not dragging (or still under the 10 pt threshold). A
+    /// GestureState resets by itself when the gesture is cancelled (a call, the app backgrounded).
+    /// Its reset glides with the snap spring, or is instant with Reduce Motion.
+    @GestureState private var kbDrag: CGSize?
+    /// This gesture moved 10 pt or more, so its release is a drag (snap), never a tap.
+    @State private var dragArmed = false
+    static let snapSpring = Animation.spring(response: 0.3, dampingFraction: 0.8)
+
+    init(size: CGSize, left: Binding<Bool>, y: Binding<Double>, reduceMotion: Bool, onTap: @escaping () -> Void) {
+        self.size = size
+        _left = left
+        _y = y
+        self.reduceMotion = reduceMotion
+        self.onTap = onTap
+        _kbDrag = GestureState(wrappedValue: nil,
+                               resetTransaction: Transaction(animation: reduceMotion ? nil : KeyboardButton.snapSpring))
+    }
+
+    /// Centre of the keyboard button in the terminal area (below the top bar, above the home
+    /// indicator, inside the side safe areas): 14 pt from the edge, 8 pt from top and bottom.
+    private func kbCenter(in size: CGSize, drag: CGSize? = nil) -> CGPoint {
+        let r: CGFloat = 22
+        let minY = 8 + r, maxY = max(minY, size.height - 8 - r)
+        var p = CGPoint(x: left ? 14 + r : size.width - 14 - r,
+                        y: minY + CGFloat(min(1, max(0, y))) * (maxY - minY))
+        if let d = drag {
+            p.x = min(size.width - r, max(r, p.x + d.width))
+            p.y = min(maxY, max(minY, p.y + d.height))
+        }
+        return p
+    }
+
+    /// Tap opens the composer; a drag (from 10 pt of movement) moves the button, and on release
+    /// it snaps to the nearer side edge. Not a Button: a Button would also fire its tap on release.
+    var body: some View {
+        Image(systemName: "keyboard")
+            .font(.system(size: 19, weight: .medium))
+            .foregroundColor(.accentColor)
+            .frame(width: 44, height: 44)
+            .background(Color(white: 0.17).opacity(0.92), in: Circle())
+            .overlay(Circle().stroke(Color.white.opacity(0.14), lineWidth: 0.5))
+            .shadow(color: .black.opacity(0.55), radius: 9, y: 6)
+            .scaleEffect(kbDrag == nil ? 1 : 1.08)
+            .contentShape(Circle())
+            .gesture(
+                // Global space: the button moves under the finger, so local translation would jitter.
+                DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                    .updating($kbDrag) { v, state, _ in
+                        if state != nil || hypot(v.translation.width, v.translation.height) >= 10 {
+                            state = v.translation
+                        }
+                    }
+                    .onChanged { v in
+                        // kbDrag is nil only before this gesture armed, so this also resets a stale
+                        // flag from a cancelled gesture.
+                        if hypot(v.translation.width, v.translation.height) >= 10 {
+                            if !dragArmed { dragArmed = true }
+                        } else if kbDrag == nil, dragArmed {
+                            dragArmed = false
+                        }
+                    }
+                    .onEnded { v in
+                        // Edge and height are committed only here. A drag that came back near its
+                        // start still snaps (back); only an unarmed gesture is a tap.
+                        let armed = dragArmed
+                        dragArmed = false
+                        guard armed else { onTap(); return }
+                        let p = kbCenter(in: size, drag: v.translation)
+                        let minY: CGFloat = 30, maxY = max(minY, size.height - 30)
+                        // Same spring as the GestureState reset, so the button glides to the edge.
+                        withAnimation(reduceMotion ? nil : KeyboardButton.snapSpring) {
+                            left = p.x < size.width / 2
+                            y = maxY > minY ? Double((p.y - minY) / (maxY - minY)) : 1
+                        }
+                    }
+            )
+            .accessibilityElement()
+            .accessibilityLabel("Mở khung gõ")
+            .accessibilityHint("Kéo để dời nút sang chỗ khác")
+            .accessibilityAddTraits(.isButton)
+            .accessibilityAction { onTap() }
+            .position(kbCenter(in: size, drag: kbDrag))
     }
 }
 
