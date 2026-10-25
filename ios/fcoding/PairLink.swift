@@ -277,6 +277,15 @@ enum CardFlow {
         // Huỷ on the sign-out alert: back to the card, never a cleanup.
         let cancel = step(.confirmSignOut, .signOutCancel)
         if cancel.cleanup || cancel.state != .card { failures.append("confirmSignOut + signOutCancel: \(cancel)") }
+        // The alert's deferred cancel can land in any other state: there it changes nothing.
+        for s in State.allCases where s != .confirmSignOut {
+            let r = step(s, .signOutCancel)
+            if r.cleanup || r.state != s { failures.append("\(s) + signOutCancel: \(r)") }
+        }
+        // Confirm then the deferred cancel: stays left, one cleanup only.
+        let confirmed = step(.confirmSignOut, .signOutConfirm)
+        let late = step(confirmed.state, .signOutCancel)
+        if !confirmed.cleanup || late.cleanup || late.state != .left { failures.append("confirm then late cancel: \(confirmed), \(late)") }
         let path: [(State, Event, State)] = [
             (.card, .link, .pairing), (.card, .pairAgain, .pairing), (.pairing, .cancel, .card),
             (.pairing, .pairFail, .pairing), (.pairing, .link, .pairing), (.card, .signOut, .confirmSignOut),

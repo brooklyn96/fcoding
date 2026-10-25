@@ -214,11 +214,8 @@ struct PairView: View {
 struct UnsupportedServerView: View {
     @EnvironmentObject private var app: AppState
     let address: String
-    /// Bumped when the sign-out alert closes; it only makes SwiftUI read the binding again.
-    @State private var alertClosed = 0
 
     var body: some View {
-        let _ = alertClosed   // read here so a bump redraws the card and re-reads the binding
         VStack(spacing: 20) {
             Spacer()
             Image(systemName: "exclamationmark.triangle")
@@ -247,11 +244,12 @@ struct UnsupportedServerView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(.systemBackground).ignoresSafeArea())
         .alert("Xoá đăng nhập trên iPhone này?",
-               // Rule: only the two buttons send events. The binding mirrors cardState and its
-               // setter sends nothing, so an alert closed any other way leaves .confirmSignOut and
-               // is presented again (the bump re-reads the getter). Nothing is deleted then.
+               // Rule: the buttons send their events synchronously. The setter sends nothing
+               // itself; on close it only queues .signOutCancel for the next main-loop turn. After
+               // "Xoá đăng nhập" that cancel lands in .left (absorbed), after "Huỷ" in .card (no-op),
+               // and after any other close it brings the card back. It never cleans up.
                isPresented: Binding(get: { app.cardState == .confirmSignOut },
-                                    set: { if !$0 { DispatchQueue.main.async { alertClosed &+= 1 } } })) {
+                                    set: { if !$0 { DispatchQueue.main.async { app.card(.signOutCancel) } } })) {
             Button("Xoá đăng nhập", role: .destructive) { app.card(.signOutConfirm) }
             Button("Huỷ", role: .cancel) { app.card(.signOutCancel) }
         } message: {
