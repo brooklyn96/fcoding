@@ -96,8 +96,11 @@ export function parseConfig(text) {
       publicUrl = u.origin;
     } catch { throw new Error('config.json: publicUrl invalid (want an https origin such as https://box.example.com)'); }
   }
+  // timeZone: the IANA zone of the home screen's days (today, yesterday, 30 days); never the process TZ
+  const timeZone = c.timeZone ?? DEFAULT_TZ;
+  try { if (typeof timeZone !== 'string') throw new Error('bad'); new Intl.DateTimeFormat('en-CA', { timeZone }); } catch { throw new Error('config.json: timeZone invalid (want an IANA zone such as "Asia/Ho_Chi_Minh")'); }
   return {
-    secret: Buffer.from(s, 'base64'), port: c.port, projects, publicUrl,
+    secret: Buffer.from(s, 'base64'), port: c.port, projects, publicUrl, timeZone,
     projectNames: Object.keys(projects).filter((k) => typeof projects[k] === 'string' && path.isAbsolute(projects[k])),
   };
 }
@@ -259,12 +262,15 @@ export function pairPage(appLink) {
 }
 
 // ---------- home screen v2 (CONTRACT.md A8): quota, spend, box timer, projects, updates, Codex reset ----------
-const QUOTA_TTL = 60e3, SPEND_TTL = 300e3, PROJECTS_TTL = 120e3;
+const QUOTA_TTL = 60e3, LISTING_TTL = 300e3, SPEND_TTL = 300e3, PROJECTS_TTL = 120e3;
+const HOME_WAIT_MS = 8000; // a part with no value yet is waited for this long at most, then it is empty and fills in the background
 const QUOTA_STALE_MS = 10 * 60e3; // a report omp fetched longer ago than this is stale
+const DEFAULT_TZ = 'Asia/Ho_Chi_Minh';
 export const BOX = { maxRunMinutes: 480, idlePauseMinutes: 30, cooldownMinutes: 10 };
 const BOX_TICK_MS = 30e3, BOX_GAP_MS = 90e3; // a tick that comes more than 90 s late = the box was asleep and resumed
 const SPEND_DAYS = 30, SCAN_DAYS = 31, SCAN_CHUNK = 8 << 20, MAX_LINE = 4 << 20;
-const RESET_TIMEOUT = 45e3, RESET_KEEP_MS = 15 * 60e3;
+const RESET_TIMEOUT = 45e3, RESET_KEEP_MS = 15 * 60e3, RESET_REPLY_MS = 15e3; // a reset still running after 15 s is answered 202 pending
+const RESET_FINAL = ['reset', 'already', 'nothing_to_reset', 'no_credit']; // the only answers kept for a retry with the same requestId
 const HARNESS_OF = { anthropic: 'claude', 'openai-codex': 'codex' };
 const OMP_HARNESS = { anthropic: 'claude', 'claude-agent-sdk': 'claude', 'openai-codex': 'codex' };
 const PLAN_LABELS = { free: 'Free', plus: 'Plus', pro: 'Pro', max: 'Max', team: 'Team', business: 'Business', enterprise: 'Enterprise', edu: 'Edu' };
@@ -277,17 +283,21 @@ export const PRICES = {
   'claude-sonnet-5-5': [2, 10, 0.1, 2.5, 4], 'claude-sonnet-5': [2, 10, 0.2, 2.5, 4], 'claude-sonnet-4-6': [3, 15, 0.3, 3.75, 6],
   'claude-sonnet-4-5': [3, 15, 0.3, 3.75, 6], 'claude-haiku-5-5': [0.1, 0.5, 0.01, 0.125, 0.2], 'claude-haiku-4-5': [1, 5, 0.1, 1.25, 2],
   'gpt-5.6': [4, 20, 0.4, 5], 'gpt-5.6-sol': [4, 20, 0.4, 5], 'gpt-5.6-terra': [2, 12, 0.2, 2.5], 'gpt-5.6-luna': [0.2, 1.2, 0.02, 0.25],
-  'gpt-5.5': [5, 30, 0.5], 'gpt-5.4': [2.5, 15, 0.25], 'gpt-5.4-mini': [0.75, 4.5, 0.075], 'gpt-5.3-codex': [1.75, 14, 0.175],
-  'gpt-5.2': [1.75, 14, 0.175], 'gpt-5.1': [1.25, 10, 0.125], 'gpt-5.1-codex-mini': [0.25, 2, 0.025], 'gpt-5': [1.25, 10, 0.125],
-  'gpt-5-codex': [1.25, 10, 0.125], 'gpt-5-mini': [0.25, 2, 0.025], 'gpt-5-nano': [0.05, 0.4, 0.005],
+  'gpt-5.6-cyber': [12.5, 75, 1.25, 15.625], 'gpt-5.5': [5, 30, 0.5], 'gpt-5.5-pro': [30, 180], 'gpt-5.5-cyber': [12.5, 75, 1.25],
+  'gpt-5.4': [2.5, 15, 0.25], 'gpt-5.4-pro': [30, 180], 'gpt-5.4-mini': [0.75, 4.5, 0.075], 'gpt-5.4-nano': [0.2, 1.25, 0.02],
+  'gpt-5.3-codex': [1.75, 14, 0.175], 'gpt-5.2': [1.75, 14, 0.175], 'gpt-5.2-pro': [21, 168], 'gpt-5.1': [1.25, 10, 0.125],
+  'gpt-5.1-codex-mini': [0.25, 2, 0.025], 'gpt-5': [1.25, 10, 0.125], 'gpt-5-pro': [15, 120], 'gpt-5-codex': [1.25, 10, 0.125],
+  'gpt-5-mini': [0.25, 2, 0.025], 'gpt-5-nano': [0.05, 0.4, 0.005],
 };
-// exact name, then without a date suffix, then the longest known "<name>-" prefix ("gpt-5.1-codex-max" -> gpt-5.1)
+// LiteLLM bills these suffixes at the base model's rate (gpt-5.1-codex-max = gpt-5.1, gpt-5.2-chat-latest = gpt-5.2)
+const SAME_PRICE_SUFFIX = /-(?:codex-max|codex|chat-latest|chat|search-api)$/;
+// exact name (date suffix dropped), then the base of a same-price variant; any other variant is unpriced
 export function priceOf(model) {
   if (typeof model !== 'string') return null;
   const m = model.toLowerCase().replace(/^.*\//, '').replace(/-\d{8}$|-\d{4}-\d{2}-\d{2}$/, '');
   if (Object.hasOwn(PRICES, m)) return PRICES[m];
-  const k = Object.keys(PRICES).filter((x) => m.startsWith(`${x}-`)).sort((a, b) => b.length - a.length)[0];
-  return k ? PRICES[k] : null;
+  const base = m.replace(SAME_PRICE_SUFFIX, '');
+  return base !== m && Object.hasOwn(PRICES, base) ? PRICES[base] : null;
 }
 const costOf = (p, { input = 0, output = 0, cacheRead = 0, w5m = 0, w1h = 0 }) =>
   (input * p[0] + output * p[1] + cacheRead * (p[2] ?? p[0]) + w5m * (p[3] ?? p[0]) + w1h * (p[4] ?? p[0] * 2)) / 1e6;
@@ -388,19 +398,23 @@ export function claudeLine(v) {
 export function codexLine(v, st) {
   const p = v?.payload;
   if (!p || typeof p !== 'object') return null;
-  if (v.type === 'session_meta') {
-    st.session = str(p.id) ?? st.session;
-    st.account = str(p.creator_account_id) ?? str(p.account_id) ?? st.account;
+  if (v.type === 'session_meta') { // the first one is the file's own; a forked file then repeats its parent's
+    if (st.session) return null;
+    st.session = str(p.id);
+    st.account = str(p.creator_account_id) ?? str(p.account_id);
     st.model = str(p.model) ?? st.model;
+    st.replay = !!str(p.forked_from_id); // a fork replays the parent's history before its own first turn (Pane CodexReplayGate)
     return null;
   }
   if (v.type === 'turn_context') { st.model = str(p.model) ?? st.model; return null; }
+  if (p.type === 'task_started') { st.replay = false; return null; }
   if (p.type !== 'token_count' || !p.info || typeof p.info !== 'object') return null;
   const tot = p.info.total_token_usage, last = p.info.last_token_usage;
   const totKey = tot ? JSON.stringify(tot) : null;
   if (totKey && totKey === st.prev) return null; // the same cumulative totals again: a re-emitted snapshot, not new usage
   const prevTot = st.prevTot;
   st.prev = totKey; st.prevTot = tot;
+  if (st.replay) return null; // replayed parent history: seeds the delta baseline, never counted (the parent's file counts it)
   const u = last ?? (tot && Object.fromEntries(Object.keys(tot).map((k) => [k, Math.max(0, num(tot[k]) - num(prevTot?.[k]))])));
   const ts = Date.parse(v.timestamp);
   if (!u || !Number.isFinite(ts)) return null;
@@ -409,7 +423,7 @@ export function codexLine(v, st) {
   return { ts, harness: 'codex', who: st.account ? `codex:${st.account}` : null, usd: pr ? costOf(pr, { input: input - cached, output, cacheRead: cached }) : null,
     tokens: num(u.total_tokens) || input + output, key: `x:${st.session ?? st.file}:${totKey ?? ts}` };
 }
-const PREFILTER = { omp: (l) => l.includes('"usage"'), claude: (l) => l.includes('"assistant"'), codex: (l) => /token_count|turn_context|session_meta/.test(l) };
+const PREFILTER = { omp: (l) => l.includes('"usage"'), claude: (l) => l.includes('"assistant"'), codex: (l) => /token_count|turn_context|session_meta|task_started/.test(l) };
 // Incremental: each file is read from where the last scan stopped (whole lines only); a file that shrank or was replaced is re-read.
 // Files not modified in the last 31 days are skipped; a file that disappears is dropped. Events stay per file, deduped when summed.
 export function spendScanner(roots, nowFn = Date.now) {
@@ -472,19 +486,26 @@ export function spendScanner(roots, nowFn = Date.now) {
     return [...files.values()].flatMap((f) => f.events);
   };
 }
-const dayKey = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const dayFmt = new Map();
+// "YYYY-MM-DD" of an instant in an IANA zone
+const dayKey = (ms, timeZone) => {
+  let f = dayFmt.get(timeZone);
+  if (!f) dayFmt.set(timeZone, f = new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }));
+  return f.format(ms);
+};
 const r4 = (x) => Math.round(x * 1e4) / 1e4;
 const money = ({ usd, tokens }) => ({ usd: r4(usd), tokens: Math.round(tokens) });
-// {today, yesterday, last30, weeklyEstimate, daily30}: local calendar days (the server's TZ), the last 30 ending today, oldest first.
-// weeklyEstimate (Pane): spend inside the account's "7d" window / (usedPercent / 100), from 5 % used; at >= 100 % the spend itself.
-export function spendOf(events, nowMs, weekly = null) {
+// {today, yesterday, last30, weeklyEstimate, daily30}: calendar days in timeZone (config.json, never the process TZ), the last 30
+// ending today, oldest first. weeklyEstimate (Pane): spend inside the account's "7d" window / (usedPercent / 100), from 5 % used;
+// at >= 100 % the spend itself. Only the account's own (attributed) events count: unattributed usage of the same quota is left out.
+export function spendOf(events, nowMs, weekly = null, timeZone = DEFAULT_TZ) {
   const days = [];
-  const base = new Date(nowMs);
-  for (let i = SPEND_DAYS - 1; i >= 0; i--) days.push(dayKey(new Date(base.getFullYear(), base.getMonth(), base.getDate() - i, 12)));
+  const today = Date.parse(`${dayKey(nowMs, timeZone)}T12:00:00Z`); // the date only; day arithmetic in UTC has no DST
+  for (let i = SPEND_DAYS - 1; i >= 0; i--) days.push(new Date(today - i * 86400e3).toISOString().slice(0, 10));
   const idx = new Map(days.map((k, i) => [k, i]));
   const daily = days.map((date) => ({ date, usd: 0, tokens: 0 }));
   for (const e of events) {
-    const i = idx.get(dayKey(new Date(e.ts)));
+    const i = idx.get(dayKey(e.ts, timeZone));
     if (i !== undefined && e.ts <= nowMs) { daily[i].usd += e.usd ?? 0; daily[i].tokens += e.tokens; }
   }
   const sum = daily.reduce((a, d) => ({ usd: a.usd + d.usd, tokens: a.tokens + d.tokens }), { usd: 0, tokens: 0 });
@@ -499,7 +520,8 @@ export function spendOf(events, nowMs, weekly = null) {
   return { today: money(daily[SPEND_DAYS - 1]), yesterday: money(daily[SPEND_DAYS - 2]), last30: money(sum), weeklyEstimate, daily30: daily.map((d) => ({ date: d.date, ...money(d) })) };
 }
 // events -> per-account spend (Map id -> spend) and totals. An event whose account is not known counts in its harness total only.
-export function spendView(events, accounts, byAccountId, nowMs) {
+// An account without an omp credential id (a "~hash" id: no reset listing matched it) has spend null: unknown, not $0.
+export function spendView(events, accounts, byAccountId, nowMs, timeZone = DEFAULT_TZ) {
   const keys = new Set(), uniq = [];
   for (const e of events) {
     if (e.key) { if (keys.has(e.key)) continue; keys.add(e.key); }
@@ -510,10 +532,10 @@ export function spendView(events, accounts, byAccountId, nowMs) {
     const id = e.who && (byId.has(e.who) ? e.who : byAccountId.get(e.who));
     if (id) byId.get(id).push(e);
   }
-  const perAccount = new Map(accounts.map((a) => [a.id, spendOf(byId.get(a.id), nowMs, a.windows.find((w) => w.key === '7d'))]));
+  const perAccount = new Map(accounts.map((a) => [a.id, a.resets.target ? spendOf(byId.get(a.id), nowMs, a.windows.find((w) => w.key === '7d'), timeZone) : null]));
   const harnesses = [...new Set(uniq.map((e) => e.harness))];
-  const byHarness = harnesses.map((h) => ({ harness: h, usd: spendOf(uniq.filter((e) => e.harness === h), nowMs).last30.usd })).sort((a, b) => b.usd - a.usd);
-  return { perAccount, totals: { spend: spendOf(uniq, nowMs), byHarness } };
+  const byHarness = harnesses.map((h) => ({ harness: h, usd: spendOf(uniq.filter((e) => e.harness === h), nowMs, null, timeZone).last30.usd })).sort((a, b) => b.usd - a.usd);
+  return { perAccount, totals: { spend: spendOf(uniq, nowMs, null, timeZone), byHarness } };
 }
 
 // --- projects (gh), updates (status.json), Codex reset (omp) ---
@@ -568,6 +590,7 @@ export const RESET_MSG = {
   changed: 'Lượt reset vừa thay đổi, chưa mất lượt nào. Mở lại Hạn mức rồi thử lại.',
   tool: 'Không chạy được omp trên box. Thử lại sau.',
   error: 'Không xác nhận được reset. Xem lại Hạn mức trước khi thử lại.',
+  pending: 'Reset vẫn đang chạy trên box. Xem lại Hạn mức sau ít phút.',
 };
 const RESET_RULES = [
   [/reset applied for/i, 'reset', 'reset'],
@@ -595,16 +618,38 @@ function execTool(spec, args, timeout) {
     }, (err, stdout, stderr) => (err ? reject(Object.assign(err, { stdout, stderr })) : resolve(stdout)));
   });
 }
-// one refresh at a time; within ttl the cached value; a failed refresh hands back the previous value with fresh: false
-function memo(ttl, fn, now) {
-  let value, at = -Infinity, pending = null;
+// Stale-while-revalidate, one refresh at a time. get(wait): a value younger than ttl as is; an older one at once while a refresh
+// runs in the background. With no value yet, or after clear(), the refresh is waited for at most `wait` ms; then the old value
+// (fresh: false) or, with none, a throw, and the refresh carries on. fresh is false while the last refresh failed. A failed
+// refresh is retried only `retry` ms later, not on every poll. clear() also drops a refresh started before it (its result is old).
+export function memo(ttl, fn, now, retry = ttl) {
+  let value, at = -Infinity, failedAt = -Infinity, ok = true, cleared = false, pending = null, gen = 0;
+  const refresh = () => {
+    if (pending) return pending;
+    const g = gen, started = now(); // the value is as old as the moment its refresh started
+    const p = Promise.resolve().then(fn).then((v) => { if (g === gen) { value = v; at = started; ok = true; cleared = false; } return v; },
+      (e) => { if (g === gen) { failedAt = now(); ok = false; } throw e; });
+    pending = p;
+    p.catch(() => {}).finally(() => { if (pending === p) pending = null; });
+    return p;
+  };
+  const old = (e) => { if (value === undefined) throw e; return { value, fresh: false }; };
   return {
-    async get() {
-      if (value !== undefined && now() - at < ttl) return { value, fresh: true };
-      pending ??= Promise.resolve().then(fn).then((v) => { value = v; at = now(); return v; }).finally(() => { pending = null; });
-      try { return { value: await pending, fresh: true }; } catch (e) { if (value === undefined) throw e; return { value, fresh: false }; }
+    async get(wait = Infinity) {
+      const t = now();
+      if (value !== undefined && t - at < ttl) return { value, fresh: ok };
+      const backoff = t - failedAt < retry;
+      if (value !== undefined && !cleared) { if (!backoff) refresh(); return { value, fresh: ok && !backoff }; }
+      if (backoff) return old(new Error('failed recently'));
+      const p = refresh();
+      let timer;
+      try {
+        const v = await (Number.isFinite(wait) ? Promise.race([p, new Promise((_, rej) => { timer = setTimeout(rej, wait, new Error('timeout')); })]) : p);
+        return { value: v, fresh: true };
+      } catch (e) { return old(e); } finally { clearTimeout(timer); }
     },
-    clear() { at = -Infinity; },
+    clear() { at = -Infinity; failedAt = -Infinity; cleared = true; gen++; pending = null; },
+    settled: () => Promise.resolve(pending).catch(() => {}), // the refresh running now, if any, has ended
   };
 }
 
@@ -977,6 +1022,8 @@ export function createApp(opts = {}) {
       return { now: Math.floor(now() / 1000), projects, sessions };
     } finally { reads--; ctx.held = false; }
   }
+  // the session name /api/open reuses for a project and harness
+  const openName = (project, harness) => `${project}-${harness}`.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+/, '').slice(0, 32);
   // <base>, <base>-2, <base>-3, ...: always within the 32-char name limit (base is shortened, the suffix kept)
   const freshName = (base, n) => {
     if (n === 1) return base;
@@ -1002,12 +1049,13 @@ export function createApp(opts = {}) {
   }
 
   // --- GET /api/home (A8): each part cached on its own; a failing part is empty or stale, never a 500 ---
-  let lastResetList = null; // the last good `omp usage reset --json`: credential ids survive one failed listing
+  const homeWait = opts.homeWaitMs ?? HOME_WAIT_MS, resetReplyMs = opts.resetReplyMs ?? RESET_REPLY_MS, resetTimeout = opts.resetTimeoutMs ?? RESET_TIMEOUT;
+  // `omp usage reset --json` (credential ids, reset counts) on its own longer TTL; the last good listing is kept on a failure
+  const listing = memo(LISTING_TTL, async () => JSON.parse(await execTool(ompSpec, ['usage', 'reset', '--json'], 30e3)), now, QUOTA_TTL);
   const quota = memo(QUOTA_TTL, async () => {
-    const [u, r] = await Promise.allSettled([execTool(ompSpec, ['usage', '--json'], 30e3), execTool(ompSpec, ['usage', 'reset', '--json'], 30e3)]);
+    const [u, r] = await Promise.allSettled([execTool(ompSpec, ['usage', '--json'], 30e3), listing.get(homeWait / 2)]);
     if (u.status === 'rejected') throw u.reason;
-    try { if (r.status === 'fulfilled') lastResetList = JSON.parse(r.value); } catch {}
-    return parseQuota(JSON.parse(u.value), lastResetList, now());
+    return parseQuota(JSON.parse(u.value), r.status === 'fulfilled' ? r.value.value : null, now());
   }, now);
   const scan = spendScanner(spendRoots, now);
   const spend = memo(SPEND_TTL, scan, now);
@@ -1015,7 +1063,8 @@ export function createApp(opts = {}) {
     const dir = cfg.projects[name];
     const out = { name, repo: null, branch: null, prs: null, lastRun: null };
     const git = (...a) => execTool(gitSpec, ['-C', dir, '-c', 'core.fsmonitor=false', ...a], 5000).then((s) => s.trim(), () => null);
-    const gh = (...a) => execTool(ghSpec, ['-R', out.repo, ...a], 20e3).then(JSON.parse).catch(() => null); // failed or not JSON: null
+    const ghRaw = (...a) => execTool(ghSpec, ['-R', out.repo, ...a], 20e3).then(JSON.parse);
+    const gh = (...a) => ghRaw(...a).catch(() => null); // failed or not JSON: null
     const [url, br] = await Promise.all([git('remote', 'get-url', 'origin'), git('rev-parse', '--abbrev-ref', 'HEAD')]);
     out.branch = br ? clip(cleanLine(br)) || null : null;
     out.repo = repoOf(url); // the remote URL itself (it may hold credentials) never leaves this function
@@ -1023,7 +1072,9 @@ export function createApp(opts = {}) {
     const prList = (fields) => gh('pr', 'list', '--state', 'open', '--limit', '20', '--json', fields);
     const [prs, runs] = await Promise.all([
       // a token without checks access fails the whole query with statusCheckRollup: then the list without checks (checks null)
-      prList('number,title,mergeable,statusCheckRollup').then((x) => x ?? prList('number,title,mergeable')),
+      // (a GraphQL "not accessible" error); a timeout or any other failure is not retried
+      ghRaw('pr', 'list', '--state', 'open', '--limit', '20', '--json', 'number,title,mergeable,statusCheckRollup')
+        .catch((e) => (!e.killed && /not accessible|permission|scope/i.test(e.stderr ?? '') ? prList('number,title,mergeable') : null)),
       gh('run', 'list', '--limit', '1', '--json', 'workflowName,name,status,conclusion,createdAt,url'),
     ]);
     out.prs = Array.isArray(prs) ? prsOf(prs) : null;
@@ -1042,22 +1093,25 @@ export function createApp(opts = {}) {
     return { state: 'running', sleepsAt: at > now() ? iso(at) : null, ...BOX, source: 'estimate' };
   }
   async function homeView() {
-    const [q, s, p] = await Promise.allSettled([quota.get(), spend.get(), projects.get()]);
+    // each part answers at once from its cache, or within homeWait the first time; a part not ready is empty and fills later
+    const [q, s, p] = await Promise.allSettled([quota.get(homeWait), spend.get(homeWait), projects.get(homeWait)]);
     const t = now();
     const qv = q.status === 'fulfilled' ? q.value : null;
     const accounts = qv ? qv.value.accounts.map((a) => ({ ...a, stale: a.stale || !qv.fresh })) : [];
-    const view = s.status === 'fulfilled' ? spendView(s.value.value, accounts, qv?.value.byAccountId ?? new Map(), t) : null;
+    const view = s.status === 'fulfilled' ? spendView(s.value.value, accounts, qv?.value.byAccountId ?? new Map(), t, cfg.timeZone) : null;
     let updates = {};
     try { updates = parseUpdates(fs.readFileSync(updatesFile, 'utf8')); } catch {}
     return {
       generatedAt: iso(t), box: boxInfo(),
       accounts: accounts.map((a) => ({ ...a, spend: view?.perAccount.get(a.id) ?? null })),
       totals: view?.totals ?? { spend: null, byHarness: [] },
-      projects: p.status === 'fulfilled' ? p.value.value : [],
+      // not read yet (first request, slow gh): each project with nothing known, as when gh fails
+      projects: p.status === 'fulfilled' ? p.value.value : cfg.projectNames.map((name) => ({ name, repo: null, branch: null, prs: null, lastRun: null })),
       updates,
     };
   }
-  // POST /api/codex-reset: one reset per account at a time; a retry with the same requestId gets the same answer, nothing runs twice
+  // POST /api/codex-reset: one reset per account at a time; the same requestId joins a running reset, and a final answer
+  // (RESET_FINAL) is kept 15 min for a retry with that id. An error is not kept: a retry runs omp again (omp fences its own spend).
   const resetJobs = new Map(); // accountId -> {requestId, promise}
   const resetDone = new Map(); // "accountId|requestId" -> {at, reply}
   function codexReset(accountId, requestId) {
@@ -1068,17 +1122,19 @@ export function createApp(opts = {}) {
     if (busy) return busy.requestId === requestId ? busy.promise : Promise.reject(new HttpErr(409, 'in_progress'));
     const job = (async () => { // the lock is taken before the first await
       let acct;
-      try { acct = (await quota.get()).value.accounts.find((a) => a.id === accountId); } catch { throw new HttpErr(503, 'unavailable'); }
+      try { acct = (await quota.get(homeWait)).value.accounts.find((a) => a.id === accountId); } catch { throw new HttpErr(503, 'unavailable'); }
       if (!acct) throw new HttpErr(404, 'not_found');
       if (acct.harness !== 'codex') throw new HttpErr(400, 'not_allowed');
       if (!acct.resets.target) throw new HttpErr(409, 'no_target');
       let reply;
-      try { reply = resetReply(await execTool(ompSpec, ['usage', 'reset', acct.resets.target], RESET_TIMEOUT)); } catch (e) {
-        reply = e.code === 'ENOENT' || e.killed ? { result: 'error', message: RESET_MSG.tool } : resetReply(`${e.stdout ?? ''}\n${e.stderr ?? ''}`);
+      try { reply = resetReply(await execTool(ompSpec, ['usage', 'reset', acct.resets.target], resetTimeout)); } catch (e) {
+        // killed at the timeout: the redeem may have gone out, so "not confirmed", never "omp did not run"
+        reply = e.killed ? { result: 'error', message: RESET_MSG.error } : e.code === 'ENOENT' ? { result: 'error', message: RESET_MSG.tool }
+          : resetReply(`${e.stdout ?? ''}\n${e.stderr ?? ''}`);
       }
       log(`codex-reset ${accountId} ${reply.result}`); // the account id and the result only
-      resetDone.set(doneKey, { at: now(), reply });
-      if (reply.result === 'reset' || reply.result === 'already') quota.clear();
+      if (RESET_FINAL.includes(reply.result)) resetDone.set(doneKey, { at: now(), reply });
+      quota.clear(); listing.clear(); // whatever omp answered, the next GET /api/home reads the counts again
       return reply;
     })();
     resetJobs.set(accountId, { requestId, promise: job });
@@ -1258,7 +1314,12 @@ export function createApp(opts = {}) {
       want('POST');
       const { accountId, requestId } = parseJson(req, body);
       if (typeof accountId !== 'string' || accountId.length > 128 || typeof requestId !== 'string' || !/^[A-Za-z0-9-]{8,64}$/.test(requestId)) throw new HttpErr(400, 'invalid');
-      return json(res, 200, await codexReset(accountId, requestId));
+      // omp may take up to 45 s (its own 10 s list + 15 s redeem, then our kill); the app gives up at 20 s, so a reset still
+      // running after resetReplyMs is answered 202 pending and finishes in the background (it clears the quota cache when done)
+      const job = codexReset(accountId, requestId);
+      let timer;
+      const reply = await Promise.race([job, new Promise((r) => { timer = setTimeout(r, resetReplyMs, null); })]).finally(() => clearTimeout(timer));
+      return reply ? json(res, 200, reply) : json(res, 202, { result: 'pending', message: RESET_MSG.pending });
     }
     if (pathname === '/api/meta') {
       want('GET');
@@ -1276,7 +1337,7 @@ export function createApp(opts = {}) {
       want('POST');
       const { project, harness, fresh } = parseJson(req, body);
       if (!validProject(project) || !validHarness(harness) || (fresh !== undefined && typeof fresh !== 'boolean')) throw new HttpErr(400, 'invalid');
-      const name = `${project}-${harness}`.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+/, '').slice(0, 32);
+      const name = openName(project, harness);
       if (!NAME_RE.test(name)) throw new HttpErr(400, 'invalid');
       if (fresh) { // A5 update 4: always a new session; the name is picked and created in the same job
         const picked = await mutate(ctx, async () => {
@@ -1309,6 +1370,13 @@ export function createApp(opts = {}) {
         const { name: to } = parseJson(req, body);
         if (!validName(to)) throw new HttpErr(400, 'bad_name');
         await mutate(ctx, async () => { // the server keeps no per-session state by name; the tmux options move with the session
+          // "<project>-<harness>" is the name /api/open reuses: only a session of that project and harness may take it
+          const reserved = cfg.projectNames.flatMap((p) => Object.keys(HARNESSES).map((h) => [p, h])).find(([p, h]) => openName(p, h) === to);
+          if (reserved && to !== name) {
+            const me = (await listSessions(ctx)).find((x) => x.name === name);
+            if (!me) throw new HttpErr(404, 'not_found');
+            if (me.project !== reserved[0] || me.harness !== reserved[1]) throw new HttpErr(409, 'reserved_name');
+          }
           try { await run(ctx, ['rename-session', '-t', sess(name), to]); } catch (e) {
             if (/duplicate session/i.test(e.stderr || '')) throw new HttpErr(409, 'name_taken'); // also one made outside the server meanwhile
             throw e; // a missing old name: 404 not_found
@@ -1400,7 +1468,8 @@ export function createApp(opts = {}) {
       new Promise((resolve) => (adminServer.listening ? adminServer.close(() => resolve()) : resolve())),
     ]);
   };
-  return { server, listen, close, devices, tickBox, stats: () => ({ streams, running, reads, waiting: queue.length, active: !!active }) };
+  const homeIdle = () => Promise.all([quota, listing, spend, projects].map((m) => m.settled())); // tests: no refresh still running
+  return { server, listen, close, devices, tickBox, homeIdle, stats: () => ({ streams, running, reads, waiting: queue.length, active: !!active }) };
 }
 
 // ---------- CLI ----------
