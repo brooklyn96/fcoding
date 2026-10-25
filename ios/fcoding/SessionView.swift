@@ -19,8 +19,11 @@ struct SessionView: View {
     @AppStorage("kbButtonY") private var kbY: Double = 1
     /// Live drag translation, nil when not dragging (or still under the 10 pt threshold). A
     /// GestureState resets by itself when the gesture is cancelled (a call, the app backgrounded).
-    @GestureState(resetTransaction: Transaction(animation: .spring(response: 0.3, dampingFraction: 0.8)))
-    private var kbDrag: CGSize?
+    /// Its reset glides with the snap spring, or is instant with Reduce Motion (set in init).
+    @GestureState private var kbDrag: CGSize?
+    /// This gesture moved 10 pt or more, so its release is a drag (snap), never a tap.
+    @State private var dragArmed = false
+    private static let snapSpring = Animation.spring(response: 0.3, dampingFraction: 0.8)
     /// Bumped on every send: the terminal jumps to the bottom and follows again.
     @State private var bottomRequest = 0
     @State private var stoppedInBackground = false
@@ -32,6 +35,8 @@ struct SessionView: View {
         self.harness = harness
         self.focusComposer = focusComposer
         _model = StateObject(wrappedValue: SessionModel(name: name))
+        _kbDrag = GestureState(wrappedValue: nil, resetTransaction:
+            Transaction(animation: UIAccessibility.isReduceMotionEnabled ? nil : SessionView.snapSpring))
         _composerShown = State(initialValue: focusComposer || UserDefaults.standard.bool(forKey: "composerPinned"))
     }
 
@@ -175,13 +180,25 @@ struct SessionView: View {
                             state = v.translation
                         }
                     }
+                    .onChanged { v in
+                        // kbDrag is nil only before this gesture armed, so this also resets a stale
+                        // flag from a cancelled gesture.
+                        if hypot(v.translation.width, v.translation.height) >= 10 {
+                            if !dragArmed { dragArmed = true }
+                        } else if kbDrag == nil, dragArmed {
+                            dragArmed = false
+                        }
+                    }
                     .onEnded { v in
-                        // Edge and height are committed only here; under 10 pt it was a tap.
-                        guard hypot(v.translation.width, v.translation.height) >= 10 else { showComposer(); return }
+                        // Edge and height are committed only here. A drag that came back near its
+                        // start still snaps (back); only an unarmed gesture is a tap.
+                        let armed = dragArmed
+                        dragArmed = false
+                        guard armed else { showComposer(); return }
                         let p = kbCenter(in: size, drag: v.translation)
                         let minY: CGFloat = 30, maxY = max(minY, size.height - 30)
                         // Same spring as the GestureState reset, so the button glides to the edge.
-                        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                        withAnimation(reduceMotion ? nil : SessionView.snapSpring) {
                             kbLeft = p.x < size.width / 2
                             kbY = maxY > minY ? Double((p.y - minY) / (maxY - minY)) : 1
                         }
@@ -335,7 +352,8 @@ struct TerminalView: View {
                     // Content moving down = the user scrolling up: off at once, so a streaming jump
                     // never fights the finger. Not when the content shrank (the clamp moves it) or
                     // while the bottom is still inside the viewport (the bounce settling back).
-                    if frame.minY > oldMinY, !shrank, frame.maxY > viewportHeight + 0.5 {
+                    if frame.minY > oldMinY, !shrank, frame.height > viewportHeight,
+                       frame.maxY > viewportHeight + 0.5 {
                         if scroll.atBottom { scroll.atBottom = false }
                     } else if frame.maxY <= viewportHeight + 24, !scroll.atBottom {
                         scroll.atBottom = true // landed back at the bottom
@@ -350,7 +368,8 @@ struct TerminalView: View {
             .onChange(of: bottomRequest) { _ in TerminalView.jump(scroll, proxy) }
             .onAppear { TerminalView.jump(scroll, proxy) }
             .overlay(alignment: jumpOnLeft ? .bottomLeading : .bottomTrailing) {
-                if !scroll.atBottom {
+                // Only content taller than the viewport can be away from the bottom.
+                if !scroll.atBottom, scroll.contentHeight > viewportHeight {
                     Button { TerminalView.jump(scroll, proxy, animated: true) } label: {
                         Image(systemName: "arrow.down")
                             .font(.system(size: 15, weight: .bold))
