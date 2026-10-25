@@ -354,6 +354,8 @@ export function createApp(opts = {}) {
   // constant-time: the comparison never depends on where the digits differ
   const codeMatches = (code, p) => typeof code === 'string' && /^\d{6}$/.test(code) && crypto.timingSafeEqual(Buffer.from(code), Buffer.from(p.code));
   function pair(code, name) {
+    refreshConfig(); // a config edit is seen BEFORE any code is looked up or consumed: a rotation has then already cleared every pending code
+    if (purgePending) throw new HttpErr(500, 'storage');
     const t = now();
     pendings = pendings.filter((p) => t < p.expiresAt && (p.issuer === 'shell' || devices.has(p.issuer))); // a revoked issuer's codes are dead
     const hits = pendings.map((p) => codeMatches(code, p)); // every live code is compared, none is skipped
@@ -364,8 +366,6 @@ export function createApp(opts = {}) {
     }
     const [used] = pendings.splice(i, 1); // single use, even if the write below fails
     const devName = used.name || cleanName(name) || 'device';
-    refreshConfig();
-    if (purgePending) throw new HttpErr(500, 'storage');
     const token = crypto.randomBytes(32).toString('base64url');
     const dev = { id: crypto.randomBytes(8).toString('hex'), name: devName, keyHash: keyOf(token), createdAt: t };
     try { commitDevices([...devices.values(), dev]); } catch { throw new HttpErr(500, 'storage'); }
@@ -757,8 +757,8 @@ export function createApp(opts = {}) {
       return res.end(method === 'HEAD' ? undefined : 'fcoding ok');
     }
 
+    refreshConfig(); // first thing for every route: no route may see a stale secret, device list or pending code
     if (pathname === '/pair' && (method === 'GET' || method === 'HEAD')) { // share link: no code in it; never reads or changes a pending code
-      refreshConfig(); // a config edit (publicUrl) is picked up here too
       const links = pairLinks(); // the query string is never read
       const status = links ? 200 : 503;
       const body = pairPage(links?.appLink);
@@ -772,7 +772,6 @@ export function createApp(opts = {}) {
     const seg = pathname.split('/');
     const isPair = pathname === '/api/pair';
     if (!isPair) {
-      refreshConfig(); // before deriving the key
       const tok = requestSid(req);
       ctx.device = tok && tok.length < 128 ? byKey.get(keyOf(tok)) ?? null : null;
       ctx.gen = gen;

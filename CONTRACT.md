@@ -72,7 +72,7 @@ UI requirements (frontend): Vietnamese labels; login screen; session list (creat
 - Only someone with a shell on the box can start a pairing.
   - The command is `node server.mjs --pair [device-name]`. install.sh also installs the wrapper `~/.local/bin/fcode-pair`, which runs it.
   - The CLI talks to the RUNNING server over the unix socket <configDir>/admin.sock. The socket has mode 600 and is usable by its owner only. The server creates it at start and removes a stale one.
-  - The server creates one pending pairing. Its 6-digit code comes from crypto.randomInt. The code is valid for 120 s and allows at most 5 wrong attempts. The pending codes are per issuer (changed by A7: up to 3 in all); a new --pair replaces the shell's own code.
+  - The server creates a pending pairing code for the shell issuer. Its 6-digit code comes from crypto.randomInt. The code is valid for 120 s and allows at most 5 wrong attempts. The pending codes are per issuer (changed by A7: up to 3 in all); a new --pair replaces the shell's own code.
   - The CLI prints the code and the expiry time, then exits.
   - If the server is not running, the CLI says so and exits 1.
 - POST /api/pair {code, name} requires X-PC: 1 and no other auth.
@@ -158,3 +158,4 @@ A new device can be paired with a QR code. The QR and every link carry ONLY the 
 - Pending codes (changes A4's "one pending"): each records its issuer (a device id, or `shell` for the command). One pending code per issuer: a new one replaces that issuer's own. At most 3 in all; when a 4th is made the oldest DEVICE code goes, so a device never pushes the shell code out. Each has its own expiry (120 s) and attempt count; live codes are distinct. A wrong guess (also a malformed one) is one attempt against every live code; a code with 5 is gone. /api/pair limits (10/min, 30/h) are unchanged.
 - A code dies with its issuer: `pair()` refuses a code whose issuing device is gone. Revoking a device (`--revoke <id>`, POST /api/logout) clears that device's pending codes; `--revoke all`, `logout?all=1` and a cookieSecret rotation clear ALL pending codes (the shell's too).
 - The admin socket never lets an exception escape: a failing request answers `{ok:false, error:"internal"}`.
+- A config edit is applied before any route or admin request reads auth or pairing state, and before POST /api/pair looks up or consumes a code; a cookieSecret rotation therefore clears every pending code before the next redemption.

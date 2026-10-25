@@ -1328,13 +1328,23 @@ test('pending codes: logout kills that device\'s codes; logout?all=1 clears ever
 }));
 
 test('pending codes: a cookieSecret rotation clears every pending code', () => withApp(async (c) => {
-  const { a, s, redeem } = await threeCodes(c);
+  const { a, b, s, redeem } = await threeCodes(c);
   const f = path.join(c.configDir, 'config.json');
   writePrivate(f, JSON.stringify({ ...JSON.parse(fs.readFileSync(f, 'utf8')), cookieSecret: Buffer.alloc(32, 9).toString('base64') }));
-  await c.req('GET', '/api/me'); // any request notices the new config
-  for (const x of [a, s]) assert.equal(await redeem(x), 401);
+  // NO request in between: POST /api/pair is the first thing that sees the new secret (the config is reloaded lazily)
+  for (const x of [a, b, s]) assert.equal(await redeem(x), 401, x.code); // a device code and the shell code alike
+  assert.deepEqual(devicesFile(c), []); // nothing was committed
   const p = await adminRequest(c.configDir, { cmd: 'pair' }); // and pairing works under the new secret
   assert.equal(await redeem(p), 200);
+  assert.equal(devicesFile(c).length, 1);
+}));
+
+test('pending codes: a cookieSecret rotation is seen by /api/pair-code (device 401) before a code is made', () => withApp(async (c) => {
+  const { d1, a, redeem } = await threeCodes(c);
+  const f = path.join(c.configDir, 'config.json');
+  writePrivate(f, JSON.stringify({ ...JSON.parse(fs.readFileSync(f, 'utf8')), cookieSecret: Buffer.alloc(32, 9).toString('base64') }));
+  assert.equal((await mintCode(c, d1.cookie)).status, 401); // the old device is gone before a code is made
+  assert.equal(await redeem(a), 401);
 }));
 
 test('names: cut on a code point and well-formed (63 characters + an emoji, lone surrogates, many emoji); the server survives', () => withApp(async (c) => {
