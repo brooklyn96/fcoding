@@ -86,7 +86,7 @@ final class AppState: ObservableObject {
         } catch let e as APIError where e.status == 401 {
             // Already gone on the old box.
         } catch {
-            popup ="Chưa gỡ được iPhone này khỏi máy chủ cũ \(PairLink.label(previous.base.absoluteString)); vào máy chủ cũ để gỡ."
+            popup = "Chưa gỡ được iPhone này khỏi máy chủ cũ \(PairLink.label(previous.base.absoluteString)); vào máy chủ cũ để gỡ."
         }
     }
 
