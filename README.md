@@ -274,7 +274,7 @@ fcode --list    # (hoặc -l) chỉ liệt kê, không vào
 ```
 
 - `fcode sync`: kéo code mới của 3 project về laptop, chỉ cập nhật khi đang ở main và không có thay đổi chưa lưu; liệt kê nhánh box và PR chờ merge.
-- `fcode ipa`: tải bản app mới nhất về `C:\Users\conta\FCode\fcode.ipa` (giữ bản trước là `fcode.prev.ipa`). Khi có bản mới, kéo file này vào Sideloadly và bấm Start; việc tự ký lại 7 ngày của Sideloadly chỉ gia hạn bản đang cài, không tự cập nhật. Không có `fcode` thì tải `fcode.ipa` từ **Releases** trên GitHub.
+- `fcode ipa`: tải bản app mới nhất về `Downloads\fcode.ipa` (giữ bản trước là `fcode.prev.ipa`). Khi có bản mới, kéo file này vào Sideloadly và bấm Start; việc tự ký lại 7 ngày của Sideloadly chỉ gia hạn bản đang cài, không tự cập nhật. Không có `fcode` thì tải `fcode.ipa` từ **Releases** trên GitHub.
 
 Thoát bằng **Ctrl+B** rồi **D**, phiên vẫn chạy tiếp.
 
