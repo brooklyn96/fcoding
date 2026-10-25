@@ -381,7 +381,7 @@ node -e 'console.log(require("crypto").randomBytes(32).toString("base64"))'
 ## 10. Phát triển
 
 - Máy chủ dùng **Node 22**, chỉ thư viện có sẵn (không `npm install`). Toàn bộ nằm trong `server.mjs`.
-- Hợp đồng giữa máy chủ và app nằm trong [`CONTRACT.md`](CONTRACT.md) (các mục A1 đến A6 là các thay đổi theo thời gian; mục A4 thay mật khẩu bằng ghép máy, A5 thêm hộp thư tổng quan, A6 thêm màu cho màn hình).
+- Hợp đồng giữa máy chủ và app nằm trong [`CONTRACT.md`](CONTRACT.md) (các mục A1 đến A7 là các thay đổi theo thời gian; mục A4 thay mật khẩu bằng ghép máy, A5 thêm hộp thư tổng quan, A6 thêm màu cho màn hình, A7 ghép thêm máy bằng mã QR).
 - Chạy thử trên máy bất kỳ, kể cả Windows (dùng tmux giả, không cần tmux):
 
   ```sh

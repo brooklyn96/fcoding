@@ -471,16 +471,31 @@ function Invoke-Pair {
   }
   Write-Host 'Đang tạo mã ghép trên box...'
   $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-  try { Invoke-BoxScript $FcodePairSh @($dev) | Out-Host; $code = $LASTEXITCODE }
+  $noUrl = $false; $noQr = $false
+  try {
+    # in nguyen van ra man hinh, dong thoi doc xem server co noi la chua co publicUrl / chua cai qrencode khong
+    Invoke-BoxScript $FcodePairSh @($dev) | ForEach-Object {
+      $l = "$_"
+      if ($l -match 'publicUrl') { $noUrl = $true }
+      if ($l -match 'qrencode') { $noQr = $true }
+      $l
+    } | Out-Host
+    $code = $LASTEXITCODE
+  }
   catch { Write-IpaError 'không chạy được trên box.' $_.Exception.Message; return 1 }
   finally { $ErrorActionPreference = $old }
   if ($code -ne 0) {
-    Write-Host 'lỗi: không tạo được mã ghép. Kiểm tra box đang bật, và server FCode trên box đã được cập nhật để hiện mã QR chưa.'
+    Write-Host 'lỗi: không tạo được mã ghép. Kiểm tra box đang bật, server FCode trên box đã được cập nhật để hiện mã QR chưa, hoặc publicUrl trong config.json không hợp lệ.'
     Write-Host "  (chi tiết: lệnh fcode-pair trên box thoát mã $code)"
     return 1
   }
   Write-Host ''
-  Write-Host 'Mở Camera trên iPhone mới, quét mã, rồi bấm Ghép trong app FCode.'
+  if ($noUrl -or $noQr) {
+    # khong co ma QR that su: dung noi "quet ma"
+    $why = if ($noUrl) { 'trên box chưa đặt publicUrl trong config.json' } else { 'trên box chưa cài qrencode' }
+    Write-Host "Chưa có mã QR: $why. Trên iPhone mới, mở link hoặc gõ địa chỉ máy chủ rồi nhập mã 6 số ở trên."
+  }
+  else { Write-Host 'Mở Camera trên iPhone mới, quét mã, rồi bấm Ghép trong app FCode.' }
   return 0
 }
 
