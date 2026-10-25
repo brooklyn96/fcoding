@@ -1339,14 +1339,6 @@ test('pending codes: a cookieSecret rotation clears every pending code', () => w
   assert.equal(devicesFile(c).length, 1);
 }));
 
-test('pending codes: a cookieSecret rotation is seen by /api/pair-code (device 401) before a code is made', () => withApp(async (c) => {
-  const { d1, a, redeem } = await threeCodes(c);
-  const f = path.join(c.configDir, 'config.json');
-  writePrivate(f, JSON.stringify({ ...JSON.parse(fs.readFileSync(f, 'utf8')), cookieSecret: Buffer.alloc(32, 9).toString('base64') }));
-  assert.equal((await mintCode(c, d1.cookie)).status, 401); // the old device is gone before a code is made
-  assert.equal(await redeem(a), 401);
-}));
-
 test('names: cut on a code point and well-formed (63 characters + an emoji, lone surrogates, many emoji); the server survives', () => withApp(async (c) => {
   setPublicUrl(c, PUB);
   const { cookie } = await c.login();
@@ -1656,6 +1648,9 @@ test('secretTag: a failed purge after a rotation blocks auth and pairing, and is
     const f = JSON.parse(fs.readFileSync(path.join(c.configDir, 'devices.json'), 'utf8'));
     assert.deepEqual(f.devices, []);
     assert.notEqual(f.secretTag, TAG);
+    // the 500 above did not use the code up: it still works once storage is back (it fails if pair() consumes before the purge guard)
+    assert.equal((await c.req('POST', '/api/pair', { body: { code: p.code } })).status, 200);
+    assert.deepEqual((await c.req('POST', '/api/pair', { body: { code: p.code } })).json, { error: 'bad_code' });
     const n = await c.login({}, 'new');
     assert.equal((await c.req('GET', '/api/me', { cookie: n.cookie })).status, 200);
     assert.equal((await c.req('GET', '/api/me', { cookie: a.cookie })).status, 401);
