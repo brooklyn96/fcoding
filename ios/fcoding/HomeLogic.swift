@@ -509,6 +509,18 @@ enum HomeLogic {
         return prs.isEmpty ? "không có PR mở" : "**\(prs.count)** PR đang mở"
     }
 
+    /// First line of the "Tất cả" card: the sum of the known PR counts, never a 0 that hides
+    /// projects still being read (loading) or not readable (gh failed).
+    static func allPrLine(_ projects: [HomeProject]?) -> String {
+        guard let projects = projects else { return "PR: chưa tải được" }
+        let known = projects.compactMap(\.prs)
+        let reading = projects.contains { $0.loading }
+        if known.isEmpty && !projects.isEmpty { return reading ? "đang đọc…" : "chưa đọc được GitHub" }
+        let line = "**\(known.reduce(0) { $0 + $1.count })** PR đang mở"
+        if known.count == projects.count { return line }
+        return line + (reading ? " · còn đang đọc" : " · chưa đọc được một số dự án")
+    }
+
     /// Second line of a project card: the worst PR checks result.
     static func checksLine(_ prs: [HomePR]?, branch: String?) -> (text: String, tone: Tone) {
         let checks = (prs ?? []).map(\.checks)
@@ -599,7 +611,8 @@ enum HomeLogic {
     static func codexOutcome(_ reply: CodexResetReply) -> CodexOutcome {
         let msg = reply.message?.trimmingCharacters(in: .whitespaces).isEmpty == false ? reply.message! : nil
         switch reply.result {
-        case "reset", "already": return CodexOutcome(done: true, text: msg ?? "Đã reset")
+        // Twice: the box's quota refresh after a reset may wait ~10 s for omp's listing.
+        case "reset", "already": return CodexOutcome(done: true, text: msg ?? "Đã reset", reload: [0, 12])
         case "pending": return CodexOutcome(text: "Đang reset… kết quả sẽ hiện trong Hạn mức.", reload: [5, 20, 35, 50], info: true)
         case "nothing_to_reset": return CodexOutcome(text: msg ?? "Chưa cần reset: hạn mức vẫn còn")
         case "no_credit": return CodexOutcome(text: msg ?? "Không reset được: chưa có lượt reset")
@@ -642,9 +655,11 @@ enum HomeLogic {
     static func reservedNameMessage(_ name: String, projects: [String],
                                     harnesses: [String] = ["omp", "claude", "codex", "shell"]) -> String {
         for p in projects { for h in harnesses where name == openName(p, h) {
+            // The server also reserves <project>-shell; the app offers no shell harness.
+            if h == "shell" { return "Tên này dành riêng cho máy chủ. Chọn tên khác." }
             return "Tên này dành cho phiên \(p) · \(h) mở từ dự án. Chọn tên khác."
         } }
-        for h in harnesses where name.hasSuffix("-" + h) && name.count > h.count + 1 {
+        for h in harnesses where h != "shell" && name.hasSuffix("-" + h) && name.count > h.count + 1 {
             return "Tên này dành cho phiên \(name.dropLast(h.count + 1)) · \(h) mở từ dự án. Chọn tên khác."
         }
         return "Tên này dành cho một phiên mở từ dự án. Chọn tên khác."
@@ -815,6 +830,19 @@ enum HomeLogic {
         eq("no target no reset", nt?.accounts.first?.canCodexReset, false)
         eq("no target nil", nt?.accounts.first?.resetTarget == nil, true)
         eq("no credit no reset", nt?.accounts.last?.canCodexReset, false)
+        func projects(_ json: String) -> [HomeProject] {
+            (try? JSONDecoder().decode(HomeData.self, from: Data("{\"projects\":[\(json)]}".utf8)))?.projects ?? []
+        }
+        let ld = "{\"name\":\"a\",\"prs\":null,\"loading\":true}", fail = "{\"name\":\"b\",\"prs\":null}"
+        let two = "{\"name\":\"c\",\"prs\":[{\"number\":1},{\"number\":2}]}", none = "{\"name\":\"d\",\"prs\":[]}"
+        eq("all no data", allPrLine(nil), "PR: chưa tải được")
+        eq("all loading", allPrLine(projects(ld + "," + ld)), "đang đọc…")
+        eq("all failed", allPrLine(projects(fail + "," + fail)), "chưa đọc được GitHub")
+        eq("all loading and failed", allPrLine(projects(ld + "," + fail)), "đang đọc…")
+        eq("all known", allPrLine(projects(two + "," + none)), "**2** PR đang mở")
+        eq("all part loading", allPrLine(projects(two + "," + ld + "," + fail)), "**2** PR đang mở · còn đang đọc")
+        eq("all part failed", allPrLine(projects(two + "," + fail)), "**2** PR đang mở · chưa đọc được một số dự án")
+        eq("all no projects", allPrLine([]), "**0** PR đang mở")
         eq("decode empty", (try? JSONDecoder().decode(HomeData.self, from: Data("{}".utf8)))?.accounts.count, 0)
 
         // Codex reset replies
@@ -829,7 +857,9 @@ enum HomeLogic {
         eq("codex message", codexOutcome(reply("error", "Mở codex trên box")).text, "Mở codex trên box")
         eq("codex pending", codexOutcome(reply("pending")),
            CodexOutcome(text: "Đang reset… kết quả sẽ hiện trong Hạn mức.", reload: [5, 20, 35, 50], info: true))
-        eq("codex done no reload", codexOutcome(reply("reset")).reload, [])
+        eq("codex done reloads", codexOutcome(reply("reset")).reload, [0, 12])
+        eq("codex already reloads", codexOutcome(reply("already")).reload, [0, 12])
+        eq("codex final no reload", codexOutcome(reply("nothing_to_reset")).reload, [])
         eq("codex 409 in_progress final", codexFailure(status: 409, code: "in_progress", timedOut: false),
            CodexOutcome(text: "Một lượt reset khác đang chạy cho tài khoản này. Xem lại Hạn mức sau ít giây.", reload: [0], info: true))
         eq("codex timeout final", codexFailure(status: 0, code: "timeout", timedOut: true),
@@ -839,6 +869,9 @@ enum HomeLogic {
            "Tên này dành cho phiên deal-sync · codex mở từ dự án. Chọn tên khác.")
         eq("reserved name unknown project", reservedNameMessage("web-omp", projects: []),
            "Tên này dành cho phiên web · omp mở từ dự án. Chọn tên khác.")
+        eq("reserved shell", reservedNameMessage("web-shell", projects: ["web"]), "Tên này dành riêng cho máy chủ. Chọn tên khác.")
+        eq("reserved shell unknown", reservedNameMessage("web-shell", projects: []),
+           "Tên này dành cho một phiên mở từ dự án. Chọn tên khác.")
         eq("reserved name no harness", reservedNameMessage("x", projects: []),
            "Tên này dành cho một phiên mở từ dự án. Chọn tên khác.")
         eq("open name", openName("My_App", "codex"), "my-app-codex")

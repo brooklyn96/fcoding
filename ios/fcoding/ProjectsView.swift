@@ -304,10 +304,9 @@ struct ProjectsView: View {
         let info = home.home?.projects.first { $0.name == id }
         let lines: [ProjectLine]
         if id == "all" {
-            let prs = home.home?.projects.reduce(0) { $0 + ($1.prs?.count ?? 0) }
             lines = [
                 ProjectLine(text: Text("\(projectNames.count) dự án · \(inP.count) phiên")),
-                ProjectLine(text: prs.map { Text("**\($0)** PR đang mở") } ?? Text("PR: chưa tải được")),
+                ProjectLine(text: Text(LocalizedStringKey(HomeLogic.allPrLine(home.home?.projects)))),
                 ProjectLine(text: Text(waiting > 0 ? "\(waiting) phiên chờ bạn" : "không ai chờ bạn"),
                             color: waiting > 0 ? .orangeTone : .l2),
             ]

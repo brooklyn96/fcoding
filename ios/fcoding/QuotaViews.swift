@@ -524,8 +524,8 @@ struct QuotaDetailView: View {
         .sheet(item: $resetTarget) { a in
             if a.harness == "codex" {
                 CodexResetSheet(account: a, home: home) { email in
+                    // HomeModel reloads /api/home itself (now and after 12 s).
                     toast = "Đã reset \(email)"
-                    Task { await home.load(app) }
                 }
                 .environmentObject(app)
             } else {
