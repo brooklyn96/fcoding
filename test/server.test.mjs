@@ -1879,6 +1879,26 @@ test('menu flag: a numbered menu on screen is menu:true even when a y/n line is 
 
 // ======================= v1.1: ansi=1 (SGR colours), tmux pane targets =======================
 // SGR in, SGR out: sequences that are not SGR are dropped; odd SGR forms are rewritten so a simple client parses them
+test('empty projects: meta, overview and the + flow work with no projects; install.sh no longer seeds a sample', () => withApp(async (c) => {
+  setProjects(c, {}); // what a fresh install has
+  const { cookie } = await c.login();
+  assert.deepEqual((await c.req('GET', '/api/meta', { cookie })).json.projects, []);
+  const ov = await c.req('GET', '/api/overview', { cookie });
+  assert.equal(ov.status, 200);
+  assert.deepEqual(ov.json.projects, []);
+  assert.deepEqual(ov.json.sessions, []);
+  for (const project of ['home', 'alpha']) { // nothing to open
+    assert.equal((await c.req('POST', '/api/open', { cookie, body: { project, harness: 'shell' } })).status, 400, project);
+    assert.equal((await c.req('POST', '/api/sessions', { cookie, body: { name: 'x', project, harness: 'shell' } })).status, 400, project);
+  }
+  assert.ok(!c.calls().some((x) => x.argv[0] === 'new-session'));
+  setProjects(c, { beta: ABS }); // adding one by editing config.json: picked up without a restart
+  assert.deepEqual((await c.req('GET', '/api/meta', { cookie })).json.projects, ['beta']);
+  const install = fs.readFileSync(path.join(here, '..', 'install.sh'), 'utf8');
+  assert.match(install, /projects: \{\}, port: 7681/);
+  assert.doesNotMatch(install, /projects: \{ home/);
+}));
+
 test('sgrOnly: keeps SGR only, drops every other escape sequence', () => {
   const E = ESC;
   const same = [`${E}[1;31mred${E}[0m`, `${E}[38;5;208mx${E}[39m`, `${E}[48;2;1;2;3;1mx`, `${E}[90;107mx`, 'plain text, no escapes ắ ẫ', `a${E}[31m\nb`];
