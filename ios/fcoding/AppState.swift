@@ -7,14 +7,66 @@ final class AppState: ObservableObject {
     @Published private(set) var serverURL: String
     @Published private(set) var token: String?
     @Published var notice: String?
+    /// A `fcode://pair` link (server only) waiting for the typed code and the tap on "Ghép".
+    @Published var pairLink: PairLink?
+    /// One-off message shown as an alert over whatever screen is up (link and re-pair results).
+    @Published var popup: String?
+    /// Paired by an older build to an address this build rejects (shown escaped). While set,
+    /// the app shows only the "pair again" card and sends that server nothing (`api` is nil).
+    @Published private(set) var unsupportedServer: String?
+    /// Where the card is (CardFlow); meaningful only while `unsupportedServer` is set.
+    @Published private(set) var cardState: CardFlow.State = .card
 
     private static let serverKey = "serverURL"
     private static let tokenAccount = "deviceToken"
 
     init() {
-        serverURL = UserDefaults.standard.string(forKey: AppState.serverKey) ?? ""
-        AppState.removeLegacyCredentials(server: serverURL)
-        token = serverURL.isEmpty ? nil : Keychain.get(AppState.tokenAccount)
+        // Stored as an origin only (older builds could keep a path or query). An address this
+        // build rejects is never kept in serverURL: it is shown only escaped, on the card.
+        let stored = UserDefaults.standard.string(forKey: AppState.serverKey) ?? ""
+        serverURL = PairLink.origin(stored)?.absoluteString ?? ""
+        AppState.removeLegacyCredentials(server: stored)
+        token = stored.isEmpty ? nil : Keychain.get(AppState.tokenAccount)
+        if token != nil && !PairLink.isSupportedStored(stored) {
+            unsupportedServer = PairLink.escapedAuthority(stored)
+        }
+    }
+
+    static func oldBoxLine(_ address: String) -> String {
+        "Box cũ (\(address)) vẫn còn iPhone này trong danh sách thiết bị; gỡ nó trên box đó."
+    }
+
+    /// Every card event goes through CardFlow.step. Nothing local is deleted unless a pairing
+    /// with a new server succeeds or "Đăng xuất" is confirmed; nothing is ever sent to the
+    /// unsupported server.
+    func card(_ event: CardFlow.Event) {
+        guard unsupportedServer != nil else { return }
+        let next = CardFlow.step(cardState, event)
+        cardState = next.state
+        if next.cleanup { leaveUnsupported(signingOut: event == .signOutConfirm) }
+    }
+
+    /// The ONE cleanup for leaving the card, reached only through `card(_:)`: drafts and read
+    /// marks go; on sign-out also the stored server and the old login (a successful pairing
+    /// has already replaced both). Then the old-box notice, once.
+    private func leaveUnsupported(signingOut: Bool) {
+        guard let old = unsupportedServer else { return }
+        AppState.removeDrafts()
+        UserDefaults.standard.removeObject(forKey: "inbox.seen")
+        if signingOut {
+            UserDefaults.standard.removeObject(forKey: AppState.serverKey)
+            serverURL = ""
+            Keychain.delete(AppState.tokenAccount)
+            token = nil
+        }
+        unsupportedServer = nil
+        popup = AppState.oldBoxLine(old)
+    }
+
+    /// Closing the pairing screen without pairing (Huỷ, swipe down): back to where it was.
+    func cancelPairing() {
+        pairLink = nil
+        card(.cancel)
     }
 
     /// Password-login leftovers: the old token (Keychain account "token" or UserDefaults), the
@@ -32,30 +84,59 @@ final class AppState: ObservableObject {
     }
 
     var api: API? {
-        guard let token = token, !token.isEmpty, let url = URL(string: serverURL) else { return nil }
+        guard unsupportedServer == nil, let token = token, !token.isEmpty,
+              let url = PairLink.origin(serverURL) else { return nil }
         return API(base: url, token: token)
     }
 
-    static func normalize(_ input: String) -> URL? {
-        var s = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !s.contains("://") { s = "https://" + s }
-        while s.hasSuffix("/") { s.removeLast() }
-        guard let url = URL(string: s), url.scheme?.lowercased() == "https", url.host != nil else { return nil }
-        return url
+    /// The https origin (`https://host[:port]`) of what the user typed; nil if not https.
+    nonisolated static func normalize(_ input: String) -> URL? { PairLink.origin(input) }
+
+    /// `fcode://pair?server=<https origin>` (QR / share link). Only fills the server on the
+    /// pairing screen; the user types the code and taps "Ghép".
+    func open(_ url: URL) {
+        guard url.scheme?.lowercased() == "fcode", url.host?.lowercased() == "pair" else { return }
+        guard let link = PairLink(url) else {
+            popup = "Link ghép không hợp lệ. Quét lại mã QR trên iPhone cũ."
+            return
+        }
+        if token != nil && link.server == serverURL {
+            popup = "iPhone này đã ghép với máy chủ \(PairLink.label(link.server)) rồi."
+        } else {
+            card(.link)   // from the card: only opens pairing, nothing is deleted
+            pairLink = link
+        }
     }
 
-    /// POST /api/pair {code, name}; the token from the body goes to the Keychain.
+    /// POST /api/pair {code, name}; the token from the body goes to the Keychain. On a move to
+    /// another box the old box's drafts and read marks go. A token held before is then logged
+    /// out on ITS box (never sent to the new one); a failure is reported, naming that box.
     func pair(server: String, code: String) async throws {
         guard let base = AppState.normalize(server) else { throw APIError(status: 0, code: "bad_url") }
+        let previous = api
         let data = try await API(base: base, token: "")
             .call("POST", "api/pair", body: ["code": code, "name": UIDevice.current.name])
         let reply = try JSONDecoder().decode(PairResponse.self, from: data)
         guard let newToken = reply.token, !newToken.isEmpty else { throw APIError(status: 0, code: "bad_response") }
         guard Keychain.set(newToken, for: AppState.tokenAccount) else { throw APIError(status: 0, code: "keychain") }
+        if !serverURL.isEmpty && serverURL != base.absoluteString {
+            AppState.removeDrafts()
+            UserDefaults.standard.removeObject(forKey: "inbox.seen")
+        }
         serverURL = base.absoluteString
         UserDefaults.standard.set(serverURL, forKey: AppState.serverKey)
         notice = nil
+        pairLink = nil
         token = newToken
+        card(.pairSuccess)   // from the card: the one cleanup, then the old-box notice
+        guard let previous = previous else { return }
+        do {
+            try await previous.call("POST", "api/logout")
+        } catch let e as APIError where e.status == 401 {
+            // Already gone on the old box.
+        } catch {
+            popup = "Chưa gỡ được iPhone này khỏi máy chủ cũ \(PairLink.label(previous.base.absoluteString)); vào máy chủ cũ để gỡ."
+        }
     }
 
     /// "Gỡ iPhone này": POST /api/logout. The token is deleted here even if the request fails

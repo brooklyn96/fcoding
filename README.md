@@ -27,7 +27,9 @@ Tính năng chính:
 - **Hàng phím nhanh**: Esc, Ctrl+C, mũi tên, Tab, Shift+Tab, Enter, y, n, **Agents** và **^O** (chỉ trong phiên omp), cùng nút `/` cho các lệnh hay dùng.
 - **Gõ tiếng Việt** bình thường bằng bàn phím iPhone; chữ được gửi nguyên vẹn lên box.
 - **Phiên mới bằng nút +**: chọn chương trình và dự án, luôn tạo phiên mới.
-- Ghép máy bằng **mã 6 số**, không có mật khẩu.
+- Ghép máy bằng **mã 6 số**, không có mật khẩu; iPhone mới ghép thêm được bằng **mã QR** (`fcode-pair --qr`, hoặc `fcode pair` trên laptop).
+- Lệnh **`fcode`** trên laptop Windows: vào phiên, `fcode add` (thêm dự án GitHub vào box), `fcode pair`, cài bằng một dòng lệnh.
+- Box **tự cập nhật** omp, Claude Code và Codex mỗi 6 giờ, không làm hỏng phiên đang mở.
 
 ## 2. Cách hoạt động
 
@@ -67,7 +69,8 @@ Script `install.sh` làm các việc sau, và chạy lại nhiều lần vẫn a
 2. Tạo thư mục cấu hình `/data/home/.fcoding` (quyền 700).
 3. Lần cài đầu: tạo `config.json` với một khóa bí mật ngẫu nhiên và danh sách dự án **trống** (không có dự án mẫu). Thêm dự án của bạn theo mục "Danh sách dự án" bên dưới.
 4. Cài lệnh `~/.local/bin/fcode-pair` (dùng để lấy mã ghép máy, xem [mục 6](#6-ghép-iphone-với-box)).
-5. Tạo dịch vụ systemd của người dùng tên **`fcoding`**, bật chạy cùng hệ thống, tự chạy lại khi lỗi, rồi khởi động ngay. Cổng mặc định là **7681**.
+5. Cài bộ tự cập nhật omp, Claude Code, Codex (timer chạy mỗi 6 giờ; cần `sudo` không mật khẩu, thiếu thì chỉ cảnh báo và việc cài vẫn tiếp tục). Chi tiết trong [`box/README.md`](box/README.md).
+6. Tạo dịch vụ systemd của người dùng tên **`fcoding`**, bật chạy cùng hệ thống, tự chạy lại khi lỗi, rồi khởi động ngay. Cổng mặc định là **7681**.
 
 **Cập nhật:** vào thư mục `fcoding`, chạy `git pull` rồi `bash install.sh` lại (script khởi động lại dịch vụ).
 
@@ -88,7 +91,7 @@ journalctl --user -u fcoding -n 50
 
 ### Danh sách dự án
 
-Các dự án hiện trong app nằm trong `config.json`, mục `projects`. Sau lần cài đầu mục này **trống**, nên nút **+** trong app báo "Chưa có dự án nào trong cấu hình máy chủ" cho tới khi bạn thêm dự án. Cách thêm: sửa `config.json` trên box như dưới đây. Lệnh `fcode add` trên laptop sẽ có ở bản sau. Mỗi dự án là một tên và một đường dẫn tuyệt đối trên box:
+Các dự án hiện trong app nằm trong `config.json`, mục `projects`. Sau lần cài đầu mục này **trống**, nên nút **+** trong app báo "Chưa có dự án nào trong cấu hình máy chủ" cho tới khi bạn thêm dự án. Cách thêm: chạy `fcode add <chủ/repo>` trên laptop (xem [mục 8](#8-dùng-từ-laptop)), hoặc sửa `config.json` trên box như dưới đây. Mỗi dự án là một tên và một đường dẫn tuyệt đối trên box:
 
 ```json
 {
@@ -207,7 +210,7 @@ Không cần gõ địa chỉ máy chủ: iPhone mới quét mã QR bằng Camer
    "publicUrl": "https://<địa-chỉ-công-khai>"
    ```
 
-   Máy chủ chỉ tạo link từ địa chỉ này, không bao giờ lấy từ yêu cầu gửi tới. Chưa đặt thì không tạo được link và mã QR. Máy chủ tự đọc lại file, không cần khởi động lại.
+   Địa chỉ phải là tên miền chữ không dấu có ít nhất một dấu chấm (ví dụ `box.example.com`), hoặc địa chỉ IP, và chỉ có thể kèm số cổng. Tên có chữ có dấu (`xn--…`), tên không có dấu chấm (`localhost`), chữ `_` thì app từ chối, và lệnh `fcode-pair --qr` báo "publicUrl trong config.json không hợp lệ cho app" thay vì in mã QR không dùng được. Máy chủ chỉ tạo link từ địa chỉ này, không bao giờ lấy từ yêu cầu gửi tới. Chưa đặt thì không tạo được link và mã QR. Máy chủ tự đọc lại file, không cần khởi động lại.
 2. Trên box, chạy `fcode-pair "iPhone mới" --qr`. Lệnh in mã QR (cần chương trình `qrencode`, cài bằng `sudo apt install qrencode`; thiếu thì in link và nhắc "cài qrencode để hiện mã QR"), link chia sẻ, rồi **mã 6 số cỡ lớn** và một dòng báo mã hết hạn sau 2 phút.
 3. Trên iPhone mới, mở Camera và quét mã QR. Link chia sẻ (`<địa chỉ>/pair`) gửi qua AirDrop hay Zalo cũng được: mở nó sẽ ra trang có nút **Mở FCode**. Link không có mã nên gửi cho ai cũng không lộ gì ngoài địa chỉ máy chủ.
 4. Trong app, gõ mã 6 số rồi bấm **Ghép**.
@@ -306,7 +309,9 @@ Khi điện thoại mở một phiên, app đặt kích thước cửa sổ tmux
 
 ### Lệnh `fcode` (tùy chọn)
 
-Trên máy Windows của chủ dự án có một lệnh `fcode` (PowerShell, kèm bản gọi cho Git Bash và cmd) để vào phiên nhanh hơn. Nó không nằm trong kho mã này và không bắt buộc. Để vào phiên, `fcode` gọi `instabox ssh` cho bạn; ngoài ra còn có `fcode sync` (dùng git ngay trên laptop) và `fcode ipa` (tải app về máy). Tên box lấy từ biến môi trường `FCODE_BOX`, nếu không đặt thì là `coder`.
+Lệnh `fcode` nằm trong thư mục `laptop/` của kho mã này, chạy trên PowerShell hoặc cmd của Windows và không bắt buộc. Để vào phiên, `fcode` gọi `instabox ssh` cho bạn; ngoài ra còn có `fcode sync` (dùng git ngay trên laptop), `fcode ipa` (tải app về máy), `fcode add` (thêm dự án) và `fcode pair` (ghép iPhone mới). Cách cài nằm ngay bên dưới, ở mục [Cài lệnh fcode trên máy Windows khác](#cài-lệnh-fcode-trên-máy-windows-khác).
+
+Tên box và các thư mục mà `fcode sync` cập nhật nằm trong file `%USERPROFILE%\.fcode\config.json` (mục `box`, mặc định `coder`, và mục `syncRepos`). Biến môi trường `FCODE_BOX` chỉ dùng để đổi tên box tạm thời cho một lần chạy; `FCODE_SYNC_REPOS` cũng vậy cho danh sách thư mục.
 
 ```sh
 fcode           # liệt kê các phiên, gõ số để vào
@@ -315,10 +320,57 @@ fcode web       # vào phiên theo tên (hoặc đầu tên, nếu chỉ khớp 
 fcode --list    # (hoặc -l) chỉ liệt kê, không vào
 ```
 
-- `fcode sync`: kéo code mới của 3 project về laptop, chỉ cập nhật khi đang ở main và không có thay đổi chưa lưu; liệt kê nhánh box và PR chờ merge.
-- `fcode ipa`: tải bản app mới nhất về `Downloads\fcode.ipa` (giữ bản trước là `fcode.prev.ipa`). Khi có bản mới, kéo file này vào Sideloadly và bấm Start; việc tự ký lại 7 ngày của Sideloadly chỉ gia hạn bản đang cài, không tự cập nhật. Không có `fcode` thì tải `fcode.ipa` từ **Releases** trên GitHub.
+- `fcode sync`: kéo code mới của các project trong `syncRepos` về laptop, chỉ cập nhật khi đang ở main và không có thay đổi chưa lưu; liệt kê nhánh box và PR chờ merge.
+- `fcode add <chủ/repo> [tên]`: thêm một dự án GitHub vào box để omp làm việc và hiện trong danh sách của app. Lần đầu cho mỗi repo, lệnh hướng dẫn bạn dán một khóa vào trang GitHub của repo.
+- `fcode pair [tên thiết bị]`: tạo mã ghép kèm mã QR cho iPhone mới (cần `publicUrl`, xem [mục 6](#ghép-thêm-iphone-bằng-mã-qr)).
+- `fcode ipa`: tải bản app mới nhất về `Downloads\fcode.ipa`. Khi có bản mới, kéo file này vào Sideloadly và bấm Start; việc tự ký lại 7 ngày của Sideloadly chỉ gia hạn bản đang cài, không tự cập nhật. Không có `fcode` thì tải `fcode.ipa` từ **Releases** trên GitHub.
 
 Thoát bằng **Ctrl+B** rồi **D**, phiên vẫn chạy tiếp.
+
+### Cài lệnh fcode trên máy Windows khác
+
+Mở **Windows PowerShell**: bấm nút **Start**, gõ `PowerShell`, bấm Enter (không cần chạy bằng quyền admin). Rồi dán đúng một dòng này và bấm Enter:
+
+```powershell
+irm https://raw.githubusercontent.com/brooklyn96/fcoding/main/laptop/install.ps1 | iex
+```
+
+Lệnh cài sẽ lần lượt làm các việc sau, mỗi việc một dòng trên màn hình:
+
+1. Chép lệnh `fcode` vào `%USERPROFILE%\.local\bin` và thêm thư mục đó vào PATH của bạn.
+2. Cho phép PowerShell chạy lệnh `fcode` (chế độ RemoteSigned, chỉ áp dụng cho tài khoản của bạn). Nếu máy công ty khóa việc này bằng chính sách của quản trị viên, lệnh cài báo `✗` ở dòng "Lệnh fcode" và bạn cần nhờ quản trị viên cho phép chế độ RemoteSigned (khi đó `fcode.cmd` cũng không chạy được). Nếu không bật được vì lý do khác, gõ `fcode.cmd` thay cho `fcode`.
+3. Tạo file cấu hình `%USERPROFILE%\.fcode\config.json` nếu chưa có (có rồi thì giữ nguyên).
+4. Kiểm tra **GitHub CLI** (`gh`). Máy chưa có thì tự cài. Nếu Windows hỏi quyền, bấm **Yes**; bấm No cũng được, lệnh cài sẽ tự thử cách khác không cần quyền admin.
+5. Kiểm tra **instabox**. Máy chưa có thì tải thẳng bản Windows từ trang chính thức của instabox và kiểm tra mã SHA256 của file. Không cần cài Node.js.
+6. Hướng dẫn bạn đăng nhập, **chỉ với phần chưa đăng nhập**. Bạn không phải gõ mật khẩu vào cửa sổ này.
+
+Bạn đăng nhập tối đa hai lần, theo thứ tự:
+
+- **Bước 1/2, instabox**: trình duyệt mở ra, bạn đăng nhập rồi quay lại cửa sổ PowerShell. Nếu trình duyệt không mở, gõ `instabox login --device` và làm theo mã hiện ra.
+- **Bước 2/2, GitHub**: GitHub hiện một mã 8 ký tự (dạng `ABCD-1234`). Chép mã đó, bấm Enter, dán mã vào trang GitHub vừa mở rồi bấm **Authorize**.
+
+Cuối cùng có bảng kết quả, mỗi dòng là `✓` (xong) hoặc `✗` kèm việc cần làm. Gặp `✗` thì làm theo dòng đó rồi chạy lại đúng lệnh trên; chạy lại bao nhiêu lần cũng an toàn và chỉ làm phần còn thiếu. Xong thì **mở cửa sổ PowerShell mới** (Start, gõ `PowerShell`, Enter) rồi gõ `fcode help` để xem danh sách lệnh.
+
+Nếu bạn đã tải kho mã này về máy, chạy `powershell -ExecutionPolicy Bypass -File .\laptop\install.ps1` trong thư mục kho mã cũng được.
+
+**Sửa file cấu hình.** Mở `%USERPROFILE%\.fcode\config.json` bằng Notepad:
+
+```json
+{
+  "instabox": "",
+  "box": "coder",
+  "syncRepos": ["C:/Users/ten-ban/code/du-an-1", "C:/Users/ten-ban/code/du-an-2"],
+  "ipaRepo": "brooklyn96/fcoding",
+  "ipaTag": "latest"
+}
+```
+
+- `box`: tên box mà `fcode` sẽ vào (mặc định `coder`).
+- `syncRepos`: các thư mục trên máy mà `fcode sync` cập nhật. Viết dấu gạch chéo `/` giữa các thư mục (hoặc gấp đôi dấu `\`), mỗi thư mục trong dấu ngoặc kép, cách nhau bằng dấu phẩy. Để trống `[]` nếu chưa dùng.
+- `instabox`: đường dẫn đầy đủ tới `instabox.exe`. Để trống `""` là máy tự tìm.
+- `ipaRepo`, `ipaTag`: nơi `fcode ipa` lấy file cài app iPhone. Thường không cần đổi.
+
+File này chỉ do bạn sửa; lệnh cài không bao giờ ghi đè nó. Danh sách đầy đủ các lệnh: gõ `fcode help`.
 
 ## 9. Bảo mật
 
@@ -350,7 +402,7 @@ node -e 'console.log(require("crypto").randomBytes(32).toString("base64"))'
 ## 10. Phát triển
 
 - Máy chủ dùng **Node 22**, chỉ thư viện có sẵn (không `npm install`). Toàn bộ nằm trong `server.mjs`.
-- Hợp đồng giữa máy chủ và app nằm trong [`CONTRACT.md`](CONTRACT.md) (các mục A1 đến A6 là các thay đổi theo thời gian; mục A4 thay mật khẩu bằng ghép máy, A5 thêm hộp thư tổng quan, A6 thêm màu cho màn hình).
+- Hợp đồng giữa máy chủ và app nằm trong [`CONTRACT.md`](CONTRACT.md) (các mục A1 đến A7 là các thay đổi theo thời gian; mục A4 thay mật khẩu bằng ghép máy, A5 thêm hộp thư tổng quan, A6 thêm màu cho màn hình, A7 ghép thêm máy bằng mã QR).
 - Chạy thử trên máy bất kỳ, kể cả Windows (dùng tmux giả, không cần tmux):
 
   ```sh

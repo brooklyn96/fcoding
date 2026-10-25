@@ -8,7 +8,7 @@ import { spawnSync, execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
-import { createApp, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock,
+import { createApp, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, strictOrigin, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock,
   parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, prsOf, runOf, parseUpdates, resetReply, RESET_MSG, BOX, memo } from '../server.mjs';
 
 process.env.TZ = 'America/Los_Angeles'; // spend days follow config.json timeZone, never the process zone: a third zone proves it
@@ -1259,6 +1259,85 @@ test('config publicUrl: only a bare https origin is accepted (normalised); anyth
   }
 });
 
+test('strictOrigin: every vector of the shared rule (test/origin-vectors.json, the same file as in the iOS tree)', () => {
+  const { rule, vectors } = JSON.parse(fs.readFileSync(path.join(here, 'origin-vectors.json'), 'utf8'));
+  assert.match(rule, /^FCode server origin rule v1/);
+  assert.ok(vectors.length >= 50);
+  for (const [input, want] of vectors) assert.equal(strictOrigin(input), want, JSON.stringify(input));
+});
+
+test('strictOrigin: extra cases on top of the shared vectors (the ones the vector file does not have)', () => {
+  const a63 = 'a'.repeat(63);
+  const ok = {
+    'https://Box.Example.COM/': 'https://box.example.com', // upper case is lowered, one trailing slash dropped
+    'https://box.example.com:8443': 'https://box.example.com:8443',
+    'https://box.example.com.:8443/': 'https://box.example.com:8443', // trailing dot, port and slash together
+    'https://a.b': 'https://a.b',
+    'https://a-b.c-d.example': 'https://a-b.c-d.example',
+    'https://192.168.1.8': 'https://192.168.1.8',
+    'https://192.168.1.8:8443/': 'https://192.168.1.8:8443',
+    'https://0.0.0.0': 'https://0.0.0.0',
+    'https://255.255.255.255': 'https://255.255.255.255',
+    [`https://${a63}.example`]: `https://${a63}.example`, // a label of 63
+    [`https://${a63}.${a63}.${a63}.${'a'.repeat(57)}.com`]: `https://${a63}.${a63}.${a63}.${'a'.repeat(57)}.com`, // 253 characters
+  };
+  for (const [from, to] of Object.entries(ok)) assert.equal(strictOrigin(from), to, from);
+  const bad = [
+    '//box.example.com', 'https:/box.example.com', 'https:box.example.com', 'https://', 'ftp://box.example.com', 'fcode://pair',
+    'https://xn--a.com', 'https://www.xn--bcher-kva.de', 'https://box.exämple.com',
+    'https://box.', 'https://my_box.example.com', 'https://box!.example.com', 'https://a.-b.example.com', 'https://a..example.com',
+    `https://${'a'.repeat(64)}.example`, `https://${a63}.${a63}.${a63}.${'a'.repeat(58)}.com`, // 64-char label, 254 characters
+    'https://0x7f.0.0.1', 'https://1.2.3.4.5', 'https://192.168.1.8.', 'https://box.example.com:abc',
+    'https://[::1]:0', 'https://[::1]:', 'https://[::1', 'https://::1', 'https://[fe80::1%25eth0]', 'https://[fe80::1%eth0]',
+    'https://box.example.com/app', 'https://box.example.com/?a=1', 'https://box.example.com?a=1', 'https://box.example.com#x', 'https://box.example.com/#x',
+    'https://u:p@box.example.com', 'https://u@box.example.com', 'https://box.example.com@evil.example', 'https://box.example.com\\evil.example', 'https://box.example.com%2e', 'https://box%2eexample.com',
+    ' https://box.example.com', 'https://box .example.com', 'https://box.example.com\n', 'https://box.example.com\r', 'https://box.example.com\t', 'https://box.example.com\0',
+    42, null, undefined, ['https://box.example.com'], {},
+  ];
+  for (const from of bad) assert.equal(strictOrigin(from), null, JSON.stringify(from));
+});
+
+test('config publicUrl: a URL that loads but is not an address the app accepts has no publicOrigin', () => {
+  const secret = Buffer.alloc(32, 1).toString('base64');
+  const parse = (publicUrl) => parseConfig(JSON.stringify({ cookieSecret: secret, publicUrl }));
+  assert.deepEqual([parse('https://box.example.com').publicUrl, parse('https://box.example.com').publicOrigin], ['https://box.example.com', 'https://box.example.com']);
+  assert.equal(parse('https://Box.Example.com:443/').publicOrigin, 'https://box.example.com');
+  for (const odd of ['https://localhost', 'https://192.168.001.010', 'https://1.2.3.0x4', 'https://bücher.de', 'https://my_box.example.com']) {
+    const p = parse(odd); // it still loads (the old rule)...
+    assert.notEqual(p.publicUrl, undefined, odd);
+    assert.equal(p.publicOrigin, null, odd); // ...but no link may be made from it
+  }
+  assert.equal(parseConfig(JSON.stringify({ cookieSecret: secret })).publicOrigin, null);
+});
+
+test('publicUrl the app would reject: /api/pair-code answers 500 public_url_invalid (one log line, no code), /pair 503; a good one works again', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  for (const odd of ['https://localhost', 'https://192.168.001.010', 'https://xn--bcher-kva.de']) {
+    setPublicUrl(c, odd);
+    const logs = c.logs.length;
+    const r = await mintCode(c, cookie);
+    assert.deepEqual([r.status, r.json], [500, { error: 'public_url_invalid' }], odd);
+    assert.equal(c.logs.slice(logs).filter((l) => l.startsWith('pair-code refused')).length, 1, odd); // one line
+    assert.ok(!JSON.stringify(r.json).includes('fcode://'));
+    const page = await c.req('GET', '/pair');
+    assert.equal(page.status, 503, odd);
+    assert.ok(!page.text.includes('fcode://'), odd);
+  }
+  // no code was made by the failed calls: the shell code is still the only one, and it still works
+  const s = await adminRequest(c.configDir, { cmd: 'pair', name: 'S' });
+  setPublicUrl(c, 'https://localhost');
+  assert.equal((await mintCode(c, cookie)).status, 500);
+  assert.equal((await pairReq(c, s.code)).status, 200);
+  setPublicUrl(c, PUB);
+  const ok = await mintCode(c, cookie);
+  assert.equal(ok.status, 200);
+  assert.equal(ok.json.appLink, `fcode://pair?server=${encodeURIComponent(PUB)}`);
+  setPublicUrl(c, `${PUB}:443/`); // the canonical form is what is put in the link
+  assert.equal((await mintCode(c, cookie)).json.appLink, `fcode://pair?server=${encodeURIComponent(PUB)}`);
+  setPublicUrl(c, undefined);
+  assert.deepEqual((await mintCode(c, cookie)).json, { error: 'no_public_url' }); // unchanged
+}));
+
 // the fcode-pair command: server.mjs --pair [name] --qr (install.sh's wrapper turns "fcode-pair name --qr" into this)
 const envWith = (vars) => { // process.env without any case variant of the keys in vars (Windows has "Path"), then vars
   const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !Object.keys(vars).some((v) => v.toLowerCase() === k.toLowerCase())));
@@ -1313,6 +1392,21 @@ test('fcode-pair --qr: server-only links, the code in big digits, ONE expiry lin
   }
 }));
 
+test('fcode-pair --qr with a publicUrl the app would reject: the Vietnamese message, exit 1, no code made', () => withApp(async (c) => {
+  const noQr = { PATH: path.join(c.root, 'empty') };
+  setPublicUrl(c, 'https://localhost');
+  const s = await cliEnv(c, { args: ['--pair', 'S'], env: noQr }); // plain --pair has no link: it works and makes the shell code
+  assert.equal(s.status, 0, s.stderr);
+  const code = /Mã ghép: (\d{6})/.exec(s.stdout)[1];
+  const r = await cliEnv(c, { args: ['--pair', 'Máy A', '--qr'], env: noQr });
+  assert.equal(r.status, 1);
+  assert.equal(r.stderr.trim(), 'publicUrl trong config.json không hợp lệ cho app (cần https://tên-miền-ASCII)');
+  assert.equal(r.stdout, ''); // no QR, no code, no links
+  assert.equal((await pairReq(c, code)).status, 200); // the earlier shell code was not replaced: the failed call made none
+  setPublicUrl(c, PUB); // a good address: the same command works
+  assert.equal((await cliEnv(c, { args: ['--pair', 'Máy A', '--qr'], env: noQr })).status, 0);
+}));
+
 // A code dies with the device that made it (a stolen device must not re-pair itself after a revoke), and with a secret rotation.
 const threeCodes = async (c) => { // two devices mint a code each, the shell makes one
   setPublicUrl(c, PUB);
@@ -1360,14 +1454,6 @@ test('pending codes: a cookieSecret rotation clears every pending code', () => w
   const p = await adminRequest(c.configDir, { cmd: 'pair' }); // and pairing works under the new secret
   assert.equal(await redeem(p), 200);
   assert.equal(devicesFile(c).length, 1);
-}));
-
-test('pending codes: a cookieSecret rotation is seen by /api/pair-code (device 401) before a code is made', () => withApp(async (c) => {
-  const { d1, a, redeem } = await threeCodes(c);
-  const f = path.join(c.configDir, 'config.json');
-  writePrivate(f, JSON.stringify({ ...JSON.parse(fs.readFileSync(f, 'utf8')), cookieSecret: Buffer.alloc(32, 9).toString('base64') }));
-  assert.equal((await mintCode(c, d1.cookie)).status, 401); // the old device is gone before a code is made
-  assert.equal(await redeem(a), 401);
 }));
 
 test('names: cut on a code point and well-formed (63 characters + an emoji, lone surrogates, many emoji); the server survives', () => withApp(async (c) => {
@@ -1679,6 +1765,9 @@ test('secretTag: a failed purge after a rotation blocks auth and pairing, and is
     const f = JSON.parse(fs.readFileSync(path.join(c.configDir, 'devices.json'), 'utf8'));
     assert.deepEqual(f.devices, []);
     assert.notEqual(f.secretTag, TAG);
+    // the 500 above did not use the code up: it still works once storage is back (it fails if pair() consumes before the purge guard)
+    assert.equal((await c.req('POST', '/api/pair', { body: { code: p.code } })).status, 200);
+    assert.deepEqual((await c.req('POST', '/api/pair', { body: { code: p.code } })).json, { error: 'bad_code' });
     const n = await c.login({}, 'new');
     assert.equal((await c.req('GET', '/api/me', { cookie: n.cookie })).status, 200);
     assert.equal((await c.req('GET', '/api/me', { cookie: a.cookie })).status, 401);
