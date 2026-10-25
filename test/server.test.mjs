@@ -1243,45 +1243,32 @@ test('strictOrigin: every vector of the shared rule (test/origin-vectors.json, t
   for (const [input, want] of vectors) assert.equal(strictOrigin(input), want, JSON.stringify(input));
 });
 
-test('strictOrigin: the server address a pairing link may carry (the same table as the iOS parser)', () => {
+test('strictOrigin: extra cases on top of the shared vectors (the ones the vector file does not have)', () => {
+  const a63 = 'a'.repeat(63);
   const ok = {
-    'https://box.example.com': 'https://box.example.com',
-    'https://Box.Example.COM/': 'https://box.example.com', // ASCII upper case is lowered, one trailing slash dropped
+    'https://Box.Example.COM/': 'https://box.example.com', // upper case is lowered, one trailing slash dropped
     'https://box.example.com:8443': 'https://box.example.com:8443',
-    'https://box.example.com:443': 'https://box.example.com', // 443 is left out
-    'https://box.example.com.': 'https://box.example.com', // one trailing dot is dropped
-    'https://box.example.com.:8443/': 'https://box.example.com:8443',
+    'https://box.example.com.:8443/': 'https://box.example.com:8443', // trailing dot, port and slash together
     'https://a.b': 'https://a.b',
     'https://a-b.c-d.example': 'https://a-b.c-d.example',
     'https://192.168.1.8': 'https://192.168.1.8',
     'https://192.168.1.8:8443/': 'https://192.168.1.8:8443',
     'https://0.0.0.0': 'https://0.0.0.0',
     'https://255.255.255.255': 'https://255.255.255.255',
-    'https://[::1]:8443': 'https://[::1]:8443',
-    'https://[::1]': 'https://[::1]',
-    'https://[2001:DB8::1]': 'https://[2001:db8::1]',
-    'https://[::ffff:1.2.3.4]': 'https://[::ffff:1.2.3.4]',
-    [`https://${'a'.repeat(63)}.example`]: `https://${'a'.repeat(63)}.example`, // a label of 63
-    [`https://${'a'.repeat(63)}.${'a'.repeat(63)}.${'a'.repeat(63)}.${'a'.repeat(57)}.com`]: `https://${'a'.repeat(63)}.${'a'.repeat(63)}.${'a'.repeat(63)}.${'a'.repeat(57)}.com`, // 253 characters
-    'https://box.example.com:65535': 'https://box.example.com:65535',
-    'https://box.example.com:1': 'https://box.example.com:1',
+    [`https://${a63}.example`]: `https://${a63}.example`, // a label of 63
+    [`https://${a63}.${a63}.${a63}.${'a'.repeat(57)}.com`]: `https://${a63}.${a63}.${a63}.${'a'.repeat(57)}.com`, // 253 characters
   };
   for (const [from, to] of Object.entries(ok)) assert.equal(strictOrigin(from), to, from);
   const bad = [
-    'http://box.example.com', 'box.example.com', '//box.example.com', 'https:/box.example.com', 'https:box.example.com', '', 'https://', 'ftp://box.example.com', 'fcode://pair',
-    'https://xn--bcher-kva.de', 'https://xn--a.com', 'https://www.xn--bcher-kva.de', // punycode labels
-    'https://bücher.de', 'https://\u212A.example.com', 'https://box.exämple.com', // non-ASCII (KELVIN SIGN would lower-case to "k")
-    'https://fcodebox', 'https://localhost', 'https://box.', // no dot inside the name
-    'https://my_box.example.com', 'https://box!.example.com', 'https://-a.example.com', 'https://a-.example.com', 'https://a.-b.example.com',
-    'https://a..example.com', 'https://.example.com', 'https://box.example.com..', 'https://.',
-    `https://${'a'.repeat(64)}.example`, `https://${'a'.repeat(63)}.${'a'.repeat(63)}.${'a'.repeat(63)}.${'a'.repeat(58)}.com`, // 64-char label, 254 characters
-    'https://192.168.001.010', 'https://010.0.0.1', 'https://1.2.3.0x4', 'https://0x7f.0x0.0x0.0x1', 'https://0x7f.0.0.1', 'https://1.2.3', 'https://1.2.3.4.5', 'https://256.1.1.1',
-    'https://192.168.1.8.', 'https://12345', 'https://box.123', 'https://box.0x1f', 'https://box.0x',
-    'https://box.example.com:0', 'https://box.example.com:65536', 'https://box.example.com:123456', 'https://box.example.com:abc', 'https://box.example.com:',
-    'https://[::1]:0', 'https://[::1]:', 'https://[::1]x', 'https://[::1', 'https://::1', 'https://[zz]', 'https://[]', 'https://[fe80::1%25eth0]', 'https://[fe80::1%eth0]', 'https://[1.2.3.4]',
-    'https://box.example.com/app', 'https://box.example.com//', 'https://box.example.com/?a=1', 'https://box.example.com?a=1', 'https://box.example.com#x', 'https://box.example.com/#x',
+    '//box.example.com', 'https:/box.example.com', 'https:box.example.com', 'https://', 'ftp://box.example.com', 'fcode://pair',
+    'https://xn--a.com', 'https://www.xn--bcher-kva.de', 'https://box.exämple.com',
+    'https://box.', 'https://my_box.example.com', 'https://box!.example.com', 'https://a.-b.example.com', 'https://a..example.com',
+    `https://${'a'.repeat(64)}.example`, `https://${a63}.${a63}.${a63}.${'a'.repeat(58)}.com`, // 64-char label, 254 characters
+    'https://0x7f.0.0.1', 'https://1.2.3.4.5', 'https://192.168.1.8.', 'https://box.example.com:abc',
+    'https://[::1]:0', 'https://[::1]:', 'https://[::1', 'https://::1', 'https://[fe80::1%25eth0]', 'https://[fe80::1%eth0]',
+    'https://box.example.com/app', 'https://box.example.com/?a=1', 'https://box.example.com?a=1', 'https://box.example.com#x', 'https://box.example.com/#x',
     'https://u:p@box.example.com', 'https://u@box.example.com', 'https://box.example.com@evil.example', 'https://box.example.com\\evil.example', 'https://box.example.com%2e', 'https://box%2eexample.com',
-    ' https://box.example.com', 'https://box.example.com ', 'https://box .example.com', 'https://box.example.com\n', 'https://box.example.com\r', 'https://box.example.com\t', 'https://box.example.com\0',
+    ' https://box.example.com', 'https://box .example.com', 'https://box.example.com\n', 'https://box.example.com\r', 'https://box.example.com\t', 'https://box.example.com\0',
     42, null, undefined, ['https://box.example.com'], {},
   ];
   for (const from of bad) assert.equal(strictOrigin(from), null, JSON.stringify(from));
