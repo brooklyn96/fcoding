@@ -149,6 +149,8 @@ File này do GitHub Actions tự dựng lại mỗi khi nhánh `main` thay đổ
 
 Với Apple ID miễn phí, app chỉ chạy được **7 ngày** rồi phải ký lại. Cách làm: cắm iPhone, mở Sideloadly và bấm **Start** lại với cùng file `fcode.ipa`. Cài đè bằng cùng Apple ID thì việc ghép máy vẫn được giữ, bạn không phải ghép lại. Sideloadly cũng có thể tự ký lại app sau vài ngày bằng một chương trình chạy nền trên máy tính (máy tính phải bật và kết nối được với iPhone, qua cáp hoặc cùng Wi-Fi); xem hướng dẫn của Sideloadly nếu muốn dùng.
 
+Muốn lên bản mới: chạy `fcode ipa` rồi cài file đó bằng Sideloadly (giữ nguyên ghép máy). Máy không có `fcode` thì vào **Releases** trên GitHub, tải `fcode.ipa` như ở mục "Tải file cài đặt" rồi cài bằng Sideloadly.
+
 ## 6. Ghép iPhone với box
 
 FCode không dùng mật khẩu. Chỉ người đang có quyền vào dòng lệnh của box mới ghép được máy mới. Cách làm:
@@ -217,7 +219,11 @@ Muốn dùng lại sau khi bị gỡ thì chạy `fcode-pair` trên box và ghé
 
 - Màn hình tự cuộn xuống dòng mới nhất. Nếu bạn cuộn lên để đọc, bấm **Xuống cuối** để quay lại. **A-** / **A+** đổi cỡ chữ.
 - Chấm màu báo kết nối: xanh lá là trực tiếp, vàng là cập nhật định kỳ, cam là đang kết nối, đỏ là mất kết nối.
-- Gõ vào ô nhập rồi bấm **Gửi** (gửi kèm Enter) hoặc **Gửi không Enter**. Bấm **Gửi** khi ô trống chỉ gửi một lần Enter. Nội dung đang soạn được giữ lại cho từng phiên.
+- **Ô nhập mặc định được ẩn** để màn hình rộng hơn. Chạm nút **bàn phím** tròn ở góc dưới bên phải: ô nhập hiện ra và bàn phím bật lên ngay, chỉ cần một lần chạm.
+- Gõ vào ô nhập rồi chạm nút gửi tròn ở mép phải ô: chữ được gửi kèm Enter. **Nhấn giữ** nút gửi để chọn **Gửi không Enter**. Chạm gửi khi ô trống chỉ gửi một lần Enter. Nội dung đang soạn được giữ lại cho từng phiên.
+- Gửi xong, ô nhập **tự ẩn lại**. Muốn ẩn bằng tay: chạm nút **⌄** trên ô nhập, hoặc vuốt xuống ở thanh kéo (vạch nhỏ ở đầu ô) hay nền ô nhập.
+- Nút **ghim** trên ô nhập: khi ghim, ô nhập hiện sẵn mỗi lần mở phiên và vẫn ở lại sau khi gửi. Bấm lần nữa để bỏ ghim. App nhớ lựa chọn này.
+- **Màu và biểu tượng**: màn hình hiện đúng màu của chương trình (chữ, nền, đậm, nghiêng, gạch chân), nên dễ phân biệt lỗi, phần thêm/xóa của diff hay mục đang chọn. Các biểu tượng đặc biệt (nhánh git, thư mục…) hiện đúng nhờ font Nerd Font đi kèm app. Tên phiên ở thanh trên nằm trong nhãn màu theo chương trình (claude cam, omp tím, codex xanh).
 - Hàng phím nhanh: Esc, Ctrl+C, mũi tên, Tab, ⇧Tab, Enter, y, n. Nút `/` chèn các lệnh hay dùng như `/model`, `/clear`. Phím được gửi đúng thứ tự bạn bấm.
 - Khi chuyển sang app khác, kết nối tạm dừng; mở lại là tự kết nối lại.
 
@@ -258,7 +264,7 @@ Khi điện thoại mở một phiên, app đặt kích thước cửa sổ tmux
 
 ### Lệnh `fcode` (tùy chọn)
 
-Trên máy Windows của chủ dự án có một lệnh `fcode` (PowerShell, kèm bản gọi cho Git Bash và cmd) để vào phiên nhanh hơn. Nó không nằm trong kho mã này và không bắt buộc; nó chỉ gọi `instabox ssh` một lần cho bạn. Tên box lấy từ biến môi trường `FCODE_BOX`, nếu không đặt thì là `coder`.
+Trên máy Windows của chủ dự án có một lệnh `fcode` (PowerShell, kèm bản gọi cho Git Bash và cmd) để vào phiên nhanh hơn. Nó không nằm trong kho mã này và không bắt buộc. Để vào phiên, `fcode` gọi `instabox ssh` cho bạn; ngoài ra còn có `fcode sync` (dùng git ngay trên laptop) và `fcode ipa` (tải app về máy). Tên box lấy từ biến môi trường `FCODE_BOX`, nếu không đặt thì là `coder`.
 
 ```sh
 fcode           # liệt kê các phiên, gõ số để vào
@@ -266,6 +272,9 @@ fcode 2         # vào thẳng phiên số 2
 fcode web       # vào phiên theo tên (hoặc đầu tên, nếu chỉ khớp một phiên)
 fcode --list    # (hoặc -l) chỉ liệt kê, không vào
 ```
+
+- `fcode sync`: kéo code mới của 3 project về laptop, chỉ cập nhật khi đang ở main và không có thay đổi chưa lưu; liệt kê nhánh box và PR chờ merge.
+- `fcode ipa`: tải bản app mới nhất về `C:\Users\conta\FCode\fcode.ipa` (giữ bản trước là `fcode.prev.ipa`). Khi có bản mới, kéo file này vào Sideloadly và bấm Start; việc tự ký lại 7 ngày của Sideloadly chỉ gia hạn bản đang cài, không tự cập nhật. Không có `fcode` thì tải `fcode.ipa` từ **Releases** trên GitHub.
 
 Thoát bằng **Ctrl+B** rồi **D**, phiên vẫn chạy tiếp.
 
@@ -299,7 +308,7 @@ node -e 'console.log(require("crypto").randomBytes(32).toString("base64"))'
 ## 10. Phát triển
 
 - Máy chủ dùng **Node 22**, chỉ thư viện có sẵn (không `npm install`). Toàn bộ nằm trong `server.mjs`.
-- Hợp đồng giữa máy chủ và app nằm trong [`CONTRACT.md`](CONTRACT.md) (các mục A1 đến A5 là các thay đổi theo thời gian; mục A4 thay mật khẩu bằng ghép máy, A5 thêm hộp thư tổng quan).
+- Hợp đồng giữa máy chủ và app nằm trong [`CONTRACT.md`](CONTRACT.md) (các mục A1 đến A6 là các thay đổi theo thời gian; mục A4 thay mật khẩu bằng ghép máy, A5 thêm hộp thư tổng quan, A6 thêm màu cho màn hình).
 - Chạy thử trên máy bất kỳ, kể cả Windows (dùng tmux giả, không cần tmux):
 
   ```sh

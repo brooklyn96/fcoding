@@ -4,6 +4,7 @@ import SwiftUI
 struct Route: Hashable {
     let name: String
     var reply = false
+    var harness: String? = nil
 }
 
 /// Inbox (CONTRACT A5): "Cần bạn" first, then the collapsible "Đang chạy" / "Đang nghỉ",
@@ -88,7 +89,7 @@ struct ProjectsView: View {
             }
             .refreshable { await model.load(app) }
             .safeAreaInset(edge: .bottom) { HarnessDock(selection: $harness) }
-            .navigationDestination(for: Route.self) { SessionView(name: $0.name, focusComposer: $0.reply) }
+            .navigationDestination(for: Route.self) { SessionView(name: $0.name, harness: $0.harness, focusComposer: $0.reply) }
             .task(id: polling) {
                 guard polling else { return }
                 while !Task.isCancelled {
@@ -138,7 +139,8 @@ struct ProjectsView: View {
     private func open(_ name: String, reply: Bool = false) {
         model.markRead(name)
         lastOpened = name
-        path.append(Route(name: name, reply: reply))
+        let known = allSessions.first { $0.name == name }
+        path.append(Route(name: name, reply: reply, harness: known.map { $0.harness ?? "shell" }))
     }
 
     // MARK: - Header: subtitle + project chips
