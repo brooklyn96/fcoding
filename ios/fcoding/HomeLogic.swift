@@ -138,6 +138,8 @@ struct QuotaAccount: Decodable, Identifiable {
     var rateLimited = false
     var windows: [QuotaWindow] = []
     var resetsAvailable = 0
+    /// `resets.target`: the omp reset target; null while the account has no listing match.
+    var resetTarget: String?
     var spend: Spend?
 
     init(id: String, harness: String, email: String, plan: String?, windows: [QuotaWindow]) {
@@ -149,7 +151,7 @@ struct QuotaAccount: Decodable, Identifiable {
     }
 
     private enum K: String, CodingKey { case id, harness, email, org, plan, fetchedAt, stale, rateLimited, windows, resets, spend }
-    private enum R: String, CodingKey { case available }
+    private enum R: String, CodingKey { case available, target }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: K.self)
         email = c.value(.email) ?? ""
@@ -161,13 +163,16 @@ struct QuotaAccount: Decodable, Identifiable {
         stale = c.value(.stale) ?? false
         rateLimited = c.value(.rateLimited) ?? false
         windows = c.list(.windows)
-        resetsAvailable = (try? c.nestedContainer(keyedBy: R.self, forKey: .resets))
-            .flatMap { r -> Int? in (try? r.decodeIfPresent(Int.self, forKey: .available)) ?? nil } ?? 0
+        let resets = try? c.nestedContainer(keyedBy: R.self, forKey: .resets)
+        resetsAvailable = resets.flatMap { r -> Int? in (try? r.decodeIfPresent(Int.self, forKey: .available)) ?? nil } ?? 0
+        resetTarget = resets.flatMap { r -> String? in (try? r.decodeIfPresent(String.self, forKey: .target)) ?? nil }
         spend = c.value(.spend)
     }
 
     /// Windows with a value; "not reported" ones are hidden (never branch on plan).
     var shown: [QuotaWindow] { windows.filter { $0.usedPercent != nil } }
+    /// Codex "Reset" is offered only with a reset target and a credit left.
+    var canCodexReset: Bool { harness == "codex" && resetTarget != nil && resetsAvailable > 0 }
     /// A weekly-or-longer window exists, so the weekly estimate row is shown.
     var hasWeekly: Bool { shown.contains { ($0.periodSeconds ?? 0) >= 6 * 86400 } }
 }
@@ -779,7 +784,7 @@ enum HomeLogic {
         // Lenient decoding
         let json = """
         {"box":{"state":"running","sleepsAt":"2027-01-15T10:00:00.000Z","maxRunMinutes":480},
-         "accounts":[{"id":"x","harness":"Codex","email":"e@x","windows":[{"key":"5h","label":"5 giờ","usedPercent":18,"resetsAt":"2027-01-15T09:00:00Z","periodSeconds":18000},{"key":"7d","label":"7 ngày","usedPercent":null}],"resets":{"available":1},"spend":{"today":{"usd":3.1,"tokens":8200000},"daily30":[{"date":"2027-01-02","usd":1,"tokens":2},{"date":"2027-01-01","usd":1,"tokens":1}]}},
+         "accounts":[{"id":"x","harness":"Codex","email":"e@x","windows":[{"key":"5h","label":"5 giờ","usedPercent":18,"resetsAt":"2027-01-15T09:00:00Z","periodSeconds":18000},{"key":"7d","label":"7 ngày","usedPercent":null}],"resets":{"available":1,"target":"openai-codex/4"},"spend":{"today":{"usd":3.1,"tokens":8200000},"daily30":[{"date":"2027-01-02","usd":1,"tokens":2},{"date":"2027-01-01","usd":1,"tokens":1}]}},
                      {"harness":5}],
          "projects":[{"name":"deal-sync","prs":null,"lastRun":null},{"name":"c","repo":null,"branch":null,"prs":null,"lastRun":null,"loading":true},{"name":"b","prs":[{"number":6,"checks":"failure"}]}],
          "totals":"broken"}
@@ -789,6 +794,8 @@ enum HomeLogic {
             eq("decode harness", h.accounts.first?.harness, "codex")
             eq("decode shown", h.accounts.first?.shown.count, 1)
             eq("decode resets", h.accounts.first?.resetsAvailable, 1)
+            eq("decode reset target", h.accounts.first?.resetTarget, "openai-codex/4")
+            eq("codex reset offered", h.accounts.first?.canCodexReset, true)
             eq("decode daily sorted", h.accounts.first?.spend?.daily30.map(\.tokens), [1, 2])
             eq("decode bad totals", h.totals == nil, true)
             eq("decode prs null", h.projects.first?.prs == nil, true)
@@ -800,6 +807,14 @@ enum HomeLogic {
         } else {
             failures.append("decode: lenient JSON failed")
         }
+        let noTarget = """
+        {"accounts":[{"id":"openai-codex/~1a2b3c4d","harness":"codex","email":"e@x","resets":{"available":2,"target":null}},
+                     {"id":"openai-codex/4","harness":"codex","email":"f@x","resets":{"available":0,"target":"openai-codex/4"}}]}
+        """
+        let nt = try? JSONDecoder().decode(HomeData.self, from: Data(noTarget.utf8))
+        eq("no target no reset", nt?.accounts.first?.canCodexReset, false)
+        eq("no target nil", nt?.accounts.first?.resetTarget == nil, true)
+        eq("no credit no reset", nt?.accounts.last?.canCodexReset, false)
         eq("decode empty", (try? JSONDecoder().decode(HomeData.self, from: Data("{}".utf8)))?.accounts.count, 0)
 
         // Codex reset replies

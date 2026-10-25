@@ -676,7 +676,7 @@ private struct AccountCard: View {
 
     var body: some View {
         let h = account.harness
-        let canReset = error == nil && (h == "claude" || (h == "codex" && account.resetsAvailable > 0))
+        let canReset = error == nil && (h == "claude" || account.canCodexReset)
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 6) {
                 HarnessGlyph(harness: h, size: 16).foregroundColor(HarnessStyle.color(h))
