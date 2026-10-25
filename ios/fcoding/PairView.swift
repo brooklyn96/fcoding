@@ -33,6 +33,15 @@ struct PairView: View {
 
     var body: some View {
         Form {
+            // The header scrolls with the content (only harness session screens freeze theirs).
+            FormHeader(title: "Ghép máy") {
+                // Re-pair from a link while paired: a way back without pairing.
+                if app.token != nil {
+                    HeaderTextButton(title: "Huỷ") { app.cancelPairing() }.disabled(busy)
+                }
+            } trailing: {
+                HeaderIconButton(symbol: "questionmark.circle", label: "Hướng dẫn") { showGuide = true }
+            }
             if asking {
                 Section {
                     Text("Thiết bị này đã ghép. Ghép lại với máy chủ mới?").font(.headline)
@@ -46,20 +55,9 @@ struct PairView: View {
             }
         }
         .navigationTitle("Ghép máy")
-        .navigationBarTitleDisplayMode(.large)
+        .toolbar(.hidden, for: .navigationBar)
+        .scrollIndicators(.hidden)
         .scrollDismissesKeyboard(.interactively)
-        .toolbar {
-            // Re-pair from a link while paired: a way back without pairing.
-            if app.token != nil {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Huỷ") { app.cancelPairing() }.disabled(busy)
-                }
-            }
-            ToolbarItem(placement: .navigationBarTrailing) {
-                Button { showGuide = true } label: { Image(systemName: "questionmark.circle") }
-                    .accessibilityLabel("Hướng dẫn")
-            }
-        }
         .sheet(isPresented: $showGuide) { PairGuideView() }
         .interactiveDismissDisabled(busy)
         .onAppear {
@@ -295,6 +293,11 @@ struct PairGuideView: View {
     var body: some View {
         NavigationStack {
             List {
+                FormHeader(title: "Hướng dẫn") {
+                    EmptyView()
+                } trailing: {
+                    HeaderTextButton(title: "Đóng", bold: true) { dismiss() }
+                }
                 ForEach(topics, id: \.title) { topic in
                     Section(topic.title) {
                         ForEach(Array(topic.steps.enumerated()), id: \.offset) { i, step in
@@ -307,10 +310,8 @@ struct PairGuideView: View {
                 }
             }
             .navigationTitle("Hướng dẫn")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) { Button("Đóng") { dismiss() } }
-            }
+            .toolbar(.hidden, for: .navigationBar)
+            .scrollIndicators(.hidden)
         }
         .preferredColorScheme(.dark)
     }
