@@ -19,6 +19,8 @@ struct SessionView: View {
     @AppStorage("kbButtonY") private var kbY: Double = 1
     /// Bumped on every send: the terminal jumps to the bottom and follows again.
     @State private var bottomRequest = 0
+    /// Bumped when the app comes back to the foreground: pin the terminal to the bottom again.
+    @State private var pinRequest = 0
     @State private var stoppedInBackground = false
     /// "Trả lời" from the inbox: open and focus the composer when the view appears.
     private let focusComposer: Bool
@@ -40,6 +42,8 @@ struct SessionView: View {
             GeometryReader { geo in
                 TerminalView(model: model, fontSize: fontSize, viewportHeight: geo.size.height,
                              bottomRequest: bottomRequest,
+                             pinRequest: pinRequest,
+                             joinWraps: chipHarness == "omp",
                              // Never under the keyboard button: the opposite edge while it shows.
                              jumpOnLeft: !composerShown && !kbLeft)
             }
@@ -125,12 +129,16 @@ struct SessionView: View {
         .onDisappear { model.stop() }
         .onChange(of: scenePhase) { phase in
             // Background: close the stream and polling so the server frees its slot.
-            // Back to active: restart only if it was the background that stopped it.
+            // Back to active from the background: restart and pin to the bottom again. Not after
+            // .inactive alone (Control Center, app switcher peek, paste prompt, Face ID): a
+            // scrolled-up view never moves.
             if phase == .background {
                 model.stop()
                 stoppedInBackground = true
-            } else if phase == .active, stoppedInBackground {
+            }
+            if phase == .active, stoppedInBackground {
                 stoppedInBackground = false
+                pinRequest += 1
                 model.restart()
             }
         }
@@ -315,6 +323,15 @@ final class ScrollState: ObservableObject {
     var minY: CGFloat = 0
     /// Until then, offset changes come from our own animated scroll-to-bottom, not from the user.
     var programmaticUntil = Date.distantPast
+    /// After opening or returning to the session: held at the bottom until the user's first scroll.
+    /// While pinned, every size change and every frame that is not at the bottom jumps again, so a
+    /// jump that landed short (layout still settling) is corrected.
+    var pinned = true
+    /// Layout settling after a pin: offset changes then are not the user's. Ends early once a jump
+    /// has landed, or on a move bigger than a jump's correction (a real drag).
+    var settleUntil = Date.distantPast
+    /// How far the last pinned jump had to move the content (pt).
+    var correction: CGFloat = 0
 }
 
 /// Monospaced, selectable, coloured screen text.
@@ -331,6 +348,10 @@ struct TerminalView: View {
     let viewportHeight: CGFloat
     /// Changes on every send: jump to the bottom and follow again.
     var bottomRequest = 0
+    /// Changes when the app returns to the foreground: pin to the bottom again.
+    var pinRequest = 0
+    /// omp session: join URLs that omp hard-wraps across lines.
+    var joinWraps = false
     /// Put the jump button on the left (the keyboard button is on the right).
     var jumpOnLeft = false
     @StateObject private var scroll = ScrollState()
@@ -350,13 +371,20 @@ struct TerminalView: View {
         }
     }
 
+    /// Open / return: atBottom on and pinned until the user's first scroll.
+    private static func pin(_ scroll: ScrollState, _ proxy: ScrollViewProxy) {
+        scroll.pinned = true
+        scroll.settleUntil = Date().addingTimeInterval(0.8)
+        jump(scroll, proxy)
+    }
+
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: 0) {
                     // Every run of the styled text carries its own font and colour; these two
                     // modifiers only style the loading line.
-                    Text(model.text.isEmpty ? AttributedString("Đang tải màn hình…") : model.styled(fontSize: fontSize))
+                    Text(model.text.isEmpty ? AttributedString("Đang tải màn hình…") : model.styled(fontSize: fontSize, joinWraps: joinWraps))
                         .font(.system(size: CGFloat(fontSize), design: .monospaced))
                         .foregroundColor(.gray)
                         .textSelection(.enabled)
@@ -380,25 +408,42 @@ struct TerminalView: View {
                 let shrank = frame.height < scroll.contentHeight
                 scroll.minY = frame.minY
                 scroll.contentHeight = frame.height
-                if moved, Date() >= scroll.programmaticUntil {
+                let nearBottom = frame.maxY <= viewportHeight + 24
+                if Date() < scroll.settleUntil, Date() >= scroll.programmaticUntil,
+                   nearBottom || (!shrank && frame.minY - oldMinY > max(scroll.correction, 24)) {
+                    // Landed at the bottom, or the content moved down further than a jump would
+                    // correct (the user dragging): settling is over, the normal unpin rule applies.
+                    scroll.settleUntil = .distantPast
+                }
+                if moved, Date() >= max(scroll.programmaticUntil, scroll.settleUntil) {
                     // Content moving down = the user scrolling up: off at once, so a streaming jump
                     // never fights the finger. Not when the content shrank (the clamp moves it) or
                     // while the bottom is still inside the viewport (the bounce settling back).
                     if frame.minY > oldMinY, !shrank, frame.height > viewportHeight,
                        frame.maxY > viewportHeight + 0.5 {
+                        scroll.pinned = false // the user's first scroll ends the pinned phase
                         if scroll.atBottom { scroll.atBottom = false }
-                    } else if frame.maxY <= viewportHeight + 24, !scroll.atBottom {
+                    } else if nearBottom, !scroll.atBottom {
                         scroll.atBottom = true // landed back at the bottom
                     }
                 }
-                // Decided by the state from before this update; scrolled up = never moved.
-                if grew, scroll.atBottom { TerminalView.jump(scroll, proxy) }
+                if scroll.pinned {
+                    // Any size change, or a landing short of the bottom: jump (again).
+                    if grew || !nearBottom {
+                        scroll.correction = max(0, frame.maxY - viewportHeight)
+                        TerminalView.jump(scroll, proxy)
+                    }
+                } else if grew, scroll.atBottom {
+                    // Decided by the state from before this update; scrolled up = never moved.
+                    TerminalView.jump(scroll, proxy)
+                }
             }
             .onChange(of: viewportHeight) { _ in
                 if scroll.atBottom { TerminalView.jump(scroll, proxy) }
             }
             .onChange(of: bottomRequest) { _ in TerminalView.jump(scroll, proxy) }
-            .onAppear { TerminalView.jump(scroll, proxy) }
+            .onChange(of: pinRequest) { _ in TerminalView.pin(scroll, proxy) }
+            .onAppear { TerminalView.pin(scroll, proxy) }
             .overlay(alignment: jumpOnLeft ? .bottomLeading : .bottomTrailing) {
                 // Only content taller than the viewport can be away from the bottom.
                 if !scroll.atBottom, scroll.contentHeight > viewportHeight {

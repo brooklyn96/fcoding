@@ -30,13 +30,22 @@ final class SessionModel: ObservableObject {
 
     init(name: String) { self.name = name }
 
-    private var styledCache: (text: String, fontSize: Double, value: AttributedString)?
+    private var styledCache: (text: String, fontSize: Double, cols: Int, joinWraps: Bool, value: AttributedString)?
+    /// Width of the screen in cells (from the server, else the last size sent), for joining
+    /// hard-wrapped links.
+    private var screenCols = 0
 
-    /// The screen text with its SGR colours, parsed once per text and font size.
-    func styled(fontSize: Double) -> AttributedString {
-        if let c = styledCache, c.fontSize == fontSize, c.text == text { return c.value }
-        let value = ANSI.attributed(ANSI.runs(text), fonts: ANSI.Fonts(size: CGFloat(fontSize)))
-        styledCache = (text, fontSize, value)
+    /// The screen text with its SGR colours and tappable links, built once per screen update
+    /// (text, font size, width), not per frame.
+    /// `joinWraps`: join URLs hard-wrapped across lines (omp sessions only).
+    func styled(fontSize: Double, joinWraps: Bool) -> AttributedString {
+        if let c = styledCache, c.fontSize == fontSize, c.cols == screenCols, c.joinWraps == joinWraps, c.text == text {
+            return c.value
+        }
+        let runs = ANSI.runs(text)
+        var value = ANSI.attributed(runs, fonts: ANSI.Fonts(size: CGFloat(fontSize)))
+        Links.apply(Links.find(in: runs.map(\.text).joined(), cols: screenCols, joinWraps: joinWraps), to: &value)
+        styledCache = (text, fontSize, screenCols, joinWraps, value)
         return value
     }
 
@@ -160,6 +169,7 @@ final class SessionModel: ObservableObject {
         guard let screen = try? JSONDecoder().decode(Screen.self, from: data) else { return }
         if screen.hash == nil || screen.hash != lastHash {
             lastHash = screen.hash
+            screenCols = screen.cols ?? sentCols
             if text != screen.text { text = screen.text }
         }
     }
