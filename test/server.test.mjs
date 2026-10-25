@@ -3060,9 +3060,13 @@ test('after a reset the quota waits for the new listing; a listing that is late 
   assert.deepEqual([cx.resets.available, cx.stale], [0, false]);
 }, { homeWaitMs: 400, listAfterResetMs: 4000 }));
 
-test('box timer: kept across a server restart within 90 s of the last tick (box-timer.json), a new run after a longer gap', async () => {
+test('box timer: kept across a server restart within 90 s of the last tick on the same boot (box-timer.json); a longer gap or a reboot is a new run', async () => {
   const clock = { t: T0 };
-  const a = await boot({ now: () => clock.t });
+  const bootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-boot-'));
+  const bootIdFile = path.join(bootDir, 'boot_id');
+  fs.writeFileSync(bootIdFile, 'boot-aaaa\n');
+  const start = (o = {}) => boot({ bootIdFile, ...o });
+  const a = await start({ now: () => clock.t });
   const sleeps = async (c) => { const { cookie } = await c.login(); return (await c.req('GET', '/api/home', { cookie })).json.box.sleepsAt; };
   try {
     clock.t += 30e3; a.app.tickBox();
@@ -3070,20 +3074,40 @@ test('box timer: kept across a server restart within 90 s of the last tick (box-
     const before = await sleeps(a);
     assert.equal(before, new Date(T0 + 480 * 60e3).toISOString());
     const stored = JSON.parse(fs.readFileSync(path.join(a.configDir, 'box-timer.json'), 'utf8'));
-    assert.deepEqual(stored, { resume: T0, tick: T0 + 60e3 });
+    assert.deepEqual(stored, { resume: T0, tick: T0 + 60e3, boot: 'boot-aaaa' });
     if (process.platform !== 'win32') assert.equal(fs.statSync(path.join(a.configDir, 'box-timer.json')).mode & 0o777, 0o600);
     await a.app.close(); // the config dir (and box-timer.json) stays
     clock.t += 45e3; // restarted 45 s after the last tick (reinstall, crash, systemctl restart)
-    const b = await boot({ now: () => clock.t, configDir: a.configDir });
+    const b = await start({ now: () => clock.t, configDir: a.configDir });
     try { assert.equal(await sleeps(b), before); } finally { await b.close(); }
     clock.t += 91e3; // stopped longer than 90 s (b ticked once at its start): the box slept, a new run
-    const c = await boot({ now: () => clock.t, configDir: a.configDir });
+    const c = await start({ now: () => clock.t, configDir: a.configDir });
     try { assert.equal(await sleeps(c), new Date(clock.t + 480 * 60e3).toISOString()); } finally { await c.close(); }
     fs.writeFileSync(path.join(a.configDir, 'box-timer.json'), 'not json');
     clock.t += 1e3;
-    const d = await boot({ now: () => clock.t, configDir: a.configDir });
+    const d = await start({ now: () => clock.t, configDir: a.configDir });
     try { assert.equal(await sleeps(d), new Date(clock.t + 480 * 60e3).toISOString()); } finally { await d.close(); }
-  } finally { await a.close(); }
+    // d left a fresh run in the file; a restart 10 s later on another boot (the box rebooted): a new run, not d's resume
+    const dRun = JSON.parse(fs.readFileSync(path.join(a.configDir, 'box-timer.json'), 'utf8')).resume;
+    clock.t += 10e3;
+    fs.writeFileSync(bootIdFile, 'boot-bbbb\n');
+    const e = await start({ now: () => clock.t, configDir: a.configDir });
+    try {
+      assert.equal(await sleeps(e), new Date(clock.t + 480 * 60e3).toISOString());
+      assert.notEqual(clock.t, dRun);
+    } finally { await e.close(); }
+    // no boot_id at all (not Linux): null on both sides still matches
+    clock.t += 10e3;
+    const noBoot = path.join(bootDir, 'missing');
+    const f = await start({ now: () => clock.t, configDir: a.configDir, bootIdFile: noBoot });
+    const fRun = clock.t;
+    await f.app.close();
+    assert.equal(JSON.parse(fs.readFileSync(path.join(a.configDir, 'box-timer.json'), 'utf8')).boot, null);
+    clock.t += 20e3;
+    const g = await start({ now: () => clock.t, configDir: a.configDir, bootIdFile: noBoot });
+    try { assert.equal(await sleeps(g), new Date(fRun + 480 * 60e3).toISOString()); } finally { await g.close(); }
+    await f.close();
+  } finally { await a.close(); fs.rmSync(bootDir, { recursive: true, force: true }); }
 });
 
 test('POST /api/codex-reset: a slow reset is answered 202 pending; it finishes in the background and clears the quota cache', () => homeApp(async (c) => {

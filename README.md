@@ -118,7 +118,7 @@ Màn hình chính của app lấy mọi thứ từ một địa chỉ của máy
 | Chi phí và số token | file nhật ký trên box: `~/.omp/agent/sessions`, `~/.claude/projects`, `~/.codex/sessions` | mỗi 5 phút, chỉ đọc phần mới thêm |
 | Pull request, CI | `gh` theo kho GitHub của từng dự án trong `config.json` | mỗi 2 phút |
 | Phiên bản công cụ | `~/.local/state/fcode-update/status.json` (omp, claude, codex) | mỗi lần mở |
-| Giờ box ngủ | ước tính: lần box thức dậy gần nhất + 8 giờ (vẫn giữ đúng khi máy chủ khởi động lại, nhờ file `~/.fcoding/box-timer.json`) | luôn |
+| Giờ box ngủ | ước tính: lần box thức dậy gần nhất + 8 giờ (vẫn giữ đúng khi máy chủ khởi động lại, nhờ file `~/.fcoding/box-timer.json`; box khởi động lại thì tính lại từ đầu) | luôn |
 
 - Một phần bị lỗi (ví dụ `gh` chưa đăng nhập) thì phần đó trống, các phần khác vẫn hiện. Hạn mức cũ được đánh dấu "cũ" nếu không làm mới được.
 - Màn hình chính luôn trả lời nhanh: phần nào đã có thì hiện ngay và được làm mới ở nền. Lần mở đầu tiên sau khi máy chủ khởi động, phần nào chưa đọc xong trong 8 giây thì tạm trống và hiện ở lần tải sau.

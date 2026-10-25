@@ -1137,19 +1137,24 @@ export function createApp(opts = {}) {
   }
   const projects = memo(PROJECTS_TTL, () => Promise.all(cfg.projectNames.map(projectInfo)), now);
   // box timer (estimate, no API key): the last resume = a 30 s tick that came more than 90 s late, or the start of a box run.
-  // {resume, tick} is kept in box-timer.json on every 30 s tick, so a server restart (reinstall, crash, systemctl restart) within
-  // 90 s of the last tick keeps the run's resume; an older or missing file means the box itself was asleep or stopped: resume = now.
+  // {resume, tick, boot} is kept in box-timer.json on every 30 s tick, so a server restart (reinstall, crash, systemctl restart)
+  // within 90 s of the last tick, on the same boot, keeps the run's resume. An older or missing file means the box was asleep or
+  // stopped; another boot (Linux boot_id; null where there is none) is a reboot: both are a new run (resume = now).
+  // An instabox pause keeps the boot_id, so the 90 s tick gap is what catches it.
   const boxFile = path.join(configDir, 'box-timer.json');
+  let boot = null;
+  try { boot = fs.readFileSync(opts.bootIdFile ?? '/proc/sys/kernel/random/boot_id', 'utf8').trim() || null; } catch {}
   let boxResume = now(), boxTick = now();
   try {
     const b = JSON.parse(fs.readFileSync(boxFile, 'utf8'));
     const age = boxTick - b?.tick;
-    if (Number.isFinite(b?.resume) && Number.isFinite(b?.tick) && b.resume <= b.tick && age >= 0 && age < BOX_GAP_MS) boxResume = b.resume;
+    if (Number.isFinite(b?.resume) && Number.isFinite(b?.tick) && b.resume <= b.tick && age >= 0 && age < BOX_GAP_MS
+      && (b.boot ?? null) === boot) boxResume = b.resume;
   } catch {} // no file or a bad one: a new run
   const tick = () => { const t = now(); if (t - boxTick > BOX_GAP_MS) boxResume = t; boxTick = t; };
   const tickBox = () => { // the 30 s tick: also stored (a failed write only loses the restart memory)
     tick();
-    try { writeFile(boxFile, JSON.stringify({ resume: boxResume, tick: boxTick })); } catch {}
+    try { writeFile(boxFile, JSON.stringify({ resume: boxResume, tick: boxTick, boot })); } catch {}
   };
   tickBox();
   const boxTimer = setInterval(tickBox, BOX_TICK_MS);
