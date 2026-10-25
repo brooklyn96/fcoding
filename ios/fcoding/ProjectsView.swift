@@ -88,6 +88,7 @@ struct ProjectsView: View {
                 .overlay(alignment: .bottomTrailing) { fab }
                 .overlay(alignment: .top) { StatusBarCover() }
                 .overlay(alignment: .top) { ToastView(text: $toast) }
+                .background(SwipeBackEnabler().frame(width: 0, height: 0))
             }
             .toolbar(.hidden, for: .navigationBar)
             .navigationTitle("FCode")

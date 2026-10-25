@@ -78,47 +78,60 @@ struct BoxRing: View {
         }
     }
 
+    /// "88:88" must fit inside the ring minus 16 % padding on each side.
+    private static let textWidth: CGFloat = 2 * 41 - 6 - 2 * 0.16 * 88
+
     private func ring(_ r: HomeLogic.Ring) -> some View {
-        let (g1, g2, core, text) = colors(r.mode)
-        let f = r.mode == .unknown ? 0 : r.fraction
+        let c = colors(r.mode)
+        let f: Double = r.mode == .unknown ? 0 : r.fraction
         return ZStack {
             Circle().stroke(Color(hex: 0x767680, alpha: 0.22), lineWidth: 6).padding(3)
-            Group {
-                Circle()
-                    .trim(from: 0, to: f)
-                    .stroke(LinearGradient(colors: [g1, g2], startPoint: .topLeading, endPoint: .bottomTrailing),
-                            style: StrokeStyle(lineWidth: 6, lineCap: .round))
-                    .rotationEffect(.degrees(-90))
-                    .padding(3)
-                if r.mode != .unknown {
-                    ZStack {
-                        Circle().fill(g2).frame(width: 8, height: 8).shadow(color: g2, radius: 2)
-                        Circle().fill(core).frame(width: 3, height: 3)
-                    }
-                    .offset(y: -41)
-                    .rotationEffect(.degrees(360 * f))
-                }
-            }
-            // A change of state snaps; inside a state the ring glides 1 s per tick.
-            .animation(reduceMotion ? nil : .linear(duration: 1), value: f)
-            .id(r.mode)
-            VStack(spacing: 6) {
-                Text(r.mode == .paused ? "Wakes in" : "Sleeps in")
-                    .font(.system(size: 11, weight: .medium))
-                    .tracking(0.22)
-                    .foregroundColor(.l2)
-                // "88:88" must fit inside the ring minus 16 % padding on each side.
-                Text(r.mode == .unknown ? "--:--" : HomeLogic.hhmm(r.seconds))
-                    .font(.system(size: 23, weight: .semibold))
-                    .monospacedDigit()
-                    .foregroundColor(r.mode == .unknown ? .l2 : text)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.5)
-                    .frame(width: 2 * 41 - 6 - 2 * 0.16 * 88)
-            }
+            arc(f, mode: r.mode, g1: c.0, g2: c.1, core: c.2)
+            texts(r, color: c.3)
         }
         .frame(width: 88, height: 88)
         .contentShape(Circle())
+    }
+
+    private func arc(_ f: Double, mode: HomeLogic.RingMode, g1: Color, g2: Color, core: Color) -> some View {
+        let gradient = LinearGradient(colors: [g1, g2], startPoint: .topLeading, endPoint: .bottomTrailing)
+        let angle = Angle.degrees(360 * f)
+        return ZStack {
+            Circle()
+                .trim(from: 0, to: CGFloat(f))
+                .stroke(gradient, style: StrokeStyle(lineWidth: 6, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+                .padding(3)
+            if mode != .unknown {
+                ZStack {
+                    Circle().fill(g2).frame(width: 8, height: 8).shadow(color: g2, radius: 2)
+                    Circle().fill(core).frame(width: 3, height: 3)
+                }
+                .offset(y: -41)
+                .rotationEffect(angle)
+            }
+        }
+        // A change of state snaps; inside a state the ring glides 1 s per tick.
+        .animation(reduceMotion ? nil : .linear(duration: 1), value: f)
+        .id(mode)
+    }
+
+    private func texts(_ r: HomeLogic.Ring, color: Color) -> some View {
+        let unknown = r.mode == .unknown
+        let time = unknown ? "--:--" : HomeLogic.hhmm(r.seconds)
+        return VStack(spacing: 6) {
+            Text(r.mode == .paused ? "Wakes in" : "Sleeps in")
+                .font(.system(size: 11, weight: .medium))
+                .tracking(0.22)
+                .foregroundColor(.l2)
+            Text(time)
+                .font(.system(size: 23, weight: .semibold))
+                .monospacedDigit()
+                .foregroundColor(unknown ? Color.l2 : color)
+                .lineLimit(1)
+                .minimumScaleFactor(0.5)
+                .frame(width: BoxRing.textWidth)
+        }
     }
 
     private func label(_ r: HomeLogic.Ring, now: Date) -> String {
@@ -1115,14 +1128,20 @@ struct ClaudeResetSheet: View {
 // MARK: - Swipe back with a hidden navigation bar
 
 /// The main screen and the quota detail hide the navigation bar (their headers scroll), which
-/// also turns off the edge swipe back; this keeps it on whenever there is a screen to go back to.
-extension UINavigationController: UIGestureRecognizerDelegate {
-    override open func viewDidLoad() {
-        super.viewDidLoad()
-        interactivePopGestureRecognizer?.delegate = self
-    }
+/// also turns off the edge swipe back. Placed once on the main screen (alive for the whole
+/// stack), it keeps the swipe on whenever there is a screen to go back to.
+struct SwipeBackEnabler: UIViewControllerRepresentable {
+    func makeUIViewController(context: Context) -> Controller { Controller() }
+    func updateUIViewController(_ controller: Controller, context: Context) {}
 
-    public func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-        viewControllers.count > 1
+    final class Controller: UIViewController, UIGestureRecognizerDelegate {
+        override func viewDidAppear(_ animated: Bool) {
+            super.viewDidAppear(animated)
+            navigationController?.interactivePopGestureRecognizer?.delegate = self
+        }
+
+        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            (navigationController?.viewControllers.count ?? 0) > 1
+        }
     }
 }
