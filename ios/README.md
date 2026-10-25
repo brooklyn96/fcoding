@@ -52,10 +52,11 @@ Sau khi ghép, iPhone nhớ box trong Keychain; mở ứng dụng là vào thẳ
 - **Trong phiên**:
   - Thanh trên cùng: nhãn tên phiên có màu theo chương trình (cam = claude, tím = omp, xanh = codex). Tên dài thì bị cắt ở giữa.
   - Chữ trên màn hình có màu như trên laptop; các biểu tượng nhỏ (nhánh git, thư mục, …) hiện đúng nhờ font biểu tượng đi kèm ứng dụng.
-  - Màn hình tự cuộn xuống dòng mới nhất. Nếu bạn cuộn lên để đọc, bấm **Xuống cuối** để quay lại.
+  - Khi bạn đang ở cuối, màn hình tự cuộn theo dòng mới. Nếu bạn cuộn lên để đọc, màn hình đứng yên dù có chữ mới; bấm nút tròn **↓** (hoặc cuộn về cuối) để theo lại. Gửi tin nhắn cũng đưa về cuối.
   - **A-** / **A+**: chữ nhỏ hơn / to hơn.
   - Chấm màu: xanh lá = đang kết nối trực tiếp, vàng = đang cập nhật định kỳ, cam = đang kết nối, đỏ = mất kết nối.
   - Khung gõ mặc định được ẩn để màn hình rộng hơn. Bấm nút tròn **bàn phím** ở góc phải dưới: khung gõ hiện ra và bàn phím iPhone bật lên luôn.
+  - Muốn dời nút **bàn phím**: giữ và kéo nó đi, thả ra thì nút tự dạt vào mép trái hoặc phải gần nhất. Ứng dụng nhớ chỗ này.
   - Ẩn khung gõ: bấm nút **⌄** ở cuối hàng phím, hoặc vuốt xuống trên thanh nhỏ ở đầu khung gõ (hay trên nền của khung).
   - Sau khi gửi xong, khung gõ tự ẩn. Bấm nút **ghim** (hình đinh ghim) để giữ khung gõ luôn hiện: khi đã ghim, mở phiên là thấy khung gõ và gửi xong nó vẫn ở đó. Bấm lại để bỏ ghim.
   - Ô nhập cao 1 dòng, tự giãn tới 4 dòng khi bạn gõ dài.

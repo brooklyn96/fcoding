@@ -14,6 +14,13 @@ struct SessionView: View {
     @AppStorage("composerPinned") private var composerPinned = false
     @State private var composerShown: Bool
     @FocusState private var composerFocused: Bool
+    /// Floating keyboard button: which edge, and how far down that edge (0 = top, 1 = bottom).
+    @AppStorage("kbButtonLeft") private var kbLeft = false
+    @AppStorage("kbButtonY") private var kbY: Double = 1
+    /// Live drag translation, nil when not dragging (or still under the 10 pt threshold).
+    @State private var kbDrag: CGSize?
+    /// Bumped on every send: the terminal jumps to the bottom and follows again.
+    @State private var bottomRequest = 0
     @State private var stoppedInBackground = false
     /// "Trả lời" from the inbox: open and focus the composer when the view appears.
     private let focusComposer: Bool
@@ -34,10 +41,12 @@ struct SessionView: View {
         VStack(spacing: 0) {
             GeometryReader { geo in
                 TerminalView(model: model, fontSize: fontSize, viewportHeight: geo.size.height,
-                             trailingInset: composerShown ? 0 : 58)
+                             bottomRequest: bottomRequest,
+                             // Never under the keyboard button: the opposite edge while it shows.
+                             jumpOnLeft: !composerShown && !kbLeft)
             }
             .background(Color.black)
-            .overlay(alignment: .bottomTrailing) { if !composerShown { keyboardButton } }
+            .overlay { if !composerShown { GeometryReader { area in keyboardButton(in: area.size) } } }
 
             if let errorText = model.errorText {
                 Button { model.errorText = nil } label: {
@@ -55,7 +64,10 @@ struct SessionView: View {
             if composerShown {
                 ComposerView(
                     draftKey: "draft.\(name)",
-                    onSend: { text, enter in model.send(text, enter: enter) },
+                    onSend: { text, enter in
+                        bottomRequest += 1
+                        return model.send(text, enter: enter)
+                    },
                     onKey: { key in model.key(key) },
                     focused: $composerFocused,
                     pinned: $composerPinned,
@@ -126,20 +138,58 @@ struct SessionView: View {
         composerShown = false
     }
 
-    private var keyboardButton: some View {
-        Button(action: showComposer) {
-            Image(systemName: "keyboard")
-                .font(.system(size: 19, weight: .medium))
-                .foregroundColor(.accentColor)
-                .frame(width: 44, height: 44)
-                .background(Color(white: 0.17).opacity(0.92), in: Circle())
-                .overlay(Circle().stroke(Color.white.opacity(0.14), lineWidth: 0.5))
-                .shadow(color: .black.opacity(0.55), radius: 9, y: 6)
+    /// Centre of the keyboard button in the terminal area (below the top bar, above the home
+    /// indicator, inside the side safe areas): 14 pt from the edge, 8 pt from top and bottom.
+    private func kbCenter(in size: CGSize) -> CGPoint {
+        let r: CGFloat = 22
+        let minY = 8 + r, maxY = max(minY, size.height - 8 - r)
+        var p = CGPoint(x: kbLeft ? 14 + r : size.width - 14 - r,
+                        y: minY + CGFloat(min(1, max(0, kbY))) * (maxY - minY))
+        if let d = kbDrag {
+            p.x = min(size.width - r, max(r, p.x + d.width))
+            p.y = min(maxY, max(minY, p.y + d.height))
         }
-        .padding(.trailing, 14)
-        .padding(.bottom, 8)
-        .accessibilityLabel("Mở khung gõ")
-        .transition(.opacity)
+        return p
+    }
+
+    /// Tap opens the composer; a drag (from 10 pt of movement) moves the button, and on release
+    /// it snaps to the nearer side edge. Not a Button: a Button would also fire its tap on release.
+    private func keyboardButton(in size: CGSize) -> some View {
+        Image(systemName: "keyboard")
+            .font(.system(size: 19, weight: .medium))
+            .foregroundColor(.accentColor)
+            .frame(width: 44, height: 44)
+            .background(Color(white: 0.17).opacity(0.92), in: Circle())
+            .overlay(Circle().stroke(Color.white.opacity(0.14), lineWidth: 0.5))
+            .shadow(color: .black.opacity(0.55), radius: 9, y: 6)
+            .scaleEffect(kbDrag == nil ? 1 : 1.08)
+            .contentShape(Circle())
+            .gesture(
+                // Global space: the button moves under the finger, so local translation would jitter.
+                DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                    .onChanged { v in
+                        if kbDrag != nil || hypot(v.translation.width, v.translation.height) >= 10 {
+                            kbDrag = v.translation
+                        }
+                    }
+                    .onEnded { _ in
+                        guard kbDrag != nil else { showComposer(); return }
+                        let p = kbCenter(in: size)
+                        let minY: CGFloat = 30, maxY = max(minY, size.height - 30)
+                        withAnimation(reduceMotion ? nil : .spring(response: 0.3, dampingFraction: 0.8)) {
+                            kbLeft = p.x < size.width / 2
+                            kbY = maxY > minY ? Double((p.y - minY) / (maxY - minY)) : 1
+                            kbDrag = nil
+                        }
+                    }
+            )
+            .accessibilityElement()
+            .accessibilityLabel("Mở khung gõ")
+            .accessibilityHint("Kéo để dời nút sang chỗ khác")
+            .accessibilityAddTraits(.isButton)
+            .accessibilityAction { showComposer() }
+            .position(kbCenter(in: size))
+            .transition(.opacity)
     }
 
     /// The session name in a harness-coloured chip (as HarnessBadge), cut in the middle when long.
@@ -193,30 +243,59 @@ struct SessionView: View {
 // MARK: - Terminal screen
 
 private struct ContentFrame: Equatable {
+    var minY: CGFloat
     var maxY: CGFloat
     var height: CGFloat
 }
 
 private struct ContentFrameKey: PreferenceKey {
-    static let defaultValue = ContentFrame(maxY: 0, height: 0)
+    static let defaultValue = ContentFrame(minY: 0, maxY: 0, height: 0)
     static func reduce(value: inout ContentFrame, nextValue: () -> ContentFrame) { value = nextValue() }
 }
 
 /// Scroll bookkeeping kept in a plain class so the preference closure (which Xcode 16 marks
 /// @Sendable) can update it through a captured reference instead of the view's @State.
 final class ScrollState: ObservableObject {
-    @Published var stick = true
+    /// Auto-scroll is on: the content bottom was within 24 pt of the viewport bottom.
+    @Published var atBottom = true
     var contentHeight: CGFloat = 0
+    var minY: CGFloat = 0
+    /// Until then, offset changes come from our own animated scroll-to-bottom, not from the user.
+    var programmaticUntil = Date.distantPast
 }
 
-/// Monospaced, selectable, coloured screen text. Sticks to the bottom unless the user scrolls up.
+/// Monospaced, selectable, coloured screen text.
+///
+/// Auto-scroll: new output scrolls to the bottom only if the view was at the bottom BEFORE the
+/// update. The user's position is read from the content's top edge (minY): new text grows the
+/// content downward without moving minY, so a minY change is a scroll. A user scroll sets
+/// atBottom from where it lands (back at the bottom turns auto-scroll on again); our own
+/// scroll-to-bottom lands at the bottom (the animated one is ignored for its duration), so it never
+/// reads as "the user scrolled up".
 struct TerminalView: View {
     @ObservedObject var model: SessionModel
     let fontSize: Double
     let viewportHeight: CGFloat
-    /// Room kept on the right for the floating keyboard button.
-    var trailingInset: CGFloat = 0
+    /// Changes on every send: jump to the bottom and follow again.
+    var bottomRequest = 0
+    /// Put the jump button on the left (the keyboard button is on the right).
+    var jumpOnLeft = false
     @StateObject private var scroll = ScrollState()
+
+    private static func jump(_ scroll: ScrollState, _ proxy: ScrollViewProxy, animated: Bool = false) {
+        scroll.atBottom = true
+        // An instant jump lands at the bottom, so it reads as "at bottom" anyway; only the animated
+        // one passes through mid-way offsets. A window on every jump would, while output streams,
+        // keep renewing and swallow the user's scroll up.
+        if animated { scroll.programmaticUntil = Date().addingTimeInterval(0.6) }
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation { proxy.scrollTo("bottom", anchor: .bottom) }
+            } else {
+                proxy.scrollTo("bottom", anchor: .bottom)
+            }
+        }
+    }
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -234,39 +313,45 @@ struct TerminalView: View {
                     Color.clear.frame(height: 1).id("bottom")
                 }
                 .background(GeometryReader { g in
+                    let f = g.frame(in: .named("term"))
                     Color.clear.preference(key: ContentFrameKey.self,
-                                           value: ContentFrame(maxY: g.frame(in: .named("term")).maxY,
-                                                               height: g.size.height))
+                                           value: ContentFrame(minY: f.minY, maxY: f.maxY, height: f.height))
                 })
             }
             .coordinateSpace(name: "term")
             .scrollDismissesKeyboard(.interactively)
             .onPreferenceChange(ContentFrameKey.self) { [scroll, viewportHeight, proxy] frame in
-                if frame.height != scroll.contentHeight {
-                    // Content grew or shrank: follow it if we were at the bottom.
-                    scroll.contentHeight = frame.height
-                    if scroll.stick { DispatchQueue.main.async { proxy.scrollTo("bottom", anchor: .bottom) } }
-                } else {
-                    // Same content, new offset: the user scrolled.
-                    let atBottom = frame.maxY <= viewportHeight + 24
-                    if scroll.stick != atBottom { scroll.stick = atBottom }
+                let moved = frame.minY != scroll.minY
+                let grew = frame.height != scroll.contentHeight
+                scroll.minY = frame.minY
+                scroll.contentHeight = frame.height
+                if moved, Date() >= scroll.programmaticUntil {
+                    let nearBottom = frame.maxY <= viewportHeight + 24
+                    if scroll.atBottom != nearBottom { scroll.atBottom = nearBottom }
                 }
+                // Decided by the state from before this update; scrolled up = never moved.
+                if grew, scroll.atBottom { TerminalView.jump(scroll, proxy) }
             }
             .onChange(of: viewportHeight) { _ in
-                if scroll.stick { DispatchQueue.main.async { proxy.scrollTo("bottom", anchor: .bottom) } }
+                if scroll.atBottom { TerminalView.jump(scroll, proxy) }
             }
-            .overlay(alignment: .bottomTrailing) {
-                if !scroll.stick {
-                    Button {
-                        scroll.stick = true
-                        withAnimation { proxy.scrollTo("bottom", anchor: .bottom) }
-                    } label: {
-                        Label("Xuống cuối", systemImage: "arrow.down")
-                            .font(.callout.bold())
+            .onChange(of: bottomRequest) { _ in TerminalView.jump(scroll, proxy) }
+            .onAppear { TerminalView.jump(scroll, proxy) }
+            .overlay(alignment: jumpOnLeft ? .bottomLeading : .bottomTrailing) {
+                if !scroll.atBottom {
+                    Button { TerminalView.jump(scroll, proxy, animated: true) } label: {
+                        Image(systemName: "arrow.down")
+                            .font(.system(size: 15, weight: .bold))
+                            .foregroundColor(.white)
+                            .frame(width: 36, height: 36)
+                            .background(Color.accentColor, in: Circle())
+                            .shadow(color: .black.opacity(0.5), radius: 6, y: 3)
+                            .frame(width: 44, height: 44)
+                            .contentShape(Circle())
                     }
-                    .buttonStyle(.borderedProminent)
-                    .padding(10)
-                    .padding(.trailing, trailingInset)
+                    .accessibilityLabel("Xuống cuối")
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 8)
                 }
             }
         }
