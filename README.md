@@ -277,7 +277,7 @@ fcode --list    # (hoặc -l) chỉ liệt kê, không vào
 ```
 
 - `fcode sync`: kéo code mới của các project trong `syncRepos` về laptop, chỉ cập nhật khi đang ở main và không có thay đổi chưa lưu; liệt kê nhánh box và PR chờ merge.
-- `fcode ipa`: tải bản app mới nhất về `Downloads\fcode.ipa` (giữ bản trước là `fcode.prev.ipa`). Khi có bản mới, kéo file này vào Sideloadly và bấm Start; việc tự ký lại 7 ngày của Sideloadly chỉ gia hạn bản đang cài, không tự cập nhật. Không có `fcode` thì tải `fcode.ipa` từ **Releases** trên GitHub.
+- `fcode ipa`: tải bản app mới nhất về `Downloads\fcode.ipa`. Khi có bản mới, kéo file này vào Sideloadly và bấm Start; việc tự ký lại 7 ngày của Sideloadly chỉ gia hạn bản đang cài, không tự cập nhật. Không có `fcode` thì tải `fcode.ipa` từ **Releases** trên GitHub.
 
 Thoát bằng **Ctrl+B** rồi **D**, phiên vẫn chạy tiếp.
 
@@ -292,7 +292,7 @@ irm https://raw.githubusercontent.com/brooklyn96/fcoding/main/laptop/install.ps1
 Lệnh cài sẽ lần lượt làm các việc sau, mỗi việc một dòng trên màn hình:
 
 1. Chép lệnh `fcode` vào `%USERPROFILE%\.local\bin` và thêm thư mục đó vào PATH của bạn.
-2. Cho phép PowerShell chạy lệnh `fcode` (chế độ RemoteSigned, chỉ áp dụng cho tài khoản của bạn). Nếu máy công ty khóa việc này thì lệnh cài báo cho bạn gõ `fcode.cmd` thay cho `fcode`.
+2. Cho phép PowerShell chạy lệnh `fcode` (chế độ RemoteSigned, chỉ áp dụng cho tài khoản của bạn). Nếu máy công ty khóa việc này bằng chính sách của quản trị viên, lệnh cài báo `✗` ở dòng "Lệnh fcode" và bạn cần nhờ quản trị viên cho phép chế độ RemoteSigned (khi đó `fcode.cmd` cũng không chạy được). Nếu không bật được vì lý do khác, gõ `fcode.cmd` thay cho `fcode`.
 3. Tạo file cấu hình `%USERPROFILE%\.fcode\config.json` nếu chưa có (có rồi thì giữ nguyên).
 4. Kiểm tra **GitHub CLI** (`gh`). Máy chưa có thì tự cài. Nếu Windows hỏi quyền, bấm **Yes**; bấm No cũng được, lệnh cài sẽ tự thử cách khác không cần quyền admin.
 5. Kiểm tra **instabox**. Máy chưa có thì tải thẳng bản Windows từ trang chính thức của instabox và kiểm tra mã SHA256 của file. Không cần cài Node.js.
