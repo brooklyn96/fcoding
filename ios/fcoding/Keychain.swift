@@ -11,9 +11,9 @@ enum Keychain {
          kSecAttrAccount as String: account]
     }
 
-    @discardableResult
     /// Update in place; add only when there is no item yet. On any failure the old token
     /// stays exactly as it was (never delete-then-add).
+    @discardableResult
     static func set(_ value: String, for account: String) -> Bool {
         let fields: [String: Any] = [kSecValueData as String: Data(value.utf8),
                                      kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly]
