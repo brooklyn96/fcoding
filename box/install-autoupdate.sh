@@ -46,6 +46,10 @@ mkdir -p "$HOME/.local/state/fcode-update"
 grep -qs DISABLE_AUTOUPDATER /etc/claude-code/managed-settings.json \
   || json_set "$HOME/.claude/settings.json" '.env.DISABLE_AUTOUPDATER = "1"'
 
+# the npm cache of the old global installs (installs now use a throwaway cache); cleaned once, only this dir
+CLEAN="$HOME/.local/state/fcode-update/.npm-cache-cleaned"
+[ -e "$CLEAN" ] || { rm -rf "$HOME/.npm/_cacache" && touch "$CLEAN"; }
+
 # the user manager must keep running without a login
 [ "$(loginctl show-user "$(id -u)" -p Linger --value 2>/dev/null)" = yes ] || sudo -n loginctl enable-linger "$USER"
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # fcode-update: keep omp, claude and codex up to date.
-# Usage: fcode-update [tool ...]   (default: all five)
+# Usage: fcode-update [tool ...]   (default: all three)
 #
 # npm tools (claude, codex) are never modified in place. Every version is installed into
 # its own prefix, /opt/fcode-tools/<tool>/<version>, verified there, and only then made current by one
@@ -108,40 +108,84 @@ newer() {
 
 # verify <dir> <tool> <version>: the installed bin runs and reports the expected version
 verify() {
-  local out
+  local out re=${3//./[.]}
   out=$(x 30 "$1/bin/$2" --version 2>&1 </dev/null) || return 1
   # the version as a whole token; "v" may be glued to it
-  printf %s "$out" | grep -Eq "(^|[^0-9.])v?${3//./\.}([^0-9A-Za-z.-]|$)"
+  printf %s "$out" | grep -Eq "(^|[^0-9.])v?${re}([^0-9A-Za-z.-]|$)"
 }
 
-# install_version <tool> <version>: npm install into <root>/<tool>/<version> (as this user, no sudo), verify there
+# boot_id: the monotonic clock (uptime) restarts at 0 on every boot, so times are always "boot_id + uptime"
+boot_id() { cat /proc/sys/kernel/random/boot_id; }
+
+# install_version <tool> <version>: make <root>/<tool>/<version> exist and be sound. An existing dir is never
+# deleted or replaced here (a live process may run from it). A new one is installed with npm (as this user, no
+# sudo) into a temp dir next to it, verified there, and renamed into place.
 install_version() {
-  local t=$1 v=$2 d="$ROOT/$1/$2" out
-  if [ -d "$d" ] && verify "$d" "$t" "$v"; then return 0; fi # already there and sound (maybe in use)
-  rm -rf "$d"; mkdir -p "$d" || { echo "cannot create $d"; return 1; }
-  out=$(x 600 npm install -g --prefix "$d" --no-audit --no-fund --no-progress --loglevel=error "$(pkg_of "$t")@$v" 2>&1 </dev/null) \
-    || { rm -rf "$d"; echo "npm install failed: $(printf %s "$out" | tail -3)"; return 1; }
-  verify "$d" "$t" "$v" || { rm -rf "$d"; echo "verify failed: $t --version does not report $v"; return 1; }
+  local t=$1 v=$2 d="$ROOT/$1/$2" tmp="$ROOT/$1/.new.$2.$" cache out free rc
+  if [ -d "$d" ]; then
+    verify "$d" "$t" "$v" && return 0
+    # exists but broken: set it aside only when it is neither current nor possibly in use
+    if [ "$(readlink "$ROOT/$t/current" 2>/dev/null)" = "$v" ] || ver_busy "$t" "$v"; then
+      echo "$d fails '$t --version' but is current or in use; left alone"; return 1
+    fi
+    mv -T "$d" "$ROOT/$t/.bad.$v.$$" || { echo "cannot set $d aside"; return 1; }
+  fi
+  mkdir -p "$ROOT/$t"
+  free=$(df -Pk "$ROOT" | awk 'NR==2{print $4}')
+  [ "${free:-0}" -ge "${FCODE_MIN_FREE_KB:-2097152}" ] || { echo "less than $(( ${FCODE_MIN_FREE_KB:-2097152} / 1048576 )) GB free on $ROOT"; return 1; }
+  rm -rf "$tmp"; mkdir -p "$tmp" && cache=$(mktemp -d "$ROOT/$t/.npmcache.XXXXXX") || { echo "cannot create temp dirs in $ROOT/$t"; return 1; }
+  out=$(x 600 npm install -g --prefix "$tmp" --cache "$cache" --no-audit --no-fund --no-progress --loglevel=error "$(pkg_of "$t")@$v" 2>&1 </dev/null); rc=$?
+  rm -rf "$cache"
+  [ $rc -eq 0 ] || { rm -rf "$tmp"; echo "npm install failed: $(printf %s "$out" | tail -3)"; return 1; }
+  verify "$tmp" "$t" "$v" || { rm -rf "$tmp"; echo "verify failed: $t --version does not report $v"; return 1; }
+  mv -T "$tmp" "$d" || { rm -rf "$tmp"; echo "cannot move $tmp to $d"; return 1; }
+  verify "$d" "$t" "$v" || { rm -rf "$d"; echo "verify failed after move: $t --version does not report $v"; return 1; } # ours, nobody uses it yet
 }
 
-# flip <tool> <version>: atomic switch of <root>/<tool>/current (rename of a temp symlink over it)
+# flip <tool> <version>: atomic switch of <root>/<tool>/current (rename of a temp symlink over it).
+# The activation log <root>/<tool>/activations gets "version boot_id uptime" (before the switch, so a process
+# started in between is covered by the offsets in pinned_versions).
 flip() {
   local tmp="$ROOT/$1/.current.$$"
-  # stamp = boot id + uptime (monotonic, immune to wall-clock jumps); the file mtime only orders versions
-  printf '%s %s\n' "$(cat /proc/sys/kernel/random/boot_id)" "$(cut -d' ' -f1 /proc/uptime)" >"$ROOT/$1/$2/.activated" && ln -s "$2" "$tmp" && mv -T "$tmp" "$ROOT/$1/current" || { rm -f "$tmp"; echo "cannot switch $1 to $2"; return 1; }
+  printf '%s %s %s\n' "$2" "$(boot_id)" "$(cut -d' ' -f1 /proc/uptime)" >>"$ROOT/$1/activations" \
+    && ln -s "$2" "$tmp" && mv -T "$tmp" "$ROOT/$1/current" || { rm -f "$tmp"; echo "cannot switch $1 to $2"; return 1; }
 }
 
-# ensure_links <tool>: BINDIR/<bin> -> <root>/<tool>/current/bin/<bin> (each replaced by an atomic rename)
+# seed_log <tool>: an install made before the activation log existed counts as active since boot
+seed_log() {
+  local cur
+  cur=$(readlink "$ROOT/$1/current") || return 0
+  awk -v v="$cur" '$1 == v {f = 1} END {exit !f}' "$ROOT/$1/activations" 2>/dev/null || printf '%s %s 0
+' "$cur" "$(boot_id)" >>"$ROOT/$1/activations"
+}
+
+# bin_names <tool>: the bin names of the current package
+bin_names() {
+  jq -r 'if (.bin|type)=="object" then (.bin|keys[]) elif (.bin|type)=="string" then (.name|split("/")|last) else empty end' \
+    "$ROOT/$1/current/lib/node_modules/$(pkg_of "$1")/package.json" 2>/dev/null
+}
+
+# ensure_links <tool>: BINDIR/<bin> -> <root>/<tool>/current/bin/<bin> (each replaced by an atomic rename).
+# Idempotent; runs on every run, so an interrupted migration is completed.
 ensure_links() {
   local t=$1 n target tmp names
-  names=$(jq -r 'if (.bin|type)=="object" then (.bin|keys[]) elif (.bin|type)=="string" then (.name|split("/")|last) else empty end' \
-    "$ROOT/$t/current/lib/node_modules/$(pkg_of "$t")/package.json" 2>/dev/null) || return 1
+  names=$(bin_names "$t") && [ -n "$names" ] || return 1
   for n in $names; do
     target="$ROOT/$t/current/bin/$n"
     [ -e "$target" ] || continue
     [ "$(readlink "$BINDIR/$n" 2>/dev/null)" = "$target" ] && continue
     tmp="$BINDIR/.$n.fcode.$$"
     priv "$BINDIR" ln -s "$target" "$tmp" && priv "$BINDIR" mv -T "$tmp" "$BINDIR/$n" || { priv "$BINDIR" rm -f "$tmp"; echo "cannot link $BINDIR/$n"; return 1; }
+  done
+}
+
+# links_ok <tool>: every bin link resolves into <root>/<tool>/
+links_ok() {
+  local n names r
+  names=$(bin_names "$1") && [ -n "$names" ] || return 1
+  for n in $names; do
+    r=$(readlink -f "$BINDIR/$n" 2>/dev/null)
+    case $r in "$ROOT/$1/"*) ;; *) return 1 ;; esac
   done
 }
 
@@ -159,49 +203,72 @@ dir_in_use() {
   return 1
 }
 
-# oldest_tool_start <tool>: start time (seconds after boot) of the oldest running process that looks like the tool (its bin
-# name in comm or the first five arguments). A node script keeps only its symlink in
-# its command line, so this is how a long-lived old session is noticed. Looking too broad only delays cleanup.
-oldest_tool_start() {
-  local names=" $1 " d pid w s best='' a=()
+# tool_proc_starts <tool>: start time (seconds after boot) of every running process that looks like the tool
+# (its name in comm or in the first five arguments). A node script keeps only its symlink on its command line,
+# so this is how a long-lived session is noticed. Too broad only delays cleanup.
+tool_proc_starts() {
+  local d pid w s clk a=()
+  clk=$(getconf CLK_TCK)
   for d in /proc/[0-9]*; do
     pid=${d#/proc/}
     [ "$pid" = "$$" ] && continue
-    mapfile -d '' -t a <"$d/cmdline" 2>/dev/null || continue
+    { mapfile -d '' -t a <"$d/cmdline"; } 2>/dev/null || continue
     for w in "$(cat "$d/comm" 2>/dev/null)" "${a[@]:0:5}"; do
-      w=${w##*/}
-      [[ -n $w && $names == *" $w "* ]] || continue
-      s=$(sed 's/.*) //' "$d/stat" 2>/dev/null | cut -d' ' -f20) || continue
-      s=$((s / $(getconf CLK_TCK)))
-      if [ -z "$best" ] || [ "$s" -lt "$best" ]; then best=$s; fi
+      [ "${w##*/}" = "$1" ] || continue
+      s=$(sed 's/.*) //' "$d/stat" 2>/dev/null | cut -d' ' -f20)
+      [ -n "$s" ] && echo $((s / clk))
       break
     done
   done
-  echo "$best"
 }
 
-# prune_tool <tool>: keep current + the 2 most recently activated others; remove older version dirs and the
-# old global copy only when nothing uses them. A tool process older than the current version blocks it all.
+# version_at <tool> <boot_id> <uptime>: the version that was current at that moment of this boot
+# ("@legacy" = the old global install, before the first activation)
+version_at() {
+  awk -v b="$2" -v s="$3" 'BEGIN{v="@legacy"} $2 != b || $3 <= s {v=$1; next} {exit} END{print v}' "$ROOT/$1/activations" 2>/dev/null || echo @legacy
+}
+
+# pinned_versions <tool>: versions a running tool process may be using: the one current when it started
+# (plus the neighbours within a few seconds: the stamp is written just before the switch, and the start time is rounded)
+pinned_versions() {
+  local s bn off
+  bn=$(boot_id)
+  for s in $(tool_proc_starts "$1"); do
+    for off in -5 0 1; do version_at "$1" "$bn" $((s + off)); done
+  done
+}
+
+# ver_busy <tool> <version>: a running process may be using this version dir
+ver_busy() {
+  dir_in_use "$ROOT/$1/$2" && return 0
+  pinned_versions "$1" | grep -qxF -- "$2"
+}
+
+# prune_tool <tool>: keep current, the 2 most recently activated others, and every version a running process
+# may use (by start time, or by direct evidence). Remove the rest, the old global copy once the links no longer
+# point into it, and half-installed leftovers (no activation entry, older than 1 h).
 prune_tool() {
-  local t=$1 cur boot='' act='' old keepall=0 n=0 f v legacy
+  local t=$1 cur keep n=0 v e legacy log="$ROOT/$1/activations"
   cur=$(readlink "$ROOT/$t/current") || return 0
-  read -r boot act <"$ROOT/$t/$cur/.activated" 2>/dev/null
-  # stamp from another boot: every process alive now started later. No stamp: assume "activated just now".
-  if [ -n "$boot" ] && [ "$boot" != "$(cat /proc/sys/kernel/random/boot_id)" ]; then act=-1; fi
-  act=${act%%.*}; act=${act:-$(cut -d. -f1 /proc/uptime)}
-  old=$(oldest_tool_start "$t")
-  if [ -n "$old" ] && [ "$old" -le "$act" ]; then keepall=1; fi
-  [ $keepall = 0 ] || return 0
+  keep=" $cur "
+  for v in $(tac "$log" 2>/dev/null | awk '!seen[$1]++ {print $1}'); do
+    [ "$v" = "$cur" ] && continue
+    n=$((n + 1)); [ $n -le 2 ] && keep="$keep$v "
+  done
+  for v in $(pinned_versions "$t"); do keep="$keep$v "; done
   legacy="$NM/$(pkg_of "$t")"
-  if [ -n "$NM" ] && [ -d "$legacy" ] && ! dir_in_use "$legacy"; then
+  if [ -n "$NM" ] && [ -d "$legacy" ] && [[ $keep != *" @legacy "* ]] && links_ok "$t" && ! dir_in_use "$legacy"; then
     priv "$NM" rm -rf "$legacy" && note "$t: removed old global copy $legacy"
   fi
-  for f in $(ls -1t "$ROOT/$t"/*/.activated 2>/dev/null); do # newest first
-    v=$(basename "$(dirname "$f")")
-    [ "$v" = current ] || [ "$v" = "$cur" ] && continue
-    n=$((n + 1))
-    [ $n -le 2 ] && continue
-    if ! dir_in_use "$ROOT/$t/$v"; then rm -rf "${ROOT:?}/$t/$v" && note "$t: removed old version $v"; fi
+  for e in "$ROOT/$t"/* "$ROOT/$t"/.[a-z]*; do
+    [ -d "$e" ] && [ ! -L "$e" ] || continue
+    v=${e##*/}
+    [[ $keep == *" $v "* ]] && continue
+    dir_in_use "$e" && continue
+    if awk -v v="$v" '$1 == v {f = 1} END {exit !f}' "$log" 2>/dev/null; then : # an old activated version
+    elif [ -z "$(find "$e" -maxdepth 0 -mmin +60)" ]; then continue # not activated and younger than 1 h: maybe being installed
+    fi
+    rm -rf "${e:?}" && note "$t: removed $v"
   done
   return 0
 }
@@ -220,6 +287,8 @@ update_tool() {
     out=$(switch_to "$t" "$v") || { record "$t" "$v" "" failed "migration failed: $out"; failed=1; return; }
     note "$t: migrated $v to $ROOT/$t/$v"
   fi
+  [ "$t" = omp ] || seed_log "$t"
+  [ "$t" = omp ] || ensure_links "$t" >/dev/null || note "$t: cannot ensure the $BINDIR links"
   cur=$(installed "$t")
   semver_ok "$cur" || { record "$t" "" "" failed "cannot read installed version"; failed=1; return; }
   lat=$(latest "$t" "$cur") || { record "$t" "$cur" "" failed "latest lookup failed: $lat"; failed=1; return; }
