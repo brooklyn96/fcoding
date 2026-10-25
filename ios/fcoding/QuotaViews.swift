@@ -1091,6 +1091,8 @@ struct CodexResetSheet: View {
     @State private var stopped = false
     @State private var tried = false
     @State private var errorText: String?
+    /// errorText is a status (pending, no answer yet), not an error.
+    @State private var info = false
 
     var body: some View {
         SheetScaffold {
@@ -1101,7 +1103,7 @@ struct CodexResetSheet: View {
                 .sheetBody()
             Text(errorText ?? " ")
                 .scaledFont(13)
-                .foregroundColor(.redTone)
+                .foregroundColor(info ? .l2 : .redTone)
                 .frame(maxWidth: .infinity, minHeight: 20, alignment: .leading)
                 .padding(.vertical, 6)
                 .accessibilityHidden(errorText == nil)
@@ -1136,6 +1138,7 @@ struct CodexResetSheet: View {
                 onDone(account.email)
             } else {
                 stopped = !r.canRetry
+                info = r.info
                 errorText = r.text
             }
         }

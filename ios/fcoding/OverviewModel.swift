@@ -169,6 +169,8 @@ final class OverviewModel: ObservableObject {
             return "Phiên này không còn nữa."
         } catch let e as APIError where [404, 405, 501].contains(e.status) {
             return "Máy chủ chưa hỗ trợ đổi tên, cập nhật máy chủ trước."
+        } catch let e as APIError where e.status == 409 && e.code == "reserved_name" {
+            return HomeLogic.reservedNameMessage(newName, projects: overview?.projects.map(\.name) ?? [])
         } catch let e as APIError where e.status == 409 {
             return "Tên này đã có phiên khác."
         } catch let e as APIError where e.status == 400 {
