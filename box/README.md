@@ -25,7 +25,7 @@ Mọi tên lệnh trong `bin` của gói đều được trỏ (`claude`, `codex
 1. so phiên bản đang chạy (`current`) với bản mới nhất (`npm view <gói> version`); phiên bản phải đúng dạng semver `X.Y.Z[-tiền_tố]`, nếu không thì bỏ qua và ghi `failed`; không bao giờ hạ cấp;
 2. khác nhau thì `npm install -g --prefix /opt/fcode-tools/<công_cụ>/<bản> <gói>@<bản>` (không cần sudo, vì thư mục thuộc người dùng) và chạy thử `<lệnh> --version` ngay trong thư mục đó; sai thì xoá thư mục tạm và ghi `failed`, `current` không đổi. Cài vào thư mục tạm `.new.<bản>.<pid>` rồi mới đổi tên thành `<bản>`; thư mục phiên bản đã có thì **không bao giờ bị xoá hay ghi đè** khi kiểm tra lỗi (nếu nó hỏng mà không phải `current` và không ai dùng thì được dời sang `.bad.*`). Mỗi lần cài dùng một cache npm tạm, xoá ngay sau đó; dưới 2 GB trống thì không cài và ghi `failed`;
 3. đổi `current` bằng một phép đổi tên nguyên tử (symlink tạm rồi `mv -T`), nên không có lúc nào thiếu lệnh; sau đó đảm bảo các symlink trong `/usr/local/bin` (cần sudo, chỉ cho việc này; việc này chạy ở **mọi** lượt nên một lần chuyển bị gián đoạn sẽ được hoàn tất);
-4. dọn: giữ bản hiện tại, 2 bản được bật gần nhất, và mọi bản mà một tiến trình đang chạy có thể đang dùng. Nhật ký `/opt/fcode-tools/<công_cụ>/activations` ghi (bản, boot_id, uptime) mỗi lần đổi `current`; một tiến trình bắt đầu lúc T chỉ có thể dùng bản đang là `current` tại T (cộng bản ngay trước đó, đề phòng lệch vài giây quanh lúc đổi), hoặc bản có bằng chứng trực tiếp (exe, thư mục làm việc, file đang mở, vùng nhớ ánh xạ, đường dẫn trên dòng lệnh). Các bản còn lại bị xoá, nên dung lượng luôn có giới hạn dù có phiên sống lâu. Thư mục dở dang (không có trong nhật ký, cũ hơn 1 giờ) cũng bị xoá. Nghi ngờ thì giữ.
+4. dọn: giữ bản hiện tại, 2 bản được bật gần nhất, và mọi bản mà một tiến trình đang chạy có thể đang dùng. Nhật ký `/opt/fcode-tools/<công_cụ>/activations` ghi (bản, boot_id, uptime) mỗi lần đổi `current`; một tiến trình bắt đầu lúc T chỉ có thể dùng bản đang là `current` tại T (cộng bản ngay trước đó, đề phòng lệch vài giây quanh lúc đổi), hoặc bản có bằng chứng trực tiếp (exe, thư mục làm việc, file đang mở, vùng nhớ ánh xạ, đường dẫn trên dòng lệnh). Khi exe hoặc các file ánh xạ của tiến trình cho biết nó đã nạp bản nào thì bằng chứng đó thắng, không ghim thêm theo giờ khởi động. Giới hạn: giờ khởi động là lúc fork pid, nên công cụ chỉ chạy bằng node mà được `exec` từ một shell đã mở nhiều ngày sẽ được ghim theo bản đang là `current` lúc shell đó khởi động; với claude và codex vẫn an toàn vì file chạy chính nằm trong thư mục bản và được nhận ra qua bằng chứng. Các bản còn lại bị xoá, nên dung lượng luôn có giới hạn dù có phiên sống lâu. Thư mục dở dang (không có trong nhật ký, cũ hơn 1 giờ) cũng bị xoá. Nghi ngờ thì giữ.
 
 Tiến trình đang chạy giữ nguyên thư mục phiên bản nó khởi động từ, nên phiên cũ chạy tiếp bình thường; phiên mới dùng bản mới.
 
@@ -47,13 +47,12 @@ Chạy tay: `systemctl --user start fcode-update.service` hoặc `fcode-update [
 ### Quay lại bản cũ (rollback)
 
 ```bash
-ls /opt/fcode-tools/claude                              # các bản còn giữ
-ln -s 2.1.288 /opt/fcode-tools/claude/.cur && mv -T /opt/fcode-tools/claude/.cur /opt/fcode-tools/claude/current   # quay lại bản đó, nguyên tử (phiên đang chạy không bị ảnh hưởng)
-touch /opt/fcode-tools/claude/hold                      # giữ nguyên, lượt sau không nâng cấp lại
-rm /opt/fcode-tools/claude/hold                         # cho phép cập nhật tiếp
+ls /opt/fcode-tools/claude                       # các bản còn giữ
+fcode-update --rollback claude 2.1.288        # quay lại bản đó
+fcode-update --resume claude                  # cho phép cập nhật tiếp
 ```
 
-Không có file `hold` thì lượt chạy sau sẽ nâng lại lên bản mới nhất.
+`--rollback` kiểm tra bản đó chạy được, đổi `current` nguyên tử, ghi vào nhật ký `activations` (để dọn dẹp biết phiên mới thuộc bản nào), đảm bảo các symlink và đặt file `hold` để lượt chạy sau không nâng cấp lại. Phiên đang chạy không bị ảnh hưởng. `--resume` xoá `hold`; lượt sau sẽ nâng lên bản mới nhất.
 
 ### Tắt trình tự cập nhật riêng của từng công cụ
 

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # fcode-update: keep omp, claude and codex up to date.
-# Usage: fcode-update [tool ...]   (default: all three)
+# Usage: fcode-update [tool ...]                (default: all three)
+#        fcode-update --rollback <tool> <version>   switch back (atomic, logged) and hold updates for the tool
+#        fcode-update --resume <tool>                allow updates again
 #
 # npm tools (claude, codex) are never modified in place. Every version is installed into
 # its own prefix, /opt/fcode-tools/<tool>/<version>, verified there, and only then made current by one
@@ -121,7 +123,7 @@ boot_id() { cat /proc/sys/kernel/random/boot_id; }
 # deleted or replaced here (a live process may run from it). A new one is installed with npm (as this user, no
 # sudo) into a temp dir next to it, verified there, and renamed into place.
 install_version() {
-  local t=$1 v=$2 d="$ROOT/$1/$2" tmp="$ROOT/$1/.new.$2.$" cache out free rc
+  local t=$1 v=$2 d="$ROOT/$1/$2" tmp="$ROOT/$1/.new.$2.$$" cache out free rc
   if [ -d "$d" ]; then
     verify "$d" "$t" "$v" && return 0
     # exists but broken: set it aside only when it is neither current nor possibly in use
@@ -203,9 +205,9 @@ dir_in_use() {
   return 1
 }
 
-# tool_proc_starts <tool>: start time (seconds after boot) of every running process that looks like the tool
-# (its name in comm or in the first five arguments). A node script keeps only its symlink on its command line,
-# so this is how a long-lived session is noticed. Too broad only delays cleanup.
+# tool_proc_starts <tool>: "pid start" for every running process that looks like the tool (start = seconds after
+# boot; its name in comm or in the first five arguments). A node script keeps only its symlink on its command
+# line, so this is how a long-lived session is noticed. Too broad only delays cleanup.
 tool_proc_starts() {
   local d pid w s clk a=()
   clk=$(getconf CLK_TCK)
@@ -216,7 +218,7 @@ tool_proc_starts() {
     for w in "$(cat "$d/comm" 2>/dev/null)" "${a[@]:0:5}"; do
       [ "${w##*/}" = "$1" ] || continue
       s=$(sed 's/.*) //' "$d/stat" 2>/dev/null | cut -d' ' -f20)
-      [ -n "$s" ] && echo $((s / clk))
+      [ -n "$s" ] && echo "$pid $((s / clk))"
       break
     done
   done
@@ -228,14 +230,25 @@ version_at() {
   awk -v b="$2" -v s="$3" 'BEGIN{v="@legacy"} $2 != b || $3 <= s {v=$1; next} {exit} END{print v}' "$ROOT/$1/activations" 2>/dev/null || echo @legacy
 }
 
-# pinned_versions <tool>: versions a running tool process may be using: the one current when it started
-# (plus the neighbours within a few seconds: the stamp is written just before the switch, and the start time is rounded)
+# proc_versions <tool> <pid>: the version dirs a process has actually loaded (its exe and mapped files)
+proc_versions() {
+  { readlink "/proc/$2/exe"; cat "/proc/$2/maps"; } 2>/dev/null | grep -o "$ROOT/$1/[^/]*/" | sed "s|^$ROOT/$1/||; s|/\$||" | sort -u
+}
+
+# pinned_versions <tool>: versions a running tool process may be using. Evidence wins: when its exe or mapped
+# files show which version dir it loaded, that is the version. Otherwise the one current when it started (plus
+# the neighbours within a few seconds: the stamp is written just before the switch, and the start time is
+# rounded). Limit: the start time is the fork time of the pid, so a node-only tool exec'd from a shell that is
+# days old (`exec codex`) is pinned to the version current when that shell started; it is still safe for claude
+# and codex, whose native binary lives in the version dir and is caught by the evidence.
 pinned_versions() {
-  local s bn off
+  local pid s bn off ev
   bn=$(boot_id)
-  for s in $(tool_proc_starts "$1"); do
+  while read -r pid s; do
+    ev=$(proc_versions "$1" "$pid")
+    if [ -n "$ev" ]; then echo "$ev"; continue; fi
     for off in -5 0 1; do version_at "$1" "$bn" $((s + off)); done
-  done
+  done < <(tool_proc_starts "$1")
 }
 
 # ver_busy <tool> <version>: a running process may be using this version dir
@@ -272,6 +285,21 @@ prune_tool() {
   done
   return 0
 }
+
+# rollback_tool <tool> <version>: atomic switch back to an installed version, logged, and updates held
+rollback_tool() {
+  local t=$1 v=${2:-}
+  [ -n "$(pkg_of "$t")" ] || { echo "fcode-update: --rollback works for: claude codex" >&2; return 2; }
+  semver_ok "$v" || { echo "fcode-update: '$v' is not a version" >&2; return 2; }
+  [ -d "$ROOT/$t/$v" ] || { echo "fcode-update: $t $v is not installed (have: $(ls "$ROOT/$t" 2>/dev/null | grep -E '^[0-9]' | tr '\n' ' '))" >&2; return 1; }
+  verify "$ROOT/$t/$v" "$t" "$v" || { echo "fcode-update: $ROOT/$t/$v does not run" >&2; return 1; }
+  seed_log "$t"
+  flip "$t" "$v" && ensure_links "$t" && touch "$ROOT/$t/hold" || return 1
+  note "$t: rolled back to $v, updates held"
+  echo "fcode-update: resume updates with: fcode-update --resume $t"
+}
+# resume_tool <tool>: allow updates again
+resume_tool() { [ -n "$(pkg_of "$1")" ] || { echo "fcode-update: --resume works for: claude codex" >&2; return 2; }; rm -f "$ROOT/$1/hold" && note "$1: updates resumed"; }
 
 # ---- one tool ----------------------------------------------------------------------------------
 
@@ -312,17 +340,29 @@ update_tool() {
 }
 
 main() {
-  local TOOLS="${*:-$ALL}" t
+  local mode=update TOOLS t
+  case ${1:-} in --rollback | --resume) mode=${1#--}; shift ;; esac
+  TOOLS="${*:-$ALL}"
   mkdir -p "$STATE"
-  for t in $TOOLS; do
-    case " $ALL " in *" $t "*) ;; *) echo "fcode-update: unknown tool '$t' (valid: $ALL)" >&2; exit 2 ;; esac
-  done
+  if [ $mode = update ]; then
+    for t in $TOOLS; do
+      case " $ALL " in *" $t "*) ;; *) echo "fcode-update: unknown tool '$t' (valid: $ALL)" >&2; exit 2 ;; esac
+    done
+  fi
 
   exec 9>"$STATE/lock"
-  flock -n 9 || { echo "fcode-update: another run is active, exiting"; exit 0; }
+  if [ $mode = update ]; then
+    flock -n 9 || { echo "fcode-update: another run is active, exiting"; exit 0; }
+  else
+    flock -w 300 9 || { echo "fcode-update: another run is active, try again later" >&2; exit 1; }
+  fi
 
   [ -n "$NM" ] || NM=$(x 30 npm root -g 2>/dev/null) || NM=
   [ -n "$NM" ] || NM=/usr/local/lib/node_modules
+  case $mode in
+    rollback) rollback_tool "$@"; exit $? ;;
+    resume) resume_tool "$@"; exit $? ;;
+  esac
 
   for t in $TOOLS; do update_tool "$t"; done
   exit $failed
