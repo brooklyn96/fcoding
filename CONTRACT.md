@@ -21,7 +21,7 @@ S7 Security headers on every response: Content-Security-Policy "default-src 'sel
 S8 Never log passwords, cookies or sent text; log only method, path, status, ms.
 
 HARNESSES (command run inside the tmux session, cwd = project dir): omp -> `omp`, claude -> `claude`, codex -> `codex`, shell -> `bash -l`. tmux sessions get env LANG=C.UTF-8 LC_ALL=C.UTF-8.
-KEYS whitelist (tmux send-keys names): Enter, Escape, Tab, BTab, Up, Down, Left, Right, PageUp, PageDown, Home, End, BSpace, C-c, C-d, C-l, C-r, C-u, C-z, y, n, Space.
+KEYS whitelist (tmux send-keys names): Enter, Escape, Tab, BTab, Up, Down, Left, Right, PageUp, PageDown, Home, End, BSpace, C-c, C-d, C-l, C-o, C-r, C-u, C-z, M-a, y, n, Space. (M-a = Alt+A opens the omp agent hub; C-o expands an entry in it.)
 
 API (JSON; errors as {error:"code"} with HTTP status):
 - POST /api/login {password} -> 200 {ok:true} + Set-Cookie | 401 {error:"bad_password"} | 429 {error:"rate_limited", retryAfter:s}

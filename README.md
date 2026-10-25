@@ -225,6 +225,7 @@ Muốn dùng lại sau khi bị gỡ thì chạy `fcode-pair` trên box và ghé
 - Nút **ghim** trên ô nhập: khi ghim, ô nhập hiện sẵn mỗi lần mở phiên và vẫn ở lại sau khi gửi. Bấm lần nữa để bỏ ghim. App nhớ lựa chọn này.
 - **Màu và biểu tượng**: màn hình hiện đúng màu của chương trình (chữ, nền, đậm, nghiêng, gạch chân), nên dễ phân biệt lỗi, phần thêm/xóa của diff hay mục đang chọn. Các biểu tượng đặc biệt (nhánh git, thư mục…) hiện đúng nhờ font Nerd Font đi kèm app. Tên phiên ở thanh trên nằm trong nhãn màu theo chương trình (claude cam, omp tím, codex xanh).
 - Hàng phím nhanh: Esc, Ctrl+C, mũi tên, Tab, ⇧Tab, Enter, y, n. Nút `/` chèn các lệnh hay dùng như `/model`, `/clear`. Phím được gửi đúng thứ tự bạn bấm.
+- Agents (Alt+A): mở danh sách subagent của omp; trong đó dùng ↑↓ chọn, Enter mở, Esc đóng.
 - Khi chuyển sang app khác, kết nối tạm dừng; mở lại là tự kết nối lại.
 
 **Khi gặp lỗi**
