@@ -1892,6 +1892,11 @@ test('sgrOnly: keeps SGR only, drops every other escape sequence', () => {
     [`${E}[58;2;1;2;3mx${E}[1;58;5;9;3mx${E}[59mx`, `x${E}[1;3mxx`], // underline colour is dropped with its arguments
     [`${E}[38;5mx${E}[38;5;999mx${E}[38;2;1;2mx${E}[1;38;9;1mx`, `xxx${E}[1mx`], // bad or cut-off colours; an unknown mode drops what follows it
     [`${E}[200mx${E}[1;108;3mx`, `x${E}[1;3mx`], // codes above 107
+    [`${E}[5:3mx${E}[1;5:3;4mx`, `${E}[53mx${E}[1;53;4mx`], // overline 5:3 is 53, never blink 5
+    [`${E}[3:1mx${E}[1:2mx${E}[31:7mx`, 'xxx'], // other colon groups are dropped, never collapsed to their head
+    [`${E}[38:2:1:2mx${E}[48:2:1:2mx${E}[38:2::1:2mx${E}[38:5mx${E}[38:5:7:8mx`, `xxxx${E}[38;5;7mx`], // cut-off colon colours are dropped (also with an empty colourspace slot); the next params stay
+    [`${E}[1;38:2:1:2;4mx`, `${E}[1;4mx`], // a dropped colon colour does not eat its neighbours
+    [`a\x0elqqk\x0fb${E}(0lqk${E}(Bc`, 'alqqkblqkc'], // ACS: SO/SI and charset designation are dropped
   ];
   for (const [from, to] of cases) assert.equal(sgrOnly(from), to, JSON.stringify(from));
   // whatever is left is SGR and nothing else

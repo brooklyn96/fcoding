@@ -194,8 +194,9 @@ export function trimScreen(s) {
 }
 
 // --- ansi=1: the screen keeps SGR colours (ESC [ ... m) and nothing else ---
-// Every other escape sequence (other CSI, OSC such as hyperlinks, DCS/APC/PM/SOS, two-byte ESC, a lone ESC) is dropped.
-const ESC_RE = /\x1b(?:\[([0-?]*)([ -\/]*)([@-~])?|[\]PX^_][^\x07\x1b\n]*(?:\x07|\x1b\\)?|[ -\/]*[0-~]?)/g;
+// Every other escape sequence (other CSI, OSC such as hyperlinks, DCS/APC/PM/SOS, two-byte ESC, a lone ESC) is dropped,
+// and so are SO/SI (0x0E/0x0F, charset shifts), so the text equals what a plain capture-pane prints.
+const ESC_RE = /[\x0e\x0f]|\x1b(?:\[([0-?]*)([ -\/]*)([@-~])?|[\]PX^_][^\x07\x1b\n]*(?:\x07|\x1b\\)?|[ -\/]*[0-~]?)/g;
 const SGR_RE = /\x1b\[[0-9;]*m/g;
 // A clean SGR: ";"-separated integers only. Colon forms become semicolon forms (38:2::r:g:b -> 38;2;r;g;b, 4:3 -> 4, 4:0 -> 24),
 // the underline colour (58) is dropped, a bad or cut-off colour is dropped, and no code above 107 is passed. Nothing left = no sequence.
@@ -204,8 +205,13 @@ function cleanSgr(params) {
   const t = [];
   for (const g of params.split(';')) {
     const [h, ...sub] = g.split(':').map((x) => (x === '' ? 0 : Number(x))); // an empty parameter is 0
-    if (sub.length && (h === 38 || h === 48 || h === 58)) t.push(h, sub[0], ...sub.slice(sub[0] === 2 ? -3 : 1));
-    else t.push(h === 4 && sub[0] === 0 ? 24 : h);
+    if (!sub.length) t.push(h);
+    else if (h === 38 || h === 48 || h === 58) { // colon colour: whole, or dropped (a cut-off one is never rewritten)
+      if (sub[0] === 5 && sub.length >= 2) t.push(h, 5, sub[1]);
+      else if (sub[0] === 2 && sub.length >= (g.split(':')[2] === '' ? 5 : 4)) t.push(h, 2, ...sub.slice(-3)); // 2:[colourspace:]r:g:b; an empty colourspace slot is there, so r:g:b must follow it
+    } else if (h === 4) t.push(sub[0] === 0 ? 24 : 4); // underline styles
+    else if (h === 5 && sub[0] === 3) t.push(53); // overline written as 5:3; it must not become blink (5)
+    // any other colon group is dropped
   }
   const out = [];
   for (let i = 0; i < t.length; i++) {
@@ -218,7 +224,7 @@ function cleanSgr(params) {
   }
   return out.length ? `\x1b[${out.join(';')}m` : '';
 }
-export const sgrOnly = (s) => (s.includes('\x1b') ? s.replace(ESC_RE, (_m, params, inter, fin) => (fin === 'm' && !inter ? cleanSgr(params) : '')) : s);
+export const sgrOnly = (s) => (/[\x0e\x0f\x1b]/.test(s) ? s.replace(ESC_RE, (_m, params, inter, fin) => (fin === 'm' && !inter ? cleanSgr(params) : '')) : s);
 // like trimScreen, but a trailing line that holds only SGR and blanks counts as blank
 export function trimAnsiScreen(s) {
   const lines = s.split('\n');

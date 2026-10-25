@@ -149,7 +149,7 @@ File này do GitHub Actions tự dựng lại mỗi khi nhánh `main` thay đổ
 
 Với Apple ID miễn phí, app chỉ chạy được **7 ngày** rồi phải ký lại. Cách làm: cắm iPhone, mở Sideloadly và bấm **Start** lại với cùng file `fcode.ipa`. Cài đè bằng cùng Apple ID thì việc ghép máy vẫn được giữ, bạn không phải ghép lại. Sideloadly cũng có thể tự ký lại app sau vài ngày bằng một chương trình chạy nền trên máy tính (máy tính phải bật và kết nối được với iPhone, qua cáp hoặc cùng Wi-Fi); xem hướng dẫn của Sideloadly nếu muốn dùng.
 
-Muốn lên bản mới: chạy `fcode ipa` rồi cài file đó bằng Sideloadly (giữ nguyên ghép máy).
+Muốn lên bản mới: chạy `fcode ipa` rồi cài file đó bằng Sideloadly (giữ nguyên ghép máy). Máy không có `fcode` thì vào **Releases** trên GitHub, tải `fcode.ipa` như ở mục "Tải file cài đặt" rồi cài bằng Sideloadly.
 
 ## 6. Ghép iPhone với box
 
@@ -264,7 +264,7 @@ Khi điện thoại mở một phiên, app đặt kích thước cửa sổ tmux
 
 ### Lệnh `fcode` (tùy chọn)
 
-Trên máy Windows của chủ dự án có một lệnh `fcode` (PowerShell, kèm bản gọi cho Git Bash và cmd) để vào phiên nhanh hơn. Nó không nằm trong kho mã này và không bắt buộc; nó chỉ gọi `instabox ssh` một lần cho bạn. Tên box lấy từ biến môi trường `FCODE_BOX`, nếu không đặt thì là `coder`.
+Trên máy Windows của chủ dự án có một lệnh `fcode` (PowerShell, kèm bản gọi cho Git Bash và cmd) để vào phiên nhanh hơn. Nó không nằm trong kho mã này và không bắt buộc. Để vào phiên, `fcode` gọi `instabox ssh` cho bạn; ngoài ra còn có `fcode sync` (dùng git ngay trên laptop) và `fcode ipa` (tải app về máy). Tên box lấy từ biến môi trường `FCODE_BOX`, nếu không đặt thì là `coder`.
 
 ```sh
 fcode           # liệt kê các phiên, gõ số để vào
@@ -274,7 +274,7 @@ fcode --list    # (hoặc -l) chỉ liệt kê, không vào
 ```
 
 - `fcode sync`: kéo code mới của 3 project về laptop, chỉ cập nhật khi đang ở main và không có thay đổi chưa lưu; liệt kê nhánh box và PR chờ merge.
-- `fcode ipa`: tải bản app mới nhất về `C:\Users\conta\FCode\fcode.ipa` (giữ bản trước là `fcode.prev.ipa`). Khi có bản mới, kéo file này vào Sideloadly và bấm Start; việc tự ký lại 7 ngày của Sideloadly chỉ gia hạn bản đang cài, không tự cập nhật.
+- `fcode ipa`: tải bản app mới nhất về `C:\Users\conta\FCode\fcode.ipa` (giữ bản trước là `fcode.prev.ipa`). Khi có bản mới, kéo file này vào Sideloadly và bấm Start; việc tự ký lại 7 ngày của Sideloadly chỉ gia hạn bản đang cài, không tự cập nhật. Không có `fcode` thì tải `fcode.ipa` từ **Releases** trên GitHub.
 
 Thoát bằng **Ctrl+B** rồi **D**, phiên vẫn chạy tiếp.
 
