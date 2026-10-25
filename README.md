@@ -279,6 +279,50 @@ fcode --list    # (hoặc -l) chỉ liệt kê, không vào
 
 Thoát bằng **Ctrl+B** rồi **D**, phiên vẫn chạy tiếp.
 
+### Cài lệnh fcode trên máy Windows khác
+
+Mở **Windows PowerShell** (không cần quyền admin), dán đúng một dòng này rồi bấm Enter:
+
+```powershell
+irm https://raw.githubusercontent.com/brooklyn96/fcoding/main/laptop/install.ps1 | iex
+```
+
+Lệnh cài sẽ lần lượt làm các việc sau, mỗi việc một dòng trên màn hình:
+
+1. Chép lệnh `fcode` vào `%USERPROFILE%\.local\bin` và thêm thư mục đó vào PATH của bạn.
+2. Tạo file cấu hình `%USERPROFILE%\.fcode\config.json` nếu chưa có (có rồi thì giữ nguyên).
+3. Kiểm tra **GitHub CLI** (`gh`). Máy chưa có thì tự cài. Nếu Windows hỏi quyền, bấm **Yes**.
+4. Kiểm tra **instabox**. Máy chưa có thì cài bằng lệnh chính thức của instabox (cần Node.js, chưa có thì tự cài thêm).
+5. Hướng dẫn bạn đăng nhập, **chỉ khi chưa đăng nhập**. Bạn không phải gõ mật khẩu vào cửa sổ này.
+
+Bạn đăng nhập hai lần, theo thứ tự:
+
+- **Bước 1/2, instabox**: trình duyệt mở ra, bạn đăng nhập rồi quay lại cửa sổ PowerShell.
+- **Bước 2/2, GitHub**: GitHub hiện một mã 8 ký tự (dạng `ABCD-1234`). Chép mã đó, bấm Enter, dán mã vào trang GitHub vừa mở rồi bấm **Authorize**.
+
+Cuối cùng có bảng kết quả, mỗi dòng là `✓` (xong) hoặc `✗` kèm việc cần làm. Gặp `✗` thì làm theo dòng đó rồi chạy lại đúng lệnh trên; chạy lại bao nhiêu lần cũng an toàn và chỉ làm phần còn thiếu. Xong thì **mở cửa sổ PowerShell mới** rồi gõ `fcode help` để xem danh sách lệnh.
+
+Nếu bạn đã tải kho mã này về máy, chạy `powershell -ExecutionPolicy Bypass -File .\laptop\install.ps1` trong thư mục kho mã cũng được.
+
+**Sửa file cấu hình.** Mở `%USERPROFILE%\.fcode\config.json` bằng Notepad:
+
+```json
+{
+  "instabox": "",
+  "box": "coder",
+  "syncRepos": ["C:/Users/ten-ban/code/du-an-1", "C:/Users/ten-ban/code/du-an-2"],
+  "ipaRepo": "brooklyn96/fcoding",
+  "ipaTag": "latest"
+}
+```
+
+- `box`: tên box mà `fcode` sẽ vào (mặc định `coder`).
+- `syncRepos`: các thư mục trên máy mà `fcode sync` cập nhật. Viết dấu gạch chéo `/` giữa các thư mục (hoặc gấp đôi dấu `\`), mỗi thư mục trong dấu ngoặc kép, cách nhau bằng dấu phẩy. Để trống `[]` nếu chưa dùng.
+- `instabox`: đường dẫn đầy đủ tới `instabox.exe`. Để trống `""` là máy tự tìm.
+- `ipaRepo`, `ipaTag`: nơi `fcode ipa` lấy file cài app iPhone. Thường không cần đổi.
+
+File này chỉ do bạn sửa; lệnh cài không bao giờ ghi đè nó. Danh sách đầy đủ các lệnh: gõ `fcode help`.
+
 ## 9. Bảo mật
 
 **Ghép máy bảo vệ điều gì.** Địa chỉ công khai ai cũng mở được, nhưng chỉ trang `fcoding ok` ở địa chỉ gốc là không cần đăng nhập. Mọi chức năng khác (xem màn hình, gửi chữ, tạo hoặc xóa phiên) đều đòi một mã thiết bị mà chỉ iPhone đã ghép mới có. Để ghép, phải có mã 6 số, và mã chỉ được tạo ra bởi người có quyền chạy lệnh trên box.
