@@ -1,6 +1,6 @@
 # FCode cho iPhone
 
-Ứng dụng FCode giúp bạn trò chuyện với các chương trình (omp, claude, codex, shell) đang chạy trên box, ngay trên iPhone. Gõ tiếng Việt (Telex) bình thường bằng bàn phím của iPhone.
+Ứng dụng FCode giúp bạn trò chuyện với các chương trình (omp, claude, codex) đang chạy trên box, ngay trên iPhone. Gõ tiếng Việt (Telex) bình thường bằng bàn phím của iPhone.
 
 Ứng dụng không có trên App Store. Bạn cài nó bằng **Sideloadly** trên máy tính (Windows hoặc Mac).
 

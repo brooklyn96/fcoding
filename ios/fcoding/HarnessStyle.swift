@@ -1,15 +1,14 @@
 import SwiftUI
 
-/// Colour and glyph per harness (CONTRACT A5 update 3). "all" is the dock's "Tất cả".
+/// Colour and glyph per harness: omp, claude and codex only (contract home v2).
 enum HarnessStyle {
-    static let all = ["omp", "claude", "codex", "shell"]
+    static let all = ["omp", "claude", "codex"]
 
     static func color(_ harness: String?) -> Color {
         switch harness {
         case "claude": return Color(red: 0xD9 / 255, green: 0x77 / 255, blue: 0x57 / 255)
         case "omp": return Color(red: 0xA7 / 255, green: 0x8B / 255, blue: 0xFA / 255)
         case "codex": return Color(red: 0x64 / 255, green: 0xD2 / 255, blue: 0xFF / 255)
-        case "shell": return Color(red: 0xAE / 255, green: 0xAE / 255, blue: 0xB2 / 255)
         default: return .accentColor
         }
     }
@@ -19,7 +18,7 @@ enum HarnessStyle {
         case "omp": return "oh-my-pi · tác tử lập trình"
         case "claude": return "Claude Code"
         case "codex": return "Codex CLI"
-        default: return "Dòng lệnh trên box"
+        default: return harness
         }
     }
 }
@@ -40,8 +39,6 @@ struct HarnessGlyph: View {
                 CodexMark().fill(style: FillStyle(eoFill: true)).frame(width: size, height: size)
             case "omp":
                 Text("π").font(.system(size: size, weight: .bold, design: .monospaced))
-            case "shell":
-                Text(">_").font(.system(size: size * 0.85, weight: .bold, design: .monospaced))
             case "all":
                 AllMark().fill().frame(width: size * 0.9, height: size * 0.9)
             default:
