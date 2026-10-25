@@ -1,0 +1,9 @@
+[Unit]
+Description=Update coding harnesses (omp, claude, codex, opencode, cmd)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/fcode-update
+TimeoutStartSec=1h
+Nice=10
