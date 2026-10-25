@@ -364,10 +364,13 @@ private struct QuickKey {
     let title: String
     let key: String
     let label: String
+    var symbol: String? = nil
 }
 
 private let quickKeys: [QuickKey] = [
     QuickKey(title: "Esc", key: "Escape", label: "Phím Escape"),
+    // omp agent hub (Alt+A): ↑/↓ chọn, Enter mở, Esc đóng.
+    QuickKey(title: "Agents", key: "M-a", label: "Mở danh sách agent của omp", symbol: "person.2"),
     QuickKey(title: "Ctrl+C", key: "C-c", label: "Control C, dừng"),
     QuickKey(title: "↑", key: "Up", label: "Mũi tên lên"),
     QuickKey(title: "↓", key: "Down", label: "Mũi tên xuống"),
@@ -378,9 +381,10 @@ private let quickKeys: [QuickKey] = [
     QuickKey(title: "Enter", key: "Enter", label: "Phím Enter"),
     QuickKey(title: "y", key: "y", label: "Chữ y, đồng ý"),
     QuickKey(title: "n", key: "n", label: "Chữ n, từ chối"),
+    QuickKey(title: "^O", key: "C-o", label: "Control O, mở rộng"),
 ]
 
-private let slashCommands = ["/model", "/clear", "/compact", "/help", "/resume", "/exit"]
+private let slashCommands = ["/model", "/clear", "/compact", "/help", "/resume", "/hub", "/exit"]
 
 /// The draft lives only here and is only written by the keyboard, except: restored from
 /// UserDefaults when the view appears (if empty), cleared after a successful send (if unchanged)
@@ -563,15 +567,18 @@ struct ComposerView: View {
                 }
                 .accessibilityLabel("Lệnh gạch chéo")
                 ForEach(quickKeys, id: \.key) { k in
-                    Button { onKey(k.key) } label: { keyLabel(k.title) }
+                    Button { onKey(k.key) } label: { keyLabel(k.title, symbol: k.symbol) }
                         .accessibilityLabel(k.label)
                 }
             }
         }
     }
 
-    private func keyLabel(_ title: String) -> some View {
-        Text(title)
+    private func keyLabel(_ title: String, symbol: String? = nil) -> some View {
+        HStack(spacing: 4) {
+            if let symbol = symbol { Image(systemName: symbol).font(.system(size: 13, weight: .semibold)) }
+            Text(title)
+        }
             .font(.system(size: 15, weight: .semibold, design: .monospaced))
             .frame(minWidth: 44, minHeight: 36)
             .padding(.horizontal, 4)

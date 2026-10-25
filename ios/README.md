@@ -62,7 +62,8 @@ Sau khi ghép, iPhone nhớ box trong Keychain; mở ứng dụng là vào thẳ
   - Ô nhập cao 1 dòng, tự giãn tới 4 dòng khi bạn gõ dài.
   - Nút tròn **↑** bên phải ô nhập = **Gửi** (gửi rồi nhấn Enter). Bấm khi ô trống = chỉ nhấn Enter. **Giữ lâu** nút này để chọn **Gửi không Enter**.
   - Nội dung đang soạn được giữ lại cho từng phiên (kể cả khi ẩn khung gõ, hay khi iPhone bị gỡ khỏi box và phải ghép lại). Nó bị xoá khi gửi thành công, khi bạn xoá phiên đó, hoặc khi bạn tự gỡ máy (**Gỡ iPhone này** / **Gỡ mọi thiết bị**).
-  - Hàng phím nhanh: Esc, Ctrl+C, mũi tên, Tab, ⇧Tab, Enter, y, n. Nút **/** chèn các lệnh hay dùng (/model, /clear, …). Các phím được gửi đúng thứ tự bạn bấm.
+  - Hàng phím nhanh: Esc, **Agents**, Ctrl+C, mũi tên, Tab, ⇧Tab, Enter, y, n, **^O**. Nút **/** chèn các lệnh hay dùng (/model, /clear, /hub, …). Các phím được gửi đúng thứ tự bạn bấm.
+  - Xem các agent con của omp: bấm **Agents** (mở danh sách agent), chọn bằng ↑ / ↓, bấm **Enter** để mở, **Esc** để quay ra; **^O** mở rộng một mục.
   - Khi xoay ngang: ô nhập thấp lại để màn hình còn chỗ; nút ghim và **⌄** nằm cạnh ô nhập; bấm nút **phím nhanh** bên trái ô nhập để hiện / ẩn hàng phím nhanh.
   - Khi bạn chuyển sang ứng dụng khác, kết nối tạm dừng; mở lại ứng dụng là tự kết nối lại.
 - **Cài đặt** (bánh răng):
