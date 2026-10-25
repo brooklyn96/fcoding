@@ -32,6 +32,12 @@ struct ProjectsView: View {
 
     private var allSessions: [OverviewSession] { model.overview?.sessions ?? [] }
     private var projectNames: [String] { model.overview?.projects.map(\.name) ?? [] }
+    /// Chip rail: real projects only. The installer seeds config.json with a sample project
+    /// "home" (the home directory, not a git repo); it is still offered in "+" and its sessions
+    /// still show under "Tất cả", but it gets no chip.
+    private var chipProjects: [String] {
+        (model.overview?.projects ?? []).filter { !($0.name == "home" && $0.branch == nil) }.map(\.name)
+    }
 
     /// A session without a harness tag counts as "shell" everywhere (avatar, badges, filter).
     private func matchesHarness(_ s: OverviewSession) -> Bool { harness == "all" || (s.harness ?? "shell") == harness }
@@ -160,7 +166,7 @@ struct ProjectsView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         chip("all", label: "Tất cả")
-                        ForEach(projectNames, id: \.self) { chip($0, label: $0) }
+                        ForEach(chipProjects, id: \.self) { chip($0, label: $0) }
                     }
                     .padding(.horizontal, railInset)
                     .padding(.vertical, 2)
