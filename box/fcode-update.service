@@ -1,0 +1,9 @@
+[Unit]
+Description=Update coding harnesses (omp, claude, codex)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/fcode-update
+# worst case (first run: a migration plus an update for each npm tool) is under 2 h; never let systemd kill an in-flight npm install
+TimeoutStartSec=3h
+Nice=10

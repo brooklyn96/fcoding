@@ -1,0 +1,14 @@
+[Unit]
+Description=Update coding harnesses every 6 hours
+
+[Timer]
+# realtime: also fires after the paused box wakes up and its clock jumps past a boundary
+OnCalendar=*-*-* 00/6:00:00
+# 5 minutes after the user manager starts (boot)
+OnStartupSec=5min
+# a run missed while the box was off is made up at the next start
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target
