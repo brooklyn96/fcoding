@@ -46,7 +46,36 @@ struct OverviewSession: Decodable, Identifiable, Hashable {
     var id: String { name }
 }
 
+/// POST /api/pair-code: a one-time code for another device, with its QR / share links.
+struct PairCodeResponse: Decodable {
+    let code: String
+    let expiresAt: Date
+    let appLink: String
+    let shareLink: String
+
+    private enum Key: String, CodingKey { case code, expiresAt, appLink, shareLink }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: Key.self)
+        code = try c.decode(String.self, forKey: .code)
+        appLink = try c.decode(String.self, forKey: .appLink)
+        shareLink = try c.decode(String.self, forKey: .shareLink)
+        let raw = try c.decode(String.self, forKey: .expiresAt)
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        guard let date = iso.date(from: raw) ?? ISO8601DateFormatter().date(from: raw) else {
+            throw DecodingError.dataCorruptedError(forKey: .expiresAt, in: c, debugDescription: "expiresAt")
+        }
+        expiresAt = date
+    }
+}
+
 extension API {
+    func pairCode() async throws -> PairCodeResponse {
+        let data = try await call("POST", "api/pair-code", body: [:])
+        return try JSONDecoder().decode(PairCodeResponse.self, from: data)
+    }
+
     func overview() async throws -> Overview { try await get("api/overview", as: Overview.self) }
 
     /// POST /api/open with fresh:true: always a new session (CONTRACT A5 update 4).

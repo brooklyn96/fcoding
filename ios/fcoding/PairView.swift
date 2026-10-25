@@ -1,22 +1,39 @@
 import SwiftUI
 
 /// "Ghép máy": server address + the 6-digit code that `fcode-pair` prints on the box.
+/// A `fcode://pair` link (QR) pre-fills both and asks "Ghép với máy chủ <host>?"; pairing
+/// still waits for the tap. While paired, it first asks whether to re-pair at all.
 struct PairView: View {
     @EnvironmentObject private var app: AppState
     @State private var server = ""
     @State private var code = ""
     @State private var busy = false
     @State private var errorText: String?
+    @State private var askRepair = false
     @FocusState private var focus: Field?
 
     private enum Field { case server, code }
 
     private var canPair: Bool { !busy && code.count == 6 && AppState.normalize(server) != nil }
+    /// Host of the address in the field, for the link confirmation.
+    private var linkHost: String? { app.pairLink == nil ? nil : AppState.normalize(server)?.host }
 
     var body: some View {
         Form {
             if let notice = app.notice {
                 Section { Label(notice, systemImage: "exclamationmark.circle").foregroundColor(.orange) }
+            }
+            if let host = linkHost {
+                Section {
+                    Label {
+                        Text("Ghép với máy chủ ") + Text(host).bold() + Text("?")
+                    } icon: {
+                        Image(systemName: "qrcode")
+                    }
+                    .font(.headline)
+                } footer: {
+                    Text("Chỉ bấm Ghép nếu đây đúng là box của bạn.")
+                }
             }
             Section {
                 TextField("https://…", text: $server)
@@ -47,7 +64,7 @@ struct PairView: View {
             Section {
                 Button(action: pair) {
                     ZStack {
-                        Text("Ghép iPhone này").bold().opacity(busy ? 0 : 1)
+                        Text(pairTitle).bold().opacity(busy ? 0 : 1)
                         if busy { ProgressView().tint(.white) }
                     }
                     .frame(maxWidth: .infinity, minHeight: 32)
@@ -55,7 +72,7 @@ struct PairView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
                 .disabled(!canPair)
-                .accessibilityLabel(busy ? "Đang ghép" : "Ghép iPhone này")
+                .accessibilityLabel(busy ? "Đang ghép" : pairTitle)
                 .listRowInsets(EdgeInsets())
                 .listRowBackground(Color.clear)
             }
@@ -63,10 +80,36 @@ struct PairView: View {
         .navigationTitle("Ghép máy")
         .navigationBarTitleDisplayMode(.large)
         .scrollDismissesKeyboard(.interactively)
+        .toolbar {
+            // Re-pair from a link while paired: a way back without pairing.
+            if app.token != nil {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Huỷ") { app.pairLink = nil }.disabled(busy)
+                }
+            }
+        }
+        .alert("Thiết bị này đã ghép. Ghép lại với máy chủ mới?", isPresented: $askRepair) {
+            Button("Ghép lại") {}
+            Button("Huỷ", role: .cancel) { app.pairLink = nil }
+        }
         .onAppear {
+            if app.pairLink != nil { applyLink(); return }
             if server.isEmpty { server = app.serverURL }
             focus = server.isEmpty ? .server : .code
         }
+        .onChange(of: app.pairLink) { _ in applyLink() }
+    }
+
+    private var pairTitle: String { app.pairLink == nil ? "Ghép iPhone này" : "Ghép" }
+
+    /// Fills the fields from the pending link; never pairs by itself.
+    private func applyLink() {
+        guard let link = app.pairLink, !busy else { return }
+        server = link.server
+        code = link.code
+        errorText = nil
+        focus = nil
+        askRepair = app.token != nil
     }
 
     /// Six boxes (3 + 3) drawn over a hidden numeric TextField that holds the real input,
@@ -120,7 +163,7 @@ struct PairView: View {
         focus = nil
         Task {
             do {
-                try await app.pair(server: server, code: code)
+                try await app.pair(server: server, code: code, name: app.pairLink?.name)
             } catch {
                 errorText = vietnameseMessage(error, pairing: true)
                 if let e = error as? APIError, e.status == 401 {

@@ -37,6 +37,11 @@ Mẹo: iPhone chỉ báo tên chung là "iPhone", nên mọi máy trong danh sá
 
 Sau khi ghép, iPhone nhớ box trong Keychain; mở ứng dụng là vào thẳng danh sách dự án. Box khởi động lại thì không phải ghép lại.
 
+**Thêm một iPhone mới bằng mã QR** (khi đã có một iPhone ghép rồi):
+
+1. Trên iPhone cũ: **Cài đặt → Thêm thiết bị (mã QR)**. Mã dùng 1 lần, hết hạn sau **5 phút** (có đồng hồ đếm ngược; hết hạn thì bấm **Tạo mã mới**).
+2. Trên iPhone mới (đã cài FCode): mở **Camera**, quét mã, chạm thông báo **Mở trong FCode**, rồi bấm **Ghép**. Không quét được thì bấm **Gửi link** để gửi link qua AirDrop hoặc Zalo.
+
 ## 4. Cách dùng
 
 - **Màn hình chính** gom mọi phiên trên box, việc cần bạn lên đầu. Danh sách tự cập nhật mỗi 5 giây; kéo xuống để cập nhật ngay.

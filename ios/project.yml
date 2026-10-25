@@ -45,6 +45,10 @@ targets:
         CFBundleInfoDictionaryVersion: "6.0"
         LSRequiresIPhoneOS: true
         UILaunchScreen: {}
+        CFBundleURLTypes:
+          - CFBundleURLName: com.brooklyn96.fcoding.pair
+            CFBundleURLSchemes:
+              - fcode
         UIAppFonts:
           - SymbolsNerdFontMono-Regular.ttf
         UIApplicationSceneManifest:
