@@ -1236,6 +1236,13 @@ test('config publicUrl: only a bare https origin is accepted (normalised); anyth
   }
 });
 
+test('strictOrigin: every vector of the shared rule (test/origin-vectors.json, the same file as in the iOS tree)', () => {
+  const { rule, vectors } = JSON.parse(fs.readFileSync(path.join(here, 'origin-vectors.json'), 'utf8'));
+  assert.match(rule, /^FCode server origin rule v1/);
+  assert.ok(vectors.length >= 50);
+  for (const [input, want] of vectors) assert.equal(strictOrigin(input), want, JSON.stringify(input));
+});
+
 test('strictOrigin: the server address a pairing link may carry (the same table as the iOS parser)', () => {
   const ok = {
     'https://box.example.com': 'https://box.example.com',

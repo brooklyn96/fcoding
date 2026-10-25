@@ -77,15 +77,16 @@ export function secureConfigDir(dir) {
   };
   if (check(dir, true)) for (const f of ['config.json', 'devices.json']) check(path.join(dir, f), false);
 }
-// The server origin the app accepts in a pairing link (the same rule as the iOS PairLink parser): "https://" + host [+ ":" port] [+ "/"], nothing else.
-// host = lowercase ASCII LDH name (labels 1-63, no leading or trailing "-", no "xn--" label, at least one dot, at most 253 chars, one trailing dot
-// dropped, last label not all digits and not "0x...") OR 4 decimal octets without leading zeros OR a bracketed IPv6 address. port 1-65535.
-// Returns the canonical origin (443 left out) or null. A host written another way (IDN, "localhost", "192.168.001.010", "1.2.3.0x4") gives a QR no phone can use.
+// The server origin the app accepts in a pairing link. ONE rule shared with the iOS PairLink parser: the "rule" field and the vectors in
+// test/origin-vectors.json (the same file is in the iOS tree). Raw input printable ASCII only, then lower-cased as a whole; "https://" + host
+// [+ ":" port, 1-65535 without a leading zero] [+ "/"], nothing else; host = LDH name with a dot (no "xn--" label, last label not a number) OR dotted IPv4
+// without leading zeros and without a trailing dot OR a bracketed IPv6 address. Returns the canonical origin (443 left out) or null.
+// A host written another way (IDN, "localhost", "192.168.001.010", "1.2.3.0x4") gives a QR no phone can use.
 export function strictOrigin(raw) {
-  if (typeof raw !== 'string' || /[^\x21-\x7e]/.test(raw)) return null; // ASCII, no space or control character (checked before any lowercasing)
-  const m = /^https:\/\/(\[[0-9a-fA-F:.]+\]|[^:/[\]]+)(?::(\d{1,5}))?\/?$/.exec(raw);
+  if (typeof raw !== 'string' || /[^\x21-\x7e]/.test(raw)) return null; // printable ASCII only (checked before lowercasing: KELVIN SIGN must not become "k")
+  const m = /^https:\/\/(\[[0-9a-f:.]+\]|[^:/[\]]+)(?::([1-9]\d{0,4}))?\/?$/.exec(raw.toLowerCase()); // the whole string is lower-cased, scheme included
   if (!m) return null;
-  let host = m[1].toLowerCase();
+  let host = m[1];
   const port = m[2] === undefined ? null : Number(m[2]);
   if (port !== null && !(port >= 1 && port <= 65535)) return null;
   const origin = `https://${host}${port === null || port === 443 ? '' : `:${port}`}`;
