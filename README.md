@@ -171,14 +171,14 @@ FCode không dùng mật khẩu. Chỉ người đang có quyền vào dòng l�
 Lưu ý về mã:
 
 - Mã có hạn **2 phút** và chỉ dùng được **một lần**.
-- Nhập sai 5 lần thì mã bị hủy; chạy lại `fcode-pair` để lấy mã mới. Có thể có tối đa 3 mã cùng lúc (mã từ lệnh và mã QR không hủy nhau); tạo mã thứ 4 thì mã cũ nhất bị thay.
+- Nhập sai 5 lần thì mã bị hủy; chạy lại `fcode-pair` để lấy mã mới. Mỗi nơi tạo mã (lệnh `fcode-pair` hoặc từng iPhone đã ghép) chỉ có 1 mã đang chờ, tạo mã mới thì thay mã cũ của nơi đó; tổng cộng tối đa 3 mã cùng lúc.
 - Máy chủ phải đang chạy thì lệnh mới in được mã.
 
 Sau khi ghép, iPhone nhớ box trong Keychain. Mở app là vào thẳng danh sách; box khởi động lại cũng không phải ghép lại.
 
 ### Ghép thêm iPhone bằng mã QR
 
-Không cần gõ địa chỉ máy chủ: iPhone mới quét mã QR bằng Camera, app FCode tự mở với địa chỉ và mã đã điền sẵn, bạn chỉ bấm **Ghép**.
+Không cần gõ địa chỉ máy chủ: iPhone mới quét mã QR bằng Camera, app FCode tự mở với địa chỉ máy chủ đã điền sẵn. Mã QR **không chứa mã 6 số**, nên bạn gõ mã 6 số đang hiện ở máy cũ (hoặc ở màn hình lệnh) vào app rồi bấm **Ghép**.
 
 1. Làm một lần: thêm `publicUrl` vào `/data/home/.fcoding/config.json` (địa chỉ công khai ở [mục 4](#4-mở-link-công-khai), bắt đầu bằng `https://`, không có đường dẫn phía sau):
 
@@ -187,12 +187,13 @@ Không cần gõ địa chỉ máy chủ: iPhone mới quét mã QR bằng Camer
    ```
 
    Máy chủ chỉ tạo link từ địa chỉ này, không bao giờ lấy từ yêu cầu gửi tới. Chưa đặt thì không tạo được link và mã QR. Máy chủ tự đọc lại file, không cần khởi động lại.
-2. Trên box, chạy `fcode-pair "iPhone mới" --qr`. Lệnh in mã 6 số như trước, rồi mã QR và link chia sẻ. Cần chương trình `qrencode` để hiện mã QR (cài bằng `sudo apt install qrencode`); thiếu thì lệnh chỉ in link và nhắc "cài qrencode để hiện mã QR".
-3. Trên iPhone mới, mở Camera và quét mã. Link chia sẻ (`<địa chỉ>/pair?code=…`) gửi qua AirDrop hay Zalo cũng được: mở nó sẽ ra trang có nút **Mở FCode**.
+2. Trên box, chạy `fcode-pair "iPhone mới" --qr`. Lệnh in mã QR (cần chương trình `qrencode`, cài bằng `sudo apt install qrencode`; thiếu thì in link và nhắc "cài qrencode để hiện mã QR"), link chia sẻ, rồi **mã 6 số cỡ lớn** và một dòng báo mã hết hạn sau 2 phút.
+3. Trên iPhone mới, mở Camera và quét mã QR. Link chia sẻ (`<địa chỉ>/pair`) gửi qua AirDrop hay Zalo cũng được: mở nó sẽ ra trang có nút **Mở FCode**. Link không có mã nên gửi cho ai cũng không lộ gì ngoài địa chỉ máy chủ.
+4. Trong app, gõ mã 6 số rồi bấm **Ghép**.
 
-Từ một iPhone đã ghép, vào **Cài đặt → Thêm thiết bị (mã QR)** trong app cũng tạo được mã như vậy (máy chủ cần có `publicUrl`).
+Từ một iPhone đã ghép, vào **Cài đặt → Thêm thiết bị (mã QR)** trong app cũng tạo được mã và QR như vậy (máy chủ cần có `publicUrl`).
 
-Mã vẫn là mã ghép thường: dùng một lần, hết hạn sau 2 phút, nhập sai 5 lần thì hủy. Mã QR và mã từ `fcode-pair` cùng tồn tại được (tối đa 3 mã, mã thứ 4 thay mã cũ nhất). Mở trang `/pair` không làm mất mã và không cho biết mã còn đúng hay không. Trong mã QR và link chỉ có địa chỉ máy chủ, mã 6 số và tên gợi ý, không có khóa hay mã thiết bị.
+Mã vẫn là mã ghép thường: dùng một lần, hết hạn sau 2 phút, nhập sai 5 lần thì hủy. Mỗi nơi tạo mã chỉ có 1 mã đang chờ (tạo mới thì thay mã cũ của nơi đó), tổng cộng tối đa 3 mã. Mở trang `/pair` không làm mất mã và trang này không có mã. Gỡ một iPhone khỏi box cũng hủy các mã nó đã tạo.
 
 ### Xem và gỡ thiết bị
 
@@ -300,7 +301,7 @@ Thoát bằng **Ctrl+B** rồi **D**, phiên vẫn chạy tiếp.
 
 ## 9. Bảo mật
 
-**Ghép máy bảo vệ điều gì.** Địa chỉ công khai ai cũng mở được, nhưng chỉ trang `fcoding ok` ở địa chỉ gốc là không cần đăng nhập. Mọi chức năng khác (xem màn hình, gửi chữ, tạo hoặc xóa phiên) đều đòi một mã thiết bị mà chỉ iPhone đã ghép mới có. Để ghép, phải có mã 6 số, và mã chỉ được tạo ra bởi người có quyền chạy lệnh trên box.
+**Ghép máy bảo vệ điều gì.** Địa chỉ công khai ai cũng mở được, nhưng chỉ trang `fcoding ok` ở địa chỉ gốc là không cần đăng nhập. Mọi chức năng khác (xem màn hình, gửi chữ, tạo hoặc xóa phiên) đều đòi một mã thiết bị mà chỉ iPhone đã ghép mới có. Để ghép, phải có mã 6 số, và mã chỉ do người có quyền chạy lệnh trên box, hoặc một iPhone đã ghép (**Cài đặt → Thêm thiết bị**), tạo ra.
 
 **Mã ghép:** ngẫu nhiên, 6 số, hạn 2 phút, dùng một lần, tối đa 5 lần nhập sai. Nhiều người cùng thử thì tổng số lần ghép bị giới hạn **10 lần mỗi phút và 30 lần mỗi giờ** cho cả hệ thống (vượt quá thì nhận lỗi 429 kèm thời gian chờ). Giới hạn này tính chung cho mọi người trên internet, nên người lạ có thể dùng hết 30 lượt; khi đó bạn chờ tối đa 1 giờ rồi ghép lại. Ghép máy hiếm khi cần nên điều này được chấp nhận.
 
@@ -321,8 +322,8 @@ node -e 'console.log(require("crypto").randomBytes(32).toString("base64"))'
 **Mất iPhone thì làm gì:**
 
 1. Trên box, xem thiết bị: `PC_CONFIG_DIR=/data/home/.fcoding node /data/home/fcoding/server.mjs --devices`.
-2. Gỡ máy bị mất bằng `--revoke <id>` (hoặc `--revoke all` nếu không chắc máy nào).
-3. Nếu nghi ngờ nặng hơn, đổi `cookieSecret` như trên để gỡ tất cả thiết bị.
+2. Gỡ máy bị mất bằng `--revoke <id>` (hoặc `--revoke all` nếu không chắc máy nào). Gỡ máy nào thì các mã ghép máy đó đã tạo cũng bị hủy ngay (`--revoke all` hủy mọi mã đang chờ). Nhớ xem lại danh sách thiết bị: nếu máy bị mất đã kịp ghép thêm máy khác thì gỡ cả máy đó.
+3. Nếu nghi ngờ nặng hơn, đổi `cookieSecret` như trên để gỡ tất cả thiết bị (mọi mã đang chờ cũng bị hủy).
 4. Vào các phiên đang chạy từ laptop và kiểm tra xem có lệnh nào lạ không.
 
 ## 10. Phát triển

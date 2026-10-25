@@ -113,7 +113,16 @@ export function parseDevices(text) {
   return { secretTag: d.secretTag, devices: d.devices.map(({ id, name, keyHash, createdAt }) => ({ id, name, keyHash, createdAt })) };
 }
 const NAME_CTRL = /[\x00-\x1f\x7f-\x9f\u061c\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/g; // C0, DEL, C1, bidi, zero-width, BOM
-const cleanName = (n) => (typeof n === 'string' ? n.replace(NAME_CTRL, '').trim().slice(0, 64) : '');
+const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+function cleanName(n) {
+  if (typeof n !== 'string') return '';
+  let out = '', len = 0;
+  for (const ch of n.replace(LONE_SURROGATE, '').replace(NAME_CTRL, '').trim()) { // never half of a surrogate pair
+    if (len + ch.length > 64) break;
+    out += ch; len += ch.length;
+  }
+  return out.trim();
+}
 
 // --- overview (A5): session state and a one-line preview from the visible pane ---
 // approval / question prompts, matched case-insensitively against the last 6 non-empty lines
@@ -241,13 +250,11 @@ export function trimAnsiScreen(s) {
   return lines.join('\n');
 }
 
-// GET /pair: a tiny page with one button that opens the app link. Only 6 digits and the configured origin reach it.
+// GET /pair: a tiny page with one button that opens the app link. Nothing from the request reaches it (no code, no query).
 const escHtml = (t) => t.replace(/[&<>"']/g, (ch) => `&#${ch.charCodeAt(0)};`);
-export function pairPage(appLink, status = 200) {
-  const note = status === 503 ? 'Máy chủ chưa đặt địa chỉ công khai, nên chưa tạo được link ghép.'
-    : status === 400 ? 'Link ghép không hợp lệ. Hãy tạo mã mới trong app FCode.' : null;
-  const body = note ? `<p>${note}</p>`
-    : `<a class="btn" href="${escHtml(appLink)}">Mở FCode</a><p>Mã dùng 1 lần, hết hạn sau ${PAIR_TTL / 60000} phút.</p><p class="s">Chưa cài FCode? Cài file fcode.ipa trước.</p>`;
+export function pairPage(appLink) {
+  const body = !appLink ? '<p>Máy chủ chưa đặt địa chỉ công khai, nên chưa mở được app từ link này.</p>'
+    : `<a class="btn" href="${escHtml(appLink)}">Mở FCode</a><p>Sau khi app mở, gõ mã 6 số đang hiện trên iPhone cũ hoặc trên máy tính.</p><p class="s">Chưa cài FCode? Cài file fcode.ipa trước.</p>`;
   return `<!doctype html><html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Ghép FCode</title><style>body{margin:0;font:17px/1.5 -apple-system,system-ui,sans-serif;background:#111;color:#eee;text-align:center}main{padding:48px 24px}.btn{display:block;max-width:320px;margin:24px auto;padding:16px;border-radius:14px;background:#0a84ff;color:#fff;font-size:20px;font-weight:600;text-decoration:none}.s{color:#999;font-size:15px}</style></head><body><main><h1>Ghép iPhone với FCode</h1>${body}</main></body></html>`;
 }
 
@@ -319,7 +326,7 @@ export function createApp(opts = {}) {
       if (next) {
         const rotated = !next.secret.equals(cfg.secret);
         cfg = next;
-        if (rotated) { gen++; load([]); purge(); return; } // no old keyHash may match any more
+        if (rotated) { gen++; pendings = []; load([]); purge(); return; } // no old keyHash may match any more
       }
     }
     if (purgePending && (force || changed || now() - purgeAt >= 1000)) purge();
@@ -334,7 +341,7 @@ export function createApp(opts = {}) {
 
   // --- pairing: up to 3 pending 6-digit codes (a shell code and QR codes do not cancel each other), each 120 s and single use,
   // 5 wrong attempts while it is live; /api/pair limited to 10/min and 30/h ---
-  let pendings = []; // oldest first: {code, name, expiresAt, attempts}
+  let pendings = []; // oldest first: {code, name, expiresAt, attempts, issuer}; issuer = a device id or 'shell'
   const pairHits = [];
   function pairLimited(t) {
     while (pairHits.length && pairHits[0] <= t - PAIR_HOUR) pairHits.shift();
@@ -348,7 +355,7 @@ export function createApp(opts = {}) {
   const codeMatches = (code, p) => typeof code === 'string' && /^\d{6}$/.test(code) && crypto.timingSafeEqual(Buffer.from(code), Buffer.from(p.code));
   function pair(code, name) {
     const t = now();
-    pendings = pendings.filter((p) => t < p.expiresAt);
+    pendings = pendings.filter((p) => t < p.expiresAt && (p.issuer === 'shell' || devices.has(p.issuer))); // a revoked issuer's codes are dead
     const hits = pendings.map((p) => codeMatches(code, p)); // every live code is compared, none is skipped
     const i = hits.indexOf(true);
     if (i < 0) { // a wrong guess is one attempt against every live code; a code with 5 is gone
@@ -364,40 +371,43 @@ export function createApp(opts = {}) {
     try { commitDevices([...devices.values(), dev]); } catch { throw new HttpErr(500, 'storage'); }
     return token;
   }
-  function revoke(ids) { // throws on a failed write; nothing changes then
+  // throws on a failed write; nothing changes then. Pending codes made by a removed device go with it; all: every pending code goes.
+  function revoke(ids, all = false) {
     commitDevices([...devices.values()].filter((d) => !ids.includes(d.id)));
+    pendings = all ? [] : pendings.filter((p) => !ids.includes(p.issuer));
   }
-  // a new pending code (3 at most: the oldest goes when a 4th is made); used by the shell command and by POST /api/pair-code
-  function newPairing(name) {
+  // a new pending code for an issuer ('shell' or a device id): it replaces that issuer's own code; 3 at most, and when a 4th is made
+  // the oldest DEVICE code goes (the shell code is never pushed out by a device). Used by the shell command and by POST /api/pair-code.
+  function newPairing(name, issuer) {
     const t = now();
-    pendings = pendings.filter((p) => t < p.expiresAt);
+    pendings = pendings.filter((p) => t < p.expiresAt && p.issuer !== issuer);
     let code;
     do code = String(crypto.randomInt(0, 1e6)).padStart(6, '0'); while (pendings.some((p) => p.code === code)); // codes of live pairings differ
-    const p = { code, name: cleanName(name), expiresAt: t + PAIR_TTL, attempts: 0 };
+    const p = { code, name: cleanName(name), expiresAt: t + PAIR_TTL, attempts: 0, issuer };
     pendings.push(p);
-    while (pendings.length > PAIR_PENDING) pendings.shift();
+    while (pendings.length > PAIR_PENDING) pendings.splice(pendings.findIndex((x) => x.issuer !== 'shell'), 1);
     return p;
   }
-  // {appLink, shareLink} from cfg.publicUrl only; null when it is not configured. The code is 6 digits, the name is encoded.
-  function pairLinks(code, name) {
+  // {appLink, shareLink} from cfg.publicUrl only; null when it is not configured. Never a code, a name or anything from a request:
+  // a link can be intercepted (the fcode scheme is not exclusive), so the user types the code.
+  function pairLinks() {
     const o = cfg.publicUrl;
-    if (!o) return null;
-    return {
-      appLink: `fcode://pair?server=${encodeURIComponent(o)}&code=${code}${name ? `&name=${encodeURIComponent(name)}` : ''}`,
-      shareLink: `${o}/pair?code=${code}`,
-    };
+    return o ? { appLink: `fcode://pair?server=${encodeURIComponent(o)}`, shareLink: `${o}/pair` } : null;
   }
-  function admin(req) {
+  function admin(req) { // an exception must never leave the socket callback: it would take the server down
+    try { return adminCmd(req); } catch (e) { log(`admin request failed: ${e.code || e.name}`); return { ok: false, error: 'internal' }; }
+  }
+  function adminCmd(req) {
     refreshConfig(true); // a rotation or a pending purge is handled before any answer
     if (req?.cmd === 'pair') {
-      const p = newPairing(req.name);
-      return { ok: true, code: p.code, expiresAt: p.expiresAt, expiresIn: PAIR_TTL / 1000, ...(req.links && { links: pairLinks(p.code, p.name) }) };
+      const p = newPairing(req.name, 'shell');
+      return { ok: true, code: p.code, expiresAt: p.expiresAt, expiresIn: PAIR_TTL / 1000, ...(req.links && { links: pairLinks() }) };
     }
     if (req?.cmd === 'devices') return { ok: true, devices: [...devices.values()].map(({ id, name, createdAt }) => ({ id, name, createdAt })) };
     if (req?.cmd === 'revoke') {
       const ids = req.id === 'all' ? [...devices.keys()] : [req.id];
       if (req.id !== 'all' && !devices.has(req.id)) return { ok: false, error: 'no such device' };
-      try { revoke(ids); } catch (e) { return { ok: false, error: `storage: ${e.code || 'write failed'}` }; }
+      try { revoke(ids, req.id === 'all'); } catch (e) { return { ok: false, error: `storage: ${e.code || 'write failed'}` }; }
       return { ok: true, revoked: ids.length };
     }
     return { ok: false, error: 'unknown command' };
@@ -747,13 +757,11 @@ export function createApp(opts = {}) {
       return res.end(method === 'HEAD' ? undefined : 'fcoding ok');
     }
 
-    if (pathname === '/pair' && (method === 'GET' || method === 'HEAD')) { // share link: never reads or consumes the pending code
+    if (pathname === '/pair' && (method === 'GET' || method === 'HEAD')) { // share link: no code in it; never reads or changes a pending code
       refreshConfig(); // a config edit (publicUrl) is picked up here too
-      const code = url.searchParams.get('code');
-      const o = cfg.publicUrl;
-      const ok = typeof code === 'string' && /^\d{6}$/.test(code) && !!o;
-      const status = !o ? 503 : ok ? 200 : 400;
-      const body = pairPage(ok ? pairLinks(code).appLink : null, status);
+      const links = pairLinks(); // the query string is never read
+      const status = links ? 200 : 503;
+      const body = pairPage(links?.appLink);
       res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': Buffer.byteLength(body), 'Cache-Control': 'no-store' });
       return res.end(method === 'HEAD' ? undefined : body);
     }
@@ -788,7 +796,8 @@ export function createApp(opts = {}) {
     }
     if (pathname === '/api/logout') {
       want('POST');
-      try { revoke(url.searchParams.get('all') === '1' ? [...devices.keys()] : [ctx.device]); } catch { throw new HttpErr(500, 'storage'); }
+      const all = url.searchParams.get('all') === '1';
+      try { revoke(all ? [...devices.keys()] : [ctx.device], all); } catch { throw new HttpErr(500, 'storage'); }
       return json(res, 200, { ok: true }, { 'Set-Cookie': setCookie('', 0) });
     }
     if (pathname === '/api/me') { want('GET'); return json(res, 200, { ok: true }); }
@@ -797,8 +806,8 @@ export function createApp(opts = {}) {
       const b = body.length ? parseJson(req, body) : {};
       if (b.name !== undefined && typeof b.name !== 'string') throw new HttpErr(400, 'invalid');
       if (!cfg.publicUrl) throw new HttpErr(409, 'no_public_url'); // no code is made when no link can be built
-      const p = newPairing(b.name);
-      return json(res, 200, { code: p.code, expiresAt: new Date(p.expiresAt).toISOString(), ...pairLinks(p.code, p.name) });
+      const p = newPairing(b.name, ctx.device);
+      return json(res, 200, { code: p.code, expiresAt: new Date(p.expiresAt).toISOString(), ...pairLinks() });
     }
     if (pathname === '/api/overview') { want('GET'); return json(res, 200, await overview(ctx)); }
     if (pathname === '/api/meta') {
@@ -931,19 +940,25 @@ export function createApp(opts = {}) {
 }
 
 // ---------- CLI ----------
-// fcode-pair --qr: the QR of the app link (qrencode, when installed) and the links; the code line is printed before this
-function printQr(links, expiresIn) {
-  if (!links) return console.log('Chưa đặt "publicUrl" trong config.json nên chưa tạo được link/mã QR. Ví dụ: "publicUrl": "https://<địa-chỉ-công-khai>"');
-  let shown = false;
-  try { process.stdout.write(execFileSync('qrencode', ['-t', 'ANSIUTF8', links.appLink], { encoding: 'utf8', timeout: 5000, windowsHide: true })); shown = true; } catch {}
-  console.log(`Link chia sẻ: ${links.shareLink}\nMã hết hạn sau ${Math.round(expiresIn / 60)} phút.`);
-  if (!shown) console.log(`Link mở app: ${links.appLink}\ncài qrencode để hiện mã QR`);
+// fcode-pair --qr: the QR of the server-only app link (qrencode, when installed), the share link, then the code in big digits and
+// ONE expiry line. The QR holds no code: the user types it.
+function printQr(r) {
+  const { links } = r;
+  if (!links) console.log('Chưa đặt "publicUrl" trong config.json nên chưa tạo được link/mã QR. Ví dụ: "publicUrl": "https://<địa-chỉ-công-khai>"');
+  else {
+    let shown = false;
+    try { process.stdout.write(execFileSync('qrencode', ['-t', 'ANSIUTF8', links.appLink], { encoding: 'utf8', timeout: 5000, windowsHide: true })); shown = true; } catch {}
+    console.log(`Link chia sẻ: ${links.shareLink}`);
+    if (!shown) console.log(`Link mở app: ${links.appLink}\ncài qrencode để hiện mã QR`);
+  }
+  const bar = '='.repeat(32);
+  console.log(`\n${bar}\n  MÃ GHÉP:   ${[...r.code].join('   ')}\n${bar}\nMã hết hạn sau ${Math.round(r.expiresIn / 60)} phút.`);
 }
 async function main() {
   const dir = defaultConfigDir();
   const arg = (f) => { const i = process.argv.indexOf(f); return i < 0 ? undefined : process.argv[i + 1] ?? ''; };
   const qr = process.argv.includes('--qr');
-  const req = process.argv.includes('--pair') ? { cmd: 'pair', name: arg('--pair'), ...(qr && { links: true }) }
+  const req = process.argv.includes('--pair') ? { cmd: 'pair', name: arg('--pair') === '--qr' ? '' : arg('--pair'), ...(qr && { links: true }) }
     : process.argv.includes('--devices') ? { cmd: 'devices' }
       : process.argv.includes('--revoke') ? { cmd: 'revoke', id: arg('--revoke') } : null;
   if (req) { // admin CLI: talks to the RUNNING server over admin.sock
@@ -951,10 +966,9 @@ async function main() {
     try { r = await adminRequest(dir, req); } catch (e) { console.error(e.code === 'ENOSERVER' ? `${e.message} (no ${adminPath(dir)})` : `admin socket: ${e.message}`); process.exit(1); }
     if (!r.ok) { console.error(`error: ${r.error}`); process.exit(1); }
     if (req.cmd === 'pair') {
-      console.log(`Mã ghép: ${r.code} (hết hạn sau ${r.expiresIn} giây)\nNhập mã này vào app. Có thể có tối đa 3 mã cùng lúc; mã thứ 4 thay mã cũ nhất.`);
-      if (qr) printQr(r.links, r.expiresIn);
-    }
-    else if (req.cmd === 'devices') {
+      if (qr) printQr(r);
+      else console.log(`Mã ghép: ${r.code} (hết hạn sau ${r.expiresIn} giây)\nNhập mã này vào app. Chạy lại lệnh sẽ thay mã cũ của lệnh này.`);
+    } else if (req.cmd === 'devices') {
       if (!r.devices.length) console.log('(no paired devices)');
       for (const d of r.devices) console.log(`${d.id}  ${new Date(d.createdAt).toISOString()}  ${d.name}`);
     } else console.log(`revoked: ${r.revoked}`);

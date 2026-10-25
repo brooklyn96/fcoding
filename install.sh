@@ -87,8 +87,8 @@ cat <<MSG
 fcoding installed and running (port 7681).
 Pair a phone (no password): run on the box
   fcode-pair "iPhone"
-and type the 6-digit code into the app within 120 s. Up to 3 codes can be pending at once (shell and QR codes); a 4th replaces the oldest.
-  fcode-pair "iPhone" --qr     (also prints the links and a QR code; needs "publicUrl" in config.json, and qrencode for the QR)
+and type the 6-digit code into the app within 120 s. One code per issuer (the command, each paired phone), 3 at most; running it again replaces the command's own code.
+  fcode-pair "iPhone" --qr     (also prints a QR of the server address and the code in big digits; needs "publicUrl" in config.json, and qrencode for the QR)
 Paired devices:   PC_CONFIG_DIR=$CFG node $APP/server.mjs --devices
 Revoke a device:  PC_CONFIG_DIR=$CFG node $APP/server.mjs --revoke <id>     (or --revoke all)
 Projects: edit $CFG/config.json ("projects": {"name": "/abs/dir"}); the server reloads it by itself.

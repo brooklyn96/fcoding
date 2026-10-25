@@ -1028,29 +1028,52 @@ test('pairing: an expired code is rejected (120 s)', async () => {
   }, { now: () => t });
 });
 
-test('pairing: up to 3 pending codes (shell and QR), the 4th drops the oldest; each is single use', async () => {
+test('pairing: one pending code per issuer, 3 in all; a device never pushes the shell code out; each code is single use', async () => {
+  let t = 1_700_000_000_000;
   await withApp(async (c) => {
     setPublicUrl(c, PUB);
-    const { cookie } = await c.login();
-    const a = await adminRequest(c.configDir, { cmd: 'pair', name: 'A' });
-    const b = (await mintCode(c, cookie, { name: 'B' })).json; // a code from a device does not cancel the shell code
-    const k = await adminRequest(c.configDir, { cmd: 'pair', name: 'C' });
-    assert.equal(new Set([a.code, b.code, k.code]).size, 3);
-    const d = (await mintCode(c, cookie, { name: 'D' })).json; // the 4th: A (the oldest) is dropped
-    assert.equal((await pairReq(c, a.code)).status, 401);
-    for (const p of [b, k, d]) assert.equal((await pairReq(c, p.code)).status, 200, p.code); // the others still work, once each
-    assert.deepEqual(devicesFile(c).map((x) => x.name), ['test', 'B', 'C', 'D']);
-    for (const p of [b, k, d]) assert.equal((await pairReq(c, p.code)).status, 401);
-  });
+    const d1 = await c.login({}, 'one'), d2 = await c.login({}, 'two'), d3 = await c.login({}, 'three');
+    const S = await adminRequest(c.configDir, { cmd: 'pair', name: 'S' });
+    const A = (await mintCode(c, d1.cookie, { name: 'A' })).json;
+    let A2 = (await mintCode(c, d1.cookie, { name: 'A2' })).json; // device one's new code replaces its own
+    while (A2.code === A.code) A2 = (await mintCode(c, d1.cookie, { name: 'A2' })).json;
+    const B = (await mintCode(c, d2.cookie, { name: 'B' })).json;
+    const C = (await mintCode(c, d3.cookie, { name: 'C' })).json; // the 4th: the oldest DEVICE code (A2) goes, the shell code stays
+    t += 61000; // stay under 10 per minute
+    for (const dead of [A, A2]) assert.equal((await pairReq(c, dead.code)).status, 401, dead.code);
+    for (const live of [S, B, C]) assert.equal((await pairReq(c, live.code)).status, 200, live.code);
+    t += 61000;
+    for (const used of [S, B, C]) assert.equal((await pairReq(c, used.code)).status, 401); // single use
+    assert.deepEqual(devicesFile(c).map((x) => x.name), ['one', 'two', 'three', 'S', 'B', 'C']);
+  }, { now: () => t });
+});
+
+test('pairing: a new shell code replaces the shell\'s own code; with three device codes it drops the oldest device code', async () => {
+  let t = 1_700_000_000_000;
+  await withApp(async (c) => {
+    setPublicUrl(c, PUB);
+    const d = [await c.login({}, 'one'), await c.login({}, 'two'), await c.login({}, 'three')];
+    const codes = [];
+    for (const [i, x] of d.entries()) codes.push((await mintCode(c, x.cookie, { name: 'ABC'[i] })).json);
+    const [A, B, C] = codes;
+    const S = await adminRequest(c.configDir, { cmd: 'pair', name: 'S' }); // the 4th code: A (the oldest) goes
+    const S2 = await adminRequest(c.configDir, { cmd: 'pair', name: 'S2' }); // replaces S, drops nobody
+    t += 61000;
+    for (const dead of [A, S]) if (dead.code !== S2.code) assert.equal((await pairReq(c, dead.code)).status, 401, dead.code);
+    for (const live of [B, C, S2]) assert.equal((await pairReq(c, live.code)).status, 200, live.code);
+  }, { now: () => t });
 });
 
 test('pairing: each pending code has its own expiry', async () => {
   let t = 1_700_000_000_000;
   await withApp(async (c) => {
+    setPublicUrl(c, PUB);
+    const { cookie } = await c.login();
     const a = await adminRequest(c.configDir, { cmd: 'pair' });
     t += 60000;
-    const b = await adminRequest(c.configDir, { cmd: 'pair' });
-    assert.deepEqual([a.expiresAt, b.expiresAt], [1_700_000_000_000 + 120000, 1_700_000_060_000 + 120000]);
+    const b = (await mintCode(c, cookie)).json;
+    assert.equal(a.expiresAt, 1_700_000_000_000 + 120000);
+    assert.equal(b.expiresAt, new Date(1_700_000_060_000 + 120000).toISOString());
     t += 70000; // A is 130 s old, B 70 s
     assert.equal((await pairReq(c, a.code)).status, 401);
     assert.equal((await pairReq(c, b.code)).status, 200);
@@ -1059,11 +1082,13 @@ test('pairing: each pending code has its own expiry', async () => {
 
 test('pairing: a wrong guess is one attempt against every live code; five kill a code, a newer one has fewer', async () => {
   await withApp(async (c) => {
+    setPublicUrl(c, PUB);
+    const { cookie } = await c.login();
     const a = await adminRequest(c.configDir, { cmd: 'pair' });
     const wrong = otherCode(a.code);
     for (let i = 0; i < 3; i++) assert.equal((await pairReq(c, wrong)).status, 401); // A: 3 attempts
-    let b = await adminRequest(c.configDir, { cmd: 'pair' });
-    while (b.code === wrong) b = await adminRequest(c.configDir, { cmd: 'pair' });
+    let b = (await mintCode(c, cookie)).json;
+    while (b.code === wrong) b = (await mintCode(c, cookie)).json;
     for (let i = 0; i < 2; i++) assert.equal((await pairReq(c, wrong)).status, 401); // A: 5 attempts, B: 2
     assert.equal((await pairReq(c, a.code)).status, 401); // A is gone
     assert.equal((await pairReq(c, b.code)).status, 200); // B survived
@@ -1078,7 +1103,7 @@ const setPublicUrl = (c, publicUrl) => { // what the owner does by editing confi
 };
 const mintCode = (c, cookie, body = {}, headers = {}) => c.req('POST', '/api/pair-code', { cookie, body, headers });
 
-test('POST /api/pair-code: needs a paired device and X-PC; answers code, ISO expiry and links built from publicUrl', async () => {
+test('POST /api/pair-code: needs a paired device and X-PC; answers the code, an ISO expiry and server-only links', async () => {
   const t = 1_700_000_000_000;
   await withApp(async (c) => {
     setPublicUrl(c, `${PUB}/`); // a trailing slash is normalised away
@@ -1089,26 +1114,24 @@ test('POST /api/pair-code: needs a paired device and X-PC; answers code, ISO exp
     assert.equal((await c.req('POST', '/api/pair-code', { cookie, body: {}, pc: false })).status, 403); // X-PC
     assert.equal((await c.req('GET', '/api/pair-code', { cookie })).status, 405);
     assert.equal((await mintCode(c, cookie, { name: 5 })).status, 400);
-    const name = 'Máy của An & Bình';
-    const r = await mintCode(c, cookie, { name });
+    const r = await mintCode(c, cookie, { name: 'Máy của An & Bình' });
     assert.equal(r.status, 200);
     assert.equal(r.headers['cache-control'], 'no-store');
     assert.deepEqual(Object.keys(r.json).sort(), ['appLink', 'code', 'expiresAt', 'shareLink']);
     assert.match(r.json.code, /^\d{6}$/);
     assert.equal(r.json.expiresAt, new Date(t + 120000).toISOString());
-    const u = new URL(r.json.appLink);
-    assert.deepEqual([u.protocol, u.host], ['fcode:', 'pair']);
-    assert.deepEqual([u.searchParams.get('server'), u.searchParams.get('code'), u.searchParams.get('name')], [PUB, r.json.code, name]);
-    assert.ok(r.json.appLink.startsWith(`fcode://pair?server=${encodeURIComponent(PUB)}&code=${r.json.code}&name=`));
-    assert.equal(r.json.shareLink, `${PUB}/pair?code=${r.json.code}`);
-    // no body, no name: the link has no name
+    // the links hold the server origin and nothing else: no code, no name
+    assert.equal(r.json.appLink, `fcode://pair?server=${encodeURIComponent(PUB)}`);
+    assert.equal(r.json.shareLink, `${PUB}/pair`);
+    assert.ok(!r.json.appLink.includes(r.json.code) && !r.json.shareLink.includes(r.json.code));
+    // no body at all is fine too (the app sends {})
     const bare = await c.req('POST', '/api/pair-code', { cookie, raw: '' });
     assert.equal(bare.status, 200);
-    assert.ok(!bare.json.appLink.includes('name='));
+    assert.deepEqual([bare.json.appLink, bare.json.shareLink], [r.json.appLink, r.json.shareLink]);
     // nothing permanent in the answer: no token, no secret
     const text = JSON.stringify([r.json, bare.json]);
     assert.ok(!text.includes(cookie.split('=')[1]) && !text.includes(Buffer.alloc(32, 7).toString('base64')));
-    assert.equal(c.logs.filter((l) => l.includes(r.json.code) || l.includes('/pair?')).length, 0); // never logged
+    assert.equal(c.logs.filter((l) => l.includes(r.json.code) || l.includes(bare.json.code)).length, 0); // never logged
     // without publicUrl no link can be built: 409 and no code is made
     setPublicUrl(c, undefined);
     assert.deepEqual((await mintCode(c, cookie)).json, { error: 'no_public_url' });
@@ -1149,64 +1172,56 @@ test('pair-code: expires after 120 s, and five wrong guesses kill it (same store
   }, { now: () => t });
 });
 
-test('GET /pair: no auth, one button with the app link, never consumes the code, looks the same for every 6-digit code', () => withApp(async (c) => {
+test('GET /pair: no auth, one button with the server-only app link, no code anywhere, changes no pairing state', () => withApp(async (c) => {
   setPublicUrl(c, PUB);
   const { cookie } = await c.login();
   const { json } = await mintCode(c, cookie);
-  const page = (code, opts) => c.req('GET', `/pair?code=${code}`, opts);
-  const good = await page(json.code);
-  assert.equal(good.status, 200);
-  assert.match(good.headers['content-type'], /^text\/html; charset=utf-8/);
-  assert.equal(good.headers['cache-control'], 'no-store');
-  assert.equal(good.headers['referrer-policy'], 'no-referrer');
-  assert.match(good.headers['content-security-policy'], /default-src 'self'/);
-  assert.ok(good.text.includes(`href="fcode://pair?server=${encodeURIComponent(PUB)}&#38;code=${json.code}"`), good.text);
-  assert.ok(good.text.includes('Mở FCode') && good.text.includes('Chưa cài FCode? Cài file fcode.ipa trước.'));
-  assert.ok(!/<script|src=|https?:\/\/(?!box\.example\.com)/.test(good.text)); // no scripts, no external assets
-  // a wrong 6-digit code gets the same page (only its own digits differ), status and headers
-  const wrong = otherCode(json.code);
-  const bad = await page(wrong);
-  assert.deepEqual([bad.status, bad.headers['content-type'], bad.headers['cache-control']], [good.status, good.headers['content-type'], good.headers['cache-control']]);
-  assert.equal(bad.text.replaceAll(wrong, json.code), good.text);
-  // 30 visits, with and without a cookie, right and wrong: the code is still valid (not consumed, no attempt counted)
-  for (let i = 0; i < 15; i++) { await page(json.code); await page(wrong, { cookie }); }
-  assert.equal((await c.req('HEAD', `/pair?code=${json.code}`)).status, 200);
-  assert.equal((await pairReq(c, json.code)).status, 200);
-  assert.deepEqual((await page(json.code)).text.includes(json.code), true); // spent codes look the same too
-  // malformed: 400, and the input is never echoed
-  for (const q of ['', '?code=', '?code=12345', '?code=1234567', '?code=abcdef', '?code=%3Cscript%3E', '?code=123456%22x']) {
-    const m = await c.req('GET', `/pair${q}`);
-    assert.equal(m.status, 400, q);
-    assert.ok(!m.text.includes('script') && !m.text.includes('abcdef') && !m.text.includes('Mở FCode'), q);
+  const page = (q = '', opts) => c.req('GET', `/pair${q}`, opts);
+  const r = await page();
+  assert.equal(r.status, 200);
+  assert.match(r.headers['content-type'], /^text\/html; charset=utf-8/);
+  assert.equal(r.headers['cache-control'], 'no-store');
+  assert.equal(r.headers['referrer-policy'], 'no-referrer');
+  assert.match(r.headers['content-security-policy'], /default-src 'self'/);
+  assert.ok(r.text.includes(`href="fcode://pair?server=${encodeURIComponent(PUB)}"`), r.text);
+  assert.ok(r.text.includes('Mở FCode') && r.text.includes('Chưa cài FCode? Cài file fcode.ipa trước.'));
+  assert.ok(!r.text.includes(json.code)); // no code in the page
+  assert.ok(!/<script|src=|https?:\/\/(?!box\.example\.com)/.test(r.text)); // no scripts, no external assets
+  // the query is ignored and never echoed: the same page whatever it says
+  for (const q of [`?code=${json.code}`, '?code=000000', '?code=%3Cscript%3E', '?x=%22%3E%3Cscript%3Ealert(1)%3C/script%3E', '?code=abcdef', '?code=']) {
+    assert.equal((await page(q)).text, r.text, q);
   }
+  // it reads and changes no pairing state: many visits later the code still works, once
+  for (let i = 0; i < 15; i++) { await page(); await page(`?code=${json.code}`, { cookie }); }
+  assert.equal((await c.req('HEAD', '/pair')).status, 200);
+  assert.equal((await pairReq(c, json.code)).status, 200);
+  assert.deepEqual((await pairReq(c, json.code)).json, { error: 'bad_code' });
+  assert.equal((await page()).text, r.text); // nothing about the spent code
   assert.equal((await c.req('POST', '/pair', { body: {} })).status, 401); // only GET/HEAD are the share page
   assert.ok(!c.logs.join('\n').includes(json.code)); // the query string is not logged
   setPublicUrl(c, undefined);
-  assert.equal((await page(json.code)).status, 503);
+  const none = await page();
+  assert.equal(none.status, 503);
+  assert.ok(!none.text.includes('fcode://'));
 }));
 
 test('links come only from publicUrl: a spoofed Host, X-Forwarded-Host or Origin never reaches a link or the page', () => withApp(async (c) => {
   setPublicUrl(c, PUB);
   const { cookie } = await c.login();
   const evil = { Host: 'evil.example', 'X-Forwarded-Host': 'evil.example', 'X-Forwarded-Proto': 'http', Forwarded: 'host=evil.example;proto=http' };
-  const r = await mintCode(c, cookie, { name: 'x' }, evil);
+  const r = await mintCode(c, cookie, { name: '"><script>alert(1)</script>&server=https://evil.example' }, evil);
   assert.equal(r.status, 200);
   assert.ok(!JSON.stringify(r.json).includes('evil'));
-  assert.ok(r.json.shareLink.startsWith(`${PUB}/pair?`) && r.json.appLink.startsWith(`fcode://pair?server=${encodeURIComponent(PUB)}&`));
-  const page = await c.req('GET', `/pair?code=${r.json.code}`, { headers: evil });
+  assert.equal(r.json.appLink, `fcode://pair?server=${encodeURIComponent(PUB)}`); // exactly this, whatever the name says
+  assert.equal(r.json.shareLink, `${PUB}/pair`);
+  const page = await c.req('GET', '/pair', { headers: evil });
   assert.equal(page.status, 200);
   assert.ok(!page.text.includes('evil') && page.text.includes(encodeURIComponent(PUB)));
-  // a name cannot break out of the link or the page
-  const nasty = await mintCode(c, cookie, { name: '"><script>alert(1)</script>&server=https://evil.example' });
-  const u = new URL(nasty.json.appLink);
-  assert.deepEqual([u.searchParams.get('server'), u.searchParams.getAll('server').length], [PUB, 1]);
-  assert.ok(!nasty.json.appLink.includes('evil.example') || nasty.json.appLink.includes(encodeURIComponent('&server=https://evil.example')));
-  assert.ok(!(await c.req('GET', `/pair?code=${nasty.json.code}`)).text.includes('script'));
   // not configured: refused, whatever Host says
   setPublicUrl(c, undefined);
   const none = await mintCode(c, cookie, {}, evil);
   assert.deepEqual([none.status, none.json], [409, { error: 'no_public_url' }]);
-  assert.equal((await c.req('GET', '/pair?code=123456', { headers: evil })).status, 503);
+  assert.equal((await c.req('GET', '/pair', { headers: evil })).status, 503);
 }));
 
 test('config publicUrl: only a bare https origin is accepted (normalised); anything else refuses to load', () => {
@@ -1231,39 +1246,130 @@ const cliEnv = (c, extra = {}) => new Promise((resolve) => {
     (err, stdout, stderr) => resolve({ status: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stdout, stderr }));
 });
 
-test('fcode-pair --qr: the code line, the links and one line about qrencode when it is missing; plain --pair is unchanged', () => withApp(async (c) => {
+const codeOfBox = (out) => /MÃ GHÉP:\s+(\d(?:\s+\d){5})/.exec(out)?.[1].replace(/\s/g, ''); // the code in big digits
+test('fcode-pair --qr: server-only links, the code in big digits, ONE expiry line; plain --pair is unchanged', () => withApp(async (c) => {
   const noQr = { PATH: path.join(c.root, 'empty') }; // a PATH without qrencode (node is started by its full path)
   const plain = await cliEnv(c, { args: ['--pair', 'iPhone X'], env: noQr });
   assert.equal(plain.status, 0, plain.stderr);
-  assert.ok(!/Link|qrencode|fcode:\/\//.test(plain.stdout), plain.stdout); // exactly the old output
-  // --qr without publicUrl: the code line, then a hint; the code still works
+  assert.match(plain.stdout, /^Mã ghép: \d{6} \(hết hạn sau 120 giây\)/);
+  assert.ok(!/Link|qrencode|fcode:\/\/|MÃ GHÉP/.test(plain.stdout), plain.stdout); // exactly the old shape
+  const count = (out) => (out.match(/hết hạn sau/g) || []).length;
+  // --qr without publicUrl: a hint, then the code and the expiry; the code works
   let r = await cliEnv(c, { args: ['--pair', 'iPhone X', '--qr'], env: noQr });
   assert.equal(r.status, 0, r.stderr);
-  assert.match(r.stdout, /^Mã ghép: \d{6} \(hết hạn sau 120 giây\)/);
   assert.match(r.stdout, /publicUrl/);
-  assert.equal((await pairReq(c, /Mã ghép: (\d{6})/.exec(r.stdout)[1])).status, 200);
-  // with publicUrl and no qrencode: links only and the one line
+  assert.equal(count(r.stdout), 1, r.stdout);
+  assert.equal((await pairReq(c, codeOfBox(r.stdout))).status, 200);
+  // with publicUrl and no qrencode: the links (no code in them), the one line, the code, one expiry line last
   setPublicUrl(c, PUB);
   r = await cliEnv(c, { args: ['--pair', 'Máy A', '--qr'], env: noQr });
   assert.equal(r.status, 0, r.stderr);
-  const code = /Mã ghép: (\d{6})/.exec(r.stdout)[1];
-  assert.ok(r.stdout.includes(`Link chia sẻ: ${PUB}/pair?code=${code}`), r.stdout);
-  assert.ok(r.stdout.includes(`Link mở app: fcode://pair?server=${encodeURIComponent(PUB)}&code=${code}&name=${encodeURIComponent('Máy A')}`), r.stdout);
-  assert.match(r.stdout, /Mã hết hạn sau 2 phút\.\n/);
-  assert.match(r.stdout, /cài qrencode để hiện mã QR\n$/);
-  // no name: no name in the link
+  const code = codeOfBox(r.stdout);
+  assert.match(code, /^\d{6}$/, r.stdout);
+  assert.ok(r.stdout.includes(`Link chia sẻ: ${PUB}/pair\n`), r.stdout);
+  assert.ok(r.stdout.includes(`Link mở app: fcode://pair?server=${encodeURIComponent(PUB)}\n`), r.stdout);
+  assert.ok(!/code=|name=/.test(r.stdout.replace(/MÃ GHÉP[^\n]*/, '')), r.stdout); // no code or name in any link
+  assert.match(r.stdout, /cài qrencode để hiện mã QR\n/);
+  assert.equal(count(r.stdout), 1, r.stdout);
+  assert.ok(r.stdout.endsWith('Mã hết hạn sau 2 phút.\n'), r.stdout);
+  assert.ok(r.stdout.indexOf('Link chia sẻ') < r.stdout.indexOf('MÃ GHÉP'));
+  assert.equal((await pairReq(c, code)).status, 200);
+  assert.ok(devicesFile(c).some((d) => d.name === 'Máy A'));
+  // no name: "--pair --qr" means no name (it is not named "--qr")
+  r = await cliEnv(c, { args: ['--pair', '--qr'], env: noQr });
+  assert.equal((await pairReq(c, codeOfBox(r.stdout))).status, 200);
+  assert.ok(!devicesFile(c).some((d) => d.name.includes('--qr')) && devicesFile(c).at(-1).name === 'device');
   r = await cliEnv(c, { args: ['--pair', '', '--qr'], env: noQr });
-  assert.ok(!r.stdout.includes('name='), r.stdout);
-  assert.equal((await pairReq(c, /Mã ghép: (\d{6})/.exec(r.stdout)[1])).status, 200);
-  if (process.platform !== 'win32') { // a stand-in qrencode: it gets "-t ANSIUTF8 <app link>" and its output is printed
+  assert.equal((await pairReq(c, codeOfBox(r.stdout))).status, 200);
+  if (process.platform !== 'win32') { // a stand-in qrencode: it gets "-t ANSIUTF8 <app link>" and its output is printed first
     const bin = path.join(c.root, 'bin'); fs.mkdirSync(bin);
     fs.writeFileSync(path.join(bin, 'qrencode'), '#!/bin/sh\necho "QR[$1 $2] $3"\n', { mode: 0o755 });
     r = await cliEnv(c, { args: ['--pair', 'Máy B', '--qr'], env: { PATH: `${bin}:${noQr.PATH}` } });
-    const code2 = /Mã ghép: (\d{6})/.exec(r.stdout)[1];
-    assert.ok(r.stdout.includes(`QR[-t ANSIUTF8] fcode://pair?server=${encodeURIComponent(PUB)}&code=${code2}`), r.stdout);
-    assert.ok(r.stdout.includes('Link chia sẻ:') && !r.stdout.includes('cài qrencode'), r.stdout);
+    assert.ok(r.stdout.startsWith(`QR[-t ANSIUTF8] fcode://pair?server=${encodeURIComponent(PUB)}\n`), r.stdout);
+    assert.ok(!r.stdout.includes('cài qrencode') && count(r.stdout) === 1 && r.stdout.indexOf('QR[') < r.stdout.indexOf('MÃ GHÉP'), r.stdout);
   }
 }));
+
+// A code dies with the device that made it (a stolen device must not re-pair itself after a revoke), and with a secret rotation.
+const threeCodes = async (c) => { // two devices mint a code each, the shell makes one
+  setPublicUrl(c, PUB);
+  const d1 = await c.login({}, 'one'), d2 = await c.login({}, 'two');
+  const a = (await mintCode(c, d1.cookie)).json, b = (await mintCode(c, d2.cookie)).json;
+  const s = await adminRequest(c.configDir, { cmd: 'pair', name: 'shell' });
+  return { d1, d2, a, b, s, redeem: async (x) => (await pairReq(c, x.code)).status };
+};
+
+test('pending codes: --revoke <id> kills that device\'s codes only (the probe: A mints, A is revoked, the code fails)', () => withApp(async (c) => {
+  const { d1, a, b, s, redeem } = await threeCodes(c);
+  assert.equal((await adminRequest(c.configDir, { cmd: 'revoke', id: await c.deviceId('one') })).ok, true);
+  assert.equal((await c.req('GET', '/api/me', { cookie: d1.cookie })).status, 401);
+  assert.equal(await redeem(a), 401);
+  assert.equal(await redeem(s), 200); // the shell's and the other device's codes live on
+  assert.equal(await redeem(b), 200);
+}));
+
+test('pending codes: --revoke all clears every pending code', () => withApp(async (c) => {
+  const { a, b, s, redeem } = await threeCodes(c);
+  assert.equal((await adminRequest(c.configDir, { cmd: 'revoke', id: 'all' })).ok, true);
+  for (const x of [a, b, s]) assert.equal(await redeem(x), 401);
+  assert.equal(devicesFile(c).length, 0);
+  await c.login(); // a new code still works afterwards
+}));
+
+test('pending codes: logout kills that device\'s codes; logout?all=1 clears every pending code', () => withApp(async (c) => {
+  let { d1, a, b, s, redeem } = await threeCodes(c);
+  assert.equal((await c.req('POST', '/api/logout', { cookie: d1.cookie })).status, 200);
+  assert.equal(await redeem(a), 401);
+  assert.equal(await redeem(s), 200);
+  const { cookie } = await c.login({}, 'three'); // d2 and the new device are still paired
+  const x = (await mintCode(c, cookie)).json, y = await adminRequest(c.configDir, { cmd: 'pair' });
+  assert.equal((await c.req('POST', '/api/logout?all=1', { cookie })).status, 200);
+  for (const z of [b, x, y]) assert.equal(await redeem(z), 401);
+}));
+
+test('pending codes: a cookieSecret rotation clears every pending code', () => withApp(async (c) => {
+  const { a, s, redeem } = await threeCodes(c);
+  const f = path.join(c.configDir, 'config.json');
+  writePrivate(f, JSON.stringify({ ...JSON.parse(fs.readFileSync(f, 'utf8')), cookieSecret: Buffer.alloc(32, 9).toString('base64') }));
+  await c.req('GET', '/api/me'); // any request notices the new config
+  for (const x of [a, s]) assert.equal(await redeem(x), 401);
+  const p = await adminRequest(c.configDir, { cmd: 'pair' }); // and pairing works under the new secret
+  assert.equal(await redeem(p), 200);
+}));
+
+test('names: cut on a code point and well-formed (63 characters + an emoji, lone surrogates, many emoji); the server survives', () => withApp(async (c) => {
+  setPublicUrl(c, PUB);
+  const { cookie } = await c.login();
+  const names = () => devicesFile(c).map((d) => d.name);
+  const via = async (name) => { const r = await mintCode(c, cookie, { name }); assert.equal(r.status, 200, JSON.stringify(name)); assert.equal((await pairReq(c, r.json.code)).status, 200); return names().at(-1); };
+  assert.equal(await via(`${'a'.repeat(63)}😀`), 'a'.repeat(63)); // the emoji would be cut in half: it is left out whole
+  assert.equal(await via('ab\ud800cd'), 'abcd'); // a lone high surrogate
+  assert.equal(await via('ab\udc00cd'), 'abcd'); // a lone low surrogate
+  assert.equal(await via('😀'.repeat(40)), '😀'.repeat(32)); // exactly 64 UTF-16 units
+  assert.ok(names().every((n) => n.length <= 64 && n === n.toWellFormed()));
+  // the shell path too: it used to throw out of the admin socket callback
+  const r = await adminRequest(c.configDir, { cmd: 'pair', name: `${'a'.repeat(63)}😀`, links: true });
+  assert.equal(r.ok, true);
+  assert.equal((await c.req('GET', '/')).status, 200);
+  // devices.json stays valid: a restart accepts it
+  await c.app.close();
+  const app2 = createApp({ configDir: c.configDir, tmux: [process.execPath, FAKE], log: () => {} });
+  await app2.listen(0, '127.0.0.1');
+  assert.equal(app2.devices.size, 5);
+  await app2.close();
+}));
+
+test('admin: an exception inside a request is an {ok:false} answer, never a crash', async () => {
+  let boom = false;
+  await withApp(async (c) => {
+    boom = true;
+    const bad = await adminRequest(c.configDir, { cmd: 'pair' });
+    boom = false;
+    assert.deepEqual(bad, { ok: false, error: 'internal' });
+    assert.equal((await c.req('GET', '/')).status, 200);
+    assert.equal((await adminRequest(c.configDir, { cmd: 'pair' })).ok, true);
+  }, { now: () => { if (boom) throw new Error('boom'); return Date.now(); } });
+});
 
 test('pairing: global /api/pair limits 10/minute and 30/hour -> 429 with Retry-After', async () => {
   let t = 1_700_000_000_000;
