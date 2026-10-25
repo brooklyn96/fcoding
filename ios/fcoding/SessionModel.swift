@@ -243,7 +243,8 @@ final class SessionModel: ObservableObject {
                 self.sentCols = cols
                 self.sentRows = rows
             } catch {
-                if !Task.isCancelled { self.fail(error) }
+                // Cancelled in flight: the server may or may not have it, so resend next time.
+                if Task.isCancelled { self.sentCols = 0; self.sentRows = 0 } else { self.fail(error) }
             }
         }
     }
