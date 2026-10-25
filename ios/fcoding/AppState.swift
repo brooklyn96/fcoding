@@ -14,34 +14,41 @@ final class AppState: ObservableObject {
     /// Paired by an older build to an address this build rejects (shown escaped). While set,
     /// the app shows only the "pair again" card and sends that server nothing (`api` is nil).
     @Published private(set) var unsupportedServer: String?
+    /// The escaped address of an unsupported box left behind; repeated as a popup once the
+    /// next pairing succeeds, since that box still lists this iPhone.
+    private var oldBoxLeft: String?
 
     private static let serverKey = "serverURL"
     private static let tokenAccount = "deviceToken"
 
     init() {
-        // Stored as an origin only (older builds could keep a path or query).
+        // Stored as an origin only (older builds could keep a path or query). An address this
+        // build rejects is never kept in serverURL: it is shown only escaped, on the card.
         let stored = UserDefaults.standard.string(forKey: AppState.serverKey) ?? ""
-        serverURL = PairLink.origin(stored)?.absoluteString ?? stored
-        AppState.removeLegacyCredentials(server: serverURL)
-        token = serverURL.isEmpty ? nil : Keychain.get(AppState.tokenAccount)
+        serverURL = PairLink.origin(stored)?.absoluteString ?? ""
+        AppState.removeLegacyCredentials(server: stored)
+        token = stored.isEmpty ? nil : Keychain.get(AppState.tokenAccount)
         if token != nil && !PairLink.isSupportedStored(stored) {
             unsupportedServer = PairLink.escapedAuthority(stored)
         }
     }
 
-    /// The card's two ways out; both are local only (no request to the unsupported server).
-    /// "Ghép lại": pairing screen with an empty address. "Đăng xuất": the same, plus a notice
-    /// that the old box still lists this iPhone.
+    static func oldBoxLine(_ address: String) -> String {
+        "Box cũ (\(address)) vẫn còn iPhone này trong danh sách thiết bị; gỡ nó trên box đó."
+    }
+
+    /// Every way out of the card ("Ghép lại", "Đăng xuất", a pairing link) is local only: no
+    /// request to the unsupported server. All of them clear its drafts and read marks and say
+    /// that the old box still lists this iPhone; the pairing screen opens with an empty address.
     func leaveUnsupported(signOut: Bool) {
         guard let old = unsupportedServer else { return }
         unsupportedServer = nil
+        oldBoxLeft = old
         serverURL = ""
         UserDefaults.standard.removeObject(forKey: AppState.serverKey)
         AppState.removeDrafts()
         UserDefaults.standard.removeObject(forKey: "inbox.seen")
-        signOutLocally(notice: signOut
-            ? "Đã đăng xuất trên iPhone này. Box cũ (\(old)) vẫn còn iPhone này trong danh sách thiết bị; gỡ nó trên box đó."
-            : nil)
+        signOutLocally(notice: (signOut ? "Đã đăng xuất trên iPhone này. " : "") + AppState.oldBoxLine(old))
     }
 
     /// Password-login leftovers: the old token (Keychain account "token" or UserDefaults), the
@@ -78,6 +85,8 @@ final class AppState: ObservableObject {
         if token != nil && link.server == serverURL {
             popup = "iPhone này đã ghép với máy chủ \(PairLink.label(link.server)) rồi."
         } else {
+            // From the card: leave it first (notice + cleanup), then pair on the root screen.
+            leaveUnsupported(signOut: false)
             pairLink = link
         }
     }
@@ -103,13 +112,17 @@ final class AppState: ObservableObject {
         pairLink = nil
         unsupportedServer = nil
         token = newToken
+        if let old = oldBoxLeft {
+            oldBoxLeft = nil
+            popup = AppState.oldBoxLine(old)
+        }
         guard let previous = previous else { return }
         do {
             try await previous.call("POST", "api/logout")
         } catch let e as APIError where e.status == 401 {
             // Already gone on the old box.
         } catch {
-            popup = "Chưa gỡ được iPhone này khỏi máy chủ cũ \(PairLink.label(previous.base.absoluteString)); vào máy chủ cũ để gỡ."
+            popup = "Chưa gỡ được iPhone này khỏi máy chủ cũ \(PairLink.escapedAuthority(previous.base.absoluteString)); vào máy chủ cũ để gỡ."
         }
     }
 

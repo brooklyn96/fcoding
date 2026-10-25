@@ -20,22 +20,22 @@ struct PairLink: Equatable {
         server = origin
     }
 
-    /// `https://` + host + optional `:port` + optional `/`, nothing else, lowercased first.
-    /// Host: an ASCII LDH name (labels `[a-z0-9-]` 1–63, no edge `-`, no `xn--`, at least one
-    /// dot, ≤ 253, one trailing dot dropped), a dotted IPv4, or a bracketed IPv6 literal.
-    /// Port: digits, 1–65535; 443 is left out. Returns the canonical origin string.
+    /// FCode server origin rule v1 (test/origin-vectors.json "rule", shared with server.mjs):
+    /// raw input printable ASCII 0x21-0x7E, then lowercased; `https://` + host + optional
+    /// `:port` + optional single `/`. Host: bracketed IPv6 (inet_pton, no `%`, kept as typed),
+    /// IPv4 (4 decimal octets 0-255, no leading zeros, NO trailing dot), or a name (one
+    /// trailing dot dropped; >= 2 LDH labels of 1-63, no edge `-`, no `xn--`, <= 253, last
+    /// label not numeric). Port: 1-5 digits, no leading zero, 1-65535; 443 left out.
     static func strict(_ input: String) -> String? {
-        // ASCII on the RAW input first: lowercasing would fold e.g. KELVIN SIGN into "k".
-        guard input.unicodeScalars.allSatisfy({ $0.isASCII }) else { return nil }
+        // Printable ASCII on the RAW input first (per scalar: a lone CR or LF is caught, and
+        // lowercasing cannot fold e.g. KELVIN SIGN into "k").
+        guard !input.isEmpty, input.unicodeScalars.allSatisfy({ (0x21...0x7E).contains($0.value) }) else { return nil }
         let s = input.lowercased()
         guard s.hasPrefix("https://") else { return nil }
         var rest = Substring(s.dropFirst("https://".count))
         if rest.hasSuffix("/") { rest = rest.dropLast() }
-        // Per scalar, so a lone CR or LF is caught (CRLF is one Character).
         let banned = Set("/?#@%\\".unicodeScalars)
-        guard !rest.isEmpty,
-              !rest.unicodeScalars.contains(where: { $0.value < 0x21 || $0.value == 0x7F || banned.contains($0) })
-        else { return nil }
+        guard !rest.isEmpty, !rest.unicodeScalars.contains(where: { banned.contains($0) }) else { return nil }
 
         var host: Substring
         var portText: Substring?
@@ -54,13 +54,16 @@ struct PairLink: Equatable {
             guard parts.count <= 2 else { return nil }
             host = parts[0]
             if parts.count == 2 { portText = parts[1] }
-            if host.hasSuffix(".") { host = host.dropLast() }
-            guard isIPv4(host) || isName(host) else { return nil }
+            // IPv4 as typed (a trailing dot is refused); only a name may drop one trailing dot.
+            if !isIPv4(host) {
+                if host.hasSuffix(".") { host = host.dropLast() }
+                guard isName(host) else { return nil }
+            }
         }
 
         var port: Int?
         if let text = portText {
-            guard !text.isEmpty, text.count <= 5, text.allSatisfy({ ("0"..."9").contains($0) }),
+            guard isDigits(text), text.count <= 5, !text.hasPrefix("0"),
                   let n = Int(text), (1...65535).contains(n) else { return nil }
             port = n == 443 ? nil : n
         }
@@ -129,6 +132,21 @@ struct PairLink: Equatable {
         return s.unicodeScalars.prefix(100).map { u in
             (0x21..<0x7F).contains(u.value) ? String(u) : String(format: "\\u{%04X}", u.value)
         }.joined()
+    }
+
+    /// The shared table (test/origin-vectors.json, `vectors`: [input, canonical or null]) through
+    /// `strict`; one line per failure. Run by the CI self-test step with the file's path.
+    static func checkVectors(_ json: Data) -> [String] {
+        guard let obj = (try? JSONSerialization.jsonObject(with: json)) as? [String: Any],
+              let vectors = obj["vectors"] as? [[Any]], !vectors.isEmpty else { return ["vectors file unreadable"] }
+        var failures: [String] = []
+        for v in vectors {
+            guard v.count == 2, let input = v[0] as? String else { failures.append("bad vector \(v)"); continue }
+            let want = v[1] as? String   // JSON null -> nil
+            let got = strict(input)
+            if got != want { failures.append("\(input.debugDescription): want \(want ?? "null"), got \(got ?? "null")") }
+        }
+        return failures
     }
 
     /// Fixed cases; one line per failure (empty = all pass). Run by the CI self-test step.

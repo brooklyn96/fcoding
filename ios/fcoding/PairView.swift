@@ -33,7 +33,7 @@ struct PairView: View {
             if asking {
                 Section {
                     Text("Thiết bị này đã ghép. Ghép lại với máy chủ mới?").font(.headline)
-                    Text("Đang ghép với \(PairLink.label(app.serverURL)). Máy chủ mới: \(PairLink.label(app.pairLink?.server ?? "")).")
+                    Text("Đang ghép với \(PairLink.escapedAuthority(app.serverURL)). Máy chủ mới: \(PairLink.label(app.pairLink?.server ?? "")).")
                         .foregroundColor(.secondary)
                     Button("Ghép lại") { repairOK = true }
                     Button("Huỷ", role: .cancel) { app.pairLink = nil }
@@ -205,8 +205,6 @@ struct PairView: View {
     }
 }
 
-/// "Hướng dẫn" (question-mark button on the pairing and settings screens): every instruction
-/// that used to sit in small footers, as short numbered steps.
 /// Full-screen card when an older build paired this iPhone to an address this build no
 /// longer accepts. Both buttons are local only: nothing is sent to that server.
 struct UnsupportedServerView: View {
@@ -243,6 +241,8 @@ struct UnsupportedServerView: View {
     }
 }
 
+/// "Hướng dẫn" (question-mark button on the pairing and settings screens): every instruction
+/// that used to sit in small footers, as short numbered steps.
 struct PairGuideView: View {
     @Environment(\.dismiss) private var dismiss
 

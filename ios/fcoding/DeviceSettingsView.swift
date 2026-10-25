@@ -18,7 +18,7 @@ struct DeviceSettingsView: View {
         NavigationStack {
             Form {
                 Section("Máy chủ") {
-                    Text(app.serverURL).textSelection(.enabled)
+                    Text(PairLink.escapedAuthority(app.serverURL)).textSelection(.enabled)
                 }
                 Section {
                     NavigationLink { AddDeviceView() } label: {
