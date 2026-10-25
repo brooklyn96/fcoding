@@ -10,6 +10,7 @@ struct DeviceSettingsView: View {
     @State private var confirmAll = false
     @State private var running: Action?
     @State private var allError: String?
+    @State private var showGuide = false
 
     private enum Action { case here, all }
 
@@ -23,15 +24,11 @@ struct DeviceSettingsView: View {
                     NavigationLink { AddDeviceView() } label: {
                         Label("Thêm thiết bị (mã QR)", systemImage: "qrcode")
                     }
-                } footer: {
-                    Text("Ghép một iPhone khác với box này mà không phải gõ địa chỉ.")
                 }
                 .disabled(running != nil)
                 Section {
                     Button { run(.here) } label: { row("Gỡ iPhone này", .here) }
                     Button(role: .destructive) { confirmAll = true } label: { row("Gỡ mọi thiết bị", .all) }
-                } footer: {
-                    Text("“Gỡ iPhone này” gỡ điện thoại này khỏi box. “Gỡ mọi thiết bị” gỡ tất cả thiết bị đã ghép; iPhone này chỉ đăng xuất khi box xác nhận. Muốn dùng lại thì gõ fcode-pair trên box và ghép lại.")
                 }
                 .disabled(running != nil)
                 if let allError = allError {
@@ -45,8 +42,13 @@ struct DeviceSettingsView: View {
             .navigationTitle("Cài đặt")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button { showGuide = true } label: { Image(systemName: "questionmark.circle") }
+                        .accessibilityLabel("Hướng dẫn")
+                }
                 ToolbarItem(placement: .confirmationAction) { Button("Đóng") { dismiss() } }
             }
+            .sheet(isPresented: $showGuide) { PairGuideView() }
             .confirmationDialog("Gỡ mọi thiết bị khỏi box?", isPresented: $confirmAll, titleVisibility: .visible) {
                 Button("Gỡ mọi thiết bị", role: .destructive) { run(.all) }
                 Button("Huỷ", role: .cancel) {}
@@ -85,7 +87,7 @@ struct AddDeviceView: View {
     /// Expiry on this phone's clock (see API.pairCode).
     @State private var expires = Date()
     @State private var qr: UIImage?
-    @State private var minutes = 0
+    @State private var showGuide = false
     @State private var loading = false
     @State private var errorText: String?
     @State private var now = Date()
@@ -103,8 +105,6 @@ struct AddDeviceView: View {
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 12)
-                } footer: {
-                    Text("Mở Camera trên iPhone mới, quét mã QR, rồi nhập mã này. Mã dùng 1 lần, hết hạn sau \(minutes) phút.")
                 }
                 Section {
                     if left > 0 {
@@ -116,15 +116,9 @@ struct AddDeviceView: View {
                     } else {
                         makeButton
                     }
-                } footer: {
-                    if left > 0 { Text("Link chỉ có địa chỉ máy chủ, không có mã.") }
                 }
             } else {
-                Section {
-                    makeButton
-                } footer: {
-                    Text("Tạo mã 6 số và mã QR để ghép một iPhone mới với box này. Mã dùng 1 lần.")
-                }
+                Section { makeButton }
             }
             if let errorText = errorText {
                 Section { Label(errorText, systemImage: "xmark.octagon").foregroundColor(.red) }
@@ -132,6 +126,13 @@ struct AddDeviceView: View {
         }
         .navigationTitle("Thêm thiết bị")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                Button { showGuide = true } label: { Image(systemName: "questionmark.circle") }
+                    .accessibilityLabel("Hướng dẫn")
+            }
+        }
+        .sheet(isPresented: $showGuide) { PairGuideView() }
         .onReceive(tick) { now = $0 }
     }
 
@@ -163,11 +164,6 @@ struct AddDeviceView: View {
                 .font(.headline.monospacedDigit())
                 .foregroundColor(left > 0 ? .secondary : .orange)
                 .accessibilityAddTraits(.updatesFrequently)
-            if left > 0 {
-                Label("Chỉ đọc mã này cho chính bạn", systemImage: "lock")
-                    .font(.footnote)
-                    .foregroundColor(.orange)
-            }
         }
     }
 
@@ -189,7 +185,6 @@ struct AddDeviceView: View {
         do {
             let r = try await api.pairCode()
             qr = AddDeviceView.qrImage(r.reply.appLink)
-            minutes = max(1, Int((r.expires.timeIntervalSinceNow / 60).rounded()))
             expires = r.expires
             now = Date()
             reply = r.reply

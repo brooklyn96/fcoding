@@ -86,10 +86,7 @@ final class AppState: ObservableObject {
         } catch let e as APIError where e.status == 401 {
             // Already gone on the old box.
         } catch {
-            // A fast failure could land while the pairing sheet is still closing; an alert
-            // presented during that animation is dropped, so wait it out first.
-            try? await Task.sleep(nanoseconds: 700_000_000)
-            popup = "Chưa gỡ được iPhone này khỏi máy chủ cũ \(PairLink.label(previous.base.absoluteString)); vào máy chủ cũ để gỡ."
+            popup ="Chưa gỡ được iPhone này khỏi máy chủ cũ \(PairLink.label(previous.base.absoluteString)); vào máy chủ cũ để gỡ."
         }
     }
 

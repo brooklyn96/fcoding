@@ -2,15 +2,18 @@ import SwiftUI
 
 /// "Ghép máy": server address + the 6-digit code that `fcode-pair` prints on the box.
 /// A `fcode://pair` link (QR) fills only the server and asks "Ghép với máy chủ <host>?"; the
-/// user types the code shown on the old device and taps "Ghép". While paired (shown as a
-/// sheet), it first asks whether to re-pair at all.
+/// user types the code shown on the old device and taps "Ghép". While paired (a sheet in the
+/// overlay window), it first asks inline whether to re-pair at all. Instructions live behind
+/// the "Hướng dẫn" button, not in footers.
 struct PairView: View {
     @EnvironmentObject private var app: AppState
     @State private var server = ""
     @State private var code = ""
     @State private var busy = false
     @State private var errorText: String?
-    @State private var askRepair = false
+    /// Paired + link: the user has said "Ghép lại" to this link.
+    @State private var repairOK = false
+    @State private var showGuide = false
     @FocusState private var focus: Field?
 
     private enum Field { case server, code }
@@ -22,67 +25,21 @@ struct PairView: View {
         return PairLink.label(url.absoluteString)
     }
 
+    /// Paired and a link is waiting for the "Ghép lại?" answer: only that question is shown.
+    private var asking: Bool { app.token != nil && app.pairLink != nil && !repairOK }
+
     var body: some View {
         Form {
-            if let notice = app.notice {
-                Section { Label(notice, systemImage: "exclamationmark.circle").foregroundColor(.orange) }
-            }
-            if let host = linkHost {
+            if asking {
                 Section {
-                    Label {
-                        Text("Ghép với máy chủ ") + Text(host).bold() + Text("?")
-                    } icon: {
-                        Image(systemName: "qrcode")
-                    }
-                    .font(.headline)
-                } footer: {
-                    Text("Chỉ bấm Ghép nếu đây đúng là box của bạn.")
+                    Text("Thiết bị này đã ghép. Ghép lại với máy chủ mới?").font(.headline)
+                    Text("Đang ghép với \(PairLink.label(app.serverURL)). Máy chủ mới: \(PairLink.label(app.pairLink?.server ?? "")).")
+                        .foregroundColor(.secondary)
+                    Button("Ghép lại") { repairOK = true }
+                    Button("Huỷ", role: .cancel) { app.pairLink = nil }
                 }
-            }
-            Section {
-                TextField("https://…", text: $server)
-                    .keyboardType(.URL)
-                    .textContentType(.URL)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .focused($focus, equals: .server)
-                    .submitLabel(.next)
-                    .onSubmit { focus = .code }
-            } header: {
-                Text("Địa chỉ máy chủ")
-            } footer: {
-                Text("Địa chỉ công khai của box, bắt đầu bằng https://")
-            }
-            .disabled(busy)
-            Section {
-                codeField
-            } header: {
-                Text("Mã ghép")
-            } footer: {
-                if app.pairLink != nil {
-                    Text("Nhập mã 6 số đang hiện trên iPhone cũ (hoặc trên máy tính). Hết hạn thì tạo mã mới trên iPhone cũ.")
-                } else {
-                    Text("Trên box gõ: ") + Text("fcode-pair").font(.footnote.monospaced()) + Text(" — mã có hạn 2 phút")
-                }
-            }
-            .disabled(busy)
-            if let errorText = errorText {
-                Section { Label(errorText, systemImage: "xmark.octagon").foregroundColor(.red) }
-            }
-            Section {
-                Button(action: pair) {
-                    ZStack {
-                        Text(pairTitle).bold().opacity(busy ? 0 : 1)
-                        if busy { ProgressView().tint(.white) }
-                    }
-                    .frame(maxWidth: .infinity, minHeight: 32)
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .disabled(!canPair)
-                .accessibilityLabel(busy ? "Đang ghép" : pairTitle)
-                .listRowInsets(EdgeInsets())
-                .listRowBackground(Color.clear)
+            } else {
+                fields
             }
         }
         .navigationTitle("Ghép máy")
@@ -95,13 +52,12 @@ struct PairView: View {
                     Button("Huỷ") { app.pairLink = nil }.disabled(busy)
                 }
             }
+            ToolbarItem(placement: .navigationBarTrailing) {
+                Button { showGuide = true } label: { Image(systemName: "questionmark.circle") }
+                    .accessibilityLabel("Hướng dẫn")
+            }
         }
-        .alert("Thiết bị này đã ghép. Ghép lại với máy chủ mới?", isPresented: $askRepair) {
-            Button("Ghép lại") {}
-            Button("Huỷ", role: .cancel) { app.pairLink = nil }
-        } message: {
-            Text("Đang ghép với \(PairLink.label(app.serverURL)). Máy chủ mới: \(PairLink.label(app.pairLink?.server ?? "")).")
-        }
+        .sheet(isPresented: $showGuide) { PairGuideView() }
         .interactiveDismissDisabled(busy)
         .onAppear {
             if app.pairLink != nil { applyLink(); return }
@@ -109,20 +65,74 @@ struct PairView: View {
             focus = server.isEmpty ? .server : .code
         }
         .onChange(of: app.pairLink) { _ in applyLink() }
-        // After "Ghép lại", straight to the code with the number pad.
-        .onChange(of: askRepair) { asking in if !asking && app.pairLink != nil { focus = .code } }
+        // After "Ghép lại": the code field appears in this update, so focus it on the next one.
+        .onChange(of: repairOK) { ok in if ok { DispatchQueue.main.async { focus = .code } } }
+    }
+
+    @ViewBuilder private var fields: some View {
+        if let notice = app.notice {
+            Section { Label(notice, systemImage: "exclamationmark.circle").foregroundColor(.orange) }
+        }
+        if let host = linkHost {
+            Section {
+                Label {
+                    Text("Ghép với máy chủ ") + Text(host).bold() + Text("?")
+                } icon: {
+                    Image(systemName: "qrcode")
+                }
+                .font(.headline)
+            }
+        }
+        Section {
+            TextField("https://…", text: $server)
+                .keyboardType(.URL)
+                .textContentType(.URL)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .focused($focus, equals: .server)
+                .submitLabel(.next)
+                .onSubmit { focus = .code }
+        } header: {
+            Text("Địa chỉ máy chủ")
+        }
+        .disabled(busy)
+        Section {
+            codeField
+        } header: {
+            Text("Mã ghép")
+        }
+        .disabled(busy)
+        if let errorText = errorText {
+            Section { Label(errorText, systemImage: "xmark.octagon").foregroundColor(.red) }
+        }
+        Section {
+            Button(action: pair) {
+                ZStack {
+                    Text(pairTitle).bold().opacity(busy ? 0 : 1)
+                    if busy { ProgressView().tint(.white) }
+                }
+                .frame(maxWidth: .infinity, minHeight: 32)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            .disabled(!canPair)
+            .accessibilityLabel(busy ? "Đang ghép" : pairTitle)
+            .listRowInsets(EdgeInsets())
+            .listRowBackground(Color.clear)
+        }
     }
 
     private var pairTitle: String { app.pairLink == nil ? "Ghép iPhone này" : "Ghép" }
 
     /// Fills the server from the pending link and asks for the code; never pairs by itself.
+    /// While paired, a new link asks "Ghép lại?" again first.
     private func applyLink() {
         guard let link = app.pairLink, !busy else { return }
         server = link.server
         code = ""
         errorText = nil
-        askRepair = app.token != nil
-        focus = askRepair ? nil : .code
+        repairOK = false
+        focus = app.token == nil ? .code : nil
     }
 
     /// Six boxes (3 + 3) drawn over a hidden numeric TextField that holds the real input,
@@ -187,5 +197,62 @@ struct PairView: View {
             }
             busy = false
         }
+    }
+}
+
+/// "Hướng dẫn" (question-mark button on the pairing and settings screens): every instruction
+/// that used to sit in small footers, as short numbered steps.
+struct PairGuideView: View {
+    @Environment(\.dismiss) private var dismiss
+
+    private let topics: [(title: String, steps: [String])] = [
+        ("Ghép iPhone lần đầu", [
+            "Trên box gõ lệnh fcode-pair (trên máy tính: fcode pair). Màn hình hiện mã 6 số.",
+            "Trên iPhone, ô “Địa chỉ máy chủ”: gõ địa chỉ công khai của box, bắt đầu bằng https://.",
+            "Ô “Mã ghép”: gõ 6 số đó, rồi bấm “Ghép iPhone này”.",
+        ]),
+        ("Thêm iPhone mới bằng mã QR", [
+            "Trên iPhone đã ghép: Cài đặt (bánh răng) → “Thêm thiết bị (mã QR)” → “Tạo mã”. Màn hình hiện mã QR và mã 6 số.",
+            "Trên iPhone mới (đã cài FCode): mở Camera, quét mã QR, chạm “Mở trong FCode”. Địa chỉ máy chủ tự điền.",
+            "Gõ mã 6 số đang hiện trên iPhone cũ (hoặc trên máy tính), rồi bấm “Ghép”.",
+            "Không quét được: trên iPhone cũ bấm “Gửi link”, gửi qua AirDrop hoặc Zalo, rồi mở link trên iPhone mới. Link chỉ có địa chỉ máy chủ, không có mã.",
+        ]),
+        ("Mã ghép hết hạn", [
+            "Mỗi mã chỉ dùng được 1 lần và hết hạn sau 2 phút. Đồng hồ trên iPhone cũ cho biết còn bao lâu.",
+            "Hết hạn hoặc gõ sai: bấm “Tạo mã mới” trên iPhone cũ (hoặc gõ lại fcode-pair), rồi nhập mã mới.",
+        ]),
+        ("An toàn", [
+            "Ai có mã cũng vào được box của bạn. Chỉ đọc mã cho chính bạn; không gửi mã qua tin nhắn.",
+            "Chỉ bấm “Ghép” khi địa chỉ máy chủ đúng là box của bạn.",
+            "Ghép sang một box khác thì nội dung đang soạn của box cũ bị xoá.",
+        ]),
+        ("Gỡ thiết bị", [
+            "“Gỡ iPhone này”: gỡ điện thoại này khỏi box. iPhone này luôn được xoá ghép, kể cả khi box không trả lời.",
+            "“Gỡ mọi thiết bị”: gỡ mọi thiết bị đã ghép với box. iPhone này chỉ đăng xuất khi box xác nhận.",
+            "Muốn dùng lại: ghép lại như trên.",
+        ]),
+    ]
+
+    var body: some View {
+        NavigationStack {
+            List {
+                ForEach(topics, id: \.title) { topic in
+                    Section(topic.title) {
+                        ForEach(Array(topic.steps.enumerated()), id: \.offset) { i, step in
+                            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                                Text("\(i + 1).").monospacedDigit().foregroundColor(.secondary)
+                                Text(step)
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Hướng dẫn")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) { Button("Đóng") { dismiss() } }
+            }
+        }
+        .preferredColorScheme(.dark)
     }
 }
