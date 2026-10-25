@@ -208,7 +208,7 @@ function Invoke-Ipa {
 function Invoke-IpaLocked {
   $tag = if ($env:FCODE_IPA_TAG) { $env:FCODE_IPA_TAG } else { Get-Cfg 'ipaTag' 'latest' }
   # file tam nam cung thu muc voi dich: doi ten/thay the cung o dia nen khong bao gio mat fcode.ipa
-  $target = Join-Path $IpaDir 'fcode.ipa'; $prev = Join-Path $IpaDir 'fcode.prev.ipa'
+  $target = Join-Path $IpaDir 'fcode.ipa'
   $tmp = Join-Path $IpaDir ('fcode.ipa.' + [guid]::NewGuid().ToString('N') + '.part')
   $old = $ErrorActionPreference
   try {
@@ -266,17 +266,13 @@ function Invoke-IpaLocked {
     if ($same) { Write-Host 'đã là bản mới nhất (giống file đang có)' }
     else {
       try {
-        Clear-ReadOnly $prev; Clear-ReadOnly $target
-        # File.Replace: mot buoc, fcode.ipa cu thanh fcode.prev.ipa; neu loi thi fcode.ipa cu van nguyen
-        if ($hadTarget) { [IO.File]::Replace($tmp, $target, $prev) }
+        Clear-ReadOnly $target
+        # thay truc tiep, khong giu ban sao: File.Replace (khong co file backup) la mot buoc cua he dieu hanh;
+        # neu loi thi fcode.ipa cu van nguyen
+        if ($hadTarget) { [IO.File]::Replace($tmp, $target, [NullString]::Value) }
         else { [IO.File]::Move($tmp, $target) }
       } catch {
-        $e1 = $_.Exception.Message
-        # Replace do dang: fcode.ipa da thanh fcode.prev.ipa ma file moi chua vao -> tra lai
-        if ($hadTarget -and -not (Test-Path -LiteralPath $target) -and (Test-Path -LiteralPath $prev)) {
-          try { Move-Item -LiteralPath $prev -Destination $target -Force } catch { }
-        }
-        Write-IpaError 'không đặt được file mới. File cũ được giữ nguyên. Nếu Sideloadly hay chương trình khác đang mở fcode.ipa, hãy đóng nó rồi chạy lại.' $e1
+        Write-IpaError 'không đặt được file mới. File cũ được giữ nguyên. Nếu Sideloadly hay chương trình khác đang mở fcode.ipa, hãy đóng nó rồi chạy lại.' $_.Exception.Message
         return 1
       }
       Write-Host 'đã tải bản mới'
