@@ -8,7 +8,7 @@ import { spawnSync, execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
-import { createApp, writePrivate, trimScreen, adminRequest, adminPath, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock } from '../server.mjs';
+import { createApp, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock } from '../server.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const FAKE = path.join(here, 'fake-tmux.mjs');
@@ -1869,3 +1869,152 @@ test('menu flag: a numbered menu on screen is menu:true even when a y/n line is 
   assert.equal(summarize(['❯ 1. Yes', 'a', 'b', 'c', 'd', 'e', 'Proceed? (y/n)'].join('\n'), act, t).menu, false);
   assert.equal(menuOf('step 1.done\n12.items'), false); // needs "N. " with a space
 });
+
+// ======================= v1.1: ansi=1 (SGR colours), tmux pane targets =======================
+// SGR in, SGR out: sequences that are not SGR are dropped; odd SGR forms are rewritten so a simple client parses them
+test('sgrOnly: keeps SGR only, drops every other escape sequence', () => {
+  const E = ESC;
+  const same = [`${E}[1;31mred${E}[0m`, `${E}[38;5;208mx${E}[39m`, `${E}[48;2;1;2;3;1mx`, `${E}[90;107mx`, 'plain text, no escapes ắ ẫ', `a${E}[31m\nb`];
+  for (const s of same) assert.equal(sgrOnly(s), s);
+  const cases = [
+    [`${E}[m`, `${E}[0m`], // empty = reset, written out
+    [`${E}[?25lx${E}[2Jy${E}[1;1Hz${E}[K`, 'xyz'], // private mode, erase, cursor move, erase-line
+    [`${E}]8;;http://example.com${E}\\link${E}]8;;${E}\\`, 'link'], // OSC 8 hyperlink with ST
+    [`${E}]0;title\x07after`, 'after'], // OSC with BEL
+    [`${E}]0;no end${E}[31mred`, `${E}[31mred`], // an unterminated OSC stops at the next ESC
+    [`${E}Pq data${E}\\x${E}_apc\x07y${E}^pm${E}\\z`, 'xyz'], // DCS, APC, PM
+    [`${E}(Ba${E}7b${E}8c${E}=d${E}>e`, 'abcde'], // two- and three-byte ESC sequences
+    [`tail${E}`, 'tail'], // a lone ESC
+    [`${E}[1;3`, ''], // a cut-off CSI
+    [`${E}[31 mx${E}[1$mx`, 'xx'], // an intermediate byte: not SGR
+    [`${E}[38:2::1:2:3mx${E}[38:2:4:5:6mx${E}[48:5:9mx`, `${E}[38;2;1;2;3mx${E}[38;2;4;5;6mx${E}[48;5;9mx`], // colon forms
+    [`${E}[4:3mx${E}[4:0mx${E}[1;4:2mx`, `${E}[4mx${E}[24mx${E}[1;4mx`], // underline styles
+    [`${E}[58;2;1;2;3mx${E}[1;58;5;9;3mx${E}[59mx`, `x${E}[1;3mxx`], // underline colour is dropped with its arguments
+    [`${E}[38;5mx${E}[38;5;999mx${E}[38;2;1;2mx${E}[1;38;9;1mx`, `xxx${E}[1mx`], // bad or cut-off colours; an unknown mode drops what follows it
+    [`${E}[200mx${E}[1;108;3mx`, `x${E}[1;3mx`], // codes above 107
+  ];
+  for (const [from, to] of cases) assert.equal(sgrOnly(from), to, JSON.stringify(from));
+  // whatever is left is SGR and nothing else
+  assert.ok(!/\x1b(?!\[[0-9;]*m)/.test(sgrOnly(cases.map((x) => x[0]).join('\n'))));
+});
+
+test('trimAnsiScreen: lines with only SGR and blanks at the end are blank; spaces on the last real line stay', () => {
+  const E = ESC;
+  assert.equal(trimAnsiScreen(`a${E}[0m  \n${E}[39m${E}[49m\n   \n${E}[0m\n`), `a${E}[0m  `);
+  assert.equal(trimAnsiScreen(`${E}[31mred${E}[0m\n\n${E}[0m\nb${E}[0m`), `${E}[31mred${E}[0m\n\n${E}[0m\nb${E}[0m`);
+  assert.equal(trimAnsiScreen(`\n${E}[0m  \n`), '');
+  assert.equal(trimAnsiScreen(''), '');
+});
+
+test('ansi=1: screen keeps SGR; default is unchanged (no -e); a colour-only change moves the hash', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  await mkSession(c, cookie);
+  const E = ESC;
+  const raw = `${E}[1;31mError${E}[0m: bad\n${E}]8;;http://x${E}\\link${E}]8;;${E}\\\n${E}[?25l${E}[2Jplain${E}[39m${E}[49m\n${E}[0m\n\n`;
+  setSession(c, 'work', { screen: raw });
+  const caps = () => c.calls().filter((x) => x.argv[0] === 'capture-pane').map((x) => x.argv);
+  // default: byte-identical to before: same argv, text exactly what tmux printed (trimmed), nothing added
+  const plain = (await c.req('GET', '/api/screen/work', { cookie })).json;
+  assert.deepEqual(caps().at(-1), ['capture-pane', '-p', '-J', '-t', '=work:', '-S', '-300']);
+  assert.equal(plain.text, trimScreen(raw));
+  // ansi=1: -e, and only SGR in the text
+  const a = (await c.req('GET', '/api/screen/work?ansi=1&lines=100', { cookie }));
+  assert.equal(a.status, 200);
+  assert.deepEqual(caps().at(-1), ['capture-pane', '-p', '-e', '-J', '-t', '=work:', '-S', '-100']);
+  assert.equal(a.json.text, `${E}[1;31mError${E}[0m: bad\nlink\nplain${E}[39m${E}[49m`);
+  assert.deepEqual([a.json.cols, a.json.rows, a.json.cursor], [80, 24, { x: 3, y: 5 }]);
+  // any other value of ansi is the plain request
+  for (const v of ['0', 'true', '2', '']) {
+    await c.req('GET', `/api/screen/work?ansi=${v}`, { cookie });
+    assert.ok(!caps().at(-1).includes('-e'), `ansi=${v}`);
+  }
+  // the hash covers the text as sent: same words, other colour = other hash; the same screen = the same hash
+  setSession(c, 'work', { screen: raw.replace('[1;31m', '[1;32m') });
+  const b = (await c.req('GET', '/api/screen/work?ansi=1&lines=100', { cookie })).json;
+  assert.notEqual(b.hash, a.json.hash);
+  assert.equal(b.text, a.json.text.replace('[1;31m', '[1;32m'));
+  assert.equal((await c.req('GET', '/api/screen/work?ansi=1&lines=100', { cookie })).json.hash, b.hash);
+  // a plain screen is the same either way
+  setSession(c, 'work', { screen: 'hello\nworld\n\n' });
+  assert.equal((await c.req('GET', '/api/screen/work?ansi=1', { cookie })).json.text, 'hello\nworld');
+  assert.equal((await c.req('GET', '/api/screen/work?ansi=1', { cookie })).json.hash, (await c.req('GET', '/api/screen/work', { cookie })).json.hash);
+}));
+
+test('ansi=1: SSE stream sends SGR text and a colour-only change is a new event', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  await mkSession(c, cookie);
+  const E = ESC;
+  setSession(c, 'work', { screen: `${E}[31mred${E}[0m ${E}]0;t\x07ok\n` });
+  const open = (query) => new Promise((resolve, reject) => {
+    let buf = '';
+    const req = http.request({ host: '127.0.0.1', port: c.port, path: `/api/stream/work${query}`, headers: { Cookie: cookie } }, (res) => {
+      res.setEncoding('utf8');
+      res.on('data', (d) => { buf += d; });
+      resolve({ req, texts: () => [...buf.matchAll(/event: screen\ndata: (.*)\n/g)].map((m) => JSON.parse(m[1]).text) });
+    });
+    req.on('error', reject); req.end();
+  });
+  const s = await open('?ansi=1');
+  const p = await open('');
+  assert.ok(await until(() => s.texts().length === 1 && p.texts().length === 1));
+  assert.deepEqual(s.texts(), [`${E}[31mred${E}[0m ok`]);
+  assert.ok(c.calls().some((x) => x.argv[0] === 'capture-pane' && x.argv.includes('-e')));
+  setSession(c, 'work', { screen: `${E}[32mred${E}[0m ${E}]0;t\x07ok\n` });
+  assert.ok(await until(() => s.texts().length === 2), 'a colour-only change did not reach the ansi stream');
+  assert.deepEqual(s.texts()[1], `${E}[32mred${E}[0m ok`);
+  s.req.destroy(); p.req.destroy();
+  assert.ok(await until(() => c.app.stats().streams === 0));
+}));
+
+test('prompt detection works on coloured text (SGR stripped before matching)', () => withApp(async (c) => {
+  const E = ESC, act = 1_700_000_000, t = act * 1000 + 9000;
+  const coloured = `${E}[1mDo you${E}[0m ${E}[33mwant${E}[0m to ${E}[4mproceed${E}[24m?\n${E}[7m❯ 1. Yes${E}[0m\n  ${E}[2m2. No${E}[0m\n`;
+  const want = { state: 'waiting', preview: 'Do you want to proceed?', menu: true };
+  assert.deepEqual(summarize(coloured, act, t), want);
+  assert.deepEqual(summarize('Do you want to proceed?\n❯ 1. Yes\n  2. No\n', act, t), want); // the same words without colour
+  assert.deepEqual(summarize(`${E}[32mProceed? ${E}[0m${E}[1m(y/n)${E}[0m`, act, t), { state: 'waiting', preview: 'Proceed? (y/n)', menu: false });
+  assert.equal(previewOf(`${E}[31mfailed${E}[0m\n${E}[2m$ ${E}[0m`), 'failed');
+  assert.equal(menuOf(`${E}[36m❯${E}[0m 1. A\n`), true);
+  // end to end: the ansi screen the server sends, fed to the same matcher, gives the same answer
+  const { cookie } = await c.login();
+  await mkSession(c, cookie);
+  setSession(c, 'work', { activity: 1_700_000_100, screen: `${coloured}${E}]8;;http://x${E}\\${E}\\\n` });
+  const sc = (await c.req('GET', '/api/screen/work?ansi=1', { cookie })).json;
+  assert.ok(!/\x1b(?!\[[0-9;]*m)/.test(sc.text));
+  assert.deepEqual(summarize(sc.text, act, t), want);
+  // overview: the pane is read without -e, and a coloured prompt is still "waiting"
+  const ov = (await c.req('GET', '/api/overview', { cookie })).json.sessions.find((x) => x.name === 'work');
+  assert.deepEqual([ov.state, ov.preview, ov.menu], ['waiting', 'Do you want to proceed?', true]);
+  assert.ok(!c.calls().filter((x) => x.argv[0] === 'capture-pane' && !x.argv.includes('-S')).some((x) => x.argv.includes('-e')));
+}));
+
+test('tmux targets: panes are =name:, session-only commands are =name; a bare =name is refused by the fake like real tmux', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  await mkSession(c, cookie); // new-session, set-option x2, has-session
+  const ok = async (p, body) => assert.equal((await c.req('POST', p, { cookie, body })).status, 200, p);
+  await ok('/api/send/work', { text: 'one line', enter: true });
+  await ok('/api/send/work', { text: 'two\nlines', enter: true }); // load-buffer + paste-buffer
+  await ok('/api/key/work', { key: 'Up' });
+  await ok('/api/resize/work', { cols: 80, rows: 24 });
+  for (const q of ['', '?ansi=1']) assert.equal((await c.req('GET', `/api/screen/work${q}`, { cookie })).status, 200);
+  assert.equal((await c.req('GET', '/api/overview', { cookie })).status, 200);
+  assert.equal((await c.req('DELETE', '/api/sessions/work', { cookie })).status, 200);
+  const seen = new Set();
+  for (const { argv } of c.calls()) {
+    const i = argv.indexOf('-t');
+    if (i < 0) continue;
+    seen.add(argv[0]);
+    assert.match(argv[i + 1], ['kill-session', 'has-session'].includes(argv[0]) ? /^=work$/ : /^=work:$/, argv.join(' '));
+  }
+  for (const cmd of ['set-option', 'has-session', 'capture-pane', 'display-message', 'send-keys', 'paste-buffer', 'resize-window', 'kill-session']) assert.ok(seen.has(cmd), `${cmd} was not exercised`);
+  // the fake follows real tmux: a bare session target does not resolve a pane
+  const fake = (...args) => spawnSync(process.execPath, [FAKE, ...args], { env: { ...process.env, FAKE_TMUX_DIR: path.join(c.root, 'fake') }, encoding: 'utf8' });
+  await mkSession(c, cookie);
+  for (const cmd of [['capture-pane', '-p'], ['send-keys'], ['resize-window', '-x', '80'], ['display-message', '-p'], ['paste-buffer'], ['set-option', '@x', '1']]) {
+    const bare = fake(cmd[0], '-t', '=work', ...cmd.slice(1)), colon = fake(cmd[0], '-t', '=work:', ...cmd.slice(1));
+    assert.equal(bare.status, 1, `${cmd[0]} =work`);
+    assert.match(bare.stderr, /can't find pane/);
+    assert.equal(colon.status, 0, `${cmd[0]} =work:`);
+  }
+  assert.equal(fake('has-session', '-t', '=work').status, 0);
+}));

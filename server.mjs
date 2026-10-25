@@ -193,6 +193,39 @@ export function trimScreen(s) {
   return nl < 0 ? s : s.slice(0, nl);
 }
 
+// --- ansi=1: the screen keeps SGR colours (ESC [ ... m) and nothing else ---
+// Every other escape sequence (other CSI, OSC such as hyperlinks, DCS/APC/PM/SOS, two-byte ESC, a lone ESC) is dropped.
+const ESC_RE = /\x1b(?:\[([0-?]*)([ -\/]*)([@-~])?|[\]PX^_][^\x07\x1b\n]*(?:\x07|\x1b\\)?|[ -\/]*[0-~]?)/g;
+const SGR_RE = /\x1b\[[0-9;]*m/g;
+// A clean SGR: ";"-separated integers only. Colon forms become semicolon forms (38:2::r:g:b -> 38;2;r;g;b, 4:3 -> 4, 4:0 -> 24),
+// the underline colour (58) is dropped, a bad or cut-off colour is dropped, and no code above 107 is passed. Nothing left = no sequence.
+function cleanSgr(params) {
+  if (!/^[0-9;:]*$/.test(params)) return '';
+  const t = [];
+  for (const g of params.split(';')) {
+    const [h, ...sub] = g.split(':').map((x) => (x === '' ? 0 : Number(x))); // an empty parameter is 0
+    if (sub.length && (h === 38 || h === 48 || h === 58)) t.push(h, sub[0], ...sub.slice(sub[0] === 2 ? -3 : 1));
+    else t.push(h === 4 && sub[0] === 0 ? 24 : h);
+  }
+  const out = [];
+  for (let i = 0; i < t.length; i++) {
+    if (t[i] === 38 || t[i] === 48 || t[i] === 58) {
+      const end = i + (t[i + 1] === 5 ? 2 : t[i + 1] === 2 ? 4 : t.length); // last index of "38;5;n" / "38;2;r;g;b"
+      if (end >= t.length) break; // cut off or an unknown mode: nothing after it can be trusted
+      if (t[i] !== 58 && t.slice(i + 2, end + 1).every((v) => v <= 255)) out.push(...t.slice(i, end + 1));
+      i = end;
+    } else if (t[i] <= 107 && t[i] !== 59) out.push(t[i]);
+  }
+  return out.length ? `\x1b[${out.join(';')}m` : '';
+}
+export const sgrOnly = (s) => (s.includes('\x1b') ? s.replace(ESC_RE, (_m, params, inter, fin) => (fin === 'm' && !inter ? cleanSgr(params) : '')) : s);
+// like trimScreen, but a trailing line that holds only SGR and blanks counts as blank
+export function trimAnsiScreen(s) {
+  const lines = s.split('\n');
+  while (lines.length && /^[ \t]*$/.test(lines.at(-1).replace(SGR_RE, ''))) lines.pop();
+  return lines.join('\n');
+}
+
 // ---------- app ----------
 export function createApp(opts = {}) {
   const configDir = opts.configDir || defaultConfigDir();
@@ -458,14 +491,15 @@ export function createApp(opts = {}) {
   }
 
   // cursor is relative to the visible pane; rows = visible height; text may include history above it
-  async function getScreen(name, lines, ctx) {
+  // ansi: keep the SGR colours (capture-pane -e, then only SGR survives); hash and change detection cover the text as sent
+  async function getScreen(name, lines, ctx, ansi = false) {
     if (!ctx.mutation && reads + 2 > MAX_READS) throw new HttpErr(503, 'busy'); // both slots or neither
     const [cap, info] = await Promise.all([
-      run(ctx, ['capture-pane', '-p', '-J', '-t', pane(name), '-S', `-${lines}`]),
+      run(ctx, ['capture-pane', '-p', ...(ansi ? ['-e'] : []), '-J', '-t', pane(name), '-S', `-${lines}`]),
       run(ctx, ['display-message', '-p', '-t', pane(name), '#{pane_width} #{pane_height} #{cursor_x} #{cursor_y}']),
     ]);
     const [cols, rows, x, y] = info.trim().split(' ').map(Number);
-    const text = trimScreen(cap);
+    const text = ansi ? trimAnsiScreen(sgrOnly(cap)) : trimScreen(cap);
     const hash = crypto.createHash('sha1').update(`${cols}x${rows}@${x},${y}\n${text}`).digest('hex').slice(0, 16);
     return { text, rows, cols, cursor: { x, y }, hash };
   }
@@ -598,7 +632,7 @@ export function createApp(opts = {}) {
 
   // --- SSE ---
   let streams = 0;
-  async function stream(req, res, name, lines, ctx) {
+  async function stream(req, res, name, lines, ctx, ansi) {
     if (streams >= MAX_STREAMS) throw new HttpErr(503, 'busy');
     streams++; // reserved before any await
     let closed = false; let paused = false; let inflight = false;
@@ -610,7 +644,7 @@ export function createApp(opts = {}) {
     };
     res.on('close', cleanup); // registered before the first await
     try {
-      let snap = await getScreen(name, lines, ctx);
+      let snap = await getScreen(name, lines, ctx, ansi);
       if (closed || res.destroyed) return cleanup();
       res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' });
       res.socket?.setNoDelay(true);
@@ -637,7 +671,7 @@ export function createApp(opts = {}) {
         inflight = true;
         try {
           if (!valid(ctx)) return end('auth');
-          if (!snap) snap = await getScreen(name, lines, ctx);
+          if (!snap) snap = await getScreen(name, lines, ctx, ansi);
           if (closed) return;
           if (!valid(ctx)) return end('auth');
           if (snap.hash !== last && send(`event: screen\ndata: ${sseJson(snap)}\n\n`)) last = snap.hash;
@@ -758,8 +792,9 @@ export function createApp(opts = {}) {
           lines = Number(q);
           if (!/^\d+$/.test(q) || lines < 50 || lines > 2000) throw new HttpErr(400, 'invalid');
         }
-        if (verb === 'screen') return json(res, 200, await getScreen(name, lines, ctx));
-        return stream(req, res, name, lines, ctx);
+        const ansi = url.searchParams.get('ansi') === '1'; // anything else = plain text, as before
+        if (verb === 'screen') return json(res, 200, await getScreen(name, lines, ctx, ansi));
+        return stream(req, res, name, lines, ctx, ansi);
       }
       want('POST');
       const b = parseJson(req, body);

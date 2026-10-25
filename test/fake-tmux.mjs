@@ -29,6 +29,9 @@ const delays = JSON.parse(process.env.FAKE_TMUX_DELAYS || '{}'); // per command,
 const delay = Number((argv.includes('-S') ? delays[`${cmd} -S`] : undefined) ?? delays[cmd] ?? process.env.FAKE_TMUX_DELAY_MS ?? 0);
 if (delay) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
 
+// like real tmux 3.x: these commands take a target-pane, and a bare "=name" does not resolve one ("can't find pane"); "=name:" does
+if (['capture-pane', 'display-message', 'send-keys', 'paste-buffer', 'resize-window', 'set-option'].includes(cmd) && /^=[^:]*$/.test(arg('-t') || '')) fail(`can't find pane: ${arg('-t').slice(1)}`);
+
 const st = load();
 const needSession = () => { if (!st.sessions[target()]) fail(`can't find session: ${target()}`); };
 
