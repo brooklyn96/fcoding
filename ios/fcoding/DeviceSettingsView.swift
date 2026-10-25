@@ -196,6 +196,7 @@ struct AddDeviceView: View {
             made = true
         } catch {
             var message: String?
+            var config = true   // a server or configuration problem: its own text stays
             if let e = error as? APIError, [404, 405, 501].contains(e.status) {
                 message = "Máy chủ chưa hỗ trợ, cập nhật máy chủ trước."
             } else if let e = error as? APIError, e.status == 409, e.code == "no_public_url" {
@@ -204,12 +205,13 @@ struct AddDeviceView: View {
                 message = "Địa chỉ máy chủ (publicUrl) trong cấu hình box không hợp lệ cho app. Dùng https:// với tên miền ASCII."
             } else {
                 message = app.report(error)
+                config = false
             }
             if reply != nil {
                 // The box may already have replaced the old code: never leave it on screen.
                 reply = nil
                 qr = nil
-                if message != nil { message = "Không tạo được mã mới. Bấm Tạo mã mới để thử lại." }
+                if message != nil && !config { message = "Không tạo được mã mới. Bấm Tạo mã mới để thử lại." }
             }
             errorText = message
         }

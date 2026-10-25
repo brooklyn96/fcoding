@@ -12,11 +12,15 @@ enum Keychain {
     }
 
     @discardableResult
+    /// Update in place; add only when there is no item yet. On any failure the old token
+    /// stays exactly as it was (never delete-then-add).
     static func set(_ value: String, for account: String) -> Bool {
-        SecItemDelete(base(account) as CFDictionary)
-        var add = base(account)
-        add[kSecValueData as String] = Data(value.utf8)
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        let fields: [String: Any] = [kSecValueData as String: Data(value.utf8),
+                                     kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly]
+        let status = SecItemUpdate(base(account) as CFDictionary, fields as CFDictionary)
+        if status == errSecSuccess { return true }
+        guard status == errSecItemNotFound else { return false }
+        let add = base(account).merging(fields) { $1 }
         return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
     }
 

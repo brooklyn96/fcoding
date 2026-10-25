@@ -274,6 +274,9 @@ enum CardFlow {
                 if r.cleanup && r.state != .left { failures.append("\(s) + \(e): cleanup without leaving") }
             }
         }
+        // Huỷ on the sign-out alert: back to the card, never a cleanup.
+        let cancel = step(.confirmSignOut, .signOutCancel)
+        if cancel.cleanup || cancel.state != .card { failures.append("confirmSignOut + signOutCancel: \(cancel)") }
         let path: [(State, Event, State)] = [
             (.card, .link, .pairing), (.card, .pairAgain, .pairing), (.pairing, .cancel, .card),
             (.pairing, .pairFail, .pairing), (.pairing, .link, .pairing), (.card, .signOut, .confirmSignOut),
