@@ -1,9 +1,9 @@
 [Unit]
 Description=Update coding harnesses (omp, claude, codex, opencode, cmd)
-After=network-online.target
 
 [Service]
 Type=oneshot
 ExecStart=%h/.local/bin/fcode-update
-TimeoutStartSec=1h
+# worst case is about 1 h 5 min (inner timeouts add up); never let systemd kill an in-flight "npm install -g"
+TimeoutStartSec=2h
 Nice=10

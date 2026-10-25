@@ -8,15 +8,15 @@ Cài (chạy lại nhiều lần cũng an toàn):
 bash box/install-autoupdate.sh
 ```
 
-Script cài `~/.local/bin/fcode-update`, hai unit `fcode-update.service` / `fcode-update.timer` trong `~/.config/systemd/user`, rồi bật timer. Lần bật đầu tiên timer chạy ngay một lượt (do `Persistent=true`, chưa có mốc chạy trước).
+Script cài `~/.local/bin/fcode-update`, hai unit `fcode-update.service` / `fcode-update.timer` trong `~/.config/systemd/user`, rồi bật timer. Ngay khi timer được bật, mốc `OnStartupSec=5min` đã qua nên systemd chạy ngay một lượt; chạy lại script cài mà có file đổi (timer được khởi động lại) cũng chạy ngay một lượt như vậy.
 
-Lịch chạy: 00:00, 06:00, 12:00, 18:00 (giờ của box), cộng 5 phút sau khi box khởi động, trễ ngẫu nhiên tới 5 phút. Box tạm dừng sau 30 phút rảnh nên timer chỉ chạy khi box đang thức; lượt bị lỡ được bù ở lần thức sau.
+Lịch chạy: 00:00, 06:00, 12:00, 18:00 giờ UTC (box dùng UTC; tức 07:00, 13:00, 19:00, 01:00 giờ Việt Nam), cộng 5 phút sau khi box khởi động, trễ ngẫu nhiên tới 5 phút. Box tạm dừng sau 30 phút rảnh nên timer chỉ chạy khi box đang thức; lượt bị lỡ được bù ở lần thức sau.
 
 Mỗi lượt, với từng công cụ:
 
 - so phiên bản đang cài với bản mới nhất (`npm view <gói> version`; omp dùng `omp update --check`);
 - khác nhau thì cập nhật (`omp update`, hoặc `sudo npm install -g <gói>@<bản>`; thư mục npm toàn cục thuộc root nên unit chạy bằng người dùng và dùng sudo chỉ cho npm);
-- **công cụ đang chạy thì bỏ qua** (`skipped_busy`) và thử lại lượt sau, nên phiên đang mở không bị hỏng;
+- **công cụ đang chạy thì bỏ qua** (`skipped_busy`) và thử lại lượt sau, nên phiên đang mở không bị hỏng. "Đang chạy" nghĩa là có tiến trình chạy từ thư mục cài của công cụ (mọi tên lệnh: `cmd`, `cmdc`, `command-code`, `commandcode`, `opencode2`, ...). Dịch vụ nền `opencode serve --service` không tính; khi không có phiên OpenCode nào, script dừng dịch vụ đó (`opencode service stop`), cập nhật, rồi bật lại (`opencode service start`) nếu trước đó đang chạy;
 - mọi lệnh đều có timeout; chỉ một lượt chạy tại một thời điểm (`flock`).
 
 Kết quả:
