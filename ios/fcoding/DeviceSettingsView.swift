@@ -33,6 +33,11 @@ struct DeviceSettingsView: View {
                 }
                 .disabled(running != nil)
                 Section {
+                    NavigationLink { AboutView() } label: {
+                        Label("Giới thiệu · Giấy phép", systemImage: "info.circle")
+                    }
+                }
+                Section {
                     Button { run(.here) } label: { row("Gỡ iPhone này", .here) }
                     Button(role: .destructive) { confirmAll = true } label: { row("Gỡ mọi thiết bị", .all) }
                 }
@@ -215,6 +220,73 @@ struct AddDeviceView: View {
     }
 }
 
+/// "Giới thiệu": app name and version, then the third-party notices (Pane, MIT) that ship with
+/// the quota screen's pace, trend and donut rules.
+struct AboutView: View {
+    @Environment(\.dismiss) private var dismiss
+
+    private var version: String {
+        let info = Bundle.main.infoDictionary
+        let v = info?["CFBundleShortVersionString"] as? String ?? "?"
+        return (info?["CFBundleVersion"] as? String).map { "\(v) (\($0))" } ?? v
+    }
+
+    var body: some View {
+        Form {
+            FormHeader(title: "Giới thiệu") {
+                HeaderTextButton(title: "Cài đặt", back: true) { dismiss() }
+            } trailing: {
+                EmptyView()
+            }
+            Section {
+                HStack {
+                    Text("FCode - EZ Vibecoding")
+                    Spacer()
+                    Text("Phiên bản \(version)").foregroundColor(.secondary)
+                }
+            }
+            Section {
+                Text("Màn hình Hạn mức làm theo cách hiển thị của Pane (màu theo tốc độ dùng, biểu đồ xu hướng, biểu đồ chi phí).")
+                    .font(.subheadline)
+                Text(AboutView.paneLicense)
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+            } header: {
+                Text("Giấy phép bên thứ ba")
+            }
+        }
+        .navigationTitle("Giới thiệu")
+        .toolbar(.hidden, for: .navigationBar)
+        .scrollIndicators(.hidden)
+    }
+
+    static let paneLicense = """
+    Pane — MIT License
+
+    Copyright (c) 2026 Jazii (Pane for Windows)
+    Copyright (c) 2025 Robin Ebers (OpenUsage for macOS — provider research and original concept, https://github.com/robinebers/openusage)
+    Copyright (c) 2025 Peter Steinberger (CodexBar for macOS — provider research for Codebuff/Kilo/Kiro/Amp/Vertex AI/Bedrock/Poe/Chutes/Warp/Crof, https://github.com/steipete/CodexBar)
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy \
+    of this software and associated documentation files (the "Software"), to deal \
+    in the Software without restriction, including without limitation the rights \
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell \
+    copies of the Software, and to permit persons to whom the Software is \
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all \
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR \
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, \
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE \
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER \
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, \
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE \
+    SOFTWARE.
+    """
+}
+
 // MARK: - Scrolling header row (non-session screens)
 
 /// A Form's first row used as the screen header: centred title, one control on each side. It
@@ -228,7 +300,7 @@ struct FormHeader<Leading: View, Trailing: View>: View {
         Section {
             ZStack {
                 Text(title)
-                    .font(.system(size: 17, weight: .semibold))
+                    .scaledFont(17, weight: .semibold)
                     .lineLimit(1)
                     .accessibilityAddTraits(.isHeader)
                 HStack(spacing: 0) {
@@ -255,7 +327,7 @@ struct HeaderTextButton: View {
         Button(action: action) {
             HStack(spacing: 2) {
                 if back { Image(systemName: "chevron.left").font(.system(size: 20, weight: .semibold)) }
-                Text(title).font(.system(size: 17, weight: bold ? .semibold : .regular))
+                Text(title).scaledFont(17, weight: bold ? .semibold : .regular)
             }
             .foregroundColor(.accentBlue)
             .padding(.horizontal, 6)

@@ -20,18 +20,19 @@ struct SheetScaffold<Content: View>: View {
     }
 }
 
-/// Title in the middle, a 72 pt text button on either side.
+/// Title in the middle, a 72 pt text button on either side (dimmed when disabled).
 struct SheetHeader: View {
     let title: String
     var left: (String, () -> Void)? = nil
     var right: (String, () -> Void)? = nil
     var rightBold = false
+    @Environment(\.isEnabled) private var isEnabled
 
     var body: some View {
         HStack(spacing: 0) {
             side(left, alignment: .leading, bold: false)
             Text(title)
-                .font(.system(size: 17, weight: .semibold))
+                .scaledFont(17, weight: .semibold)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity)
                 .accessibilityAddTraits(.isHeader)
@@ -39,6 +40,7 @@ struct SheetHeader: View {
         }
         .frame(minHeight: 44)
         .padding(.bottom, 6)
+        .dynamicTypeSize(...DynamicTypeSize.xxLarge)
     }
 
     private func side(_ item: (String, () -> Void)?, alignment: Alignment, bold: Bool) -> some View {
@@ -46,12 +48,15 @@ struct SheetHeader: View {
             if let item = item {
                 Button(action: item.1) {
                     Text(item.0)
-                        .font(.system(size: 16, weight: bold ? .semibold : .regular))
+                        .scaledFont(16, weight: bold ? .semibold : .regular)
                         .foregroundColor(.accentBlue)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
                         .frame(minHeight: 44)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .opacity(isEnabled ? 1 : 0.4)
             }
         }
         .frame(width: 72, alignment: alignment)
@@ -66,7 +71,7 @@ struct PrimaryButtonStyle: ButtonStyle {
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(.system(size: 16, weight: .semibold))
+            .scaledFont(16, weight: .semibold)
             .foregroundColor(text)
             .frame(maxWidth: .infinity, minHeight: 44)
             .background(fill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -77,12 +82,12 @@ struct PrimaryButtonStyle: ButtonStyle {
 extension View {
     /// Sheet paragraph: 14.5 pt secondary text.
     func sheetBody() -> some View {
-        font(.system(size: 14.5)).foregroundColor(.l2).fixedSize(horizontal: false, vertical: true).padding(.bottom, 10)
+        scaledFont(14.5).foregroundColor(.l2).fixedSize(horizontal: false, vertical: true).padding(.bottom, 10)
     }
 
     /// Grouped note box (mockup .now).
     func sheetNote() -> some View {
-        font(.system(size: 14))
+        scaledFont(14)
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 12)
@@ -92,10 +97,37 @@ extension View {
     }
 }
 
+// MARK: - Dynamic Type
+
+/// The mockup's point size, scaled with the user's text size like the nearest text style.
+private struct ScaledFont: ViewModifier {
+    @ScaledMetric private var size: CGFloat
+    let weight: Font.Weight
+    let design: Font.Design
+
+    init(size: CGFloat, weight: Font.Weight, design: Font.Design) {
+        let style: Font.TextStyle = size >= 16 ? .body : size >= 14 ? .subheadline : size >= 13 ? .footnote
+            : size >= 12 ? .caption : .caption2
+        _size = ScaledMetric(wrappedValue: size, relativeTo: style)
+        self.weight = weight
+        self.design = design
+    }
+
+    func body(content: Content) -> some View { content.font(.system(size: size, weight: weight, design: design)) }
+}
+
+extension View {
+    func scaledFont(_ size: CGFloat, weight: Font.Weight = .regular, design: Font.Design = .default) -> some View {
+        modifier(ScaledFont(size: size, weight: weight, design: design))
+    }
+}
+
 // MARK: - Box info (tap on the ring)
 
 struct BoxInfoSheet: View {
     let box: HomeBox?
+    /// Server clock minus phone clock (HomeModel.offset).
+    let offset: TimeInterval
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -116,7 +148,7 @@ struct BoxInfoSheet: View {
             }
             .padding(.bottom, 16)
             TimelineView(.periodic(from: Date(), by: 1)) { ctx in
-                now(HomeLogic.ring(box, now: ctx.date), maxRun: maxRun, idle: idle).sheetNote()
+                now(HomeLogic.ring(box, now: ctx.date.addingTimeInterval(offset)), maxRun: maxRun, idle: idle).sheetNote()
             }
             Button("Đã hiểu") { dismiss() }.buttonStyle(PrimaryButtonStyle())
         }
@@ -127,13 +159,14 @@ struct BoxInfoSheet: View {
     private func step(_ tag: String, _ color: Color, _ title: Text, _ detail: String) -> some View {
         HStack(alignment: .top, spacing: 12) {
             Text(tag)
-                .font(.system(size: 13, weight: .bold))
+                .scaledFont(13, weight: .bold)
                 .foregroundColor(color)
                 .frame(width: 30, height: 30)
                 .background(color.opacity(0.18), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .dynamicTypeSize(...DynamicTypeSize.large)
             VStack(alignment: .leading, spacing: 2) {
-                title.font(.system(size: 14.5))
-                Text(detail).font(.system(size: 13)).foregroundColor(.l2)
+                title.scaledFont(14.5)
+                Text(detail).scaledFont(13).foregroundColor(.l2)
             }
             .fixedSize(horizontal: false, vertical: true)
         }
@@ -146,7 +179,7 @@ struct BoxInfoSheet: View {
         let left = Text(HomeLogic.hms(r.seconds)).bold().monospacedDigit()
         switch r.mode {
         case .unknown:
-            return Text("Bây giờ: chưa biết giờ box nghỉ. Kéo màn hình chính xuống để làm mới.")
+            return Text("Bây giờ: chưa biết giờ box nghỉ.")
         case .paused:
             return Text("Bây giờ: box đang nghỉ, tự dậy lúc ") + at + Text(" (sau ") + left + Text(").")
         default:
@@ -217,12 +250,13 @@ struct HomeGuideView: View {
             } label: {
                 HStack(spacing: 12) {
                     Text("\(i + 1)")
-                        .font(.system(size: 15, weight: .bold))
+                        .scaledFont(15, weight: .bold)
                         .foregroundColor(color)
                         .frame(width: 34, height: 34)
                         .background(color.opacity(0.15), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                        .dynamicTypeSize(...DynamicTypeSize.large)
                         .accessibilityHidden(true)
-                    Text(t.title).font(.system(size: 15, weight: .semibold)).foregroundColor(.white)
+                    Text(t.title).scaledFont(15, weight: .semibold).foregroundColor(.white)
                     Spacer()
                     Image(systemName: "chevron.right")
                         .font(.footnote.weight(.semibold))
@@ -242,7 +276,7 @@ struct HomeGuideView: View {
                             Text("\(k + 1).").monospacedDigit()
                             Text(HomeGuideView.styled(t.steps[k]))
                         }
-                        .font(.system(size: 14.5))
+                        .scaledFont(14.5)
                         .foregroundColor(.l2)
                         .fixedSize(horizontal: false, vertical: true)
                     }
@@ -293,15 +327,15 @@ struct NewSessionSheet: View {
                         row(disabled: opening != nil, action: { Task { await open(p, h) } }) {
                             HarnessAvatar(harness: h)
                             VStack(alignment: .leading, spacing: 1) {
-                                Text(h).font(.system(size: 15, weight: .semibold, design: .monospaced))
-                                Text(HarnessStyle.description(h)).font(.system(size: 13)).foregroundColor(.l2)
+                                Text(h).scaledFont(15, weight: .semibold, design: .monospaced)
+                                Text(HarnessStyle.description(h)).scaledFont(13).foregroundColor(.l2)
                             }
                             Spacer()
                             if opening == h { ProgressView() } else { chevron }
                         }
                 }
                 if let errorText = errorText {
-                    Label(errorText, systemImage: "exclamationmark.triangle").font(.system(size: 13)).foregroundColor(.redTone)
+                    Label(errorText, systemImage: "exclamationmark.triangle").scaledFont(13).foregroundColor(.redTone)
                 }
             } else {
                 SheetHeader(title: "Phiên mới", left: ("Huỷ", { dismiss() }))
@@ -313,13 +347,13 @@ struct NewSessionSheet: View {
                         options(projects) { p in
                                 row(disabled: false, action: { picked = p }) {
                                     Image(systemName: "folder")
-                                        .font(.system(size: 16))
+                                        .scaledFont(16)
                                         .foregroundColor(.accentBlue)
                                         .frame(width: 34, height: 34)
                                         .background(Color.accentBlue.opacity(0.16), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
                                     VStack(alignment: .leading, spacing: 1) {
-                                        Text(p).font(.system(size: 15, weight: .semibold))
-                                        Text(detail(p)).font(.system(size: 13)).foregroundColor(.l2)
+                                        Text(p).scaledFont(15, weight: .semibold)
+                                        Text(detail(p)).scaledFont(13).foregroundColor(.l2)
                                     }
                                     Spacer()
                                     chevron
@@ -329,7 +363,7 @@ struct NewSessionSheet: View {
                 } else {
                     Text("Chưa tải được danh sách dự án").sheetBody()
                     if let loadError = loadError {
-                        Text(loadError).font(.system(size: 13)).foregroundColor(.redTone)
+                        Text(loadError).scaledFont(13).foregroundColor(.redTone)
                     }
                 }
             }
@@ -391,7 +425,7 @@ struct NewSessionSheet: View {
 
 private extension Text {
     func stepCaption() -> some View {
-        font(.system(size: 13)).foregroundColor(.l2).frame(maxWidth: .infinity).multilineTextAlignment(.center).padding(.bottom, 10)
+        scaledFont(13).foregroundColor(.l2).frame(maxWidth: .infinity).multilineTextAlignment(.center).padding(.bottom, 10)
     }
 }
 
@@ -411,9 +445,9 @@ struct RenameSheet: View {
     var body: some View {
         SheetScaffold {
             SheetHeader(title: "Đổi tên phiên", left: ("Huỷ", { dismiss() }), right: ("Lưu", save), rightBold: true)
-            Text("Tên mới").font(.system(size: 13)).foregroundColor(.l2).padding(.bottom, 6)
+            Text("Tên mới").scaledFont(13).foregroundColor(.l2).padding(.bottom, 6)
             TextField("", text: $text)
-                .font(.system(size: 15, design: .monospaced))
+                .scaledFont(15, design: .monospaced)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .submitLabel(.done)
@@ -426,7 +460,7 @@ struct RenameSheet: View {
                 .accessibilityLabel("Tên mới")
             HStack(spacing: 8) {
                 if saving { ProgressView() }
-                Text(errorText ?? " ").font(.system(size: 13)).foregroundColor(.redTone)
+                Text(errorText ?? " ").scaledFont(13).foregroundColor(.redTone)
             }
             .frame(minHeight: 20)
             .padding(.vertical, 6)

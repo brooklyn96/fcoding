@@ -45,7 +45,7 @@ struct TopCard: View {
 
     var body: some View {
         HStack(spacing: 14) {
-            BoxRing(box: home.home?.box, onTap: onRing)
+            BoxRing(box: home.home?.box, offset: home.offset, onTap: onRing)
             Rectangle().fill(Color.hair).frame(width: 0.5, height: 88).accessibilityHidden(true)
             QuotaTile(home: home, visible: visible, onTap: onQuota)
         }
@@ -58,12 +58,14 @@ struct TopCard: View {
 /// "Wakes in" during the cooldown. It drains continuously (1 s linear glide per tick).
 struct BoxRing: View {
     let box: HomeBox?
+    /// Server clock minus phone clock (HomeModel.offset).
+    let offset: TimeInterval
     let onTap: () -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         TimelineView(.periodic(from: Date(), by: 1)) { ctx in
-            let r = HomeLogic.ring(box, now: ctx.date)
+            let r = HomeLogic.ring(box, now: ctx.date.addingTimeInterval(offset))
             Button(action: onTap) { ring(r) }
                 .buttonStyle(.plain)
                 .accessibilityLabel(label(r, now: ctx.date))
@@ -80,6 +82,18 @@ struct BoxRing: View {
 
     /// "88:88" must fit inside the ring minus 16 % padding on each side.
     private static let textWidth: CGFloat = 2 * 41 - 6 - 2 * 0.16 * 88
+    /// Mockup layoutRing: the time takes the size at which "88:88" fits `textWidth`; 6 pt from
+    /// the label baseline to the cap top of the digits; the pair is centred on its cap block.
+    private static let labelFont = UIFont.systemFont(ofSize: 11, weight: .medium)
+    private static let timeFont: UIFont = {
+        let base = UIFont.monospacedDigitSystemFont(ofSize: 23, weight: .semibold)
+        let width = ("88:88" as NSString).size(withAttributes: [.font: base]).width
+        return UIFont.monospacedDigitSystemFont(ofSize: 23 * min(1, textWidth / max(1, width)), weight: .semibold)
+    }()
+    /// Text frames run ascender to descender: remove the label descent and the space above the digit caps.
+    private static let textSpacing: CGFloat = 6 + labelFont.descender - (timeFont.ascender - timeFont.capHeight)
+    /// Moves the frames so the label cap top to digit baseline block sits on the ring centre.
+    private static let textOffset: CGFloat = (-timeFont.descender - (labelFont.ascender - labelFont.capHeight)) / 2
 
     private func ring(_ r: HomeLogic.Ring) -> some View {
         let c = colors(r.mode)
@@ -119,19 +133,18 @@ struct BoxRing: View {
     private func texts(_ r: HomeLogic.Ring, color: Color) -> some View {
         let unknown = r.mode == .unknown
         let time = unknown ? "--:--" : HomeLogic.hhmm(r.seconds)
-        return VStack(spacing: 6) {
+        return VStack(spacing: BoxRing.textSpacing) {
             Text(r.mode == .paused ? "Wakes in" : "Sleeps in")
-                .font(.system(size: 11, weight: .medium))
+                .font(Font(BoxRing.labelFont as CTFont))
                 .tracking(0.22)
                 .foregroundColor(.l2)
             Text(time)
-                .font(.system(size: 23, weight: .semibold))
-                .monospacedDigit()
+                .font(Font(BoxRing.timeFont as CTFont))
                 .foregroundColor(unknown ? Color.l2 : color)
                 .lineLimit(1)
-                .minimumScaleFactor(0.5)
-                .frame(width: BoxRing.textWidth)
+                .fixedSize()
         }
+        .offset(y: BoxRing.textOffset)
     }
 
     private func label(_ r: HomeLogic.Ring, now: Date) -> String {
@@ -185,9 +198,10 @@ struct QuotaTile: View {
     @State private var hold = false
     @State private var lastMove = Date()
 
-    private let tick = Timer.publish(every: 4, on: .main, in: .common).autoconnect()
     private var accounts: [QuotaAccount] { home.home?.accounts ?? [] }
     private var current: Int { accounts.isEmpty ? 0 : index % accounts.count }
+    /// On screen, app active, more than one account: the tile may roll.
+    private var rolling: Bool { visible && scenePhase == .active && accounts.count > 1 }
     private var animation: Animation {
         reduceMotion ? .easeInOut(duration: 0.35) : .timingCurve(0.22, 1, 0.36, 1, duration: 0.52)
     }
@@ -223,13 +237,20 @@ struct QuotaTile: View {
         .buttonStyle(PressReportingStyle(pressed: $hold))
         .onChange(of: hold) { down in
             // After a release the next roll waits at least 1.5 s.
-            if !down { lastMove = max(lastMove, Date().addingTimeInterval(-2)) }
+            if !down { lastMove = max(lastMove, Date().addingTimeInterval(-2.5)) }
         }
-        .onReceive(tick) { now in
-            guard visible, scenePhase == .active, !hold, accounts.count > 1,
-                  now.timeIntervalSince(lastMove) >= 3.5 else { return }
-            lastMove = now
-            withAnimation(animation) { index = (current + 1) % accounts.count }
+        // One 4 s loop tied to the tile's place on screen, not to the struct: parent re-renders
+        // (the 5 s overview poll) neither restart nor duplicate it. It ends off screen, in the
+        // background and with one account.
+        .task(id: rolling) {
+            guard rolling else { return }
+            lastMove = Date()
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                guard !Task.isCancelled, !hold, !accounts.isEmpty, Date().timeIntervalSince(lastMove) >= 4 else { continue }
+                lastMove = Date()
+                withAnimation(animation) { index = (current + 1) % accounts.count }
+            }
         }
         .accessibilityLabel(accessibility)
     }
@@ -258,7 +279,8 @@ struct QuotaTile: View {
                 .padding(.horizontal, 10)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
         } else {
-            TilePage(account: accounts[current], stale: home.failed || accounts[current].stale, showUsed: showUsed)
+            TilePage(account: accounts[current], stale: home.failed || accounts[current].stale, showUsed: showUsed,
+                     now: home.serverNow())
         }
     }
 
@@ -284,9 +306,10 @@ struct QuotaTile: View {
         guard !accounts.isEmpty else { return "Hạn mức tài khoản. Chạm để xem chi tiết." }
         let a = accounts[current]
         var detail = "chưa có số liệu"
-        if let w = HomeLogic.worst(a.shown, now: Date()) {
+        let now = home.serverNow()
+        if let w = HomeLogic.worst(a.shown, now: now) {
             detail = w.label + " " + HomeLogic.headline(w, showUsed: showUsed).lowercased() + ", "
-                + HomeLogic.resetText(w, now: Date(), exact: false).lowercased()
+                + HomeLogic.resetText(w, now: now, exact: false).lowercased()
         }
         return "Hạn mức tài khoản \(current + 1) trên \(accounts.count): \(a.email), \(a.plan ?? "")\(a.org.map { " " + $0 } ?? ""), \(detail). Chạm để xem chi tiết."
     }
@@ -297,10 +320,12 @@ private struct TilePage: View {
     let account: QuotaAccount
     let stale: Bool
     let showUsed: Bool
+    /// Server clock.
+    let now: Date
 
     var body: some View {
         let color = HarnessStyle.color(account.harness)
-        let worst = HomeLogic.worst(account.shown, now: Date())
+        let worst = HomeLogic.worst(account.shown, now: now)
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 5) {
                 Circle().fill(color).frame(width: 7, height: 7)
@@ -315,7 +340,7 @@ private struct TilePage: View {
             .frame(height: 16)
             Spacer(minLength: 0)
             if let w = worst {
-                let pace = HomeLogic.pace(w, now: Date())
+                let pace = HomeLogic.pace(w, now: now)
                 HStack(spacing: 6) {
                     Text(w.label).foregroundColor(.l2).lineLimit(1)
                     Spacer(minLength: 0)
@@ -332,7 +357,7 @@ private struct TilePage: View {
                 }
                 .frame(height: 4)
                 Spacer(minLength: 0)
-                Text(HomeLogic.resetText(w, now: Date(), exact: false))
+                Text(HomeLogic.resetText(w, now: now, exact: false))
                     .font(.system(size: 11)).foregroundColor(.l2).lineLimit(1)
             } else {
                 Text(account.rateLimited ? "Bị giới hạn tốc độ — nhà cung cấp yêu cầu chờ một lúc" : "Chưa có số liệu hạn mức")
@@ -511,12 +536,12 @@ struct QuotaDetailView: View {
 
     private var nav: some View {
         ZStack {
-            Text("Hạn mức").font(.system(size: 17, weight: .semibold)).accessibilityAddTraits(.isHeader)
+            Text("Hạn mức").scaledFont(17, weight: .semibold).accessibilityAddTraits(.isHeader)
             HStack {
                 Button { dismiss() } label: {
                     HStack(spacing: 2) {
-                        Image(systemName: "chevron.left").font(.system(size: 20, weight: .semibold))
-                        Text("FCode").font(.system(size: 17))
+                        Image(systemName: "chevron.left").scaledFont(20, weight: .semibold)
+                        Text("FCode").scaledFont(17)
                     }
                     .foregroundColor(.accentBlue)
                     .padding(.horizontal, 6)
@@ -536,8 +561,8 @@ struct QuotaDetailView: View {
     @ViewBuilder
     private var content: some View {
         if home.home == nil {
-            Text(home.failed ? "Chưa tải được hạn mức. Kéo xuống để thử lại." : "Đang tải hạn mức…")
-                .font(.system(size: 14))
+            Text(home.failed ? "Chưa tải được hạn mức." : "Đang tải hạn mức…")
+                .scaledFont(14)
                 .padding(.bottom, 6)
             if !home.failed {
                 ForEach(0..<3, id: \.self) { _ in
@@ -557,11 +582,11 @@ struct QuotaDetailView: View {
             SpendDonut(accounts: accounts, totals: home.home?.totals, tip: $tip)
             ForEach(harnesses, id: \.self) { h in group(h) }
             Text(footer)
-                .font(.system(size: 12)).foregroundColor(.paneMuted)
+                .scaledFont(12).foregroundColor(.paneMuted)
                 .frame(maxWidth: .infinity)
                 .padding(.top, 14).padding(.bottom, 4)
             Text("Dựa trên Pane (MIT) · OpenUsage")
-                .font(.system(size: 11)).foregroundColor(.l3)
+                .scaledFont(11).foregroundColor(.l3)
                 .frame(maxWidth: .infinity)
                 .padding(.bottom, 8)
         }
@@ -580,7 +605,7 @@ struct QuotaDetailView: View {
     }
 
     private var summaryLine: some View {
-        let now = Date()
+        let now = home.serverNow()
         let all = accounts.filter { !$0.shown.isEmpty }.flatMap(\.shown)
         let lo = all.max { HomeLogic.clampPercent($0.usedPercent) < HomeLogic.clampPercent($1.usedPercent) }
         var line = Text("\(accounts.count) tài khoản")
@@ -594,7 +619,7 @@ struct QuotaDetailView: View {
         if home.failed || accounts.contains(where: \.stale) {
             line = line + Text(" · ") + Text("⚠ Cũ").foregroundColor(.paneWarn)
         }
-        return line.font(.system(size: 14))
+        return line.scaledFont(14)
     }
 
     private func group(_ h: String) -> some View {
@@ -604,11 +629,11 @@ struct QuotaDetailView: View {
                 HarnessBadge(harness: h)
                 Text("\(QuotaLinks.name(h)) · \(accs.count) tài khoản")
             }
-            .font(.system(size: 12.5, weight: .semibold))
+            .scaledFont(12.5, weight: .semibold)
             .foregroundColor(.l2)
             .padding(.top, 4).padding(.bottom, 6)
             ForEach(accs) { a in
-                AccountCard(account: a, stale: home.failed || a.stale, showUsed: $showUsed, exact: $exact,
+                AccountCard(account: a, stale: home.failed || a.stale, now: home.serverNow(), showUsed: $showUsed, exact: $exact,
                             expanded: Binding(get: { expanded.contains(a.id) },
                                               set: { if $0 { expanded.insert(a.id) } else { expanded.remove(a.id) } }),
                             tip: $tip, onReset: { resetTarget = a })
@@ -621,6 +646,8 @@ struct QuotaDetailView: View {
 private struct AccountCard: View {
     let account: QuotaAccount
     let stale: Bool
+    /// Server clock.
+    let now: Date
     @Binding var showUsed: Bool
     @Binding var exact: Bool
     @Binding var expanded: Bool
@@ -647,16 +674,16 @@ private struct AccountCard: View {
             HStack(spacing: 6) {
                 HarnessGlyph(harness: h, size: 16).foregroundColor(HarnessStyle.color(h))
                 Text(HomeLogic.shortMail(account.email))
-                    .font(.system(size: 14, weight: .semibold))
+                    .scaledFont(14, weight: .semibold)
                     .lineLimit(1)
                     .layoutPriority(1)
                 Text([account.plan, account.org].compactMap { $0 }.joined(separator: " · "))
-                    .font(.system(size: 11))
+                    .scaledFont(11)
                     .foregroundColor(.paneMuted)
                     .lineLimit(1)
                 if stale {
                     Button { tip = TipItem(id: "stale." + account.id, text: staleText) } label: {
-                        Text("⚠ Cũ").font(.system(size: 10.5)).foregroundColor(.paneWarn)
+                        Text("⚠ Cũ").scaledFont(10.5).foregroundColor(.paneWarn)
                             .frame(minHeight: 44).padding(.horizontal, 2).contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
@@ -667,10 +694,10 @@ private struct AccountCard: View {
                 if canReset {
                     Button(action: onReset) {
                         HStack(spacing: 4) {
-                            Image(systemName: "arrow.counterclockwise").font(.system(size: 11, weight: .bold))
+                            Image(systemName: "arrow.counterclockwise").scaledFont(11, weight: .bold)
                             Text("Reset")
                         }
-                        .font(.system(size: 13, weight: .semibold))
+                        .scaledFont(13, weight: .semibold)
                         .foregroundColor(.accentBlue)
                         .padding(.horizontal, 9)
                         .frame(height: 28)
@@ -694,16 +721,17 @@ private struct AccountCard: View {
         .padding(.top, 7).padding(.bottom, 3)
         .padding(.bottom, 6)
         .opacity(error == nil ? 1 : 0.7)
+        .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
     }
 
     @ViewBuilder
     private var panel: some View {
         if let error = error {
-            Text(error).font(.system(size: 11)).foregroundColor(.paneMuted).padding(.vertical, 10)
+            Text(error).scaledFont(11).foregroundColor(.paneMuted).padding(.vertical, 10)
         } else {
             VStack(alignment: .leading, spacing: 0) {
                 ForEach(account.shown.indices, id: \.self) { i in
-                    MetricRow(window: account.shown[i], id: account.id + ".\(i)", showUsed: $showUsed, exact: $exact, tip: $tip)
+                    MetricRow(window: account.shown[i], id: account.id + ".\(i)", now: now, showUsed: $showUsed, exact: $exact, tip: $tip)
                 }
                 if let daily = account.spend?.daily30, !daily.isEmpty {
                     TrendRow(days: daily, id: account.id, tip: $tip)
@@ -712,9 +740,10 @@ private struct AccountCard: View {
                     .padding(.top, 2).padding(.bottom, 6)
                 HStack(spacing: 6) {
                     link("Trang Usage", QuotaLinks.usage(account.harness))
-                    Text("·").font(.system(size: 11)).foregroundColor(.paneTrack)
+                    Text("·").scaledFont(11).foregroundColor(.paneTrack)
                     link("Trạng thái", QuotaLinks.status(account.harness))
                 }
+                .padding(.vertical, -6)
                 .padding(.top, 2)
                 if account.harness == "codex" {
                     if expanded {
@@ -724,21 +753,22 @@ private struct AccountCard: View {
                             Text(account.resetsAvailable > 0 ? "\(account.resetsAvailable) lượt còn dùng" : "Chưa có lượt")
                                 .foregroundColor(.paneFg)
                         }
-                        .font(.system(size: 12))
+                        .scaledFont(12)
                         .padding(.vertical, 6)
                         .overlay(alignment: .top) { Rectangle().fill(Color.paneTrack).frame(height: 0.5) }
                     }
                     Button { expanded.toggle() } label: {
                         HStack(spacing: 4) {
                             Text(expanded ? "Ẩn bớt" : "Thêm")
-                            Image(systemName: expanded ? "chevron.up" : "chevron.down").font(.system(size: 9, weight: .semibold))
+                            Image(systemName: expanded ? "chevron.up" : "chevron.down").scaledFont(9, weight: .semibold)
                         }
-                        .font(.system(size: 11))
+                        .scaledFont(11)
                         .foregroundColor(.paneMuted)
-                        .frame(maxWidth: .infinity, minHeight: 36)
+                        .frame(maxWidth: .infinity, minHeight: 44)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .padding(.vertical, -4)
                 }
             }
         }
@@ -746,7 +776,8 @@ private struct AccountCard: View {
 
     private func link(_ title: String, _ url: URL?) -> some View {
         Button { if let url = url { openURL(url) } } label: {
-            Text(title).font(.system(size: 11)).foregroundColor(.paneMuted).frame(minHeight: 32)
+            Text(title).scaledFont(11).foregroundColor(.paneMuted)
+                .padding(.horizontal, 4).frame(minHeight: 44).contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
@@ -757,25 +788,26 @@ private struct AccountCard: View {
 private struct MetricRow: View {
     let window: QuotaWindow
     let id: String
+    /// Server clock.
+    let now: Date
     @Binding var showUsed: Bool
     @Binding var exact: Bool
     @Binding var tip: TipItem?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        let now = Date()
         let pace = HomeLogic.pace(window, now: now)
         let used = HomeLogic.clampPercent(window.usedPercent)
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
-                Text(window.label).font(.system(size: 13, weight: .semibold)).foregroundColor(.paneFg)
+                Text(window.label).scaledFont(13, weight: .semibold).foregroundColor(.paneFg)
                 Spacer(minLength: 0)
                 if !pace.note.isEmpty {
                     HStack(spacing: 4) {
-                        if pace.flame { Image(systemName: "flame.fill").font(.system(size: 10)) }
+                        if pace.flame { Image(systemName: "flame.fill").scaledFont(10) }
                         Text(pace.note)
                     }
-                    .font(.system(size: 12))
+                    .scaledFont(12)
                     .foregroundColor(pace.level == .low ? .paneLow : pace.level == .warn ? .paneWarn : .paneMuted)
                     .lineLimit(1)
                 }
@@ -803,18 +835,22 @@ private struct MetricRow: View {
             .accessibilityElement()
             .accessibilityLabel("\(window.label): đã dùng \(Int(used.rounded()))%" + (pace.note.isEmpty ? "" : ", " + pace.note))
             HStack(spacing: 8) {
+                // 44 pt tall hit areas; the row still takes 28 pt of layout.
                 Button { showUsed.toggle() } label: {
                     Text(HomeLogic.headline(window, showUsed: showUsed)).monospacedDigit().foregroundColor(.paneFg)
+                        .frame(minHeight: 44).contentShape(Rectangle())
                 }
                 Spacer(minLength: 0)
                 Button { exact.toggle() } label: {
                     Text(HomeLogic.resetText(window, now: now, exact: exact)).foregroundColor(.paneMuted)
+                        .frame(minHeight: 44).contentShape(Rectangle())
                 }
             }
             .buttonStyle(.plain)
-            .font(.system(size: 12))
+            .scaledFont(12)
             .lineLimit(1)
-            .frame(minHeight: 28)
+            .frame(minHeight: 44)
+            .padding(.vertical, -8)
             .padding(.top, 4).padding(.bottom, -8)
         }
         .padding(.vertical, 10)
@@ -838,7 +874,7 @@ private struct TrendRow: View {
             + HomeLogic.tokens(peak) + " ngày " + dm(peakDay?.date) + " · từ log trên máy"
         HStack(spacing: 10) {
             Button { tip = TipItem(id: "trend." + id, text: summary) } label: {
-                Text("Xu hướng dùng").font(.system(size: 13, weight: .semibold)).foregroundColor(.paneFg)
+                Text("Xu hướng dùng").scaledFont(13, weight: .semibold).foregroundColor(.paneFg)
                     .frame(minHeight: 44)
             }
             .buttonStyle(.plain)
@@ -905,7 +941,7 @@ private struct SpendRows: View {
                         .foregroundColor(.paneFg)
                         .lineLimit(1)
                 }
-                .font(.system(size: 12))
+                .scaledFont(12)
                 .padding(.top, i == 0 ? 6 : 2)
                 .padding(.bottom, 6)
             }
@@ -941,9 +977,9 @@ private struct SpendDonut: View {
         let total = ws.reduce(0) { $0 + $1.usd }
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text("Tổng chi phí").font(.system(size: 13, weight: .semibold)).foregroundColor(.paneFg)
+                Text("Tổng chi phí").scaledFont(13, weight: .semibold).foregroundColor(.paneFg)
                 Spacer()
-                Text("\(accounts.count) tài khoản").font(.system(size: 12)).foregroundColor(.paneMuted)
+                Text("\(accounts.count) tài khoản").scaledFont(12).foregroundColor(.paneMuted)
             }
             .frame(minHeight: 36)
             HStack(spacing: 16) {
@@ -957,8 +993,8 @@ private struct SpendDonut: View {
                             .onTapGesture { tip = TipItem(id: "wedge", text: wedgeTip(ws[i], total)) }
                     }
                     VStack(spacing: 0) {
-                        Text(HomeLogic.usd(total)).font(.system(size: 14, weight: .semibold)).monospacedDigit()
-                        Text("30 ngày").font(.system(size: 10.5)).foregroundColor(.paneMuted)
+                        Text(HomeLogic.usd(total)).scaledFont(14, weight: .semibold).monospacedDigit()
+                        Text("30 ngày").scaledFont(10.5).foregroundColor(.paneMuted)
                     }
                     .allowsHitTesting(false)
                 }
@@ -967,7 +1003,7 @@ private struct SpendDonut: View {
                 .accessibilityElement()
                 .accessibilityLabel("Tổng chi phí 30 ngày " + HomeLogic.usd(total))
                 VStack(alignment: .leading, spacing: 0) {
-                    if ws.isEmpty { Text("Chưa có chi phí").font(.system(size: 13)).frame(minHeight: 36) }
+                    if ws.isEmpty { Text("Chưa có chi phí").scaledFont(13).frame(minHeight: 36) }
                     ForEach(ws.indices, id: \.self) { i in
                         HStack(spacing: 8) {
                             Circle().fill(color(ws[i].key)).frame(width: 8, height: 8)
@@ -975,7 +1011,7 @@ private struct SpendDonut: View {
                             Spacer(minLength: 0)
                             Text(HomeLogic.usd(ws[i].usd)).fontWeight(.semibold).monospacedDigit()
                         }
-                        .font(.system(size: 13))
+                        .scaledFont(13)
                         .frame(minHeight: 36)
                         .contentShape(Rectangle())
                         .onTapGesture { tip = TipItem(id: "legend.\(i)", text: ws[i].name + " · " + HomeLogic.usd(ws[i].usd)) }
@@ -993,6 +1029,7 @@ private struct SpendDonut: View {
         .padding(.top, 10).padding(.bottom, 12)
         .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .padding(.top, 4).padding(.bottom, 10)
+        .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
     }
 
     private func wedgeTip(_ w: HomeLogic.Wedge, _ total: Double) -> String {
@@ -1054,15 +1091,20 @@ struct CodexResetSheet: View {
     var body: some View {
         SheetScaffold {
             SheetHeader(title: "Reset Codex", left: ("Huỷ", { dismiss() }))
+                .disabled(running)
             (Text("Dùng 1 lượt reset cho ") + Text(account.email).foregroundColor(.white)
                 + Text("? Còn \(account.resetsAvailable) lượt."))
                 .sheetBody()
             Text(errorText ?? " ")
-                .font(.system(size: 13))
+                .scaledFont(13)
                 .foregroundColor(.redTone)
                 .frame(maxWidth: .infinity, minHeight: 20, alignment: .leading)
                 .padding(.vertical, 6)
                 .accessibilityHidden(errorText == nil)
+                .onChange(of: errorText) { t in
+                    // The mockup's error is role="alert": VoiceOver reads it when it appears.
+                    if let t = t { UIAccessibility.post(notification: .announcement, argument: t) }
+                }
             Button(action: run) {
                 HStack(spacing: 6) {
                     if running { ProgressView().tint(.white) }
@@ -1113,7 +1155,7 @@ struct ClaudeResetSheet: View {
                 + Text(" trên web. App không tự reset được, chỉ trang chính thức mới có nút này (claude.ai trên web hoặc app Desktop)."))
                 .sheetNote()
             Text(url?.absoluteString ?? "")
-                .font(.system(size: 12, design: .monospaced))
+                .scaledFont(12, design: .monospaced)
                 .foregroundColor(.l2)
                 .padding(.bottom, 10)
             Button("Mở trang Usage") {

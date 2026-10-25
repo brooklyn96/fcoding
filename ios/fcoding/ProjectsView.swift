@@ -71,7 +71,7 @@ struct ProjectsView: View {
                         .homeRow(top: 0, bottom: 0)
                     summary(proxy).homeRow(top: 6, bottom: 2)
                     Text("Dự án")
-                        .font(.system(size: 13))
+                        .scaledFont(13)
                         .foregroundColor(.l2)
                         .padding(.horizontal, 2)
                         .homeRow(top: 10, bottom: 6)
@@ -162,7 +162,7 @@ struct ProjectsView: View {
         case .guide:
             HomeGuideView()
         case .box:
-            BoxInfoSheet(box: home.home?.box)
+            BoxInfoSheet(box: home.home?.box, offset: home.offset)
         case .new(let project):
             NewSessionSheet(projects: model.overview == nil ? nil : projectNames,
                             loadError: model.errorText,
@@ -189,7 +189,7 @@ struct ProjectsView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
                     .accessibilityHidden(true)
                 Text("FCode - EZ Vibecoding")
-                    .font(.system(size: 17, weight: .bold))
+                    .scaledFont(17, weight: .bold)
                     .lineLimit(1)
                     .accessibilityAddTraits(.isHeader)
             }
@@ -198,13 +198,14 @@ struct ProjectsView: View {
             headerButton("gearshape", label: "Cài đặt") { sheet = .settings }
                 .padding(.trailing, -10)
         }
-        .frame(height: 52)
+        .frame(minHeight: 52)
+        .dynamicTypeSize(...DynamicTypeSize.xxLarge)
     }
 
     private func headerButton(_ symbol: String, label: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: symbol)
-                .font(.system(size: 20))
+                .scaledFont(20)
                 .foregroundColor(.accentBlue)
                 .frame(width: 44, height: 44)
                 .contentShape(Rectangle())
@@ -261,7 +262,7 @@ struct ProjectsView: View {
             }
             Spacer(minLength: 0)
         }
-        .font(.system(size: 15))
+        .scaledFont(15)
         .frame(minHeight: 44)
     }
 
@@ -293,6 +294,8 @@ struct ProjectsView: View {
             .padding(.top, 2)
             .padding(.bottom, 6)
         }
+        // 182 pt cards: text grows up to xxLarge, then stops.
+        .dynamicTypeSize(...DynamicTypeSize.xxLarge)
     }
 
     private func projectCard(_ id: String) -> some View {
@@ -312,7 +315,7 @@ struct ProjectsView: View {
             let prs = info?.prs
             let branch = info?.branch ?? model.overview?.projects.first { $0.name == id }?.branch
             let checks = HomeLogic.checksLine(prs, branch: branch)
-            let deploy = HomeLogic.deployLine(info?.lastRun, now: Date())
+            let deploy = HomeLogic.deployLine(info?.lastRun, now: home.serverNow())
             lines = [
                 ProjectLine(text: prs.map { $0.isEmpty ? Text("không có PR mở") : Text("**\($0.count)** PR đang mở") }
                                 ?? Text("PR: chưa xem được")),
@@ -343,7 +346,7 @@ struct ProjectsView: View {
                     StatusDot(state: "waiting")
                     Text("Cần bạn · \(waiting.count)")
                 }
-                .font(.system(size: 14, weight: .semibold))
+                .scaledFont(14, weight: .semibold)
                 .foregroundColor(.orangeTone)
                 .padding(.horizontal, 4)
                 .frame(minHeight: 44)
@@ -366,14 +369,14 @@ struct ProjectsView: View {
             } label: {
                 HStack(spacing: 8) {
                     StatusDot(state: state)
-                    Text(title).font(.system(size: 15, weight: .semibold)).foregroundColor(.primary).fixedSize()
-                    Text("\(rows.count)").font(.system(size: 14)).foregroundColor(.l2)
+                    Text(title).scaledFont(15, weight: .semibold).foregroundColor(.primary).fixedSize()
+                    Text("\(rows.count)").scaledFont(14).foregroundColor(.l2)
                     HStack(spacing: 4) {
                         ForEach(Array(rows.prefix(3).enumerated()), id: \.offset) { item in
                             HarnessBadge(harness: item.element.harness ?? "omp")
                         }
                         if rows.count > 3 {
-                            Text("+\(rows.count - 3)").font(.system(size: 12)).foregroundColor(.l2)
+                            Text("+\(rows.count - 3)").scaledFont(12).foregroundColor(.l2)
                         }
                     }
                     .padding(.leading, 4)
@@ -427,7 +430,7 @@ struct ProjectsView: View {
     private var fab: some View {
         Button { sheet = .new(project: nil) } label: {
             Image(systemName: "plus")
-                .font(.system(size: 18, weight: .semibold))
+                .scaledFont(18, weight: .semibold)
                 .foregroundColor(.white)
                 .frame(width: 44, height: 44)
                 .background(LinearGradient(colors: [Color(hex: 0x2E95FF), .accentBlue], startPoint: .top, endPoint: .bottom),
@@ -438,6 +441,7 @@ struct ProjectsView: View {
         .buttonStyle(ScaleButtonStyle())
         .padding(.trailing, 16)
         .padding(.bottom, 16)
+        .dynamicTypeSize(...DynamicTypeSize.xxLarge)
         .accessibilityLabel("Tạo phiên mới")
     }
 }
@@ -525,7 +529,7 @@ struct ToastView: View {
         Group {
             if let t = text {
                 Text(t)
-                    .font(.system(size: 14))
+                    .scaledFont(14)
                     .foregroundColor(.white)
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -570,9 +574,9 @@ struct ProjectCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
-                Text(title).font(.system(size: 15, weight: .semibold)).lineLimit(1)
+                Text(title).scaledFont(15, weight: .semibold).lineLimit(1)
                 Text("\(count)")
-                    .font(.system(size: 12, weight: .bold))
+                    .scaledFont(12, weight: .bold)
                     .foregroundColor(waiting ? .black : .l2)
                     .padding(.horizontal, 5)
                     .frame(minWidth: 19, minHeight: 19)
@@ -582,7 +586,7 @@ struct ProjectCard: View {
             .padding(.bottom, 0)
             ForEach(lines.indices, id: \.self) { i in
                 lines[i].text
-                    .font(.system(size: 12.5))
+                    .scaledFont(12.5)
                     .foregroundColor(lines[i].color)
                     .lineLimit(1)
             }
@@ -596,7 +600,7 @@ struct ProjectCard: View {
             if showMore {
                 Button(action: onMore) {
                     Image(systemName: "ellipsis")
-                        .font(.system(size: 14, weight: .bold))
+                        .scaledFont(14, weight: .bold)
                         .foregroundColor(.l2)
                         .frame(width: 28, height: 28)
                         .background(Color.fill4, in: Circle())
@@ -617,6 +621,8 @@ struct ProjectCard: View {
         }, onPressingChanged: { pressing = $0 })
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+        // A double tap filters (the combined "…" button would otherwise take it).
+        .accessibilityAction(.default, onTap)
         .accessibilityAction(named: "Mở phiên mới", onMore)
     }
 }
@@ -630,23 +636,23 @@ struct EmptySessions: View {
     var body: some View {
         VStack(spacing: 0) {
             Image(systemName: "terminal")
-                .font(.system(size: 44, weight: .regular))
+                .scaledFont(44, weight: .regular)
                 .foregroundColor(HarnessStyle.color("omp"))
                 .frame(height: 96)
                 .accessibilityHidden(true)
             Text("Chưa có phiên nào" + (project.map { " trong \($0)" } ?? ""))
-                .font(.system(size: 19, weight: .bold))
+                .scaledFont(19, weight: .bold)
                 .padding(.top, 12)
                 .padding(.bottom, 4)
             Text("Mở một phiên omp, claude hoặc codex để máy bắt đầu làm việc cho bạn.")
-                .font(.system(size: 14))
+                .scaledFont(14)
                 .foregroundColor(.l2)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 260)
                 .padding(.bottom, 16)
             Button(action: onCreate) {
                 Text(project.map { "Tạo phiên trong \($0)" } ?? "Tạo phiên đầu tiên")
-                    .font(.system(size: 16, weight: .semibold))
+                    .scaledFont(16, weight: .semibold)
                     .foregroundColor(.white)
                     .padding(.horizontal, 20)
                     .frame(minHeight: 44)
@@ -705,6 +711,7 @@ struct SessionRow: View {
         )
         // Waiting rows keep their answer buttons as separate VoiceOver elements.
         .accessibilityElement(children: state == "waiting" ? .contain : .combine)
+        .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
     }
 
     private var content: some View {
@@ -713,7 +720,7 @@ struct SessionRow: View {
             HStack(spacing: 7) {
                 HarnessBadge(harness: session.harness ?? "omp")
                 Text(session.name)
-                    .font(.system(size: 15, weight: idle ? .medium : .semibold, design: .monospaced))
+                    .scaledFont(15, weight: idle ? .medium : .semibold, design: .monospaced)
                     .foregroundColor(idle ? .l2 : .primary)
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -723,7 +730,7 @@ struct SessionRow: View {
                 }
                 if waiting {
                     Text("Cần bạn")
-                        .font(.system(size: 12, weight: .bold))
+                        .scaledFont(12, weight: .bold)
                         .foregroundColor(.black)
                         .padding(.horizontal, 7)
                         .padding(.vertical, 1)
@@ -732,14 +739,14 @@ struct SessionRow: View {
                 }
                 Spacer(minLength: 6)
                 Text(time)
-                    .font(.system(size: 12.5))
+                    .scaledFont(12.5)
                     .foregroundColor(waiting ? .orangeTone : .l2)
                     .fixedSize()
             }
             meta.padding(.top, 3)
             if let preview = session.preview, !preview.isEmpty {
                 Text(preview)
-                    .font(.system(size: 12.5, design: .monospaced))
+                    .scaledFont(12.5, design: .monospaced)
                     .foregroundColor(idle ? .l2 : Color(hex: 0xD1D1D6))
                     .lineLimit(waiting ? 3 : 1)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -760,11 +767,11 @@ struct SessionRow: View {
                 Text("·").foregroundColor(.l3)
             }
             if let branch = info?.branch, !branch.isEmpty {
-                Image(systemName: "arrow.triangle.branch").font(.system(size: 11))
-                Text(branch).font(.system(size: 12, design: .monospaced)).truncationMode(.tail)
+                Image(systemName: "arrow.triangle.branch").scaledFont(11)
+                Text(branch).scaledFont(12, design: .monospaced).truncationMode(.tail)
             }
         }
-        .font(.system(size: 13))
+        .scaledFont(13)
         .foregroundColor(.l2)
         .lineLimit(1)
     }
@@ -789,7 +796,7 @@ struct SessionRow: View {
         Button(action: action) {
             // 32 pt capsule look, 44 pt tall hit area.
             Text(title)
-                .font(.system(size: 14.5, weight: .semibold))
+                .scaledFont(14.5, weight: .semibold)
                 .foregroundColor(text)
                 .padding(.horizontal, 14)
                 .frame(minHeight: 32)
