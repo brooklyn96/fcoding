@@ -21,7 +21,9 @@ struct RootView: View {
 
     var body: some View {
         Group {
-            if app.token == nil {
+            if let old = app.unsupportedServer {
+                UnsupportedServerView(address: old)
+            } else if app.token == nil {
                 NavigationStack { PairView() }
             } else {
                 // A new pairing (new token) starts the home screen afresh.

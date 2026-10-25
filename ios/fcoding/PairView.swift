@@ -207,6 +207,42 @@ struct PairView: View {
 
 /// "Hướng dẫn" (question-mark button on the pairing and settings screens): every instruction
 /// that used to sit in small footers, as short numbered steps.
+/// Full-screen card when an older build paired this iPhone to an address this build no
+/// longer accepts. Both buttons are local only: nothing is sent to that server.
+struct UnsupportedServerView: View {
+    @EnvironmentObject private var app: AppState
+    let address: String
+
+    var body: some View {
+        VStack(spacing: 20) {
+            Spacer()
+            Image(systemName: "exclamationmark.triangle")
+                .font(.system(size: 44, weight: .semibold))
+                .foregroundColor(.orange)
+                .accessibilityHidden(true)
+            (Text("Địa chỉ máy chủ đã lưu không còn được hỗ trợ (") + Text(address).font(.body.monospaced())
+                + Text("). Ghép lại để tiếp tục."))
+                .multilineTextAlignment(.center)
+            Text("Chỉ dùng được tên miền chữ thường không dấu, có dấu chấm (ví dụ box.instabox.tech), hoặc địa chỉ IP.")
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+            Spacer()
+            Button { app.leaveUnsupported(signOut: false) } label: {
+                Text("Ghép lại").bold().frame(maxWidth: .infinity, minHeight: 32)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            Button("Đăng xuất", role: .destructive) { app.leaveUnsupported(signOut: true) }
+                .controlSize(.large)
+        }
+        .padding(24)
+        .frame(maxWidth: 520)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(.systemBackground).ignoresSafeArea())
+    }
+}
+
 struct PairGuideView: View {
     @Environment(\.dismiss) private var dismiss
 

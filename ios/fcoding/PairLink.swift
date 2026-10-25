@@ -25,12 +25,17 @@ struct PairLink: Equatable {
     /// dot, ≤ 253, one trailing dot dropped), a dotted IPv4, or a bracketed IPv6 literal.
     /// Port: digits, 1–65535; 443 is left out. Returns the canonical origin string.
     static func strict(_ input: String) -> String? {
+        // ASCII on the RAW input first: lowercasing would fold e.g. KELVIN SIGN into "k".
+        guard input.unicodeScalars.allSatisfy({ $0.isASCII }) else { return nil }
         let s = input.lowercased()
         guard s.hasPrefix("https://") else { return nil }
         var rest = Substring(s.dropFirst("https://".count))
         if rest.hasSuffix("/") { rest = rest.dropLast() }
-        guard !rest.isEmpty, rest.unicodeScalars.allSatisfy({ $0.isASCII }),
-              !rest.contains(where: { "/?#@%\\ \t\r\n".contains($0) }) else { return nil }
+        // Per scalar, so a lone CR or LF is caught (CRLF is one Character).
+        let banned = Set("/?#@%\\".unicodeScalars)
+        guard !rest.isEmpty,
+              !rest.unicodeScalars.contains(where: { $0.value < 0x21 || $0.value == 0x7F || banned.contains($0) })
+        else { return nil }
 
         var host: Substring
         var portText: Substring?
@@ -64,18 +69,30 @@ struct PairLink: Equatable {
         return origin
     }
 
+    private static func isDigits<S: StringProtocol>(_ s: S) -> Bool {
+        !s.isEmpty && s.allSatisfy { ("0"..."9").contains($0) }
+    }
+
+    /// Exactly 4 decimal octets 0–255, no leading zeros ("0" yes, "010" no): read the same by
+    /// everyone (inet_aton and WHATWG would read "010" as octal).
     private static func isIPv4(_ host: Substring) -> Bool {
         let parts = host.split(separator: ".", omittingEmptySubsequences: false)
         return parts.count == 4 && parts.allSatisfy { p in
-            (1...3).contains(p.count) && p.allSatisfy({ ("0"..."9").contains($0) }) && Int(p)! <= 255
+            isDigits(p) && p.count <= 3 && (p.count == 1 || !p.hasPrefix("0")) && Int(p)! <= 255
         }
+    }
+
+    /// A last label that WHATWG / inet_aton would read as a number: `[0-9]+` or `0x[0-9a-f]*`.
+    static func isNumericLabel<S: StringProtocol>(_ label: S) -> Bool {
+        isDigits(label)
+            || (label.hasPrefix("0x") && label.dropFirst(2).allSatisfy { ("0"..."9").contains($0) || ("a"..."f").contains($0) })
     }
 
     private static func isName(_ host: Substring) -> Bool {
         let labels = host.split(separator: ".", omittingEmptySubsequences: false)
         guard host.count <= 253, labels.count >= 2,
-              // An all-digit last label is an IP address, and that must pass isIPv4 instead.
-              !(labels.last ?? "").allSatisfy({ ("0"..."9").contains($0) }) else { return false }
+              // A numeric last label makes it an IP address, which must pass isIPv4 instead.
+              !isNumericLabel(labels.last ?? "") else { return false }
         return labels.allSatisfy { l in
             (1...63).contains(l.count) && !l.hasPrefix("-") && !l.hasSuffix("-") && !l.hasPrefix("xn--")
                 && l.allSatisfy { ("a"..."z").contains($0) || ("0"..."9").contains($0) || $0 == "-" }
@@ -97,6 +114,21 @@ struct PairLink: Equatable {
     /// "host" or "host:port", exactly as connected to.
     static func label(_ server: String) -> String {
         server.hasPrefix("https://") ? String(server.dropFirst("https://".count)) : server
+    }
+
+    /// Migration: a server address an older build stored ("" = none) that this build can still
+    /// talk to. false = the app asks to pair again and sends that server nothing.
+    static func isSupportedStored(_ stored: String) -> Bool { stored.isEmpty || origin(stored) != nil }
+
+    /// The host part of a stored address for display: printable ASCII as is, every other
+    /// scalar escaped as `\u{XXXX}`, at most 100 scalars.
+    static func escapedAuthority(_ stored: String) -> String {
+        var s = Substring(stored)
+        if let r = s.range(of: "://") { s = s[r.upperBound...] }
+        if let cut = s.firstIndex(where: { "/?#".contains($0) }) { s = s[..<cut] }
+        return s.unicodeScalars.prefix(100).map { u in
+            (0x21..<0x7F).contains(u.value) ? String(u) : String(format: "\\u{%04X}", u.value)
+        }.joined()
     }
 
     /// Fixed cases; one line per failure (empty = all pass). Run by the CI self-test step.
@@ -124,6 +156,9 @@ struct PairLink: Equatable {
         strict("ipv4", "https://192.168.1.10:8443", "https://192.168.1.10:8443")
         strict("ipv6 port", "https://[2001:db8::1]:8443", "https://[2001:db8::1]:8443")
         strict("ipv6", "https://[::1]", "https://[::1]")
+        strict("ipv4 zero octet", "https://10.0.0.1", "https://10.0.0.1")
+        strict("digit inside name", "https://box1.example2.com", "https://box1.example2.com")
+        strict("hex-looking non-last", "https://0x7f.example.com", "https://0x7f.example.com")
         // Rejected.
         for (name, bad) in [
             ("xn--", "https://xn--80ak6aa92e.com"), ("xn-- inner", "https://a.xn--a.com"),
@@ -138,6 +173,11 @@ struct PairLink: Equatable {
             ("bad ipv4", "https://1.2.3.999"), ("bad ipv6", "https://[2001:db8::g]"),
             ("ipv6 zone", "https://[fe80::1%25en0]"), ("ipv6 tail", "https://[::1]x"),
             ("long label", "https://" + String(repeating: "a", count: 64) + ".com"),
+            ("ipv4 leading zeros", "https://192.168.001.010"), ("ipv4 hex last", "https://1.2.3.0x4"),
+            ("ipv4 all hex", "https://0x7f.0x0.0x0.0x1"), ("ipv4 3 parts", "https://1.2.3"),
+            ("kelvin sign", "https://\u{212A}.example.com"), ("lone cr", "https://box.example.com\r"),
+            ("lone lf", "https://box\n.example.com"), ("tab", "https://box.example.com\t"),
+            ("underscore", "https://a_b.example.com"),
         ] {
             strict(name, bad, nil)
         }
@@ -158,6 +198,16 @@ struct PairLink: Equatable {
         if PairLink.origin("http://box.example.com") != nil { failures.append("origin rejects http") }
         if PairLink.origin("https://xn--a.com") != nil { failures.append("origin rejects xn--") }
         if PairLink.label("https://[::1]:8443") != "[::1]:8443" { failures.append("label") }
+        // Migration classification of what older builds stored.
+        for (stored, ok) in [("", true), ("https://box.example.com", true), ("https://box.example.com/", true),
+                             ("https://xn--bcher-kva.de", false), ("https://fcodebox", false),
+                             ("https://a_b.example.com", false), ("https://192.168.001.010", false)]
+        where PairLink.isSupportedStored(stored) != ok {
+            failures.append("stored \(stored): want \(ok)")
+        }
+        if PairLink.escapedAuthority("https://bücher.de/x") != "b\\u{00FC}cher.de" {
+            failures.append("escaped: \(PairLink.escapedAuthority("https://bücher.de/x"))")
+        }
         return failures
     }
 }

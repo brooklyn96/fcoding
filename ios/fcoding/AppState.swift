@@ -11,6 +11,9 @@ final class AppState: ObservableObject {
     @Published var pairLink: PairLink?
     /// One-off message shown as an alert over whatever screen is up (link and re-pair results).
     @Published var popup: String?
+    /// Paired by an older build to an address this build rejects (shown escaped). While set,
+    /// the app shows only the "pair again" card and sends that server nothing (`api` is nil).
+    @Published private(set) var unsupportedServer: String?
 
     private static let serverKey = "serverURL"
     private static let tokenAccount = "deviceToken"
@@ -21,6 +24,24 @@ final class AppState: ObservableObject {
         serverURL = PairLink.origin(stored)?.absoluteString ?? stored
         AppState.removeLegacyCredentials(server: serverURL)
         token = serverURL.isEmpty ? nil : Keychain.get(AppState.tokenAccount)
+        if token != nil && !PairLink.isSupportedStored(stored) {
+            unsupportedServer = PairLink.escapedAuthority(stored)
+        }
+    }
+
+    /// The card's two ways out; both are local only (no request to the unsupported server).
+    /// "Ghép lại": pairing screen with an empty address. "Đăng xuất": the same, plus a notice
+    /// that the old box still lists this iPhone.
+    func leaveUnsupported(signOut: Bool) {
+        guard let old = unsupportedServer else { return }
+        unsupportedServer = nil
+        serverURL = ""
+        UserDefaults.standard.removeObject(forKey: AppState.serverKey)
+        AppState.removeDrafts()
+        UserDefaults.standard.removeObject(forKey: "inbox.seen")
+        signOutLocally(notice: signOut
+            ? "Đã đăng xuất trên iPhone này. Box cũ (\(old)) vẫn còn iPhone này trong danh sách thiết bị; gỡ nó trên box đó."
+            : nil)
     }
 
     /// Password-login leftovers: the old token (Keychain account "token" or UserDefaults), the
@@ -38,7 +59,8 @@ final class AppState: ObservableObject {
     }
 
     var api: API? {
-        guard let token = token, !token.isEmpty, let url = URL(string: serverURL) else { return nil }
+        guard unsupportedServer == nil, let token = token, !token.isEmpty,
+              let url = PairLink.origin(serverURL) else { return nil }
         return API(base: url, token: token)
     }
 
@@ -79,6 +101,7 @@ final class AppState: ObservableObject {
         UserDefaults.standard.set(serverURL, forKey: AppState.serverKey)
         notice = nil
         pairLink = nil
+        unsupportedServer = nil
         token = newToken
         guard let previous = previous else { return }
         do {
@@ -147,6 +170,7 @@ final class AppState: ObservableObject {
     }
 
     func signOutLocally(notice: String?) {
+        unsupportedServer = nil
         Keychain.delete(AppState.tokenAccount)
         self.notice = notice
         token = nil
