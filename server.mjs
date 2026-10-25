@@ -693,7 +693,7 @@ export function memo(ttl, fn, now, retry = ttl, ttlOf = () => undefined) {
       let timer;
       try {
         const r = await (Number.isFinite(wait) ? Promise.race([p, new Promise((_, rej) => { timer = setTimeout(rej, wait, new Error('timeout')); })]) : p);
-        return { value: r.v, fresh: r.kept, at: r.started };
+        return r.kept ? { value: r.v, fresh: true, at: r.started } : { value: r.v, fresh: false, at: -Infinity }; // dropped: of no age
       } catch (e) { return old(e); } finally { clearTimeout(timer); }
     },
     clear() { at = -Infinity; failedAt = -Infinity; cleared = true; gen++; pending = null; },
@@ -1106,7 +1106,8 @@ export function createApp(opts = {}) {
   // After a reset the reset counts must come from a listing fetched after it: a kept listing whose refresh started at or after
   // lastResetAt. While the stored listing is older than the last reset, a quota refresh waits up to LIST_AFTER_RESET_MS (omp's own
   // listing timeout) for one, not homeWait / 2. Without one (slow, failed, or a refresh dropped by a later reset) the accounts are
-  // stored with stale: true and the quota value only for STALE_QUOTA_TTL, so the next request reads both again.
+  // stored with stale: true and the quota value only for STALE_QUOTA_TTL, so the next request reads both again. A stored listing
+  // started at or after lastResetAt stays trusted even when a later listing refresh fails (as when no reset ever happened).
   let lastResetAt = -Infinity;
   const quota = memo(QUOTA_TTL, async () => {
     const resetAt = lastResetAt;
@@ -1114,8 +1115,8 @@ export function createApp(opts = {}) {
     const [u, r] = await Promise.allSettled([execTool(ompSpec, ['usage', '--json'], 30e3), listing.get(needNew ? listAfterReset : homeWait / 2)]);
     if (u.status === 'rejected') throw u.reason;
     const q = parseQuota(JSON.parse(u.value), r.status === 'fulfilled' ? r.value.value : null, now());
-    const trusted = r.status === 'fulfilled' && r.value.fresh && r.value.at >= resetAt;
-    if (resetAt > -Infinity && !trusted) { for (const a of q.accounts) a.stale = true; q.ttl = STALE_QUOTA_TTL; }
+    // by the listing's age only: a later listing failure is the same with or without a past reset
+    if (resetAt > -Infinity && !(r.status === 'fulfilled' && r.value.at >= resetAt)) { for (const a of q.accounts) a.stale = true; q.ttl = STALE_QUOTA_TTL; }
     return q;
   }, now, QUOTA_TTL, (q) => q.ttl);
   const scan = spendScanner(spendRoots, now);

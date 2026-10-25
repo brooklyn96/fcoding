@@ -2801,7 +2801,7 @@ test('memo: stale-while-revalidate, bounded first wait, backoff after a failure,
   await new Promise((r) => setImmediate(r));
   d.clear();
   gate('pre-clear');
-  assert.deepEqual(await waiting, { value: 'pre-clear', fresh: false, at: 1000 });
+  assert.deepEqual(await waiting, { value: 'pre-clear', fresh: false, at: -Infinity }); // of no age: never counts as after a reset
   assert.equal(d.at(), -Infinity); // not stored
   t = 1010;
   const next2 = d.get(1000);
@@ -3103,6 +3103,29 @@ test('two resets close together: a listing fetched before the second reset never
   await c.app.homeIdle();
   c.clock.t += 20e3; // also later: the fresh 0 stays (no old count stored for 60 s)
   assert.deepEqual([(await c.home()).accounts[3].resets.available], [0]);
+}, { homeWaitMs: 600, listAfterResetMs: 8000 }));
+
+test('after a reset and a good listing, a later listing failure is handled as without a reset: not stale, 60 s TTL', () => homeApp(async (c) => {
+  await c.homeUntil((h) => h.accounts[3]?.resets.target);
+  await c.app.homeIdle();
+  assert.equal((await c.reset({ accountId: 'openai-codex/4', requestId: '0f8f7a6e-1111-4222-8333-000000000201' })).json.result, 'reset');
+  await c.homeUntil((h) => h.accounts.every((a) => !a.stale)); // the listing fetched after the reset has landed
+  await c.app.homeIdle();
+  c.setRules([['usage reset --json', { code: 1, stderr: 'down' }], ...baseRules()]);
+  const fails = c.toolCalls('usage reset --json').length;
+  for (const step of [305e3, 61e3]) { // the listing expires and fails; then its retry delay is over and it fails again
+    c.clock.t += step;
+    await c.home(); // served while the quota refresh runs
+    await c.app.homeIdle(); await c.app.homeIdle();
+    const h = await c.home();
+    assert.ok(h.accounts.every((a) => !a.stale), JSON.stringify(h.accounts.map((a) => [a.id, a.stale])));
+  }
+  assert.equal(c.toolCalls('usage reset --json').length, fails + 2); // both listing refreshes ran and failed
+  const reads = c.toolCalls('usage --json').length;
+  c.clock.t += 20e3; // past the 15 s stale TTL, within the normal 60 s
+  await c.home();
+  await c.app.homeIdle();
+  assert.equal(c.toolCalls('usage --json').length, reads);
 }, { homeWaitMs: 600, listAfterResetMs: 8000 }));
 
 test('box timer: kept across a server restart within 90 s of the last tick on the same boot (box-timer.json); a longer gap or a reboot is a new run', async () => {
