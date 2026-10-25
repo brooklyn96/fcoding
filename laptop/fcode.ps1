@@ -405,7 +405,9 @@ function Invoke-Add {
         'V_SERVER_BAD'  { Write-Host '[7] cảnh báo: server FCode báo lỗi khi nạp lại cấu hình'; $bad++ }
         'V_CFG_BAD'     { Write-Host '[7] cảnh báo: cấu hình FCode chưa đúng cho project này'; $bad++ }
         'V_EMPTY_REPO'  { Write-Host '[7] Repo còn trống (chưa có commit nào): bình thường với repo mới' }
-        'CLEANUP_FAIL'  { Write-Host "cảnh báo: nhánh thử $d còn sót trên GitHub, hãy xoá nó trong trang Branches của repo."; $bad++ }
+        'CLEANUP_FAIL'  { $br = $d -replace '^refs/heads/', ''; Write-Host "cảnh báo: GitHub không cho box xoá nhánh thử $br. Hãy xoá bằng tay: mở https://github.com/$repo/branches, tìm nhánh $br, bấm biểu tượng thùng rác."; Write-Host '  (chạy lại lệnh sẽ dùng lại đúng nhánh này, không tạo thêm nhánh mới)' ; $bad++ }
+        'NET_FAIL'      { Write-Host "lỗi: mạng từ box tới GitHub đang chập chờn nên chưa kiểm tra được. Đợi ít phút rồi chạy lại cùng lệnh: fcode add $repo $name"; if ($detail) { Write-Host "  (chi tiết: $detail)" } }
+        'REPO_ARCHIVED' { Write-Host "[5] lỗi: repo này đã lưu trữ (archived) nên không ghi được. Vào Settings của repo để bỏ lưu trữ (Unarchive), hoặc chọn repo khác." }
         'NAME_USED'     { Write-Host "lỗi: tên '$name' đã được dùng cho khoá hoặc kết nối GitHub khác trên box (không phải repo này). Đặt tên khác: fcode add $repo <tên>" }
         'WRITE_BLOCKED' { Write-Host '[5] lỗi: khoá đã vào GitHub nhưng GitHub không cho box tạo nhánh thử box/... (thường do quy tắc bảo vệ nhánh của repo).'; Write-Host "    Nhờ chủ repo cho phép nhánh box/*, rồi chạy lại: fcode add $repo $name"; if ($detail) { Write-Host "  (chi tiết: $detail)" } }
         'RULES_YES'     { $rules = $true }
@@ -418,7 +420,8 @@ function Invoke-Add {
       Write-IpaError 'không nói chuyện được với box. Kiểm tra: đã chạy "instabox login" chưa, và box đang bật không.' $d
       return 1
     }
-    if ($code -eq 42) { return 1 }
+    # loi can sua truoc (ten da dung, cau hinh hong, GitHub chan, mang, repo luu tru): thong bao cu the da in o tren, khong bao "chay lai cung lenh"
+    if ($code -in 11, 21, 22, 23, 42, 43, 44) { return 1 }
     if ($code -eq 40 -or $code -eq 41) {
       # can dan khoa cong khai vao GitHub (nguoi dung tu dan; khong tu them bang token/API)
       Write-Host ''
@@ -595,27 +598,39 @@ HOOK
 # alias cua rieng repo nay? 0 = co (co dong "# fcode add: <repo>" ngay tren), 1 = chua co, 2 = co nhung cua nguoi khac
 alias_owner() {
   [ -f "$sshdir/config" ] || return 1
-  awk -v h="Host $alias_" -v m="# fcode add: $repo" 'prev==m && $0==h {ok=1} $0==h {seen=1} {prev=$0} END {exit (ok ? 0 : (seen ? 2 : 1))}' "$sshdir/config"
+  awk -v h="Host $alias_" -v m="# fcode add: $want" 'tolower(prev)==m && $0==h {ok=1} $0==h {seen=1} {prev=$0} END {exit (ok ? 0 : (seen ? 2 : 1))}' "$sshdir/config"
+}
+
+# phan loai loi tu noi dung $err (chi dua vao chu cua ssh / may chu GitHub bang tieng Anh, khong phu thuoc ngon ngu cua git)
+NETRE='connect to host|Connection (timed out|refused|reset|closed)|Could not resolve|hung up|Network is unreachable|Operation timed out|kex_exchange|Broken pipe|Temporary failure'
+classify_fail() { # dat $kind: net | archived | ro | other
+  if grep -qiE "$NETRE" "$err"; then kind=net
+  elif grep -qi 'archived' "$err"; then kind=archived
+  elif grep -qiE 'marked as read only|Permission to .* denied' "$err"; then kind=ro
+  else kind=other; fi
 }
 
 # ghi duoc repo: day THAT 1 nhanh thu tu commit cay rong (chay duoc ca repo rong), roi xoa ngay.
-# Chung minh luon: khoa mo duoc receive-pack, va luat bao ve nhanh khong chan box/*. Khong de lai nhanh nao.
+# Chung minh luon: khoa mo duoc receive-pack, va luat bao ve nhanh khong chan box/*. Chi dung MOT ten nhanh co dinh
+# (box/fcode-add-check, ghi de bang +) nen neu GitHub khong cho xoa thi cung chi con toi da 1 nhanh, khong tich them.
 write_check() { # $1 = thu muc clone; 0 = ghi duoc; 1 = loi (noi dung loi o $err)
-  local tree c ref e2; e2="$(mktemp)"
+  local tree c ref e2 ex; ref="refs/heads/box/fcode-add-check"; e2="$(mktemp)"
+  ex="$(git -C "$1" ls-remote origin "$ref" 2>/dev/null </dev/null)"
+  if [ -n "$ex" ]; then   # con sot tu lan truoc: thu xoa; khong xoa duoc thi coi nhu da chung minh ghi duoc (nhanh do da tao duoc)
+    if ! git -C "$1" push -q origin ":$ref" >/dev/null 2>"$e2" </dev/null; then say CLEANUP_FAIL "$ref"; fail=1; rm -f "$e2"; return 0; fi
+  fi
   tree="$(git -C "$1" hash-object -t tree -w /dev/null 2>"$err")" || { rm -f "$e2"; return 1; }
   c="$(GIT_AUTHOR_NAME=fcode GIT_AUTHOR_EMAIL=fcode@box GIT_COMMITTER_NAME=fcode GIT_COMMITTER_EMAIL=fcode@box \
        git -C "$1" commit-tree "$tree" -m 'fcode add write check' </dev/null 2>"$err")" || { rm -f "$e2"; return 1; }
-  ref="refs/heads/box/fcode-add-check-$(date +%s)-$$"
-  git -C "$1" push -q origin "$c:$ref" >/dev/null 2>"$err" </dev/null || { rm -f "$e2"; return 1; }
+  git -C "$1" push -q origin "+$c:$ref" >/dev/null 2>"$err" </dev/null || { rm -f "$e2"; return 1; }
   if ! git -C "$1" push -q origin ":$ref" >/dev/null 2>"$e2" </dev/null; then
     sleep 2
-    git -C "$1" push -q origin ":$ref" >/dev/null 2>"$e2" </dev/null || say CLEANUP_FAIL "$ref"
+    git -C "$1" push -q origin ":$ref" >/dev/null 2>"$e2" </dev/null || { say CLEANUP_FAIL "$ref"; fail=1; }
   fi
   rm -f "$e2"; return 0
 }
-
 # 0. hai lan fcode add cung ten khong chay song song
-exec 8>"${TMPDIR:-/tmp}/fcode-add-$name.lock"; flock 8
+mkdir -p "$sshdir"; chmod 700 "$sshdir"; exec 8>>"$sshdir/.fcode-add-$name.lock"; flock 8
 
 # 1. kiem tra truoc (chua tao gi): thu muc, cau hinh, khoa/alias co phai cua repo khac khong
 want="$(printf '%s' "$repo" | tr 'A-Z' 'a-z')"
@@ -641,7 +656,7 @@ PY
 rc=$?; [ "$rc" -eq 0 ] || exit "$rc"
 alias_owner; ao=$?
 if [ "$ao" -eq 2 ]; then say NAME_USED; exit 23; fi
-if [ "$ao" -eq 1 ] && [ -e "$key" ] && [ "$(awk '{print $3}' "$key.pub" 2>/dev/null)" != "fcode-$repo" ]; then say NAME_USED; exit 23; fi
+if [ "$ao" -eq 1 ] && [ -e "$key" ] && [ "$(awk '{print tolower($3)}' "$key.pub" 2>/dev/null)" != "fcode-$want" ]; then say NAME_USED; exit 23; fi
 
 # 2. khoa SSH rieng + alias + ghim khoa may chu github.com (khoa thu muc ~/.ssh: cac lan chay khac ten cung ghi config nay)
 mkdir -p "$sshdir"; chmod 700 "$sshdir"
@@ -669,7 +684,11 @@ fi
 flock -u 9
 
 # 3. doc duoc repo qua khoa nay? (khong duoc -> nguoi dung dan khoa cong khai vao GitHub, roi chay lai)
-if ! git ls-remote "$url" >/dev/null 2>"$err" </dev/null; then say SSH_DETAIL "$(clean <"$err")"; say PUBKEY "$pub"; say NEED_KEY; exit 40; fi
+if ! git ls-remote "$url" >/dev/null 2>"$err" </dev/null; then
+  say SSH_DETAIL "$(clean <"$err")"; classify_fail
+  if [ "$kind" = net ]; then say NET_FAIL; exit 43; fi
+  say PUBKEY "$pub"; say NEED_KEY; exit 40
+fi
 say READ_OK
 
 # 4. clone qua alias (da co thi giu nguyen, dat lai remote qua alias)
@@ -677,7 +696,10 @@ if [ -e "$dir" ]; then
   git -C "$dir" remote set-url origin "$url"
   say CLONE_EXISTS
 else
-  if ! git clone -q "$url" "$dir" >/dev/null 2>"$err" </dev/null; then say CLONE_FAIL "$(clean <"$err")"; exit 12; fi
+  if ! git clone -q "$url" "$dir" >/dev/null 2>"$err" </dev/null; then
+    classify_fail; if [ "$kind" = net ]; then say SSH_DETAIL "$(clean <"$err")"; say NET_FAIL; exit 43; fi
+    say CLONE_FAIL "$(clean <"$err")"; exit 12
+  fi
   say CLONED
 fi
 
@@ -690,7 +712,12 @@ rm -f "$htmp"; chmod 755 "$dir/.git/hooks/pre-push"
 # 6. ghi duoc repo?
 if ! write_check "$dir"; then
   say SSH_DETAIL "$(clean <"$err")"
-  if grep -qiE 'read.only|permission|denied|publickey|could not read' "$err"; then say PUBKEY "$pub"; say NEED_WRITE; exit 41; fi
+  classify_fail
+  case "$kind" in
+    net) say NET_FAIL; exit 43;;
+    archived) say REPO_ARCHIVED; exit 44;;
+    ro) say PUBKEY "$pub"; say NEED_WRITE; exit 41;;
+  esac
   say WRITE_BLOCKED; exit 42
 fi
 say WRITE_OK
