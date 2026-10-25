@@ -188,6 +188,13 @@ test('validation of names, keys, projects, harnesses, ranges', () => withApp(asy
   assert.equal((await k({ key: 'Enter', repeat: 21 })).status, 400);
   assert.equal((await k({ key: 'Enter', repeat: 1.5 })).status, 400);
   for (const key of KEYS) assert.equal((await k({ key })).status, 200, key);
+  // omp agent hub: Alt+A opens it, Ctrl+O expands an entry; other Alt/Ctrl combinations stay refused
+  assert.ok(KEYS.includes('M-a') && KEYS.includes('C-o'));
+  for (const key of ['M-a', 'C-o']) {
+    await k({ key }); // status 200 is covered by the KEYS loop above
+    assert.deepEqual(c.calls().filter((x) => x.argv[0] === 'send-keys').at(-1).argv, ['send-keys', '-t', '=work:', key]);
+  }
+  for (const key of ['M-x', 'M-A', 'C-x', 'M-a M-a']) assert.deepEqual((await k({ key })).json, { error: 'bad_key' }, key);
   assert.equal((await k({ key: 'Down', repeat: 3 })).status, 200);
   assert.deepEqual(c.calls().filter((x) => x.argv[0] === 'send-keys').at(-1).argv, ['send-keys', '-t', '=work:', 'Down', 'Down', 'Down']);
 
