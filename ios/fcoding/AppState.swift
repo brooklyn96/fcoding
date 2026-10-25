@@ -38,7 +38,7 @@ final class AppState: ObservableObject {
         return API(base: url, token: token)
     }
 
-    static func normalize(_ input: String) -> URL? {
+    nonisolated static func normalize(_ input: String) -> URL? {
         var s = input.trimmingCharacters(in: .whitespacesAndNewlines)
         if !s.contains("://") { s = "https://" + s }
         while s.hasSuffix("/") { s.removeLast() }
