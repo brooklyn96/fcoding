@@ -120,7 +120,8 @@ newer() {
 verify() {
   local out
   out=$(x 30 "$1/bin/$2" --version 2>&1 </dev/null) || return 1
-  printf %s "$out" | grep -Fqw -- "$3"
+  # the version as a whole token; "v" may be glued to it (opencode prints "opencode v2.1.4")
+  printf %s "$out" | grep -Eq "(^|[^0-9.])v?${3//./\.}([^0-9A-Za-z.-]|$)"
 }
 
 # install_version <tool> <version>: npm install into <root>/<tool>/<version> (as this user, no sudo), verify there
