@@ -24,7 +24,7 @@ Tính năng chính:
 - Trò chuyện với **omp**, **Claude Code**, **Codex** hoặc **shell** (bash) chạy trong tmux trên box.
 - **Hộp thư tổng quan**: mọi phiên được chia thành **Cần bạn**, **Đang chạy** và **Đang nghỉ**. Việc cần bạn trả lời luôn nằm trên cùng.
 - **Trả lời y/n ngay trên danh sách**, không cần mở phiên.
-- **Hàng phím nhanh**: Esc, **Agents**, Ctrl+C, mũi tên, Tab, Shift+Tab, Enter, y, n, **^O** (chỉ trong phiên omp) và nút `/` cho các lệnh hay dùng.
+- **Hàng phím nhanh**: Esc, Ctrl+C, mũi tên, Tab, Shift+Tab, Enter, y, n, **Agents** và **^O** (chỉ trong phiên omp), cùng nút `/` cho các lệnh hay dùng.
 - **Gõ tiếng Việt** bình thường bằng bàn phím iPhone; chữ được gửi nguyên vẹn lên box.
 - **Phiên mới bằng nút +**: chọn chương trình và dự án, luôn tạo phiên mới.
 - Ghép máy bằng **mã 6 số**, không có mật khẩu.
