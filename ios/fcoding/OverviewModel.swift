@@ -17,6 +17,9 @@ final class OverviewModel: ObservableObject {
     /// The one load in flight; a load() call during it asks for exactly one more (`reloadAfter`).
     private var current: Task<Void, Never>?
     private var reloadAfter = false
+    /// Bumped by a rename: a fetch that started before it carries the old names, so its reply is
+    /// dropped (it would undo the moved read mark) and the follow-up fetch is used instead.
+    private var generation = 0
     private static let seenKey = "inbox.seen"
 
     init() {
@@ -47,8 +50,13 @@ final class OverviewModel: ObservableObject {
     /// Keeps the last data on failure; a 401 goes back to pairing through `app.report`.
     private func fetchOnce(_ app: AppState) async {
         guard let api = app.api else { return }
+        let started = generation
         do {
             let fresh = try await api.overview()
+            guard started == generation else {
+                reloadAfter = true
+                return
+            }
             overview = fresh
             errorText = nil
             syncSeen(fresh)
@@ -158,6 +166,7 @@ final class OverviewModel: ObservableObject {
         } catch {
             return app.report(error) ?? "Chưa đổi được tên, thử lại."
         }
+        generation += 1
         let defaults = UserDefaults.standard
         if let draft = defaults.string(forKey: "draft.\(name)") {
             defaults.set(draft, forKey: "draft.\(newName)")
