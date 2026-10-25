@@ -2739,3 +2739,70 @@ test('POST /api/codex-reset: Codex only, validated, lock per account, the same r
   assert.ok(c.logs.includes('codex-reset openai-codex/4 no_credit'));
   assert.ok(!c.logs.some((l) => l.includes('@')));
 }));
+
+// ---------- A8: PATCH /api/sessions/<name> renames a session ----------
+const rename = (c, cookie, from, body, o = {}) => c.req('PATCH', `/api/sessions/${from}`, { cookie, body, ...o });
+const readFake = (c) => JSON.parse(fs.readFileSync(fakeState(c), 'utf8'));
+
+test('rename: exact-match target, project and harness kept, errors 400 bad_name / 404 not_found / 409 name_taken, auth and CSRF', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  assert.equal((await mkSession(c, cookie, 'work')).status, 201);
+  assert.equal((await mkSession(c, cookie, 'other')).status, 201);
+  assert.equal((await rename(c, undefined, 'work', { name: 'x1' })).status, 401);
+  assert.equal((await rename(c, cookie, 'work', { name: 'x1' }, { pc: false })).status, 403);
+  assert.equal((await rename(c, cookie, 'work', { name: 'x1' }, { headers: { Origin: 'https://evil.example' } })).status, 403);
+  for (const name of ['Bad', '-x', 'a'.repeat(33), 'a b', 'a;b', '', 7, undefined]) {
+    const r = await rename(c, cookie, 'work', { name });
+    assert.deepEqual([r.status, r.json], [400, { error: 'bad_name' }], String(name));
+  }
+  assert.equal((await rename(c, cookie, 'NOPE', { name: 'x1' })).status, 400); // the old name follows the same rule
+  const missing = await rename(c, cookie, 'wor', { name: 'x1' }); // a prefix of "work" is not "work"
+  assert.deepEqual([missing.status, missing.json], [404, { error: 'not_found' }]);
+  const taken = await rename(c, cookie, 'work', { name: 'other' });
+  assert.deepEqual([taken.status, taken.json], [409, { error: 'name_taken' }]);
+  const ok = await rename(c, cookie, 'work', { name: 'renamed-1' });
+  assert.deepEqual([ok.status, ok.json], [200, { name: 'renamed-1' }]);
+  assert.ok(c.calls().some(({ argv }) => argv.join(' ') === 'rename-session -t =work renamed-1'));
+  const list = (await c.req('GET', '/api/sessions', { cookie })).json.sessions;
+  assert.deepEqual(list.map((s) => [s.name, s.project, s.harness]).sort(), [['other', 'alpha', 'shell'], ['renamed-1', 'alpha', 'shell']]);
+  assert.equal((await rename(c, cookie, 'renamed-1', { name: 'renamed-1' })).status, 200); // the same name: nothing changes
+  assert.equal((await c.req('PUT', '/api/sessions/renamed-1', { cookie, body: { name: 'y' } })).status, 405);
+}));
+
+test('rename: race-safe against a create of the same name (server jobs in one queue; one made outside -> name_taken)', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  for (let i = 0; i < 6; i++) {
+    assert.equal((await mkSession(c, cookie, `src${i}`)).status, 201);
+    const mk = () => mkSession(c, cookie, `t${i}`), rn = () => rename(c, cookie, `src${i}`, { name: `t${i}` });
+    const [created, renamed] = i % 2 ? await Promise.all([mk(), rn()]) : (await Promise.all([rn(), mk()])).reverse(); // both send orders
+    assert.deepEqual([created.status === 201, renamed.status === 200].filter(Boolean).length, 1, `${created.status} ${renamed.status}`); // exactly one gets the name
+    assert.ok(created.status === 409 || renamed.json?.error === 'name_taken');
+    assert.equal(Object.keys(readFake(c).sessions).filter((n) => n === `t${i}`).length, 1);
+  }
+  // a session made outside the server under the wanted name (plain tmux): tmux refuses, the server answers name_taken
+  const st = readFake(c);
+  st.sessions.outside = { created: 1700000000, opts: {} };
+  fs.writeFileSync(fakeState(c), JSON.stringify(st));
+  assert.equal((await mkSession(c, cookie, 'src-x')).status, 201);
+  const r = await rename(c, cookie, 'src-x', { name: 'outside' });
+  assert.deepEqual([r.status, r.json], [409, { error: 'name_taken' }]);
+}));
+
+const REAL_TMUX = spawnSync('tmux', ['-V'], { encoding: 'utf8' }).status === 0 && process.platform !== 'win32';
+test('rename with real tmux: exact target, options move, duplicate and missing names', { skip: !REAL_TMUX && 'tmux not installed' }, async () => {
+  const sock = `pc-test-${process.pid}`;
+  const tmux = (...a) => spawnSync('tmux', ['-L', sock, '-f', '/dev/null', ...a], { encoding: 'utf8' });
+  const c = await boot({ tmux: ['tmux', '-L', sock, '-f', '/dev/null'] });
+  try {
+    const { cookie } = await c.login();
+    for (const n of ['work', 'workbench']) assert.equal((await mkSession(c, cookie, n)).status, 201);
+    assert.deepEqual((await rename(c, cookie, 'wor', { name: 'x' })).status, 404); // "=wor" is exact: no prefix match
+    assert.deepEqual((await rename(c, cookie, 'work', { name: 'workbench' })).json, { error: 'name_taken' });
+    const r = await rename(c, cookie, 'work', { name: 'done-1' });
+    assert.deepEqual([r.status, r.json], [200, { name: 'done-1' }]);
+    const out = tmux('list-sessions', '-F', '#{session_name} #{@pc_project} #{@pc_harness}').stdout.trim().split('\n').sort();
+    assert.deepEqual(out, ['done-1 alpha shell', 'workbench alpha shell']);
+    assert.equal((await c.req('GET', '/api/screen/done-1', { cookie })).status, 200);
+    assert.equal((await c.req('GET', '/api/screen/work', { cookie })).status, 404);
+  } finally { tmux('kill-server'); await c.close(); }
+});

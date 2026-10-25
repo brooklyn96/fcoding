@@ -1305,6 +1305,17 @@ export function createApp(opts = {}) {
     if (seg.length === 4 && seg[1] === 'api' && seg[0] === '' && ['sessions', 'screen', 'stream', 'send', 'key', 'resize'].includes(seg[2])) {
       const verb = seg[2]; const name = seg[3];
       if (!validName(name)) throw new HttpErr(400, 'invalid');
+      if (verb === 'sessions' && method === 'PATCH') { // A8 rename: a mutation job, so it is ordered against every create of the server
+        const { name: to } = parseJson(req, body);
+        if (!validName(to)) throw new HttpErr(400, 'bad_name');
+        await mutate(ctx, async () => { // the server keeps no per-session state by name; the tmux options move with the session
+          try { await run(ctx, ['rename-session', '-t', sess(name), to]); } catch (e) {
+            if (/duplicate session/i.test(e.stderr || '')) throw new HttpErr(409, 'name_taken'); // also one made outside the server meanwhile
+            throw e; // a missing old name: 404 not_found
+          }
+        });
+        return json(res, 200, { name: to });
+      }
       if (verb === 'sessions') {
         want('DELETE');
         await mutate(ctx, () => run(ctx, ['kill-session', '-t', sess(name)]));

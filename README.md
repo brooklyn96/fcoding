@@ -122,6 +122,7 @@ Màn hình chính của app lấy mọi thứ từ một địa chỉ của máy
 - Ngày (Hôm nay, Hôm qua) tính theo múi giờ của box. Box mặc định dùng giờ UTC; muốn tính theo giờ Việt Nam thì thêm `Environment=TZ=Asia/Ho_Chi_Minh` vào dịch vụ `fcoding` rồi khởi động lại.
 - `gh` cần quyền đọc kho: đăng nhập bằng `gh auth login` trên box, hoặc đặt `GH_TOKEN` cho dịch vụ. Nếu token không được đọc trạng thái kiểm tra (checks) thì app chỉ không hiện phần đó.
 - Nút Reset của Codex trong app chạy `omp usage reset <tài khoản>` trên box, mỗi tài khoản một lần một. Reset của Claude chỉ mở trang claude.ai.
+- Đổi tên phiên (vuốt trên một phiên, "Đổi tên") dùng `tmux rename-session`; tên mới theo cùng luật như tên phiên.
 
 ## 4. Mở link công khai
 
