@@ -18,7 +18,7 @@
 #   FCODE_INSTALL_HIDE    comma list of tools (gh,instabox,winget) hidden from the PATH search
 #   FCODE_INSTALL_ENVKEY  HKCU subkey used instead of "Environment" when editing the user PATH
 #   FCODE_INSTALL_EPFAKE  fake execution policy list, e.g. CurrentUser=Restricted,LocalMachine=Undefined (nothing is set)
-#   FCODE_INSTALL_EPREAL  =1 with EPFAKE: really run Set-ExecutionPolicy (only safe where CurrentUser is already RemoteSigned)
+#   FCODE_INSTALL_EPREAL  exactly 1, and only together with EPFAKE: really run Set-ExecutionPolicy (only safe where CurrentUser is already RemoteSigned)
 #
 # Do not capture the output of Invoke-FcodeInstall in a variable: gh and instabox need the real console to log in.
 
@@ -122,10 +122,13 @@ function Invoke-FcodeInstall {
         try { & $exe --version *> $null; return ($LASTEXITCODE -eq 0) } catch { return $false }
     }
     function Find-Ib {
-        # An instabox.exe that does not run (a download cut short, say) counts as missing, so it gets replaced.
-        $p = Find-Tool 'instabox' @((Join-Path $ibDir 'instabox.exe'))
-        if ($p -and -not (Test-Runs $p)) { return $null }
-        return $p
+        # Every candidate is tried (all PATH hits, then the install folder) and the first that runs wins, so a broken copy
+        # (a download cut short, a stale shim) never hides a good one. No working copy means "missing".
+        $c = @()
+        if ($hide -notcontains 'instabox') { $c += @(Get-Command 'instabox' -CommandType Application -All -ErrorAction SilentlyContinue | ForEach-Object { $_.Source }) }
+        $c += (Join-Path $ibDir 'instabox.exe')
+        foreach ($p in $c) { if ($p -and (Test-Path -LiteralPath $p) -and (Test-Runs $p)) { return $p } }
+        return $null
     }
     function Ensure-OnPath($exe) {
         # fcode.ps1 calls gh and instabox by name, so the folder of each must be on PATH (this window and the user PATH).
@@ -198,9 +201,9 @@ function Invoke-FcodeInstall {
                     # Group policy outranks everything, including the -ExecutionPolicy Bypass that fcode.cmd uses, so fcode.cmd cannot help here.
                     $why = V 'PowerShell tr\u00ean m\u00e1y n\u00e0y b\u1ecb qu\u1ea3n tr\u1ecb vi\u00ean kh\u00f3a n\u00ean ch\u01b0a ch\u1ea1y \u0111\u01b0\u1ee3c l\u1ec7nh fcode'
                     $act = V 'Nh\u1edd qu\u1ea3n tr\u1ecb vi\u00ean cho ph\u00e9p PowerShell ch\u1ea1y script \u1edf ch\u1ebf \u0111\u1ed9 RemoteSigned, r\u1ed3i ch\u1ea1y l\u1ea1i l\u1ec7nh c\u00e0i'
-                    Say '\u2717 {0}.' $why
+                    Show-Why @{ Cause = $why; Detail = '' }
                     $todo.fcode = $why + '. ' + $act
-                } elseif (($dry -or $env:FCODE_INSTALL_EPFAKE) -and -not $env:FCODE_INSTALL_EPREAL) {
+                } elseif (($dry -or $env:FCODE_INSTALL_EPFAKE) -and -not ($env:FCODE_INSTALL_EPFAKE -and $env:FCODE_INSTALL_EPREAL -eq '1')) {
                     Say '[ch\u1ea1y th\u1eed] Set-ExecutionPolicy RemoteSigned -Scope CurrentUser -Force'
                 } else {
                     # Judge the result by reading the CurrentUser policy back, not by the exit code.
@@ -296,6 +299,8 @@ function Invoke-FcodeInstall {
         $netCause = 'Kh\u00f4ng t\u1ea3i \u0111\u01b0\u1ee3c instabox (kh\u00f4ng v\u00e0o \u0111\u01b0\u1ee3c api.instabox.sh)'
         Say '\u0110ang t\u1ea3i instabox t\u1eeb trang ch\u00ednh th\u1ee9c c\u1ee7a instabox v\u00e0 ki\u1ec3m tra m\u00e3 SHA256.'
         if ($dry) { Say '[ch\u1ea1y th\u1eed] s\u1ebd t\u1ea3i {0}/{1} v\u00e0 {0}/SHA256SUMS, ki\u1ec3m tra SHA256, r\u1ed3i \u0111\u1eb7t v\u00e0o {2}' @($base, $name, $ibDir); return }
+        # Temp exes left by a run that was killed (closed window) are never cleaned by its finally block, so remove them now.
+        Get-ChildItem -LiteralPath $ibDir -Filter '.instabox.install.*.exe' -Force -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
         $d = Join-Path ([IO.Path]::GetTempPath()) ('fcode-ib-' + [guid]::NewGuid().ToString('N'))
         $null = New-Item -ItemType Directory -Path $d -Force
         # The exe is downloaded into its final folder under a temporary name (same volume) and renamed only after it is
@@ -309,7 +314,8 @@ function Invoke-FcodeInstall {
             $want = (Get-Content -LiteralPath $sf | Where-Object { $_ -match ('\s\*?' + [regex]::Escape($name) + '\s*$') } | Select-Object -First 1) -replace '\s.*$', ''
             if ($want -notmatch '^[0-9a-fA-F]{64}$' -or (Get-FileHash $exe -Algorithm SHA256).Hash -ne $want.ToUpperInvariant()) { throw 'fc:File t\u1ea3i v\u1ec1 kh\u00f4ng kh\u1edbp m\u00e3 ki\u1ec3m tra n\u00ean \u0111\u00e3 b\u1ecf|Ch\u1ea1y l\u1ea1i l\u1ec7nh c\u00e0i sau v\u00e0i ph\u00fat. N\u1ebfu v\u1eabn l\u1ed7i: https://instabox.sh/docs/start|' }
             if (-not (Test-Runs $exe)) { throw 'fc:File instabox t\u1ea3i v\u1ec1 kh\u00f4ng ch\u1ea1y \u0111\u01b0\u1ee3c|Ch\u1ea1y l\u1ea1i l\u1ec7nh c\u00e0i sau v\u00e0i ph\u00fat. N\u1ebfu v\u1eabn l\u1ed7i: https://instabox.sh/docs/start|' }
-            Move-Item -LiteralPath $exe -Destination (Join-Path $ibDir 'instabox.exe') -Force
+            try { Move-Item -LiteralPath $exe -Destination (Join-Path $ibDir 'instabox.exe') -Force -ErrorAction Stop }
+            catch { throw ('fc:Kh\u00f4ng ghi \u0111\u00e8 \u0111\u01b0\u1ee3c instabox.exe (c\u00f3 th\u1ec3 instabox \u0111ang ch\u1ea1y \u1edf m\u1ed9t c\u1eeda s\u1ed5 kh\u00e1c)|\u0110\u00f3ng c\u1eeda s\u1ed5 instabox \u0111ang ch\u1ea1y r\u1ed3i ch\u1ea1y l\u1ea1i l\u1ec7nh c\u00e0i|' + $_.Exception.Message) }
         } finally {
             Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
