@@ -65,7 +65,7 @@ Script `install.sh` làm các việc sau, và chạy lại nhiều lần vẫn a
 
 1. Chép `server.mjs` vào `/data/home/fcoding`.
 2. Tạo thư mục cấu hình `/data/home/.fcoding` (quyền 700).
-3. Lần cài đầu: tạo `config.json` với một khóa bí mật ngẫu nhiên và một dự án mẫu là thư mục home.
+3. Lần cài đầu: tạo `config.json` với một khóa bí mật ngẫu nhiên và danh sách dự án **trống** (không có dự án mẫu). Thêm dự án của bạn theo mục "Danh sách dự án" bên dưới.
 4. Cài lệnh `~/.local/bin/fcode-pair` (dùng để lấy mã ghép máy, xem [mục 6](#6-ghép-iphone-với-box)).
 5. Tạo dịch vụ systemd của người dùng tên **`fcoding`**, bật chạy cùng hệ thống, tự chạy lại khi lỗi, rồi khởi động ngay. Cổng mặc định là **7681**.
 
@@ -88,7 +88,7 @@ journalctl --user -u fcoding -n 50
 
 ### Danh sách dự án
 
-Các dự án hiện trong app nằm trong `config.json`, mục `projects`. Mỗi dự án là một tên và một đường dẫn tuyệt đối trên box:
+Các dự án hiện trong app nằm trong `config.json`, mục `projects`. Sau lần cài đầu mục này **trống**, nên nút **+** trong app báo "Chưa có dự án nào trong cấu hình máy chủ" cho tới khi bạn thêm dự án. Cách thêm: sửa `config.json` trên box như dưới đây. Lệnh `fcode add` trên laptop sẽ có ở bản sau. Mỗi dự án là một tên và một đường dẫn tuyệt đối trên box:
 
 ```json
 {
@@ -224,6 +224,7 @@ Muốn dùng lại sau khi bị gỡ thì chạy `fcode-pair` trên box và ghé
 - Gửi xong, ô nhập **tự ẩn lại**. Muốn ẩn bằng tay: chạm nút **⌄** trên ô nhập, hoặc vuốt xuống ở thanh kéo (vạch nhỏ ở đầu ô) hay nền ô nhập.
 - Nút **ghim** trên ô nhập: khi ghim, ô nhập hiện sẵn mỗi lần mở phiên và vẫn ở lại sau khi gửi. Bấm lần nữa để bỏ ghim. App nhớ lựa chọn này.
 - **Màu và biểu tượng**: màn hình hiện đúng màu của chương trình (chữ, nền, đậm, nghiêng, gạch chân), nên dễ phân biệt lỗi, phần thêm/xóa của diff hay mục đang chọn. Các biểu tượng đặc biệt (nhánh git, thư mục…) hiện đúng nhờ font Nerd Font đi kèm app. Tên phiên ở thanh trên nằm trong nhãn màu theo chương trình (claude cam, omp tím, codex xanh).
+- Link trong màn hình được gạch chân; chạm để mở trong trình duyệt. Link dài bị omp cắt xuống dòng thường vẫn mở đúng cả link. Nhấn giữ để chép chữ trên màn hình.
 - Hàng phím nhanh: Esc, **Agents**, Ctrl+C, mũi tên, Tab, ⇧Tab, Enter, y, n, **^O**. Nút `/` chèn các lệnh hay dùng như `/model`, `/clear`. Phím được gửi đúng thứ tự bạn bấm.
 - **Agents** (Alt+A): mở danh sách subagent của omp; trong đó dùng ↑↓ chọn, Enter mở, Esc đóng. **^O** (Ctrl+O) mở rộng nội dung. Hai phím **Agents** và **^O** chỉ hiện trong phiên omp.
 - Khi chuyển sang app khác, kết nối tạm dừng; mở lại là tự kết nối lại.

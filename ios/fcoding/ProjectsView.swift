@@ -72,7 +72,16 @@ struct ProjectsView: View {
             }
             .listStyle(.insetGrouped)
             .navigationTitle("FCode")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .principal) {
+                    // One line; shrinks rather than truncates. "FCode" stays the back-button label.
+                    Text("FCode - EZ Vibecoding")
+                        .font(.headline)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.6)
+                        .accessibilityAddTraits(.isHeader)
+                }
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button { showSettings = true } label: { Image(systemName: "gearshape") }
                         .accessibilityLabel("Cài đặt")

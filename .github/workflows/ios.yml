@@ -27,6 +27,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The app has no test target: build Links.swift for macOS with a tiny main and run its selfTest.
+      - name: Links self-test
+        run: |
+          T=$(mktemp -d)
+          cp ios/fcoding/Links.swift "$T/"
+          cat > "$T/main.swift" <<'EOF'
+          import Foundation
+          let failures = Links.selfTest()
+          for f in failures { print("FAIL \(f)") }
+          print(failures.isEmpty ? "Links self-test: all passed" : "Links self-test: \(failures.count) failed")
+          exit(failures.isEmpty ? 0 : 1)
+          EOF
+          cd "$T"
+          xcrun -sdk macosx swiftc -o linktest Links.swift main.swift
+          ./linktest
+
       - name: Install XcodeGen
         run: brew install xcodegen
 

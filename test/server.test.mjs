@@ -8,7 +8,7 @@ import { spawnSync, execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
-import { createApp, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock } from '../server.mjs';
+import { createApp, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock } from '../server.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const FAKE = path.join(here, 'fake-tmux.mjs');
@@ -813,6 +813,41 @@ test('screen trim is linear: 2000 lines x 300 spaces < 50 ms and correct', () =>
   assert.equal(trimScreen(`a\n${blank}b`), `a\n${blank}b`);
   assert.equal(trimScreen('x\t \n \t\n'), 'x\t ');
   assert.equal(trimScreen(''), '');
+});
+
+test('empty projects: meta, overview and the + flow work with no projects; a fresh install seeds none', () => withApp(async (c) => {
+  setProjects(c, {}); // what a fresh install has
+  const { cookie } = await c.login();
+  assert.deepEqual((await c.req('GET', '/api/meta', { cookie })).json.projects, []);
+  const ov = await c.req('GET', '/api/overview', { cookie });
+  assert.equal(ov.status, 200);
+  assert.deepEqual(ov.json.projects, []);
+  assert.deepEqual(ov.json.sessions, []);
+  for (const project of ['home', 'alpha']) { // nothing to open
+    const o = await c.req('POST', '/api/open', { cookie, body: { project, harness: 'shell' } });
+    assert.deepEqual([o.status, o.json], [400, { error: 'invalid' }], project);
+    const s = await c.req('POST', '/api/sessions', { cookie, body: { name: 'x', project, harness: 'shell' } });
+    assert.deepEqual([s.status, s.json], [400, { error: 'invalid' }], project);
+  }
+  assert.ok(!c.calls().some((x) => x.argv[0] === 'new-session'));
+  setProjects(c, { beta: ABS }); // adding one by editing config.json: picked up without a restart
+  assert.deepEqual((await c.req('GET', '/api/meta', { cookie })).json.projects, ['beta']);
+}));
+
+test('install.sh first-install seed: the config it writes parses and has no projects', () => {
+  // run the real `node -e '...'` snippet from install.sh into a temp file (no bash needed)
+  const install = fs.readFileSync(path.join(here, '..', 'install.sh'), 'utf8');
+  const m = /\(umask 077; node -e '([^']+)' "\$CFG\/config\.json"\)/.exec(install);
+  assert.ok(m, 'seed snippet not found in install.sh');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-seed-'));
+  try {
+    const file = path.join(dir, 'config.json');
+    const r = spawnSync(process.execPath, ['-e', m[1], file], { encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+    const cfg = parseConfig(fs.readFileSync(file, 'utf8'));
+    assert.deepEqual(cfg.projectNames, []);
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).projects, {});
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('malformed config at reload: the previous one stays; a repaired one is picked up', () => withApp(async (c) => {

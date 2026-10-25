@@ -19,7 +19,7 @@ rm -f "$CFG/sessions.json" # older versions stored logins on disk
 # first install: a config with a random cookie secret (devices are paired with fcode-pair, there is no password)
 if [ ! -f "$CFG/config.json" ]; then
   (umask 077; node -e '
-    const c = { cookieSecret: require("crypto").randomBytes(32).toString("base64"), projects: { home: process.env.HOME }, port: 7681 };
+    const c = { cookieSecret: require("crypto").randomBytes(32).toString("base64"), projects: {}, port: 7681 };
     require("fs").writeFileSync(process.argv[1], JSON.stringify(c, null, 2), { mode: 0o600 });' "$CFG/config.json")
 fi
 chmod 600 "$CFG/config.json"
