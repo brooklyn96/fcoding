@@ -1028,14 +1028,47 @@ test('pairing: an expired code is rejected (120 s)', async () => {
   }, { now: () => t });
 });
 
-test('pairing: only one pending at a time; a new --pair replaces it', () => withApp(async (c) => {
-  let a = await adminRequest(c.configDir, { cmd: 'pair', name: 'A' });
-  let b = await adminRequest(c.configDir, { cmd: 'pair', name: 'B' });
-  while (b.code === a.code) b = await adminRequest(c.configDir, { cmd: 'pair', name: 'B' });
-  assert.equal((await pairReq(c, a.code)).status, 401);
-  assert.equal((await pairReq(c, b.code)).status, 200);
-  assert.deepEqual(devicesFile(c).map((d) => d.name), ['B']);
-}));
+test('pairing: up to 3 pending codes (shell and QR), the 4th drops the oldest; each is single use', async () => {
+  await withApp(async (c) => {
+    setPublicUrl(c, PUB);
+    const { cookie } = await c.login();
+    const a = await adminRequest(c.configDir, { cmd: 'pair', name: 'A' });
+    const b = (await mintCode(c, cookie, { name: 'B' })).json; // a code from a device does not cancel the shell code
+    const k = await adminRequest(c.configDir, { cmd: 'pair', name: 'C' });
+    assert.equal(new Set([a.code, b.code, k.code]).size, 3);
+    const d = (await mintCode(c, cookie, { name: 'D' })).json; // the 4th: A (the oldest) is dropped
+    assert.equal((await pairReq(c, a.code)).status, 401);
+    for (const p of [b, k, d]) assert.equal((await pairReq(c, p.code)).status, 200, p.code); // the others still work, once each
+    assert.deepEqual(devicesFile(c).map((x) => x.name), ['test', 'B', 'C', 'D']);
+    for (const p of [b, k, d]) assert.equal((await pairReq(c, p.code)).status, 401);
+  });
+});
+
+test('pairing: each pending code has its own expiry', async () => {
+  let t = 1_700_000_000_000;
+  await withApp(async (c) => {
+    const a = await adminRequest(c.configDir, { cmd: 'pair' });
+    t += 60000;
+    const b = await adminRequest(c.configDir, { cmd: 'pair' });
+    assert.deepEqual([a.expiresAt, b.expiresAt], [1_700_000_000_000 + 120000, 1_700_000_060_000 + 120000]);
+    t += 70000; // A is 130 s old, B 70 s
+    assert.equal((await pairReq(c, a.code)).status, 401);
+    assert.equal((await pairReq(c, b.code)).status, 200);
+  }, { now: () => t });
+});
+
+test('pairing: a wrong guess is one attempt against every live code; five kill a code, a newer one has fewer', async () => {
+  await withApp(async (c) => {
+    const a = await adminRequest(c.configDir, { cmd: 'pair' });
+    const wrong = otherCode(a.code);
+    for (let i = 0; i < 3; i++) assert.equal((await pairReq(c, wrong)).status, 401); // A: 3 attempts
+    let b = await adminRequest(c.configDir, { cmd: 'pair' });
+    while (b.code === wrong) b = await adminRequest(c.configDir, { cmd: 'pair' });
+    for (let i = 0; i < 2; i++) assert.equal((await pairReq(c, wrong)).status, 401); // A: 5 attempts, B: 2
+    assert.equal((await pairReq(c, a.code)).status, 401); // A is gone
+    assert.equal((await pairReq(c, b.code)).status, 200); // B survived
+  });
+});
 
 // ======================= QR pairing: POST /api/pair-code, GET /pair, fcode-pair --qr =======================
 const PUB = 'https://box.example.com';
@@ -1106,12 +1139,12 @@ test('pair-code: expires after 120 s, and five wrong guesses kill it (same store
     for (let i = 0; i < 5; i++) assert.equal((await pairReq(c, otherCode(json.code))).status, 401);
     assert.deepEqual((await pairReq(c, json.code)).json, { error: 'bad_code' });
     assert.equal(devicesFile(c).length, 1); // only the first device
-    // one pending code at a time: a new one (from a device or from the shell) replaces the old
+    // a code from a device and one from the shell are pending together: neither cancels the other
     t += 61000;
     const a = (await mintCode(c, cookie)).json;
-    let b = await adminRequest(c.configDir, { cmd: 'pair' });
-    while (b.code === a.code) b = await adminRequest(c.configDir, { cmd: 'pair' });
-    assert.equal((await pairReq(c, a.code)).status, 401);
+    const b = await adminRequest(c.configDir, { cmd: 'pair' });
+    assert.notEqual(a.code, b.code);
+    assert.equal((await pairReq(c, a.code)).status, 200);
     assert.equal((await pairReq(c, b.code)).status, 200);
   }, { now: () => t });
 });
@@ -1216,6 +1249,7 @@ test('fcode-pair --qr: the code line, the links and one line about qrencode when
   const code = /Mã ghép: (\d{6})/.exec(r.stdout)[1];
   assert.ok(r.stdout.includes(`Link chia sẻ: ${PUB}/pair?code=${code}`), r.stdout);
   assert.ok(r.stdout.includes(`Link mở app: fcode://pair?server=${encodeURIComponent(PUB)}&code=${code}&name=${encodeURIComponent('Máy A')}`), r.stdout);
+  assert.match(r.stdout, /Mã hết hạn sau 2 phút\.\n/);
   assert.match(r.stdout, /cài qrencode để hiện mã QR\n$/);
   // no name: no name in the link
   r = await cliEnv(c, { args: ['--pair', '', '--qr'], env: noQr });

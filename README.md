@@ -171,7 +171,7 @@ FCode không dùng mật khẩu. Chỉ người đang có quyền vào dòng l�
 Lưu ý về mã:
 
 - Mã có hạn **2 phút** và chỉ dùng được **một lần**.
-- Nhập sai 5 lần thì mã bị hủy; chạy lại `fcode-pair` để lấy mã mới (mã mới thay mã cũ).
+- Nhập sai 5 lần thì mã bị hủy; chạy lại `fcode-pair` để lấy mã mới. Có thể có tối đa 3 mã cùng lúc (mã từ lệnh và mã QR không hủy nhau); tạo mã thứ 4 thì mã cũ nhất bị thay.
 - Máy chủ phải đang chạy thì lệnh mới in được mã.
 
 Sau khi ghép, iPhone nhớ box trong Keychain. Mở app là vào thẳng danh sách; box khởi động lại cũng không phải ghép lại.
@@ -192,7 +192,7 @@ Không cần gõ địa chỉ máy chủ: iPhone mới quét mã QR bằng Camer
 
 Từ một iPhone đã ghép, vào **Cài đặt → Thêm thiết bị (mã QR)** trong app cũng tạo được mã như vậy (máy chủ cần có `publicUrl`).
 
-Mã vẫn là mã ghép thường: dùng một lần, hết hạn sau 2 phút, nhập sai 5 lần thì hủy, mã mới thay mã cũ. Mở trang `/pair` không làm mất mã và không cho biết mã còn đúng hay không. Trong mã QR và link chỉ có địa chỉ máy chủ, mã 6 số và tên gợi ý, không có khóa hay mã thiết bị.
+Mã vẫn là mã ghép thường: dùng một lần, hết hạn sau 2 phút, nhập sai 5 lần thì hủy. Mã QR và mã từ `fcode-pair` cùng tồn tại được (tối đa 3 mã, mã thứ 4 thay mã cũ nhất). Mở trang `/pair` không làm mất mã và không cho biết mã còn đúng hay không. Trong mã QR và link chỉ có địa chỉ máy chủ, mã 6 số và tên gợi ý, không có khóa hay mã thiết bị.
 
 ### Xem và gỡ thiết bị
 

@@ -87,7 +87,7 @@ cat <<MSG
 fcoding installed and running (port 7681).
 Pair a phone (no password): run on the box
   fcode-pair "iPhone"
-and type the 6-digit code into the app within 120 s. Running it again replaces the code.
+and type the 6-digit code into the app within 120 s. Up to 3 codes can be pending at once (shell and QR codes); a 4th replaces the oldest.
   fcode-pair "iPhone" --qr     (also prints the links and a QR code; needs "publicUrl" in config.json, and qrencode for the QR)
 Paired devices:   PC_CONFIG_DIR=$CFG node $APP/server.mjs --devices
 Revoke a device:  PC_CONFIG_DIR=$CFG node $APP/server.mjs --revoke <id>     (or --revoke all)

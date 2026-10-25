@@ -18,7 +18,7 @@ const COOKIE_MAX_AGE = 30 * 24 * 3600;
 const BODY_LIMIT = 64 * 1024;
 const TEXT_LIMIT = 32 * 1024;
 const LONG_TEXT = 500; // bytes; longer single lines are pasted, not typed
-const PAIR_TTL = 120 * 1000, PAIR_ATTEMPTS = 5;
+const PAIR_TTL = 120 * 1000, PAIR_ATTEMPTS = 5, PAIR_PENDING = 3;
 const PAIR_PER_MINUTE = 10, PAIR_MINUTE = 60 * 1000, PAIR_PER_HOUR = 30, PAIR_HOUR = 3600 * 1000;
 const MAX_STREAMS = 50;
 const MAX_WAITING = 20; // mutation jobs waiting behind the active one
@@ -332,8 +332,9 @@ export function createApp(opts = {}) {
   }
   const gateErr = (ctx) => (ctx.cancelled ? new HttpErr(499, 'cancelled') : new HttpErr(401, 'unauthorized'));
 
-  // --- pairing: one pending 6-digit code, 120 s, 5 wrong attempts; /api/pair limited to 10/min and 30/h ---
-  let pending = null; // {code, name, expiresAt, attempts}
+  // --- pairing: up to 3 pending 6-digit codes (a shell code and QR codes do not cancel each other), each 120 s and single use,
+  // 5 wrong attempts while it is live; /api/pair limited to 10/min and 30/h ---
+  let pendings = []; // oldest first: {code, name, expiresAt, attempts}
   const pairHits = [];
   function pairLimited(t) {
     while (pairHits.length && pairHits[0] <= t - PAIR_HOUR) pairHits.shift();
@@ -344,16 +345,18 @@ export function createApp(opts = {}) {
     return 0;
   }
   // constant-time: the comparison never depends on where the digits differ
-  const codeMatches = (code) => typeof code === 'string' && /^\d{6}$/.test(code) && crypto.timingSafeEqual(Buffer.from(code), Buffer.from(pending.code));
+  const codeMatches = (code, p) => typeof code === 'string' && /^\d{6}$/.test(code) && crypto.timingSafeEqual(Buffer.from(code), Buffer.from(p.code));
   function pair(code, name) {
     const t = now();
-    if (!pending || t >= pending.expiresAt) { pending = null; throw new HttpErr(401, 'bad_code'); }
-    if (!codeMatches(code)) {
-      if (++pending.attempts >= PAIR_ATTEMPTS) pending = null;
+    pendings = pendings.filter((p) => t < p.expiresAt);
+    const hits = pendings.map((p) => codeMatches(code, p)); // every live code is compared, none is skipped
+    const i = hits.indexOf(true);
+    if (i < 0) { // a wrong guess is one attempt against every live code; a code with 5 is gone
+      pendings = pendings.filter((p) => ++p.attempts < PAIR_ATTEMPTS);
       throw new HttpErr(401, 'bad_code');
     }
-    const devName = pending.name || cleanName(name) || 'device';
-    pending = null; // single use, even if the write below fails
+    const [used] = pendings.splice(i, 1); // single use, even if the write below fails
+    const devName = used.name || cleanName(name) || 'device';
     refreshConfig();
     if (purgePending) throw new HttpErr(500, 'storage');
     const token = crypto.randomBytes(32).toString('base64url');
@@ -364,10 +367,16 @@ export function createApp(opts = {}) {
   function revoke(ids) { // throws on a failed write; nothing changes then
     commitDevices([...devices.values()].filter((d) => !ids.includes(d.id)));
   }
-  // the one pending code (a new one replaces the old); used by the shell command and by POST /api/pair-code
+  // a new pending code (3 at most: the oldest goes when a 4th is made); used by the shell command and by POST /api/pair-code
   function newPairing(name) {
-    pending = { code: String(crypto.randomInt(0, 1e6)).padStart(6, '0'), name: cleanName(name), expiresAt: now() + PAIR_TTL, attempts: 0 };
-    return pending;
+    const t = now();
+    pendings = pendings.filter((p) => t < p.expiresAt);
+    let code;
+    do code = String(crypto.randomInt(0, 1e6)).padStart(6, '0'); while (pendings.some((p) => p.code === code)); // codes of live pairings differ
+    const p = { code, name: cleanName(name), expiresAt: t + PAIR_TTL, attempts: 0 };
+    pendings.push(p);
+    while (pendings.length > PAIR_PENDING) pendings.shift();
+    return p;
   }
   // {appLink, shareLink} from cfg.publicUrl only; null when it is not configured. The code is 6 digits, the name is encoded.
   function pairLinks(code, name) {
@@ -923,11 +932,11 @@ export function createApp(opts = {}) {
 
 // ---------- CLI ----------
 // fcode-pair --qr: the QR of the app link (qrencode, when installed) and the links; the code line is printed before this
-function printQr(links) {
+function printQr(links, expiresIn) {
   if (!links) return console.log('Chưa đặt "publicUrl" trong config.json nên chưa tạo được link/mã QR. Ví dụ: "publicUrl": "https://<địa-chỉ-công-khai>"');
   let shown = false;
   try { process.stdout.write(execFileSync('qrencode', ['-t', 'ANSIUTF8', links.appLink], { encoding: 'utf8', timeout: 5000, windowsHide: true })); shown = true; } catch {}
-  console.log(`Link chia sẻ: ${links.shareLink}`);
+  console.log(`Link chia sẻ: ${links.shareLink}\nMã hết hạn sau ${Math.round(expiresIn / 60)} phút.`);
   if (!shown) console.log(`Link mở app: ${links.appLink}\ncài qrencode để hiện mã QR`);
 }
 async function main() {
@@ -942,8 +951,8 @@ async function main() {
     try { r = await adminRequest(dir, req); } catch (e) { console.error(e.code === 'ENOSERVER' ? `${e.message} (no ${adminPath(dir)})` : `admin socket: ${e.message}`); process.exit(1); }
     if (!r.ok) { console.error(`error: ${r.error}`); process.exit(1); }
     if (req.cmd === 'pair') {
-      console.log(`Mã ghép: ${r.code} (hết hạn sau ${r.expiresIn} giây)\nNhập mã này vào app. Chạy lại lệnh sẽ thay mã cũ.`);
-      if (qr) printQr(r.links);
+      console.log(`Mã ghép: ${r.code} (hết hạn sau ${r.expiresIn} giây)\nNhập mã này vào app. Có thể có tối đa 3 mã cùng lúc; mã thứ 4 thay mã cũ nhất.`);
+      if (qr) printQr(r.links, r.expiresIn);
     }
     else if (req.cmd === 'devices') {
       if (!r.devices.length) console.log('(no paired devices)');
