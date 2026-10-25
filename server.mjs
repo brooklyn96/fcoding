@@ -665,34 +665,40 @@ function execTool(spec, args, timeout) {
 // runs in the background. With no value yet, or after clear(), the refresh is waited for at most `wait` ms; then the old value
 // (fresh: false) or, with none, a throw, and the refresh carries on. fresh is false while the last refresh failed. A failed
 // refresh is retried only `retry` ms later, not on every poll. clear() also drops a refresh started before it (its result is old).
+// Every answer carries `at`, when the refresh behind the value started; fresh is never true for a refresh that clear() dropped.
 export function memo(ttl, fn, now, retry = ttl, ttlOf = () => undefined) {
   let value, vttl = ttl, at = -Infinity, failedAt = -Infinity, ok = true, cleared = false, pending = null, gen = 0;
   const refresh = () => {
     if (pending) return pending;
     const g = gen, started = now(); // the value is as old as the moment its refresh started
-    const p = Promise.resolve().then(fn).then((v) => { if (g === gen) { value = v; vttl = ttlOf(v) ?? ttl; at = started; ok = true; cleared = false; } return v; },
+    const p = Promise.resolve().then(fn).then((v) => {
+      const kept = g === gen;
+      if (kept) { value = v; vttl = ttlOf(v) ?? ttl; at = started; ok = true; cleared = false; }
+      return { v, kept, started };
+    },
       (e) => { if (g === gen) { failedAt = now(); ok = false; } throw e; });
     pending = p;
     p.catch(() => {}).finally(() => { if (pending === p) pending = null; });
     return p;
   };
-  const old = (e) => { if (value === undefined) throw e; return { value, fresh: false }; };
+  const old = (e) => { if (value === undefined) throw e; return { value, fresh: false, at }; };
   return {
     async get(wait = Infinity) {
       const t = now();
-      if (value !== undefined && t - at < vttl) return { value, fresh: ok };
+      if (value !== undefined && t - at < vttl) return { value, fresh: ok, at };
       const backoff = t - failedAt < retry;
-      if (value !== undefined && !cleared) { if (!backoff) refresh(); return { value, fresh: ok && !backoff }; }
+      if (value !== undefined && !cleared) { if (!backoff) refresh(); return { value, fresh: ok && !backoff, at }; }
       if (backoff) return old(new Error('failed recently'));
       const p = refresh();
       let timer;
       try {
-        const v = await (Number.isFinite(wait) ? Promise.race([p, new Promise((_, rej) => { timer = setTimeout(rej, wait, new Error('timeout')); })]) : p);
-        return { value: v, fresh: true };
+        const r = await (Number.isFinite(wait) ? Promise.race([p, new Promise((_, rej) => { timer = setTimeout(rej, wait, new Error('timeout')); })]) : p);
+        return { value: r.v, fresh: r.kept, at: r.started };
       } catch (e) { return old(e); } finally { clearTimeout(timer); }
     },
     clear() { at = -Infinity; failedAt = -Infinity; cleared = true; gen++; pending = null; },
     settled: () => Promise.resolve(pending).catch(() => {}), // the refresh running now, if any, has ended
+    at: () => at, // when the stored value's refresh started (-Infinity: none)
   };
 }
 
@@ -1097,18 +1103,19 @@ export function createApp(opts = {}) {
   const homeWait = opts.homeWaitMs ?? HOME_WAIT_MS, resetReplyMs = opts.resetReplyMs ?? RESET_REPLY_MS, resetTimeout = opts.resetTimeoutMs ?? RESET_TIMEOUT;
   // `omp usage reset --json` (credential ids, reset counts) on its own longer TTL; the last good listing is kept on a failure
   const listing = memo(LISTING_TTL, async () => JSON.parse(await execTool(ompSpec, ['usage', 'reset', '--json'], 30e3)), now, QUOTA_TTL);
-  // After a reset (listingCleared) the reset counts must come from a new listing: the quota refresh then waits for it up to
-  // LIST_AFTER_RESET_MS (omp's own listing timeout), not homeWait / 2. If it still is not there (slow or failed), the accounts are
+  // After a reset the reset counts must come from a listing fetched after it: a kept listing whose refresh started at or after
+  // lastResetAt. While the stored listing is older than the last reset, a quota refresh waits up to LIST_AFTER_RESET_MS (omp's own
+  // listing timeout) for one, not homeWait / 2. Without one (slow, failed, or a refresh dropped by a later reset) the accounts are
   // stored with stale: true and the quota value only for STALE_QUOTA_TTL, so the next request reads both again.
-  let listingCleared = false;
+  let lastResetAt = -Infinity;
   const quota = memo(QUOTA_TTL, async () => {
-    const afterReset = listingCleared;
-    const [u, r] = await Promise.allSettled([execTool(ompSpec, ['usage', '--json'], 30e3), listing.get(afterReset ? listAfterReset : homeWait / 2)]);
+    const resetAt = lastResetAt;
+    const needNew = listing.at() < resetAt;
+    const [u, r] = await Promise.allSettled([execTool(ompSpec, ['usage', '--json'], 30e3), listing.get(needNew ? listAfterReset : homeWait / 2)]);
     if (u.status === 'rejected') throw u.reason;
-    const fresh = r.status === 'fulfilled' && r.value.fresh;
-    if (fresh) listingCleared = false;
     const q = parseQuota(JSON.parse(u.value), r.status === 'fulfilled' ? r.value.value : null, now());
-    if (afterReset && !fresh) { for (const a of q.accounts) a.stale = true; q.ttl = STALE_QUOTA_TTL; }
+    const trusted = r.status === 'fulfilled' && r.value.fresh && r.value.at >= resetAt;
+    if (resetAt > -Infinity && !trusted) { for (const a of q.accounts) a.stale = true; q.ttl = STALE_QUOTA_TTL; }
     return q;
   }, now, QUOTA_TTL, (q) => q.ttl);
   const scan = spendScanner(spendRoots, now);
@@ -1206,7 +1213,7 @@ export function createApp(opts = {}) {
       }
       log(`codex-reset ${accountId} ${reply.result}`); // the account id and the result only
       if (RESET_FINAL.includes(reply.result)) resetDone.set(doneKey, { at: now(), reply });
-      listing.clear(); listingCleared = true; quota.clear(); // whatever omp answered, the next GET /api/home reads the counts again
+      lastResetAt = now(); listing.clear(); quota.clear(); // whatever omp answered, the next GET /api/home reads the counts again
       return reply;
     })();
     resetJobs.set(accountId, { requestId, promise: job });

@@ -2761,43 +2761,59 @@ test('spend days: calendar days of config timeZone (default Asia/Ho_Chi_Minh), n
 
 test('memo: stale-while-revalidate, bounded first wait, backoff after a failure, clear() drops an older refresh', async () => {
   let t = 0, n = 0, gate;
+  const get = async (mm, w) => { const { value, fresh } = await mm.get(w); return { value, fresh }; }; // at: checked below
   const calls = [];
   const m = memo(100, () => { calls.push(++n); return new Promise((r, j) => { gate = { r, j }; }); }, () => t);
   // the first value: waited for at most `wait`, then the refresh carries on
-  await assert.rejects(m.get(30), /timeout/);
+  await assert.rejects(get(m, 30), /timeout/);
   gate.r('v1');
-  assert.deepEqual(await m.get(30), { value: 'v1', fresh: true });
+  assert.deepEqual(await get(m, 30), { value: 'v1', fresh: true });
   // past the TTL: the old value at once, one refresh in the background
   t = 150;
-  assert.deepEqual(await m.get(30), { value: 'v1', fresh: true });
-  assert.deepEqual(await m.get(30), { value: 'v1', fresh: true });
+  assert.deepEqual(await get(m, 30), { value: 'v1', fresh: true });
+  assert.deepEqual(await get(m, 30), { value: 'v1', fresh: true });
   assert.equal(calls.length, 2);
   gate.j(new Error('down'));
   await new Promise((r) => setImmediate(r));
-  assert.deepEqual(await m.get(30), { value: 'v1', fresh: false }); // the refresh failed: stale, and no new refresh before a TTL
+  assert.deepEqual(await get(m, 30), { value: 'v1', fresh: false }); // the refresh failed: stale, and no new refresh before a TTL
   assert.equal(calls.length, 2);
   t = 260;
-  await m.get(30); // a TTL after the failure: retried
+  await get(m, 30); // a TTL after the failure: retried
   await new Promise((r) => setImmediate(r));
   assert.equal(calls.length, 3);
   const old = gate;
   m.clear(); // e.g. a reset finished while this refresh ran: its (pre-reset) result must not be kept
-  const next = m.get(1000);
+  const next = get(m, 1000);
   await new Promise((r) => setImmediate(r));
   assert.equal(calls.length, 4);
   old.r('pre-reset');
   gate.r('post-reset');
   assert.deepEqual(await next, { value: 'post-reset', fresh: true }); // after clear(): waited for, not the old value
-  assert.deepEqual(await m.get(30), { value: 'post-reset', fresh: true });
+  assert.deepEqual(await get(m, 30), { value: 'post-reset', fresh: true });
   // after clear(), a refresh slower than the wait: the old value, marked not fresh
   m.clear();
-  assert.deepEqual(await m.get(20), { value: 'post-reset', fresh: false });
+  assert.deepEqual(await get(m, 20), { value: 'post-reset', fresh: false });
   gate.r('later');
+  // a refresh dropped by clear() is not fresh for whoever waited on it, and every answer says when its refresh started
+  const d = memo(100, () => new Promise((r) => { gate = r; }), () => t);
+  t = 1000;
+  const waiting = d.get(1000);
+  await new Promise((r) => setImmediate(r));
+  d.clear();
+  gate('pre-clear');
+  assert.deepEqual(await waiting, { value: 'pre-clear', fresh: false, at: 1000 });
+  assert.equal(d.at(), -Infinity); // not stored
+  t = 1010;
+  const next2 = d.get(1000);
+  await new Promise((r) => setImmediate(r));
+  gate('post-clear');
+  assert.deepEqual(await next2, { value: 'post-clear', fresh: true, at: 1010 });
+  assert.deepEqual(await d.get(10), { value: 'post-clear', fresh: true, at: 1010 });
   // a first refresh that failed: no new run for a TTL, the part is empty
   let k = 0;
   const f = memo(100, () => { k++; throw new Error('no'); }, () => t);
-  await assert.rejects(f.get(30), /no/);
-  await assert.rejects(f.get(30), /failed recently/);
+  await assert.rejects(get(f, 30), /no/);
+  await assert.rejects(get(f, 30), /failed recently/);
   assert.equal(k, 1);
 });
 
@@ -3035,11 +3051,13 @@ test('POST /api/codex-reset: errors are not kept (a retry runs omp again); a kil
 
 test('after a reset the quota waits for the new listing; a listing that is late or fails marks the accounts stale, briefly cached', () => homeApp(async (c) => {
   const body = { accountId: 'openai-codex/4', requestId: '0f8f7a6e-1111-4222-8333-000000000099' };
+  await c.homeUntil((h) => h.accounts[3]?.resets.target); // warm: the first listing has landed (a cold spawn can take longer than homeWait)
+  await c.app.homeIdle();
   assert.equal((await c.home()).accounts[3].resets.available, 1);
   const spent = JSON.parse(fs.readFileSync(FIX('omp-reset-list.json'), 'utf8'));
   for (const a of spent.accounts) if (a.provider === 'openai-codex') { a.redeemableCount = 0; a.availableCount = 0; }
   // the listing after the reset is slower than homeWait / 2 (and than homeWait) but within the post-reset wait
-  c.setRules([['usage reset --json', { stdout: JSON.stringify(spent), delay: 700 }], ...baseRules()]);
+  c.setRules([['usage reset --json', { stdout: JSON.stringify(spent), delay: 1500 }], ...baseRules()]);
   assert.equal((await c.reset(body)).json.result, 'reset');
   let cx = (await c.home()).accounts[3];
   assert.deepEqual([cx.resets.available, cx.stale], [1, true]); // not ready within homeWait: the old count, marked stale
@@ -3058,7 +3076,34 @@ test('after a reset the quota waits for the new listing; a listing that is late 
   c.clock.t += 61e3; // the listing's retry delay after its failure is over
   cx = (await c.homeUntil((h) => !h.accounts[3].stale && h.accounts[3].resets.available === 0)).accounts[3];
   assert.deepEqual([cx.resets.available, cx.stale], [0, false]);
-}, { homeWaitMs: 400, listAfterResetMs: 4000 }));
+}, { homeWaitMs: 600, listAfterResetMs: 8000 }));
+
+test('two resets close together: a listing fetched before the second reset never gives its count as fresh', () => homeApp(async (c) => {
+  const id = (n) => `0f8f7a6e-1111-4222-8333-0000000001${n}0`;
+  await c.homeUntil((h) => h.accounts[3]?.resets.target);
+  await c.app.homeIdle();
+  const spent = JSON.parse(fs.readFileSync(FIX('omp-reset-list.json'), 'utf8'));
+  for (const a of spent.accounts) if (a.provider === 'openai-codex') { a.redeemableCount = 0; a.availableCount = 0; }
+  // reset A; the refresh after it waits for listing L1, which is slow and still says 1 (it predates reset B)
+  c.setRules([['usage reset --json', { file: FIX('omp-reset-list.json'), delay: 3000 }], ...baseRules()]); // lands well after reset B
+  assert.equal((await c.reset({ accountId: 'openai-codex/4', requestId: id(1) })).json.result, 'reset');
+  c.clock.t += 1000;
+  const h1 = await c.home(); // Q1 starts and waits for L1
+  assert.equal(h1.accounts[3].stale, true);
+  c.clock.t += 1000;
+  // reset B ends while L1 is still running; after it the listing says 0, slowly (longer than homeWait)
+  c.setRules([['usage reset --json', { stdout: JSON.stringify(spent), delay: 1500 }], ...baseRules()]);
+  assert.equal((await c.reset({ accountId: 'openai-codex/4', requestId: id(2) })).json.result, 'reset');
+  await new Promise((res) => setTimeout(res, 4000)); // L1 lands (its refresh was dropped by reset B) before the next poll
+  // until the new listing lands every reply is stale or says 0; the old count 1 is never given as current
+  const seen = [];
+  const h = await waitFor(async () => { const x = await c.home(); const a = x.accounts[3]; seen.push([a.resets.available, a.stale]); return !a.stale && x; });
+  assert.equal(h.accounts[3].resets.available, 0);
+  assert.ok(!seen.some(([n, stale]) => n === 1 && !stale), JSON.stringify(seen));
+  await c.app.homeIdle();
+  c.clock.t += 20e3; // also later: the fresh 0 stays (no old count stored for 60 s)
+  assert.deepEqual([(await c.home()).accounts[3].resets.available], [0]);
+}, { homeWaitMs: 600, listAfterResetMs: 8000 }));
 
 test('box timer: kept across a server restart within 90 s of the last tick on the same boot (box-timer.json); a longer gap or a reboot is a new run', async () => {
   const clock = { t: T0 };
