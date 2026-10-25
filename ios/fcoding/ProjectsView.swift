@@ -316,11 +316,12 @@ struct ProjectsView: View {
             let branch = info?.branch ?? model.overview?.projects.first { $0.name == id }?.branch
             let checks = HomeLogic.checksLine(prs, branch: branch)
             let deploy = HomeLogic.deployLine(info?.lastRun, now: home.serverNow())
+            let reading = info?.loading == true
             lines = [
-                ProjectLine(text: prs.map { $0.isEmpty ? Text("không có PR mở") : Text("**\($0.count)** PR đang mở") }
-                                ?? Text("PR: chưa xem được")),
+                ProjectLine(text: Text(LocalizedStringKey(HomeLogic.prLine(info)))),
                 ProjectLine(text: Text(checks.text.isEmpty ? " " : checks.text), color: checks.tone.color),
-                ProjectLine(text: Text(deploy.text), color: deploy.tone.color),
+                // Before the first gh read there is no deploy to report yet.
+                ProjectLine(text: Text(reading ? " " : deploy.text), color: deploy.tone.color),
             ]
         }
         return ProjectCard(title: id == "all" ? "Tất cả" : id, count: waiting > 0 ? waiting : inP.count,

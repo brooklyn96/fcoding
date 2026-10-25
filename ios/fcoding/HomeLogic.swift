@@ -236,8 +236,10 @@ struct HomeProject: Decodable {
     /// nil = the server could not read them (gh failed).
     var prs: [HomePR]?
     var lastRun: HomeRun?
+    /// Placeholder before the server's first gh read (not a failure).
+    var loading = false
 
-    private enum K: String, CodingKey { case name, branch, prs, lastRun }
+    private enum K: String, CodingKey { case name, branch, prs, lastRun, loading }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: K.self)
         name = c.value(.name) ?? ""
@@ -245,6 +247,7 @@ struct HomeProject: Decodable {
         let list: [HomePR] = c.list(.prs)
         prs = c.contains(.prs) && !((try? c.decodeNil(forKey: .prs)) ?? true) ? list : nil
         lastRun = c.value(.lastRun)
+        loading = c.value(.loading) ?? false
     }
 }
 
@@ -493,6 +496,14 @@ enum HomeLogic {
         }
     }
 
+    /// First line of a project card (markdown bold for the count).
+    static func prLine(_ p: HomeProject?) -> String {
+        guard let p = p else { return "PR: chưa tải được" }
+        if p.loading { return "đang đọc…" }
+        guard let prs = p.prs else { return "chưa đọc được GitHub" }
+        return prs.isEmpty ? "không có PR mở" : "**\(prs.count)** PR đang mở"
+    }
+
     /// Second line of a project card: the worst PR checks result.
     static func checksLine(_ prs: [HomePR]?, branch: String?) -> (text: String, tone: Tone) {
         let checks = (prs ?? []).map(\.checks)
@@ -584,7 +595,7 @@ enum HomeLogic {
         let msg = reply.message?.trimmingCharacters(in: .whitespaces).isEmpty == false ? reply.message! : nil
         switch reply.result {
         case "reset", "already": return CodexOutcome(done: true, text: msg ?? "Đã reset")
-        case "pending": return CodexOutcome(text: "Đang reset… kết quả sẽ hiện trong Hạn mức.", reload: [5, 20], info: true)
+        case "pending": return CodexOutcome(text: "Đang reset… kết quả sẽ hiện trong Hạn mức.", reload: [5, 20, 35, 50], info: true)
         case "nothing_to_reset": return CodexOutcome(text: msg ?? "Chưa cần reset: hạn mức vẫn còn")
         case "no_credit": return CodexOutcome(text: msg ?? "Không reset được: chưa có lượt reset")
         default: return CodexOutcome(canRetry: true, text: msg ?? "Không reset được, thử lại")
@@ -600,14 +611,32 @@ enum HomeLogic {
                                 info: true)
         }
         if status == 400 && code == "not_allowed" { return CodexOutcome(text: "Tài khoản này không reset được trong app.") }
+        if status == 409 && code == "no_target" { return CodexOutcome(text: "Tài khoản này không có lượt reset.", reload: [0]) }
+        if status == 503 && code == "unavailable" {
+            return CodexOutcome(canRetry: true, text: "omp chưa sẵn sàng trên box. Thử lại sau ít phút.")
+        }
+        // A server that lists accounts has the route: this 404 means the account changed.
+        if status == 404 && code == "unknown_account" {
+            return CodexOutcome(text: "Không tìm thấy tài khoản này. Kéo xuống để tải lại.", reload: [0])
+        }
         if [404, 405, 501].contains(status) { return CodexOutcome(text: "Máy chủ chưa hỗ trợ, cập nhật máy chủ trước.") }
         return nil
     }
 
     /// Rename refused with 409 reserved_name (CONTRACT A8): the new name is `<project>-<harness>`,
     /// the name a project's "open" reuses.
-    static func reservedNameMessage(_ name: String, projects: [String], harnesses: [String] = ["omp", "claude", "codex"]) -> String {
-        for p in projects { for h in harnesses where name == p + "-" + h {
+    /// The server's openName(project, harness), exactly: lowercased, every run of other
+    /// characters than a-z 0-9 "-" made one "-", leading "-" removed, cut to 32.
+    static func openName(_ project: String, _ harness: String) -> String {
+        let s = (project + "-" + harness).lowercased()
+            .replacingOccurrences(of: "[^a-z0-9-]+", with: "-", options: .regularExpression)
+            .replacingOccurrences(of: "^-+", with: "", options: .regularExpression)
+        return String(s.prefix(32))
+    }
+
+    static func reservedNameMessage(_ name: String, projects: [String],
+                                    harnesses: [String] = ["omp", "claude", "codex", "shell"]) -> String {
+        for p in projects { for h in harnesses where name == openName(p, h) {
             return "Tên này dành cho phiên \(p) · \(h) mở từ dự án. Chọn tên khác."
         } }
         for h in harnesses where name.hasSuffix("-" + h) && name.count > h.count + 1 {
@@ -752,7 +781,7 @@ enum HomeLogic {
         {"box":{"state":"running","sleepsAt":"2027-01-15T10:00:00.000Z","maxRunMinutes":480},
          "accounts":[{"id":"x","harness":"Codex","email":"e@x","windows":[{"key":"5h","label":"5 giờ","usedPercent":18,"resetsAt":"2027-01-15T09:00:00Z","periodSeconds":18000},{"key":"7d","label":"7 ngày","usedPercent":null}],"resets":{"available":1},"spend":{"today":{"usd":3.1,"tokens":8200000},"daily30":[{"date":"2027-01-02","usd":1,"tokens":2},{"date":"2027-01-01","usd":1,"tokens":1}]}},
                      {"harness":5}],
-         "projects":[{"name":"deal-sync","prs":null,"lastRun":null},{"name":"b","prs":[{"number":6,"checks":"failure"}]}],
+         "projects":[{"name":"deal-sync","prs":null,"lastRun":null},{"name":"c","repo":null,"branch":null,"prs":null,"lastRun":null,"loading":true},{"name":"b","prs":[{"number":6,"checks":"failure"}]}],
          "totals":"broken"}
         """
         if let h = try? JSONDecoder().decode(HomeData.self, from: Data(json.utf8)) {
@@ -763,6 +792,9 @@ enum HomeLogic {
             eq("decode daily sorted", h.accounts.first?.spend?.daily30.map(\.tokens), [1, 2])
             eq("decode bad totals", h.totals == nil, true)
             eq("decode prs null", h.projects.first?.prs == nil, true)
+            eq("pr line failed", prLine(h.projects.first), "chưa đọc được GitHub")
+            eq("pr line count", prLine(h.projects.last), "**1** PR đang mở")
+            eq("pr line loading", prLine(h.projects.dropFirst().first), "đang đọc…")
             eq("decode checks", checksLine(h.projects.last?.prs, branch: nil).text, "✗ checks PR lỗi")
             eq("decode sleeps", h.box?.sleepsAt, now.addingTimeInterval(2 * hr))
         } else {
@@ -781,7 +813,7 @@ enum HomeLogic {
         eq("codex error retry", codexOutcome(reply("error")).canRetry, true)
         eq("codex message", codexOutcome(reply("error", "Mở codex trên box")).text, "Mở codex trên box")
         eq("codex pending", codexOutcome(reply("pending")),
-           CodexOutcome(text: "Đang reset… kết quả sẽ hiện trong Hạn mức.", reload: [5, 20], info: true))
+           CodexOutcome(text: "Đang reset… kết quả sẽ hiện trong Hạn mức.", reload: [5, 20, 35, 50], info: true))
         eq("codex done no reload", codexOutcome(reply("reset")).reload, [])
         eq("codex 409 in_progress final", codexFailure(status: 409, code: "in_progress", timedOut: false),
            CodexOutcome(text: "Một lượt reset khác đang chạy cho tài khoản này. Xem lại Hạn mức sau ít giây.", reload: [0], info: true))
@@ -794,6 +826,19 @@ enum HomeLogic {
            "Tên này dành cho phiên web · omp mở từ dự án. Chọn tên khác.")
         eq("reserved name no harness", reservedNameMessage("x", projects: []),
            "Tên này dành cho một phiên mở từ dự án. Chọn tên khác.")
+        eq("open name", openName("My_App", "codex"), "my-app-codex")
+        eq("open name lead", openName("__x  y", "omp"), "x-y-omp")
+        eq("open name cut", openName(String(repeating: "a", count: 30), "claude"), String(repeating: "a", count: 30) + "-c")
+        eq("reserved My_App", reservedNameMessage("my-app-codex", projects: ["My_App"]),
+           "Tên này dành cho phiên My_App · codex mở từ dự án. Chọn tên khác.")
+        eq("codex no_target", codexFailure(status: 409, code: "no_target", timedOut: false),
+           CodexOutcome(text: "Tài khoản này không có lượt reset.", reload: [0]))
+        eq("codex unavailable", codexFailure(status: 503, code: "unavailable", timedOut: false),
+           CodexOutcome(canRetry: true, text: "omp chưa sẵn sàng trên box. Thử lại sau ít phút."))
+        eq("codex unknown_account", codexFailure(status: 404, code: "unknown_account", timedOut: false),
+           CodexOutcome(text: "Không tìm thấy tài khoản này. Kéo xuống để tải lại.", reload: [0]))
+        eq("codex 404 not_found old server", codexFailure(status: 404, code: "not_found", timedOut: false)?.text,
+           "Máy chủ chưa hỗ trợ, cập nhật máy chủ trước.")
         eq("codex not allowed", codexFailure(status: 400, code: "not_allowed", timedOut: false)?.canRetry, false)
         eq("codex old server", codexFailure(status: 405, code: "method", timedOut: false)?.canRetry, false)
         eq("codex other 409 retry", codexFailure(status: 409, code: "exists", timedOut: false) == nil, true)
