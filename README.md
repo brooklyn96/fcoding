@@ -45,7 +45,7 @@ Các phiên tmux: omp / claude / codex / shell
 ```
 
 - `server.mjs` là một file Node.js duy nhất, chỉ dùng thư viện có sẵn của Node 22. Không có gói ngoài, không có cơ sở dữ liệu.
-- Máy chủ chỉ gọi lệnh `tmux` (và `git` ở chế độ chỉ đọc để hiện nhánh và số dòng thay đổi). Nó không tự kết nối ra internet.
+- Máy chủ gọi lệnh `tmux` (và `git` ở chế độ chỉ đọc để hiện nhánh và số dòng thay đổi). Cho màn hình chính nó còn gọi `omp usage` (hạn mức) và `gh` (pull request, lần chạy CI); chính hai lệnh này kết nối ra internet, máy chủ thì không. Nó không bao giờ đọc file đăng nhập của omp, Claude hay Codex.
 - Dữ liệu chỉ đi giữa box và điện thoại của bạn, qua đường HTTPS của instabox. FCode không có máy chủ riêng, không gửi thống kê đi đâu.
 - Lưu ý: bản thân omp, Claude Code, Codex vẫn nói chuyện với dịch vụ AI của chúng như khi bạn chạy chúng ở bất kỳ nơi nào khác. FCode không can thiệp vào việc đó.
 
@@ -104,6 +104,24 @@ Các dự án hiện trong app nằm trong `config.json`, mục `projects`. Sau 
 - Tên dự án nên gồm chữ thường, số và dấu gạch ngang (tên này được dùng để đặt tên phiên, ví dụ `web-claude`).
 - Máy chủ tự đọc lại file sau khi bạn lưu, không cần khởi động lại (riêng `port` chỉ có tác dụng sau khi khởi động lại dịch vụ). Nếu file bị lỗi cú pháp, máy chủ giữ cấu hình cũ cho tới khi bạn sửa đúng.
 - Mỗi phiên mới chạy trong thư mục của dự án đã chọn.
+
+### Màn hình chính: hạn mức, chi phí, dự án
+
+Màn hình chính của app lấy mọi thứ từ một địa chỉ của máy chủ (`GET /api/home`). Máy chủ gom dữ liệu như sau:
+
+| Phần | Lấy từ đâu | Làm mới |
+|---|---|---|
+| Hạn mức Claude / Codex | `omp usage --json` (omp đã đăng nhập các tài khoản) | mỗi 60 giây |
+| Chi phí và số token | file nhật ký trên box: `~/.omp/agent/sessions`, `~/.claude/projects`, `~/.codex/sessions` | mỗi 5 phút, chỉ đọc phần mới thêm |
+| Pull request, CI | `gh` theo kho GitHub của từng dự án trong `config.json` | mỗi 2 phút |
+| Phiên bản công cụ | `~/.local/state/fcode-update/status.json` (omp, claude, codex) | mỗi lần mở |
+| Giờ box ngủ | ước tính: lần box thức dậy gần nhất + 8 giờ | luôn |
+
+- Một phần bị lỗi (ví dụ `gh` chưa đăng nhập) thì phần đó trống, các phần khác vẫn hiện. Hạn mức cũ được đánh dấu "cũ" nếu không làm mới được.
+- Chi phí là giá API niêm yết (bảng giá kèm trong `server.mjs`), không phải số tiền bạn trả theo gói. Chi phí của omp lấy đúng theo từng tài khoản; chi phí từ Claude Code và Codex chạy riêng chỉ cộng vào tổng.
+- Ngày (Hôm nay, Hôm qua) tính theo múi giờ của box. Box mặc định dùng giờ UTC; muốn tính theo giờ Việt Nam thì thêm `Environment=TZ=Asia/Ho_Chi_Minh` vào dịch vụ `fcoding` rồi khởi động lại.
+- `gh` cần quyền đọc kho: đăng nhập bằng `gh auth login` trên box, hoặc đặt `GH_TOKEN` cho dịch vụ. Nếu token không được đọc trạng thái kiểm tra (checks) thì app chỉ không hiện phần đó.
+- Nút Reset của Codex trong app chạy `omp usage reset <tài khoản>` trên box, mỗi tài khoản một lần một. Reset của Claude chỉ mở trang claude.ai.
 
 ## 4. Mở link công khai
 

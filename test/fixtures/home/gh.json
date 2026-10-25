@@ -1,0 +1,10 @@
+{
+  "_note": "gh pr list / gh run list --json output recorded on the box 2026-10-25 (titles, names and URLs replaced)",
+  "prs": [
+    {"mergeable":"MERGEABLE","number":6,"statusCheckRollup":[{"__typename":"CheckRun","completedAt":"2026-10-25T19:30:00Z","conclusion":"SUCCESS","detailsUrl":"https://github.com/o/r/x","name":"check","startedAt":"2026-10-25T19:25:00Z","status":"COMPLETED","workflowName":"wf"},{"__typename":"StatusContext","context":"ctx","startedAt":"2026-10-25T19:25:00Z","state":"PENDING","targetUrl":"u"}],"title":"T6"},
+    {"mergeable":"CONFLICTING","number":5,"statusCheckRollup":[{"__typename":"CheckRun","conclusion":"FAILURE","name":"check","status":"COMPLETED"}],"title":"T5"},
+    {"mergeable":"UNKNOWN","number":4,"statusCheckRollup":[],"title":"T4"}
+  ],
+  "runs": [{"conclusion":"failure","createdAt":"2026-10-25T19:25:12Z","name":"Deal Sync Mobile v2 Gate","status":"completed","url":"https://github.com/owner/repo/actions/runs/1","workflowName":"Deal Sync Mobile v2 Gate"}],
+  "status": {"omp":{"from":"18.12.6","to":"18.12.6","at":"2026-10-25T19:21:17Z","result":"current","error":null},"claude":{"from":"2.1.310","to":"2.1.310","at":"2026-10-25T19:21:17Z","result":"current","error":null},"codex":{"from":"0.164.0","to":"0.164.1","at":"2026-10-25T19:21:18Z","result":"updated","error":null}}
+}

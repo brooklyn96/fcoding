@@ -258,6 +258,356 @@ export function pairPage(appLink) {
   return `<!doctype html><html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Ghép FCode</title><style>body{margin:0;font:17px/1.5 -apple-system,system-ui,sans-serif;background:#111;color:#eee;text-align:center}main{padding:48px 24px}.btn{display:block;max-width:320px;margin:24px auto;padding:16px;border-radius:14px;background:#0a84ff;color:#fff;font-size:20px;font-weight:600;text-decoration:none}.s{color:#999;font-size:15px}</style></head><body><main><h1>Ghép iPhone với FCode</h1>${body}</main></body></html>`;
 }
 
+// ---------- home screen v2 (CONTRACT.md A8): quota, spend, box timer, projects, updates, Codex reset ----------
+const QUOTA_TTL = 60e3, SPEND_TTL = 300e3, PROJECTS_TTL = 120e3;
+const QUOTA_STALE_MS = 10 * 60e3; // a report omp fetched longer ago than this is stale
+export const BOX = { maxRunMinutes: 480, idlePauseMinutes: 30, cooldownMinutes: 10 };
+const BOX_TICK_MS = 30e3, BOX_GAP_MS = 90e3; // a tick that comes more than 90 s late = the box was asleep and resumed
+const SPEND_DAYS = 30, SCAN_DAYS = 31, SCAN_CHUNK = 8 << 20, MAX_LINE = 4 << 20;
+const RESET_TIMEOUT = 45e3, RESET_KEEP_MS = 15 * 60e3;
+const HARNESS_OF = { anthropic: 'claude', 'openai-codex': 'codex' };
+const OMP_HARNESS = { anthropic: 'claude', 'claude-agent-sdk': 'claude', 'openai-codex': 'codex' };
+const PLAN_LABELS = { free: 'Free', plus: 'Plus', pro: 'Pro', max: 'Max', team: 'Team', business: 'Business', enterprise: 'Enterprise', edu: 'Edu' };
+// USD per million tokens: [input, output, cache read, cache write 5 min, cache write 1 h] (absent = input rate; 1 h absent = 2 x input).
+// Source: LiteLLM model_prices_and_context_window.json (github.com/BerriAI/litellm, main), read 2026-10-26. Used only for logs
+// that carry no cost of their own (Claude Code, Codex); omp logs carry their own cost. An unknown model counts tokens, never dollars.
+export const PRICES = {
+  'claude-opus-5-5': [4, 20, 0.2, 5, 8], 'claude-opus-5': [5, 25, 0.5, 6.25, 10], 'claude-opus-4-8': [5, 25, 0.5, 6.25, 10],
+  'claude-opus-4-7': [5, 25, 0.5, 6.25, 10], 'claude-opus-4-6': [5, 25, 0.5, 6.25, 10], 'claude-opus-4-5': [5, 25, 0.5, 6.25, 10],
+  'claude-sonnet-5-5': [2, 10, 0.1, 2.5, 4], 'claude-sonnet-5': [2, 10, 0.2, 2.5, 4], 'claude-sonnet-4-6': [3, 15, 0.3, 3.75, 6],
+  'claude-sonnet-4-5': [3, 15, 0.3, 3.75, 6], 'claude-haiku-5-5': [0.1, 0.5, 0.01, 0.125, 0.2], 'claude-haiku-4-5': [1, 5, 0.1, 1.25, 2],
+  'gpt-5.6': [4, 20, 0.4, 5], 'gpt-5.6-sol': [4, 20, 0.4, 5], 'gpt-5.6-terra': [2, 12, 0.2, 2.5], 'gpt-5.6-luna': [0.2, 1.2, 0.02, 0.25],
+  'gpt-5.5': [5, 30, 0.5], 'gpt-5.4': [2.5, 15, 0.25], 'gpt-5.4-mini': [0.75, 4.5, 0.075], 'gpt-5.3-codex': [1.75, 14, 0.175],
+  'gpt-5.2': [1.75, 14, 0.175], 'gpt-5.1': [1.25, 10, 0.125], 'gpt-5.1-codex-mini': [0.25, 2, 0.025], 'gpt-5': [1.25, 10, 0.125],
+  'gpt-5-codex': [1.25, 10, 0.125], 'gpt-5-mini': [0.25, 2, 0.025], 'gpt-5-nano': [0.05, 0.4, 0.005],
+};
+// exact name, then without a date suffix, then the longest known "<name>-" prefix ("gpt-5.1-codex-max" -> gpt-5.1)
+export function priceOf(model) {
+  if (typeof model !== 'string') return null;
+  const m = model.toLowerCase().replace(/^.*\//, '').replace(/-\d{8}$|-\d{4}-\d{2}-\d{2}$/, '');
+  if (Object.hasOwn(PRICES, m)) return PRICES[m];
+  const k = Object.keys(PRICES).filter((x) => m.startsWith(`${x}-`)).sort((a, b) => b.length - a.length)[0];
+  return k ? PRICES[k] : null;
+}
+const costOf = (p, { input = 0, output = 0, cacheRead = 0, w5m = 0, w1h = 0 }) =>
+  (input * p[0] + output * p[1] + cacheRead * (p[2] ?? p[0]) + w5m * (p[3] ?? p[0]) + w1h * (p[4] ?? p[0] * 2)) / 1e6;
+const num = (x) => (Number.isFinite(x) && x > 0 ? x : 0);
+const str = (v) => (typeof v === 'string' && v.trim() ? v.trim() : null);
+const iso = (ms) => (Number.isFinite(ms) ? new Date(ms).toISOString() : null);
+const planLabel = (raw) => { const r = str(raw); return r ? PLAN_LABELS[r.toLowerCase()] ?? r[0].toUpperCase() + r.slice(1) : null; };
+
+// --- quota: `omp usage --json` reports + the `omp usage reset --json` listing (credential ids) -> accounts ---
+const windowLabel = (id, tier) => {
+  const m = /^(\d+)([hd])$/.exec(id);
+  const base = m ? `${m[1]} ${m[2] === 'h' ? 'giờ' : 'ngày'}` : id;
+  return tier ? `${base} ${tier[0].toUpperCase()}${tier.slice(1)}` : base;
+};
+function usedPercentOf(a) {
+  if (!a || typeof a !== 'object') return null;
+  let v = null;
+  if (Number.isFinite(a.usedFraction)) v = a.usedFraction * 100;
+  else if (Number.isFinite(a.used) && a.unit === 'percent') v = a.used;
+  else if (Number.isFinite(a.used) && Number.isFinite(a.limit) && a.limit > 0) v = (a.used / a.limit) * 100;
+  return v === null ? null : Math.round(v * 10) / 10;
+}
+// a window omp does not report (no limit entry, or no number) is not shown
+export function windowsOf(limits) {
+  const out = [];
+  for (const l of Array.isArray(limits) ? limits : []) {
+    const usedPercent = usedPercentOf(l?.amount);
+    const id = str(l?.scope?.windowId) ?? str(l?.window?.id);
+    if (usedPercent === null || !id) continue;
+    const tier = str(l.scope?.tier)?.toLowerCase() ?? null;
+    const dur = l.window?.durationMs;
+    out.push({ key: tier ? `${id}_${tier}` : id, label: windowLabel(id, tier), usedPercent, resetsAt: iso(l.window?.resetsAt),
+      periodSeconds: Number.isFinite(dur) ? Math.round(dur / 1000) : null });
+  }
+  return out;
+}
+// -> {accounts, byAccountId: Map("<harness>:<vendor account id>" -> account id)}. The account id is the omp reset target
+// "<provider>/<credential id>" (also the key of omp's per-message credentialId); unmatched accounts get a hash id and no target.
+export function parseQuota(usage, resetList, nowMs) {
+  const listed = (Array.isArray(resetList?.accounts) ? resetList.accounts : []).filter((r) => r && Number.isInteger(r.credentialId));
+  const taken = new Set();
+  const accounts = [], byAccountId = new Map();
+  const add = (provider, m, report) => {
+    const harness = HARNESS_OF[provider];
+    if (!harness || !m || typeof m !== 'object') return;
+    const same = (r) => r.provider === provider && (r.accountId ?? null) === (m.accountId ?? null) && (r.orgId ?? null) === (m.orgId ?? null)
+      && (!r.email || !m.email || r.email === m.email);
+    const r = listed.find((x) => !taken.has(x) && same(x));
+    if (r) taken.add(r);
+    const target = r ? `${provider}/${r.credentialId}` : null;
+    const id = target ?? `${provider}/~${crypto.createHash('sha256').update(`${m.accountId}|${m.orgId}|${m.email}`).digest('hex').slice(0, 8)}`;
+    const fetched = Number.isFinite(report?.fetchedAt) ? report.fetchedAt : null;
+    const credits = r ?? report?.resetCredits ?? {};
+    const err = [report?.error, m.error, m.reason, m.status].filter((x) => typeof x === 'string' || typeof x === 'number').join(' ');
+    accounts.push({
+      id, harness, email: str(m.email), org: str(m.orgName), plan: planLabel(m.planType ?? m.subscriptionType ?? m.plan),
+      fetchedAt: iso(fetched), stale: fetched === null || nowMs - fetched > QUOTA_STALE_MS, rateLimited: /rate.?limit|\b429\b/i.test(err),
+      windows: windowsOf(report?.limits),
+      resets: { available: Math.max(0, Math.trunc(num(credits.redeemableCount ?? credits.availableCount))), target },
+    });
+    if (str(m.accountId)) byAccountId.set(`${harness}:${m.accountId}`, id);
+  };
+  for (const rep of Array.isArray(usage?.reports) ? usage.reports : []) add(rep?.provider, rep?.metadata, rep);
+  for (const a of Array.isArray(usage?.accountsWithoutUsage) ? usage.accountsWithoutUsage : []) add(a?.provider, a, null);
+  return { accounts, byAccountId };
+}
+
+// --- spend: local logs. One event per billed request: {ts, harness, who, usd|null, tokens, key}; key dedupes across files ---
+// omp / pi session files (~/.omp/agent/sessions): assistant messages carry provider, credentialId, usage and usage.cost.total
+export function ompLine(v, fileKey) {
+  let m, who = null, key;
+  if (v?.type === 'message' && v.message?.role === 'assistant') {
+    m = v.message;
+    key = str(m.responseId) ? `o:${m.responseId}` : `o:${fileKey}:${v.id}`;
+    if (Number.isInteger(m.credentialId) && str(m.provider)) who = `${m.provider}/${m.credentialId}`;
+  } else if (v?.type === 'model_usage') { m = v; key = `o:${fileKey}:${v.id}`; } // titles, compaction: no credential id
+  else return null;
+  const harness = OMP_HARNESS[m.provider], u = m.usage;
+  const ts = Number.isFinite(m.timestamp) ? m.timestamp : Date.parse(v.timestamp);
+  if (!harness || !u || typeof u !== 'object' || !Number.isFinite(ts)) return null;
+  const w1h = num(u.cttl?.ephemeral1h), parts = { input: num(u.input), output: num(u.output), cacheRead: num(u.cacheRead), w5m: Math.max(0, num(u.cacheWrite) - w1h), w1h };
+  const p = priceOf(m.model);
+  const usd = Number.isFinite(u.cost?.total) ? u.cost.total : p ? costOf(p, parts) : null;
+  return { ts, harness, who, usd, tokens: num(u.totalTokens) || parts.input + parts.output + parts.cacheRead + num(u.cacheWrite), key };
+}
+// Claude Code (~/.claude/projects): one message can span several lines (and sidechains replay it) with the same message.id: count it once
+export function claudeLine(v) {
+  const m = v?.type === 'assistant' ? v.message : null, u = m?.usage;
+  const ts = Date.parse(v?.timestamp);
+  if (!u || typeof u !== 'object' || m.model === '<synthetic>' || !Number.isFinite(ts)) return null;
+  const w = num(u.cache_creation_input_tokens), w1h = Math.min(w, num(u.cache_creation?.ephemeral_1h_input_tokens));
+  const parts = { input: num(u.input_tokens), output: num(u.output_tokens), cacheRead: num(u.cache_read_input_tokens), w5m: w - w1h, w1h };
+  const p = priceOf(m.model);
+  const usd = Number.isFinite(v.costUSD) ? v.costUSD : p ? costOf(p, parts) : null;
+  return { ts, harness: 'claude', who: null, usd, tokens: parts.input + parts.output + parts.cacheRead + w, key: str(m.id) ? `c:${m.id}` : null };
+}
+// Codex (~/.codex/sessions, archived_sessions): token_count events; st carries the session, account and model of the file
+export function codexLine(v, st) {
+  const p = v?.payload;
+  if (!p || typeof p !== 'object') return null;
+  if (v.type === 'session_meta') {
+    st.session = str(p.id) ?? st.session;
+    st.account = str(p.creator_account_id) ?? str(p.account_id) ?? st.account;
+    st.model = str(p.model) ?? st.model;
+    return null;
+  }
+  if (v.type === 'turn_context') { st.model = str(p.model) ?? st.model; return null; }
+  if (p.type !== 'token_count' || !p.info || typeof p.info !== 'object') return null;
+  const tot = p.info.total_token_usage, last = p.info.last_token_usage;
+  const totKey = tot ? JSON.stringify(tot) : null;
+  if (totKey && totKey === st.prev) return null; // the same cumulative totals again: a re-emitted snapshot, not new usage
+  const prevTot = st.prevTot;
+  st.prev = totKey; st.prevTot = tot;
+  const u = last ?? (tot && Object.fromEntries(Object.keys(tot).map((k) => [k, Math.max(0, num(tot[k]) - num(prevTot?.[k]))])));
+  const ts = Date.parse(v.timestamp);
+  if (!u || !Number.isFinite(ts)) return null;
+  const input = num(u.input_tokens), cached = Math.min(input, num(u.cached_input_tokens)), output = num(u.output_tokens);
+  const pr = priceOf(str(p.info.model) ?? st.model);
+  return { ts, harness: 'codex', who: st.account ? `codex:${st.account}` : null, usd: pr ? costOf(pr, { input: input - cached, output, cacheRead: cached }) : null,
+    tokens: num(u.total_tokens) || input + output, key: `x:${st.session ?? st.file}:${totKey ?? ts}` };
+}
+const PREFILTER = { omp: (l) => l.includes('"usage"'), claude: (l) => l.includes('"assistant"'), codex: (l) => /token_count|turn_context|session_meta/.test(l) };
+// Incremental: each file is read from where the last scan stopped (whole lines only); a file that shrank or was replaced is re-read.
+// Files not modified in the last 31 days are skipped; a file that disappears is dropped. Events stay per file, deduped when summed.
+export function spendScanner(roots, nowFn = Date.now) {
+  const files = new Map(); // path -> {ino, offset, events, st, skip}
+  async function listFiles(dir, out, depth = 0) {
+    if (depth > 16) return;
+    let ents;
+    try { ents = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of ents) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) await listFiles(p, out, depth + 1);
+      else if (e.isFile() && e.name.endsWith('.jsonl')) out.push(p);
+    }
+  }
+  function parse(kind, f, line) {
+    if (!line || line.length > MAX_LINE || !PREFILTER[kind](line)) return;
+    let v;
+    try { v = JSON.parse(line); } catch { return; }
+    const e = kind === 'omp' ? ompLine(v, f.st.file) : kind === 'claude' ? claudeLine(v) : codexLine(v, f.st);
+    if (e) f.events.push(e);
+  }
+  async function readNew(file, kind, f, size) {
+    const fh = await fs.promises.open(file, 'r');
+    try {
+      while (f.offset < size) {
+        const buf = Buffer.alloc(Math.min(size - f.offset, SCAN_CHUNK));
+        const { bytesRead } = await fh.read(buf, 0, buf.length, f.offset);
+        if (!bytesRead) break;
+        const nl = buf.lastIndexOf(10, bytesRead - 1);
+        if (nl < 0) { // no line end in a full chunk: an over-long line, skipped up to its end; else an unfinished last line waits
+          if (bytesRead < SCAN_CHUNK) break;
+          f.offset += bytesRead; f.skip = true; continue;
+        }
+        const lines = buf.toString('utf8', 0, nl).split('\n');
+        if (f.skip) { lines.shift(); f.skip = false; }
+        for (const line of lines) parse(kind, f, line);
+        f.offset += nl + 1;
+      }
+    } finally { await fh.close(); }
+  }
+  return async function scan() {
+    const cutoff = nowFn() - SCAN_DAYS * 86400e3;
+    const seen = new Set();
+    for (const kind of ['omp', 'claude', 'codex']) {
+      for (const dir of roots[kind] ?? []) {
+        const list = [];
+        await listFiles(dir, list);
+        for (const file of list) {
+          let s;
+          try { s = await fs.promises.stat(file); } catch { continue; }
+          if (s.mtimeMs < cutoff || seen.has(file)) continue;
+          seen.add(file);
+          let f = files.get(file);
+          if (!f || f.ino !== s.ino || s.size < f.offset) files.set(file, f = { ino: s.ino, offset: 0, events: [], st: { file: path.basename(file) }, skip: false });
+          if (s.size > f.offset) { try { await readNew(file, kind, f, s.size); } catch {} } // unreadable now: what was read stays
+        }
+      }
+    }
+    for (const k of files.keys()) if (!seen.has(k)) files.delete(k);
+    return [...files.values()].flatMap((f) => f.events);
+  };
+}
+const dayKey = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const r4 = (x) => Math.round(x * 1e4) / 1e4;
+const money = ({ usd, tokens }) => ({ usd: r4(usd), tokens: Math.round(tokens) });
+// {today, yesterday, last30, weeklyEstimate, daily30}: local calendar days (the server's TZ), the last 30 ending today, oldest first.
+// weeklyEstimate (Pane): spend inside the account's "7d" window / (usedPercent / 100), from 5 % used; at >= 100 % the spend itself.
+export function spendOf(events, nowMs, weekly = null) {
+  const days = [];
+  const base = new Date(nowMs);
+  for (let i = SPEND_DAYS - 1; i >= 0; i--) days.push(dayKey(new Date(base.getFullYear(), base.getMonth(), base.getDate() - i, 12)));
+  const idx = new Map(days.map((k, i) => [k, i]));
+  const daily = days.map((date) => ({ date, usd: 0, tokens: 0 }));
+  for (const e of events) {
+    const i = idx.get(dayKey(new Date(e.ts)));
+    if (i !== undefined && e.ts <= nowMs) { daily[i].usd += e.usd ?? 0; daily[i].tokens += e.tokens; }
+  }
+  const sum = daily.reduce((a, d) => ({ usd: a.usd + d.usd, tokens: a.tokens + d.tokens }), { usd: 0, tokens: 0 });
+  let weeklyEstimate = null;
+  const end = Date.parse(weekly?.resetsAt);
+  if (weekly && Number.isFinite(end) && weekly.periodSeconds > 0 && weekly.usedPercent >= 5) {
+    const start = end - weekly.periodSeconds * 1000, w = { usd: 0, tokens: 0 };
+    for (const e of events) if (e.ts >= start && e.ts <= nowMs) { w.usd += e.usd ?? 0; w.tokens += e.tokens; }
+    const frac = Math.min(1, weekly.usedPercent / 100);
+    if (w.tokens > 0) weeklyEstimate = money({ usd: w.usd / frac, tokens: w.tokens / frac }); // nothing logged in the window: no estimate
+  }
+  return { today: money(daily[SPEND_DAYS - 1]), yesterday: money(daily[SPEND_DAYS - 2]), last30: money(sum), weeklyEstimate, daily30: daily.map((d) => ({ date: d.date, ...money(d) })) };
+}
+// events -> per-account spend (Map id -> spend) and totals. An event whose account is not known counts in its harness total only.
+export function spendView(events, accounts, byAccountId, nowMs) {
+  const keys = new Set(), uniq = [];
+  for (const e of events) {
+    if (e.key) { if (keys.has(e.key)) continue; keys.add(e.key); }
+    uniq.push(e);
+  }
+  const byId = new Map(accounts.map((a) => [a.id, []]));
+  for (const e of uniq) {
+    const id = e.who && (byId.has(e.who) ? e.who : byAccountId.get(e.who));
+    if (id) byId.get(id).push(e);
+  }
+  const perAccount = new Map(accounts.map((a) => [a.id, spendOf(byId.get(a.id), nowMs, a.windows.find((w) => w.key === '7d'))]));
+  const harnesses = [...new Set(uniq.map((e) => e.harness))];
+  const byHarness = harnesses.map((h) => ({ harness: h, usd: spendOf(uniq.filter((e) => e.harness === h), nowMs).last30.usd })).sort((a, b) => b.usd - a.usd);
+  return { perAccount, totals: { spend: spendOf(uniq, nowMs), byHarness } };
+}
+
+// --- projects (gh), updates (status.json), Codex reset (omp) ---
+// owner/repo of a GitHub remote: https, ssh:// or scp-like, also through an ssh host alias (git@github-work:owner/repo.git)
+export function repoOf(url) {
+  const m = /^(?:[a-z+]+:\/\/)?(?:[^@/\s]+@)?([^:/\s]+)[:/]+(?:\d+\/)?([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/i.exec(String(url ?? '').trim());
+  return m && /github/i.test(m[1]) ? `${m[2]}/${m[3]}` : null;
+}
+const CHECK_FAIL = ['FAILURE', 'ERROR', 'TIMED_OUT', 'CANCELLED', 'ACTION_REQUIRED', 'STARTUP_FAILURE'];
+// gh statusCheckRollup: CheckRun {status, conclusion} or StatusContext {state}; null when gh could not read checks
+export function checksOf(rollup) {
+  if (!Array.isArray(rollup)) return null;
+  if (!rollup.length) return 'none';
+  let pending = false;
+  for (const c of rollup) {
+    const res = String(c?.conclusion || c?.state || '').toUpperCase();
+    if (CHECK_FAIL.includes(res)) return 'failure';
+    if (c?.status !== undefined ? String(c.status).toUpperCase() !== 'COMPLETED' : ['PENDING', 'EXPECTED', ''].includes(res)) pending = true;
+  }
+  return pending ? 'pending' : 'success';
+}
+export const prsOf = (list) => list.map((p) => ({ number: p.number, title: clip(cleanLine(String(p.title ?? ''))), checks: checksOf(p.statusCheckRollup),
+  mergeable: p.mergeable === 'MERGEABLE' ? true : p.mergeable === 'CONFLICTING' ? false : null }));
+export function runOf(list) {
+  const r = Array.isArray(list) ? list[0] : null;
+  if (!r || typeof r !== 'object') return null;
+  const status = r.status !== 'completed' ? 'in_progress' : ['success', 'neutral', 'skipped'].includes(r.conclusion) ? 'success' : 'failure';
+  return { workflow: str(r.workflowName) ?? str(r.name), status, at: str(r.createdAt), url: str(r.url) };
+}
+// status.json of the box updater: the harness tools only (omp, claude, codex); a result outside updated|current|failed is null
+const UPDATE_RESULTS = ['updated', 'current', 'failed'];
+export function parseUpdates(text) {
+  let j;
+  try { j = JSON.parse(text); } catch { return {}; }
+  const out = {};
+  if (!j || typeof j !== 'object' || Array.isArray(j)) return out;
+  for (const tool of ['omp', 'claude', 'codex']) {
+    const v = j[tool];
+    if (v && typeof v === 'object') out[tool] = { from: str(v.from) ?? '', to: str(v.to) ?? '', at: str(v.at), result: UPDATE_RESULTS.includes(v.result) ? v.result : null };
+  }
+  return out;
+}
+// `omp usage reset <target>` prints one line (stdout on success, stderr otherwise); first matching rule wins
+export const RESET_MSG = {
+  reset: 'Đã reset hạn mức Codex.',
+  already: 'Lượt reset này đã được dùng rồi, không trừ thêm lượt nào.',
+  nothing_to_reset: 'Chưa cần reset: hạn mức chưa bị chặn nên không mất lượt nào.',
+  no_credit: 'Không còn lượt reset nào cho tài khoản này.',
+  login: 'Đăng nhập tài khoản này đã hết hạn. Mở omp trên box và /login lại.',
+  busy: 'Đang có một lần reset khác cho tài khoản này. Đợi một chút rồi xem lại Hạn mức.',
+  list: 'Không tải được lượt reset (mạng hoặc đăng nhập). Chưa mất lượt nào, thử lại sau.',
+  changed: 'Lượt reset vừa thay đổi, chưa mất lượt nào. Mở lại Hạn mức rồi thử lại.',
+  tool: 'Không chạy được omp trên box. Thử lại sau.',
+  error: 'Không xác nhận được reset. Xem lại Hạn mức trước khi thử lại.',
+};
+const RESET_RULES = [
+  [/reset applied for/i, 'reset', 'reset'],
+  [/already redeemed|another omp process spent a saved reset/i, 'already', 'already'],
+  [/nothing to reset right now/i, 'nothing_to_reset', 'nothing_to_reset'],
+  [/no saved resets available/i, 'no_credit', 'no_credit'],
+  [/could not authenticate|try \/login|sign in to it again/i, 'error', 'login'],
+  [/already in progress|started spending/i, 'error', 'busy'],
+  [/couldn.t load this account.s saved resets/i, 'error', 'list'],
+  [/reset offer changed/i, 'error', 'changed'],
+];
+export function resetReply(text) {
+  const t = String(text ?? '').replace(ANSI_RE, '');
+  const [, result, msg] = RESET_RULES.find(([re]) => re.test(t)) ?? [null, 'error', 'error'];
+  return { result, message: RESET_MSG[msg] };
+}
+// a child with a timeout, never a shell; rejects with stdout/stderr attached
+function execTool(spec, args, timeout) {
+  return new Promise((resolve, reject) => {
+    const [cmd, ...pre] = spec;
+    execFile(cmd, [...pre, ...args], {
+      encoding: 'utf8', timeout, maxBuffer: 32 << 20, windowsHide: true,
+      env: { ...process.env, LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', NO_COLOR: '1', GH_PROMPT_DISABLED: '1', GIT_OPTIONAL_LOCKS: '0',
+        PATH: `${home}/.local/bin:${home}/.bun/bin:${process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'}` },
+    }, (err, stdout, stderr) => (err ? reject(Object.assign(err, { stdout, stderr })) : resolve(stdout)));
+  });
+}
+// one refresh at a time; within ttl the cached value; a failed refresh hands back the previous value with fresh: false
+function memo(ttl, fn, now) {
+  let value, at = -Infinity, pending = null;
+  return {
+    async get() {
+      if (value !== undefined && now() - at < ttl) return { value, fresh: true };
+      pending ??= Promise.resolve().then(fn).then((v) => { value = v; at = now(); return v; }).finally(() => { pending = null; });
+      try { return { value: await pending, fresh: true }; } catch (e) { if (value === undefined) throw e; return { value, fresh: false }; }
+    },
+    clear() { at = -Infinity; },
+  };
+}
+
 // ---------- app ----------
 export function createApp(opts = {}) {
   const configDir = opts.configDir || defaultConfigDir();
@@ -272,6 +622,15 @@ export function createApp(opts = {}) {
   const writeFile = opts.writePrivate || writePrivate;
   let gitSpec = opts.git ?? process.env.PC_GIT ?? 'git';
   if (typeof gitSpec === 'string') gitSpec = gitSpec.startsWith('[') ? JSON.parse(gitSpec) : [gitSpec];
+  const specOf = (v) => (typeof v === 'string' ? (v.startsWith('[') ? JSON.parse(v) : [v]) : v);
+  const ompSpec = specOf(opts.omp ?? process.env.PC_OMP ?? 'omp');
+  const ghSpec = specOf(opts.gh ?? process.env.PC_GH ?? 'gh');
+  const spendRoots = opts.spendRoots ?? {
+    omp: [path.join(home, '.omp', 'agent', 'sessions')],
+    claude: [path.join(process.env.CLAUDE_CONFIG_DIR || path.join(home, '.claude'), 'projects')],
+    codex: ['sessions', 'archived_sessions'].map((d) => path.join(process.env.CODEX_HOME || path.join(home, '.codex'), d)),
+  };
+  const updatesFile = opts.updatesFile ?? path.join(home, '.local', 'state', 'fcode-update', 'status.json');
 
   secureConfigDir(configDir);
 
@@ -642,6 +1001,91 @@ export function createApp(opts = {}) {
     if (enter) await run(ctx, ['send-keys', '-t', pane(name), 'Enter']);
   }
 
+  // --- GET /api/home (A8): each part cached on its own; a failing part is empty or stale, never a 500 ---
+  let lastResetList = null; // the last good `omp usage reset --json`: credential ids survive one failed listing
+  const quota = memo(QUOTA_TTL, async () => {
+    const [u, r] = await Promise.allSettled([execTool(ompSpec, ['usage', '--json'], 30e3), execTool(ompSpec, ['usage', 'reset', '--json'], 30e3)]);
+    if (u.status === 'rejected') throw u.reason;
+    try { if (r.status === 'fulfilled') lastResetList = JSON.parse(r.value); } catch {}
+    return parseQuota(JSON.parse(u.value), lastResetList, now());
+  }, now);
+  const scan = spendScanner(spendRoots, now);
+  const spend = memo(SPEND_TTL, scan, now);
+  async function projectInfo(name) {
+    const dir = cfg.projects[name];
+    const out = { name, repo: null, branch: null, prs: null, lastRun: null };
+    const git = (...a) => execTool(gitSpec, ['-C', dir, '-c', 'core.fsmonitor=false', ...a], 5000).then((s) => s.trim(), () => null);
+    const gh = (...a) => execTool(ghSpec, ['-R', out.repo, ...a], 20e3).then(JSON.parse).catch(() => null); // failed or not JSON: null
+    const [url, br] = await Promise.all([git('remote', 'get-url', 'origin'), git('rev-parse', '--abbrev-ref', 'HEAD')]);
+    out.branch = br ? clip(cleanLine(br)) || null : null;
+    out.repo = repoOf(url); // the remote URL itself (it may hold credentials) never leaves this function
+    if (!out.repo) return out;
+    const prList = (fields) => gh('pr', 'list', '--state', 'open', '--limit', '20', '--json', fields);
+    const [prs, runs] = await Promise.all([
+      // a token without checks access fails the whole query with statusCheckRollup: then the list without checks (checks null)
+      prList('number,title,mergeable,statusCheckRollup').then((x) => x ?? prList('number,title,mergeable')),
+      gh('run', 'list', '--limit', '1', '--json', 'workflowName,name,status,conclusion,createdAt,url'),
+    ]);
+    out.prs = Array.isArray(prs) ? prsOf(prs) : null;
+    out.lastRun = runOf(runs);
+    return out;
+  }
+  const projects = memo(PROJECTS_TTL, () => Promise.all(cfg.projectNames.map(projectInfo)), now);
+  // box timer (estimate, no API key): the last resume = process start or a 30 s tick that came more than 90 s late
+  let boxResume = now(), boxTick = now();
+  const tickBox = () => { const t = now(); if (t - boxTick > BOX_GAP_MS) boxResume = t; boxTick = t; };
+  const boxTimer = setInterval(tickBox, BOX_TICK_MS);
+  boxTimer.unref();
+  function boxInfo() {
+    tickBox();
+    const at = boxResume + BOX.maxRunMinutes * 60e3;
+    return { state: 'running', sleepsAt: at > now() ? iso(at) : null, ...BOX, source: 'estimate' };
+  }
+  async function homeView() {
+    const [q, s, p] = await Promise.allSettled([quota.get(), spend.get(), projects.get()]);
+    const t = now();
+    const qv = q.status === 'fulfilled' ? q.value : null;
+    const accounts = qv ? qv.value.accounts.map((a) => ({ ...a, stale: a.stale || !qv.fresh })) : [];
+    const view = s.status === 'fulfilled' ? spendView(s.value.value, accounts, qv?.value.byAccountId ?? new Map(), t) : null;
+    let updates = {};
+    try { updates = parseUpdates(fs.readFileSync(updatesFile, 'utf8')); } catch {}
+    return {
+      generatedAt: iso(t), box: boxInfo(),
+      accounts: accounts.map((a) => ({ ...a, spend: view?.perAccount.get(a.id) ?? null })),
+      totals: view?.totals ?? { spend: null, byHarness: [] },
+      projects: p.status === 'fulfilled' ? p.value.value : [],
+      updates,
+    };
+  }
+  // POST /api/codex-reset: one reset per account at a time; a retry with the same requestId gets the same answer, nothing runs twice
+  const resetJobs = new Map(); // accountId -> {requestId, promise}
+  const resetDone = new Map(); // "accountId|requestId" -> {at, reply}
+  function codexReset(accountId, requestId) {
+    for (const [k, d] of resetDone) if (now() - d.at > RESET_KEEP_MS) resetDone.delete(k);
+    const doneKey = `${accountId}|${requestId}`;
+    if (resetDone.has(doneKey)) return Promise.resolve(resetDone.get(doneKey).reply);
+    const busy = resetJobs.get(accountId);
+    if (busy) return busy.requestId === requestId ? busy.promise : Promise.reject(new HttpErr(409, 'in_progress'));
+    const job = (async () => { // the lock is taken before the first await
+      let acct;
+      try { acct = (await quota.get()).value.accounts.find((a) => a.id === accountId); } catch { throw new HttpErr(503, 'unavailable'); }
+      if (!acct) throw new HttpErr(404, 'not_found');
+      if (acct.harness !== 'codex') throw new HttpErr(400, 'not_allowed');
+      if (!acct.resets.target) throw new HttpErr(409, 'no_target');
+      let reply;
+      try { reply = resetReply(await execTool(ompSpec, ['usage', 'reset', acct.resets.target], RESET_TIMEOUT)); } catch (e) {
+        reply = e.code === 'ENOENT' || e.killed ? { result: 'error', message: RESET_MSG.tool } : resetReply(`${e.stdout ?? ''}\n${e.stderr ?? ''}`);
+      }
+      log(`codex-reset ${accountId} ${reply.result}`); // the account id and the result only
+      resetDone.set(doneKey, { at: now(), reply });
+      if (reply.result === 'reset' || reply.result === 'already') quota.clear();
+      return reply;
+    })();
+    resetJobs.set(accountId, { requestId, promise: job });
+    job.then(() => resetJobs.delete(accountId), () => resetJobs.delete(accountId));
+    return job;
+  }
+
   // --- http helpers ---
   function json(res, status, obj, headers) {
     const body = JSON.stringify(obj);
@@ -809,6 +1253,13 @@ export function createApp(opts = {}) {
       return json(res, 200, { code: p.code, expiresAt: new Date(p.expiresAt).toISOString(), ...pairLinks() });
     }
     if (pathname === '/api/overview') { want('GET'); return json(res, 200, await overview(ctx)); }
+    if (pathname === '/api/home') { want('GET'); return json(res, 200, await homeView()); }
+    if (pathname === '/api/codex-reset') {
+      want('POST');
+      const { accountId, requestId } = parseJson(req, body);
+      if (typeof accountId !== 'string' || accountId.length > 128 || typeof requestId !== 'string' || !/^[A-Za-z0-9-]{8,64}$/.test(requestId)) throw new HttpErr(400, 'invalid');
+      return json(res, 200, await codexReset(accountId, requestId));
+    }
     if (pathname === '/api/meta') {
       want('GET');
       return json(res, 200, { projects: cfg.projectNames, harnesses: Object.keys(HARNESSES), keys: KEYS });
@@ -931,11 +1382,14 @@ export function createApp(opts = {}) {
       return await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, host, () => resolve(server.address().port)); });
     } catch (e) { adminServer.close(); throw e; }
   };
-  const close = () => Promise.all([
-    new Promise((resolve) => { server.close(() => resolve()); server.closeAllConnections(); }),
-    new Promise((resolve) => (adminServer.listening ? adminServer.close(() => resolve()) : resolve())),
-  ]);
-  return { server, listen, close, devices, stats: () => ({ streams, running, reads, waiting: queue.length, active: !!active }) };
+  const close = () => {
+    clearInterval(boxTimer);
+    return Promise.all([
+      new Promise((resolve) => { server.close(() => resolve()); server.closeAllConnections(); }),
+      new Promise((resolve) => (adminServer.listening ? adminServer.close(() => resolve()) : resolve())),
+    ]);
+  };
+  return { server, listen, close, devices, tickBox, stats: () => ({ streams, running, reads, waiting: queue.length, active: !!active }) };
 }
 
 // ---------- CLI ----------
