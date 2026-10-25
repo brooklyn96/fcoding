@@ -48,21 +48,33 @@ final class HomeModel: ObservableObject {
     }
 
     /// POST /api/codex-reset. `requestId` is minted once per confirm and reused on every retry.
-    func codexReset(_ account: QuotaAccount, requestId: String, app: AppState) async -> (done: Bool, canRetry: Bool, text: String) {
-        guard let api = app.api else { return (false, false, unpairedNotice) }
+    func codexReset(_ account: QuotaAccount, requestId: String, app: AppState) async -> HomeLogic.CodexOutcome {
+        guard let api = app.api else { return HomeLogic.CodexOutcome(text: unpairedNotice) }
+        let outcome: HomeLogic.CodexOutcome
         do {
             let data = try await api.call("POST", "api/codex-reset", body: ["accountId": account.id, "requestId": requestId])
-            let reply = try JSONDecoder().decode(CodexResetReply.self, from: data)
-            return HomeLogic.codexOutcome(reply)
-        } catch let e as APIError where e.status == 400 && e.code == "not_allowed" {
-            return (false, false, "Tài khoản này không reset được trong app.")
-        } catch let e as APIError where [404, 405, 501].contains(e.status) {
-            return (false, false, "Máy chủ chưa hỗ trợ, cập nhật máy chủ trước.")
-        } catch let e as APIError where e.status == 409 && e.code == "in_progress" {
-            // Another reset of this account is running; the same requestId may be sent again.
-            return (false, true, "Đang reset tài khoản này, thử lại sau ít giây.")
+            outcome = HomeLogic.codexOutcome(try JSONDecoder().decode(CodexResetReply.self, from: data))
         } catch {
-            return (false, true, "Không reset được: " + (app.report(error) ?? "lỗi mạng").lowercased(with: Locale(identifier: "vi")) + " Thử lại.")
+            let e = error as? APIError
+            if let known = HomeLogic.codexFailure(status: e?.status ?? 0, code: e?.code,
+                                                  timedOut: (error as? URLError)?.code == .timedOut) {
+                outcome = known
+            } else {
+                let why = (app.report(error) ?? "lỗi mạng").lowercased(with: Locale(identifier: "vi"))
+                outcome = HomeLogic.CodexOutcome(canRetry: true, text: "Không reset được: " + why + " Thử lại.")
+            }
         }
+        if !outcome.reload.isEmpty {
+            // Refresh the count once the box has had time to finish (the sheet may be gone by then).
+            Task {
+                var waited = 0.0
+                for at in outcome.reload {
+                    try? await Task.sleep(nanoseconds: UInt64(max(0, at - waited) * 1_000_000_000))
+                    waited = at
+                    await self.load(app)
+                }
+            }
+        }
+        return outcome
     }
 }

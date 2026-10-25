@@ -568,15 +568,37 @@ enum HomeLogic {
 
     // MARK: Codex reset reply
 
-    /// done = the reset happened (or had already); canRetry = "Thử lại" may help.
-    static func codexOutcome(_ reply: CodexResetReply) -> (done: Bool, canRetry: Bool, text: String) {
+    /// done = the reset happened (or had already); canRetry = "Thử lại" may help (only when the
+    /// server says nothing ran, so a retry cannot spend a second credit); reload = seconds after
+    /// which GET /api/home is fetched again to show the real count.
+    struct CodexOutcome: Equatable {
+        var done = false
+        var canRetry = false
+        var text: String
+        var reload: [Double] = []
+    }
+
+    static func codexOutcome(_ reply: CodexResetReply) -> CodexOutcome {
         let msg = reply.message?.trimmingCharacters(in: .whitespaces).isEmpty == false ? reply.message! : nil
         switch reply.result {
-        case "reset", "already": return (true, false, msg ?? "Đã reset")
-        case "nothing_to_reset": return (false, false, msg ?? "Chưa cần reset: hạn mức vẫn còn")
-        case "no_credit": return (false, false, msg ?? "Không reset được: chưa có lượt reset")
-        default: return (false, true, msg ?? "Không reset được, thử lại")
+        case "reset", "already": return CodexOutcome(done: true, text: msg ?? "Đã reset")
+        case "pending": return CodexOutcome(text: "Đang reset… kết quả sẽ hiện trong Hạn mức.", reload: [5, 20])
+        case "nothing_to_reset": return CodexOutcome(text: msg ?? "Chưa cần reset: hạn mức vẫn còn")
+        case "no_credit": return CodexOutcome(text: msg ?? "Không reset được: chưa có lượt reset")
+        default: return CodexOutcome(canRetry: true, text: msg ?? "Không reset được, thử lại")
         }
+    }
+
+    /// Final outcomes of a failed POST /api/codex-reset; nil = an ordinary error that may be retried.
+    static func codexFailure(status: Int, code: String?, timedOut: Bool) -> CodexOutcome? {
+        // The reset may still be running on the box: never offer a retry (a new run spends a credit).
+        if timedOut { return CodexOutcome(text: "Chưa nhận được kết quả. Xem lại Hạn mức sau ít giây.", reload: [0]) }
+        if status == 409 && code == "in_progress" {
+            return CodexOutcome(text: "Một lượt reset khác đang chạy cho tài khoản này. Xem lại Hạn mức sau ít giây.", reload: [0])
+        }
+        if status == 400 && code == "not_allowed" { return CodexOutcome(text: "Tài khoản này không reset được trong app.") }
+        if [404, 405, 501].contains(status) { return CodexOutcome(text: "Máy chủ chưa hỗ trợ, cập nhật máy chủ trước.") }
+        return nil
     }
 
     /// Session names the server accepts (NAME_RE): lowercase letters, digits and "-", 1-32.
@@ -743,6 +765,17 @@ enum HomeLogic {
         eq("codex no credit final", codexOutcome(reply("no_credit")).canRetry, false)
         eq("codex error retry", codexOutcome(reply("error")).canRetry, true)
         eq("codex message", codexOutcome(reply("error", "Mở codex trên box")).text, "Mở codex trên box")
+        eq("codex pending", codexOutcome(reply("pending")),
+           CodexOutcome(text: "Đang reset… kết quả sẽ hiện trong Hạn mức.", reload: [5, 20]))
+        eq("codex done no reload", codexOutcome(reply("reset")).reload, [])
+        eq("codex 409 in_progress final", codexFailure(status: 409, code: "in_progress", timedOut: false),
+           CodexOutcome(text: "Một lượt reset khác đang chạy cho tài khoản này. Xem lại Hạn mức sau ít giây.", reload: [0]))
+        eq("codex timeout final", codexFailure(status: 0, code: "timeout", timedOut: true),
+           CodexOutcome(text: "Chưa nhận được kết quả. Xem lại Hạn mức sau ít giây.", reload: [0]))
+        eq("codex not allowed", codexFailure(status: 400, code: "not_allowed", timedOut: false)?.canRetry, false)
+        eq("codex old server", codexFailure(status: 405, code: "method", timedOut: false)?.canRetry, false)
+        eq("codex other 409 retry", codexFailure(status: 409, code: "exists", timedOut: false) == nil, true)
+        eq("codex 500 retry", codexFailure(status: 500, code: "error", timedOut: false) == nil, true)
         eq("name ok", validSessionName("deal-sync-omp-2"), true)
         eq("name upper", validSessionName("Deal"), false)
         eq("name dash first", validSessionName("-a"), false)
