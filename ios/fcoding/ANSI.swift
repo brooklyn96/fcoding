@@ -1,3 +1,4 @@
+import CoreText
 import SwiftUI
 import UIKit
 
@@ -180,9 +181,29 @@ enum ANSI {
         return UIFont(descriptor: desc, size: size)
     }
 
-    /// Nerd Font icons: the Private Use Area and planes 15–16.
+    /// Drawn in the Nerd icon font: the Private Use Area and planes 15–16, plus any scalar SF Mono
+    /// has no glyph for but the Nerd font has (U+23FB–23FE, U+2630, U+2665, U+26A1, U+276C–2771
+    /// incl. omp's prompt ❯, U+2B58). Box drawing and normal text have SF Mono glyphs, so they stay.
     static func isIcon(_ c: Unicode.Scalar) -> Bool {
-        (0xE000...0xF8FF).contains(c.value) || c.value >= 0xF0000
+        let v = c.value
+        if v < 0x80 { return false }
+        if (0xE000...0xF8FF).contains(v) || v >= 0xF0000 { return true }
+        if let known = iconCache[v] { return known }
+        let icon = nerdProbe.map { !hasGlyph(baseProbe, c) && hasGlyph($0, c) } ?? false
+        iconCache[v] = icon
+        return icon
+    }
+
+    // Glyph coverage does not depend on size; probes and cache are used on the main thread only.
+    private static var iconCache: [UInt32: Bool] = [:]
+    private static let baseProbe = UIFont.monospacedSystemFont(ofSize: 13, weight: .regular) as CTFont
+    private static let nerdProbe: CTFont? = UIFont(name: nerdFontName, size: 13).map { $0 as CTFont }
+
+    /// The font itself has a glyph for `c` (no cascade, no system fallback).
+    static func hasGlyph(_ font: CTFont, _ c: Unicode.Scalar) -> Bool {
+        var units = Array(String(c).utf16)
+        var glyphs = [CGGlyph](repeating: 0, count: units.count)
+        return CTFontGetGlyphsForCharacters(font, &units, &glyphs, units.count)
     }
 
     /// One terminal cell: the "M" advance of the base font.
@@ -217,6 +238,8 @@ enum ANSI {
                 #if DEBUG
                 let iconW = ("\u{F017}" as NSString).size(withAttributes: [.font: nerd]).width
                 assert(abs(iconW - ANSI.cellWidth(size: size)) < 0.5, "Nerd icon is not one cell wide")
+                let promptW = ("\u{276F}" as NSString).size(withAttributes: [.font: nerd]).width
+                assert(abs(promptW - ANSI.cellWidth(size: size)) < 0.5, "omp prompt is not one cell wide")
                 #endif
             } else {
                 icon = regular

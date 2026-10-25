@@ -21,6 +21,9 @@ final class SessionModel: ObservableObject {
     private weak var app: AppState?
     private var loop: Task<Void, Never>?
     private var resizeTask: Task<Void, Never>?
+    /// Generation of the resize whose request is on the wire (past its sleep), if any.
+    private var resizeGen = 0
+    private var inFlightGen: Int?
     private var lastHash: String?
     private var sentCols = 0
     private var sentRows = 0
@@ -234,18 +237,31 @@ final class SessionModel: ObservableObject {
         let rows = min(200, max(10, Int((size.height - 2 * SessionModel.vPad) / font.lineHeight)))
         // Cancel first: a size that returns to the sent one must also drop a pending resize.
         resizeTask?.cancel()
+        // A request already on the wire may have been applied by the server: the sent size is then
+        // unknown, so never short-circuit on it.
+        if inFlightGen != nil {
+            inFlightGen = nil
+            sentCols = 0
+            sentRows = 0
+        }
         guard cols != sentCols || rows != sentRows else { return }
+        resizeGen += 1
+        let gen = resizeGen
         resizeTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 300_000_000)
             guard let self = self, !Task.isCancelled, let api = self.app?.api else { return }
+            self.inFlightGen = gen
             do {
                 try await api.call("POST", "api/resize/\(self.name)", body: ["cols": cols, "rows": rows])
-                self.sentCols = cols
-                self.sentRows = rows
+                if !Task.isCancelled {
+                    self.sentCols = cols
+                    self.sentRows = rows
+                }
             } catch {
                 // Cancelled in flight: the server may or may not have it, so resend next time.
                 if Task.isCancelled { self.sentCols = 0; self.sentRows = 0 } else { self.fail(error) }
             }
+            if self.inFlightGen == gen { self.inFlightGen = nil }
         }
     }
 }
