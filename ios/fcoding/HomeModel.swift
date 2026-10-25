@@ -32,11 +32,10 @@ final class HomeModel: ObservableObject {
         loading = true
         defer { loading = false }
         do {
-            let sent = Date()
             let reply = try await api.get("api/home", as: HomeData.self)
             let received = Date()
             if reply.generatedAt != nil {
-                offset = HomeLogic.clockOffset(generatedAt: reply.generatedAt, sent: sent, received: received)
+                offset = HomeLogic.clockOffset(generatedAt: reply.generatedAt, received: received)
             }
             home = reply
             loadedAt = received
@@ -59,6 +58,9 @@ final class HomeModel: ObservableObject {
             return (false, false, "Tài khoản này không reset được trong app.")
         } catch let e as APIError where [404, 405, 501].contains(e.status) {
             return (false, false, "Máy chủ chưa hỗ trợ, cập nhật máy chủ trước.")
+        } catch let e as APIError where e.status == 409 && e.code == "in_progress" {
+            // Another reset of this account is running; the same requestId may be sent again.
+            return (false, true, "Đang reset tài khoản này, thử lại sau ít giây.")
         } catch {
             return (false, true, "Không reset được: " + (app.report(error) ?? "lỗi mạng").lowercased(with: Locale(identifier: "vi")) + " Thử lại.")
         }

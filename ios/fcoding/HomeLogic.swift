@@ -559,10 +559,11 @@ enum HomeLogic {
 
     // MARK: Server clock
 
-    /// Server clock minus phone clock; `generatedAt` is taken as the middle of the request.
-    static func clockOffset(generatedAt: Date?, sent: Date, received: Date) -> TimeInterval {
+    /// Server clock minus phone clock. The server stamps `generatedAt` just before it sends (after
+    /// its slow parts resolved), so it is compared with the moment the reply arrived.
+    static func clockOffset(generatedAt: Date?, received: Date) -> TimeInterval {
         guard let g = generatedAt else { return 0 }
-        return g.timeIntervalSince(sent.addingTimeInterval(received.timeIntervalSince(sent) / 2))
+        return g.timeIntervalSince(received)
     }
 
     // MARK: Codex reset reply
@@ -674,10 +675,12 @@ enum HomeLogic {
         eq("ring ignores state", ring(HomeBox(state: "paused", sleepsAt: now.addingTimeInterval(hr)), now: now).mode, .run)
         // Phone 4 min fast: the server clock (phone + offset) still sees 2 h before sleep.
         let phone = now.addingTimeInterval(240)
-        let off = clockOffset(generatedAt: now.addingTimeInterval(0.5), sent: phone, received: phone.addingTimeInterval(1))
+        let off = clockOffset(generatedAt: now, received: phone)
         eq("clock offset", off, -240)
+        // A slow reply (the server waited on a refresh) does not shift the offset.
+        eq("clock slow reply", clockOffset(generatedAt: now.addingTimeInterval(30), received: now.addingTimeInterval(30)), 0)
         eq("ring skew", ring(HomeBox(sleepsAt: now.addingTimeInterval(2 * hr)), now: phone.addingTimeInterval(off)).seconds, 7200)
-        eq("clock no date", clockOffset(generatedAt: nil, sent: now, received: now), 0)
+        eq("clock no date", clockOffset(generatedAt: nil, received: now), 0)
         eq("ring woke", ring(HomeBox(sleepsAt: now.addingTimeInterval(-700)), now: now).mode, .unknown)
         eq("ring no data", ring(nil, now: now).mode, .unknown)
         eq("hms", hms(9 * 60 + 12), "00:09:12")

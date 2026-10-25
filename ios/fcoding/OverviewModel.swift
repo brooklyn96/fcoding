@@ -17,8 +17,11 @@ final class OverviewModel: ObservableObject {
     /// The one load in flight; a load() call during it asks for exactly one more (`reloadAfter`).
     private var current: Task<Void, Never>?
     private var reloadAfter = false
-    /// Bumped by a rename: a fetch that started before it carries the old names, so its reply is
-    /// dropped (it would undo the moved read mark) and the follow-up fetch is used instead.
+    /// Renames in flight: every overview reply that arrives meanwhile is dropped, because it may
+    /// hold the old name or the new one, and syncSeen would mark the renamed session read.
+    private var renaming = 0
+    /// Bumped when a rename ends: a reply to a fetch that started before that is dropped too, and
+    /// the fetch is repeated.
     private var generation = 0
     private static let seenKey = "inbox.seen"
 
@@ -53,6 +56,7 @@ final class OverviewModel: ObservableObject {
         let started = generation
         do {
             let fresh = try await api.overview()
+            if renaming > 0 { return }   // the rename fetches once its PATCH has answered
             guard started == generation else {
                 reloadAfter = true
                 return
@@ -152,7 +156,13 @@ final class OverviewModel: ObservableObject {
         guard !busy.contains(name) else { return "Phiên đang bận, thử lại." }
         busy.insert(name)
         defer { busy.remove(name) }
+        let mark = seen[name]
+        renaming += 1
         do {
+            defer {
+                renaming -= 1
+                generation += 1
+            }
             try await api.call("PATCH", "api/sessions/\(name)", body: ["name": newName])
         } catch let e as APIError where e.status == 404 && e.code == "not_found" {
             await load(app)
@@ -166,17 +176,15 @@ final class OverviewModel: ObservableObject {
         } catch {
             return app.report(error) ?? "Chưa đổi được tên, thử lại."
         }
-        generation += 1
         let defaults = UserDefaults.standard
         if let draft = defaults.string(forKey: "draft.\(name)") {
             defaults.set(draft, forKey: "draft.\(newName)")
             defaults.removeObject(forKey: "draft.\(name)")
         }
-        if let mark = seen[name] {
-            seen[newName] = mark
-            seen[name] = nil
-            saveSeen()
-        }
+        // The mark read before the PATCH: no reply since then has been applied to `seen`.
+        if let mark = mark { seen[newName] = mark }
+        seen[name] = nil
+        saveSeen()
         await load(app)
         return nil
     }
