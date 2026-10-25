@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Install the coding-harness auto-update timer for the current user. Safe to re-run.
-#   0. creates /opt/fcode-tools (owned by this user): versioned installs of claude, codex, opencode, cmd
+#   0. creates /opt/fcode-tools (owned by this user): versioned installs of claude and codex
 #   1. fcode-update.sh   -> ~/.local/bin/fcode-update
 #   2. fcode-update.service + .timer -> ~/.config/systemd/user, timer enabled
-#   3. turns off the built-in self-updaters of Command Code and OpenCode (and claude if not already off)
-#      (the tools are replaced only through the versioned layout, never by themselves)
+#   3. turns off claude's built-in self-updater unless the box already does (tools are replaced only
+#      through the versioned layout, never by themselves)
 set -euo pipefail
 
 D=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -41,12 +41,10 @@ put "$D/fcode-update.service" "$UNITS/fcode-update.service" 644
 put "$D/fcode-update.timer" "$UNITS/fcode-update.timer" 644
 mkdir -p "$HOME/.local/state/fcode-update"
 
-# built-in self-updaters off (our timer does the updating)
+# claude's built-in self-updater off (our timer does the updating)
 # claude: skipped when the box already sets it system-wide (instabox image: /etc/claude-code/managed-settings.json)
 grep -qs DISABLE_AUTOUPDATER /etc/claude-code/managed-settings.json \
   || json_set "$HOME/.claude/settings.json" '.env.DISABLE_AUTOUPDATER = "1"'
-json_set "$HOME/.commandcode/updates.json" '.autoUpdate = false'
-json_set "$HOME/.config/opencode/opencode.json" '.autoupdate = false'
 
 # the user manager must keep running without a login
 [ "$(loginctl show-user "$(id -u)" -p Linger --value 2>/dev/null)" = yes ] || sudo -n loginctl enable-linger "$USER"

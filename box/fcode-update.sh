@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# fcode-update: keep omp, claude, codex, opencode and cmd (Command Code) up to date.
+# fcode-update: keep omp, claude and codex up to date.
 # Usage: fcode-update [tool ...]   (default: all five)
 #
-# npm tools (claude, codex, opencode, cmd) are never modified in place. Every version is installed into
+# npm tools (claude, codex) are never modified in place. Every version is installed into
 # its own prefix, /opt/fcode-tools/<tool>/<version>, verified there, and only then made current by one
 # atomic symlink switch: /opt/fcode-tools/<tool>/current -> <version>. /usr/local/bin/<bin> point at
 # <tool>/current/bin/<bin>. A running process keeps the directory it started from, so no "is it busy"
@@ -19,7 +19,7 @@ export LC_ALL=C NO_UPDATE_NOTIFIER=1 npm_config_update_notifier=false
 STATE="${FCODE_UPDATE_STATE:-$HOME/.local/state/fcode-update}"
 LOG="$STATE/log"
 STATUS="$STATE/status.json"
-ALL="omp claude codex opencode cmd"
+ALL="omp claude codex"
 ROOT="${FCODE_TOOLS_ROOT:-/opt/fcode-tools}" # versioned installs
 BINDIR="${FCODE_BINDIR:-/usr/local/bin}"      # where the bin symlinks live
 NM="${FCODE_UPDATE_NM:-}"                     # old global npm root (migration source), set in main
@@ -37,16 +37,6 @@ pkg_of() {
   case $1 in
     claude) echo @anthropic-ai/claude-code ;;
     codex) echo @openai/codex ;;
-    opencode) echo @opencode/cli ;;
-    cmd) echo command-code ;;
-  esac
-}
-# the process names a running tool can have (bin names and process titles)
-tool_names() {
-  case $1 in
-    opencode) echo "opencode opencode2" ;;
-    cmd) echo "cmd cmdc command-code commandcode" ;;
-    *) echo "$1" ;;
   esac
 }
 
@@ -120,7 +110,7 @@ newer() {
 verify() {
   local out
   out=$(x 30 "$1/bin/$2" --version 2>&1 </dev/null) || return 1
-  # the version as a whole token; "v" may be glued to it (opencode prints "opencode v2.1.4")
+  # the version as a whole token; "v" may be glued to it
   printf %s "$out" | grep -Eq "(^|[^0-9.])v?${3//./\.}([^0-9A-Za-z.-]|$)"
 }
 
@@ -169,11 +159,11 @@ dir_in_use() {
   return 1
 }
 
-# oldest_tool_start <tool>: start time (seconds after boot) of the oldest running process that looks like the tool (any of its bin
-# names or process titles in comm or the first five arguments). A node script keeps only its symlink in
+# oldest_tool_start <tool>: start time (seconds after boot) of the oldest running process that looks like the tool (its bin
+# name in comm or the first five arguments). A node script keeps only its symlink in
 # its command line, so this is how a long-lived old session is noticed. Looking too broad only delays cleanup.
 oldest_tool_start() {
-  local names=" $(tool_names "$1") " d pid w s best='' a=()
+  local names=" $1 " d pid w s best='' a=()
   for d in /proc/[0-9]*; do
     pid=${d#/proc/}
     [ "$pid" = "$$" ] && continue

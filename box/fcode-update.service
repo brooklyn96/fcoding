@@ -1,5 +1,5 @@
 [Unit]
-Description=Update coding harnesses (omp, claude, codex, opencode, cmd)
+Description=Update coding harnesses (omp, claude, codex)
 
 [Service]
 Type=oneshot
