@@ -248,6 +248,7 @@ struct AboutView: View {
             Section {
                 Text("Màn hình Hạn mức làm theo cách hiển thị của Pane (màu theo tốc độ dùng, biểu đồ xu hướng, biểu đồ chi phí).")
                     .font(.subheadline)
+                Text("Pane").font(.subheadline.weight(.semibold))
                 Text(AboutView.paneLicense)
                     .font(.system(.caption, design: .monospaced))
                     .textSelection(.enabled)
@@ -261,7 +262,7 @@ struct AboutView: View {
     }
 
     static let paneLicense = """
-    Pane — MIT License
+    MIT License
 
     Copyright (c) 2026 Jazii (Pane for Windows)
     Copyright (c) 2025 Robin Ebers (OpenUsage for macOS — provider research and original concept, https://github.com/robinebers/openusage)
@@ -298,18 +299,19 @@ struct FormHeader<Leading: View, Trailing: View>: View {
 
     var body: some View {
         Section {
-            ZStack {
+            // Equal fixed sides keep the title centred; it shrinks before it would reach them.
+            HStack(spacing: 4) {
+                leading.frame(width: 112, alignment: .leading)
                 Text(title)
                     .scaledFont(17, weight: .semibold)
                     .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                    .frame(maxWidth: .infinity)
                     .accessibilityAddTraits(.isHeader)
-                HStack(spacing: 0) {
-                    leading
-                    Spacer(minLength: 0)
-                    trailing
-                }
+                trailing.frame(width: 112, alignment: .trailing)
             }
             .frame(minHeight: 44)
+            .dynamicTypeSize(...DynamicTypeSize.xxLarge)
             .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
             .listRowBackground(Color.clear)
         }
@@ -327,7 +329,7 @@ struct HeaderTextButton: View {
         Button(action: action) {
             HStack(spacing: 2) {
                 if back { Image(systemName: "chevron.left").font(.system(size: 20, weight: .semibold)) }
-                Text(title).scaledFont(17, weight: bold ? .semibold : .regular)
+                Text(title).scaledFont(17, weight: bold ? .semibold : .regular).lineLimit(1).minimumScaleFactor(0.7)
             }
             .foregroundColor(.accentBlue)
             .padding(.horizontal, 6)

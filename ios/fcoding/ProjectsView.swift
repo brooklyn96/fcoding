@@ -636,7 +636,7 @@ struct EmptySessions: View {
     var body: some View {
         VStack(spacing: 0) {
             Image(systemName: "terminal")
-                .scaledFont(44, weight: .regular)
+                .font(.system(size: 44, weight: .regular))
                 .foregroundColor(HarnessStyle.color("omp"))
                 .frame(height: 96)
                 .accessibilityHidden(true)

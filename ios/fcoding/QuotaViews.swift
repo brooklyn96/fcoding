@@ -534,28 +534,35 @@ struct QuotaDetailView: View {
         }
     }
 
+    /// Back button, title, and an empty side as wide as the back button: the title stays centred
+    /// and never runs under the button (it shrinks first).
     private var nav: some View {
-        ZStack {
-            Text("Hạn mức").scaledFont(17, weight: .semibold).accessibilityAddTraits(.isHeader)
-            HStack {
-                Button { dismiss() } label: {
-                    HStack(spacing: 2) {
-                        Image(systemName: "chevron.left").scaledFont(20, weight: .semibold)
-                        Text("FCode").scaledFont(17)
-                    }
-                    .foregroundColor(.accentBlue)
-                    .padding(.horizontal, 6)
-                    .frame(minHeight: 44)
-                    .contentShape(Rectangle())
+        HStack(spacing: 4) {
+            Button { dismiss() } label: {
+                HStack(spacing: 2) {
+                    Image(systemName: "chevron.left").scaledFont(20, weight: .semibold)
+                    Text("FCode").scaledFont(17).lineLimit(1).minimumScaleFactor(0.7)
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Quay lại FCode")
-                Spacer()
+                .foregroundColor(.accentBlue)
+                .padding(.horizontal, 6)
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Quay lại FCode")
+            .frame(width: 104, alignment: .leading)
+            Text("Hạn mức")
+                .scaledFont(17, weight: .semibold)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+                .frame(maxWidth: .infinity)
+                .accessibilityAddTraits(.isHeader)
+            Color.clear.frame(width: 104, height: 1)
         }
-        .frame(height: 44)
+        .frame(minHeight: 44)
         .padding(.leading, 4)
         .padding(.trailing, 12)
+        .dynamicTypeSize(...DynamicTypeSize.xxLarge)
     }
 
     @ViewBuilder
@@ -743,8 +750,6 @@ private struct AccountCard: View {
                     Text("·").scaledFont(11).foregroundColor(.paneTrack)
                     link("Trạng thái", QuotaLinks.status(account.harness))
                 }
-                .padding(.vertical, -6)
-                .padding(.top, 2)
                 if account.harness == "codex" {
                     if expanded {
                         HStack {
@@ -764,11 +769,10 @@ private struct AccountCard: View {
                         }
                         .scaledFont(11)
                         .foregroundColor(.paneMuted)
-                        .frame(maxWidth: .infinity, minHeight: 44)
+                        .frame(maxWidth: .infinity, minHeight: 36)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .padding(.vertical, -4)
                 }
             }
         }
@@ -777,7 +781,7 @@ private struct AccountCard: View {
     private func link(_ title: String, _ url: URL?) -> some View {
         Button { if let url = url { openURL(url) } } label: {
             Text(title).scaledFont(11).foregroundColor(.paneMuted)
-                .padding(.horizontal, 4).frame(minHeight: 44).contentShape(Rectangle())
+                .padding(.horizontal, 4).frame(minHeight: 34).contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
@@ -827,33 +831,31 @@ private struct MetricRow: View {
             }
             .frame(height: 6)
             .tipAnchor("bar." + id, tip)
-            // 26 pt tall touch area around the 6 pt bar.
-            .padding(.vertical, 10)
+            // Touch area: 10 pt above the 6 pt bar, 4 pt below (where the toggles begin).
+            .padding(.top, 10).padding(.bottom, 4)
             .contentShape(Rectangle())
             .onTapGesture { if !pace.title.isEmpty { tip = TipItem(id: "bar." + id, text: pace.title) } }
-            .padding(.vertical, -10)
+            .padding(.top, -10).padding(.bottom, -4)
             .accessibilityElement()
             .accessibilityLabel("\(window.label): đã dùng \(Int(used.rounded()))%" + (pace.note.isEmpty ? "" : ", " + pace.note))
             HStack(spacing: 8) {
-                // 44 pt tall hit areas; the row still takes 28 pt of layout.
+                // 30 pt tall hit areas from the end of the bar's touch area to the end of the row.
                 Button { showUsed.toggle() } label: {
                     Text(HomeLogic.headline(window, showUsed: showUsed)).monospacedDigit().foregroundColor(.paneFg)
-                        .frame(minHeight: 44).contentShape(Rectangle())
+                        .frame(minHeight: 30).contentShape(Rectangle())
                 }
                 Spacer(minLength: 0)
                 Button { exact.toggle() } label: {
                     Text(HomeLogic.resetText(window, now: now, exact: exact)).foregroundColor(.paneMuted)
-                        .frame(minHeight: 44).contentShape(Rectangle())
+                        .frame(minHeight: 30).contentShape(Rectangle())
                 }
             }
             .buttonStyle(.plain)
             .scaledFont(12)
             .lineLimit(1)
-            .frame(minHeight: 44)
-            .padding(.vertical, -8)
-            .padding(.top, 4).padding(.bottom, -8)
+            .padding(.top, 4)
         }
-        .padding(.vertical, 10)
+        .padding(.top, 10)
     }
 }
 
@@ -993,8 +995,10 @@ private struct SpendDonut: View {
                             .onTapGesture { tip = TipItem(id: "wedge", text: wedgeTip(ws[i], total)) }
                     }
                     VStack(spacing: 0) {
-                        Text(HomeLogic.usd(total)).scaledFont(14, weight: .semibold).monospacedDigit()
-                        Text("30 ngày").scaledFont(10.5).foregroundColor(.paneMuted)
+                        // Inside the fixed 70 pt hole: fixed sizes.
+                        Text(HomeLogic.usd(total)).font(.system(size: 14, weight: .semibold)).monospacedDigit()
+                            .lineLimit(1).minimumScaleFactor(0.7)
+                        Text("30 ngày").font(.system(size: 10.5)).foregroundColor(.paneMuted)
                     }
                     .allowsHitTesting(false)
                 }
