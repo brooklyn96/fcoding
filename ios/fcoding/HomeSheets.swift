@@ -446,7 +446,7 @@ struct RenameSheet: View {
             errorText = "Tên chưa hợp lệ: chỉ chữ thường không dấu, số và “-” (tối đa 32)."
             return
         }
-        guard !taken.contains(v) else { errorText = "Đã có phiên tên này."; return }
+        guard !taken.contains(v) else { errorText = "Tên này đã có phiên khác."; return }
         saving = true
         errorText = nil
         Task {

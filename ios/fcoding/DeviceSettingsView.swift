@@ -17,6 +17,12 @@ struct DeviceSettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
+                // The header scrolls with the content (only harness session screens freeze theirs).
+                FormHeader(title: "Cài đặt") {
+                    HeaderIconButton(symbol: "questionmark.circle", label: "Hướng dẫn") { showGuide = true }
+                } trailing: {
+                    HeaderTextButton(title: "Đóng", bold: true) { dismiss() }
+                }
                 Section("Máy chủ") {
                     Text(app.serverURL).textSelection(.enabled)
                 }
@@ -40,14 +46,9 @@ struct DeviceSettingsView: View {
                 }
             }
             .navigationTitle("Cài đặt")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button { showGuide = true } label: { Image(systemName: "questionmark.circle") }
-                        .accessibilityLabel("Hướng dẫn")
-                }
-                ToolbarItem(placement: .confirmationAction) { Button("Đóng") { dismiss() } }
-            }
+            .toolbar(.hidden, for: .navigationBar)
+            .scrollIndicators(.hidden)
+            .background(SwipeBackEnabler().frame(width: 0, height: 0))
             .sheet(isPresented: $showGuide) { PairGuideView() }
             .confirmationDialog("Gỡ mọi thiết bị khỏi box?", isPresented: $confirmAll, titleVisibility: .visible) {
                 Button("Gỡ mọi thiết bị", role: .destructive) { run(.all) }
@@ -83,6 +84,7 @@ struct DeviceSettingsView: View {
 /// type on the new iPhone. Live countdown on this phone's clock; a share link with the server.
 struct AddDeviceView: View {
     @EnvironmentObject private var app: AppState
+    @Environment(\.dismiss) private var dismiss
     @State private var reply: PairCodeResponse?
     /// Expiry on this phone's clock (see API.pairCode).
     @State private var expires = Date()
@@ -96,6 +98,11 @@ struct AddDeviceView: View {
 
     var body: some View {
         Form {
+            FormHeader(title: "Thêm thiết bị") {
+                HeaderTextButton(title: "Cài đặt", back: true) { dismiss() }
+            } trailing: {
+                HeaderIconButton(symbol: "questionmark.circle", label: "Hướng dẫn") { showGuide = true }
+            }
             if let reply = reply {
                 let left = Int(expires.timeIntervalSince(now).rounded(.up))
                 Section {
@@ -125,13 +132,8 @@ struct AddDeviceView: View {
             }
         }
         .navigationTitle("Thêm thiết bị")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .navigationBarTrailing) {
-                Button { showGuide = true } label: { Image(systemName: "questionmark.circle") }
-                    .accessibilityLabel("Hướng dẫn")
-            }
-        }
+        .toolbar(.hidden, for: .navigationBar)
+        .scrollIndicators(.hidden)
         .sheet(isPresented: $showGuide) { PairGuideView() }
         .onReceive(tick) { now = $0 }
     }
@@ -210,5 +212,75 @@ struct AddDeviceView: View {
         guard let output = filter.outputImage,
               let cg = CIContext().createCGImage(output, from: output.extent) else { return nil }
         return UIImage(cgImage: cg)
+    }
+}
+
+// MARK: - Scrolling header row (non-session screens)
+
+/// A Form's first row used as the screen header: centred title, one control on each side. It
+/// scrolls away with the content; the navigation bar stays hidden.
+struct FormHeader<Leading: View, Trailing: View>: View {
+    let title: String
+    @ViewBuilder let leading: Leading
+    @ViewBuilder let trailing: Trailing
+
+    var body: some View {
+        Section {
+            ZStack {
+                Text(title)
+                    .font(.system(size: 17, weight: .semibold))
+                    .lineLimit(1)
+                    .accessibilityAddTraits(.isHeader)
+                HStack(spacing: 0) {
+                    leading
+                    Spacer(minLength: 0)
+                    trailing
+                }
+            }
+            .frame(minHeight: 44)
+            .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
+            .listRowBackground(Color.clear)
+        }
+    }
+}
+
+struct HeaderTextButton: View {
+    let title: String
+    var bold = false
+    /// Shows "‹" before the title (back to the previous screen).
+    var back = false
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 2) {
+                if back { Image(systemName: "chevron.left").font(.system(size: 20, weight: .semibold)) }
+                Text(title).font(.system(size: 17, weight: bold ? .semibold : .regular))
+            }
+            .foregroundColor(.accentBlue)
+            .padding(.horizontal, 6)
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .accessibilityLabel(back ? "Quay lại \(title)" : title)
+    }
+}
+
+struct HeaderIconButton: View {
+    let symbol: String
+    let label: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 20))
+                .foregroundColor(.accentBlue)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .accessibilityLabel(label)
     }
 }

@@ -146,10 +146,15 @@ final class OverviewModel: ObservableObject {
         defer { busy.remove(name) }
         do {
             try await api.call("PATCH", "api/sessions/\(name)", body: ["name": newName])
-        } catch let e as APIError where [404, 405, 501].contains(e.status) && e.code != "not_found" {
+        } catch let e as APIError where e.status == 404 && e.code == "not_found" {
+            await load(app)
+            return "Phiên này không còn nữa."
+        } catch let e as APIError where [404, 405, 501].contains(e.status) {
             return "Máy chủ chưa hỗ trợ đổi tên, cập nhật máy chủ trước."
         } catch let e as APIError where e.status == 409 {
-            return "Đã có phiên tên này."
+            return "Tên này đã có phiên khác."
+        } catch let e as APIError where e.status == 400 {
+            return "Tên không hợp lệ."
         } catch {
             return app.report(error) ?? "Chưa đổi được tên, thử lại."
         }
