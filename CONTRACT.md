@@ -137,9 +137,9 @@ Applies to `GET /api/screen/:name` and `GET /api/stream/:name` (the SSE `screen`
 1. Optional query `ansi=1`.
    - With `ansi=1` the text keeps colours: the server runs `tmux capture-pane -p -e -J -t =<name>: -S -<lines>` (`-e` added).
    - Without it, or with any other value (`ansi=0`, `ansi=true`, empty), nothing changes: the same tmux call, no escapes. Apps installed before v1.1 keep working.
-2. With `ansi=1` only SGR sequences (`ESC [ <params> m`) may appear in `text`. The server removes every other escape sequence: other CSI (cursor, erase, private modes), OSC (titles, OSC 8 hyperlinks), DCS/APC/PM/SOS, two-byte `ESC x` sequences, and a lone ESC. What stays is written in one simple form that a client can parse by splitting on `;`:
+2. With `ansi=1` only SGR sequences (`ESC [ <params> m`) may appear in `text`. The server removes every other escape sequence: other CSI (cursor, erase, private modes), OSC (titles, OSC 8 hyperlinks), DCS/APC/PM/SOS, two-byte `ESC x` sequences, a lone ESC, and SO/SI (0x0E, 0x0F), so the text equals a plain capture. What stays is written in one simple form that a client can parse by splitting on `;`:
    - parameters are integers separated by `;`; `ESC [ m` is sent as `ESC [ 0 m`;
-   - colours are `38;5;n`, `48;5;n`, `38;2;r;g;b`, `48;2;r;g;b` (n, r, g, b in 0..255); the colon forms (`38:2::r:g:b`, `4:3`) are rewritten (`4:0` becomes `24`, any other `4:x` becomes `4`);
+   - colours are `38;5;n`, `48;5;n`, `38;2;r;g;b`, `48;2;r;g;b` (n, r, g, b in 0..255); the colon forms (`38:2::r:g:b`) are rewritten, and a cut-off one is dropped; `4:0` becomes `24`, any other `4:x` becomes `4`, `5:3` (overline) becomes `53`, any other colon group is dropped;
    - the underline colour (`58`, `59`), colours that are cut off or out of range, and codes above 107 are dropped; a sequence with nothing left is dropped.
 3. Server-side text matching never sees escapes: prompt detection, the preview and the inbox/overview state work on text with escapes removed. (`/api/overview` reads the pane without `-e` and also strips any escape it meets.)
 4. `hash` covers exactly the `text` that is sent (plus size and cursor, as before). With `ansi=1` a colour-only change gives a new hash, so the stream sends a new event. Trailing lines that hold only SGR and blanks count as blank and are trimmed, like trailing blank lines today.
