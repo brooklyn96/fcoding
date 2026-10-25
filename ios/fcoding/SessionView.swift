@@ -314,6 +314,11 @@ struct ComposerView: View {
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     @State private var draft = ""
     @State private var sending = false
+    /// New identity for the field after a send, so no UITextView keeps the sent text.
+    @State private var fieldID = 0
+    /// The text just sent and cleared. If the old field writes it back (an IME commit on resign),
+    /// onChange drops it instead of storing it again. Reset by the next real edit.
+    @State private var justSent: String?
     @State private var showKeys = false
 
     /// Landscape on iPhone: no grab handle, a 1–2 line field, key row behind a toggle.
@@ -368,6 +373,10 @@ struct ComposerView: View {
             if draft.isEmpty, let saved = UserDefaults.standard.string(forKey: draftKey) { draft = saved }
         }
         .onChange(of: draft) { value in
+            if let sent = justSent, !value.isEmpty {
+                justSent = nil
+                if value == sent { draft = ""; return }
+            }
             if value.isEmpty {
                 UserDefaults.standard.removeObject(forKey: draftKey)
             } else {
@@ -384,6 +393,7 @@ struct ComposerView: View {
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .focused(focused)
+                .id(fieldID)
                 .padding(.vertical, 8)
             sendButton
         }
@@ -484,21 +494,39 @@ struct ComposerView: View {
             .foregroundColor(.primary)
     }
 
+    /// On success the field is emptied and the stored draft removed, unless the draft changed while
+    /// sending (compared with the exact snapshot taken here).
+    ///
+    /// Order matters. Vietnamese Telex keeps the last word as marked (composing) text. Clearing the
+    /// binding while the field is still first responder, then resigning it (auto-hide), made UIKit
+    /// commit the composition and the field write the OLD text back through the binding; onChange
+    /// stored it again and onAppear restored it. So: resign first (commits the composition), let that
+    /// settle, then clear and rebuild the field.
     private func submit(enter: Bool) {
-        let text = draft
-        guard !sending, enter || !text.isEmpty else { return }
+        let snapshot = draft
+        guard !sending, enter || !snapshot.isEmpty else { return }
         sending = true
-        let job = onSend(text, enter) // queued now, in tap order with the quick keys
+        let job = onSend(snapshot, enter) // queued now, in tap order with the quick keys
         Task {
             let ok = await job.value
-            if ok, draft == text { draft = "" }
-            // Clear the stored copy here too: onChange(of: draft) may never run if the composer
-            // hides right after this send.
-            if ok, UserDefaults.standard.string(forKey: draftKey) == text {
+            guard ok, draft == snapshot else { sending = false; return } // failed, or edited meanwhile
+            let stayOpen = pinned
+            focused.wrappedValue = false
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            if draft == snapshot {
+                justSent = snapshot.isEmpty ? nil : snapshot
+                draft = ""
                 UserDefaults.standard.removeObject(forKey: draftKey)
+                fieldID += 1
             }
             sending = false
-            if ok, draft.isEmpty { onSent() }
+            if !draft.isEmpty { return }
+            if stayOpen {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+                focused.wrappedValue = true
+            } else {
+                onSent()
+            }
         }
     }
 }
