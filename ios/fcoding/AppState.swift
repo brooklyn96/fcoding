@@ -14,9 +14,8 @@ final class AppState: ObservableObject {
     /// Paired by an older build to an address this build rejects (shown escaped). While set,
     /// the app shows only the "pair again" card and sends that server nothing (`api` is nil).
     @Published private(set) var unsupportedServer: String?
-    /// The escaped address of an unsupported box left behind; repeated as a popup once the
-    /// next pairing succeeds, since that box still lists this iPhone.
-    private var oldBoxLeft: String?
+    /// Where the card is (CardFlow); meaningful only while `unsupportedServer` is set.
+    @Published private(set) var cardState: CardFlow.State = .card
 
     private static let serverKey = "serverURL"
     private static let tokenAccount = "deviceToken"
@@ -37,18 +36,37 @@ final class AppState: ObservableObject {
         "Box cũ (\(address)) vẫn còn iPhone này trong danh sách thiết bị; gỡ nó trên box đó."
     }
 
-    /// Every way out of the card ("Ghép lại", "Đăng xuất", a pairing link) is local only: no
-    /// request to the unsupported server. All of them clear its drafts and read marks and say
-    /// that the old box still lists this iPhone; the pairing screen opens with an empty address.
-    func leaveUnsupported(signOut: Bool) {
+    /// Every card event goes through CardFlow.step. Nothing local is deleted unless a pairing
+    /// with a new server succeeds or "Đăng xuất" is confirmed; nothing is ever sent to the
+    /// unsupported server.
+    func card(_ event: CardFlow.Event) {
+        guard unsupportedServer != nil else { return }
+        let next = CardFlow.step(cardState, event)
+        cardState = next.state
+        if next.cleanup { leaveUnsupported(signingOut: event == .signOutConfirm) }
+    }
+
+    /// The ONE cleanup for leaving the card, reached only through `card(_:)`: drafts and read
+    /// marks go; on sign-out also the stored server and the old login (a successful pairing
+    /// has already replaced both). Then the old-box notice, once.
+    private func leaveUnsupported(signingOut: Bool) {
         guard let old = unsupportedServer else { return }
-        unsupportedServer = nil
-        oldBoxLeft = old
-        serverURL = ""
-        UserDefaults.standard.removeObject(forKey: AppState.serverKey)
         AppState.removeDrafts()
         UserDefaults.standard.removeObject(forKey: "inbox.seen")
-        signOutLocally(notice: (signOut ? "Đã đăng xuất trên iPhone này. " : "") + AppState.oldBoxLine(old))
+        if signingOut {
+            UserDefaults.standard.removeObject(forKey: AppState.serverKey)
+            serverURL = ""
+            Keychain.delete(AppState.tokenAccount)
+            token = nil
+        }
+        unsupportedServer = nil
+        popup = AppState.oldBoxLine(old)
+    }
+
+    /// Closing the pairing screen without pairing (Huỷ, swipe down): back to where it was.
+    func cancelPairing() {
+        pairLink = nil
+        card(.cancel)
     }
 
     /// Password-login leftovers: the old token (Keychain account "token" or UserDefaults), the
@@ -85,8 +103,7 @@ final class AppState: ObservableObject {
         if token != nil && link.server == serverURL {
             popup = "iPhone này đã ghép với máy chủ \(PairLink.label(link.server)) rồi."
         } else {
-            // From the card: leave it first (notice + cleanup), then pair on the root screen.
-            leaveUnsupported(signOut: false)
+            card(.link)   // from the card: only opens pairing, nothing is deleted
             pairLink = link
         }
     }
@@ -110,19 +127,15 @@ final class AppState: ObservableObject {
         UserDefaults.standard.set(serverURL, forKey: AppState.serverKey)
         notice = nil
         pairLink = nil
-        unsupportedServer = nil
         token = newToken
-        if let old = oldBoxLeft {
-            oldBoxLeft = nil
-            popup = AppState.oldBoxLine(old)
-        }
+        card(.pairSuccess)   // from the card: the one cleanup, then the old-box notice
         guard let previous = previous else { return }
         do {
             try await previous.call("POST", "api/logout")
         } catch let e as APIError where e.status == 401 {
             // Already gone on the old box.
         } catch {
-            popup = "Chưa gỡ được iPhone này khỏi máy chủ cũ \(PairLink.escapedAuthority(previous.base.absoluteString)); vào máy chủ cũ để gỡ."
+            popup = "Chưa gỡ được iPhone này khỏi máy chủ cũ \(PairLink.label(previous.base.absoluteString)); vào máy chủ cũ để gỡ."
         }
     }
 
@@ -183,7 +196,6 @@ final class AppState: ObservableObject {
     }
 
     func signOutLocally(notice: String?) {
-        unsupportedServer = nil
         Keychain.delete(AppState.tokenAccount)
         self.notice = notice
         token = nil

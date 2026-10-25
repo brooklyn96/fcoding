@@ -26,6 +26,8 @@ struct PairLink: Equatable {
     /// IPv4 (4 decimal octets 0-255, no leading zeros, NO trailing dot), or a name (one
     /// trailing dot dropped; >= 2 LDH labels of 1-63, no edge `-`, no `xn--`, <= 253, last
     /// label not numeric). Port: 1-5 digits, no leading zero, 1-65535; 443 left out.
+    /// No extra reject step: the Foundation URL round trip is NOT checked here. The self-test
+    /// asserts it on every accepted vector, and a disagreement is a bug to report.
     static func strict(_ input: String) -> String? {
         // Printable ASCII on the RAW input first (per scalar: a lone CR or LF is caught, and
         // lowercasing cannot fold e.g. KELVIN SIGN into "k").
@@ -67,9 +69,7 @@ struct PairLink: Equatable {
                   let n = Int(text), (1...65535).contains(n) else { return nil }
             port = n == 443 ? nil : n
         }
-        let origin = "https://" + host + (port.map { ":\($0)" } ?? "")
-        guard URL(string: origin)?.absoluteString == origin else { return nil }
-        return origin
+        return "https://" + host + (port.map { ":\($0)" } ?? "")
     }
 
     private static func isDigits<S: StringProtocol>(_ s: S) -> Bool {
@@ -123,15 +123,17 @@ struct PairLink: Equatable {
     /// talk to. false = the app asks to pair again and sends that server nothing.
     static func isSupportedStored(_ stored: String) -> Bool { stored.isEmpty || origin(stored) != nil }
 
-    /// The host part of a stored address for display: printable ASCII as is, every other
-    /// scalar escaped as `\u{XXXX}`, at most 100 scalars.
+    /// ONLY for a raw stored address this build rejects (the card): the host part with
+    /// printable ASCII as is and every other scalar as `\u{XXXX}`; past 100 scalars it is cut
+    /// and ends in "…". Canonical addresses are shown with `label` instead, never cut.
     static func escapedAuthority(_ stored: String) -> String {
         var s = Substring(stored)
         if let r = s.range(of: "://") { s = s[r.upperBound...] }
         if let cut = s.firstIndex(where: { "/?#".contains($0) }) { s = s[..<cut] }
-        return s.unicodeScalars.prefix(100).map { u in
+        let shown = s.unicodeScalars.prefix(100).map { u in
             (0x21..<0x7F).contains(u.value) ? String(u) : String(format: "\\u{%04X}", u.value)
         }.joined()
+        return s.unicodeScalars.count > 100 ? shown + "…" : shown
     }
 
     /// The shared table (test/origin-vectors.json, `vectors`: [input, canonical or null]) through
@@ -141,10 +143,16 @@ struct PairLink: Equatable {
               let vectors = obj["vectors"] as? [[Any]], !vectors.isEmpty else { return ["vectors file unreadable"] }
         var failures: [String] = []
         for v in vectors {
-            guard v.count == 2, let input = v[0] as? String else { failures.append("bad vector \(v)"); continue }
-            let want = v[1] as? String   // JSON null -> nil
+            // Expected must be a string or JSON null; anything else is a broken vector.
+            guard v.count == 2, let input = v[0] as? String, v[1] is String || v[1] is NSNull
+            else { failures.append("bad vector \(v)"); continue }
+            let want = v[1] as? String
             let got = strict(input)
             if got != want { failures.append("\(input.debugDescription): want \(want ?? "null"), got \(got ?? "null")") }
+            // Assertion only (never a reject in strict): Foundation must print it unchanged.
+            if let got = got, URL(string: got)?.absoluteString != got {
+                failures.append("\(input.debugDescription): URL round trip disagrees (\(URL(string: got)?.absoluteString ?? "nil"))")
+            }
         }
         return failures
     }
@@ -225,6 +233,55 @@ struct PairLink: Equatable {
         }
         if PairLink.escapedAuthority("https://bücher.de/x") != "b\\u{00FC}cher.de" {
             failures.append("escaped: \(PairLink.escapedAuthority("https://bücher.de/x"))")
+        }
+        let long = String(repeating: "a", count: 120)
+        if PairLink.escapedAuthority("https://" + long) != String(repeating: "a", count: 100) + "…" {
+            failures.append("escaped cut marker")
+        }
+        failures += CardFlow.selfTest().map { "CardFlow " + $0 }
+        return failures
+    }
+}
+
+/// The unsupported-server card as a pure state machine. Invariant: nothing local is deleted
+/// unless a pairing with a new server SUCCEEDS or the user CONFIRMS "Đăng xuất".
+enum CardFlow {
+    enum State: CaseIterable { case card, pairing, confirmSignOut, left }
+    enum Event: CaseIterable { case link, pairAgain, cancel, pairSuccess, pairFail, signOut, signOutConfirm, signOutCancel }
+
+    /// Next state, and whether to run the one cleanup (drafts, read marks, old login, old box notice).
+    static func step(_ state: State, _ event: Event) -> (state: State, cleanup: Bool) {
+        switch (state, event) {
+        case (.left, _): return (.left, false)
+        case (_, .pairSuccess): return (.left, true)
+        case (_, .link): return (.pairing, false)                      // a link always opens pairing
+        case (.card, .pairAgain): return (.pairing, false)
+        case (.card, .signOut): return (.confirmSignOut, false)
+        case (.pairing, .cancel): return (.card, false)
+        case (.confirmSignOut, .signOutConfirm): return (.left, true)
+        case (.confirmSignOut, .signOutCancel): return (.card, false)
+        default: return (state, false)                               // pairFail and stray events
+        }
+    }
+
+    static func selfTest() -> [String] {
+        var failures: [String] = []
+        for s in State.allCases {
+            for e in Event.allCases {
+                let r = step(s, e)
+                let mayClean = s != .left && (e == .pairSuccess || (e == .signOutConfirm && s == .confirmSignOut))
+                if r.cleanup != mayClean { failures.append("\(s) + \(e): cleanup \(r.cleanup)") }
+                if r.cleanup && r.state != .left { failures.append("\(s) + \(e): cleanup without leaving") }
+            }
+        }
+        let path: [(State, Event, State)] = [
+            (.card, .link, .pairing), (.card, .pairAgain, .pairing), (.pairing, .cancel, .card),
+            (.pairing, .pairFail, .pairing), (.pairing, .link, .pairing), (.card, .signOut, .confirmSignOut),
+            (.confirmSignOut, .signOutCancel, .card), (.confirmSignOut, .link, .pairing),
+            (.card, .cancel, .card), (.card, .signOutConfirm, .card),
+        ]
+        for (s, e, want) in path where step(s, e).state != want {
+            failures.append("\(s) + \(e) -> \(step(s, e).state), want \(want)")
         }
         return failures
     }

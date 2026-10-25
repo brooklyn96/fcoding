@@ -34,6 +34,8 @@ struct RootView: View {
         .onChange(of: app.pairLink) { _ in Overlay.shared.sync(app) }
         .onChange(of: app.popup) { _ in Overlay.shared.sync(app) }
         .onChange(of: app.token) { _ in Overlay.shared.sync(app) }
+        .onChange(of: app.cardState) { _ in Overlay.shared.sync(app) }
+        .onChange(of: app.unsupportedServer) { _ in Overlay.shared.sync(app) }
         .onChange(of: scenePhase) { _ in Overlay.shared.sync(app) }
     }
 }
@@ -50,7 +52,10 @@ final class Overlay: ObservableObject {
     private var window: UIWindow?
 
     /// While paired, a link opens the pair sheet here (unpaired, the root PairView takes it).
-    static func wantsSheet(_ app: AppState) -> Bool { app.token != nil && app.pairLink != nil }
+    /// From the unsupported-server card, "Ghép lại" opens it too (CardFlow state .pairing).
+    static func wantsSheet(_ app: AppState) -> Bool {
+        app.token != nil && (app.pairLink != nil || (app.unsupportedServer != nil && app.cardState == .pairing))
+    }
 
     private func needed(_ app: AppState) -> Bool { Overlay.wantsSheet(app) || app.popup != nil || sheetUp }
 
@@ -101,7 +106,7 @@ private struct OverlayPresenter: View {
             .ignoresSafeArea()
             .allowsHitTesting(false)
             .sheet(isPresented: Binding(get: { armed && Overlay.wantsSheet(app) },
-                                        set: { if !$0 { app.pairLink = nil } }),
+                                        set: { if !$0 { app.cancelPairing() } }),
                    onDismiss: { overlay.sheetUp = false; overlay.sync(app) }) {
                 NavigationStack { PairView() }
                     .environmentObject(app)

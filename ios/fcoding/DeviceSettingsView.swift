@@ -18,7 +18,7 @@ struct DeviceSettingsView: View {
         NavigationStack {
             Form {
                 Section("Máy chủ") {
-                    Text(PairLink.escapedAuthority(app.serverURL)).textSelection(.enabled)
+                    Text(PairLink.label(app.serverURL)).textSelection(.enabled)
                 }
                 Section {
                     NavigationLink { AddDeviceView() } label: {
@@ -200,6 +200,8 @@ struct AddDeviceView: View {
                 message = "Máy chủ chưa hỗ trợ, cập nhật máy chủ trước."
             } else if let e = error as? APIError, e.status == 409, e.code == "no_public_url" {
                 message = "Máy chủ chưa đặt địa chỉ công khai (publicUrl), cập nhật cấu hình máy chủ trước."
+            } else if let e = error as? APIError, e.code == "public_url_invalid" {
+                message = "Địa chỉ máy chủ (publicUrl) trong cấu hình box không hợp lệ cho app. Dùng https:// với tên miền ASCII."
             } else {
                 message = app.report(error)
             }

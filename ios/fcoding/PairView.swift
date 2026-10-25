@@ -26,17 +26,20 @@ struct PairView: View {
     }
 
     /// Paired and a link is waiting for the "Ghép lại?" answer: only that question is shown.
-    private var asking: Bool { app.token != nil && app.pairLink != nil && !repairOK }
+    /// Not from the unsupported-server card: the card already says why pairing again is needed.
+    private var asking: Bool {
+        app.token != nil && app.pairLink != nil && app.unsupportedServer == nil && !repairOK
+    }
 
     var body: some View {
         Form {
             if asking {
                 Section {
                     Text("Thiết bị này đã ghép. Ghép lại với máy chủ mới?").font(.headline)
-                    Text("Đang ghép với \(PairLink.escapedAuthority(app.serverURL)). Máy chủ mới: \(PairLink.label(app.pairLink?.server ?? "")).")
+                    Text("Đang ghép với \(PairLink.label(app.serverURL)). Máy chủ mới: \(PairLink.label(app.pairLink?.server ?? "")).")
                         .foregroundColor(.secondary)
                     Button("Ghép lại") { repairOK = true }
-                    Button("Huỷ", role: .cancel) { app.pairLink = nil }
+                    Button("Huỷ", role: .cancel) { app.cancelPairing() }
                 }
             } else {
                 fields
@@ -49,7 +52,7 @@ struct PairView: View {
             // Re-pair from a link while paired: a way back without pairing.
             if app.token != nil {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Huỷ") { app.pairLink = nil }.disabled(busy)
+                    Button("Huỷ") { app.cancelPairing() }.disabled(busy)
                 }
             }
             ToolbarItem(placement: .navigationBarTrailing) {
@@ -194,6 +197,7 @@ struct PairView: View {
                 try await app.pair(server: server, code: code)
             } catch {
                 errorText = vietnameseMessage(error, pairing: true)
+                app.card(.pairFail)   // from the card: nothing is deleted
                 if let e = error as? APIError, e.status == 401 {
                     if app.pairLink != nil { errorText = "Mã sai hoặc đã hết hạn. Gõ lại mã đang hiện trên iPhone cũ; hết hạn thì bấm “Tạo mã mới” ở đó." }
                     code = ""
@@ -226,18 +230,27 @@ struct UnsupportedServerView: View {
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
             Spacer()
-            Button { app.leaveUnsupported(signOut: false) } label: {
+            // Only opens pairing; Huỷ there comes back here with everything kept.
+            Button { app.card(.pairAgain) } label: {
                 Text("Ghép lại").bold().frame(maxWidth: .infinity, minHeight: 32)
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
-            Button("Đăng xuất", role: .destructive) { app.leaveUnsupported(signOut: true) }
+            Button("Đăng xuất", role: .destructive) { app.card(.signOut) }
                 .controlSize(.large)
         }
         .padding(24)
         .frame(maxWidth: 520)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(.systemBackground).ignoresSafeArea())
+        .alert("Xoá đăng nhập trên iPhone này?",
+               isPresented: Binding(get: { app.cardState == .confirmSignOut },
+                                    set: { if !$0 && app.cardState == .confirmSignOut { app.card(.signOutCancel) } })) {
+            Button("Xoá đăng nhập", role: .destructive) { app.card(.signOutConfirm) }
+            Button("Huỷ", role: .cancel) { app.card(.signOutCancel) }
+        } message: {
+            Text("Box cũ vẫn giữ iPhone này trong danh sách thiết bị.")
+        }
     }
 }
 
