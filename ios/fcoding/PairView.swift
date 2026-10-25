@@ -75,15 +75,12 @@ struct PairView: View {
         }
         if let linked = linkServer {
             Section {
-                // The host exactly as connected to (punycode, never decoded), with the safety
-                // line as part of the question itself.
+                // The host exactly as connected to (ASCII only), with the safety line as part of
+                // the question itself.
                 Label {
                     VStack(alignment: .leading, spacing: 4) {
-                        (Text("Ghép với máy chủ ") + Text(PairLink.host(linked)).bold() + Text("?"))
+                        (Text("Ghép với máy chủ ") + Text(PairLink.label(linked)).bold() + Text("?"))
                             .font(.headline)
-                        if let tag = PairLink.idnTag(linked) {
-                            Text(tag).font(.caption).foregroundColor(.orange)
-                        }
                         Text("Chỉ ghép nếu đây là box của bạn.").font(.subheadline).foregroundColor(.secondary)
                     }
                 } icon: {

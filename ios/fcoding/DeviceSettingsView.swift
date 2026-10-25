@@ -88,6 +88,8 @@ struct AddDeviceView: View {
     @State private var expires = Date()
     @State private var qr: UIImage?
     @State private var showGuide = false
+    /// A code was made on this screen before, so the button says "Tạo mã mới".
+    @State private var made = false
     @State private var loading = false
     @State private var errorText: String?
     @State private var now = Date()
@@ -173,7 +175,7 @@ struct AddDeviceView: View {
     private var makeButton: some View {
         Button { Task { await load() } } label: {
             HStack {
-                Label(reply == nil ? "Tạo mã" : "Tạo mã mới", systemImage: "qrcode")
+                Label(made ? "Tạo mã mới" : "Tạo mã", systemImage: "qrcode")
                 Spacer()
                 if loading { ProgressView() }
             }
@@ -191,12 +193,23 @@ struct AddDeviceView: View {
             expires = r.expires
             now = Date()
             reply = r.reply
-        } catch let e as APIError where [404, 405, 501].contains(e.status) {
-            errorText = "Máy chủ chưa hỗ trợ, cập nhật máy chủ trước."
-        } catch let e as APIError where e.status == 409 && e.code == "no_public_url" {
-            errorText = "Máy chủ chưa đặt địa chỉ công khai (publicUrl), cập nhật cấu hình máy chủ trước."
+            made = true
         } catch {
-            errorText = app.report(error)
+            var message: String?
+            if let e = error as? APIError, [404, 405, 501].contains(e.status) {
+                message = "Máy chủ chưa hỗ trợ, cập nhật máy chủ trước."
+            } else if let e = error as? APIError, e.status == 409, e.code == "no_public_url" {
+                message = "Máy chủ chưa đặt địa chỉ công khai (publicUrl), cập nhật cấu hình máy chủ trước."
+            } else {
+                message = app.report(error)
+            }
+            if reply != nil {
+                // The box may already have replaced the old code: never leave it on screen.
+                reply = nil
+                qr = nil
+                if message != nil { message = "Không tạo được mã mới. Bấm Tạo mã mới để thử lại." }
+            }
+            errorText = message
         }
         loading = false
     }

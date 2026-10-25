@@ -3,122 +3,161 @@ import Foundation
 /// `fcode://pair?server=<https origin>` from a QR or share link (contract DECISION r2). It
 /// carries ONLY the server: the 6-digit code is always typed by the user, so another app that
 /// claims the `fcode` scheme learns nothing but the public address.
+///
+/// Origins are parsed and built as plain strings (no URLComponents host/scheme setters, no
+/// IDN): what is shown is byte for byte what is connected to.
 struct PairLink: Equatable {
     /// Canonical origin, `https://host[:port]`.
     let server: String
 
-    /// Strict: the link must be `fcode://pair` and `server` exactly an https origin (an optional
-    /// trailing "/" only): no user info, path, query or fragment.
+    /// The link must be `fcode://pair` and `server` exactly an https origin (see `strict`).
     init?(_ url: URL) {
         guard url.scheme?.lowercased() == "fcode", url.host?.lowercased() == "pair",
               let raw = URLComponents(url: url, resolvingAgainstBaseURL: false)?
                 .queryItems?.first(where: { $0.name == "server" })?.value,
-              let c = URLComponents(string: raw), c.scheme?.lowercased() == "https",
-              c.user == nil, c.password == nil, c.query == nil, c.fragment == nil,
-              c.path.isEmpty || c.path == "/",
-              let origin = PairLink.origin(raw)
+              let origin = PairLink.strict(raw)
         else { return nil }
-        server = origin.absoluteString
+        server = origin
     }
 
-    /// `https://host[:port]` from what the user typed or a link held; path, query and fragment
-    /// are dropped. nil unless https with a host and no user info. A missing scheme means https.
-    /// Canonical, so one box is always one string: lowercase host, one trailing "." dropped,
-    /// the default port 443 left out. Works on the ENCODED host (punycode, IPv6 brackets kept),
-    /// never the IDNA-decoded `host`. Rejects empty labels and ports outside 1...65535.
+    /// `https://` + host + optional `:port` + optional `/`, nothing else, lowercased first.
+    /// Host: an ASCII LDH name (labels `[a-z0-9-]` 1–63, no edge `-`, no `xn--`, at least one
+    /// dot, ≤ 253, one trailing dot dropped), a dotted IPv4, or a bracketed IPv6 literal.
+    /// Port: digits, 1–65535; 443 is left out. Returns the canonical origin string.
+    static func strict(_ input: String) -> String? {
+        let s = input.lowercased()
+        guard s.hasPrefix("https://") else { return nil }
+        var rest = Substring(s.dropFirst("https://".count))
+        if rest.hasSuffix("/") { rest = rest.dropLast() }
+        guard !rest.isEmpty, rest.unicodeScalars.allSatisfy({ $0.isASCII }),
+              !rest.contains(where: { "/?#@%\\ \t\r\n".contains($0) }) else { return nil }
+
+        var host: Substring
+        var portText: Substring?
+        if rest.hasPrefix("[") {
+            guard let close = rest.firstIndex(of: "]") else { return nil }
+            host = rest[...close]
+            let after = rest[rest.index(after: close)...]
+            if !after.isEmpty {
+                guard after.hasPrefix(":") else { return nil }
+                portText = after.dropFirst()
+            }
+            var addr = in6_addr()
+            guard inet_pton(AF_INET6, String(host.dropFirst().dropLast()), &addr) == 1 else { return nil }
+        } else {
+            let parts = rest.split(separator: ":", omittingEmptySubsequences: false)
+            guard parts.count <= 2 else { return nil }
+            host = parts[0]
+            if parts.count == 2 { portText = parts[1] }
+            if host.hasSuffix(".") { host = host.dropLast() }
+            guard isIPv4(host) || isName(host) else { return nil }
+        }
+
+        var port: Int?
+        if let text = portText {
+            guard !text.isEmpty, text.count <= 5, text.allSatisfy({ ("0"..."9").contains($0) }),
+                  let n = Int(text), (1...65535).contains(n) else { return nil }
+            port = n == 443 ? nil : n
+        }
+        let origin = "https://" + host + (port.map { ":\($0)" } ?? "")
+        guard URL(string: origin)?.absoluteString == origin else { return nil }
+        return origin
+    }
+
+    private static func isIPv4(_ host: Substring) -> Bool {
+        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
+        return parts.count == 4 && parts.allSatisfy { p in
+            (1...3).contains(p.count) && p.allSatisfy({ ("0"..."9").contains($0) }) && Int(p)! <= 255
+        }
+    }
+
+    private static func isName(_ host: Substring) -> Bool {
+        let labels = host.split(separator: ".", omittingEmptySubsequences: false)
+        guard host.count <= 253, labels.count >= 2,
+              // An all-digit last label is an IP address, and that must pass isIPv4 instead.
+              !(labels.last ?? "").allSatisfy({ ("0"..."9").contains($0) }) else { return false }
+        return labels.allSatisfy { l in
+            (1...63).contains(l.count) && !l.hasPrefix("-") && !l.hasSuffix("-") && !l.hasPrefix("xn--")
+                && l.allSatisfy { ("a"..."z").contains($0) || ("0"..."9").contains($0) || $0 == "-" }
+        }
+    }
+
+    /// Lenient, for what the user typed or what an older build stored: a missing scheme means
+    /// https, and a path, query or fragment is cut off; the rest must pass `strict`.
     static func origin(_ input: String) -> URL? {
         var s = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !s.contains("://") { s = "https://" + s }
-        guard var c = URLComponents(string: s), c.scheme?.lowercased() == "https",
-              c.user == nil, c.password == nil, var host = c.encodedHost?.lowercased() else { return nil }
-        if host.contains(":") && !host.hasPrefix("[") { host = "[\(host)]" }   // IPv6 literal
-        if host.hasSuffix(".") { host.removeLast() }
-        if !host.hasPrefix("[") {
-            guard !host.split(separator: ".", omittingEmptySubsequences: false).contains(where: \.isEmpty)
-            else { return nil }
+        if !s.lowercased().hasPrefix("https://") && !s.contains("://") { s = "https://" + s }
+        if s.lowercased().hasPrefix("https://") {
+            let start = s.index(s.startIndex, offsetBy: "https://".count)
+            if let cut = s[start...].firstIndex(where: { "/?#".contains($0) }) { s = String(s[..<cut]) }
         }
-        if let port = c.port, !(1...65535).contains(port) { return nil }
-        if c.encodedHost != host { c.encodedHost = host }
-        c.scheme = "https"
-        c.port = c.port == 443 ? nil : c.port
-        c.path = ""
-        c.query = nil
-        c.fragment = nil
-        return c.url
+        return strict(s).flatMap(URL.init(string:))
     }
 
-    /// "host" or "host:port" exactly as connected to (punycode, never decoded).
-    static func host(_ server: String) -> String {
-        guard let c = URLComponents(string: server), let host = c.encodedHost?.lowercased() else { return server }
-        return c.port.map { "\(host):\($0)" } ?? host
-    }
-
-    /// Tag shown after an internationalised (punycode) host, else nil.
-    static func idnTag(_ server: String) -> String? {
-        host(server).contains("xn--") ? "(tên miền quốc tế)" : nil
-    }
-
-    /// `host(_:)` plus the IDN tag, for plain-text messages.
+    /// "host" or "host:port", exactly as connected to.
     static func label(_ server: String) -> String {
-        [host(server), idnTag(server)].compactMap { $0 }.joined(separator: " ")
+        server.hasPrefix("https://") ? String(server.dropFirst("https://".count)) : server
     }
 
     /// Fixed cases; one line per failure (empty = all pass). Run by the CI self-test step.
     static func selfTest() -> [String] {
         var failures: [String] = []
-        func check(_ name: String, _ link: String, _ want: String?) {
-            let got = URL(string: link).flatMap(PairLink.init)?.server
-            if got != want { failures.append("\(name): got \(got ?? "nil")") }
+        func link(_ name: String, _ server: String, _ want: String?) {
+            let enc = server.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? server
+            let got = URL(string: "fcode://pair?server=\(enc)").flatMap(PairLink.init)?.server
+            if got != want { failures.append("link \(name): got \(got ?? "nil")") }
         }
-        let enc = "https%3A%2F%2Fbox.example.com"
-        check("valid", "fcode://pair?server=\(enc)", "https://box.example.com")
-        check("valid slash", "fcode://pair?server=https%3A%2F%2FBox.Example.com%2F", "https://box.example.com")
-        check("port", "fcode://pair?server=https%3A%2F%2Fbox.example.com%3A8443", "https://box.example.com:8443")
-        check("port 443", "fcode://pair?server=\(enc)%3A443", "https://box.example.com")
-        check("trailing dot", "fcode://pair?server=https%3A%2F%2Fbox.example.com.", "https://box.example.com")
-        check("http","fcode://pair?server=http%3A%2F%2Fbox.example.com", nil)
-        check("no scheme", "fcode://pair?server=box.example.com", nil)
-        check("userinfo", "fcode://pair?server=https%3A%2F%2Fu%3Ap%40box.example.com", nil)
-        check("path", "fcode://pair?server=\(enc)%2Fx", nil)
-        check("query", "fcode://pair?server=\(enc)%2F%3Fall%3D1", nil)
-        check("query no slash", "fcode://pair?server=\(enc)%3Fall%3D1", nil)
-        check("fragment", "fcode://pair?server=\(enc)%23z", nil)
-        check("missing server", "fcode://pair?code=123456", nil)
-        check("other host", "fcode://other?server=\(enc)", nil)
-        check("other scheme", "https://pair?server=\(enc)", nil)
-        // A code in the link (older server) is never read: only the server counts.
-        check("code ignored", "fcode://pair?server=\(enc)&code=12345", "https://box.example.com")
+        func strict(_ name: String, _ input: String, _ want: String?) {
+            let got = PairLink.strict(input)
+            if got != want { failures.append("strict \(name): got \(got ?? "nil")") }
+            // Round trip: an accepted origin is exactly what URL prints.
+            if let got = got, URL(string: got)?.absoluteString != got { failures.append("round trip \(name)") }
+        }
+        // Accepted.
+        strict("plain", "https://box.example.com", "https://box.example.com")
+        strict("slash", "https://box.example.com/", "https://box.example.com")
+        strict("trailing dot", "https://box.example.com.", "https://box.example.com")
+        strict("port", "https://box.example.com:8443", "https://box.example.com:8443")
+        strict("port 443", "https://box.example.com:443/", "https://box.example.com")
+        strict("port 65535", "https://box.example.com:65535", "https://box.example.com:65535")
+        strict("uppercase", "HTTPS://Box.Example.COM", "https://box.example.com")
+        strict("ipv4", "https://192.168.1.10:8443", "https://192.168.1.10:8443")
+        strict("ipv6 port", "https://[2001:db8::1]:8443", "https://[2001:db8::1]:8443")
+        strict("ipv6", "https://[::1]", "https://[::1]")
+        // Rejected.
+        for (name, bad) in [
+            ("xn--", "https://xn--80ak6aa92e.com"), ("xn-- inner", "https://a.xn--a.com"),
+            ("non-ascii", "https://bücher.de"), ("h..", "https://h.."), ("a..b", "https://a..b.com"),
+            ("-a.b", "https://-a.b"), ("a-.b", "https://a-.b"), ("no dot", "https://localhost"),
+            ("port 0", "https://box.example.com:0"), ("port 65536", "https://box.example.com:65536"),
+            ("port 08x", "https://box.example.com:08x"), ("port empty", "https://box.example.com:"),
+            ("userinfo", "https://u:p@box.example.com"), ("query", "https://box.example.com?q"),
+            ("query slash", "https://box.example.com/?all=1"), ("fragment", "https://box.example.com#f"),
+            ("path", "https://box.example.com/path"), ("percent", "https://box%2eexample.com"),
+            ("http", "http://box.example.com"), ("no scheme", "box.example.com"),
+            ("bad ipv4", "https://1.2.3.999"), ("bad ipv6", "https://[2001:db8::g]"),
+            ("ipv6 zone", "https://[fe80::1%25en0]"), ("ipv6 tail", "https://[::1]x"),
+            ("long label", "https://" + String(repeating: "a", count: 64) + ".com"),
+        ] {
+            strict(name, bad, nil)
+        }
+        // Links: only the server counts; uppercase-only differences are the same server.
+        link("valid", "https://box.example.com", "https://box.example.com")
+        link("upper", "https://BOX.example.com", "https://box.example.com")
+        link("ipv6", "https://[2001:db8::1]:8443", "https://[2001:db8::1]:8443")
+        link("xn--", "https://xn--a.com", nil)
+        link("path", "https://box.example.com/x", nil)
+        if URL(string: "fcode://pair?code=123456").flatMap(PairLink.init) != nil { failures.append("link without server") }
+        if URL(string: "fcode://other?server=https%3A%2F%2Fbox.example.com").flatMap(PairLink.init) != nil {
+            failures.append("link other host")
+        }
+        // Lenient entry: scheme added, path/query cut, still strict on the host.
         if PairLink.origin("box.example.com/x?all=1#z")?.absoluteString != "https://box.example.com" {
-            failures.append("origin strips path/query")
+            failures.append("origin cuts path")
         }
         if PairLink.origin("http://box.example.com") != nil { failures.append("origin rejects http") }
-        if PairLink.origin("box.example.com:443")?.absoluteString != "https://box.example.com" {
-            failures.append("origin drops :443")
-        }
-        if PairLink.origin("https://Box.Example.com.:443/")?.absoluteString != "https://box.example.com" {
-            failures.append("origin dot + 443")
-        }
-        if PairLink.origin("https://.") != nil { failures.append("origin rejects bare dot") }
-        // Punycode stays punycode (homograph check), with the tag.
-        let idn = "https://xn--80ak6aa92e.com"
-        check("punycode link", "fcode://pair?server=https%3A%2F%2Fxn--80ak6aa92e.com", idn)
-        if PairLink.host(idn) != "xn--80ak6aa92e.com" { failures.append("host punycode: \(PairLink.host(idn))") }
-        if PairLink.label(idn) != "xn--80ak6aa92e.com (tên miền quốc tế)" { failures.append("label punycode: \(PairLink.label(idn))") }
-        if PairLink.label("https://box.example.com") != "box.example.com" { failures.append("label plain") }
-        // IPv6 keeps its brackets.
-        let v6 = "https://[2001:db8::1]:8443"
-        if PairLink.origin(v6)?.absoluteString != v6 { failures.append("origin ipv6: \(PairLink.origin(v6)?.absoluteString ?? "nil")") }
-        if PairLink.host(v6) != "[2001:db8::1]:8443" { failures.append("host ipv6: \(PairLink.host(v6))") }
-        check("ipv6 link", "fcode://pair?server=https%3A%2F%2F%5B2001%3Adb8%3A%3A1%5D%3A8443", v6)
-        // Empty labels and bad ports.
-        for bad in ["https://h..", "https://a..b", "https://.a", "https://box.example.com:0", "https://box.example.com:65536"]
-        where PairLink.origin(bad) != nil {
-            failures.append("origin accepts \(bad)")
-        }
-        if PairLink.origin("https://box.example.com:65535")?.absoluteString != "https://box.example.com:65535" {
-            failures.append("origin port 65535")
-        }
-        if PairLink.label("https://box.example.com:8443") != "box.example.com:8443" { failures.append("label port") }
+        if PairLink.origin("https://xn--a.com") != nil { failures.append("origin rejects xn--") }
+        if PairLink.label("https://[::1]:8443") != "[::1]:8443" { failures.append("label") }
         return failures
     }
 }

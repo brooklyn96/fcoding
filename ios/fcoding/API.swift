@@ -116,20 +116,14 @@ struct API {
 
     func request(_ method: String, _ path: String, query: [URLQueryItem] = [],
                  body: [String: Any]? = nil, timeout: TimeInterval = 20) throws -> URLRequest {
-        // Origin + explicit path + explicit query: nothing of `base` beyond scheme://host[:port].
-        // The authority is kept as parsed (IPv6 brackets, punycode); `URL.host` would drop them.
-        guard var origin = URLComponents(url: base, resolvingAgainstBaseURL: false)
+        // The canonical origin STRING + "/" + encoded path + encoded query, through URL(string:):
+        // nothing of `base` beyond https://host[:port], and no URLComponents host/scheme setters.
+        var q = URLComponents()
+        q.queryItems = query.isEmpty ? nil : query
+        guard let origin = PairLink.origin(base.absoluteString)?.absoluteString,
+              let encodedPath = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+              let url = URL(string: origin + "/" + encodedPath + (q.percentEncodedQuery.map { "?" + $0 } ?? ""))
         else { throw APIError(status: 0, code: "bad_url") }
-        origin.user = nil
-        origin.password = nil
-        origin.path = ""
-        origin.query = nil
-        origin.fragment = nil
-        guard let root = origin.url,
-              var comps = URLComponents(url: root.appendingPathComponent(path), resolvingAgainstBaseURL: false)
-        else { throw APIError(status: 0, code: "bad_url") }
-        comps.queryItems = query.isEmpty ? nil : query
-        guard let url = comps.url else { throw APIError(status: 0, code: "bad_url") }
         var req = URLRequest(url: url, timeoutInterval: timeout)
         req.httpMethod = method
         req.setValue("1", forHTTPHeaderField: "X-PC")
