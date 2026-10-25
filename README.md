@@ -27,7 +27,9 @@ Tính năng chính:
 - **Hàng phím nhanh**: Esc, Ctrl+C, mũi tên, Tab, Shift+Tab, Enter, y, n, **Agents** và **^O** (chỉ trong phiên omp), cùng nút `/` cho các lệnh hay dùng.
 - **Gõ tiếng Việt** bình thường bằng bàn phím iPhone; chữ được gửi nguyên vẹn lên box.
 - **Phiên mới bằng nút +**: chọn chương trình và dự án, luôn tạo phiên mới.
-- Ghép máy bằng **mã 6 số**, không có mật khẩu.
+- Ghép máy bằng **mã 6 số**, không có mật khẩu; iPhone mới ghép thêm được bằng **mã QR** (`fcode-pair --qr`, hoặc `fcode pair` trên laptop).
+- Lệnh **`fcode`** trên laptop Windows: vào phiên, `fcode add` (thêm dự án GitHub vào box), `fcode pair`, cài bằng một dòng lệnh.
+- Box **tự cập nhật** omp, Claude Code và Codex mỗi 6 giờ, không làm hỏng phiên đang mở.
 
 ## 2. Cách hoạt động
 
@@ -67,7 +69,8 @@ Script `install.sh` làm các việc sau, và chạy lại nhiều lần vẫn a
 2. Tạo thư mục cấu hình `/data/home/.fcoding` (quyền 700).
 3. Lần cài đầu: tạo `config.json` với một khóa bí mật ngẫu nhiên và danh sách dự án **trống** (không có dự án mẫu). Thêm dự án của bạn theo mục "Danh sách dự án" bên dưới.
 4. Cài lệnh `~/.local/bin/fcode-pair` (dùng để lấy mã ghép máy, xem [mục 6](#6-ghép-iphone-với-box)).
-5. Tạo dịch vụ systemd của người dùng tên **`fcoding`**, bật chạy cùng hệ thống, tự chạy lại khi lỗi, rồi khởi động ngay. Cổng mặc định là **7681**.
+5. Cài bộ tự cập nhật omp, Claude Code, Codex (timer chạy mỗi 6 giờ; cần `sudo` không mật khẩu, thiếu thì chỉ cảnh báo và việc cài vẫn tiếp tục). Chi tiết trong [`box/README.md`](box/README.md).
+6. Tạo dịch vụ systemd của người dùng tên **`fcoding`**, bật chạy cùng hệ thống, tự chạy lại khi lỗi, rồi khởi động ngay. Cổng mặc định là **7681**.
 
 **Cập nhật:** vào thư mục `fcoding`, chạy `git pull` rồi `bash install.sh` lại (script khởi động lại dịch vụ).
 
@@ -88,7 +91,7 @@ journalctl --user -u fcoding -n 50
 
 ### Danh sách dự án
 
-Các dự án hiện trong app nằm trong `config.json`, mục `projects`. Sau lần cài đầu mục này **trống**, nên nút **+** trong app báo "Chưa có dự án nào trong cấu hình máy chủ" cho tới khi bạn thêm dự án. Cách thêm: sửa `config.json` trên box như dưới đây. Lệnh `fcode add` trên laptop sẽ có ở bản sau. Mỗi dự án là một tên và một đường dẫn tuyệt đối trên box:
+Các dự án hiện trong app nằm trong `config.json`, mục `projects`. Sau lần cài đầu mục này **trống**, nên nút **+** trong app báo "Chưa có dự án nào trong cấu hình máy chủ" cho tới khi bạn thêm dự án. Cách thêm: chạy `fcode add <chủ/repo>` trên laptop (xem [mục 8](#8-dùng-từ-laptop)), hoặc sửa `config.json` trên box như dưới đây. Mỗi dự án là một tên và một đường dẫn tuyệt đối trên box:
 
 ```json
 {
@@ -285,7 +288,7 @@ Khi điện thoại mở một phiên, app đặt kích thước cửa sổ tmux
 
 ### Lệnh `fcode` (tùy chọn)
 
-Lệnh `fcode` nằm trong thư mục `laptop/` của kho mã này, chạy trên PowerShell hoặc cmd của Windows và không bắt buộc. Để vào phiên, `fcode` gọi `instabox ssh` cho bạn; ngoài ra còn có `fcode sync` (dùng git ngay trên laptop) và `fcode ipa` (tải app về máy). Cách cài nằm ngay bên dưới, ở mục [Cài lệnh fcode trên máy Windows khác](#cài-lệnh-fcode-trên-máy-windows-khác).
+Lệnh `fcode` nằm trong thư mục `laptop/` của kho mã này, chạy trên PowerShell hoặc cmd của Windows và không bắt buộc. Để vào phiên, `fcode` gọi `instabox ssh` cho bạn; ngoài ra còn có `fcode sync` (dùng git ngay trên laptop), `fcode ipa` (tải app về máy), `fcode add` (thêm dự án) và `fcode pair` (ghép iPhone mới). Cách cài nằm ngay bên dưới, ở mục [Cài lệnh fcode trên máy Windows khác](#cài-lệnh-fcode-trên-máy-windows-khác).
 
 Tên box và các thư mục mà `fcode sync` cập nhật nằm trong file `%USERPROFILE%\.fcode\config.json` (mục `box`, mặc định `coder`, và mục `syncRepos`). Biến môi trường `FCODE_BOX` chỉ dùng để đổi tên box tạm thời cho một lần chạy; `FCODE_SYNC_REPOS` cũng vậy cho danh sách thư mục.
 
@@ -297,6 +300,8 @@ fcode --list    # (hoặc -l) chỉ liệt kê, không vào
 ```
 
 - `fcode sync`: kéo code mới của các project trong `syncRepos` về laptop, chỉ cập nhật khi đang ở main và không có thay đổi chưa lưu; liệt kê nhánh box và PR chờ merge.
+- `fcode add <chủ/repo> [tên]`: thêm một dự án GitHub vào box để omp làm việc và hiện trong danh sách của app. Lần đầu cho mỗi repo, lệnh hướng dẫn bạn dán một khóa vào trang GitHub của repo.
+- `fcode pair [tên thiết bị]`: tạo mã ghép kèm mã QR cho iPhone mới (cần `publicUrl`, xem [mục 6](#ghép-thêm-iphone-bằng-mã-qr)).
 - `fcode ipa`: tải bản app mới nhất về `Downloads\fcode.ipa`. Khi có bản mới, kéo file này vào Sideloadly và bấm Start; việc tự ký lại 7 ngày của Sideloadly chỉ gia hạn bản đang cài, không tự cập nhật. Không có `fcode` thì tải `fcode.ipa` từ **Releases** trên GitHub.
 
 Thoát bằng **Ctrl+B** rồi **D**, phiên vẫn chạy tiếp.
