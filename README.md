@@ -176,6 +176,24 @@ Lưu ý về mã:
 
 Sau khi ghép, iPhone nhớ box trong Keychain. Mở app là vào thẳng danh sách; box khởi động lại cũng không phải ghép lại.
 
+### Ghép thêm iPhone bằng mã QR
+
+Không cần gõ địa chỉ máy chủ: iPhone mới quét mã QR bằng Camera, app FCode tự mở với địa chỉ và mã đã điền sẵn, bạn chỉ bấm **Ghép**.
+
+1. Làm một lần: thêm `publicUrl` vào `/data/home/.fcoding/config.json` (địa chỉ công khai ở [mục 4](#4-mở-link-công-khai), bắt đầu bằng `https://`, không có đường dẫn phía sau):
+
+   ```json
+   "publicUrl": "https://<địa-chỉ-công-khai>"
+   ```
+
+   Máy chủ chỉ tạo link từ địa chỉ này, không bao giờ lấy từ yêu cầu gửi tới. Chưa đặt thì không tạo được link và mã QR. Máy chủ tự đọc lại file, không cần khởi động lại.
+2. Trên box, chạy `fcode-pair "iPhone mới" --qr`. Lệnh in mã 6 số như trước, rồi mã QR và link chia sẻ. Cần chương trình `qrencode` để hiện mã QR (cài bằng `sudo apt install qrencode`); thiếu thì lệnh chỉ in link và nhắc "cài qrencode để hiện mã QR".
+3. Trên iPhone mới, mở Camera và quét mã. Link chia sẻ (`<địa chỉ>/pair?code=…`) gửi qua AirDrop hay Zalo cũng được: mở nó sẽ ra trang có nút **Mở FCode**.
+
+Từ một iPhone đã ghép, vào **Cài đặt → Thêm thiết bị (mã QR)** trong app cũng tạo được mã như vậy (máy chủ cần có `publicUrl`).
+
+Mã vẫn là mã ghép thường: dùng một lần, hết hạn sau 2 phút, nhập sai 5 lần thì hủy, mã mới thay mã cũ. Mở trang `/pair` không làm mất mã và không cho biết mã còn đúng hay không. Trong mã QR và link chỉ có địa chỉ máy chủ, mã 6 số và tên gợi ý, không có khóa hay mã thiết bị.
+
 ### Xem và gỡ thiết bị
 
 Trên box:

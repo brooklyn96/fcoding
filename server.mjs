@@ -6,7 +6,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 export const HARNESSES = { omp: 'omp', claude: 'claude', codex: 'codex', shell: 'bash -l' };
@@ -87,8 +87,17 @@ export function parseConfig(text) {
   const projects = c.projects ?? {};
   if (typeof projects !== 'object' || projects === null || Array.isArray(projects)) throw new Error('config.json: projects must be an object');
   if (c.port !== undefined && !(Number.isInteger(c.port) && c.port > 0 && c.port < 65536)) throw new Error('config.json: port invalid');
+  // publicUrl: the https origin of the published port; the pairing links are built from it and from nothing in a request
+  let publicUrl;
+  if (c.publicUrl !== undefined) {
+    try {
+      const u = new URL(c.publicUrl);
+      if (typeof c.publicUrl !== 'string' || u.protocol !== 'https:' || u.username || u.password || u.pathname !== '/' || u.search || u.hash) throw new Error('bad');
+      publicUrl = u.origin;
+    } catch { throw new Error('config.json: publicUrl invalid (want an https origin such as https://box.example.com)'); }
+  }
   return {
-    secret: Buffer.from(s, 'base64'), port: c.port, projects,
+    secret: Buffer.from(s, 'base64'), port: c.port, projects, publicUrl,
     projectNames: Object.keys(projects).filter((k) => typeof projects[k] === 'string' && path.isAbsolute(projects[k])),
   };
 }
@@ -232,6 +241,16 @@ export function trimAnsiScreen(s) {
   return lines.join('\n');
 }
 
+// GET /pair: a tiny page with one button that opens the app link. Only 6 digits and the configured origin reach it.
+const escHtml = (t) => t.replace(/[&<>"']/g, (ch) => `&#${ch.charCodeAt(0)};`);
+export function pairPage(appLink, status = 200) {
+  const note = status === 503 ? 'Máy chủ chưa đặt địa chỉ công khai, nên chưa tạo được link ghép.'
+    : status === 400 ? 'Link ghép không hợp lệ. Hãy tạo mã mới trong app FCode.' : null;
+  const body = note ? `<p>${note}</p>`
+    : `<a class="btn" href="${escHtml(appLink)}">Mở FCode</a><p>Mã dùng 1 lần, hết hạn sau ${PAIR_TTL / 60000} phút.</p><p class="s">Chưa cài FCode? Cài file fcode.ipa trước.</p>`;
+  return `<!doctype html><html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Ghép FCode</title><style>body{margin:0;font:17px/1.5 -apple-system,system-ui,sans-serif;background:#111;color:#eee;text-align:center}main{padding:48px 24px}.btn{display:block;max-width:320px;margin:24px auto;padding:16px;border-radius:14px;background:#0a84ff;color:#fff;font-size:20px;font-weight:600;text-decoration:none}.s{color:#999;font-size:15px}</style></head><body><main><h1>Ghép iPhone với FCode</h1>${body}</main></body></html>`;
+}
+
 // ---------- app ----------
 export function createApp(opts = {}) {
   const configDir = opts.configDir || defaultConfigDir();
@@ -345,11 +364,25 @@ export function createApp(opts = {}) {
   function revoke(ids) { // throws on a failed write; nothing changes then
     commitDevices([...devices.values()].filter((d) => !ids.includes(d.id)));
   }
+  // the one pending code (a new one replaces the old); used by the shell command and by POST /api/pair-code
+  function newPairing(name) {
+    pending = { code: String(crypto.randomInt(0, 1e6)).padStart(6, '0'), name: cleanName(name), expiresAt: now() + PAIR_TTL, attempts: 0 };
+    return pending;
+  }
+  // {appLink, shareLink} from cfg.publicUrl only; null when it is not configured. The code is 6 digits, the name is encoded.
+  function pairLinks(code, name) {
+    const o = cfg.publicUrl;
+    if (!o) return null;
+    return {
+      appLink: `fcode://pair?server=${encodeURIComponent(o)}&code=${code}${name ? `&name=${encodeURIComponent(name)}` : ''}`,
+      shareLink: `${o}/pair?code=${code}`,
+    };
+  }
   function admin(req) {
     refreshConfig(true); // a rotation or a pending purge is handled before any answer
     if (req?.cmd === 'pair') {
-      pending = { code: String(crypto.randomInt(0, 1e6)).padStart(6, '0'), name: cleanName(req.name), expiresAt: now() + PAIR_TTL, attempts: 0 };
-      return { ok: true, code: pending.code, expiresAt: pending.expiresAt, expiresIn: PAIR_TTL / 1000 };
+      const p = newPairing(req.name);
+      return { ok: true, code: p.code, expiresAt: p.expiresAt, expiresIn: PAIR_TTL / 1000, ...(req.links && { links: pairLinks(p.code, p.name) }) };
     }
     if (req?.cmd === 'devices') return { ok: true, devices: [...devices.values()].map(({ id, name, createdAt }) => ({ id, name, createdAt })) };
     if (req?.cmd === 'revoke') {
@@ -705,6 +738,17 @@ export function createApp(opts = {}) {
       return res.end(method === 'HEAD' ? undefined : 'fcoding ok');
     }
 
+    if (pathname === '/pair' && (method === 'GET' || method === 'HEAD')) { // share link: never reads or consumes the pending code
+      refreshConfig(); // a config edit (publicUrl) is picked up here too
+      const code = url.searchParams.get('code');
+      const o = cfg.publicUrl;
+      const ok = typeof code === 'string' && /^\d{6}$/.test(code) && !!o;
+      const status = !o ? 503 : ok ? 200 : 400;
+      const body = pairPage(ok ? pairLinks(code).appLink : null, status);
+      res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': Buffer.byteLength(body), 'Cache-Control': 'no-store' });
+      return res.end(method === 'HEAD' ? undefined : body);
+    }
+
     const isApi = pathname.startsWith('/api/');
     if (method !== 'GET' && method !== 'HEAD' && !csrfOk(req)) throw new HttpErr(403, 'forbidden');
 
@@ -739,6 +783,14 @@ export function createApp(opts = {}) {
       return json(res, 200, { ok: true }, { 'Set-Cookie': setCookie('', 0) });
     }
     if (pathname === '/api/me') { want('GET'); return json(res, 200, { ok: true }); }
+    if (pathname === '/api/pair-code') { // a paired device mints a code for its next device (same store, TTL, single use and limits as --pair)
+      want('POST');
+      const b = body.length ? parseJson(req, body) : {};
+      if (b.name !== undefined && typeof b.name !== 'string') throw new HttpErr(400, 'invalid');
+      if (!cfg.publicUrl) throw new HttpErr(409, 'no_public_url'); // no code is made when no link can be built
+      const p = newPairing(b.name);
+      return json(res, 200, { code: p.code, expiresAt: new Date(p.expiresAt).toISOString(), ...pairLinks(p.code, p.name) });
+    }
     if (pathname === '/api/overview') { want('GET'); return json(res, 200, await overview(ctx)); }
     if (pathname === '/api/meta') {
       want('GET');
@@ -870,17 +922,29 @@ export function createApp(opts = {}) {
 }
 
 // ---------- CLI ----------
+// fcode-pair --qr: the QR of the app link (qrencode, when installed) and the links; the code line is printed before this
+function printQr(links) {
+  if (!links) return console.log('Chưa đặt "publicUrl" trong config.json nên chưa tạo được link/mã QR. Ví dụ: "publicUrl": "https://<địa-chỉ-công-khai>"');
+  let shown = false;
+  try { process.stdout.write(execFileSync('qrencode', ['-t', 'ANSIUTF8', links.appLink], { encoding: 'utf8', timeout: 5000, windowsHide: true })); shown = true; } catch {}
+  console.log(`Link chia sẻ: ${links.shareLink}`);
+  if (!shown) console.log(`Link mở app: ${links.appLink}\ncài qrencode để hiện mã QR`);
+}
 async function main() {
   const dir = defaultConfigDir();
   const arg = (f) => { const i = process.argv.indexOf(f); return i < 0 ? undefined : process.argv[i + 1] ?? ''; };
-  const req = process.argv.includes('--pair') ? { cmd: 'pair', name: arg('--pair') }
+  const qr = process.argv.includes('--qr');
+  const req = process.argv.includes('--pair') ? { cmd: 'pair', name: arg('--pair'), ...(qr && { links: true }) }
     : process.argv.includes('--devices') ? { cmd: 'devices' }
       : process.argv.includes('--revoke') ? { cmd: 'revoke', id: arg('--revoke') } : null;
   if (req) { // admin CLI: talks to the RUNNING server over admin.sock
     let r;
     try { r = await adminRequest(dir, req); } catch (e) { console.error(e.code === 'ENOSERVER' ? `${e.message} (no ${adminPath(dir)})` : `admin socket: ${e.message}`); process.exit(1); }
     if (!r.ok) { console.error(`error: ${r.error}`); process.exit(1); }
-    if (req.cmd === 'pair') console.log(`Mã ghép: ${r.code} (hết hạn sau ${r.expiresIn} giây)\nNhập mã này vào app. Chạy lại lệnh sẽ thay mã cũ.`);
+    if (req.cmd === 'pair') {
+      console.log(`Mã ghép: ${r.code} (hết hạn sau ${r.expiresIn} giây)\nNhập mã này vào app. Chạy lại lệnh sẽ thay mã cũ.`);
+      if (qr) printQr(r.links);
+    }
     else if (req.cmd === 'devices') {
       if (!r.devices.length) console.log('(no paired devices)');
       for (const d of r.devices) console.log(`${d.id}  ${new Date(d.createdAt).toISOString()}  ${d.name}`);
