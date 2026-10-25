@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Install the coding-harness auto-update timer for the current user. Safe to re-run.
+#   0. creates /opt/fcode-tools (owned by this user): versioned installs of claude, codex, opencode, cmd
 #   1. fcode-update.sh   -> ~/.local/bin/fcode-update
 #   2. fcode-update.service + .timer -> ~/.config/systemd/user, timer enabled
 #   3. turns off the built-in self-updaters of Command Code and OpenCode (and claude if not already off)
-#      (they run as this user and cannot write to the root-owned npm prefix)
+#      (the tools are replaced only through the versioned layout, never by themselves)
 set -euo pipefail
 
 D=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -12,7 +13,8 @@ UNITS="$HOME/.config/systemd/user"
 
 command -v jq >/dev/null || sudo -n apt-get install -y jq >/dev/null
 command -v flock >/dev/null || { echo "install-autoupdate: flock is missing (util-linux)" >&2; exit 1; }
-sudo -n true 2>/dev/null || { echo "install-autoupdate: passwordless sudo is needed for 'sudo npm install -g'" >&2; exit 1; }
+sudo -n true 2>/dev/null || { echo "install-autoupdate: passwordless sudo is needed (links in /usr/local/bin, /opt/fcode-tools)" >&2; exit 1; }
+sudo -n install -d -o "$(id -un)" -g "$(id -gn)" /opt/fcode-tools
 
 # put <src> <dst> <mode>: copy when different; sets CHANGED=1 when it did
 CHANGED=0

@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # fcode-update: keep omp, claude, codex, opencode and cmd (Command Code) up to date.
 # Usage: fcode-update [tool ...]   (default: all five)
-# - a tool whose process is running right now is skipped and retried next run
+#
+# npm tools (claude, codex, opencode, cmd) are never modified in place. Every version is installed into
+# its own prefix, /opt/fcode-tools/<tool>/<version>, verified there, and only then made current by one
+# atomic symlink switch: /opt/fcode-tools/<tool>/current -> <version>. /usr/local/bin/<bin> point at
+# <tool>/current/bin/<bin>. A running process keeps the directory it started from, so no "is it busy"
+# check is needed. omp replaces its own binary by atomic rename (new inode), so it needs none either.
+#
 # - one log line per tool: ~/.local/state/fcode-update/log (last 500 lines)
 # - status.json {tool:{from,to,at,result,error}} next to it, written atomically
 # - one run at a time (flock); every command has a timeout; no credentials touched
@@ -14,12 +20,17 @@ STATE="${FCODE_UPDATE_STATE:-$HOME/.local/state/fcode-update}"
 LOG="$STATE/log"
 STATUS="$STATE/status.json"
 ALL="omp claude codex opencode cmd"
-NM="${FCODE_UPDATE_NM:-}" # npm global root (override only for tests)
+ROOT="${FCODE_TOOLS_ROOT:-/opt/fcode-tools}" # versioned installs
+BINDIR="${FCODE_BINDIR:-/usr/local/bin}"      # where the bin symlinks live
+NM="${FCODE_UPDATE_NM:-}"                     # old global npm root (migration source), set in main
 
 # every external command: timeout, and without the lock fd so a leftover child cannot hold the lock
 x() { local t=$1; shift; timeout -k 10 "$t" "$@" 9>&-; }
+# priv <dir> cmd...: run directly when <dir> is writable, else through sudo
+priv() { local d=$1; shift; if [ -w "$d" ]; then "$@"; else sudo -n -H "$@"; fi 9>&-; }
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 oneline() { tr '\n\r\t' '   ' | tr -s ' ' | cut -c1-300; }
+# strict semver; also guarantees a version is a safe single path component
 semver_ok() { [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; }
 
 pkg_of() {
@@ -28,6 +39,14 @@ pkg_of() {
     codex) echo @openai/codex ;;
     opencode) echo @opencode/cli ;;
     cmd) echo command-code ;;
+  esac
+}
+# the process names a running tool can have (bin names and process titles)
+tool_names() {
+  case $1 in
+    opencode) echo "opencode opencode2" ;;
+    cmd) echo "cmd cmdc command-code commandcode" ;;
+    *) echo "$1" ;;
   esac
 }
 
@@ -44,11 +63,17 @@ record() {
     '.[$t] = {from:$f, to:$to, at:$at, result:$r, error:(if $e == "" then null else $e end)}' >"$tmp" \
     && chmod 644 "$tmp" && mv "$tmp" "$STATUS" || rm -f "$tmp"
 }
+note() { printf '%s %s\n' "$(now)" "$*" >>"$LOG"; echo "fcode-update: $*"; }
+
+pkg_version() { x 30 node -p 'require(process.argv[1]).version' "$1" 2>/dev/null; }
+# the version the tool currently runs from: <root>/<tool>/current, or the old global install
+cur_ver() { pkg_version "$ROOT/$1/current/lib/node_modules/$(pkg_of "$1")/package.json"; }
+legacy_ver() { pkg_version "$NM/$(pkg_of "$1")/package.json"; }
 
 installed() {
   case $1 in
     omp) x 30 omp --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.+-]*' | head -1 ;;
-    *) x 30 node -p 'require(process.argv[1]).version' "$NM/$(pkg_of "$1")/package.json" 2>/dev/null ;;
+    *) cur_ver "$1" ;;
   esac
 }
 
@@ -89,78 +114,141 @@ newer() {
   [ "$(printf '%s\n%s\n' "$cp" "$lp" | sort -V | tail -1)" = "$lp" ]
 }
 
-# busy <tool>: true when a process is running from the tool's install path. Works for every bin name:
-# a native binary is matched by /proc/<pid>/exe, a node script by the resolved path of its arguments.
-# opencode's detached background service ("serve --service") is not a client and is not counted.
-busy() {
-  local root d pid exe arg r i svc a=()
-  case $1 in
-    omp) root=$(readlink -f "$(command -v omp)" 2>/dev/null) ;;
-    *) root="$NM/$(pkg_of "$1")" ;;
-  esac
-  [ -n "$root" ] || return 1
-  for d in /proc/[0-9]*; do
-    pid=${d#/proc/}
-    [ "$pid" = "$$" ] && continue
-    exe=$(readlink "$d/exe" 2>/dev/null) || continue
-    mapfile -d '' -t a <"$d/cmdline" 2>/dev/null || continue
-    case $exe in
-      "$root" | "$root"/*) ;;
-      */node | */nodejs | */bun)
-        r=
-        for arg in "${a[@]:1:3}"; do
-          [[ $arg == -* ]] && continue
-          [[ $arg == /* ]] || arg="$(readlink "$d/cwd" 2>/dev/null)/$arg"
-          r=$(readlink -f "$arg" 2>/dev/null)
-          case $r in "$root"/*) break ;; esac
-          r=
-        done
-        [ -n "$r" ] || continue
-        ;;
-      *) continue ;;
-    esac
-    if [ "$1" = opencode ]; then
-      svc=0
-      for ((i = 0; i + 1 < ${#a[@]}; i++)); do
-        [ "${a[i]}" = serve ] && [ "${a[i + 1]}" = --service ] && svc=1
-      done
-      [ $svc = 1 ] && continue
-    fi
-    return 0
+# ---- versioned install, atomic switch ----------------------------------------------------------
+
+# verify <dir> <tool> <version>: the installed bin runs and reports the expected version
+verify() {
+  local out
+  out=$(x 30 "$1/bin/$2" --version 2>&1 </dev/null) || return 1
+  printf %s "$out" | grep -Fqw -- "$3"
+}
+
+# install_version <tool> <version>: npm install into <root>/<tool>/<version> (as this user, no sudo), verify there
+install_version() {
+  local t=$1 v=$2 d="$ROOT/$1/$2" out
+  if [ -d "$d" ] && verify "$d" "$t" "$v"; then return 0; fi # already there and sound (maybe in use)
+  rm -rf "$d"; mkdir -p "$d" || { echo "cannot create $d"; return 1; }
+  out=$(x 600 npm install -g --prefix "$d" --no-audit --no-fund --no-progress --loglevel=error "$(pkg_of "$t")@$v" 2>&1 </dev/null) \
+    || { rm -rf "$d"; echo "npm install failed: $(printf %s "$out" | tail -3)"; return 1; }
+  verify "$d" "$t" "$v" || { rm -rf "$d"; echo "verify failed: $t --version does not report $v"; return 1; }
+}
+
+# flip <tool> <version>: atomic switch of <root>/<tool>/current (rename of a temp symlink over it)
+flip() {
+  local tmp="$ROOT/$1/.current.$$"
+  # stamp = boot id + uptime (monotonic, immune to wall-clock jumps); the file mtime only orders versions
+  printf '%s %s\n' "$(cat /proc/sys/kernel/random/boot_id)" "$(cut -d' ' -f1 /proc/uptime)" >"$ROOT/$1/$2/.activated" && ln -s "$2" "$tmp" && mv -T "$tmp" "$ROOT/$1/current" || { rm -f "$tmp"; echo "cannot switch $1 to $2"; return 1; }
+}
+
+# ensure_links <tool>: BINDIR/<bin> -> <root>/<tool>/current/bin/<bin> (each replaced by an atomic rename)
+ensure_links() {
+  local t=$1 n target tmp names
+  names=$(jq -r 'if (.bin|type)=="object" then (.bin|keys[]) elif (.bin|type)=="string" then (.name|split("/")|last) else empty end' \
+    "$ROOT/$t/current/lib/node_modules/$(pkg_of "$t")/package.json" 2>/dev/null) || return 1
+  for n in $names; do
+    target="$ROOT/$t/current/bin/$n"
+    [ -e "$target" ] || continue
+    [ "$(readlink "$BINDIR/$n" 2>/dev/null)" = "$target" ] && continue
+    tmp="$BINDIR/.$n.fcode.$$"
+    priv "$BINDIR" ln -s "$target" "$tmp" && priv "$BINDIR" mv -T "$tmp" "$BINDIR/$n" || { priv "$BINDIR" rm -f "$tmp"; echo "cannot link $BINDIR/$n"; return 1; }
   done
+}
+
+# switch_to <tool> <version>: install, verify, switch, link
+switch_to() { install_version "$1" "$2" && flip "$1" "$2" && ensure_links "$1"; }
+
+# ---- cleanup (best effort; a doubt always means "keep") ---------------------------------------
+
+# dir_in_use <dir>: some process has the dir as exe/cwd/open file/mapping, or its path on its command line
+dir_in_use() {
+  local d=${1%/}
+  sudo -n true 2>/dev/null </dev/null 9>&- || return 0 # cannot look at every process: assume in use
+  [ -n "$(sudo -n find /proc -maxdepth 3 \( -lname "$d" -o -lname "$d/*" \) -print -quit 2>/dev/null </dev/null 9>&-)" ] && return 0
+  cat /proc/[0-9]*/cmdline 2>/dev/null | tr '\0' '\n' | grep -qF -f <(printf '%s/\n' "$d") && return 0
   return 1
 }
 
-# opencode keeps one shared background service; "status" prints its URL while it runs
-oc_service_running() { x 30 opencode service status 2>/dev/null </dev/null | grep -q '^http'; }
-
-# do_update <tool> <target>: runs the update and prints its output
-do_update() {
-  case $1 in
-    omp) x 600 omp update 2>&1 </dev/null ;;
-    *) sudo -n -H timeout -k 15 600 npm install -g "$(pkg_of "$1")@$2" --no-audit --no-fund --no-progress --loglevel=error 2>&1 </dev/null 9>&- ;;
-  esac
+# oldest_tool_start <tool>: start time (seconds after boot) of the oldest running process that looks like the tool (any of its bin
+# names or process titles in comm or the first five arguments). A node script keeps only its symlink in
+# its command line, so this is how a long-lived old session is noticed. Looking too broad only delays cleanup.
+oldest_tool_start() {
+  local names=" $(tool_names "$1") " d pid w s best='' a=()
+  for d in /proc/[0-9]*; do
+    pid=${d#/proc/}
+    [ "$pid" = "$$" ] && continue
+    mapfile -d '' -t a <"$d/cmdline" 2>/dev/null || continue
+    for w in "$(cat "$d/comm" 2>/dev/null)" "${a[@]:0:5}"; do
+      w=${w##*/}
+      [[ -n $w && $names == *" $w "* ]] || continue
+      s=$(sed 's/.*) //' "$d/stat" 2>/dev/null | cut -d' ' -f20) || continue
+      s=$((s / $(getconf CLK_TCK)))
+      if [ -z "$best" ] || [ "$s" -lt "$best" ]; then best=$s; fi
+      break
+    done
+  done
+  echo "$best"
 }
+
+# prune_tool <tool>: keep current + the 2 most recently activated others; remove older version dirs and the
+# old global copy only when nothing uses them. A tool process older than the current version blocks it all.
+prune_tool() {
+  local t=$1 cur boot='' act='' old keepall=0 n=0 f v legacy
+  cur=$(readlink "$ROOT/$t/current") || return 0
+  read -r boot act <"$ROOT/$t/$cur/.activated" 2>/dev/null
+  # stamp from another boot: every process alive now started later. No stamp: assume "activated just now".
+  if [ -n "$boot" ] && [ "$boot" != "$(cat /proc/sys/kernel/random/boot_id)" ]; then act=-1; fi
+  act=${act%%.*}; act=${act:-$(cut -d. -f1 /proc/uptime)}
+  old=$(oldest_tool_start "$t")
+  if [ -n "$old" ] && [ "$old" -le "$act" ]; then keepall=1; fi
+  [ $keepall = 0 ] || return 0
+  legacy="$NM/$(pkg_of "$t")"
+  if [ -n "$NM" ] && [ -d "$legacy" ] && ! dir_in_use "$legacy"; then
+    priv "$NM" rm -rf "$legacy" && note "$t: removed old global copy $legacy"
+  fi
+  for f in $(ls -1t "$ROOT/$t"/*/.activated 2>/dev/null); do # newest first
+    v=$(basename "$(dirname "$f")")
+    [ "$v" = current ] || [ "$v" = "$cur" ] && continue
+    n=$((n + 1))
+    [ $n -le 2 ] && continue
+    if ! dir_in_use "$ROOT/$t/$v"; then rm -rf "${ROOT:?}/$t/$v" && note "$t: removed old version $v"; fi
+  done
+  return 0
+}
+
+# ---- one tool ----------------------------------------------------------------------------------
 
 failed=0
 update_tool() {
-  local t=$1 cur lat out new rc svc=0
+  local t=$1 cur lat out new v
+  if [ -e "$ROOT/$t/hold" ]; then # rollback pin: touch <root>/<tool>/hold
+    record "$t" "$(installed "$t")" "$(installed "$t")" current "held (remove $ROOT/$t/hold to resume updates)"; return
+  fi
+  if [ "$t" != omp ] && [ -z "$(cur_ver "$t")" ]; then # first run: move the old global install into the layout
+    v=$(legacy_ver "$t")
+    semver_ok "$v" || { record "$t" "" "" failed "not installed (no $ROOT/$t/current and no global package)"; failed=1; return; }
+    out=$(switch_to "$t" "$v") || { record "$t" "$v" "" failed "migration failed: $out"; failed=1; return; }
+    note "$t: migrated $v to $ROOT/$t/$v"
+  fi
   cur=$(installed "$t")
   semver_ok "$cur" || { record "$t" "" "" failed "cannot read installed version"; failed=1; return; }
   lat=$(latest "$t" "$cur") || { record "$t" "$cur" "" failed "latest lookup failed: $lat"; failed=1; return; }
   if [ "$lat" != newer ] && ! semver_ok "$lat"; then record "$t" "$cur" "" failed "invalid latest version '$lat'"; failed=1; return; fi
-  if ! newer "$cur" "$lat"; then record "$t" "$cur" "$cur" current; return; fi
-  if busy "$t"; then record "$t" "$cur" "$lat" skipped_busy; return; fi
-  # no client is running: stop the idle opencode service so it restarts on the new version
-  if [ "$t" = opencode ] && oc_service_running; then svc=1; x 60 opencode service stop >/dev/null 2>&1 </dev/null; fi
-  out=$(do_update "$t" "$lat"); rc=$?
-  [ $svc = 1 ] && x 60 opencode service start >/dev/null 2>&1 </dev/null
-  [ $rc -eq 0 ] || { record "$t" "$cur" "$lat" failed "update failed: $(printf %s "$out" | tail -3)"; failed=1; return; }
+  if ! newer "$cur" "$lat"; then
+    record "$t" "$cur" "$cur" current
+    [ "$t" = omp ] || prune_tool "$t"
+    return
+  fi
+  if [ "$t" = omp ]; then
+    out=$(x 600 omp update 2>&1 </dev/null) || { record "$t" "$cur" "$lat" failed "update failed: $(printf %s "$out" | tail -3)"; failed=1; return; }
+  else
+    out=$(switch_to "$t" "$lat") || { record "$t" "$cur" "$lat" failed "$out"; failed=1; return; }
+  fi
   new=$(installed "$t")
   if [ -z "$new" ] || [ "$new" = "$cur" ] || { [ "$lat" != newer ] && [ "$new" != "$lat" ]; }; then
     record "$t" "$cur" "${new:-}" failed "version after update is '${new:-unreadable}', expected '$lat'"; failed=1; return
   fi
   record "$t" "$cur" "$new" updated
+  [ "$t" = omp ] || prune_tool "$t"
 }
 
 main() {
