@@ -175,6 +175,8 @@ struct AddDeviceView: View {
             reply = r
         } catch let e as APIError where [404, 405, 501].contains(e.status) {
             errorText = "Máy chủ chưa hỗ trợ, cập nhật máy chủ trước."
+        } catch let e as APIError where e.status == 409 && e.code == "no_public_url" {
+            errorText = "Máy chủ chưa đặt địa chỉ công khai (publicUrl), cập nhật cấu hình máy chủ trước."
         } catch {
             errorText = app.report(error)
         }

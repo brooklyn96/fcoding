@@ -39,7 +39,7 @@ Sau khi ghép, iPhone nhớ box trong Keychain; mở ứng dụng là vào thẳ
 
 **Thêm một iPhone mới bằng mã QR** (khi đã có một iPhone ghép rồi):
 
-1. Trên iPhone cũ: **Cài đặt → Thêm thiết bị (mã QR)**. Mã dùng 1 lần, hết hạn sau **5 phút** (có đồng hồ đếm ngược; hết hạn thì bấm **Tạo mã mới**).
+1. Trên iPhone cũ: **Cài đặt → Thêm thiết bị (mã QR)**. Mã dùng 1 lần, hết hạn sau **2 phút** (có đồng hồ đếm ngược; hết hạn thì bấm **Tạo mã mới**).
 2. Trên iPhone mới (đã cài FCode): mở **Camera**, quét mã, chạm thông báo **Mở trong FCode**, rồi bấm **Ghép**. Không quét được thì bấm **Gửi link** để gửi link qua AirDrop hoặc Zalo.
 
 ## 4. Cách dùng
