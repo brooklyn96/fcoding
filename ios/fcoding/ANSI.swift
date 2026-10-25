@@ -60,7 +60,11 @@ enum ANSI {
                 var j = i + 2
                 while j < s.count, (0x20...0x3F).contains(s[j].value) { j += 1 }
                 guard j < s.count else { i = s.count; continue }
-                if s[j] == "m" {
+                // Not a final byte: abandon the sequence, keep s[j] as text.
+                guard (0x40...0x7E).contains(s[j].value) else { i = j; continue }
+                // A private-parameter CSI ("ESC[>4;2m", "ESC[?25h") is never SGR.
+                let isPrivate = j > i + 2 && "<=>?".unicodeScalars.contains(s[i + 2])
+                if s[j] == "m", !isPrivate {
                     var next = style
                     apply(String(String.UnicodeScalarView(s[(i + 2)..<j])), to: &next)
                     if next != style {
@@ -176,17 +180,48 @@ enum ANSI {
         return UIFont(descriptor: desc, size: size)
     }
 
+    /// Nerd Font icons: the Private Use Area and planes 15–16.
+    static func isIcon(_ c: Unicode.Scalar) -> Bool {
+        (0xE000...0xF8FF).contains(c.value) || c.value >= 0xF0000
+    }
+
+    /// One terminal cell: the "M" advance of the base font.
+    static func cellWidth(size: CGFloat) -> CGFloat {
+        ("M" as NSString).size(withAttributes: [.font: UIFont.monospacedSystemFont(ofSize: size, weight: .regular)]).width
+    }
+
+    /// Point size for the Nerd icon font so one icon is exactly one cell wide. Every glyph of
+    /// SymbolsNerdFontMono advances 2048 units on a 2048 em, i.e. 1.0 em, so advance = point size;
+    /// SF Mono advances about 0.6 em. Hence point size = cell width (≈ 0.6 × base size).
+    static func iconFontSize(forBase size: CGFloat) -> CGFloat { cellWidth(size: size) }
+
     struct Fonts {
         let regular: Font
         let bold: Font
         let italic: Font
         let boldItalic: Font
+        /// The Nerd font itself (not through the cascade), sized to one cell.
+        let icon: Font
+        /// Raises the smaller icon so its centre sits on the centre of the text line.
+        let iconBaselineOffset: CGFloat
 
         init(size: CGFloat) {
-            regular = Font(ANSI.terminalFont(size: size) as CTFont)
+            let base = ANSI.terminalFont(size: size)
+            regular = Font(base as CTFont)
             bold = Font(ANSI.terminalFont(size: size, bold: true) as CTFont)
             italic = Font(ANSI.terminalFont(size: size, italic: true) as CTFont)
             boldItalic = Font(ANSI.terminalFont(size: size, bold: true, italic: true) as CTFont)
+            if let nerd = UIFont(name: ANSI.nerdFontName, size: ANSI.iconFontSize(forBase: size)) {
+                icon = Font(nerd as CTFont)
+                iconBaselineOffset = (base.ascender + base.descender) / 2 - (nerd.ascender + nerd.descender) / 2
+                #if DEBUG
+                let iconW = ("\u{F017}" as NSString).size(withAttributes: [.font: nerd]).width
+                assert(abs(iconW - ANSI.cellWidth(size: size)) < 0.5, "Nerd icon is not one cell wide")
+                #endif
+            } else {
+                icon = regular
+                iconBaselineOffset = 0
+            }
         }
     }
 
@@ -199,12 +234,33 @@ enum ANSI {
             let st = run.style
             let (fg, bg) = colors(st)
             var c = AttributeContainer()
-            c[A.FontAttribute.self] = st.bold ? (st.italic ? fonts.boldItalic : fonts.bold)
-                                              : (st.italic ? fonts.italic : fonts.regular)
             c[A.ForegroundColorAttribute.self] = color(fg).opacity(st.dim ? 0.6 : 1)
             if let bg = bg { c[A.BackgroundColorAttribute.self] = color(bg) }
             if st.underline { c[A.UnderlineStyleAttribute.self] = .single }
-            out.append(AttributedString(run.text, attributes: c))
+            var text = c
+            text[A.FontAttribute.self] = st.bold ? (st.italic ? fonts.boldItalic : fonts.bold)
+                                                 : (st.italic ? fonts.italic : fonts.regular)
+            var icon = c
+            icon[A.FontAttribute.self] = fonts.icon
+            icon[A.BaselineOffsetAttribute.self] = fonts.iconBaselineOffset
+
+            // Icons get their own pieces, in the icon font; everything else keeps the text font.
+            var piece = String.UnicodeScalarView()
+            var pieceIsIcon = false
+            func emit() {
+                guard !piece.isEmpty else { return }
+                out.append(AttributedString(String(piece), attributes: pieceIsIcon ? icon : text))
+                piece = String.UnicodeScalarView()
+            }
+            for scalar in run.text.unicodeScalars {
+                let iconScalar = isIcon(scalar)
+                if iconScalar != pieceIsIcon {
+                    emit()
+                    pieceIsIcon = iconScalar
+                }
+                piece.append(scalar)
+            }
+            emit()
         }
         return out
     }

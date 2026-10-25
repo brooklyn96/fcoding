@@ -2,7 +2,7 @@ import SwiftUI
 
 struct SessionView: View {
     let name: String
-    /// From the inbox; nil (e.g. a session just made from "+") falls back to the name's suffix.
+    /// From the inbox; nil only for a session the inbox does not know yet (e.g. just made from "+").
     let harness: String?
     @EnvironmentObject private var app: AppState
     @Environment(\.dismiss) private var dismiss
@@ -27,7 +27,7 @@ struct SessionView: View {
     }
 
     private var chipHarness: String? {
-        harness ?? HarnessStyle.all.first { name.split(separator: "-").contains(Substring($0)) }
+        harness ?? name.split(separator: "-").last { HarnessStyle.all.contains(String($0)) }.map(String.init)
     }
 
     var body: some View {
@@ -35,11 +35,6 @@ struct SessionView: View {
             GeometryReader { geo in
                 TerminalView(model: model, fontSize: fontSize, viewportHeight: geo.size.height,
                              trailingInset: composerShown ? 0 : 58)
-                    .onAppear { model.resize(to: geo.size, fontSize: fontSize) }
-                    .onChange(of: geo.size.width) { _ in model.resize(to: geo.size, fontSize: fontSize) }
-                    // Composer or keyboard shown / hidden: new row count (resize() debounces).
-                    .onChange(of: geo.size.height) { _ in model.resize(to: geo.size, fontSize: fontSize) }
-                    .onChange(of: fontSize) { newSize in model.resize(to: geo.size, fontSize: newSize) }
             }
             .background(Color.black)
             .overlay(alignment: .bottomTrailing) { if !composerShown { keyboardButton } }
@@ -71,6 +66,18 @@ struct SessionView: View {
             }
         }
         .background(Color.black.ignoresSafeArea())
+        .background {
+            // tmux size = the FULL terminal area (below the top bar, without composer or keyboard),
+            // so showing the composer or the keyboard never resizes tmux; the terminal then shows
+            // its bottom part. Only rotation (size) and A-/A+ resize.
+            GeometryReader { full in
+                Color.clear
+                    .onAppear { model.resize(to: full.size, fontSize: fontSize) }
+                    .onChange(of: full.size) { size in model.resize(to: size, fontSize: fontSize) }
+                    .onChange(of: fontSize) { newSize in model.resize(to: full.size, fontSize: newSize) }
+            }
+            .ignoresSafeArea(.keyboard)
+        }
         .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: composerShown)
         .overlay { if model.gone { goneView } }
         .navigationTitle(name)
@@ -314,7 +321,7 @@ struct ComposerView: View {
 
     private var swipeDown: some Gesture {
         DragGesture(minimumDistance: 10).onEnded { v in
-            if v.translation.height > 30, v.translation.height > abs(v.translation.width) { onHide() }
+            if !sending, v.translation.height > 30, v.translation.height > abs(v.translation.width) { onHide() }
         }
     }
 
@@ -434,6 +441,7 @@ struct ComposerView: View {
                 .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8))
                 .foregroundColor(.accentColor)
         }
+        .disabled(sending) // hiding mid-send would drop the composer before the draft is cleared
         .accessibilityLabel("Ẩn khung gõ")
     }
 
@@ -484,6 +492,11 @@ struct ComposerView: View {
         Task {
             let ok = await job.value
             if ok, draft == text { draft = "" }
+            // Clear the stored copy here too: onChange(of: draft) may never run if the composer
+            // hides right after this send.
+            if ok, UserDefaults.standard.string(forKey: draftKey) == text {
+                UserDefaults.standard.removeObject(forKey: draftKey)
+            }
             sending = false
             if ok, draft.isEmpty { onSent() }
         }

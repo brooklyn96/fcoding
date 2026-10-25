@@ -139,7 +139,8 @@ struct ProjectsView: View {
     private func open(_ name: String, reply: Bool = false) {
         model.markRead(name)
         lastOpened = name
-        path.append(Route(name: name, reply: reply, harness: allSessions.first { $0.name == name }?.harness))
+        let known = allSessions.first { $0.name == name }
+        path.append(Route(name: name, reply: reply, harness: known.map { $0.harness ?? "shell" }))
     }
 
     // MARK: - Header: subtitle + project chips
