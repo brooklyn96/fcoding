@@ -30,13 +30,19 @@ final class SessionModel: ObservableObject {
 
     init(name: String) { self.name = name }
 
-    private var styledCache: (text: String, fontSize: Double, value: AttributedString)?
+    private var styledCache: (text: String, fontSize: Double, cols: Int, value: AttributedString)?
+    /// Width of the screen in cells (from the server, else the last size sent), for joining
+    /// hard-wrapped links.
+    private var screenCols = 0
 
-    /// The screen text with its SGR colours, parsed once per text and font size.
+    /// The screen text with its SGR colours and tappable links, built once per screen update
+    /// (text, font size, width), not per frame.
     func styled(fontSize: Double) -> AttributedString {
-        if let c = styledCache, c.fontSize == fontSize, c.text == text { return c.value }
-        let value = ANSI.attributed(ANSI.runs(text), fonts: ANSI.Fonts(size: CGFloat(fontSize)))
-        styledCache = (text, fontSize, value)
+        if let c = styledCache, c.fontSize == fontSize, c.cols == screenCols, c.text == text { return c.value }
+        let runs = ANSI.runs(text)
+        var value = ANSI.attributed(runs, fonts: ANSI.Fonts(size: CGFloat(fontSize)))
+        Links.apply(Links.find(in: runs.map(\.text).joined(), cols: screenCols), to: &value)
+        styledCache = (text, fontSize, screenCols, value)
         return value
     }
 
@@ -160,6 +166,7 @@ final class SessionModel: ObservableObject {
         guard let screen = try? JSONDecoder().decode(Screen.self, from: data) else { return }
         if screen.hash == nil || screen.hash != lastHash {
             lastHash = screen.hash
+            screenCols = screen.cols ?? sentCols
             if text != screen.text { text = screen.text }
         }
     }
