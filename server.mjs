@@ -6,7 +6,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 export const HARNESSES = { omp: 'omp', claude: 'claude', codex: 'codex', shell: 'bash -l' };
@@ -18,7 +18,7 @@ const COOKIE_MAX_AGE = 30 * 24 * 3600;
 const BODY_LIMIT = 64 * 1024;
 const TEXT_LIMIT = 32 * 1024;
 const LONG_TEXT = 500; // bytes; longer single lines are pasted, not typed
-const PAIR_TTL = 120 * 1000, PAIR_ATTEMPTS = 5;
+const PAIR_TTL = 120 * 1000, PAIR_ATTEMPTS = 5, PAIR_PENDING = 3;
 const PAIR_PER_MINUTE = 10, PAIR_MINUTE = 60 * 1000, PAIR_PER_HOUR = 30, PAIR_HOUR = 3600 * 1000;
 const MAX_STREAMS = 50;
 const MAX_WAITING = 20; // mutation jobs waiting behind the active one
@@ -77,6 +77,27 @@ export function secureConfigDir(dir) {
   };
   if (check(dir, true)) for (const f of ['config.json', 'devices.json']) check(path.join(dir, f), false);
 }
+// The server origin the app accepts in a pairing link. ONE rule shared with the iOS PairLink parser: the "rule" field and the vectors in
+// test/origin-vectors.json (the same file is in the iOS tree). Raw input printable ASCII only, then lower-cased as a whole; "https://" + host
+// [+ ":" port, 1-65535 without a leading zero] [+ "/"], nothing else; host = LDH name with a dot (no "xn--" label, last label not a number) OR dotted IPv4
+// without leading zeros and without a trailing dot OR a bracketed IPv6 address. Returns the canonical origin (443 left out) or null.
+// A host written another way (IDN, "localhost", "192.168.001.010", "1.2.3.0x4") gives a QR no phone can use.
+export function strictOrigin(raw) {
+  if (typeof raw !== 'string' || /[^\x21-\x7e]/.test(raw)) return null; // printable ASCII only (checked before lowercasing: KELVIN SIGN must not become "k")
+  const m = /^https:\/\/(\[[0-9a-f:.]+\]|[^:/[\]]+)(?::([1-9]\d{0,4}))?\/?$/.exec(raw.toLowerCase()); // the whole string is lower-cased, scheme included
+  if (!m) return null;
+  let host = m[1];
+  const port = m[2] === undefined ? null : Number(m[2]);
+  if (port !== null && !(port >= 1 && port <= 65535)) return null;
+  const origin = `https://${host}${port === null || port === 443 ? '' : `:${port}`}`;
+  if (host.startsWith('[')) return net.isIPv6(host.slice(1, -1)) ? origin : null;
+  if (/^(0|[1-9]\d{0,2})(\.(0|[1-9]\d{0,2})){3}$/.test(host)) return host.split('.').every((o) => Number(o) <= 255) ? origin : null;
+  if (host.endsWith('.')) host = host.slice(0, -1);
+  const labels = host.split('.');
+  if (host.length > 253 || labels.length < 2 || !labels.every((l) => /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(l) && !l.startsWith('xn--'))) return null;
+  if (/^(0x[0-9a-f]*|[0-9]+)$/.test(labels.at(-1))) return null; // read as a number by the system resolver
+  return `https://${host}${port === null || port === 443 ? '' : `:${port}`}`;
+}
 // Parse + validate a complete candidate. Error messages never quote the file (it holds the secret).
 export function parseConfig(text) {
   let c;
@@ -87,8 +108,19 @@ export function parseConfig(text) {
   const projects = c.projects ?? {};
   if (typeof projects !== 'object' || projects === null || Array.isArray(projects)) throw new Error('config.json: projects must be an object');
   if (c.port !== undefined && !(Number.isInteger(c.port) && c.port > 0 && c.port < 65536)) throw new Error('config.json: port invalid');
+  // publicUrl: the https origin of the published port; the pairing links are built from it and from nothing in a request
+  let publicUrl;
+  if (c.publicUrl !== undefined) {
+    try {
+      const u = new URL(c.publicUrl);
+      if (typeof c.publicUrl !== 'string' || u.protocol !== 'https:' || u.username || u.password || u.pathname !== '/' || u.search || u.hash) throw new Error('bad');
+      publicUrl = u.origin;
+    } catch { throw new Error('config.json: publicUrl invalid (want an https origin such as https://box.example.com)'); }
+  }
+  // publicOrigin: publicUrl in the exact form the app accepts, or null (then no pairing link is made; see strictOrigin)
+  const publicOrigin = publicUrl === undefined ? null : strictOrigin(c.publicUrl);
   return {
-    secret: Buffer.from(s, 'base64'), port: c.port, projects,
+    secret: Buffer.from(s, 'base64'), port: c.port, projects, publicUrl, publicOrigin,
     projectNames: Object.keys(projects).filter((k) => typeof projects[k] === 'string' && path.isAbsolute(projects[k])),
   };
 }
@@ -104,7 +136,16 @@ export function parseDevices(text) {
   return { secretTag: d.secretTag, devices: d.devices.map(({ id, name, keyHash, createdAt }) => ({ id, name, keyHash, createdAt })) };
 }
 const NAME_CTRL = /[\x00-\x1f\x7f-\x9f\u061c\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/g; // C0, DEL, C1, bidi, zero-width, BOM
-const cleanName = (n) => (typeof n === 'string' ? n.replace(NAME_CTRL, '').trim().slice(0, 64) : '');
+const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+function cleanName(n) {
+  if (typeof n !== 'string') return '';
+  let out = '', len = 0;
+  for (const ch of n.replace(LONE_SURROGATE, '').replace(NAME_CTRL, '').trim()) { // never half of a surrogate pair
+    if (len + ch.length > 64) break;
+    out += ch; len += ch.length;
+  }
+  return out.trim();
+}
 
 // --- overview (A5): session state and a one-line preview from the visible pane ---
 // approval / question prompts, matched case-insensitively against the last 6 non-empty lines
@@ -232,6 +273,14 @@ export function trimAnsiScreen(s) {
   return lines.join('\n');
 }
 
+// GET /pair: a tiny page with one button that opens the app link. Nothing from the request reaches it (no code, no query).
+const escHtml = (t) => t.replace(/[&<>"']/g, (ch) => `&#${ch.charCodeAt(0)};`);
+export function pairPage(appLink) {
+  const body = !appLink ? '<p>Máy chủ chưa đặt địa chỉ công khai hợp lệ, nên chưa mở được app từ link này.</p>'
+    : `<a class="btn" href="${escHtml(appLink)}">Mở FCode</a><p>Sau khi app mở, gõ mã 6 số đang hiện trên iPhone cũ hoặc trên máy tính.</p><p class="s">Chưa cài FCode? Cài file fcode.ipa trước.</p>`;
+  return `<!doctype html><html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Ghép FCode</title><style>body{margin:0;font:17px/1.5 -apple-system,system-ui,sans-serif;background:#111;color:#eee;text-align:center}main{padding:48px 24px}.btn{display:block;max-width:320px;margin:24px auto;padding:16px;border-radius:14px;background:#0a84ff;color:#fff;font-size:20px;font-weight:600;text-decoration:none}.s{color:#999;font-size:15px}</style></head><body><main><h1>Ghép iPhone với FCode</h1>${body}</main></body></html>`;
+}
+
 // ---------- app ----------
 export function createApp(opts = {}) {
   const configDir = opts.configDir || defaultConfigDir();
@@ -300,7 +349,7 @@ export function createApp(opts = {}) {
       if (next) {
         const rotated = !next.secret.equals(cfg.secret);
         cfg = next;
-        if (rotated) { gen++; load([]); purge(); return; } // no old keyHash may match any more
+        if (rotated) { gen++; pendings = []; load([]); purge(); return; } // no old keyHash may match any more
       }
     }
     if (purgePending && (force || changed || now() - purgeAt >= 1000)) purge();
@@ -313,8 +362,9 @@ export function createApp(opts = {}) {
   }
   const gateErr = (ctx) => (ctx.cancelled ? new HttpErr(499, 'cancelled') : new HttpErr(401, 'unauthorized'));
 
-  // --- pairing: one pending 6-digit code, 120 s, 5 wrong attempts; /api/pair limited to 10/min and 30/h ---
-  let pending = null; // {code, name, expiresAt, attempts}
+  // --- pairing: up to 3 pending 6-digit codes (a shell code and QR codes do not cancel each other), each 120 s and single use,
+  // 5 wrong attempts while it is live; /api/pair limited to 10/min and 30/h ---
+  let pendings = []; // oldest first: {code, name, expiresAt, attempts, issuer}; issuer = a device id or 'shell'
   const pairHits = [];
   function pairLimited(t) {
     while (pairHits.length && pairHits[0] <= t - PAIR_HOUR) pairHits.shift();
@@ -325,37 +375,63 @@ export function createApp(opts = {}) {
     return 0;
   }
   // constant-time: the comparison never depends on where the digits differ
-  const codeMatches = (code) => typeof code === 'string' && /^\d{6}$/.test(code) && crypto.timingSafeEqual(Buffer.from(code), Buffer.from(pending.code));
+  const codeMatches = (code, p) => typeof code === 'string' && /^\d{6}$/.test(code) && crypto.timingSafeEqual(Buffer.from(code), Buffer.from(p.code));
   function pair(code, name) {
+    refreshConfig(); // a config edit is seen BEFORE any code is looked up or consumed: a rotation has then already cleared every pending code
+    if (purgePending) throw new HttpErr(500, 'storage');
     const t = now();
-    if (!pending || t >= pending.expiresAt) { pending = null; throw new HttpErr(401, 'bad_code'); }
-    if (!codeMatches(code)) {
-      if (++pending.attempts >= PAIR_ATTEMPTS) pending = null;
+    pendings = pendings.filter((p) => t < p.expiresAt && (p.issuer === 'shell' || devices.has(p.issuer))); // a revoked issuer's codes are dead
+    const hits = pendings.map((p) => codeMatches(code, p)); // every live code is compared, none is skipped
+    const i = hits.indexOf(true);
+    if (i < 0) { // a wrong guess is one attempt against every live code; a code with 5 is gone
+      pendings = pendings.filter((p) => ++p.attempts < PAIR_ATTEMPTS);
       throw new HttpErr(401, 'bad_code');
     }
-    const devName = pending.name || cleanName(name) || 'device';
-    pending = null; // single use, even if the write below fails
-    refreshConfig();
-    if (purgePending) throw new HttpErr(500, 'storage');
+    const [used] = pendings.splice(i, 1); // single use, even if the write below fails
+    const devName = used.name || cleanName(name) || 'device';
     const token = crypto.randomBytes(32).toString('base64url');
     const dev = { id: crypto.randomBytes(8).toString('hex'), name: devName, keyHash: keyOf(token), createdAt: t };
     try { commitDevices([...devices.values(), dev]); } catch { throw new HttpErr(500, 'storage'); }
     return token;
   }
-  function revoke(ids) { // throws on a failed write; nothing changes then
+  // throws on a failed write; nothing changes then. Pending codes made by a removed device go with it; all: every pending code goes.
+  function revoke(ids, all = false) {
     commitDevices([...devices.values()].filter((d) => !ids.includes(d.id)));
+    pendings = all ? [] : pendings.filter((p) => !ids.includes(p.issuer));
   }
-  function admin(req) {
+  // a new pending code for an issuer ('shell' or a device id): it replaces that issuer's own code; 3 at most, and when a 4th is made
+  // the oldest DEVICE code goes (the shell code is never pushed out by a device). Used by the shell command and by POST /api/pair-code.
+  function newPairing(name, issuer) {
+    const t = now();
+    pendings = pendings.filter((p) => t < p.expiresAt && p.issuer !== issuer);
+    let code;
+    do code = String(crypto.randomInt(0, 1e6)).padStart(6, '0'); while (pendings.some((p) => p.code === code)); // codes of live pairings differ
+    const p = { code, name: cleanName(name), expiresAt: t + PAIR_TTL, attempts: 0, issuer };
+    pendings.push(p);
+    while (pendings.length > PAIR_PENDING) pendings.splice(pendings.findIndex((x) => x.issuer !== 'shell'), 1);
+    return p;
+  }
+  // {appLink, shareLink} from cfg.publicOrigin (publicUrl as the app accepts it) only; null when it is not configured or not usable. Never a code, a name or anything from a request:
+  // a link can be intercepted (the fcode scheme is not exclusive), so the user types the code.
+  function pairLinks() {
+    const o = cfg.publicOrigin;
+    return o ? { appLink: `fcode://pair?server=${encodeURIComponent(o)}`, shareLink: `${o}/pair` } : null;
+  }
+  function admin(req) { // an exception must never leave the socket callback: it would take the server down
+    try { return adminCmd(req); } catch (e) { log(`admin request failed: ${e.code || e.name}`); return { ok: false, error: 'internal' }; }
+  }
+  function adminCmd(req) {
     refreshConfig(true); // a rotation or a pending purge is handled before any answer
     if (req?.cmd === 'pair') {
-      pending = { code: String(crypto.randomInt(0, 1e6)).padStart(6, '0'), name: cleanName(req.name), expiresAt: now() + PAIR_TTL, attempts: 0 };
-      return { ok: true, code: pending.code, expiresAt: pending.expiresAt, expiresIn: PAIR_TTL / 1000 };
+      if (req.links && cfg.publicUrl && !cfg.publicOrigin) return { ok: false, error: 'public_url_invalid' }; // no code is made for a QR that cannot work
+      const p = newPairing(req.name, 'shell');
+      return { ok: true, code: p.code, expiresAt: p.expiresAt, expiresIn: PAIR_TTL / 1000, ...(req.links && { links: pairLinks() }) };
     }
     if (req?.cmd === 'devices') return { ok: true, devices: [...devices.values()].map(({ id, name, createdAt }) => ({ id, name, createdAt })) };
     if (req?.cmd === 'revoke') {
       const ids = req.id === 'all' ? [...devices.keys()] : [req.id];
       if (req.id !== 'all' && !devices.has(req.id)) return { ok: false, error: 'no such device' };
-      try { revoke(ids); } catch (e) { return { ok: false, error: `storage: ${e.code || 'write failed'}` }; }
+      try { revoke(ids, req.id === 'all'); } catch (e) { return { ok: false, error: `storage: ${e.code || 'write failed'}` }; }
       return { ok: true, revoked: ids.length };
     }
     return { ok: false, error: 'unknown command' };
@@ -705,13 +781,21 @@ export function createApp(opts = {}) {
       return res.end(method === 'HEAD' ? undefined : 'fcoding ok');
     }
 
+    refreshConfig(); // first thing for every route: no route may see a stale secret, device list or pending code
+    if (pathname === '/pair' && (method === 'GET' || method === 'HEAD')) { // share link: no code in it; never reads or changes a pending code
+      const links = pairLinks(); // the query string is never read
+      const status = links ? 200 : 503;
+      const body = pairPage(links?.appLink);
+      res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': Buffer.byteLength(body), 'Cache-Control': 'no-store' });
+      return res.end(method === 'HEAD' ? undefined : body);
+    }
+
     const isApi = pathname.startsWith('/api/');
     if (method !== 'GET' && method !== 'HEAD' && !csrfOk(req)) throw new HttpErr(403, 'forbidden');
 
     const seg = pathname.split('/');
     const isPair = pathname === '/api/pair';
     if (!isPair) {
-      refreshConfig(); // before deriving the key
       const tok = requestSid(req);
       ctx.device = tok && tok.length < 128 ? byKey.get(keyOf(tok)) ?? null : null;
       ctx.gen = gen;
@@ -735,10 +819,20 @@ export function createApp(opts = {}) {
     }
     if (pathname === '/api/logout') {
       want('POST');
-      try { revoke(url.searchParams.get('all') === '1' ? [...devices.keys()] : [ctx.device]); } catch { throw new HttpErr(500, 'storage'); }
+      const all = url.searchParams.get('all') === '1';
+      try { revoke(all ? [...devices.keys()] : [ctx.device], all); } catch { throw new HttpErr(500, 'storage'); }
       return json(res, 200, { ok: true }, { 'Set-Cookie': setCookie('', 0) });
     }
     if (pathname === '/api/me') { want('GET'); return json(res, 200, { ok: true }); }
+    if (pathname === '/api/pair-code') { // a paired device mints a code for its next device (same store, TTL, single use and limits as --pair)
+      want('POST');
+      const b = body.length ? parseJson(req, body) : {};
+      if (b.name !== undefined && typeof b.name !== 'string') throw new HttpErr(400, 'invalid');
+      if (!cfg.publicUrl) throw new HttpErr(409, 'no_public_url'); // no code is made when no link can be built
+      if (!cfg.publicOrigin) { log('pair-code refused: publicUrl is not a server address the app accepts'); throw new HttpErr(500, 'public_url_invalid'); }
+      const p = newPairing(b.name, ctx.device);
+      return json(res, 200, { code: p.code, expiresAt: new Date(p.expiresAt).toISOString(), ...pairLinks() });
+    }
     if (pathname === '/api/overview') { want('GET'); return json(res, 200, await overview(ctx)); }
     if (pathname === '/api/meta') {
       want('GET');
@@ -870,18 +964,38 @@ export function createApp(opts = {}) {
 }
 
 // ---------- CLI ----------
+// fcode-pair --qr: the QR of the server-only app link (qrencode, when installed), the share link, then the code in big digits and
+// ONE expiry line. The QR holds no code: the user types it.
+function printQr(r) {
+  const { links } = r;
+  if (!links) console.log('Chưa đặt "publicUrl" trong config.json nên chưa tạo được link/mã QR. Ví dụ: "publicUrl": "https://<địa-chỉ-công-khai>"');
+  else {
+    let shown = false;
+    try { process.stdout.write(execFileSync('qrencode', ['-t', 'ANSIUTF8', links.appLink], { encoding: 'utf8', timeout: 5000, windowsHide: true })); shown = true; } catch {}
+    console.log(`Link chia sẻ: ${links.shareLink}`);
+    if (!shown) console.log(`Link mở app: ${links.appLink}\ncài qrencode để hiện mã QR`);
+  }
+  const bar = '='.repeat(32);
+  console.log(`\n${bar}\n  MÃ GHÉP:   ${[...r.code].join('   ')}\n${bar}\nMã hết hạn sau ${Math.round(r.expiresIn / 60)} phút.`);
+}
 async function main() {
   const dir = defaultConfigDir();
   const arg = (f) => { const i = process.argv.indexOf(f); return i < 0 ? undefined : process.argv[i + 1] ?? ''; };
-  const req = process.argv.includes('--pair') ? { cmd: 'pair', name: arg('--pair') }
+  const qr = process.argv.includes('--qr');
+  const req = process.argv.includes('--pair') ? { cmd: 'pair', name: arg('--pair') === '--qr' ? '' : arg('--pair'), ...(qr && { links: true }) }
     : process.argv.includes('--devices') ? { cmd: 'devices' }
       : process.argv.includes('--revoke') ? { cmd: 'revoke', id: arg('--revoke') } : null;
   if (req) { // admin CLI: talks to the RUNNING server over admin.sock
     let r;
     try { r = await adminRequest(dir, req); } catch (e) { console.error(e.code === 'ENOSERVER' ? `${e.message} (no ${adminPath(dir)})` : `admin socket: ${e.message}`); process.exit(1); }
-    if (!r.ok) { console.error(`error: ${r.error}`); process.exit(1); }
-    if (req.cmd === 'pair') console.log(`Mã ghép: ${r.code} (hết hạn sau ${r.expiresIn} giây)\nNhập mã này vào app. Chạy lại lệnh sẽ thay mã cũ.`);
-    else if (req.cmd === 'devices') {
+    if (!r.ok) {
+      console.error(r.error === 'public_url_invalid' ? 'publicUrl trong config.json không hợp lệ cho app (cần https://tên-miền-ASCII)' : `error: ${r.error}`);
+      process.exit(1);
+    }
+    if (req.cmd === 'pair') {
+      if (qr) printQr(r);
+      else console.log(`Mã ghép: ${r.code} (hết hạn sau ${r.expiresIn} giây)\nNhập mã này vào app. Chạy lại lệnh sẽ thay mã cũ của lệnh này.`);
+    } else if (req.cmd === 'devices') {
       if (!r.devices.length) console.log('(no paired devices)');
       for (const d of r.devices) console.log(`${d.id}  ${new Date(d.createdAt).toISOString()}  ${d.name}`);
     } else console.log(`revoked: ${r.revoked}`);

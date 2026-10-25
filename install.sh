@@ -42,11 +42,16 @@ strip_password_hash() { # strip_password_hash CONFIG_FILE  (tmp file, full write
 strip_password_hash "$CFG/config.json"
 [ ! -f "$CFG/devices.json" ] || chmod 600 "$CFG/devices.json"
 
-# fcode-pair [device name]: prints a one-time 6-digit code for the app (needs the running server)
+# fcode-pair [device name] [--qr]: prints a one-time 6-digit code for the app (needs the running server);
+# --qr adds the pairing links and a QR code (qrencode, when installed; apt package "qrencode")
 mkdir -p "$HOME/.local/bin"
 cat > "$HOME/.local/bin/fcode-pair" <<WRAP
 #!/bin/sh
-exec env PC_CONFIG_DIR="$CFG" "$(command -v node)" "$APP/server.mjs" --pair "\$*"
+qr=; name=
+for a in "\$@"; do
+  case "\$a" in --qr) qr=--qr ;; *) name="\${name:+\$name }\$a" ;; esac
+done
+exec env PC_CONFIG_DIR="$CFG" "$(command -v node)" "$APP/server.mjs" --pair "\$name" \$qr
 WRAP
 chmod 755 "$HOME/.local/bin/fcode-pair"
 
@@ -82,7 +87,8 @@ cat <<MSG
 fcoding installed and running (port 7681).
 Pair a phone (no password): run on the box
   fcode-pair "iPhone"
-and type the 6-digit code into the app within 120 s. Running it again replaces the code.
+and type the 6-digit code into the app within 120 s. One code per issuer (the command, each paired phone), 3 at most; running it again replaces the command's own code.
+  fcode-pair "iPhone" --qr     (also prints a QR of the server address and the code in big digits; needs "publicUrl" in config.json, and qrencode for the QR)
 Paired devices:   PC_CONFIG_DIR=$CFG node $APP/server.mjs --devices
 Revoke a device:  PC_CONFIG_DIR=$CFG node $APP/server.mjs --revoke <id>     (or --revoke all)
 Projects: edit $CFG/config.json ("projects": {"name": "/abs/dir"}); the server reloads it by itself.

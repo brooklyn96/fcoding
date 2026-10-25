@@ -8,7 +8,7 @@ import { spawnSync, execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
-import { createApp, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock } from '../server.mjs';
+import { createApp, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, strictOrigin, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock } from '../server.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const FAKE = path.join(here, 'fake-tmux.mjs');
@@ -1028,14 +1028,444 @@ test('pairing: an expired code is rejected (120 s)', async () => {
   }, { now: () => t });
 });
 
-test('pairing: only one pending at a time; a new --pair replaces it', () => withApp(async (c) => {
-  let a = await adminRequest(c.configDir, { cmd: 'pair', name: 'A' });
-  let b = await adminRequest(c.configDir, { cmd: 'pair', name: 'B' });
-  while (b.code === a.code) b = await adminRequest(c.configDir, { cmd: 'pair', name: 'B' });
-  assert.equal((await pairReq(c, a.code)).status, 401);
-  assert.equal((await pairReq(c, b.code)).status, 200);
-  assert.deepEqual(devicesFile(c).map((d) => d.name), ['B']);
+test('pairing: one pending code per issuer, 3 in all; a device never pushes the shell code out; each code is single use', async () => {
+  let t = 1_700_000_000_000;
+  await withApp(async (c) => {
+    setPublicUrl(c, PUB);
+    const d1 = await c.login({}, 'one'), d2 = await c.login({}, 'two'), d3 = await c.login({}, 'three');
+    const S = await adminRequest(c.configDir, { cmd: 'pair', name: 'S' });
+    const A = (await mintCode(c, d1.cookie, { name: 'A' })).json;
+    let A2 = (await mintCode(c, d1.cookie, { name: 'A2' })).json; // device one's new code replaces its own
+    while (A2.code === A.code) A2 = (await mintCode(c, d1.cookie, { name: 'A2' })).json;
+    const B = (await mintCode(c, d2.cookie, { name: 'B' })).json;
+    const C = (await mintCode(c, d3.cookie, { name: 'C' })).json; // the 4th: the oldest DEVICE code (A2) goes, the shell code stays
+    t += 61000; // stay under 10 per minute
+    for (const dead of [A, A2]) assert.equal((await pairReq(c, dead.code)).status, 401, dead.code);
+    for (const live of [S, B, C]) assert.equal((await pairReq(c, live.code)).status, 200, live.code);
+    t += 61000;
+    for (const used of [S, B, C]) assert.equal((await pairReq(c, used.code)).status, 401); // single use
+    assert.deepEqual(devicesFile(c).map((x) => x.name), ['one', 'two', 'three', 'S', 'B', 'C']);
+  }, { now: () => t });
+});
+
+test('pairing: a new shell code replaces the shell\'s own code; with three device codes it drops the oldest device code', async () => {
+  let t = 1_700_000_000_000;
+  await withApp(async (c) => {
+    setPublicUrl(c, PUB);
+    const d = [await c.login({}, 'one'), await c.login({}, 'two'), await c.login({}, 'three')];
+    const codes = [];
+    for (const [i, x] of d.entries()) codes.push((await mintCode(c, x.cookie, { name: 'ABC'[i] })).json);
+    const [A, B, C] = codes;
+    const S = await adminRequest(c.configDir, { cmd: 'pair', name: 'S' }); // the 4th code: A (the oldest) goes
+    const S2 = await adminRequest(c.configDir, { cmd: 'pair', name: 'S2' }); // replaces S, drops nobody
+    t += 61000;
+    for (const dead of [A, S]) if (dead.code !== S2.code) assert.equal((await pairReq(c, dead.code)).status, 401, dead.code);
+    for (const live of [B, C, S2]) assert.equal((await pairReq(c, live.code)).status, 200, live.code);
+  }, { now: () => t });
+});
+
+test('pairing: each pending code has its own expiry', async () => {
+  let t = 1_700_000_000_000;
+  await withApp(async (c) => {
+    setPublicUrl(c, PUB);
+    const { cookie } = await c.login();
+    const a = await adminRequest(c.configDir, { cmd: 'pair' });
+    t += 60000;
+    const b = (await mintCode(c, cookie)).json;
+    assert.equal(a.expiresAt, 1_700_000_000_000 + 120000);
+    assert.equal(b.expiresAt, new Date(1_700_000_060_000 + 120000).toISOString());
+    t += 70000; // A is 130 s old, B 70 s
+    assert.equal((await pairReq(c, a.code)).status, 401);
+    assert.equal((await pairReq(c, b.code)).status, 200);
+  }, { now: () => t });
+});
+
+test('pairing: a wrong guess is one attempt against every live code; five kill a code, a newer one has fewer', async () => {
+  await withApp(async (c) => {
+    setPublicUrl(c, PUB);
+    const { cookie } = await c.login();
+    const a = await adminRequest(c.configDir, { cmd: 'pair' });
+    const wrong = otherCode(a.code);
+    for (let i = 0; i < 3; i++) assert.equal((await pairReq(c, wrong)).status, 401); // A: 3 attempts
+    let b = (await mintCode(c, cookie)).json;
+    while (b.code === wrong) b = (await mintCode(c, cookie)).json;
+    for (let i = 0; i < 2; i++) assert.equal((await pairReq(c, wrong)).status, 401); // A: 5 attempts, B: 2
+    assert.equal((await pairReq(c, a.code)).status, 401); // A is gone
+    assert.equal((await pairReq(c, b.code)).status, 200); // B survived
+  });
+});
+
+// ======================= QR pairing: POST /api/pair-code, GET /pair, fcode-pair --qr =======================
+const PUB = 'https://box.example.com';
+const setPublicUrl = (c, publicUrl) => { // what the owner does by editing config.json; picked up without a restart
+  const f = path.join(c.configDir, 'config.json');
+  writePrivate(f, JSON.stringify({ ...JSON.parse(fs.readFileSync(f, 'utf8')), publicUrl }));
+};
+const mintCode = (c, cookie, body = {}, headers = {}) => c.req('POST', '/api/pair-code', { cookie, body, headers });
+
+test('POST /api/pair-code: needs a paired device and X-PC; answers the code, an ISO expiry and server-only links', async () => {
+  const t = 1_700_000_000_000;
+  await withApp(async (c) => {
+    setPublicUrl(c, `${PUB}/`); // a trailing slash is normalised away
+    assert.equal((await c.req('POST', '/api/pair-code', { body: {} })).status, 401); // no device
+    assert.equal((await c.req('POST', '/api/pair-code', { body: {}, headers: { Authorization: 'Bearer forged' } })).status, 401);
+    assert.equal((await c.req('POST', '/api/pair-code', { body: {}, cookie: 'pc_sid=forged' })).status, 401);
+    const { cookie } = await c.login();
+    assert.equal((await c.req('POST', '/api/pair-code', { cookie, body: {}, pc: false })).status, 403); // X-PC
+    assert.equal((await c.req('GET', '/api/pair-code', { cookie })).status, 405);
+    assert.equal((await mintCode(c, cookie, { name: 5 })).status, 400);
+    const r = await mintCode(c, cookie, { name: 'Máy của An & Bình' });
+    assert.equal(r.status, 200);
+    assert.equal(r.headers['cache-control'], 'no-store');
+    assert.deepEqual(Object.keys(r.json).sort(), ['appLink', 'code', 'expiresAt', 'shareLink']);
+    assert.match(r.json.code, /^\d{6}$/);
+    assert.equal(r.json.expiresAt, new Date(t + 120000).toISOString());
+    // the links hold the server origin and nothing else: no code, no name
+    assert.equal(r.json.appLink, `fcode://pair?server=${encodeURIComponent(PUB)}`);
+    assert.equal(r.json.shareLink, `${PUB}/pair`);
+    assert.ok(!r.json.appLink.includes(r.json.code) && !r.json.shareLink.includes(r.json.code));
+    // no body at all is fine too (the app sends {})
+    const bare = await c.req('POST', '/api/pair-code', { cookie, raw: '' });
+    assert.equal(bare.status, 200);
+    assert.deepEqual([bare.json.appLink, bare.json.shareLink], [r.json.appLink, r.json.shareLink]);
+    // nothing permanent in the answer: no token, no secret
+    const text = JSON.stringify([r.json, bare.json]);
+    assert.ok(!text.includes(cookie.split('=')[1]) && !text.includes(Buffer.alloc(32, 7).toString('base64')));
+    assert.equal(c.logs.filter((l) => l.includes(r.json.code) || l.includes(bare.json.code)).length, 0); // never logged
+    // without publicUrl no link can be built: 409 and no code is made
+    setPublicUrl(c, undefined);
+    assert.deepEqual((await mintCode(c, cookie)).json, { error: 'no_public_url' });
+  }, { now: () => t });
+});
+
+test('pair-code: the code works exactly once and makes a device named as suggested; a wrong guess is a normal bad_code', () => withApp(async (c) => {
+  setPublicUrl(c, PUB);
+  const { cookie } = await c.login();
+  const { json } = await mintCode(c, cookie, { name: 'iPhone mới' });
+  const r = await pairReq(c, json.code);
+  assert.equal(r.status, 200);
+  assert.equal((await c.req('GET', '/api/me', { headers: { Authorization: `Bearer ${r.json.token}` } })).status, 200);
+  assert.deepEqual((await pairReq(c, json.code)).json, { error: 'bad_code' }); // single use
+  assert.deepEqual(devicesFile(c).map((d) => d.name), ['test', 'iPhone mới']);
 }));
+
+test('pair-code: expires after 120 s, and five wrong guesses kill it (same store and lockout as --pair)', async () => {
+  let t = 1_700_000_000_000;
+  await withApp(async (c) => {
+    setPublicUrl(c, PUB);
+    const { cookie } = await c.login();
+    let { json } = await mintCode(c, cookie);
+    t += 120000;
+    assert.deepEqual((await pairReq(c, json.code)).json, { error: 'bad_code' });
+    t += 61000; // under the 10 per minute limit again
+    ({ json } = await mintCode(c, cookie));
+    for (let i = 0; i < 5; i++) assert.equal((await pairReq(c, otherCode(json.code))).status, 401);
+    assert.deepEqual((await pairReq(c, json.code)).json, { error: 'bad_code' });
+    assert.equal(devicesFile(c).length, 1); // only the first device
+    // a code from a device and one from the shell are pending together: neither cancels the other
+    t += 61000;
+    const a = (await mintCode(c, cookie)).json;
+    const b = await adminRequest(c.configDir, { cmd: 'pair' });
+    assert.notEqual(a.code, b.code);
+    assert.equal((await pairReq(c, a.code)).status, 200);
+    assert.equal((await pairReq(c, b.code)).status, 200);
+  }, { now: () => t });
+});
+
+test('GET /pair: no auth, one button with the server-only app link, no code anywhere, changes no pairing state', () => withApp(async (c) => {
+  setPublicUrl(c, PUB);
+  const { cookie } = await c.login();
+  const { json } = await mintCode(c, cookie);
+  const page = (q = '', opts) => c.req('GET', `/pair${q}`, opts);
+  const r = await page();
+  assert.equal(r.status, 200);
+  assert.match(r.headers['content-type'], /^text\/html; charset=utf-8/);
+  assert.equal(r.headers['cache-control'], 'no-store');
+  assert.equal(r.headers['referrer-policy'], 'no-referrer');
+  assert.match(r.headers['content-security-policy'], /default-src 'self'/);
+  assert.ok(r.text.includes(`href="fcode://pair?server=${encodeURIComponent(PUB)}"`), r.text);
+  assert.ok(r.text.includes('Mở FCode') && r.text.includes('Chưa cài FCode? Cài file fcode.ipa trước.'));
+  assert.ok(!r.text.includes(json.code)); // no code in the page
+  assert.ok(!/<script|src=|https?:\/\/(?!box\.example\.com)/.test(r.text)); // no scripts, no external assets
+  // the query is ignored and never echoed: the same page whatever it says
+  for (const q of [`?code=${json.code}`, '?code=000000', '?code=%3Cscript%3E', '?x=%22%3E%3Cscript%3Ealert(1)%3C/script%3E', '?code=abcdef', '?code=']) {
+    assert.equal((await page(q)).text, r.text, q);
+  }
+  // it reads and changes no pairing state: many visits later the code still works, once
+  for (let i = 0; i < 15; i++) { await page(); await page(`?code=${json.code}`, { cookie }); }
+  assert.equal((await c.req('HEAD', '/pair')).status, 200);
+  assert.equal((await pairReq(c, json.code)).status, 200);
+  assert.deepEqual((await pairReq(c, json.code)).json, { error: 'bad_code' });
+  assert.equal((await page()).text, r.text); // nothing about the spent code
+  assert.equal((await c.req('POST', '/pair', { body: {} })).status, 401); // only GET/HEAD are the share page
+  assert.ok(!c.logs.join('\n').includes(json.code)); // the query string is not logged
+  setPublicUrl(c, undefined);
+  const none = await page();
+  assert.equal(none.status, 503);
+  assert.ok(!none.text.includes('fcode://'));
+}));
+
+test('links come only from publicUrl: a spoofed Host, X-Forwarded-Host or Origin never reaches a link or the page', () => withApp(async (c) => {
+  setPublicUrl(c, PUB);
+  const { cookie } = await c.login();
+  const evil = { Host: 'evil.example', 'X-Forwarded-Host': 'evil.example', 'X-Forwarded-Proto': 'http', Forwarded: 'host=evil.example;proto=http' };
+  const r = await mintCode(c, cookie, { name: '"><script>alert(1)</script>&server=https://evil.example' }, evil);
+  assert.equal(r.status, 200);
+  assert.ok(!JSON.stringify(r.json).includes('evil'));
+  assert.equal(r.json.appLink, `fcode://pair?server=${encodeURIComponent(PUB)}`); // exactly this, whatever the name says
+  assert.equal(r.json.shareLink, `${PUB}/pair`);
+  const page = await c.req('GET', '/pair', { headers: evil });
+  assert.equal(page.status, 200);
+  assert.ok(!page.text.includes('evil') && page.text.includes(encodeURIComponent(PUB)));
+  // not configured: refused, whatever Host says
+  setPublicUrl(c, undefined);
+  const none = await mintCode(c, cookie, {}, evil);
+  assert.deepEqual([none.status, none.json], [409, { error: 'no_public_url' }]);
+  assert.equal((await c.req('GET', '/pair', { headers: evil })).status, 503);
+}));
+
+test('config publicUrl: only a bare https origin is accepted (normalised); anything else refuses to load', () => {
+  const secret = Buffer.alloc(32, 1).toString('base64');
+  const parse = (publicUrl) => parseConfig(JSON.stringify({ cookieSecret: secret, publicUrl })).publicUrl;
+  assert.equal(parseConfig(JSON.stringify({ cookieSecret: secret })).publicUrl, undefined);
+  assert.equal(parse('https://box.example.com'), 'https://box.example.com');
+  assert.equal(parse('https://Box.Example.com/'), 'https://box.example.com');
+  assert.equal(parse('https://box.example.com:8443'), 'https://box.example.com:8443');
+  for (const bad of ['http://box.example.com', 'https://box.example.com/app', 'https://box.example.com/?a=1', 'https://box.example.com/#x', 'https://u:p@box.example.com', 'box.example.com', '', 'fcode://pair', 42, null, ['https://a.b'], {}]) {
+    assert.throws(() => parse(bad), /publicUrl/, JSON.stringify(bad));
+  }
+});
+
+test('strictOrigin: every vector of the shared rule (test/origin-vectors.json, the same file as in the iOS tree)', () => {
+  const { rule, vectors } = JSON.parse(fs.readFileSync(path.join(here, 'origin-vectors.json'), 'utf8'));
+  assert.match(rule, /^FCode server origin rule v1/);
+  assert.ok(vectors.length >= 50);
+  for (const [input, want] of vectors) assert.equal(strictOrigin(input), want, JSON.stringify(input));
+});
+
+test('strictOrigin: extra cases on top of the shared vectors (the ones the vector file does not have)', () => {
+  const a63 = 'a'.repeat(63);
+  const ok = {
+    'https://Box.Example.COM/': 'https://box.example.com', // upper case is lowered, one trailing slash dropped
+    'https://box.example.com:8443': 'https://box.example.com:8443',
+    'https://box.example.com.:8443/': 'https://box.example.com:8443', // trailing dot, port and slash together
+    'https://a.b': 'https://a.b',
+    'https://a-b.c-d.example': 'https://a-b.c-d.example',
+    'https://192.168.1.8': 'https://192.168.1.8',
+    'https://192.168.1.8:8443/': 'https://192.168.1.8:8443',
+    'https://0.0.0.0': 'https://0.0.0.0',
+    'https://255.255.255.255': 'https://255.255.255.255',
+    [`https://${a63}.example`]: `https://${a63}.example`, // a label of 63
+    [`https://${a63}.${a63}.${a63}.${'a'.repeat(57)}.com`]: `https://${a63}.${a63}.${a63}.${'a'.repeat(57)}.com`, // 253 characters
+  };
+  for (const [from, to] of Object.entries(ok)) assert.equal(strictOrigin(from), to, from);
+  const bad = [
+    '//box.example.com', 'https:/box.example.com', 'https:box.example.com', 'https://', 'ftp://box.example.com', 'fcode://pair',
+    'https://xn--a.com', 'https://www.xn--bcher-kva.de', 'https://box.exämple.com',
+    'https://box.', 'https://my_box.example.com', 'https://box!.example.com', 'https://a.-b.example.com', 'https://a..example.com',
+    `https://${'a'.repeat(64)}.example`, `https://${a63}.${a63}.${a63}.${'a'.repeat(58)}.com`, // 64-char label, 254 characters
+    'https://0x7f.0.0.1', 'https://1.2.3.4.5', 'https://192.168.1.8.', 'https://box.example.com:abc',
+    'https://[::1]:0', 'https://[::1]:', 'https://[::1', 'https://::1', 'https://[fe80::1%25eth0]', 'https://[fe80::1%eth0]',
+    'https://box.example.com/app', 'https://box.example.com/?a=1', 'https://box.example.com?a=1', 'https://box.example.com#x', 'https://box.example.com/#x',
+    'https://u:p@box.example.com', 'https://u@box.example.com', 'https://box.example.com@evil.example', 'https://box.example.com\\evil.example', 'https://box.example.com%2e', 'https://box%2eexample.com',
+    ' https://box.example.com', 'https://box .example.com', 'https://box.example.com\n', 'https://box.example.com\r', 'https://box.example.com\t', 'https://box.example.com\0',
+    42, null, undefined, ['https://box.example.com'], {},
+  ];
+  for (const from of bad) assert.equal(strictOrigin(from), null, JSON.stringify(from));
+});
+
+test('config publicUrl: a URL that loads but is not an address the app accepts has no publicOrigin', () => {
+  const secret = Buffer.alloc(32, 1).toString('base64');
+  const parse = (publicUrl) => parseConfig(JSON.stringify({ cookieSecret: secret, publicUrl }));
+  assert.deepEqual([parse('https://box.example.com').publicUrl, parse('https://box.example.com').publicOrigin], ['https://box.example.com', 'https://box.example.com']);
+  assert.equal(parse('https://Box.Example.com:443/').publicOrigin, 'https://box.example.com');
+  for (const odd of ['https://localhost', 'https://192.168.001.010', 'https://1.2.3.0x4', 'https://bücher.de', 'https://my_box.example.com']) {
+    const p = parse(odd); // it still loads (the old rule)...
+    assert.notEqual(p.publicUrl, undefined, odd);
+    assert.equal(p.publicOrigin, null, odd); // ...but no link may be made from it
+  }
+  assert.equal(parseConfig(JSON.stringify({ cookieSecret: secret })).publicOrigin, null);
+});
+
+test('publicUrl the app would reject: /api/pair-code answers 500 public_url_invalid (one log line, no code), /pair 503; a good one works again', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  for (const odd of ['https://localhost', 'https://192.168.001.010', 'https://xn--bcher-kva.de']) {
+    setPublicUrl(c, odd);
+    const logs = c.logs.length;
+    const r = await mintCode(c, cookie);
+    assert.deepEqual([r.status, r.json], [500, { error: 'public_url_invalid' }], odd);
+    assert.equal(c.logs.slice(logs).filter((l) => l.startsWith('pair-code refused')).length, 1, odd); // one line
+    assert.ok(!JSON.stringify(r.json).includes('fcode://'));
+    const page = await c.req('GET', '/pair');
+    assert.equal(page.status, 503, odd);
+    assert.ok(!page.text.includes('fcode://'), odd);
+  }
+  // no code was made by the failed calls: the shell code is still the only one, and it still works
+  const s = await adminRequest(c.configDir, { cmd: 'pair', name: 'S' });
+  setPublicUrl(c, 'https://localhost');
+  assert.equal((await mintCode(c, cookie)).status, 500);
+  assert.equal((await pairReq(c, s.code)).status, 200);
+  setPublicUrl(c, PUB);
+  const ok = await mintCode(c, cookie);
+  assert.equal(ok.status, 200);
+  assert.equal(ok.json.appLink, `fcode://pair?server=${encodeURIComponent(PUB)}`);
+  setPublicUrl(c, `${PUB}:443/`); // the canonical form is what is put in the link
+  assert.equal((await mintCode(c, cookie)).json.appLink, `fcode://pair?server=${encodeURIComponent(PUB)}`);
+  setPublicUrl(c, undefined);
+  assert.deepEqual((await mintCode(c, cookie)).json, { error: 'no_public_url' }); // unchanged
+}));
+
+// the fcode-pair command: server.mjs --pair [name] --qr (install.sh's wrapper turns "fcode-pair name --qr" into this)
+const envWith = (vars) => { // process.env without any case variant of the keys in vars (Windows has "Path"), then vars
+  const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !Object.keys(vars).some((v) => v.toLowerCase() === k.toLowerCase())));
+  return { ...env, ...vars };
+};
+const cliEnv = (c, extra = {}) => new Promise((resolve) => {
+  execFile(process.execPath, [SERVER, ...extra.args], { env: envWith({ PC_CONFIG_DIR: c.configDir, ...extra.env }), encoding: 'utf8', timeout: 15000, windowsHide: true },
+    (err, stdout, stderr) => resolve({ status: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stdout, stderr }));
+});
+
+const codeOfBox = (out) => /MÃ GHÉP:\s+(\d(?:\s+\d){5})/.exec(out)?.[1].replace(/\s/g, ''); // the code in big digits
+test('fcode-pair --qr: server-only links, the code in big digits, ONE expiry line; plain --pair is unchanged', () => withApp(async (c) => {
+  const noQr = { PATH: path.join(c.root, 'empty') }; // a PATH without qrencode (node is started by its full path)
+  const plain = await cliEnv(c, { args: ['--pair', 'iPhone X'], env: noQr });
+  assert.equal(plain.status, 0, plain.stderr);
+  assert.match(plain.stdout, /^Mã ghép: \d{6} \(hết hạn sau 120 giây\)/);
+  assert.ok(!/Link|qrencode|fcode:\/\/|MÃ GHÉP/.test(plain.stdout), plain.stdout); // exactly the old shape
+  const count = (out) => (out.match(/hết hạn sau/g) || []).length;
+  // --qr without publicUrl: a hint, then the code and the expiry; the code works
+  let r = await cliEnv(c, { args: ['--pair', 'iPhone X', '--qr'], env: noQr });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /publicUrl/);
+  assert.equal(count(r.stdout), 1, r.stdout);
+  assert.equal((await pairReq(c, codeOfBox(r.stdout))).status, 200);
+  // with publicUrl and no qrencode: the links (no code in them), the one line, the code, one expiry line last
+  setPublicUrl(c, PUB);
+  r = await cliEnv(c, { args: ['--pair', 'Máy A', '--qr'], env: noQr });
+  assert.equal(r.status, 0, r.stderr);
+  const code = codeOfBox(r.stdout);
+  assert.match(code, /^\d{6}$/, r.stdout);
+  assert.ok(r.stdout.includes(`Link chia sẻ: ${PUB}/pair\n`), r.stdout);
+  assert.ok(r.stdout.includes(`Link mở app: fcode://pair?server=${encodeURIComponent(PUB)}\n`), r.stdout);
+  assert.ok(!/code=|name=/.test(r.stdout.replace(/MÃ GHÉP[^\n]*/, '')), r.stdout); // no code or name in any link
+  assert.match(r.stdout, /cài qrencode để hiện mã QR\n/);
+  assert.equal(count(r.stdout), 1, r.stdout);
+  assert.ok(r.stdout.endsWith('Mã hết hạn sau 2 phút.\n'), r.stdout);
+  assert.ok(r.stdout.indexOf('Link chia sẻ') < r.stdout.indexOf('MÃ GHÉP'));
+  assert.equal((await pairReq(c, code)).status, 200);
+  assert.ok(devicesFile(c).some((d) => d.name === 'Máy A'));
+  // no name: "--pair --qr" means no name (it is not named "--qr")
+  r = await cliEnv(c, { args: ['--pair', '--qr'], env: noQr });
+  assert.equal((await pairReq(c, codeOfBox(r.stdout))).status, 200);
+  assert.ok(!devicesFile(c).some((d) => d.name.includes('--qr')) && devicesFile(c).at(-1).name === 'device');
+  r = await cliEnv(c, { args: ['--pair', '', '--qr'], env: noQr });
+  assert.equal((await pairReq(c, codeOfBox(r.stdout))).status, 200);
+  if (process.platform !== 'win32') { // a stand-in qrencode: it gets "-t ANSIUTF8 <app link>" and its output is printed first
+    const bin = path.join(c.root, 'bin'); fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, 'qrencode'), '#!/bin/sh\necho "QR[$1 $2] $3"\n', { mode: 0o755 });
+    r = await cliEnv(c, { args: ['--pair', 'Máy B', '--qr'], env: { PATH: `${bin}:${noQr.PATH}` } });
+    assert.ok(r.stdout.startsWith(`QR[-t ANSIUTF8] fcode://pair?server=${encodeURIComponent(PUB)}\n`), r.stdout);
+    assert.ok(!r.stdout.includes('cài qrencode') && count(r.stdout) === 1 && r.stdout.indexOf('QR[') < r.stdout.indexOf('MÃ GHÉP'), r.stdout);
+  }
+}));
+
+test('fcode-pair --qr with a publicUrl the app would reject: the Vietnamese message, exit 1, no code made', () => withApp(async (c) => {
+  const noQr = { PATH: path.join(c.root, 'empty') };
+  setPublicUrl(c, 'https://localhost');
+  const s = await cliEnv(c, { args: ['--pair', 'S'], env: noQr }); // plain --pair has no link: it works and makes the shell code
+  assert.equal(s.status, 0, s.stderr);
+  const code = /Mã ghép: (\d{6})/.exec(s.stdout)[1];
+  const r = await cliEnv(c, { args: ['--pair', 'Máy A', '--qr'], env: noQr });
+  assert.equal(r.status, 1);
+  assert.equal(r.stderr.trim(), 'publicUrl trong config.json không hợp lệ cho app (cần https://tên-miền-ASCII)');
+  assert.equal(r.stdout, ''); // no QR, no code, no links
+  assert.equal((await pairReq(c, code)).status, 200); // the earlier shell code was not replaced: the failed call made none
+  setPublicUrl(c, PUB); // a good address: the same command works
+  assert.equal((await cliEnv(c, { args: ['--pair', 'Máy A', '--qr'], env: noQr })).status, 0);
+}));
+
+// A code dies with the device that made it (a stolen device must not re-pair itself after a revoke), and with a secret rotation.
+const threeCodes = async (c) => { // two devices mint a code each, the shell makes one
+  setPublicUrl(c, PUB);
+  const d1 = await c.login({}, 'one'), d2 = await c.login({}, 'two');
+  const a = (await mintCode(c, d1.cookie)).json, b = (await mintCode(c, d2.cookie)).json;
+  const s = await adminRequest(c.configDir, { cmd: 'pair', name: 'shell' });
+  return { d1, d2, a, b, s, redeem: async (x) => (await pairReq(c, x.code)).status };
+};
+
+test('pending codes: --revoke <id> kills that device\'s codes only (the probe: A mints, A is revoked, the code fails)', () => withApp(async (c) => {
+  const { d1, a, b, s, redeem } = await threeCodes(c);
+  assert.equal((await adminRequest(c.configDir, { cmd: 'revoke', id: await c.deviceId('one') })).ok, true);
+  assert.equal((await c.req('GET', '/api/me', { cookie: d1.cookie })).status, 401);
+  assert.equal(await redeem(a), 401);
+  assert.equal(await redeem(s), 200); // the shell's and the other device's codes live on
+  assert.equal(await redeem(b), 200);
+}));
+
+test('pending codes: --revoke all clears every pending code', () => withApp(async (c) => {
+  const { a, b, s, redeem } = await threeCodes(c);
+  assert.equal((await adminRequest(c.configDir, { cmd: 'revoke', id: 'all' })).ok, true);
+  for (const x of [a, b, s]) assert.equal(await redeem(x), 401);
+  assert.equal(devicesFile(c).length, 0);
+  await c.login(); // a new code still works afterwards
+}));
+
+test('pending codes: logout kills that device\'s codes; logout?all=1 clears every pending code', () => withApp(async (c) => {
+  let { d1, a, b, s, redeem } = await threeCodes(c);
+  assert.equal((await c.req('POST', '/api/logout', { cookie: d1.cookie })).status, 200);
+  assert.equal(await redeem(a), 401);
+  assert.equal(await redeem(s), 200);
+  const { cookie } = await c.login({}, 'three'); // d2 and the new device are still paired
+  const x = (await mintCode(c, cookie)).json, y = await adminRequest(c.configDir, { cmd: 'pair' });
+  assert.equal((await c.req('POST', '/api/logout?all=1', { cookie })).status, 200);
+  for (const z of [b, x, y]) assert.equal(await redeem(z), 401);
+}));
+
+test('pending codes: a cookieSecret rotation clears every pending code', () => withApp(async (c) => {
+  const { a, b, s, redeem } = await threeCodes(c);
+  const f = path.join(c.configDir, 'config.json');
+  writePrivate(f, JSON.stringify({ ...JSON.parse(fs.readFileSync(f, 'utf8')), cookieSecret: Buffer.alloc(32, 9).toString('base64') }));
+  // NO request in between: POST /api/pair is the first thing that sees the new secret (the config is reloaded lazily)
+  for (const x of [a, b, s]) assert.equal(await redeem(x), 401, x.code); // a device code and the shell code alike
+  assert.deepEqual(devicesFile(c), []); // nothing was committed
+  const p = await adminRequest(c.configDir, { cmd: 'pair' }); // and pairing works under the new secret
+  assert.equal(await redeem(p), 200);
+  assert.equal(devicesFile(c).length, 1);
+}));
+
+test('names: cut on a code point and well-formed (63 characters + an emoji, lone surrogates, many emoji); the server survives', () => withApp(async (c) => {
+  setPublicUrl(c, PUB);
+  const { cookie } = await c.login();
+  const names = () => devicesFile(c).map((d) => d.name);
+  const via = async (name) => { const r = await mintCode(c, cookie, { name }); assert.equal(r.status, 200, JSON.stringify(name)); assert.equal((await pairReq(c, r.json.code)).status, 200); return names().at(-1); };
+  assert.equal(await via(`${'a'.repeat(63)}😀`), 'a'.repeat(63)); // the emoji would be cut in half: it is left out whole
+  assert.equal(await via('ab\ud800cd'), 'abcd'); // a lone high surrogate
+  assert.equal(await via('ab\udc00cd'), 'abcd'); // a lone low surrogate
+  assert.equal(await via('😀'.repeat(40)), '😀'.repeat(32)); // exactly 64 UTF-16 units
+  assert.ok(names().every((n) => n.length <= 64 && n === n.toWellFormed()));
+  // the shell path too: it used to throw out of the admin socket callback
+  const r = await adminRequest(c.configDir, { cmd: 'pair', name: `${'a'.repeat(63)}😀`, links: true });
+  assert.equal(r.ok, true);
+  assert.equal((await c.req('GET', '/')).status, 200);
+  // devices.json stays valid: a restart accepts it
+  await c.app.close();
+  const app2 = createApp({ configDir: c.configDir, tmux: [process.execPath, FAKE], log: () => {} });
+  await app2.listen(0, '127.0.0.1');
+  assert.equal(app2.devices.size, 5);
+  await app2.close();
+}));
+
+test('admin: an exception inside a request is an {ok:false} answer, never a crash', async () => {
+  let boom = false;
+  await withApp(async (c) => {
+    boom = true;
+    const bad = await adminRequest(c.configDir, { cmd: 'pair' });
+    boom = false;
+    assert.deepEqual(bad, { ok: false, error: 'internal' });
+    assert.equal((await c.req('GET', '/')).status, 200);
+    assert.equal((await adminRequest(c.configDir, { cmd: 'pair' })).ok, true);
+  }, { now: () => { if (boom) throw new Error('boom'); return Date.now(); } });
+});
 
 test('pairing: global /api/pair limits 10/minute and 30/hour -> 429 with Retry-After', async () => {
   let t = 1_700_000_000_000;
@@ -1312,6 +1742,9 @@ test('secretTag: a failed purge after a rotation blocks auth and pairing, and is
     const f = JSON.parse(fs.readFileSync(path.join(c.configDir, 'devices.json'), 'utf8'));
     assert.deepEqual(f.devices, []);
     assert.notEqual(f.secretTag, TAG);
+    // the 500 above did not use the code up: it still works once storage is back (it fails if pair() consumes before the purge guard)
+    assert.equal((await c.req('POST', '/api/pair', { body: { code: p.code } })).status, 200);
+    assert.deepEqual((await c.req('POST', '/api/pair', { body: { code: p.code } })).json, { error: 'bad_code' });
     const n = await c.login({}, 'new');
     assert.equal((await c.req('GET', '/api/me', { cookie: n.cookie })).status, 200);
     assert.equal((await c.req('GET', '/api/me', { cookie: a.cookie })).status, 401);
