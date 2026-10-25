@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 
 export const HARNESSES = { omp: 'omp', claude: 'claude', codex: 'codex', shell: 'bash -l' };
 export const KEYS = ['Enter', 'Escape', 'Tab', 'BTab', 'Up', 'Down', 'Left', 'Right', 'PageUp', 'PageDown',
-  'Home', 'End', 'BSpace', 'C-c', 'C-d', 'C-l', 'C-r', 'C-u', 'C-z', 'y', 'n', 'Space'];
+  'Home', 'End', 'BSpace', 'C-c', 'C-d', 'C-l', 'C-o', 'C-r', 'C-u', 'C-z', 'M-a', 'y', 'n', 'Space'];
 const NAME_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const COOKIE = 'pc_sid';
 const COOKIE_MAX_AGE = 30 * 24 * 3600;

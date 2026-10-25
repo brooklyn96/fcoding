@@ -14,6 +14,15 @@ struct SessionView: View {
     @AppStorage("composerPinned") private var composerPinned = false
     @State private var composerShown: Bool
     @FocusState private var composerFocused: Bool
+    /// Floating keyboard button: which edge, and how far down that edge (0 = top, 1 = bottom).
+    @AppStorage("kbButtonLeft") private var kbLeft = false
+    @AppStorage("kbButtonY") private var kbY: Double = 1
+    /// Live drag translation, nil when not dragging (or still under the 10 pt threshold). A
+    /// GestureState resets by itself when the gesture is cancelled (a call, the app backgrounded).
+    @GestureState(resetTransaction: Transaction(animation: .spring(response: 0.3, dampingFraction: 0.8)))
+    private var kbDrag: CGSize?
+    /// Bumped on every send: the terminal jumps to the bottom and follows again.
+    @State private var bottomRequest = 0
     @State private var stoppedInBackground = false
     /// "Trả lời" from the inbox: open and focus the composer when the view appears.
     private let focusComposer: Bool
@@ -34,10 +43,12 @@ struct SessionView: View {
         VStack(spacing: 0) {
             GeometryReader { geo in
                 TerminalView(model: model, fontSize: fontSize, viewportHeight: geo.size.height,
-                             trailingInset: composerShown ? 0 : 58)
+                             bottomRequest: bottomRequest,
+                             // Never under the keyboard button: the opposite edge while it shows.
+                             jumpOnLeft: !composerShown && !kbLeft)
             }
             .background(Color.black)
-            .overlay(alignment: .bottomTrailing) { if !composerShown { keyboardButton } }
+            .overlay { if !composerShown { GeometryReader { area in keyboardButton(in: area.size) } } }
 
             if let errorText = model.errorText {
                 Button { model.errorText = nil } label: {
@@ -55,9 +66,13 @@ struct SessionView: View {
             if composerShown {
                 ComposerView(
                     draftKey: "draft.\(name)",
-                    onSend: { text, enter in model.send(text, enter: enter) },
+                    onSend: { text, enter in
+                        bottomRequest += 1
+                        return model.send(text, enter: enter)
+                    },
                     onKey: { key in model.key(key) },
                     focused: $composerFocused,
+                    isOmp: chipHarness == "omp",
                     pinned: $composerPinned,
                     onHide: hideComposer,
                     onSent: { if !composerPinned { hideComposer() } }
@@ -126,20 +141,59 @@ struct SessionView: View {
         composerShown = false
     }
 
-    private var keyboardButton: some View {
-        Button(action: showComposer) {
-            Image(systemName: "keyboard")
-                .font(.system(size: 19, weight: .medium))
-                .foregroundColor(.accentColor)
-                .frame(width: 44, height: 44)
-                .background(Color(white: 0.17).opacity(0.92), in: Circle())
-                .overlay(Circle().stroke(Color.white.opacity(0.14), lineWidth: 0.5))
-                .shadow(color: .black.opacity(0.55), radius: 9, y: 6)
+    /// Centre of the keyboard button in the terminal area (below the top bar, above the home
+    /// indicator, inside the side safe areas): 14 pt from the edge, 8 pt from top and bottom.
+    private func kbCenter(in size: CGSize, drag: CGSize? = nil) -> CGPoint {
+        let r: CGFloat = 22
+        let minY = 8 + r, maxY = max(minY, size.height - 8 - r)
+        var p = CGPoint(x: kbLeft ? 14 + r : size.width - 14 - r,
+                        y: minY + CGFloat(min(1, max(0, kbY))) * (maxY - minY))
+        if let d = drag {
+            p.x = min(size.width - r, max(r, p.x + d.width))
+            p.y = min(maxY, max(minY, p.y + d.height))
         }
-        .padding(.trailing, 14)
-        .padding(.bottom, 8)
-        .accessibilityLabel("Mở khung gõ")
-        .transition(.opacity)
+        return p
+    }
+
+    /// Tap opens the composer; a drag (from 10 pt of movement) moves the button, and on release
+    /// it snaps to the nearer side edge. Not a Button: a Button would also fire its tap on release.
+    private func keyboardButton(in size: CGSize) -> some View {
+        Image(systemName: "keyboard")
+            .font(.system(size: 19, weight: .medium))
+            .foregroundColor(.accentColor)
+            .frame(width: 44, height: 44)
+            .background(Color(white: 0.17).opacity(0.92), in: Circle())
+            .overlay(Circle().stroke(Color.white.opacity(0.14), lineWidth: 0.5))
+            .shadow(color: .black.opacity(0.55), radius: 9, y: 6)
+            .scaleEffect(kbDrag == nil ? 1 : 1.08)
+            .contentShape(Circle())
+            .gesture(
+                // Global space: the button moves under the finger, so local translation would jitter.
+                DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                    .updating($kbDrag) { v, state, _ in
+                        if state != nil || hypot(v.translation.width, v.translation.height) >= 10 {
+                            state = v.translation
+                        }
+                    }
+                    .onEnded { v in
+                        // Edge and height are committed only here; under 10 pt it was a tap.
+                        guard hypot(v.translation.width, v.translation.height) >= 10 else { showComposer(); return }
+                        let p = kbCenter(in: size, drag: v.translation)
+                        let minY: CGFloat = 30, maxY = max(minY, size.height - 30)
+                        // Same spring as the GestureState reset, so the button glides to the edge.
+                        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                            kbLeft = p.x < size.width / 2
+                            kbY = maxY > minY ? Double((p.y - minY) / (maxY - minY)) : 1
+                        }
+                    }
+            )
+            .accessibilityElement()
+            .accessibilityLabel("Mở khung gõ")
+            .accessibilityHint("Kéo để dời nút sang chỗ khác")
+            .accessibilityAddTraits(.isButton)
+            .accessibilityAction { showComposer() }
+            .position(kbCenter(in: size, drag: kbDrag))
+            .transition(.opacity)
     }
 
     /// The session name in a harness-coloured chip (as HarnessBadge), cut in the middle when long.
@@ -193,30 +247,59 @@ struct SessionView: View {
 // MARK: - Terminal screen
 
 private struct ContentFrame: Equatable {
+    var minY: CGFloat
     var maxY: CGFloat
     var height: CGFloat
 }
 
 private struct ContentFrameKey: PreferenceKey {
-    static let defaultValue = ContentFrame(maxY: 0, height: 0)
+    static let defaultValue = ContentFrame(minY: 0, maxY: 0, height: 0)
     static func reduce(value: inout ContentFrame, nextValue: () -> ContentFrame) { value = nextValue() }
 }
 
 /// Scroll bookkeeping kept in a plain class so the preference closure (which Xcode 16 marks
 /// @Sendable) can update it through a captured reference instead of the view's @State.
 final class ScrollState: ObservableObject {
-    @Published var stick = true
+    /// Auto-scroll is on: the content bottom was within 24 pt of the viewport bottom.
+    @Published var atBottom = true
     var contentHeight: CGFloat = 0
+    var minY: CGFloat = 0
+    /// Until then, offset changes come from our own animated scroll-to-bottom, not from the user.
+    var programmaticUntil = Date.distantPast
 }
 
-/// Monospaced, selectable, coloured screen text. Sticks to the bottom unless the user scrolls up.
+/// Monospaced, selectable, coloured screen text.
+///
+/// Auto-scroll: new output scrolls to the bottom only if the view was at the bottom BEFORE the
+/// update. The user's position is read from the content's top edge (minY): new text grows the
+/// content downward without moving minY, so a minY change is a scroll. A user scroll sets
+/// atBottom from where it lands (back at the bottom turns auto-scroll on again); our own
+/// scroll-to-bottom lands at the bottom (the animated one is ignored for its duration), so it never
+/// reads as "the user scrolled up".
 struct TerminalView: View {
     @ObservedObject var model: SessionModel
     let fontSize: Double
     let viewportHeight: CGFloat
-    /// Room kept on the right for the floating keyboard button.
-    var trailingInset: CGFloat = 0
+    /// Changes on every send: jump to the bottom and follow again.
+    var bottomRequest = 0
+    /// Put the jump button on the left (the keyboard button is on the right).
+    var jumpOnLeft = false
     @StateObject private var scroll = ScrollState()
+
+    private static func jump(_ scroll: ScrollState, _ proxy: ScrollViewProxy, animated: Bool = false) {
+        scroll.atBottom = true
+        // An instant jump lands at the bottom, so it reads as "at bottom" anyway; only the animated
+        // one passes through mid-way offsets. A window on every jump would, while output streams,
+        // keep renewing and swallow the user's scroll up.
+        if animated { scroll.programmaticUntil = Date().addingTimeInterval(0.6) }
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation { proxy.scrollTo("bottom", anchor: .bottom) }
+            } else {
+                proxy.scrollTo("bottom", anchor: .bottom)
+            }
+        }
+    }
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -234,39 +317,53 @@ struct TerminalView: View {
                     Color.clear.frame(height: 1).id("bottom")
                 }
                 .background(GeometryReader { g in
+                    let f = g.frame(in: .named("term"))
                     Color.clear.preference(key: ContentFrameKey.self,
-                                           value: ContentFrame(maxY: g.frame(in: .named("term")).maxY,
-                                                               height: g.size.height))
+                                           value: ContentFrame(minY: f.minY, maxY: f.maxY, height: f.height))
                 })
             }
             .coordinateSpace(name: "term")
             .scrollDismissesKeyboard(.interactively)
             .onPreferenceChange(ContentFrameKey.self) { [scroll, viewportHeight, proxy] frame in
-                if frame.height != scroll.contentHeight {
-                    // Content grew or shrank: follow it if we were at the bottom.
-                    scroll.contentHeight = frame.height
-                    if scroll.stick { DispatchQueue.main.async { proxy.scrollTo("bottom", anchor: .bottom) } }
-                } else {
-                    // Same content, new offset: the user scrolled.
-                    let atBottom = frame.maxY <= viewportHeight + 24
-                    if scroll.stick != atBottom { scroll.stick = atBottom }
+                let moved = frame.minY != scroll.minY
+                let grew = frame.height != scroll.contentHeight
+                let oldMinY = scroll.minY
+                let shrank = frame.height < scroll.contentHeight
+                scroll.minY = frame.minY
+                scroll.contentHeight = frame.height
+                if moved, Date() >= scroll.programmaticUntil {
+                    // Content moving down = the user scrolling up: off at once, so a streaming jump
+                    // never fights the finger. Not when the content shrank (the clamp moves it) or
+                    // while the bottom is still inside the viewport (the bounce settling back).
+                    if frame.minY > oldMinY, !shrank, frame.maxY > viewportHeight + 0.5 {
+                        if scroll.atBottom { scroll.atBottom = false }
+                    } else if frame.maxY <= viewportHeight + 24, !scroll.atBottom {
+                        scroll.atBottom = true // landed back at the bottom
+                    }
                 }
+                // Decided by the state from before this update; scrolled up = never moved.
+                if grew, scroll.atBottom { TerminalView.jump(scroll, proxy) }
             }
             .onChange(of: viewportHeight) { _ in
-                if scroll.stick { DispatchQueue.main.async { proxy.scrollTo("bottom", anchor: .bottom) } }
+                if scroll.atBottom { TerminalView.jump(scroll, proxy) }
             }
-            .overlay(alignment: .bottomTrailing) {
-                if !scroll.stick {
-                    Button {
-                        scroll.stick = true
-                        withAnimation { proxy.scrollTo("bottom", anchor: .bottom) }
-                    } label: {
-                        Label("Xuống cuối", systemImage: "arrow.down")
-                            .font(.callout.bold())
+            .onChange(of: bottomRequest) { _ in TerminalView.jump(scroll, proxy) }
+            .onAppear { TerminalView.jump(scroll, proxy) }
+            .overlay(alignment: jumpOnLeft ? .bottomLeading : .bottomTrailing) {
+                if !scroll.atBottom {
+                    Button { TerminalView.jump(scroll, proxy, animated: true) } label: {
+                        Image(systemName: "arrow.down")
+                            .font(.system(size: 15, weight: .bold))
+                            .foregroundColor(.white)
+                            .frame(width: 36, height: 36)
+                            .background(Color.accentColor, in: Circle())
+                            .shadow(color: .black.opacity(0.5), radius: 6, y: 3)
+                            .frame(width: 44, height: 44)
+                            .contentShape(Circle())
                     }
-                    .buttonStyle(.borderedProminent)
-                    .padding(10)
-                    .padding(.trailing, trailingInset)
+                    .accessibilityLabel("Xuống cuối")
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 8)
                 }
             }
         }
@@ -279,10 +376,15 @@ private struct QuickKey {
     let title: String
     let key: String
     let label: String
+    var symbol: String? = nil
+    /// Only for omp: in bash C-o runs the line, in claude it toggles the transcript.
+    var ompOnly = false
 }
 
 private let quickKeys: [QuickKey] = [
     QuickKey(title: "Esc", key: "Escape", label: "Phím Escape"),
+    // omp agent hub (Alt+A): ↑/↓ chọn, Enter mở, Esc đóng.
+    QuickKey(title: "Agents", key: "M-a", label: "Mở danh sách agent của omp", symbol: "person.2", ompOnly: true),
     QuickKey(title: "Ctrl+C", key: "C-c", label: "Control C, dừng"),
     QuickKey(title: "↑", key: "Up", label: "Mũi tên lên"),
     QuickKey(title: "↓", key: "Down", label: "Mũi tên xuống"),
@@ -293,9 +395,12 @@ private let quickKeys: [QuickKey] = [
     QuickKey(title: "Enter", key: "Enter", label: "Phím Enter"),
     QuickKey(title: "y", key: "y", label: "Chữ y, đồng ý"),
     QuickKey(title: "n", key: "n", label: "Chữ n, từ chối"),
+    QuickKey(title: "^O", key: "C-o", label: "Control O, mở rộng", ompOnly: true),
 ]
 
 private let slashCommands = ["/model", "/clear", "/compact", "/help", "/resume", "/exit"]
+/// omp's agent hub; only offered in omp sessions.
+private let ompSlashCommands = ["/hub"]
 
 /// The draft lives only here and is only written by the keyboard, except: restored from
 /// UserDefaults when the view appears (if empty), cleared after a successful send (if unchanged)
@@ -307,6 +412,8 @@ struct ComposerView: View {
     let onSend: (String, Bool) -> Task<Bool, Never>
     let onKey: (String) -> Void
     var focused: FocusState<Bool>.Binding
+    /// omp session: show the agent-hub keys (Agents, ^O) and /hub.
+    var isOmp = false
     @Binding var pinned: Bool
     let onHide: () -> Void
     /// After a successful send that emptied the draft.
@@ -314,6 +421,14 @@ struct ComposerView: View {
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     @State private var draft = ""
     @State private var sending = false
+    /// New identity for the field after a send, so no UITextView keeps the sent text.
+    @State private var fieldID = 0
+    /// The text just sent and cleared. If the old field writes it back (an IME commit on resign),
+    /// onChange drops it instead of storing it again. Reset by the next real edit.
+    @State private var justSent: String?
+    /// The guard above holds only until then (the rebuild has settled); after it, typing the same
+    /// text again is a real edit.
+    @State private var justSentUntil = Date.distantPast
     @State private var showKeys = false
 
     /// Landscape on iPhone: no grab handle, a 1–2 line field, key row behind a toggle.
@@ -368,6 +483,10 @@ struct ComposerView: View {
             if draft.isEmpty, let saved = UserDefaults.standard.string(forKey: draftKey) { draft = saved }
         }
         .onChange(of: draft) { value in
+            if let sent = justSent, !value.isEmpty {
+                justSent = nil
+                if value == sent, Date() < justSentUntil { draft = ""; return }
+            }
             if value.isEmpty {
                 UserDefaults.standard.removeObject(forKey: draftKey)
             } else {
@@ -384,6 +503,7 @@ struct ComposerView: View {
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .focused(focused)
+                .id(fieldID)
                 .padding(.vertical, 8)
             sendButton
         }
@@ -460,23 +580,26 @@ struct ComposerView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
                 Menu {
-                    ForEach(slashCommands, id: \.self) { cmd in
+                    ForEach(isOmp ? slashCommands + ompSlashCommands : slashCommands, id: \.self) { cmd in
                         Button(cmd) { draft = draft.isEmpty ? cmd : draft + cmd }
                     }
                 } label: {
                     keyLabel("/")
                 }
                 .accessibilityLabel("Lệnh gạch chéo")
-                ForEach(quickKeys, id: \.key) { k in
-                    Button { onKey(k.key) } label: { keyLabel(k.title) }
+                ForEach(quickKeys.filter { isOmp || !$0.ompOnly }, id: \.key) { k in
+                    Button { onKey(k.key) } label: { keyLabel(k.title, symbol: k.symbol) }
                         .accessibilityLabel(k.label)
                 }
             }
         }
     }
 
-    private func keyLabel(_ title: String) -> some View {
-        Text(title)
+    private func keyLabel(_ title: String, symbol: String? = nil) -> some View {
+        HStack(spacing: 4) {
+            if let symbol = symbol { Image(systemName: symbol).font(.system(size: 13, weight: .semibold)) }
+            Text(title)
+        }
             .font(.system(size: 15, weight: .semibold, design: .monospaced))
             .frame(minWidth: 44, minHeight: 36)
             .padding(.horizontal, 4)
@@ -484,21 +607,47 @@ struct ComposerView: View {
             .foregroundColor(.primary)
     }
 
+    /// On success the field is emptied and the stored draft removed, unless the draft changed while
+    /// sending (compared with the exact snapshot taken here).
+    ///
+    /// Order matters. Vietnamese Telex keeps the last word as marked (composing) text. Clearing the
+    /// binding while the field is still first responder, then resigning it (auto-hide), made UIKit
+    /// commit the composition and the field write the OLD text back through the binding; onChange
+    /// stored it again and onAppear restored it. So: resign first (commits the composition), let that
+    /// settle, then clear and rebuild the field.
     private func submit(enter: Bool) {
-        let text = draft
-        guard !sending, enter || !text.isEmpty else { return }
+        let snapshot = draft
+        guard !sending, enter || !snapshot.isEmpty else { return }
         sending = true
-        let job = onSend(text, enter) // queued now, in tap order with the quick keys
+        let job = onSend(snapshot, enter) // queued now, in tap order with the quick keys
         Task {
             let ok = await job.value
-            if ok, draft == text { draft = "" }
-            // Clear the stored copy here too: onChange(of: draft) may never run if the composer
-            // hides right after this send.
-            if ok, UserDefaults.standard.string(forKey: draftKey) == text {
+            guard ok else { sending = false; return }
+            let unchanged = draft == snapshot
+            let stayOpen = pinned
+            if unchanged {
+                focused.wrappedValue = false
+                try? await Task.sleep(nanoseconds: 150_000_000)
+            }
+            // The stored copy is decided on its own (works even if the screen was left mid-send):
+            // remove it when it is still exactly what was sent.
+            if UserDefaults.standard.string(forKey: draftKey) == snapshot {
                 UserDefaults.standard.removeObject(forKey: draftKey)
             }
+            // The field is cleared only if the user did not change it while sending.
+            guard unchanged, draft == snapshot else { sending = false; return }
+            justSent = snapshot.isEmpty ? nil : snapshot
+            justSentUntil = Date().addingTimeInterval(0.3)
+            draft = ""
+            fieldID += 1
             sending = false
-            if ok, draft.isEmpty { onSent() }
+            if !draft.isEmpty { return }
+            if stayOpen {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+                focused.wrappedValue = true
+            } else {
+                onSent()
+            }
         }
     }
 }
