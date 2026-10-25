@@ -383,27 +383,31 @@ function Invoke-Add {
         'SSH_DETAIL'    { $detail = $d }
         'PUBKEY'        { $pub = $d }
         'READ_OK'       { Write-Host '[2] Box đọc được repo qua khoá SSH: OK' }
-        'WRITE_OK'      { Write-Host '[2] Box ghi được repo (thử đẩy nhánh thử, không gửi gì): OK' }
+        'WRITE_OK'      { Write-Host '[5] Box ghi được repo (đẩy thử một nhánh tạm rồi xoá ngay): OK' }
         'CLONED'        { Write-Host "[3] Đã tải repo về /data/workspace/$name" }
         'CLONE_EXISTS'  { Write-Host "[3] Repo đã có sẵn ở /data/workspace/$name, giữ nguyên" }
         'CLONE_FAIL'    { Write-Host '[3] lỗi: không tải được repo về box. Chạy lại sau ít phút.'; if ($d) { Write-Host "  (chi tiết: $d)" } }
-        'DIR_NOTGIT'    { Write-Host "[3] lỗi: thư mục /data/workspace/$name đã có nhưng không phải project git. Đặt tên khác: fcode add $repo <tên>" }
-        'DIR_OTHER'     { Write-Host "[3] lỗi: thư mục /data/workspace/$name đang là project khác ($d). Đặt tên khác: fcode add $repo <tên>" }
+        'DIR_NOTGIT'    { Write-Host "lỗi: thư mục /data/workspace/$name đã có nhưng không phải project git. Đặt tên khác: fcode add $repo <tên>" }
+        'DIR_OTHER'     { Write-Host "lỗi: thư mục /data/workspace/$name đang là project khác ($d). Đặt tên khác: fcode add $repo <tên>" }
         'HOOK_OK'       { Write-Host '[4] Đã cài hook chặn push thẳng lên main/master' }
         'HOOK_EXISTS'   { Write-Host '[4] Hook chặn push lên main/master đã có sẵn' }
-        'CFG_ADDED'     { Write-Host "[5] Đã thêm '$name' vào danh sách project của FCode (có bản sao lưu config, không đụng project khác)" }
-        'CFG_EXISTS'    { Write-Host "[5] '$name' đã có trong danh sách project của FCode" }
-        'CFG_CONFLICT'  { Write-Host "[5] lỗi: tên '$name' đang trỏ tới thư mục khác ($d). Đặt tên khác: fcode add $repo <tên>" }
-        'CFG_BROKEN'    { Write-Host '[5] lỗi: file cấu hình FCode trên box (/data/home/.fcoding/config.json) bị hỏng hoặc không đọc được, nên chưa thêm project. Nhờ người quản lý box kiểm tra file đó rồi chạy lại.'; if ($d) { Write-Host "  (chi tiết: $d)" } }
-        'V_BRANCH_OK'   { Write-Host "[6] Bản clone đang ở nhánh mặc định ($d): OK" }
-        'V_BRANCH_BAD'  { Write-Host "[6] cảnh báo: bản clone không ở nhánh mặc định ($d)"; $bad++ }
-        'V_PR_OK'       { Write-Host '[6] Xem được danh sách PR của repo (gh pr list): OK' }
-        'V_PR_BAD'      { Write-Host '[6] cảnh báo: gh pr list chưa chạy được cho repo này (token của box thiếu quyền Pull requests?). Việc tải và đẩy code không bị ảnh hưởng.'; $bad++ }
-        'V_HOOK_OK'     { Write-Host '[6] Hook chặn push lên main, vẫn cho push nhánh box/...: OK' }
-        'V_HOOK_BAD'    { Write-Host "[6] cảnh báo: hook không chạy đúng ($d)"; $bad++ }
-        'V_SERVER_OK'   { Write-Host '[6] Server FCode đã nạp cấu hình mới, không báo lỗi: OK' }
-        'V_SERVER_BAD'  { Write-Host '[6] cảnh báo: server FCode báo lỗi khi nạp lại cấu hình'; $bad++ }
-        'V_CFG_BAD'     { Write-Host '[6] cảnh báo: cấu hình FCode chưa đúng cho project này'; $bad++ }
+        'CFG_ADDED'     { Write-Host "[6] Đã thêm '$name' vào danh sách project của FCode (có bản sao lưu config, không đụng project khác)" }
+        'CFG_EXISTS'    { Write-Host "[6] '$name' đã có trong danh sách project của FCode" }
+        'CFG_CONFLICT'  { Write-Host "lỗi: tên '$name' đang trỏ tới thư mục khác ($d). Đặt tên khác: fcode add $repo <tên>" }
+        'CFG_BROKEN'    { Write-Host 'lỗi: file cấu hình FCode trên box (/data/home/.fcoding/config.json) bị hỏng hoặc không đọc được, nên chưa thêm project. Nhờ người quản lý box kiểm tra file đó rồi chạy lại.'; if ($d) { Write-Host "  (chi tiết: $d)" } }
+        'V_BRANCH_OK'   { Write-Host "[7] Bản clone đang ở nhánh mặc định ($d): OK" }
+        'V_BRANCH_BAD'  { Write-Host "[7] cảnh báo: bản clone không ở nhánh mặc định ($d)"; $bad++ }
+        'V_PR_OK'       { Write-Host '[7] Xem được danh sách PR của repo (gh pr list): OK' }
+        'V_PR_BAD'      { Write-Host '[7] cảnh báo: gh pr list chưa chạy được cho repo này (token của box thiếu quyền Pull requests?). Việc tải và đẩy code không bị ảnh hưởng.'; $bad++ }
+        'V_HOOK_OK'     { Write-Host '[7] Hook chặn push lên main, vẫn cho push nhánh box/...: OK' }
+        'V_HOOK_BAD'    { Write-Host "[7] cảnh báo: hook không chạy đúng ($d)"; $bad++ }
+        'V_SERVER_OK'   { Write-Host '[7] Server FCode đã nạp cấu hình mới, không báo lỗi: OK' }
+        'V_SERVER_BAD'  { Write-Host '[7] cảnh báo: server FCode báo lỗi khi nạp lại cấu hình'; $bad++ }
+        'V_CFG_BAD'     { Write-Host '[7] cảnh báo: cấu hình FCode chưa đúng cho project này'; $bad++ }
+        'V_EMPTY_REPO'  { Write-Host '[7] Repo còn trống (chưa có commit nào): bình thường với repo mới' }
+        'CLEANUP_FAIL'  { Write-Host "cảnh báo: nhánh thử $d còn sót trên GitHub, hãy xoá nó trong trang Branches của repo."; $bad++ }
+        'NAME_USED'     { Write-Host "lỗi: tên '$name' đã được dùng cho khoá hoặc kết nối GitHub khác trên box (không phải repo này). Đặt tên khác: fcode add $repo <tên>" }
+        'WRITE_BLOCKED' { Write-Host '[5] lỗi: khoá đã vào GitHub nhưng GitHub không cho box tạo nhánh thử box/... (thường do quy tắc bảo vệ nhánh của repo).'; Write-Host "    Nhờ chủ repo cho phép nhánh box/*, rồi chạy lại: fcode add $repo $name"; if ($detail) { Write-Host "  (chi tiết: $detail)" } }
         'RULES_YES'     { $rules = $true }
         'USAGE'         { Write-Host 'lỗi: thiếu tên repo hoặc tên project. Cách dùng: fcode add <chủ/repo> [tên]' }
         'BAD_ARGS'      { Write-Host 'lỗi: tên repo hoặc tên project không hợp lệ.' }
@@ -414,6 +418,7 @@ function Invoke-Add {
       Write-IpaError 'không nói chuyện được với box. Kiểm tra: đã chạy "instabox login" chưa, và box đang bật không.' $d
       return 1
     }
+    if ($code -eq 42) { return 1 }
     if ($code -eq 40 -or $code -eq 41) {
       # can dan khoa cong khai vao GitHub (nguoi dung tu dan; khong tu them bang token/API)
       Write-Host ''
@@ -433,6 +438,7 @@ function Invoke-Add {
         return 1
       }
       Write-Host "Bấm Enter khi đã làm xong (lần thử $try/$max)..."
+      try { while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) } } catch { }   # bo cac phim go truoc luc cho
       $k = [Console]::In.ReadLine()
       if ($null -eq $k) { Write-Host "Không đọc được phím Enter. Làm các bước trên rồi chạy lại: fcode add $repo $name"; return 1 }
       Write-Host 'Đang kiểm tra lại...'
@@ -550,7 +556,8 @@ $FcodeAddSh = (@'
 # Moi repo co 1 deploy key SSH rieng (cung kieu 3 project san co): ~/.ssh/id_ed25519_<ten> + alias "github-<ten>".
 # Chay lai nhieu lan van an toan. Chi in ASCII: dong "R <MA> [chi tiet]" de fcode.ps1 dich ra tieng Viet.
 # Khong bao gio in khoa rieng; chi in khoa cong khai (PUBKEY). Khong dung token/API de them khoa.
-# Ma thoat: 0 xong, 40 can dan khoa vao GitHub, 41 khoa chua co quyen ghi, 2 tham so sai, 1x/2x loi khac.
+# Ma thoat: 0 xong, 30 xong nhung co canh bao, 40 can dan khoa vao GitHub, 41 khoa chua co quyen ghi,
+# 42 GitHub chan tao nhanh box/*, 2 tham so sai, 11/21/22/23 ten da dung hoac cau hinh hong, 1x/2x loi khac.
 set -u
 repo="${1:-}"; name="${2:-}"
 [ -n "$repo" ] && [ -n "$name" ] || { echo "R USAGE"; exit 2; }
@@ -564,7 +571,7 @@ cfg="${FCODE_CFG:-/data/home/.fcoding/config.json}"
 key="$sshdir/id_ed25519_$name"
 alias_="github-$name"
 url="git@$alias_:$repo.git"
-export GIT_SSH_COMMAND="ssh -F $sshdir/config -o BatchMode=yes"
+export GIT_SSH_COMMAND="ssh -F $sshdir/config -o BatchMode=yes -o ConnectTimeout=15"
 GH_ED25519='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl'   # khoa may chu github.com (chinh thuc)
 fail=0
 say() { echo "R $*"; }
@@ -585,7 +592,58 @@ exit 0
 HOOK
 }
 
-# 1. khoa SSH rieng + alias + ghim khoa may chu github.com (khoa thu muc ~/.ssh: hai lan chay cung luc phai doi nhau)
+# alias cua rieng repo nay? 0 = co (co dong "# fcode add: <repo>" ngay tren), 1 = chua co, 2 = co nhung cua nguoi khac
+alias_owner() {
+  [ -f "$sshdir/config" ] || return 1
+  awk -v h="Host $alias_" -v m="# fcode add: $repo" 'prev==m && $0==h {ok=1} $0==h {seen=1} {prev=$0} END {exit (ok ? 0 : (seen ? 2 : 1))}' "$sshdir/config"
+}
+
+# ghi duoc repo: day THAT 1 nhanh thu tu commit cay rong (chay duoc ca repo rong), roi xoa ngay.
+# Chung minh luon: khoa mo duoc receive-pack, va luat bao ve nhanh khong chan box/*. Khong de lai nhanh nao.
+write_check() { # $1 = thu muc clone; 0 = ghi duoc; 1 = loi (noi dung loi o $err)
+  local tree c ref e2; e2="$(mktemp)"
+  tree="$(git -C "$1" hash-object -t tree -w /dev/null 2>"$err")" || { rm -f "$e2"; return 1; }
+  c="$(GIT_AUTHOR_NAME=fcode GIT_AUTHOR_EMAIL=fcode@box GIT_COMMITTER_NAME=fcode GIT_COMMITTER_EMAIL=fcode@box \
+       git -C "$1" commit-tree "$tree" -m 'fcode add write check' </dev/null 2>"$err")" || { rm -f "$e2"; return 1; }
+  ref="refs/heads/box/fcode-add-check-$(date +%s)-$$"
+  git -C "$1" push -q origin "$c:$ref" >/dev/null 2>"$err" </dev/null || { rm -f "$e2"; return 1; }
+  if ! git -C "$1" push -q origin ":$ref" >/dev/null 2>"$e2" </dev/null; then
+    sleep 2
+    git -C "$1" push -q origin ":$ref" >/dev/null 2>"$e2" </dev/null || say CLEANUP_FAIL "$ref"
+  fi
+  rm -f "$e2"; return 0
+}
+
+# 0. hai lan fcode add cung ten khong chay song song
+exec 8>"${TMPDIR:-/tmp}/fcode-add-$name.lock"; flock 8
+
+# 1. kiem tra truoc (chua tao gi): thu muc, cau hinh, khoa/alias co phai cua repo khac khong
+want="$(printf '%s' "$repo" | tr 'A-Z' 'a-z')"
+if [ -e "$dir" ]; then
+  if [ ! -d "$dir/.git" ]; then say DIR_NOTGIT "$dir"; exit 11; fi
+  have="$(git -C "$dir" config --get remote.origin.url 2>/dev/null | tr 'A-Z' 'a-z' | sed -E 's#^(https://github\.com/|git@[^:]*:)##; s#\.git$##')"
+  if [ "$have" != "$want" ]; then say DIR_OTHER "$have"; exit 11; fi
+fi
+python3 - "$cfg" "$name" "$dir" <<'PY'
+import json, sys
+cfg, name, d = sys.argv[1:4]
+try:
+    c = json.load(open(cfg, encoding='utf-8'))
+    if not isinstance(c, dict): raise ValueError('config is not an object')
+    p = c.get('projects')
+    if p is None: p = {}
+    if not isinstance(p, dict): raise ValueError('projects is not an object')
+except (OSError, ValueError) as e:
+    print('R CFG_BROKEN ' + type(e).__name__); sys.exit(22)
+if name in p and p[name] != d:
+    print('R CFG_CONFLICT ' + str(p[name])[:100]); sys.exit(21)
+PY
+rc=$?; [ "$rc" -eq 0 ] || exit "$rc"
+alias_owner; ao=$?
+if [ "$ao" -eq 2 ]; then say NAME_USED; exit 23; fi
+if [ "$ao" -eq 1 ] && [ -e "$key" ] && [ "$(awk '{print $3}' "$key.pub" 2>/dev/null)" != "fcode-$repo" ]; then say NAME_USED; exit 23; fi
+
+# 2. khoa SSH rieng + alias + ghim khoa may chu github.com (khoa thu muc ~/.ssh: cac lan chay khac ten cung ghi config nay)
 mkdir -p "$sshdir"; chmod 700 "$sshdir"
 exec 9<"$sshdir"; flock 9
 if [ -s "$key" ]; then say KEY_EXISTS
@@ -594,10 +652,13 @@ else
   ssh-keygen -q -t ed25519 -N '' -C "fcode-$repo" -f "$key" </dev/null >/dev/null 2>&1 || { say KEY_FAIL; exit 20; }
   chmod 600 "$key"; say KEY_NEW
 fi
-[ -s "$key.pub" ] || ssh-keygen -y -f "$key" </dev/null >"$key.pub" 2>/dev/null
+# khoa cong khai luon suy ra tu khoa rieng (khong tin file .pub cu)
+pubk="$(ssh-keygen -y -f "$key" </dev/null 2>/dev/null | cut -d' ' -f1,2)"; [ -n "$pubk" ] || { say KEY_FAIL; exit 20; }
+pub="$pubk fcode-$repo"
+printf '%s\n' "$pub" >"$key.pub"; chmod 644 "$key.pub"
 touch "$sshdir/known_hosts"; chmod 644 "$sshdir/known_hosts"
 grep -qF "$GH_ED25519" "$sshdir/known_hosts" || printf 'github.com %s\n' "$GH_ED25519" >>"$sshdir/known_hosts"
-if grep -qxF "Host $alias_" "$sshdir/config" 2>/dev/null; then say ALIAS_EXISTS
+if [ "$ao" -eq 0 ]; then say ALIAS_EXISTS
 else
   ctmp="$(mktemp "$sshdir/.config.XXXXXX")"
   { [ -f "$sshdir/config" ] && cat "$sshdir/config"
@@ -606,18 +667,13 @@ else
   say ALIAS_ADDED
 fi
 flock -u 9
-pub="$(cat "$key.pub")"
 
-# 2. doc duoc repo qua khoa nay? (khong duoc -> nguoi dung dan khoa cong khai vao GitHub, roi chay lai)
+# 3. doc duoc repo qua khoa nay? (khong duoc -> nguoi dung dan khoa cong khai vao GitHub, roi chay lai)
 if ! git ls-remote "$url" >/dev/null 2>"$err" </dev/null; then say SSH_DETAIL "$(clean <"$err")"; say PUBKEY "$pub"; say NEED_KEY; exit 40; fi
 say READ_OK
 
-# 3. clone qua alias (da co thi giu nguyen, dat lai remote qua alias)
-want="$(printf '%s' "$repo" | tr 'A-Z' 'a-z')"
+# 4. clone qua alias (da co thi giu nguyen, dat lai remote qua alias)
 if [ -e "$dir" ]; then
-  if [ ! -d "$dir/.git" ]; then say DIR_NOTGIT "$dir"; exit 11; fi
-  have="$(git -C "$dir" remote get-url origin 2>/dev/null | tr 'A-Z' 'a-z' | sed -E 's#^(https://github\.com/|git@[^:]*:)##; s#\.git$##')"
-  if [ "$have" != "$want" ]; then say DIR_OTHER "$have"; exit 11; fi
   git -C "$dir" remote set-url origin "$url"
   say CLONE_EXISTS
 else
@@ -625,19 +681,21 @@ else
   say CLONED
 fi
 
-# 4. hook chan push len main/master
+# 5. hook chan push len main/master
 mkdir -p "$dir/.git/hooks"
 htmp="$(mktemp)"; hook_text >"$htmp"
 if cmp -s "$htmp" "$dir/.git/hooks/pre-push" 2>/dev/null; then say HOOK_EXISTS; else install -m 755 "$htmp" "$dir/.git/hooks/pre-push"; say HOOK_OK; fi
 rm -f "$htmp"; chmod 755 "$dir/.git/hooks/pre-push"
 
-# 5. ghi duoc repo? (push thu, khong gui gi; nhanh box/ duoc hook cho phep)
-if ! git -C "$dir" push --dry-run origin HEAD:refs/heads/box/fcode-add-check >/dev/null 2>"$err" </dev/null; then
-  say SSH_DETAIL "$(clean <"$err")"; say PUBKEY "$pub"; say NEED_WRITE; exit 41
+# 6. ghi duoc repo?
+if ! write_check "$dir"; then
+  say SSH_DETAIL "$(clean <"$err")"
+  if grep -qiE 'read.only|permission|denied|publickey|could not read' "$err"; then say PUBKEY "$pub"; say NEED_WRITE; exit 41; fi
+  say WRITE_BLOCKED; exit 42
 fi
 say WRITE_OK
 
-# 6. them vao config FCode (chi them 1 khoa trong "projects"; khoa thu muc; sao luu truoc; ghi bang rename, 0600)
+# 7. them vao config FCode (chi them 1 khoa trong "projects"; khoa thu muc; sao luu truoc; ghi bang rename, 0600)
 python3 - "$cfg" "$name" "$dir" <<'PY'
 import fcntl, json, os, shutil, sys, tempfile, time
 cfg, name, d = sys.argv[1:4]
@@ -679,10 +737,11 @@ PY
 rc=$?
 [ "$rc" -eq 0 ] || exit "$rc"
 
-# 7. kiem tra
+# 8. kiem tra
 branch="$(git -C "$dir" symbolic-ref --short HEAD 2>/dev/null)"
 defb="$(git -C "$dir" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null)"; defb="${defb#origin/}"
-if [ -n "$branch" ] && [ "$branch" = "$defb" ]; then say V_BRANCH_OK "$branch"; else say V_BRANCH_BAD "${branch:-none}/${defb:-?}"; fail=1; fi
+if ! git -C "$dir" rev-parse -q --verify HEAD >/dev/null 2>&1; then say V_EMPTY_REPO
+elif [ -n "$branch" ] && [ "$branch" = "$defb" ]; then say V_BRANCH_OK "$branch"; else say V_BRANCH_BAD "${branch:-none}/${defb:-?}"; fail=1; fi
 if gh pr list -R "$repo" --limit 1 >/dev/null 2>&1 </dev/null; then say V_PR_OK; else say V_PR_BAD; fail=1; fi
 # hook: chay thu voi ref gia, khong push gi
 hook="$dir/.git/hooks/pre-push"
