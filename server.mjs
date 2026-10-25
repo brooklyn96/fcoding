@@ -286,6 +286,7 @@ export function pairPage(appLink) {
 
 // ---------- home screen v2 (CONTRACT.md A8): quota, spend, box timer, projects, updates, Codex reset ----------
 const QUOTA_TTL = 60e3, LISTING_TTL = 300e3, SPEND_TTL = 300e3, PROJECTS_TTL = 120e3;
+const LIST_AFTER_RESET_MS = 10e3, STALE_QUOTA_TTL = 15e3; // omp's own listing timeout is 10 s
 const HOME_WAIT_MS = 8000; // a part with no value yet is waited for this long at most, then it is empty and fills in the background
 const QUOTA_STALE_MS = 10 * 60e3; // a report omp fetched longer ago than this is stale
 const DEFAULT_TZ = 'Asia/Ho_Chi_Minh';
@@ -417,27 +418,46 @@ export function claudeLine(v) {
   const usd = Number.isFinite(v.costUSD) ? v.costUSD : p ? costOf(p, parts) : null;
   return { ts, harness: 'claude', who: null, usd, tokens: parts.input + parts.output + parts.cacheRead + w, key: str(m.id) ? `c:${m.id}` : null };
 }
-// Codex (~/.codex/sessions, archived_sessions): token_count events; st carries the session, account and model of the file
+// A child session (fork or subagent spawn) whose leading token_count lines replay the parent's history (Pane codex_child_meta):
+// JSON null and blank strings count as absent, so a root session with `forked_from_id: null` is not a child.
+export function codexChildMeta(p) {
+  const set = (k) => p?.[k] !== undefined && p[k] !== null && (typeof p[k] !== 'string' || p[k].trim() !== '');
+  return set('forked_from_id') || set('parent_thread_id') || p?.thread_source === 'subagent'
+    || (p?.source !== null && typeof p?.source === 'object' && p.source.subagent !== undefined && p.source.subagent !== null);
+}
+const epochSec = (t) => { const ms = Date.parse(t); return Number.isFinite(ms) ? Math.floor(ms / 1000) : null; };
+// Codex (~/.codex/sessions, archived_sessions): token_count events; st carries the session, account and model of the file.
+// Replay gate (Pane CodexReplayGate): a child file replays its parent's history, task_started lines included (with the parent's
+// older started_at), before its own first live turn. The gate opens at the first task_started whose started_at is at or after
+// the child's session_meta timestamp (seconds); with no such timestamp, at or after that task_started line's own second.
 export function codexLine(v, st) {
   const p = v?.payload;
   if (!p || typeof p !== 'object') return null;
-  if (v.type === 'session_meta') { // the first one is the file's own; a forked file then repeats its parent's
-    if (st.session) return null;
+  if (v.type === 'session_meta') { // only the file's own (first) one counts: a child file repeats its parent's right after
+    if (st.sawMeta) return null;
+    st.sawMeta = true;
     st.session = str(p.id);
     st.account = str(p.creator_account_id) ?? str(p.account_id);
     st.model = str(p.model) ?? st.model;
-    st.replay = !!str(p.forked_from_id); // a fork replays the parent's history before its own first turn (Pane CodexReplayGate)
+    if (codexChildMeta(p)) st.gate = { until: epochSec(v.timestamp) }; // until null: self-timed
     return null;
   }
   if (v.type === 'turn_context') { st.model = str(p.model) ?? st.model; return null; }
-  if (p.type === 'task_started') { st.replay = false; return null; }
+  if (p.type === 'task_started') {
+    const started = p.started_at;
+    if (st.gate && typeof started === 'number' && Number.isFinite(started)) {
+      const t = st.gate.until ?? epochSec(v.timestamp);
+      if (t !== null && started >= t) st.gate = null;
+    }
+    return null;
+  }
   if (p.type !== 'token_count' || !p.info || typeof p.info !== 'object') return null;
   const tot = p.info.total_token_usage, last = p.info.last_token_usage;
   const totKey = tot ? JSON.stringify(tot) : null;
   if (totKey && totKey === st.prev) return null; // the same cumulative totals again: a re-emitted snapshot, not new usage
   const prevTot = st.prevTot;
   st.prev = totKey; st.prevTot = tot;
-  if (st.replay) return null; // replayed parent history: seeds the delta baseline, never counted (the parent's file counts it)
+  if (st.gate) return null; // replayed parent history: seeds the delta baseline, never counted (the parent's file counts it)
   const u = last ?? (tot && Object.fromEntries(Object.keys(tot).map((k) => [k, Math.max(0, num(tot[k]) - num(prevTot?.[k]))])));
   const ts = Date.parse(v.timestamp);
   if (!u || !Number.isFinite(ts)) return null;
@@ -645,12 +665,12 @@ function execTool(spec, args, timeout) {
 // runs in the background. With no value yet, or after clear(), the refresh is waited for at most `wait` ms; then the old value
 // (fresh: false) or, with none, a throw, and the refresh carries on. fresh is false while the last refresh failed. A failed
 // refresh is retried only `retry` ms later, not on every poll. clear() also drops a refresh started before it (its result is old).
-export function memo(ttl, fn, now, retry = ttl) {
-  let value, at = -Infinity, failedAt = -Infinity, ok = true, cleared = false, pending = null, gen = 0;
+export function memo(ttl, fn, now, retry = ttl, ttlOf = () => undefined) {
+  let value, vttl = ttl, at = -Infinity, failedAt = -Infinity, ok = true, cleared = false, pending = null, gen = 0;
   const refresh = () => {
     if (pending) return pending;
     const g = gen, started = now(); // the value is as old as the moment its refresh started
-    const p = Promise.resolve().then(fn).then((v) => { if (g === gen) { value = v; at = started; ok = true; cleared = false; } return v; },
+    const p = Promise.resolve().then(fn).then((v) => { if (g === gen) { value = v; vttl = ttlOf(v) ?? ttl; at = started; ok = true; cleared = false; } return v; },
       (e) => { if (g === gen) { failedAt = now(); ok = false; } throw e; });
     pending = p;
     p.catch(() => {}).finally(() => { if (pending === p) pending = null; });
@@ -660,7 +680,7 @@ export function memo(ttl, fn, now, retry = ttl) {
   return {
     async get(wait = Infinity) {
       const t = now();
-      if (value !== undefined && t - at < ttl) return { value, fresh: ok };
+      if (value !== undefined && t - at < vttl) return { value, fresh: ok };
       const backoff = t - failedAt < retry;
       if (value !== undefined && !cleared) { if (!backoff) refresh(); return { value, fresh: ok && !backoff }; }
       if (backoff) return old(new Error('failed recently'));
@@ -1073,14 +1093,24 @@ export function createApp(opts = {}) {
   }
 
   // --- GET /api/home (A8): each part cached on its own; a failing part is empty or stale, never a 500 ---
+  const listAfterReset = opts.listAfterResetMs ?? LIST_AFTER_RESET_MS;
   const homeWait = opts.homeWaitMs ?? HOME_WAIT_MS, resetReplyMs = opts.resetReplyMs ?? RESET_REPLY_MS, resetTimeout = opts.resetTimeoutMs ?? RESET_TIMEOUT;
   // `omp usage reset --json` (credential ids, reset counts) on its own longer TTL; the last good listing is kept on a failure
   const listing = memo(LISTING_TTL, async () => JSON.parse(await execTool(ompSpec, ['usage', 'reset', '--json'], 30e3)), now, QUOTA_TTL);
+  // After a reset (listingCleared) the reset counts must come from a new listing: the quota refresh then waits for it up to
+  // LIST_AFTER_RESET_MS (omp's own listing timeout), not homeWait / 2. If it still is not there (slow or failed), the accounts are
+  // stored with stale: true and the quota value only for STALE_QUOTA_TTL, so the next request reads both again.
+  let listingCleared = false;
   const quota = memo(QUOTA_TTL, async () => {
-    const [u, r] = await Promise.allSettled([execTool(ompSpec, ['usage', '--json'], 30e3), listing.get(homeWait / 2)]);
+    const afterReset = listingCleared;
+    const [u, r] = await Promise.allSettled([execTool(ompSpec, ['usage', '--json'], 30e3), listing.get(afterReset ? listAfterReset : homeWait / 2)]);
     if (u.status === 'rejected') throw u.reason;
-    return parseQuota(JSON.parse(u.value), r.status === 'fulfilled' ? r.value.value : null, now());
-  }, now);
+    const fresh = r.status === 'fulfilled' && r.value.fresh;
+    if (fresh) listingCleared = false;
+    const q = parseQuota(JSON.parse(u.value), r.status === 'fulfilled' ? r.value.value : null, now());
+    if (afterReset && !fresh) { for (const a of q.accounts) a.stale = true; q.ttl = STALE_QUOTA_TTL; }
+    return q;
+  }, now, QUOTA_TTL, (q) => q.ttl);
   const scan = spendScanner(spendRoots, now);
   const spend = memo(SPEND_TTL, scan, now);
   async function projectInfo(name) {
@@ -1106,13 +1136,26 @@ export function createApp(opts = {}) {
     return out;
   }
   const projects = memo(PROJECTS_TTL, () => Promise.all(cfg.projectNames.map(projectInfo)), now);
-  // box timer (estimate, no API key): the last resume = process start or a 30 s tick that came more than 90 s late
+  // box timer (estimate, no API key): the last resume = a 30 s tick that came more than 90 s late, or the start of a box run.
+  // {resume, tick} is kept in box-timer.json on every 30 s tick, so a server restart (reinstall, crash, systemctl restart) within
+  // 90 s of the last tick keeps the run's resume; an older or missing file means the box itself was asleep or stopped: resume = now.
+  const boxFile = path.join(configDir, 'box-timer.json');
   let boxResume = now(), boxTick = now();
-  const tickBox = () => { const t = now(); if (t - boxTick > BOX_GAP_MS) boxResume = t; boxTick = t; };
+  try {
+    const b = JSON.parse(fs.readFileSync(boxFile, 'utf8'));
+    const age = boxTick - b?.tick;
+    if (Number.isFinite(b?.resume) && Number.isFinite(b?.tick) && b.resume <= b.tick && age >= 0 && age < BOX_GAP_MS) boxResume = b.resume;
+  } catch {} // no file or a bad one: a new run
+  const tick = () => { const t = now(); if (t - boxTick > BOX_GAP_MS) boxResume = t; boxTick = t; };
+  const tickBox = () => { // the 30 s tick: also stored (a failed write only loses the restart memory)
+    tick();
+    try { writeFile(boxFile, JSON.stringify({ resume: boxResume, tick: boxTick })); } catch {}
+  };
+  tickBox();
   const boxTimer = setInterval(tickBox, BOX_TICK_MS);
   boxTimer.unref();
   function boxInfo() {
-    tickBox();
+    tick();
     const at = boxResume + BOX.maxRunMinutes * 60e3;
     return { state: 'running', sleepsAt: at > now() ? iso(at) : null, ...BOX, source: 'estimate' };
   }
@@ -1129,8 +1172,8 @@ export function createApp(opts = {}) {
       generatedAt: iso(t), box: boxInfo(),
       accounts: accounts.map((a) => ({ ...a, spend: view?.perAccount.get(a.id) ?? null })),
       totals: view?.totals ?? { spend: null, byHarness: [] },
-      // not read yet (first request, slow gh): each project with nothing known, as when gh fails
-      projects: p.status === 'fulfilled' ? p.value.value : cfg.projectNames.map((name) => ({ name, repo: null, branch: null, prs: null, lastRun: null })),
+      // not read yet (first request, slow gh): each project with nothing known and loading: true (a gh failure has no loading)
+      projects: p.status === 'fulfilled' ? p.value.value : cfg.projectNames.map((name) => ({ name, repo: null, branch: null, prs: null, lastRun: null, loading: true })),
       updates,
     };
   }
@@ -1147,7 +1190,7 @@ export function createApp(opts = {}) {
     const job = (async () => { // the lock is taken before the first await
       let acct;
       try { acct = (await quota.get(homeWait)).value.accounts.find((a) => a.id === accountId); } catch { throw new HttpErr(503, 'unavailable'); }
-      if (!acct) throw new HttpErr(404, 'not_found');
+      if (!acct) throw new HttpErr(404, 'unknown_account'); // not 'not_found', which an older server gives for the unknown route
       if (acct.harness !== 'codex') throw new HttpErr(400, 'not_allowed');
       if (!acct.resets.target) throw new HttpErr(409, 'no_target');
       let reply;
@@ -1158,7 +1201,7 @@ export function createApp(opts = {}) {
       }
       log(`codex-reset ${accountId} ${reply.result}`); // the account id and the result only
       if (RESET_FINAL.includes(reply.result)) resetDone.set(doneKey, { at: now(), reply });
-      quota.clear(); listing.clear(); // whatever omp answered, the next GET /api/home reads the counts again
+      listing.clear(); listingCleared = true; quota.clear(); // whatever omp answered, the next GET /api/home reads the counts again
       return reply;
     })();
     resetJobs.set(accountId, { requestId, promise: job });

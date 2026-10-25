@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import { createApp, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, strictOrigin, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock,
-  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, prsOf, runOf, parseUpdates, resetReply, RESET_MSG, BOX, memo } from '../server.mjs';
+  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, prsOf, runOf, parseUpdates, resetReply, RESET_MSG, BOX, memo, codexChildMeta } from '../server.mjs';
 
 process.env.TZ = 'America/Los_Angeles'; // spend days follow config.json timeZone, never the process zone: a third zone proves it
 
@@ -24,8 +24,9 @@ const LAUNCH = `env LANG=C.UTF-8 LC_ALL=C.UTF-8 'PATH=${HOME}/.local/bin:${HOME}
 async function boot(opts = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-test-'));
   const fakeDir = path.join(root, 'fake'); fs.mkdirSync(fakeDir);
-  const configDir = path.join(root, 'cfg'); fs.mkdirSync(configDir);
-  fs.writeFileSync(path.join(configDir, 'config.json'), JSON.stringify({
+  const configDir = opts.configDir ?? path.join(root, 'cfg'); // opts.configDir: a restart on the same config dir
+  if (!opts.configDir) fs.mkdirSync(configDir);
+  if (!opts.configDir) fs.writeFileSync(path.join(configDir, 'config.json'), JSON.stringify({
     cookieSecret: Buffer.alloc(32, 7).toString('base64'),
     projects: { alpha: ABS, 'my.proj': ABS }, port: 7681, ...opts.config,
   }));
@@ -2650,20 +2651,6 @@ test('spend parsers: omp cost and credential, Claude dedupe and prices, Codex de
   const cx = lines('codex.jsonl').map((v) => codexLine(v, st)).filter(Boolean);
   assert.deepEqual(cx.map((e) => [e.who, e.tokens]), [['codex:acct-cdx', 21000], ['codex:acct-cdx', 11000]]); // the repeated snapshot is not counted
   assert.ok(Math.abs(cx[0].usd - 0.085) < 1e-12 && Math.abs(cx[1].usd - 0.0575) < 1e-12); // cached input at the cache-read rate; 2nd from the delta
-  // a forked rollout replays its parent's history (parent session_meta, token_count) before its own first turn: never counted,
-  // but the replayed totals are the baseline of the fork's first delta
-  const ts = new Date(T0).toISOString();
-  const tc = (input, output) => ({ timestamp: ts, type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: input, output_tokens: output, total_tokens: input + output } } } });
-  const fork = [
-    { timestamp: ts, type: 'session_meta', payload: { id: 'child-1', forked_from_id: 'parent-1', creator_account_id: 'acct-cdx', model: 'gpt-5.5' } },
-    { timestamp: ts, type: 'session_meta', payload: { id: 'parent-1', creator_account_id: 'acct-other' } },
-    tc(1000, 100), tc(3000, 300),
-    { timestamp: ts, type: 'event_msg', payload: { type: 'task_started' } },
-    tc(3500, 350),
-  ];
-  const fst = { file: 'fork' };
-  const fx = fork.map((v) => codexLine(v, fst)).filter(Boolean);
-  assert.deepEqual(fx.map((e) => [e.who, e.tokens, e.key.startsWith('x:child-1:')]), [['codex:acct-cdx', 550, true]]);
   assert.deepEqual([priceOf('claude-opus-4-8-20260101'), priceOf('gpt-5.1-codex-max'), priceOf('anthropic/claude-haiku-5-5'), priceOf('nope')],
     [[5, 25, 0.5, 6.25, 10], [1.25, 10, 0.125], [0.1, 0.5, 0.01, 0.125, 0.2], null]);
   // variants priced on their own (LiteLLM 2026-10-26), never at the base model's rate
@@ -2674,6 +2661,52 @@ test('spend parsers: omp cost and credential, Claude dedupe and prices, Codex de
     [null, null, null, [1.75, 14, 0.175], [1.75, 14, 0.175]]);
   const unpriced = ompLine({ type: 'message', id: 'u', message: { role: 'assistant', provider: 'openai-codex', model: 'gpt-5.5-ultra', credentialId: 4, timestamp: T0, usage: { input: 10, output: 5 } } }, 'f');
   assert.deepEqual([unpriced.usd, unpriced.tokens], [null, 15]);
+});
+
+// Pane spend.rs codex_child_meta_rules + codex_replay_gate_skips_child_history (@442bdd7), ported line for line
+test('codex replay gate (Pane CodexReplayGate): child markers; replayed parent history and task_started never counted', () => {
+  assert.equal(codexChildMeta({ forked_from_id: null, parent_thread_id: null }), false);
+  assert.equal(codexChildMeta({ forked_from_id: '  ' }), false);
+  assert.equal(codexChildMeta({ session_id: 'root' }), false);
+  assert.equal(codexChildMeta({ forked_from_id: 'abc' }), true);
+  assert.equal(codexChildMeta({ parent_thread_id: 'abc' }), true);
+  assert.equal(codexChildMeta({ thread_source: 'subagent' }), true);
+  assert.equal(codexChildMeta({ source: { subagent: { thread_spawn: {} } } }), true);
+  assert.equal(codexChildMeta({ source: { subagent: null } }), false);
+  const tcl = (ts, last, total) => {
+    const info = { total_token_usage: { input_tokens: total[0], output_tokens: total[1], total_tokens: total[0] + total[1] } };
+    if (last) info.last_token_usage = { input_tokens: last[0], output_tokens: last[1], total_tokens: last[0] + last[1] };
+    return { timestamp: ts, type: 'event_msg', payload: { type: 'token_count', info } };
+  };
+  const spawn = Date.parse('2026-07-10T10:00:00Z') / 1000;
+  const run = (lines) => { const st = { file: 'f' }; return lines.map((v) => codexLine(v, st)).filter(Boolean); };
+  const tokens = (ev) => ev.reduce((a, e) => a + e.tokens, 0);
+  const child = (meta, metaTs = '2026-07-10T10:00:00Z') => [
+    { timestamp: metaTs, type: 'session_meta', payload: meta },
+    { timestamp: '2026-07-10T10:00:00Z', type: 'turn_context', payload: { model: 'gpt-5.6-terra' } },
+    tcl('2026-07-10T10:00:01Z', [50000, 5000], [50000, 5000]),
+    { timestamp: '2026-07-10T10:00:02Z', type: 'event_msg', payload: { type: 'task_started', started_at: spawn - 3600 } }, // replayed: parent's older start
+    tcl('2026-07-10T10:00:03Z', [30000, 3000], [80000, 8000]),
+    { timestamp: '2026-07-10T10:00:05Z', type: 'event_msg', payload: { type: 'task_started', started_at: spawn + 5 } }, // first live turn
+    tcl('2026-07-10T10:00:09Z', [1000, 100], [81000, 8100]),
+  ];
+  assert.equal(tokens(run(child({ parent_thread_id: 'abc', thread_source: 'subagent' }))), 1100); // Pane's test: subagent spawn
+  assert.equal(tokens(run(child({ forked_from_id: 'abc' }))), 1100); // the same history in a fork
+  assert.equal(tokens(run(child({ source: { subagent: { thread_spawn: {} } } }))), 1100);
+  const self = run(child({ forked_from_id: 'abc' }, 'not a time')); // no session_meta time: self-timed (started_at >= the line's own second)
+  assert.equal(tokens(self), 1100);
+  const live = run(child({ forked_from_id: 'abc' })); // without last_token_usage the first live delta is from the replayed totals
+  assert.deepEqual(live.map((e) => e.usd !== null), [true]); // gpt-5.6-terra priced
+  const noLast = child({ forked_from_id: 'abc' }).map((v) => (v.payload.type === 'token_count' ? { ...v, payload: { ...v.payload, info: { total_token_usage: v.payload.info.total_token_usage } } } : v));
+  assert.equal(tokens(run(noLast)), 1100);
+  // a root session with null parents counts normally (Pane codex_root_session_with_null_parent_counts_normally)
+  assert.equal(tokens(run([{ timestamp: '2026-07-10T10:00:00Z', type: 'session_meta', payload: { forked_from_id: null, parent_thread_id: null } },
+    tcl('2026-07-10T10:00:01Z', [1000, 100], [1000, 100])])), 1100);
+  // only the file's first session_meta counts, even one with no id: the replayed parent meta sets neither account nor gate
+  const first = run([{ timestamp: '2026-07-10T10:00:00Z', type: 'session_meta', payload: { creator_account_id: 'acct-cdx' } },
+    { timestamp: '2026-07-10T10:00:00Z', type: 'session_meta', payload: { id: 'parent', forked_from_id: 'x', creator_account_id: 'acct-other' } },
+    tcl('2026-07-10T10:00:01Z', [1000, 100], [1000, 100])]);
+  assert.deepEqual(first.map((e) => [e.who, e.tokens, e.key.startsWith('x:f:')]), [['codex:acct-cdx', 1100, true]]);
 });
 
 test('spend summary: today / yesterday / last 30 days, 30 daily rows, weekly estimate, per account and per harness', async () => {
@@ -2922,7 +2955,7 @@ test('GET /api/home never waits long: a slow part is empty the first time, then 
   let h = await c.home();
   assert.ok(Date.now() - t0 < 1200, `took ${Date.now() - t0} ms`); // homeWaitMs 300 per part, in parallel
   assert.deepEqual(h.accounts, []); // not ready yet: empty, the rest answers (spend, box, updates)
-  assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: null, branch: null, prs: null, lastRun: null })));
+  assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: null, branch: null, prs: null, lastRun: null, loading: true })));
   assert.ok(h.totals.spend && h.box && h.updates.omp);
   h = await c.homeUntil((x) => x.accounts.length === 4 && x.projects[0].repo);
   c.clock.t += 121e3; // both TTLs over, both tools still slow: the cached parts at once
@@ -2950,7 +2983,8 @@ test('POST /api/codex-reset: Codex only, validated, lock per account, the same r
   assert.equal((await c.reset({ accountId: 'openai-codex/4', requestId: 'x' })).status, 400);
   const claude = await c.reset({ accountId: 'anthropic/1', requestId: id(1) });
   assert.deepEqual([claude.status, claude.json], [400, { error: 'not_allowed' }]);
-  assert.equal((await c.reset({ accountId: 'openai-codex/99', requestId: id(2) })).status, 404);
+  const unknown = await c.reset({ accountId: 'openai-codex/99', requestId: id(2) });
+  assert.deepEqual([unknown.status, unknown.json], [404, { error: 'unknown_account' }]); // not not_found (an older server's unknown route)
   assert.equal(c.toolCalls('usage reset openai').length, 0);
   // two confirms at once for one account: one runs, the other is refused
   c.setRules([['usage reset openai-codex/4', { stdout: RESET_OK, delay: 400 }], ...baseRules()]);
@@ -2998,6 +3032,59 @@ test('POST /api/codex-reset: errors are not kept (a retry runs omp again); a kil
   await c.home();
   assert.equal(c.toolCalls('usage --json').length, before + 1);
 }, { resetTimeoutMs: 500 }));
+
+test('after a reset the quota waits for the new listing; a listing that is late or fails marks the accounts stale, briefly cached', () => homeApp(async (c) => {
+  const body = { accountId: 'openai-codex/4', requestId: '0f8f7a6e-1111-4222-8333-000000000099' };
+  assert.equal((await c.home()).accounts[3].resets.available, 1);
+  const spent = JSON.parse(fs.readFileSync(FIX('omp-reset-list.json'), 'utf8'));
+  for (const a of spent.accounts) if (a.provider === 'openai-codex') { a.redeemableCount = 0; a.availableCount = 0; }
+  // the listing after the reset is slower than homeWait / 2 (and than homeWait) but within the post-reset wait
+  c.setRules([['usage reset --json', { stdout: JSON.stringify(spent), delay: 700 }], ...baseRules()]);
+  assert.equal((await c.reset(body)).json.result, 'reset');
+  let cx = (await c.home()).accounts[3];
+  assert.deepEqual([cx.resets.available, cx.stale], [1, true]); // not ready within homeWait: the old count, marked stale
+  cx = (await c.homeUntil((h) => !h.accounts[3].stale)).accounts[3];
+  assert.equal(cx.resets.available, 0); // the refresh waited for the new listing: its count, not the old one
+  // the listing fails after a reset: the old count is shown marked stale and read again within 15 s, not kept 60 s
+  c.setRules([['usage reset --json', { code: 1, stderr: 'down' }], ['usage reset openai-codex/4', { stdout: RESET_OK }], ...baseRules()]);
+  assert.equal((await c.reset({ ...body, requestId: `${body.requestId}-2` })).json.result, 'reset');
+  cx = (await c.home()).accounts[3];
+  assert.equal(cx.stale, true);
+  const reads = c.toolCalls('usage --json').length;
+  c.clock.t += 16e3;
+  c.setRules([['usage reset --json', { stdout: JSON.stringify(spent) }], ...baseRules()]);
+  await c.home(); // the short-lived stale value has expired: served once more while the refresh runs
+  await waitFor(() => c.toolCalls('usage --json').length > reads);
+  c.clock.t += 61e3; // the listing's retry delay after its failure is over
+  cx = (await c.homeUntil((h) => !h.accounts[3].stale && h.accounts[3].resets.available === 0)).accounts[3];
+  assert.deepEqual([cx.resets.available, cx.stale], [0, false]);
+}, { homeWaitMs: 400, listAfterResetMs: 4000 }));
+
+test('box timer: kept across a server restart within 90 s of the last tick (box-timer.json), a new run after a longer gap', async () => {
+  const clock = { t: T0 };
+  const a = await boot({ now: () => clock.t });
+  const sleeps = async (c) => { const { cookie } = await c.login(); return (await c.req('GET', '/api/home', { cookie })).json.box.sleepsAt; };
+  try {
+    clock.t += 30e3; a.app.tickBox();
+    clock.t += 30e3; a.app.tickBox(); // an hour into the run, ticking regularly
+    const before = await sleeps(a);
+    assert.equal(before, new Date(T0 + 480 * 60e3).toISOString());
+    const stored = JSON.parse(fs.readFileSync(path.join(a.configDir, 'box-timer.json'), 'utf8'));
+    assert.deepEqual(stored, { resume: T0, tick: T0 + 60e3 });
+    if (process.platform !== 'win32') assert.equal(fs.statSync(path.join(a.configDir, 'box-timer.json')).mode & 0o777, 0o600);
+    await a.app.close(); // the config dir (and box-timer.json) stays
+    clock.t += 45e3; // restarted 45 s after the last tick (reinstall, crash, systemctl restart)
+    const b = await boot({ now: () => clock.t, configDir: a.configDir });
+    try { assert.equal(await sleeps(b), before); } finally { await b.close(); }
+    clock.t += 91e3; // stopped longer than 90 s (b ticked once at its start): the box slept, a new run
+    const c = await boot({ now: () => clock.t, configDir: a.configDir });
+    try { assert.equal(await sleeps(c), new Date(clock.t + 480 * 60e3).toISOString()); } finally { await c.close(); }
+    fs.writeFileSync(path.join(a.configDir, 'box-timer.json'), 'not json');
+    clock.t += 1e3;
+    const d = await boot({ now: () => clock.t, configDir: a.configDir });
+    try { assert.equal(await sleeps(d), new Date(clock.t + 480 * 60e3).toISOString()); } finally { await d.close(); }
+  } finally { await a.close(); }
+});
 
 test('POST /api/codex-reset: a slow reset is answered 202 pending; it finishes in the background and clears the quota cache', () => homeApp(async (c) => {
   const body = { accountId: 'openai-codex/4', requestId: '0f8f7a6e-1111-4222-8333-000000000088' };
