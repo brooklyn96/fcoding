@@ -25,6 +25,8 @@ const MAX_WAITING = 20; // mutation jobs waiting behind the active one
 const MAX_READS = 7; // 8 tmux children in all: one slot is reserved for the active mutation
 const DRAIN_TIMEOUT = 30000;
 const HARNESS_CHECK_MS = 400; // after create: is the harness still running?
+const ADMIN_JOB_MS = 20000; // admin.sock: how long a request may take once it is read (fcode-new waits for a session to start)
+const FCODE_NEW_HARNESSES = ['omp', 'claude', 'codex']; // what fcode-new offers (not the plain shell)
 const RUNNING_MS = 8000; // overview: activity this recent = running
 const GIT_CACHE_MS = 10000; // overview: git results per project
 const NOT_FOUND_RE = /can't find|no such session|no server running|no sessions|error connecting to|no current/i;
@@ -219,9 +221,11 @@ export function adminRequest(configDir, req, timeoutMs = 5000) {
     const s = net.connect(adminPath(configDir));
     let buf = '';
     const t = setTimeout(() => { s.destroy(); reject(new Error('admin socket timeout')); }, timeoutMs);
-    s.on('connect', () => s.end(`${JSON.stringify(req)}\n`));
-    s.on('data', (d) => { buf += d; });
-    s.on('end', () => { clearTimeout(t); try { resolve(JSON.parse(buf)); } catch { reject(new Error('bad admin reply')); } });
+    // no half-close after the request (a named pipe on Windows would drop the reply of a slow command): the reply is one line
+    const done = () => { clearTimeout(t); s.destroy(); try { resolve(JSON.parse(buf)); } catch { reject(new Error('bad admin reply')); } };
+    s.on('connect', () => s.write(`${JSON.stringify(req)}\n`));
+    s.on('data', (d) => { buf += d; if (buf.includes('\n')) done(); });
+    s.on('end', done);
     s.on('error', (e) => {
       clearTimeout(t);
       reject(['ENOENT', 'ECONNREFUSED'].includes(e.code) ? Object.assign(new Error('the fcoding server is not running'), { code: 'ENOSERVER' }) : e);
@@ -285,7 +289,7 @@ export function pairPage(appLink) {
 }
 
 // ---------- home screen v2 (CONTRACT.md A8): quota, spend, box timer, projects, updates, Codex reset ----------
-const QUOTA_TTL = 60e3, LISTING_TTL = 300e3, SPEND_TTL = 300e3, PROJECTS_TTL = 120e3;
+const QUOTA_TTL = 60e3, LISTING_TTL = 300e3, SPEND_TTL = 300e3, PROJECTS_TTL = 120e3, RUN_WINDOW = 100; // RUN_WINDOW: Actions runs read per project (deploy line and PR checks)
 const LIST_AFTER_RESET_MS = 10e3, STALE_QUOTA_TTL = 15e3; // omp's own listing timeout is 10 s
 const HOME_WAIT_MS = 8000; // a part with no value yet is waited for this long at most, then it is empty and fills in the background
 const QUOTA_STALE_MS = 10 * 60e3; // a report omp fetched longer ago than this is stale
@@ -600,13 +604,35 @@ export function checksOf(rollup) {
   }
   return pending ? 'pending' : 'success';
 }
-export const prsOf = (list) => list.map((p) => ({ number: p.number, title: clip(cleanLine(String(p.title ?? ''))), checks: checksOf(p.statusCheckRollup),
+// a workflow is told apart by its id (a run's workflowDatabaseId, a workflow list's id): two files can share a name; without an id, by name
+const wfKey = (r) => String(r?.workflowDatabaseId ?? r?.id ?? str(r?.workflowName) ?? str(r?.name) ?? '');
+// checks of one PR head from Actions runs (gh run list --json workflowDatabaseId,workflowName,name,status,conclusion,headSha, newest first):
+// the latest run per workflow through the same pass/fail/pending rules as the rollup; null when the runs could not be read
+export function checksOfRuns(runs, sha) {
+  if (!Array.isArray(runs)) return null;
+  const latest = new Map();
+  for (const r of runs) {
+    const wf = wfKey(r);
+    if (sha && r?.headSha === sha && !latest.has(wf)) latest.set(wf, { status: String(r.status ?? '').toUpperCase(), conclusion: String(r.conclusion ?? '').toUpperCase() });
+  }
+  return checksOf([...latest.values()]);
+}
+// runs: Actions runs, the checks of a PR whose statusCheckRollup is unreadable (a token without Checks access)
+export const prsOf = (list, runs = null) => list.map((p) => ({ number: p.number, title: clip(cleanLine(String(p.title ?? ''))), checks: checksOf(p.statusCheckRollup) ?? checksOfRuns(runs, p.headRefOid),
   mergeable: p.mergeable === 'MERGEABLE' ? true : p.mergeable === 'CONFLICTING' ? false : null }));
 export function runOf(list) {
   const r = Array.isArray(list) ? list[0] : null;
   if (!r || typeof r !== 'object') return null;
   const status = r.status !== 'completed' ? 'in_progress' : ['success', 'neutral', 'skipped'].includes(r.conclusion) ? 'success' : 'failure';
   return { workflow: str(r.workflowName) ?? str(r.name), status, at: str(r.createdAt), url: str(r.url) };
+}
+// the workflows whose name or file path contains "deploy" (gh workflow list --all --json id,name,path)
+export const deployWorkflows = (workflows) => (Array.isArray(workflows) ? workflows : []).filter((w) => /deploy/i.test(`${w?.name} ${w?.path}`));
+// the newest run of a deploy workflow (the same, by id); PR gates and CI are never it
+export function deployRunOf(runs, workflows) {
+  if (!Array.isArray(runs)) return null;
+  const ids = new Set(deployWorkflows(workflows).map(wfKey));
+  return runOf(runs.filter((r) => { const n = str(r?.workflowName) ?? str(r?.name); return n && (/deploy/i.test(n) || ids.has(wfKey(r))); }));
 }
 // status.json of the box updater: the harness tools only (omp, claude, codex); a result outside updated|current|failed is null
 const UPDATE_RESULTS = ['updated', 'current', 'failed'];
@@ -786,9 +812,10 @@ export function createApp(opts = {}) {
   }
   const keyOf = (token) => crypto.createHmac('sha256', cfg.secret).update(token).digest('hex');
   // ctx = {cancelled, device, gen}: the request is alive, its device still paired, the config generation unchanged
+  // ctx.admin (the local admin socket, no device): the same checks without the device
   function valid(ctx) {
     refreshConfig();
-    return !ctx.cancelled && ctx.gen === gen && !purgePending && !!ctx.device && devices.has(ctx.device);
+    return !ctx.cancelled && ctx.gen === gen && !purgePending && (ctx.admin || (!!ctx.device && devices.has(ctx.device)));
   }
   const gateErr = (ctx) => (ctx.cancelled ? new HttpErr(499, 'cancelled') : new HttpErr(401, 'unauthorized'));
 
@@ -847,10 +874,10 @@ export function createApp(opts = {}) {
     const o = cfg.publicOrigin;
     return o ? { appLink: `fcode://pair?server=${encodeURIComponent(o)}`, shareLink: `${o}/pair` } : null;
   }
-  function admin(req) { // an exception must never leave the socket callback: it would take the server down
-    try { return adminCmd(req); } catch (e) { log(`admin request failed: ${e.code || e.name}`); return { ok: false, error: 'internal' }; }
+  async function admin(req, ctx) { // an exception must never leave the socket callback: it would take the server down
+    try { return await adminCmd(req, ctx); } catch (e) { log(`admin request failed: ${e.code || e.name}`); return { ok: false, error: 'internal' }; }
   }
-  function adminCmd(req) {
+  async function adminCmd(req, ctx) {
     refreshConfig(true); // a rotation or a pending purge is handled before any answer
     if (req?.cmd === 'pair') {
       if (req.links && cfg.publicUrl && !cfg.publicOrigin) return { ok: false, error: 'public_url_invalid' }; // no code is made for a QR that cannot work
@@ -863,6 +890,14 @@ export function createApp(opts = {}) {
       if (req.id !== 'all' && !devices.has(req.id)) return { ok: false, error: 'no such device' };
       try { revoke(ids, req.id === 'all'); } catch (e) { return { ok: false, error: `storage: ${e.code || 'write failed'}` }; }
       return { ok: true, revoked: ids.length };
+    }
+    if (req?.cmd === 'meta') return { ok: true, projects: cfg.projectNames, harnesses: FCODE_NEW_HARNESSES };
+    if (req?.cmd === 'new') { // fcode-new: the same new session as the app's "+" (openFresh), without a paired device
+      if (!validProject(req.project)) return { ok: false, error: 'unknown_project' };
+      if (!FCODE_NEW_HARNESSES.includes(req.harness)) return { ok: false, error: 'unknown_harness' };
+      ctx.gen = gen; // after refreshConfig above: a rotation just handled is not a stale generation
+      try { return { ok: true, name: await openFresh(req.project, req.harness, ctx) }; }
+      catch (e) { return { ok: false, error: e instanceof HttpErr ? e.code : 'internal' }; }
     }
     return { ok: false, error: 'unknown command' };
   }
@@ -877,8 +912,13 @@ export function createApp(opts = {}) {
       const i = buf.indexOf('\n');
       if (i < 0) return;
       done = true;
+      sock.setTimeout(ADMIN_JOB_MS); // a new session waits for the mutation queue and the harness check
       let req; try { req = JSON.parse(buf.slice(0, i)); } catch { req = null; }
-      sock.end(`${JSON.stringify(admin(req))}\n`);
+      // the client gone (timeout, Ctrl+C) before the reply: a queued new session is dropped, as for an HTTP request that closes
+      const ctx = { cancelled: false, device: null, gen: -1, admin: true };
+      let replied = false; // not sock.writableFinished: a peer that left has already ended our side too
+      sock.on('close', () => { if (!replied) { ctx.cancelled = true; ctx.onCancel?.(); } });
+      admin(req, ctx).then((r) => { replied = true; sock.end(`${JSON.stringify(r)}\n`); });
     });
   });
   const adminFile = adminPath(configDir);
@@ -1081,6 +1121,21 @@ export function createApp(opts = {}) {
     return base.slice(0, 32 - suffix.length).replace(/-+$/, '') + suffix;
   };
 
+  // always a new session (the app's "+", fcode-new): the name is picked and created in the same mutation job
+  async function openFresh(project, harness, ctx) {
+    const name = openName(project, harness);
+    if (!NAME_RE.test(name)) throw new HttpErr(400, 'invalid');
+    return mutate(ctx, async () => {
+      const taken = new Set((await listSessions(ctx)).map((x) => x.name));
+      for (let n = 1; n <= 1000; n++) {
+        const cand = freshName(name, n);
+        if (taken.has(cand)) continue;
+        try { await createSession(cand, project, harness, ctx); return cand; } catch (e) { if (e.code !== 'exists') throw e; } // created outside us meanwhile
+      }
+      throw new HttpErr(409, 'exists');
+    });
+  }
+
   // runs inside a mutation job; every step re-checks through run(ctx)
   async function sendText(name, text, enter, ctx) {
     text = text.replace(/\r\n?/g, '\n');
@@ -1141,16 +1196,22 @@ export function createApp(opts = {}) {
     out.branch = br ? clip(cleanLine(br)) || null : null;
     out.repo = repoOf(url); // the remote URL itself (it may hold credentials) never leaves this function
     if (!out.repo) return out;
+    const runList = (limit, ...a) => gh('run', 'list', '--limit', String(limit), '--json', 'workflowDatabaseId,workflowName,name,status,conclusion,createdAt,url,headSha', ...a);
     const prList = (fields) => gh('pr', 'list', '--state', 'open', '--limit', '20', '--json', fields);
-    const [prs, runs] = await Promise.all([
-      // a token without checks access fails the whole query with statusCheckRollup: then the list without checks (checks null)
-      // (a GraphQL "not accessible" error); a timeout or any other failure is not retried
-      ghRaw('pr', 'list', '--state', 'open', '--limit', '20', '--json', 'number,title,mergeable,statusCheckRollup')
-        .catch((e) => (!e.killed && /not accessible|permission|scope/i.test(e.stderr ?? '') ? prList('number,title,mergeable') : null)),
-      gh('run', 'list', '--limit', '1', '--json', 'workflowName,name,status,conclusion,createdAt,url'),
+    const [prs, runs, workflows] = await Promise.all([
+      // a token without checks access fails the whole query with statusCheckRollup (a GraphQL "not accessible" error or an HTTP 403):
+      // then the list without it, and the checks come from the Actions runs of each head SHA; a timeout or any other failure is not retried
+      ghRaw('pr', 'list', '--state', 'open', '--limit', '20', '--json', 'number,title,mergeable,headRefOid,statusCheckRollup')
+        .catch((e) => (!e.killed && !/rate limit/i.test(e.stderr ?? '') && /not accessible|permission|scope|403|forbidden/i.test(e.stderr ?? '') ? prList('number,title,mergeable,headRefOid') : null)),
+      runList(RUN_WINDOW), // one list: the deploy line and the PR checks
+      gh('workflow', 'list', '--all', '--json', 'id,name,path'), // a deploy workflow is also known by its file path (--all: a disabled one too)
     ]);
-    out.prs = Array.isArray(prs) ? prsOf(prs) : null;
-    out.lastRun = runOf(runs);
+    out.prs = Array.isArray(prs) ? prsOf(prs, runs) : null;
+    out.lastRun = deployRunOf(runs, workflows);
+    if (!out.lastRun && Array.isArray(runs) && runs.length >= RUN_WINDOW) { // window full: a deploy run may be older than all of it
+      const old = await Promise.all(deployWorkflows(workflows).filter((w) => w.id != null).map((w) => runList(1, '--workflow', String(w.id))));
+      out.lastRun = runOf(old.flat().filter(Boolean).sort((a, b) => (a.createdAt < b.createdAt) - (a.createdAt > b.createdAt)));
+    }
     return out;
   }
   const projects = memo(PROJECTS_TTL, () => Promise.all(cfg.projectNames.map(projectInfo)), now);
@@ -1430,18 +1491,7 @@ export function createApp(opts = {}) {
       if (!validProject(project) || !validHarness(harness) || (fresh !== undefined && typeof fresh !== 'boolean')) throw new HttpErr(400, 'invalid');
       const name = openName(project, harness);
       if (!NAME_RE.test(name)) throw new HttpErr(400, 'invalid');
-      if (fresh) { // A5 update 4: always a new session; the name is picked and created in the same job
-        const picked = await mutate(ctx, async () => {
-          const taken = new Set((await listSessions(ctx)).map((x) => x.name));
-          for (let n = 1; n <= 1000; n++) {
-            const cand = freshName(name, n);
-            if (taken.has(cand)) continue;
-            try { await createSession(cand, project, harness, ctx); return cand; } catch (e) { if (e.code !== 'exists') throw e; } // created outside us meanwhile
-          }
-          throw new HttpErr(409, 'exists');
-        });
-        return json(res, 200, { name: picked, created: true });
-      }
+      if (fresh) return json(res, 200, { name: await openFresh(project, harness, ctx), created: true }); // A5 update 4: always a new session
       const created = await mutate(ctx, async () => { // check-then-create in one job
         try { await createSession(name, project, harness, ctx); return true; } catch (e) {
           if (e.code !== 'exists') throw e;
@@ -1578,8 +1628,33 @@ function printQr(r) {
   const bar = '='.repeat(32);
   console.log(`\n${bar}\n  MÃ GHÉP:   ${[...r.code].join('   ')}\n${bar}\nMã hết hạn sau ${Math.round(r.expiresIn / 60)} phút.`);
 }
+// fcode-new (--new <args>): --projects | --harnesses | <project> <harness>. Over admin.sock, so the session is made by the running server
+// exactly as the app's "+" makes it. stdout: the list or the new session name only; any error: Vietnamese on stderr, nothing on stdout, exit 1.
+const NEW_ERRORS = {
+  unknown_project: 'Không có dự án này. Xem danh sách: fcode-new --projects',
+  unknown_harness: 'Không có harness này. Xem danh sách: fcode-new --harnesses',
+  harness_exited: 'Harness thoát ngay sau khi khởi động, chưa có phiên nào.',
+  busy: 'Server đang bận, thử lại sau ít giây.',
+  cancelled: 'Lệnh đã bị huỷ, chưa có phiên nào.',
+  'unknown command': 'Server FCode trên box là bản cũ: chạy lại bash install.sh.',
+};
+async function newCli(dir, args) {
+  const fail = (msg) => { console.error(msg); process.exit(1); };
+  const meta = args.length === 1 && ['--projects', '--harnesses'].includes(args[0]);
+  if (!meta && args.length !== 2) fail('Cách dùng: fcode-new --projects | fcode-new --harnesses | fcode-new <dự án> <harness>');
+  let r;
+  try { r = await adminRequest(dir, meta ? { cmd: 'meta' } : { cmd: 'new', project: args[0], harness: args[1] }, 20000); }
+  catch (e) {
+    fail(e.code === 'ENOSERVER' ? 'Server FCode chưa chạy trên box.'
+      : e.message === 'admin socket timeout' ? 'Server FCode không trả lời kịp. Thử lại sau ít giây; nếu vẫn vậy, chạy lại bash install.sh trên box.'
+        : 'Không nói chuyện được với server FCode. Thử lại; nếu vẫn lỗi, chạy lại bash install.sh trên box.');
+  }
+  if (!r.ok) fail(NEW_ERRORS[r.error] ?? 'Không tạo được phiên. Thử lại sau ít giây.');
+  for (const line of meta ? (args[0] === '--projects' ? r.projects : r.harnesses) : [r.name]) console.log(line);
+}
 async function main() {
   const dir = defaultConfigDir();
+  if (process.argv[2] === '--new') return newCli(dir, process.argv.slice(3)); // the wrapper puts it first; "fcode-pair --new" is a pairing name
   const arg = (f) => { const i = process.argv.indexOf(f); return i < 0 ? undefined : process.argv[i + 1] ?? ''; };
   const qr = process.argv.includes('--qr');
   const req = process.argv.includes('--pair') ? { cmd: 'pair', name: arg('--pair') === '--qr' ? '' : arg('--pair'), ...(qr && { links: true }) }

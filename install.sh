@@ -55,6 +55,14 @@ exec env PC_CONFIG_DIR="$CFG" "$(command -v node)" "$APP/server.mjs" --pair "\$n
 WRAP
 chmod 755 "$HOME/.local/bin/fcode-pair"
 
+# fcode-new --projects | --harnesses | <project> <harness>: a new session made by the running server, the same as the app's "+";
+# prints only the tmux session name (the laptop's fcode command calls this over ssh)
+cat > "$HOME/.local/bin/fcode-new" <<WRAP
+#!/bin/sh
+exec env PC_CONFIG_DIR="$CFG" "$(command -v node)" "$APP/server.mjs" --new "\$@"
+WRAP
+chmod 755 "$HOME/.local/bin/fcode-new"
+
 # box auto-update (omp, claude, codex timer): idempotent, runs as this user; a failure (e.g. no passwordless sudo) must not abort the install
 if [ -f "$SRC/box/install-autoupdate.sh" ]; then
   bash "$SRC/box/install-autoupdate.sh" || echo "warning: box auto-update was not installed (see box/README.md)" >&2
@@ -108,6 +116,7 @@ Pair a phone (no password): run on the box
   fcode-pair "iPhone"
 and type the 6-digit code into the app within 120 s. One code per issuer (the command, each paired phone), 3 at most; running it again replaces the command's own code.
   fcode-pair "iPhone" --qr     (also prints a QR of the server address and the code in big digits; needs "publicUrl" in config.json, and qrencode for the QR)
+New session:      fcode-new <project> <harness>     (fcode-new --projects, fcode-new --harnesses; prints the session name)
 Paired devices:   PC_CONFIG_DIR=$CFG node $APP/server.mjs --devices
 Revoke a device:  PC_CONFIG_DIR=$CFG node $APP/server.mjs --revoke <id>     (or --revoke all)
 Projects: edit $CFG/config.json ("projects": {"name": "/abs/dir"}); the server reloads it by itself.
