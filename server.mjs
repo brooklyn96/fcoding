@@ -6,7 +6,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFile, execFileSync } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 export const HARNESSES = { omp: 'omp', claude: 'claude', codex: 'codex', shell: 'bash -l' };
@@ -676,17 +676,39 @@ export function resetReply(text) {
   const [, result, msg] = RESET_RULES.find(([re]) => re.test(t)) ?? [null, 'error', 'error'];
   return { result, message: RESET_MSG[msg] };
 }
+// the environment of the tools the server runs (omp, gh, git, fcode-git-sync): ~/.local/bin and ~/.bun/bin first on PATH
+const toolEnv = () => ({ ...process.env, LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', NO_COLOR: '1', GH_PROMPT_DISABLED: '1', GIT_OPTIONAL_LOCKS: '0',
+  PATH: `${home}/.local/bin:${home}/.bun/bin:${process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'}` });
 // a child with a timeout, never a shell; rejects with stdout/stderr attached
 function execTool(spec, args, timeout) {
   return new Promise((resolve, reject) => {
     const [cmd, ...pre] = spec;
-    execFile(cmd, [...pre, ...args], {
-      encoding: 'utf8', timeout, maxBuffer: 32 << 20, windowsHide: true,
-      env: { ...process.env, LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', NO_COLOR: '1', GH_PROMPT_DISABLED: '1', GIT_OPTIONAL_LOCKS: '0',
-        PATH: `${home}/.local/bin:${home}/.bun/bin:${process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'}` },
-    }, (err, stdout, stderr) => (err ? reject(Object.assign(err, { stdout, stderr })) : resolve(stdout)));
+    execFile(cmd, [...pre, ...args], { encoding: 'utf8', timeout, maxBuffer: 32 << 20, windowsHide: true, env: toolEnv() },
+      (err, stdout, stderr) => (err ? reject(Object.assign(err, { stdout, stderr })) : resolve(stdout)));
   });
 }
+// git-sync.json of the box timer (fcode-git-sync) -> Map project name -> the `git` object of GET /api/home. A missing, unreadable or
+// broken file, or a project it does not list, is NO_GIT (every field null); a field of the wrong type is null on its own.
+const NO_GIT = Object.freeze({ behind: null, ahead: null, dirty: null, branch: null, syncedAt: null, error: null });
+const textOf = (v) => { const t = str(v); return t ? clip(cleanLine(t)) || null : null; };
+const count = (v) => (Number.isInteger(v) && v >= 0 ? v : null);
+const isoOf = (v) => (typeof v === 'string' ? iso(Date.parse(v)) : null);
+export function parseGitSync(text) {
+  const out = new Map();
+  let projects;
+  try { projects = JSON.parse(text)?.projects; } catch { return out; }
+  if (!projects || typeof projects !== 'object' || Array.isArray(projects)) return out;
+  for (const [name, v] of Object.entries(projects)) {
+    if (!v || typeof v !== 'object') continue;
+    out.set(name, {
+      behind: count(v.behindDefault), ahead: count(v.aheadOfOrigin),
+      dirty: typeof v.dirty === 'boolean' ? v.dirty : null,
+      branch: textOf(v.branch), syncedAt: isoOf(v.lastFetchAt), error: textOf(v.error),
+    });
+  }
+  return out;
+}
+const GIT_SYNC_MS = 8e3; // openFresh: how long fcode-git-sync may take before the new session is made anyway (fcode-new and the app wait 20 s in all)
 // Stale-while-revalidate, one refresh at a time. get(wait): a value younger than ttl as is; an older one at once while a refresh
 // runs in the background. With no value yet, or after clear(), the refresh is waited for at most `wait` ms; then the old value
 // (fresh: false) or, with none, a throw, and the refresh carries on. fresh is false while the last refresh failed. A failed
@@ -751,6 +773,8 @@ export function createApp(opts = {}) {
     codex: ['sessions', 'archived_sessions'].map((d) => path.join(process.env.CODEX_HOME || path.join(home, '.codex'), d)),
   };
   const updatesFile = opts.updatesFile ?? path.join(home, '.local', 'state', 'fcode-update', 'status.json');
+  const gitSyncFile = opts.gitSyncFile ?? path.join(home, '.local', 'state', 'fcode', 'git-sync.json');
+  const gitSyncMs = opts.gitSyncMs ?? GIT_SYNC_MS;
 
   secureConfigDir(configDir);
 
@@ -1121,10 +1145,57 @@ export function createApp(opts = {}) {
     return base.slice(0, 32 - suffix.length).replace(/-+$/, '') + suffix;
   };
 
+  // `fcode-git-sync <project>` before a new session, so it starts on the newest code when a fast-forward is safe. Never blocks the open
+  // and is NEVER killed (a kill during `git merge --ff-only` can leave a half-updated tree): an open waits for it at most gitSyncMs, or
+  // until the open is cancelled, then goes on; the child keeps running, detached and unref'd with its output ignored, and ends by its
+  // own limits. One sync per project at a time: an open that arrives meanwhile joins it instead of starting another. A missing
+  // command or a failure only log one line. ctx.onCancel is free until mutate takes it.
+  const syncs = new Map(); // project -> {done, warned} while its fcode-git-sync runs
+  function startSync(project, spec) {
+    let over = false, finish;
+    const s = { warned: false, done: new Promise((r) => { finish = r; }) };
+    const end = (why) => {
+      if (over) return;
+      over = true;
+      if (syncs.get(project) === s) syncs.delete(project);
+      if (why) log(`git-sync ${project}: ${why}`);
+      finish();
+    };
+    try {
+      const [cmd, ...pre] = spec;
+      const child = spawn(cmd, [...pre, project], { stdio: 'ignore', detached: true, windowsHide: true, env: toolEnv() });
+      child.on('error', (e) => end(e.code === 'ENOENT' ? 'command not found' : 'cannot start'));
+      child.on('exit', (code, sig) => end(code === 0 ? '' : `exit ${code ?? sig}`));
+      child.unref();
+    } catch { end('cannot start'); }
+    return s;
+  }
+  function gitSync(project, ctx) {
+    const spec = opts.gitSync === undefined ? ['fcode-git-sync'] : opts.gitSync; // null: none; else resolved on toolEnv()'s PATH (~/.local/bin first)
+    if (!spec) return Promise.resolve();
+    let s = syncs.get(project);
+    if (!s) syncs.set(project, s = startSync(project, spec));
+    return new Promise((resolve) => {
+      let left = false, timer;
+      const leave = (why) => {
+        if (left) return;
+        left = true; clearTimeout(timer);
+        if (ctx.onCancel === cancel) ctx.onCancel = undefined;
+        if (why && !s.warned) { s.warned = true; log(`git-sync ${project}: ${why}`); } // once per sync, not per waiting open
+        resolve();
+      };
+      const cancel = () => leave();
+      ctx.onCancel = cancel;
+      timer = setTimeout(leave, gitSyncMs, `not finished after ${gitSyncMs / 1000} s, opening anyway`);
+      s.done.then(() => leave());
+    });
+  }
   // always a new session (the app's "+", fcode-new): the name is picked and created in the same mutation job
   async function openFresh(project, harness, ctx) {
     const name = openName(project, harness);
     if (!NAME_RE.test(name)) throw new HttpErr(400, 'invalid');
+    if (!valid(ctx)) throw gateErr(ctx);
+    await gitSync(project, ctx); // outside the mutation job: it does not hold up other creates
     return mutate(ctx, async () => {
       const taken = new Set((await listSessions(ctx)).map((x) => x.name));
       for (let n = 1; n <= 1000; n++) {
@@ -1252,12 +1323,15 @@ export function createApp(opts = {}) {
     const view = s.status === 'fulfilled' ? spendView(s.value.value, accounts, qv?.value.byAccountId ?? new Map(), t, cfg.timeZone) : null;
     let updates = {};
     try { updates = parseUpdates(fs.readFileSync(updatesFile, 'utf8')); } catch {}
+    let gits = new Map(); // read once per home reply; the projects part is cached, this is not
+    try { gits = parseGitSync(fs.readFileSync(gitSyncFile, 'utf8')); } catch {}
+    const withGit = (list) => list.map((x) => ({ ...x, git: gits.get(x.name) ?? NO_GIT }));
     return {
       generatedAt: iso(t), box: boxInfo(),
       accounts: accounts.map((a) => ({ ...a, spend: view?.perAccount.get(a.id) ?? null })),
       totals: view?.totals ?? { spend: null, byHarness: [] },
       // not read yet (first request, slow gh): each project with nothing known and loading: true (a gh failure has no loading)
-      projects: p.status === 'fulfilled' ? p.value.value : cfg.projectNames.map((name) => ({ name, repo: null, branch: null, prs: null, lastRun: null, loading: true })),
+      projects: withGit(p.status === 'fulfilled' ? p.value.value : cfg.projectNames.map((name) => ({ name, repo: null, branch: null, prs: null, lastRun: null, loading: true }))),
       updates,
     };
   }

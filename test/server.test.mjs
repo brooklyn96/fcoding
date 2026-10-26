@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import { createApp, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, strictOrigin, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock,
-  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, parseUpdates, resetReply, RESET_MSG, BOX, memo, codexChildMeta } from '../server.mjs';
+  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, parseUpdates, resetReply, RESET_MSG, BOX, memo, codexChildMeta, parseGitSync } from '../server.mjs';
 
 process.env.TZ = 'America/Los_Angeles'; // spend days follow config.json timeZone, never the process zone: a third zone proves it
 
@@ -34,7 +34,7 @@ async function boot(opts = {}) {
   const logs = [];
   // home v2 sources default to nothing real: no scan of this machine's logs, no omp/gh on PATH
   const app = createApp({ configDir, tmux: [process.execPath, FAKE], log: (l) => logs.push(l), pollMs: 40, pasteEnterDelayMs: 0,
-    spendRoots: {}, updatesFile: path.join(root, 'no-status.json'), omp: [process.execPath, '-e', 'process.exit(1)'], gh: [process.execPath, '-e', 'process.exit(1)'], ...opts });
+    spendRoots: {}, updatesFile: path.join(root, 'no-status.json'), gitSync: null, gitSyncFile: path.join(root, 'no-git-sync.json'), omp: [process.execPath, '-e', 'process.exit(1)'], gh: [process.execPath, '-e', 'process.exit(1)'], ...opts });
   const port = await app.listen(0, '127.0.0.1');
   const ctx = { app, port, logs, root, configDir };
   ctx.req = (method, p, o = {}) => request(port, method, p, o);
@@ -2528,6 +2528,7 @@ const FIXDIR = path.join(here, 'fixtures', 'home');
 const FIX = (f) => path.join(FIXDIR, f);
 const fixJson = (f) => JSON.parse(fs.readFileSync(FIX(f), 'utf8'));
 const GH = fixJson('gh.json');
+const GIT_NULL = { behind: null, ahead: null, dirty: null, branch: null, syncedAt: null, error: null }; // projects[].git with no git-sync.json entry
 const T0 = 1792956700000; // 2026-10-25T19:31:40Z, two minutes after the recorded omp fetch
 // one fake for omp, gh and git: logs its argv, answers by the first rule whose key is a substring of the joined argv
 const FAKE_TOOL_SRC = `import fs from 'node:fs'; import path from 'node:path';
@@ -2926,7 +2927,7 @@ test('GET /api/home: the whole shape from omp, logs, gh and status.json; box tim
   assert.deepEqual(h.totals.byHarness.map((x) => x.harness), ['claude', 'codex']);
   // the newest run is a failed PR gate: the deploy line is the newest run of the workflow whose FILE is deploy.yml ("Ship it")
   const ship = { workflow: 'Ship it', status: 'success', at: '2026-10-25T19:10:00Z', url: 'https://github.com/owner/repo/actions/runs/7' };
-  assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: 'owner/repo', branch: 'main', prs: prsOf(GH.prs), lastRun: ship })));
+  assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: 'owner/repo', branch: 'main', prs: prsOf(GH.prs), lastRun: ship, git: GIT_NULL })));
   assert.deepEqual(Object.keys(h.updates), ['omp', 'claude', 'codex']);
   assert.ok(!JSON.stringify(h).includes('github-work')); // the remote URL never leaves the server
   // box: a tick more than 90 s late is a resume; regular ticks are not
@@ -2968,7 +2969,7 @@ test('GET /api/home partial failure: omp, gh or the logs down -> that part empty
   fs.rmSync(c.roots.dirs.claude, { recursive: true }); // one log source gone
   let h = await c.homeUntil((x) => x.totals.spend && !x.projects[0].loading); // the spend scan and gh have answered
   assert.deepEqual(h.accounts, []);
-  assert.deepEqual(h.projects[0], { name: 'alpha', repo: 'owner/repo', branch: 'main', prs: null, lastRun: null });
+  assert.deepEqual(h.projects[0], { name: 'alpha', repo: 'owner/repo', branch: 'main', prs: null, lastRun: null, git: GIT_NULL });
   assert.equal(h.totals.spend.last30.usd, 0.2897); // omp + Codex logs; Claude Code logs gone
   assert.ok(h.box.sleepsAt && h.updates.omp);
   // omp back: fresh; omp down again after the TTL: the last accounts, marked stale
@@ -3056,7 +3057,7 @@ test('GET /api/home never waits long: a slow part is empty the first time, then 
   let h = await c.home();
   assert.ok(Date.now() - t0 < 1200, `took ${Date.now() - t0} ms`); // homeWaitMs 300 per part, in parallel
   assert.deepEqual(h.accounts, []); // not ready yet: empty, the rest answers (box, updates; spend if its scan was quick)
-  assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: null, branch: null, prs: null, lastRun: null, loading: true })));
+  assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: null, branch: null, prs: null, lastRun: null, loading: true, git: GIT_NULL })));
   assert.ok('spend' in h.totals && Array.isArray(h.totals.byHarness) && h.box && h.updates.omp);
   h = await c.homeUntil((x) => x.accounts.length === 4 && x.projects[0].repo && x.totals.spend);
   c.clock.t += 121e3; // both TTLs over, both tools still slow: the cached parts at once
@@ -3533,4 +3534,245 @@ test('fcode-pair "--new": a pairing name is not the fcode-new switch (only argv[
 test('fcode-new: the install.sh wrapper passes its arguments through to server.mjs --new', () => {
   const sh = fs.readFileSync(path.join(here, '..', 'install.sh'), 'utf8').replaceAll('\r\n', '\n');
   assert.match(sh, /cat > "\$HOME\/\.local\/bin\/fcode-new" <<WRAP\n#!\/bin\/sh\nexec env PC_CONFIG_DIR="\$CFG" "\$\(command -v node\)" "\$APP\/server\.mjs" --new "\\\$@"\nWRAP\nchmod 755 "\$HOME\/\.local\/bin\/fcode-new"/);
+});
+
+// ======================= v1.3.1 phase 2: git sync state in GET /api/home, fcode-git-sync before a fresh session =======================
+// projects[].git from git-sync.json (the box timer fcode-git-sync); openFresh first runs `fcode-git-sync <project>` (8 s cap)
+const logsOf = (c) => c.logs.filter((l) => !/^(GET|POST|PATCH|DELETE|PUT|HEAD) /.test(l)); // the log without the access lines
+const gitFile = () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-gsync-')); return { dir, file: path.join(dir, 'git-sync.json') }; };
+
+test('parseGitSync: field mapping; wrong types, a broken file or a non-object are null on their own, never a throw', () => {
+  const m = parseGitSync(fs.readFileSync(FIX('git-sync.json'), 'utf8'));
+  assert.deepEqual([...m.keys()], ['alpha', 'my.proj', 'odd']);
+  assert.deepEqual(m.get('alpha'), { behind: 3, ahead: 0, dirty: true, branch: 'main', syncedAt: '2026-10-25T19:29:00.000Z', error: null });
+  assert.deepEqual(m.get('my.proj'), { behind: 0, ahead: 2, dirty: false, branch: 'feature/x', syncedAt: '2026-10-25T19:00:00.000Z', error: 'fetch failed: could not resolve host' }); // behind 0 stays 0
+  // 'odd': every field of the wrong type, one by one
+  assert.deepEqual(m.get('odd'), GIT_NULL);
+  for (const bad of ['', '{', 'null', '[]', '"x"', '{"projects":null}', '{"projects":[]}', '{"projects":"x"}', '{"updatedAt":"x"}']) assert.equal(parseGitSync(bad).size, 0, bad);
+  assert.equal(parseGitSync('{"projects":{"a":null,"b":3,"c":[]}}').size, 1); // an array is an object: all null; null and numbers are skipped
+  // text fields: control and escape characters dropped, one line, at most 160 characters
+  const e = parseGitSync(JSON.stringify({ projects: { a: { error: `\u001b[31mfetch\tfailed\u001b[0m\n${'x'.repeat(300)}`, branch: '  ' } } })).get('a');
+  assert.equal(e.branch, null);
+  assert.ok(Array.from(e.error).length <= 160 && !/[\u001b\t\n]/.test(e.error) && e.error.startsWith('fetch'), e.error);
+});
+
+test('GET /api/home projects[].git: from git-sync.json; no file, a broken file or an unlisted project -> all null, no error, nothing logged', async () => {
+  const g = gitFile();
+  try {
+    await homeApp(async (c) => {
+      const gits = async () => (await c.home()).projects.map((p) => p.git);
+      assert.deepEqual(await gits(), [GIT_NULL, GIT_NULL]); // no file (the first reply: loading placeholders carry it too)
+      fs.writeFileSync(g.file, '{"projects": {broken');
+      assert.deepEqual(await gits(), [GIT_NULL, GIT_NULL]);
+      fs.writeFileSync(g.file, JSON.stringify({ updatedAt: 'x', projects: { alpha: { branch: 'main', dirty: true, behindDefault: 4, aheadOfOrigin: 1, lastFetchAt: '2026-10-25T19:29:00Z', error: null } } }));
+      assert.deepEqual(await gits(), [{ behind: 4, ahead: 1, dirty: true, branch: 'main', syncedAt: '2026-10-25T19:29:00.000Z', error: null }, GIT_NULL]); // my.proj is not in the file
+      const h = await c.warm((x) => !x.projects[0].loading); // the cached projects part carries the file's values as well, never stale ones
+      assert.equal(h.projects[0].repo, 'owner/repo');
+      assert.deepEqual(h.projects[0].git.behind, 4);
+      fs.copyFileSync(FIX('git-sync.json'), g.file); // the file changes between two replies: the next reply has it (the file is not cached)
+      assert.deepEqual((await c.home()).projects.map((p) => p.git.behind), [3, 0]);
+      fs.rmSync(g.file);
+      assert.deepEqual(await gits(), [GIT_NULL, GIT_NULL]);
+      assert.deepEqual(logsOf(c), []); // no log line for any of it
+    }, { gitSyncFile: g.file });
+  } finally { fs.rmSync(g.dir, { recursive: true, force: true }); }
+});
+
+// a fake fcode-git-sync: logs its start (and end) with the argv project, then ok (ends after 150 ms, exit 0), fail (exit 3) or hang
+function syncTool(mode) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-fsync-'));
+  const script = path.join(dir, 'sync.mjs');
+  fs.writeFileSync(script, `import fs from 'node:fs';
+const [file, mode, project] = process.argv.slice(2);
+const w = (what) => fs.appendFileSync(file, JSON.stringify({ what, project, pid: process.pid, at: Date.now() }) + '\\n');
+w('start');
+if (mode === 'fail') process.exit(3);
+if (mode === 'hang') setInterval(() => {}, 1000);
+else setTimeout(() => { w('end'); process.exit(0); }, mode === 'slow' ? 1200 : 150);
+`);
+  const log = path.join(dir, 'sync.jsonl');
+  const lines = () => { try { return fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } };
+  const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const cleanup = () => { for (const l of lines()) try { process.kill(l.pid, 'SIGKILL'); } catch {} fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); };
+  return { dir, spec: [process.execPath, script, log, mode], lines, alive, cleanup };
+}
+const sessionCalls = (c, name) => c.calls().filter((x) => x.argv[0] === 'new-session' && x.argv[3] === name);
+
+test('open fresh (app "+" and fcode-new) runs fcode-git-sync <project> first, then creates the session; a reuse open does not sync', async () => {
+  const s = syncTool('ok');
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      const r = await c.req('POST', '/api/open', { cookie, body: { project: 'my.proj', harness: 'omp', fresh: true } });
+      assert.deepEqual([r.status, r.json], [200, { name: 'my-proj-omp', created: true }]);
+      let l = s.lines();
+      assert.deepEqual(l.map((x) => [x.what, x.project]), [['start', 'my.proj'], ['end', 'my.proj']]); // the project name is the only argument
+      const made = sessionCalls(c, 'my-proj-omp');
+      assert.equal(made.length, 1);
+      assert.ok(made[0].t0 >= l[1].at, `sync ended ${l[1].at}, session created ${made[0].t0}`); // sync first, then new-session
+      // the admin command (fcode-new) too
+      assert.deepEqual(await adminRequest(c.configDir, { cmd: 'new', project: 'alpha', harness: 'claude' }), { ok: true, name: 'alpha-claude' });
+      l = s.lines();
+      assert.deepEqual(l.slice(2).map((x) => [x.what, x.project]), [['start', 'alpha'], ['end', 'alpha']]);
+      assert.ok(sessionCalls(c, 'alpha-claude')[0].t0 >= l[3].at);
+      // an open that reuses a session is not a fresh open: no sync
+      assert.equal((await c.req('POST', '/api/open', { cookie, body: { project: 'alpha', harness: 'codex' } })).json.created, true);
+      assert.equal(s.lines().length, 4);
+      // rejected before anything runs: no sync
+      assert.equal((await c.req('POST', '/api/open', { cookie, body: { project: 'nope', harness: 'omp', fresh: true } })).status, 400);
+      assert.equal((await adminRequest(c.configDir, { cmd: 'new', project: 'nope', harness: 'omp' })).ok, false);
+      assert.equal(s.lines().length, 4);
+      assert.deepEqual(logsOf(c), []); // a good sync logs nothing
+    }, { gitSync: s.spec });
+  } finally { s.cleanup(); }
+});
+
+test('open fresh: a failing or missing fcode-git-sync never blocks the open; one log line, the session is created', async () => {
+  const s = syncTool('fail');
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      const r = await c.req('POST', '/api/open', { cookie, body: { project: 'alpha', harness: 'omp', fresh: true } });
+      assert.deepEqual([r.status, r.json.name], [200, 'alpha-omp']);
+      assert.deepEqual(logsOf(c), ['git-sync alpha: exit 3']);
+      assert.equal(sessionCalls(c, 'alpha-omp').length, 1);
+    }, { gitSync: s.spec });
+  } finally { s.cleanup(); }
+  await withApp(async (c) => { // the command does not exist (not installed, not on PATH)
+    const { cookie } = await c.login();
+    const r = await c.req('POST', '/api/open', { cookie, body: { project: 'alpha', harness: 'omp', fresh: true } });
+    assert.deepEqual([r.status, r.json.name], [200, 'alpha-omp']);
+    assert.deepEqual(logsOf(c), ['git-sync alpha: command not found']);
+    assert.equal((await newCli(c, 'alpha', 'omp')).stdout, 'alpha-omp-2\n'); // fcode-new has the same path (the CLI runs the same server code)
+  }, { gitSync: [path.join(os.tmpdir(), 'pc-no-such-dir', 'fcode-git-sync')] });
+});
+
+test('open fresh: a sync that hangs does not hold the open past the cap; the session is created and the sync is left running', async () => {
+  const s = syncTool('hang');
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      const t0 = Date.now();
+      const r = await c.req('POST', '/api/open', { cookie, body: { project: 'alpha', harness: 'omp', fresh: true } });
+      const took = Date.now() - t0;
+      assert.deepEqual([r.status, r.json.name], [200, 'alpha-omp']);
+      assert.ok(took >= 380 && took < 4000, `took ${took} ms`); // the cap is 400 ms here
+      assert.deepEqual(logsOf(c), ['git-sync alpha: not finished after 0.4 s, opening anyway']);
+      await sleep(500);
+      assert.ok(s.alive(s.lines()[0].pid), 'the server killed the sync'); // never killed: it ends by its own limits
+    }, { gitSync: s.spec, gitSyncMs: 400 });
+  } finally { s.cleanup(); }
+});
+
+test('open fresh: the default cap is 8 s', async () => {
+  const s = syncTool('hang');
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      const t0 = Date.now();
+      const r = await c.req('POST', '/api/open', { cookie, body: { project: 'alpha', harness: 'omp', fresh: true } });
+      const took = Date.now() - t0;
+      assert.deepEqual([r.status, r.json.name], [200, 'alpha-omp']);
+      assert.ok(took >= 7500 && took < 12000, `took ${took} ms`);
+      assert.deepEqual(logsOf(c), ['git-sync alpha: not finished after 8 s, opening anyway']);
+      assert.ok(s.alive(s.lines()[0].pid));
+    }, { gitSync: s.spec });
+  } finally { s.cleanup(); }
+});
+
+test('open fresh: fcode-new (the real CLI, 20 s budget) still gets its session name when the sync never exits: the cap is 8 s', async () => {
+  const s = syncTool('hang');
+  try {
+    await withApp(async (c) => {
+      const t0 = Date.now();
+      const r = await newCli(c, 'alpha', 'omp');
+      const took = Date.now() - t0;
+      assert.deepEqual([r.status, r.stdout, r.stderr], [0, 'alpha-omp\n', '']);
+      assert.ok(took >= 7500 && took < 14000, `took ${took} ms`); // the default cap, then the create: far inside 20 s
+      assert.deepEqual(logsOf(c), ['git-sync alpha: not finished after 8 s, opening anyway']);
+      assert.ok(s.alive(s.lines()[0].pid));
+    }, { gitSync: s.spec });
+  } finally { s.cleanup(); }
+});
+
+// an /api/open fresh request that can be abandoned; done = its reply
+const abandonable = (c, cookie, project, harness) => {
+  const rq = http.request({ host: '127.0.0.1', port: c.port, method: 'POST', path: '/api/open', headers: { 'X-PC': '1', Cookie: cookie, 'Content-Type': 'application/json' } });
+  const done = new Promise((resolve) => {
+    rq.on('error', () => resolve(null));
+    rq.on('response', (res) => { let t = ''; res.on('data', (d) => { t += d; }); res.on('end', () => resolve({ status: res.statusCode, json: JSON.parse(t) })); });
+  });
+  rq.end(JSON.stringify({ project, harness, fresh: true }));
+  return { rq, done };
+};
+
+test('open fresh: the client going away during the sync makes no session and leaves the sync running (HTTP and admin socket)', async () => {
+  const s = syncTool('hang');
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      // HTTP: the app gives up
+      const a = abandonable(c, cookie, 'alpha', 'omp');
+      assert.ok(await until(() => s.lines().length === 1, 5000));
+      const first = s.lines()[0].pid;
+      a.rq.destroy();
+      await sleep(500);
+      assert.ok(s.alive(first), 'the sync of a closed request was killed');
+      // admin socket: fcode-new gives up (timeout, Ctrl+C)
+      const sock = net.connect(adminPath(c.configDir));
+      sock.on('error', () => {});
+      sock.write(`${JSON.stringify({ cmd: 'new', project: 'my.proj', harness: 'claude' })}\n`);
+      assert.ok(await until(() => s.lines().length === 2, 5000));
+      const second = s.lines()[1].pid;
+      sock.destroy();
+      await sleep(500);
+      assert.ok(s.alive(second), 'the sync of a closed admin socket was killed');
+      assert.equal(c.calls().filter((x) => x.argv[0] === 'new-session').length, 0, JSON.stringify(c.calls().map((x) => x.argv.slice(0, 4))));
+      assert.deepEqual(logsOf(c), []); // a cancel is not a failure to report
+      assert.equal(c.app.stats().running + c.app.stats().waiting, 0);
+    }, { gitSync: s.spec, gitSyncMs: 10000 });
+  } finally { s.cleanup(); }
+});
+
+test('open fresh: concurrent opens of one project share one sync (a later open syncs again)', async () => {
+  const s = syncTool('slow');
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      const o = (project, harness) => c.req('POST', '/api/open', { cookie, body: { project, harness, fresh: true } });
+      const rs = await Promise.all([o('alpha', 'omp'), o('alpha', 'claude'), o('alpha', 'codex'), o('my.proj', 'omp')]);
+      assert.deepEqual(rs.map((r) => [r.status, r.json.name]), [[200, 'alpha-omp'], [200, 'alpha-claude'], [200, 'alpha-codex'], [200, 'my-proj-omp']]);
+      assert.deepEqual(s.lines().map((x) => [x.what, x.project]).sort(), [['end', 'alpha'], ['end', 'my.proj'], ['start', 'alpha'], ['start', 'my.proj']]); // one per project
+      assert.equal((await o('alpha', 'omp')).json.name, 'alpha-omp-2');
+      assert.equal(s.lines().filter((x) => x.what === 'start').length, 3); // the sync had ended: a new one
+    }, { gitSync: s.spec });
+  } finally { s.cleanup(); }
+});
+
+test('open fresh: an open while a sync still runs (even past an earlier open\'s cap) joins it: no second spawn, no kill', async () => {
+  const s = syncTool('hang');
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      const a = abandonable(c, cookie, 'alpha', 'omp'), b = abandonable(c, cookie, 'alpha', 'claude');
+      assert.ok(await until(() => s.lines().length === 1, 5000));
+      await sleep(300); // both wait on the one sync
+      assert.equal(s.lines().length, 1);
+      const pid = s.lines()[0].pid;
+      b.rq.destroy(); // one waiting open goes away: the other is not affected
+      await sleep(300);
+      assert.ok(s.alive(pid));
+      const ra = await a.done; // the cap (2.5 s) ends a's wait: its session is made, b's is not
+      assert.deepEqual([ra.status, ra.json.name], [200, 'alpha-omp']);
+      assert.equal(sessionCalls(c, 'alpha-claude').length, 0);
+      assert.deepEqual(logsOf(c), ['git-sync alpha: not finished after 2.5 s, opening anyway']);
+      assert.ok(s.alive(pid)); // still running after the cap
+      // a new open: the sync is still running, so it joins (waits its own cap) instead of spawning another
+      const r = await c.req('POST', '/api/open', { cookie, body: { project: 'alpha', harness: 'codex', fresh: true } });
+      assert.deepEqual([r.status, r.json.name], [200, 'alpha-codex']);
+      assert.equal(s.lines().length, 1);
+      assert.ok(s.alive(pid));
+      assert.equal(logsOf(c).length, 1); // the warning is once per sync
+    }, { gitSync: s.spec, gitSyncMs: 2500 });
+  } finally { s.cleanup(); }
 });
