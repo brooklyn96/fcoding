@@ -943,7 +943,7 @@ enum HomeLogic {
                 if job.code == "ADDED_WARN" {
                     // Exit 30 covers every failed check; only CLEANUP_FAIL's detail is the check branch.
                     let d = detail ?? ""
-                    if d.range(of: "^(refs/heads/)?box/fcode-add-check$", options: .regularExpression) != nil {
+                    if d.range(of: "^(refs/heads/)?box/fcode-add-check(-[a-z0-9-]+)?$", options: .regularExpression) != nil {
                         let branch = d.replacingOccurrences(of: "^refs/heads/", with: "", options: .regularExpression)
                         s.message = "Đã thêm \(name). GitHub không cho box xoá nhánh thử \(branch), hãy xoá bằng tay."
                     } else {
@@ -1403,6 +1403,16 @@ enum HomeLogic {
            generic)
         eq("done warn bare branch", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\" box/fcode-add-check \"}"))).message,
            "Đã thêm web. GitHub không cho box xoá nhánh thử box/fcode-add-check, hãy xoá bằng tay.")
+        eq("done warn suffixed ref", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\"refs/heads/box/fcode-add-check-k3x9-2\"}"))).message,
+           "Đã thêm web. GitHub không cho box xoá nhánh thử box/fcode-add-check-k3x9-2, hãy xoá bằng tay.")
+        eq("done warn suffixed bare", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\"box/fcode-add-check-ab12\"}"))).message,
+           "Đã thêm web. GitHub không cho box xoá nhánh thử box/fcode-add-check-ab12, hãy xoá bằng tay.")
+        eq("done warn bad suffix", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\"box/fcode-add-check-AB_1\"}"))).message,
+           generic)
+        eq("done warn empty suffix", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\"box/fcode-add-check-\"}"))).message,
+           generic)
+        eq("done warn suffix then path", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\"box/fcode-add-check-x/y\"}"))).message,
+           generic)
         // Another sheet's job (the server dedupes by name): never its key or its success.
         let conflict = "Tên này đang được dùng để thêm repo khác, đặt tên khác."
         let alice = addReduce(a, .polled(job("""
