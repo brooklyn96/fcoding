@@ -77,16 +77,18 @@ function Find-LocalClones([hashtable]$Want) {
   $roots = @(@{ P = (Get-SyncDesktop); D = 4 }, @{ P = $docs; D = 3 }, @{ P = (Join-Path $env:USERPROFILE 'source\repos'); D = 3 }, @{ P = $env:USERPROFILE; D = 2 })
   foreach ($r in $SyncRepos) { $pp = Split-Path ([string]$r).TrimEnd('\', '/') -Parent; if ($pp) { $roots += @{ P = $pp; D = 2 } } }
   $found = @{}; $where = New-Object System.Collections.ArrayList; $seenRoot = @{}; $seenDir = @{}
+  $lim = if ("$env:FCODE_FIND_SEC" -match '\A[0-9]{1,3}\z') { [int]$env:FCODE_FIND_SEC } else { 15 }   # FCODE_FIND_SEC: chi de thu
   $sw = [Diagnostics.Stopwatch]::StartNew(); $skip = [IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System
   foreach ($r in $roots) {
     if (-not $r.P -or -not (Test-Path -LiteralPath $r.P -PathType Container)) { continue }
     $rp = [IO.Path]::GetFullPath($r.P).TrimEnd('\'); $rk = $rp.ToLowerInvariant()
     if ($seenRoot.ContainsKey($rk) -and $seenRoot[$rk] -ge $r.D) { continue }
+    if ($sw.Elapsed.TotalSeconds -ge $lim) { [void]$where.Add("$rp (chưa tìm)"); continue }
     $seenRoot[$rk] = $r.D; [void]$where.Add("$rp ($($r.D) cấp)")
     $q = New-Object System.Collections.Queue; $q.Enqueue(@($rp, 0))
-    while ($q.Count -and $sw.Elapsed.TotalSeconds -lt 15) {
+    while ($q.Count -and $sw.Elapsed.TotalSeconds -lt $lim) {
       $x = $q.Dequeue(); $d = [string]$x[0]; $lv = [int]$x[1]
-      if (Test-Path -LiteralPath (Join-Path $d '.git')) {
+      if ($lv -gt 0 -and (Test-Path -LiteralPath (Join-Path $d '.git'))) {   # thu muc goc la git (vd. %USERPROFILE%) van tim ben trong
         $k = Get-RepoKey (Get-GitDirOrigin $d); $dk = $d.ToLowerInvariant()
         if ($k -and $Want.ContainsKey($k) -and -not $seenDir.ContainsKey($dk)) { $seenDir[$dk] = $true; if (-not $found.ContainsKey($k)) { $found[$k] = New-Object System.Collections.ArrayList }; [void]$found[$k].Add($d) }
         continue
@@ -101,15 +103,17 @@ function Find-LocalClones([hashtable]$Want) {
       }
     }
   }
-  if ($sw.Elapsed.TotalSeconds -ge 15) { [void]$where.Add('(dừng sau 15 giây, chưa tìm hết)') }
+  if ($sw.Elapsed.TotalSeconds -ge $lim) { [void]$where.Add("(dừng sau $lim giây, chưa tìm hết)") }
   @{ Found = $found; Where = @($where) }
 }
 
 # thu muc dung duoc cho repo $Repo? @{Ok; Clone; Path; Why}
 function Test-SyncFolder([string]$Path, [string]$Repo) {
   $p = $Path.Trim().Trim('"', "'").Trim()
-  if (-not $p -or -not [IO.Path]::IsPathRooted($p) -or $p -notmatch '\A([A-Za-z]:\\|\\\\)') { return @{ Ok = $false; Why = 'cần đường dẫn đầy đủ, ví dụ C:\Users\ten\Desktop\du-an' } }
-  $p = [IO.Path]::GetFullPath($p)
+  if (-not $p -or $p -notmatch '\A([A-Za-z]:\\|\\\\)') { return @{ Ok = $false; Why = 'cần đường dẫn đầy đủ, ví dụ C:\Users\ten\Desktop\du-an' } }
+  # ky tu Windows khong cho trong ten (ca hai ban PowerShell); ':' chi duoc sau ky tu o dia
+  if ($p -match '[<>|?*"]' -or $p.Substring(2).Contains(':')) { return @{ Ok = $false; Why = 'đường dẫn không hợp lệ' } }
+  try { $p = [IO.Path]::GetFullPath($p) } catch { return @{ Ok = $false; Why = 'đường dẫn không hợp lệ' } }
   if (Test-Path -LiteralPath $p -PathType Leaf) { return @{ Ok = $false; Why = 'đây là một file, không phải thư mục' } }
   if (-not (Test-Path -LiteralPath $p)) { return @{ Ok = $true; Clone = $true; Path = $p } }
   if (Test-Path -LiteralPath (Join-Path $p '.git')) {
@@ -159,11 +163,16 @@ function Select-SyncFolder($M, $Cands) {
 # them $Path vao syncRepos trong config.json: chi chen dung mot muc, giu nguyen cac khoa va cach trinh bay khac; ghi bang file tam roi thay
 function Add-SyncRepoConfig([string]$Path) {
   if ($CfgBroken) { throw "file cấu hình $ConfigFile bị hỏng, sửa tay trước" }
-  $raw = if (Test-Path -LiteralPath $ConfigFile) { [IO.File]::ReadAllText($ConfigFile) } else { '' }
-  $bom = $raw.Length -gt 0 -and $raw[0] -eq [char]0xFEFF; if ($bom) { $raw = $raw.Substring(1) }
+  $b = if (Test-Path -LiteralPath $ConfigFile) { [IO.File]::ReadAllBytes($ConfigFile) } else { [byte[]]@() }
+  $bom = $b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF   # ReadAllText bo BOM nen phai doc byte
+  $raw = if ($bom) { (New-Object Text.UTF8Encoding($false)).GetString($b, 3, $b.Length - 3) } else { (New-Object Text.UTF8Encoding($false)).GetString($b) }
   $js = ConvertTo-JsonStr $Path
   $m = [regex]::Match($raw, '"syncRepos"\s*:\s*\[')
-  if ($m.Success) {
+  $mv = [regex]::Match($raw, '"syncRepos"\s*:\s*(null|"(?:[^"\\]|\\.)*")')   # null hoac mot chuoi: thay bang danh sach (giu chuoi cu)
+  if (-not $m.Success -and $mv.Success) {
+    $v = $mv.Groups[1].Value; $arr = if ($v -eq 'null') { $js } else { $v + ', ' + $js }
+    $new = $raw.Substring(0, $mv.Groups[1].Index) + '[' + $arr + ']' + $raw.Substring($mv.Groups[1].Index + $v.Length)
+  } elseif ($m.Success) {
     $inStr = $false; $esc = $false; $last = -1
     for ($i = $m.Index + $m.Length; $i -lt $raw.Length; $i++) {
       $ch = $raw[$i]
@@ -192,7 +201,9 @@ function Add-SyncMissing {
   if ($env:FCODE_SYNC_REPOS) { return }   # danh sach dat tam cho lan chay nay: khong tim, khong ghi config
   Write-Host 'Đang hỏi box danh sách project...'
   $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-  try { & (Get-InstaboxExe) wake $box *> $null; $bp = Get-BoxJson (Invoke-BoxPy 'projects' ([byte[]]@())) } catch { $bp = $null } finally { $ErrorActionPreference = $old }
+  # han 60 giay cho lenh nay (khong phai 900 giay cua mot dot chep phien)
+  $script:PhienDeadline = [DateTime]::UtcNow.AddSeconds([Math]::Min(60, (Get-PhienLimitSec $false)))
+  try { & (Get-InstaboxExe) wake $box *> $null; $bp = Get-BoxJson (Invoke-BoxPy 'projects' ([byte[]]@())) } catch { $bp = $null } finally { $ErrorActionPreference = $old; $script:PhienDeadline = $null }
   if (-not $bp) { Write-Host 'cảnh báo: không đọc được danh sách project trên box; chỉ cập nhật các project đã có trên laptop.'; return }
   $have = @{}; foreach ($r in $SyncRepos) { $k = Get-LocalRepoKey $r; if ($k) { $have[$k] = $true } }
   $miss = @(@($bp.projects) | Where-Object { $_ -and $_.repo -and -not $have.ContainsKey([string]$_.repo) })
@@ -558,11 +569,12 @@ function Invoke-Add {
       $code = $LASTEXITCODE
     } catch { $lines = @("$($_.Exception.Message)"); $code = 255 }
     finally { $ErrorActionPreference = $old }
-    $rules = $false; $bad = 0; $seen = @{}; $pub = ''; $detail = ''
+    $rules = $false; $bad = 0; $seen = @{}; $pub = ''; $detail = ''; $hookD = ''
     foreach ($l in $lines) {
       if ($l -notmatch '^R (\S+)\s*(.*)$') { continue }
       $c = $Matches[1]; $d = $Matches[2]; $seen[$c] = $true
-      switch ($c) {
+      # -Wildcard: DIR_* / HOOK_FAIL* / CLEANUP* khop theo tien to (ten ma tren box co the doi chut); cac nhan khac khop dung ten
+      switch -Wildcard ($c) {
         'NO_SCRIPT'     { Write-Host "lỗi: box chưa có script thêm dự án (bản FCode trên box đã cũ). Cập nhật box: instabox ssh $box rồi chạy: cd ~/fcode-src && git pull && bash install.sh"; Write-Host "  Xong thì chạy lại: fcode add $repo $name" }
         'TOKEN_OK'      { if ($try -eq 1) { Write-Host '[1] Box dùng khoá GitHub sẵn có (token) cho repo này, không cần dán khoá' } }
         'TOKEN_FALLBACK' { Write-Host '[1] Khoá GitHub sẵn có của box không ghi được repo này, chuyển sang khoá SSH riêng cho repo' }
@@ -574,13 +586,13 @@ function Invoke-Add {
         'ALIAS_FAIL'    { Write-Host '[1] lỗi: box không ghi được cấu hình SSH.' }
         'SSH_DETAIL'    { $detail = $d }
         'PUBKEY'        { $pub = $d }
-        'READ_OK'       { Write-Host '[2] Box đọc được repo qua khoá SSH: OK' }
+        'READ_OK'       { if ($seen.ContainsKey('TOKEN_OK') -and -not $seen.ContainsKey('TOKEN_FALLBACK')) { Write-Host '[2] Box đọc được repo: OK' } else { Write-Host '[2] Box đọc được repo qua khoá SSH: OK' } }
         'WRITE_OK'      { Write-Host '[5] Box ghi được repo (đẩy thử một nhánh tạm rồi xoá ngay): OK' }
         'CLONED'        { Write-Host "[3] Đã tải repo về /data/workspace/$name" }
         'CLONE_EXISTS'  { Write-Host "[3] Repo đã có sẵn ở /data/workspace/$name, giữ nguyên" }
         'CLONE_FAIL'    { Write-Host '[3] lỗi: không tải được repo về box. Chạy lại sau ít phút.'; if ($d) { Write-Host "  (chi tiết: $d)" } }
-        'DIR_NOTGIT'    { Write-Host "lỗi: thư mục /data/workspace/$name đã có nhưng không phải project git. Đặt tên khác: fcode add $repo <tên>" }
-        'DIR_OTHER'     { Write-Host "lỗi: thư mục /data/workspace/$name đang là project khác ($d). Đặt tên khác: fcode add $repo <tên>" }
+        'DIR_*'         { }   # moi ma thoat 11: mot thong bao sau vong lap
+        'HOOK_FAIL*'    { $hookD = $d }
         'HOOK_OK'       { Write-Host '[4] Đã cài hook chặn push thẳng lên main/master' }
         'HOOK_EXISTS'   { Write-Host '[4] Hook chặn push lên main/master đã có sẵn' }
         'CFG_ADDED'     { Write-Host "[6] Đã thêm '$name' vào danh sách project của FCode (có bản sao lưu config, không đụng project khác)" }
@@ -597,7 +609,7 @@ function Invoke-Add {
         'V_SERVER_BAD'  { Write-Host '[7] cảnh báo: server FCode báo lỗi khi nạp lại cấu hình'; $bad++ }
         'V_CFG_BAD'     { Write-Host '[7] cảnh báo: cấu hình FCode chưa đúng cho project này'; $bad++ }
         'V_EMPTY_REPO'  { Write-Host '[7] Repo còn trống (chưa có commit nào): bình thường với repo mới' }
-        'CLEANUP_FAIL'  { $br = $d -replace '^refs/heads/', ''; Write-Host "cảnh báo: GitHub không cho box xoá nhánh thử $br. Hãy xoá bằng tay: mở https://github.com/$repo/branches, tìm nhánh $br, bấm biểu tượng thùng rác."; Write-Host '  (chạy lại lệnh sẽ dùng lại đúng nhánh này, không tạo thêm nhánh mới)' ; $bad++ }
+        'CLEANUP*'      { $br = $d.Trim() -replace '^refs/heads/', ''; Write-Host "cảnh báo: GitHub không cho box xoá nhánh thử $br ($($d.Trim())). Hãy xoá nhánh này trên GitHub: mở https://github.com/$repo/branches, tìm đúng nhánh $br, bấm biểu tượng thùng rác."; $bad++ }
         'NET_FAIL'      { Write-Host "lỗi: mạng từ box tới GitHub đang chập chờn nên chưa kiểm tra được. Đợi ít phút rồi chạy lại cùng lệnh: fcode add $repo $name"; if ($detail) { Write-Host "  (chi tiết: $detail)" } }
         'REPO_ARCHIVED' { Write-Host "[5] lỗi: repo này đã lưu trữ (archived) nên không ghi được. Vào Settings của repo để bỏ lưu trữ (Unarchive), hoặc chọn repo khác." }
         'NAME_USED'     { Write-Host "lỗi: tên '$name' đã được dùng cho khoá hoặc kết nối GitHub khác trên box (không phải repo này). Đặt tên khác: fcode add $repo <tên>" }
@@ -607,13 +619,15 @@ function Invoke-Add {
         'BAD_ARGS'      { Write-Host 'lỗi: tên repo hoặc tên project không hợp lệ.' }
       }
     }
+    if ($code -eq 11) { Write-Host "Thư mục $name đã có trên box (hoặc không an toàn) — chọn tên khác: fcode add $repo <tên-khác>"; return 1 }
+    if ($code -eq 24) { Write-Host '[4] lỗi: không cài được chốt chặn push lên main, nên chưa thêm project.'; if ($hookD) { Write-Host "  (chi tiết: $hookD)" }; return 1 }
     if ($seen.Count -eq 0) {
       $d = ($lines | Where-Object { "$_".Trim() } | Select-Object -First 1)
       Write-IpaError 'không nói chuyện được với box. Kiểm tra: đã chạy "instabox login" chưa, và box đang bật không.' $d
       return 1
     }
     # loi can sua truoc (ten da dung, cau hinh hong, GitHub chan, mang, repo luu tru): thong bao cu the da in o tren, khong bao "chay lai cung lenh"
-    if ($code -in 3, 11, 21, 22, 23, 42, 43, 44) { return 1 }
+    if ($code -in 3, 11, 21, 22, 23, 24, 42, 43, 44) { return 1 }
     if ($code -eq 40 -or $code -eq 41) {
       # can dan khoa cong khai vao GitHub (nguoi dung tu dan; khong tu them bang token/API)
       Write-Host ''
@@ -1267,6 +1281,7 @@ def box_projects():
     for name, d in sorted(cfg_projects().items()):
         if isinstance(d, str) and d:
             o = origin_of(d) if os.path.isdir(d) else ''
+            o = re.sub(r'^([a-z][a-z0-9+.-]*://)[^/@]*@', r'\1', o, flags=re.I)   # khong bao gio gui token / mat khau trong URL
             out.append({'name': name, 'dir': d, 'origin': o, 'repo': repo_key(o)})
     return out
 
@@ -1418,6 +1433,11 @@ def place_file(src, dst, after=None):
             return 'busy'
         a, b = eff(dst), eff(src)
         if b == a:
+            if after:   # file nhan bi mat o lan truoc: ghi lai khi file chinh da giong
+                try:
+                    after()
+                except OSError:
+                    pass
             return 'same'
         if b < a or not is_prefix(dst, src):
             return 'skip'
@@ -1429,8 +1449,11 @@ def place_file(src, dst, after=None):
         st = os.stat(src)
         os.utime(part, (st.st_atime, st.st_mtime))
         os.replace(part, dst)
-        if after:   # file nhan (.fcode-origin) chi ghi khi file chinh da dat xong
-            after()
+        if after:   # file nhan (.fcode-origin) chi ghi khi file chinh da dat xong; loi ghi file nhan khong lam hong file chinh da dat
+            try:
+                after()
+            except OSError:
+                pass
     finally:
         if os.path.exists(part):
             os.unlink(part)
@@ -1516,8 +1539,10 @@ def cmd_put(_req):
                 continue
 
             def side(dest=dest, r=r):
-                with open(os.path.join(dest, r[:-6] + '.fcode-origin'), 'w', encoding='utf-8') as f:
-                    f.write('laptop\n')
+                sp = os.path.join(dest, r[:-6] + '.fcode-origin')
+                if not os.path.isfile(sp):
+                    with open(sp, 'w', encoding='utf-8') as f:
+                        f.write('laptop\n')
             put1(e, r, side if t.get('origin') == 'laptop' else None)
         cnt['busyFiles'] = busyf
         cnt['deferred'] = defer
@@ -2270,13 +2295,17 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
     foreach ($n in @($scan.blobs)) { if (([string]$n) -match '\A([a-f0-9]{64})') { $hx = $Matches[1]; if (-not $boxBlobNames.ContainsKey($hx)) { $boxBlobNames[$hx] = New-Object System.Collections.ArrayList }; [void]$boxBlobNames[$hx].Add([string]$n) } }
     $boxBlobSize = @{}; if ($scan.blobsize) { foreach ($pr in $scan.blobsize.PSObject.Properties) { $boxBlobSize[$pr.Name] = [long]$pr.Value } }
     $lblobIx = Get-OmpBlobIndex $laptopBlobDir
-    $ctx = @(); $used = @{}
+    # trung ten luon thang; khop theo repo chi lay thu muc chua project nao dung
+    $ctx = @(); $used = @{}; $pick = @{}
+    foreach ($bp in @($scan.projects)) { $ld = $projs[[string]$bp.name]; if ($ld) { $pick[[string]$bp.name] = $ld; $used[$ld] = $true } }
     foreach ($bp in @($scan.projects)) {
-      $ldir = $projs[[string]$bp.name]
-      if (-not $ldir -and $bp.repo) { $ldir = $repoDir[[string]$bp.repo] }
-      if ($ldir -and $used.ContainsKey($ldir)) { continue }
+      $ld = if ($bp.repo) { $repoDir[[string]$bp.repo] } else { $null }
+      if (-not $pick.ContainsKey([string]$bp.name) -and $ld -and -not $used.ContainsKey($ld)) { $pick[[string]$bp.name] = $ld; $used[$ld] = $true }
+    }
+    foreach ($bp in @($scan.projects)) {
+      $ldir = $pick[[string]$bp.name]
+      if (-not $ldir -and $bp.repo -and $repoDir.ContainsKey([string]$bp.repo)) { continue }   # thu muc cua repo nay da thuoc project khac
       if (-not $ldir -or -not (Test-Path -LiteralPath $ldir)) { Write-PhienOut "== $($bp.name): bỏ qua, không thấy thư mục project trên laptop"; continue }
-      $used[$ldir] = $true
       $lsd = Join-Path $sessRoot (Get-LaptopEncodedDir $ldir)
       $ctx += [pscustomobject]@{ Name = [string]$bp.name; LDir = $ldir; BDir = [string]$bp.dir; Lsd = $lsd; Benc = [string]$bp.enc; L = (Get-PhienLocalScan $lsd); R = @($bp.sessions); LN = (Get-PhienLocalNotes $ldir); RN = $bp.notes }
     }
@@ -2343,19 +2372,22 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
           $items = $plan.Put; $us = $putU; $sz = $lsz   # plain assignments: an `if` expression would unroll an empty list to $null
           if ($dir -eq 'get') { $items = $plan.Get; $us = $getU; $sz = $rsz }
           foreach ($it in $items) {
+            $bigBlob = $false
             foreach ($hx in @($it.Blobs)) {
               $bns = if ($dir -eq 'put') { @($lblobIx[$hx]) } else { @($boxBlobNames[$hx]) }
               foreach ($bn in $bns) {
-                if (-not $bn -or $queuedBlob.ContainsKey("$dir/$bn")) { continue }
-                $queuedBlob["$dir/$bn"] = $true
+                if (-not $bn) { continue }
                 $bsz = if ($dir -eq 'put') { (Get-Item -LiteralPath (Join-Path $laptopBlobDir $bn)).Length } else { [long]$boxBlobSize[[string]$bn] }
+                if ((Get-PhienUnitBytes ([long]$bsz) ([string]$bn)) -gt $PhienBatchLimit) { $bigBlob = $true }
+                if ($queuedBlob.ContainsKey("$dir/$bn")) { continue }
+                $queuedBlob["$dir/$bn"] = $true
                 [void]$us.Add(@{ K = 'blob'; Name = [string]$bn; Size = [long]$bsz })
               }
             }
             foreach ($rel in @(@($it.Files | Where-Object { -not $_.EndsWith('.jsonl') }) + @($it.Files | Where-Object { $_.EndsWith('.jsonl') }))) { if ($rel) { [void]$us.Add(@{ K = 'file'; C = $c; Rel = $rel; Size = $sz[$rel] }) } }
             if ($it.Top) {
               # file chinh cua phien co file qua 50 MB: dat sau dot cua file do (cung lan chay), khong thi phai cho lan sau
-              $late = @(@($it.Files) | Where-Object { $_ -and (Get-PhienUnitBytes ([long]$sz[$_]) $_) -gt $PhienBatchLimit }).Count -gt 0
+              $late = $bigBlob -or @(@($it.Files) | Where-Object { $_ -and (Get-PhienUnitBytes ([long]$sz[$_]) $_) -gt $PhienBatchLimit }).Count -gt 0
               [void]$us.Add(@{ K = 'top'; C = $c; Rel = $it.Name; Size = $sz[$it.Name]; Deps = @($it.Deps); DepBlobs = @($it.DepBlobs); Late = $late })
               if ($dir -eq 'put') { $nPutSess++ } else { $nGetSess++ }
             }
@@ -2376,11 +2408,13 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
       $putLB = New-Object System.Collections.ArrayList; $getLB = New-Object System.Collections.ArrayList
       foreach ($u in @(@($putN) + @($putU))) { if ($u.Late) { [void](Get-PhienBatch $putLB (Join-Path $tmpRoot 'putlate') (& $est $u) $PhienBatchLimit).Items.Add($u) } else { [void](Get-PhienBatch $putB (Join-Path $tmpRoot 'put') (& $est $u) $PhienBatchLimit).Items.Add($u) } }
       foreach ($u in @(@($getN) + @($getU))) { if ($u.Late) { [void](Get-PhienBatch $getLB (Join-Path $tmpRoot 'getlate') (& $est $u) $PhienBatchLimit).Items.Add($u) } else { [void](Get-PhienBatch $getB (Join-Path $tmpRoot 'get') (& $est $u) $PhienBatchLimit).Items.Add($u) } }
-      if (($ensure.Count -or $unexcl.Count) -and -not $putB.Count) { [void]$putB.Add((New-PhienBatch (Join-Path $tmpRoot 'put\put0'))) }
-      if ($putB.Count) { foreach ($x in $ensure) { [void]$putB[0].Ensure.Add($x) }; foreach ($x in $unexcl) { [void]$putB[0].Unexclude.Add($x) } }
+      $bigName = { param($b) if ($b.Items.Count -eq 1 -and $b.Bytes -gt $PhienBatchLimit) { $u = $b.Items[0]; if ($u.Rel) { [string]$u.Rel } else { [string]$u.Name } } }
+      # exclude / go exclude cua ghi chu di cung dot gui THUONG dau tien (dot qua lon chay sau cung va co the hong), khong co thi mot dot rong
+      $nb = $null; foreach ($bb in $putB) { if (-not (& $bigName $bb)) { $nb = $bb; break } }
+      if (($ensure.Count -or $unexcl.Count) -and -not $nb) { $nb = New-PhienBatch (Join-Path $tmpRoot 'put\notes'); [void]$putB.Add($nb) }
+      if ($nb) { foreach ($x in $ensure) { [void]$nb.Ensure.Add($x) }; foreach ($x in $unexcl) { [void]$nb.Unexclude.Add($x) } }
       $notePlanned = $putN.Count; $placedPut = 0
       $saveNotes = { if ($noteRec.Count -or $noteDel.Count) { foreach ($k in $noteRec.Keys) { $noteState[$k] = $noteRec[$k] }; foreach ($k in $noteDel) { $noteState.Remove([string]$k) }; try { Write-PhienNoteState $noteState } catch { } } }
-      $bigName = { param($b) if ($b.Items.Count -eq 1 -and $b.Bytes -gt $PhienBatchLimit) { $u = $b.Items[0]; if ($u.Rel) { [string]$u.Rel } else { [string]$u.Name } } }
       $deferredTops = New-Object System.Collections.ArrayList; $busyFiles = New-Object System.Collections.ArrayList
       # --- mot dot gui len box (chep sang thu muc tam, doi cwd, dong goi, gui, xoa): 'ok' | 'fail' | 'lost' (ssh 255: mat box) ---
       $putRes = @{ new = 0; replaced = 0; same = 0; skip = 0; busy = 0; blobs = 0; failed = 0 }

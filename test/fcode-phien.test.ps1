@@ -31,7 +31,8 @@ $wanted = 'Test-WinPath', 'Resolve-OmpPath', 'Get-OmpUnder', 'Join-OmpName', 'Ge
   'Get-OmpHeaderSpan', 'Open-ShareRead', 'Read-Head', 'Get-OmpBodyOff', 'Test-OmpNonEmpty', 'Get-RangeSha', 'Get-PhienOff', 'Test-PhienPrefix', 'Get-PhienKnownVersions', 'Test-PhienKnownVersion', 'Get-OmpHeaderVersion', 'Get-OmpHeaderInfo', 'Get-PhienVersionNote', 'Get-PhienUnknownNote', 'Get-PhienNoteRx', 'Get-PhienNoteSpecs', 'Invoke-GitQuiet', 'Get-PhienLocalNotes', 'Get-PhienNotePlan', 'Get-PhienNoteStatePath', 'Read-PhienNoteState', 'Write-PhienNoteState', 'Add-PhienNoteExclude', 'Install-PhienNote',
   'Copy-OmpSession', 'Get-OmpBlobRefs', 'Get-OmpBlobIndex', 'Get-PhienLocalScan', 'Compare-PhienFile', 'Get-PhienPlan', 'Install-PhienFile',
   'Install-PhienTask', 'Remove-PhienTask', 'New-PhienPartName', 'Get-PhienBoxBlobSet', 'New-PhienBatch', 'Get-PhienBatch', 'Remove-PhienNoteExclude',
-  'Get-PhienDirFiles', 'Get-PhienIdOf', 'Test-PhienDeps', 'Get-PhienUnitBytes', 'Get-PhienUpstreamNotes'
+  'Get-PhienDirFiles', 'Get-PhienIdOf', 'Test-PhienDeps', 'Get-PhienUnitBytes', 'Get-PhienUpstreamNotes',
+  'Add-SyncRepoConfig', 'Test-SyncFolder', 'Get-RepoKey', 'Get-GitDirOrigin', 'Find-LocalClones', 'Get-SyncDesktop'
 foreach ($fn in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in $wanted }, $true)) { . ([scriptblock]::Create($fn.Extent.Text)) }
 $pyAssign = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$PhienPy' }, $true)
 Invoke-Expression $pyAssign.Extent.Text
@@ -1268,6 +1269,34 @@ T 'e2e r4: the .fcode-origin sidecar is written only after the top is in place' 
   $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
   Ok (Test-Path $sc) 'sidecar once the top is placed'
 }
+T 'r5: sidecar: a failed sidecar write never turns a placed top into failed; a missing sidecar is written when the top arrives equal' {
+  $d = Join-Path $Root 'sc'; $src = New-Sess (Join-Path $d 'src') 'sc000001' '/x' @('a'); $dst = Join-Path $d ('dst\' + (Split-Path $src -Leaf))
+  $drv = Join-Path $Root 'sc.py'
+  [IO.File]::WriteAllText($drv, ("import os, runpy, sys`nm = runpy.run_path(sys.argv[1], run_name='x')`nsrc, dst, side = sys.argv[2], sys.argv[3], sys.argv[4]`n" +
+    "def bad():`n    raise OSError('no room')`n" +
+    "def good():`n    if not os.path.isfile(side):`n        open(side, 'w').write('laptop\n')`n" +
+    "print(m['place_file'](src, dst, bad))`nprint(os.path.isfile(side))`nos.utime(dst, (1, 1))`nprint(m['place_file'](src, dst, good))`nprint(os.path.isfile(side))`n"))
+  $out = @(python -I $drv $PyFile $src $dst $dst.Replace('.jsonl', '.fcode-origin'))
+  Eq ($out -join ',') 'new,False,same,True' 'placed despite the sidecar error; written later when equal'
+}
+T 'e2e r5: a session whose blob is > 50 MB is placed in one good run (its top goes after the blob)' {
+  $w = New-W2 'e2e37'
+  $h = 'f7' * 32
+  $a = New-Sess $w.LS '7777aaaa-bblob' $w.LP @('a', "blob:sha256:$h")
+  Put-Big (Join-Path $w.LBlobs ($h + '.bin')) 60 37
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
+  Ok (Test-Path (Join-Path $w.BBlobs ($h + '.bin'))) 'the blob is on the box'
+  Ok (Test-Path (Join-Path $w.BS (Split-Path $a -Leaf))) ("the top is placed in the same run; out: " + $r.Out)
+}
+T 'e2e r5: the notes exclude rides on the first normal put batch, not on an oversized one that is cut every time' {
+  $w = New-W2 'e2e38'; New-GitDir $w.LP; New-GitDir $w.BP
+  Put-File "$($w.LP)\HANDOFF-same.md" 'same text'; Put-File "$($w.BP)\HANDOFF-same.md" 'same text'
+  $a = New-Sess $w.LS '0000000c-big3' $w.LP @('a'); Put-Big (Join-Path $a.Replace('.jsonl', '') 'huge.log') 60 53
+  $r = Invoke-Fcode $w @('phien') @{ FAKE_SSH_CUT = 'put:*:20000000:cut' }
+  Eq $r.Code 1 $r.Out
+  $ex = Join-Path $w.BP '.git\info\exclude'
+  Ok ((Test-Path $ex) -and ((Get-Content $ex -Raw) -match '(?m)^/HANDOFF-same\.md\r?$')) ("exclude on the box; out: " + $r.Out)
+}
 T 'e2e r4: phien matches a laptop folder to a box project by its GitHub repo when the folder name differs; a box project with no laptop folder is only noted' {
   $w = New-World 'e2e36'
   $ld = Join-Path $w.U 'Desktop\New folder (2)'; New-GitDir $ld; & git -C $ld remote add origin https://github.com/Owner/Proj.git
@@ -1282,6 +1311,28 @@ T 'e2e r4: phien matches a laptop folder to a box project by its GitHub repo whe
   Ok ($r.Out -match 'project trên box chưa có trên laptop: zeta') 'the new box project is noted'
   Eq (@((Get-PhienStat $w).newProjects) -join ',') 'zeta' 'and recorded in the status'
   $r = Invoke-Fcode $w @('phien', '--tu-dong'); Eq $r.Code 0 $r.Out   # the auto run never asks
+  # r5: an exact name always wins over a repo match (box {aaa, proj} with the same origin; laptop Desktop\proj)
+  $w2 = New-World 'e2e36b'
+  New-GitDir $w2.LP; & git -C $w2.LP remote add origin https://github.com/owner/proj.git
+  $aaa = ($w2.W -replace '\\', '/') + '/boxws/aaa'
+  foreach ($d in $w2.BP, $aaa) { New-GitDir ($d -replace '/', '\'); & git -C $d remote add origin https://github.com/owner/proj.git }
+  [IO.File]::WriteAllText($w2.Cfg, (@{ projects = @{ proj = $w2.BP; aaa = $aaa } } | ConvertTo-Json -Compress))
+  [IO.File]::WriteAllText((Join-Path $w2.U '.fcode\config.json'), (@{ instabox = $Cmd; box = 'coder'; syncRepos = @($w2.LP) } | ConvertTo-Json -Compress))
+  $a2 = New-Sess $w2.LS 'abcdabcd-rep2' $w2.LP @('a')
+  $r = Invoke-Fcode $w2 @('phien'); Eq $r.Code 0 $r.Out
+  Ok (Test-Path (Join-Path $w2.BS (Split-Path $a2 -Leaf))) ("the exact name proj gets the folder; out: " + $r.Out)
+  Eq @(Get-ChildItem (Join-Path $w2.BH '.omp\agent\sessions') -Recurse -File -Filter '*.jsonl').Count 1 'aaa gets nothing'
+  Ok ($r.Out -notmatch '== aaa') 'aaa is not synced'
+}
+T 'r5: box `projects` never sends a token or password from the origin URL; the repo still matches' {
+  $d = Join-Path $Root 'pj\ws\tok'; New-GitDir $d; & git -C $d remote add origin 'https://x-access-token:ghp_TEST@github.com/o/r.git'
+  $cfg = Join-Path $Root 'pj\cfg.json'; [IO.File]::WriteAllText($cfg, (@{ projects = @{ tok = $d } } | ConvertTo-Json -Compress))
+  $save = @{}; foreach ($k in 'HOME', 'FCODE_CFG') { $save[$k] = [Environment]::GetEnvironmentVariable($k) }
+  [Environment]::SetEnvironmentVariable('HOME', (Join-Path $Root 'pj\home')); [Environment]::SetEnvironmentVariable('FCODE_CFG', $cfg)
+  try { $out = (cmd /c "python -I `"$PyFile`" projects < NUL") | Out-String } finally { foreach ($k in $save.Keys) { [Environment]::SetEnvironmentVariable($k, $(if ($null -eq $save[$k]) { [NullString]::Value } else { $save[$k] })) } }
+  Ok ($out -notmatch 'ghp_TEST|x-access-token') "no secret in the answer: $out"
+  $j = ($out.Trim() -replace '^FCODE-JSON ', '') | ConvertFrom-Json
+  Eq $j.projects[0].origin 'https://github.com/o/r.git' 'origin without userinfo'; Eq $j.projects[0].repo 'o/r' 'repo still matches'
 }
 
 # ============================== round 4: fcode add (installed box script) and fcode sync (find / ask / clone) ==============================
@@ -1294,6 +1345,7 @@ T 'add: fcode add runs the script installed on the box (token path: no key step)
   Eq $r.Code 0 $r.Out
   Ok ($r.Out -match 'Box dùng khoá GitHub sẵn có \(token\)' -and $r.Out -match 'Xong\. Mở app FCode') ("token path told; out: " + $r.Out)
   Ok ($r.Out -notmatch 'Deploy keys|settings/keys') 'no key step'
+  Ok ($r.Out -match '\[2\] Box đọc được repo: OK' -and $r.Out -notmatch 'qua khoá SSH') 'token path: neutral read line'
   Eq ((Get-Content ($log -replace '/', '\')) -join '|') 'ARGS Owner/Repo-X repo-x' 'arguments'
   Ok ($r.Out -match 'chạy fcode sync') 'points to fcode sync for the laptop copy'
 }
@@ -1313,6 +1365,24 @@ T 'add: NEED_KEY shows the key and the steps, waits for Enter, then the retry su
   Eq $r.Code 0 $r.Out
   Ok ($r.Out -match 'Khoá của box \(copy cả dòng\): ssh-ed25519 AAAAfakekey' -and $r.Out -match 'settings/keys/new' -and $r.Out -match 'Xong\.') ("key flow; out: " + $r.Out)
   Eq (@(Get-Content $w.Log | Where-Object { $_ -eq 'ssh script' }).Count) 2 'retried once'
+}
+T 'add r5: exit 11 (folder exists or unsafe), exit 24 (HOOK_FAIL) stop without a retry; CLEANUP_FAIL names the exact branch and the add still succeeds' {
+  $w = New-World 'add4'; $fa = Join-Path $w.W 'fake-add.sh'
+  $cases = @(
+    @{ B = 'echo "R DIR_EXISTS /data/workspace/repo"; exit 11'; Code = 1; Rx = 'Thư mục repo đã có trên box \(hoặc không an toàn\) — chọn tên khác: fcode add owner/repo <tên-khác>' },
+    @{ B = 'echo "R DIR_UNSAFE /data/workspace/repo"; exit 11'; Code = 1; Rx = 'Thư mục repo đã có trên box \(hoặc không an toàn\)' },
+    @{ B = 'echo "R TOKEN_OK"; echo "R READ_OK"; echo "R CLONED"; echo "R HOOK_FAIL verify"; exit 24'; Code = 1; Rx = 'không cài được chốt chặn push lên main[\s\S]*chi tiết: verify' },
+    @{ B = 'for c in TOKEN_OK READ_OK CLONED HOOK_OK; do echo "R $c"; done; echo "R CLEANUP_FAIL refs/heads/box/fcode-add-check-repo-1700000000-42-7"; for c in WRITE_OK CFG_ADDED V_BRANCH_OK; do echo "R $c"; done; exit 30'; Code = 1
+       Rx = 'không cho box xoá nhánh thử box/fcode-add-check-repo-1700000000-42-7 \(refs/heads/box/fcode-add-check-repo-1700000000-42-7\)\. Hãy xoá nhánh này trên GitHub' })
+  foreach ($c in $cases) {
+    Remove-Item $w.Log -ErrorAction SilentlyContinue
+    New-FakeAdd $fa $c.B
+    $r = Invoke-Fcode $w @('add', 'owner/repo') @{ FCODE_ADD_SCRIPT = (ConvertTo-Posix $fa) }
+    Eq $r.Code $c.Code $r.Out; Ok ($r.Out -match $c.Rx) ("message; out: " + $r.Out)
+    Eq (@(Get-Content $w.Log | Where-Object { $_ -eq 'ssh script' }).Count) 1 'no retry'
+    Ok ($r.Out -notmatch 'dùng lại đúng nhánh này') 'no reuse hint'
+  }
+  Ok ($r.Out -match 'Đã thêm nhưng có 1 mục cần xem lại') 'cleanup failure: added with a warning'
 }
 T 'sync: box projects missing on the laptop are found (OneDrive Desktop, names with spaces and brackets, several matches) or cloned (default folder, empty folder); wrong origin and non-git folders are refused; config keeps its other keys' {
   $w = New-World 'syn1'
@@ -1334,8 +1404,10 @@ T 'sync: box projects missing on the laptop are found (OneDrive Desktop, names w
   [IO.File]::WriteAllText($cfgFile, "{`r`n  `"instabox`": $(ConvertTo-JsonStr $Cmd),`r`n  `"box`": `"coder`",`r`n  `"syncRepos`": [],`r`n  `"ipaTag`": `"latest`"`r`n}`r`n")
   $env0 = @{ FCODE_DESKTOP = $desk; FCODE_DOCUMENTS = $docs; FCODE_GITHUB_BASE = $gh }
   # box order: alpha (one found), beta (two found: pick 2), delta (none: Enter = default), gamma (none: wrong origin, not git, then an empty folder)
-  $r = Invoke-Fcode $w @('sync') $env0 ("`n2`n`n" + "$wrong`n$nongit`n$empty`n")
+  $r = Invoke-Fcode $w @('sync') $env0 ("`n2`n`n" + "$wrong`n$nongit`nC:\a|b`n$empty`n")
   Eq $r.Code 0 $r.Out
+  Ok ($r.Out -match 'đường dẫn không hợp lệ\. Chọn thư mục khác') 'a bad pasted path is refused and asked again (Windows PowerShell 5.1)'
+  Eq ([IO.File]::ReadAllBytes($cfgFile)[0]) 0x7B 'no BOM before: none written'
   Ok ($r.Out -match [regex]::Escape("Đã tìm bản có sẵn trong: $desk (4 cấp)")) ("where it looked; out: " + $r.Out)
   Ok ($r.Out -match [regex]::Escape("Đã có owner/alpha ở $desk\New folder (2)\alpha")) 'one found: offered'
   Ok ($r.Out -match 'Có 2 bản owner/beta') 'several found: listed'
@@ -1349,6 +1421,51 @@ T 'sync: box projects missing on the laptop are found (OneDrive Desktop, names w
   Ok ($r.Out -match '== beta \[old\]' -and $r.Out -match '== delta' -and $r.Out -match 'main: đã mới nhất') 'synced at once'
   $r = Invoke-Fcode $w @('sync') $env0
   Eq $r.Code 0 $r.Out; Ok ($r.Out -notmatch 'chưa có trên laptop') 'second run: nothing to add, nothing asked'
+  # r5: config.json BOM kept only when it was there; "syncRepos": null / a string is replaced, never a second key
+  $CfgBroken = $false
+  $cases = @(
+    @{ N = 'bom'; Pre = [byte[]](0xEF, 0xBB, 0xBF); Body = "{`r`n  `"box`": `"coder`",`r`n  `"syncRepos`": [`"C:\\x`"]`r`n}`r`n"; Want = @('C:\x', 'C:\new dir') },
+    @{ N = 'nobom'; Pre = [byte[]]@(); Body = "{ `"box`": `"coder`", `"syncRepos`": [] }"; Want = @('C:\new dir') },
+    @{ N = 'null'; Pre = [byte[]]@(); Body = "{ `"box`": `"coder`", `"syncRepos`": null }"; Want = @('C:\new dir') },
+    @{ N = 'string'; Pre = [byte[]](0xEF, 0xBB, 0xBF); Body = "{ `"syncRepos`": `"C:\\old`", `"box`": `"coder`" }"; Want = @('C:\old', 'C:\new dir') })
+  foreach ($c in $cases) {
+    $ConfigFile = Join-Path $w.W "cfg-$($c.N).json"
+    [IO.File]::WriteAllBytes($ConfigFile, [byte[]](@($c.Pre) + @($utf8.GetBytes($c.Body))))
+    Add-SyncRepoConfig 'C:\new dir'
+    $b = [IO.File]::ReadAllBytes($ConfigFile)
+    Eq (($b[0..2] | ForEach-Object { '{0:X2}' -f $_ }) -join ' ') $(if ($c.Pre.Length) { 'EF BB BF' } else { (($utf8.GetBytes($c.Body)[0..2] | ForEach-Object { '{0:X2}' -f $_ }) -join ' ') }) "$($c.N): first bytes"
+    $t = $utf8.GetString($b); if ($c.Pre.Length) { $t = $t.Substring(1) }
+    Eq ([regex]::Matches($t, '"syncRepos"').Count) 1 "$($c.N): one syncRepos key"
+    $j = $t | ConvertFrom-Json; Eq (@($j.syncRepos) -join '|') ($c.Want -join '|') "$($c.N): syncRepos"; Eq $j.box 'coder' "$($c.N): other key kept"
+  }
+  # r5: a bad pasted path never throws, on this edition too
+  foreach ($p in 'C:\a:b', 'C:\a|b', 'C:\x\D?esktop\p', 'C:\a<b', 'C:\a"b', 'C:\a*') {
+    $v = Test-SyncFolder $p 'owner/x'; Ok (-not $v.Ok) "refused: $p"; Eq $v.Why 'đường dẫn không hợp lệ' "why: $p"
+  }
+}
+T 'sync r5: a search root that is itself a git checkout is searched inside; roots not reached in time are marked "(chưa tìm)"' {
+  $d = Join-Path $Root 'fl\desk'; New-GitDir $d; & git -C $d remote add origin https://github.com/me/dotfiles.git
+  New-GitDir (Join-Path $d 'sub\alpha'); & git -C (Join-Path $d 'sub\alpha') remote add origin https://github.com/Owner/Alpha.git
+  $docs = Join-Path $Root 'fl\docs'; $prof = Join-Path $Root 'fl\profile'; [void](New-Item -ItemType Directory -Force -Path $docs, $prof)
+  $save = @{}; foreach ($k in 'FCODE_DESKTOP', 'FCODE_DOCUMENTS', 'FCODE_FIND_SEC', 'USERPROFILE') { $save[$k] = [Environment]::GetEnvironmentVariable($k) }
+  [Environment]::SetEnvironmentVariable('FCODE_DESKTOP', $d); [Environment]::SetEnvironmentVariable('FCODE_DOCUMENTS', $docs); [Environment]::SetEnvironmentVariable('USERPROFILE', $prof)
+  $SyncRepos = @()
+  try {
+    $f = Find-LocalClones @{ 'owner/alpha' = $true }
+    Eq (@($f.Found['owner/alpha']) -join '|') (Join-Path $d 'sub\alpha') 'found inside a root that is a git checkout'
+    Ok (@($f.Where)[0] -eq "$d (4 cấp)") ("where: " + ($f.Where -join '; '))
+    [Environment]::SetEnvironmentVariable('FCODE_FIND_SEC', '0')
+    $f = Find-LocalClones @{ 'owner/alpha' = $true }
+    Ok (@($f.Where | Where-Object { $_ -match 'cấp\)$' }).Count -eq 0) ("no root claimed as searched: " + ($f.Where -join '; '))
+    Ok (@($f.Where | Where-Object { $_ -eq "$d (chưa tìm)" }).Count -eq 1 -and @($f.Where)[-1] -match 'chưa tìm hết') ("marked: " + ($f.Where -join '; '))
+  } finally { foreach ($k in $save.Keys) { [Environment]::SetEnvironmentVariable($k, $(if ($null -eq $save[$k]) { [NullString]::Value } else { $save[$k] })) } }
+}
+T 'sync r5: the box `projects` call has its own short deadline; a stalled answer does not hang `fcode sync`' {
+  $w = New-World 'syn3'
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  $r = Invoke-Fcode $w @('sync') @{ FAKE_SSH_CUT = 'projects:1:0:stall'; FCODE_PHIEN_TIMEOUT = '4' }
+  Ok ($sw.Elapsed.TotalSeconds -lt 40) "returned in $([int]$sw.Elapsed.TotalSeconds) s"
+  Ok ($r.Out -match 'không đọc được danh sách project trên box') ("told; out: " + $r.Out)
 }
 
 # ============================== scheduled task (hidden) ==============================

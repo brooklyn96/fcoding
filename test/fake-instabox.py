@@ -6,7 +6,7 @@
 #   FAKE_LS=fail|bad|nostate          ls --json: loi (exit 1) | khong phai JSON | box khong co trang thai
 #   FAKE_SSH_FAIL=1                   moi ssh loi ngay
 #   FAKE_SSH_FAIL_AFTER=<n>           ssh loi tu lan thu n+1
-#   FAKE_SSH_CUT=<lenh>:<lan>:<byte>:<kieu>   lan goi thu <lan> (hoac * = moi lan) cua <lenh> (put|get): sau <byte> byte (put: stdin, get: stdout)
+#   FAKE_SSH_CUT=<lenh>:<lan>:<byte>:<kieu>   lan goi thu <lan> (hoac * = moi lan) cua <lenh> (put|get|scan|hash|projects): sau <byte> byte (put: stdin, cac lenh khac: stdout)
 #   ssh voi script base64 (Invoke-BoxScript: fcode add / pair): chay script bang bash cua Git for Windows
 #                                     kieu cut = cat ngang va loi; stall = dung han (khong doc / khong gui nua, cho toi 60 s);
 #                                     fail = khong chay chuong trinh, thoat 1 (loi o box, khong phai mat ket noi)
@@ -109,7 +109,7 @@ if a and a[0] == 'ssh':
     try:
         while True:
             want = 1 << 16
-            if cmd == 'get' and mode in ('cut', 'stall'):
+            if cmd != 'put' and mode in ('cut', 'stall'):   # get, scan, hash, projects: cut the answer
                 want = min(want, limit - n[1])
                 if want <= 0:
                     if mode == 'stall':
