@@ -26,7 +26,7 @@ if ($errs.Count) { throw "fcode.ps1 does not parse: $($errs[0].Message)" }
 $wanted = 'Test-WinPath', 'Resolve-OmpPath', 'Get-OmpUnder', 'Join-OmpName', 'Get-OmpEncodedDir', 'ConvertTo-Epoch', 'Convert-OmpCwd', 'ConvertTo-JsonStr',
   'Get-OmpHeaderSpan', 'Open-ShareRead', 'Read-Head', 'Get-OmpBodyOff', 'Test-OmpNonEmpty', 'Get-RangeSha', 'Get-PhienOff', 'Test-PhienPrefix', 'Get-PhienKnownVersions', 'Test-PhienKnownVersion', 'Get-OmpHeaderVersion', 'Get-OmpHeaderInfo', 'Get-PhienVersionNote', 'Get-PhienUnknownNote', 'Get-PhienNoteRx', 'Get-PhienNoteSpecs', 'Invoke-GitQuiet', 'Get-PhienLocalNotes', 'Get-PhienNotePlan', 'Get-PhienNoteStatePath', 'Read-PhienNoteState', 'Write-PhienNoteState', 'Add-PhienNoteExclude', 'Install-PhienNote',
   'Copy-OmpSession', 'Get-OmpBlobRefs', 'Get-OmpBlobIndex', 'Get-PhienLocalScan', 'Compare-PhienFile', 'Get-PhienPlan', 'Install-PhienFile',
-  'Install-PhienTask', 'Remove-PhienTask', 'New-PhienPartName', 'Get-PhienBoxBlobSet'
+  'Install-PhienTask', 'Remove-PhienTask', 'New-PhienPartName', 'Get-PhienBoxBlobSet', 'New-PhienBatch', 'Get-PhienBatch', 'Remove-PhienNoteExclude'
 foreach ($fn in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in $wanted }, $true)) { . ([scriptblock]::Create($fn.Extent.Text)) }
 $pyAssign = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$PhienPy' }, $true)
 Invoke-Expression $pyAssign.Extent.Text
@@ -328,6 +328,45 @@ T 'notes: install refuses when the target changed, is busy or is tracked' {
   Put-File "$d\CLAUDE.md" 'tracked'; Git-Commit $d @('CLAUDE.md')
   Eq (Install-PhienNote $src $d 'CLAUDE.md' '' $n) 'tracked'
   Ok (-not (Get-ChildItem $d -Filter '*.fcode-part*' -Force)) 'no part files'
+}
+T 'batches: <= 50 MB per tar stream, a bigger single item gets its own batch' {
+  $bs = New-Object System.Collections.ArrayList
+  foreach ($mb in 30, 30, 10, 60, 1, 49, 2) { $b = Get-PhienBatch $bs 'R' ([long]$mb * 1MB); [void]$b.Items.Add($mb) }
+  Eq (($bs | ForEach-Object { ($_.Items -join '+') }) -join ' | ') '30 | 30+10 | 60 | 1+49 | 2' 'grouping'
+  Ok (@($bs | Where-Object { $_.Bytes -gt 50MB -and $_.Items.Count -gt 1 }).Count -eq 0) 'only a lone item may pass 50 MB'
+  Eq (($bs | ForEach-Object { $_.Dir }) -join ',') 'R\put0,R\put1,R\put2,R\put3,R\put4' 'own dir per batch'
+  $z = New-Object System.Collections.ArrayList; $b0 = Get-PhienBatch $z 'R' 0; Eq $z.Count 1 'a zero-size add still gives a batch (notes ensure / unexclude)'
+}
+T 'notes planner: release when git starts tracking a name that fcode placed and excluded on the other side' {
+  $now = ConvertTo-Epoch (Get-Date)
+  # tracked on the laptop now, the box copy was placed by fcode (marker) -> release on the box
+  $p = Get-PhienNotePlan 'proj' (NS @((Nt 'A.md' 'a1')) @('A.md')) (NS @((Nt 'A.md' 'a1'))) @{ 'exclude:box:proj/A.md' = '1'; 'proj/A.md' = 'a1' } $now $now
+  Eq (($p.Release | ForEach-Object { "$($_.Name):$($_.TrackedOn):$($_.OldOn)" }) -join ',') 'A.md:laptop:box'; Eq ($p.Put.Count + $p.Get.Count) 0 'and it is not synced any more'
+  # tracked on the box, the laptop copy came from the box (marker) -> release on the laptop
+  $p = Get-PhienNotePlan 'proj' (NS @((Nt 'B.md' 'b1'))) (NS @((Nt 'B.md' 'b1')) @('B.md')) @{ 'exclude:laptop:proj/B.md' = '1' } $now $now
+  Eq (($p.Release | ForEach-Object { "$($_.Name):$($_.TrackedOn):$($_.OldOn)" }) -join ',') 'B.md:box:laptop'
+  # no marker = the exclude line was not ours (or git ignored it already): nothing to give back
+  $p = Get-PhienNotePlan 'proj' (NS @((Nt 'C.md' 'c1')) @('C.md')) (NS @((Nt 'C.md' 'c1'))) @{} $now $now; Eq $p.Release.Count 0
+  # marker for the other side only, or tracked on both sides: nothing
+  $p = Get-PhienNotePlan 'proj' (NS @((Nt 'D.md' 'd1')) @('D.md')) (NS @((Nt 'D.md' 'd1'))) @{ 'exclude:laptop:proj/D.md' = '1' } $now $now; Eq $p.Release.Count 0
+  $p = Get-PhienNotePlan 'proj' (NS @((Nt 'E.md' 'e1')) @('E.md')) (NS @((Nt 'E.md' 'e1')) @('E.md')) @{ 'exclude:box:proj/E.md' = '1' } $now $now; Eq $p.Release.Count 0
+}
+T 'notes: Add returns true only when it added the line; Remove takes out only that exact line' {
+  $d = Join-Path $Root 'nt5'; New-GitDir $d; Put-File "$d\HANDOFF-a.md" 'a'; Put-File "$d\HANDOFF-ab.md" 'ab'
+  $ex = "$d\.git\info\exclude"
+  [IO.File]::WriteAllText($ex, "# my own comment`n/HANDOFF-ab.md`n/other.txt`n")
+  Eq (Add-PhienNoteExclude $d 'HANDOFF-a.md') $true; Eq (Add-PhienNoteExclude $d 'HANDOFF-a.md') $false 'second time: already ignored'
+  Eq (Add-PhienNoteExclude $d 'HANDOFF-ab.md') $false 'a pre-existing line is not ours'
+  Eq (Remove-PhienNoteExclude $d 'HANDOFF-a.md') $true
+  $t = Get-Content $ex -Raw
+  Ok ($t -notmatch '(?m)^/HANDOFF-a\.md\r?$') 'our line is gone'
+  Ok ($t -match '(?m)^/HANDOFF-ab\.md\r?$' -and $t -match '(?m)^/other\.txt\r?$' -and $t -match '# my own comment') 'every other line stays (also the one with the same prefix)'
+  Eq (Remove-PhienNoteExclude $d 'HANDOFF-a.md') $false 'nothing left to remove'
+}
+function Grow-Sess([string]$Path, [int]$MB) {
+  $line = $utf8.GetBytes('{"type":"message","id":"pad","parentId":null,"timestamp":"2026-10-25T16:18:29.000Z","message":{"role":"user","content":"' + ('x' * 100000) + '"}}' + "`n")
+  $fs = [IO.File]::Open($Path, 'Append'); try { for ($i = 0; $i -lt $MB * 10; $i++) { $fs.Write($line, 0, $line.Length) } } finally { $fs.Dispose() }
+  Set-Age $Path 600
 }
 # ============================== install (place) rules ==============================
 T 'install: new / same / replaced (only when target is a prefix) / skip / busy; no overwrite of diverged' {
@@ -834,6 +873,72 @@ T 'P3: temp names are unique per run and no part file is left behind' {
   [void](New-Item -ItemType Directory -Path $D -Force); [IO.File]::WriteAllText("$dst.fcode-part", 'stale part of an older version, locked')
   $lock = [IO.File]::Open("$dst.fcode-part", 'Open', 'ReadWrite', 'None')
   try { Eq (Install-PhienFile $f $dst '/d/p' 'C:\q' (ConvertTo-Epoch (Get-Date))) 'new' 'a stale/locked old-style part name no longer gets in the way' } finally { $lock.Dispose() }
+}
+T 'e2e: git starts tracking a note fcode had placed and excluded: sync stops for it, only fcode''s own exclude line is given back, nothing is deleted' {
+  $w = New-World 'e2e13'
+  [void](New-Item -ItemType Directory -Path (Join-Path $w.U 'Desktop\other'), (Join-Path $w.U 'Desktop\notonbox') -Force)
+  New-GitDir $w.LP; New-GitDir $w.BP
+  foreach ($d in $w.LP, $w.BP) { [IO.File]::WriteAllText("$d\.git\info\exclude", "# my own comment`n/user-ignored.txt`n") }
+  Put-File "$($w.LP)\HANDOFF-lap.md" 'from laptop'          # laptop -> box (box side gets an exclude line from fcode)
+  Put-File "$($w.BP)\HANDOFF-box.md" 'from box'            # box -> laptop (laptop side gets an exclude line from fcode)
+  Put-File "$($w.LP)\TASK.md" 'task'; [IO.File]::AppendAllText("$($w.BP)\.git\info\exclude", "/TASK.md`n")   # box already ignores TASK.md by the user's own line
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
+  Ok ((Get-Content "$($w.BP)\.git\info\exclude" -Raw) -match '(?m)^/HANDOFF-lap\.md\r?$') 'box exclude has our line'
+  Ok ((Get-Content "$($w.LP)\.git\info\exclude" -Raw) -match '(?m)^/HANDOFF-box\.md\r?$') 'laptop exclude has our line'
+  $st = Get-Content (Join-Path $w.U 'AppData\Local\fcode\handoff-state.json') -Raw | ConvertFrom-Json
+  Ok ($null -ne $st.PSObject.Properties['exclude:box:proj/HANDOFF-lap.md'] -and $null -ne $st.PSObject.Properties['exclude:laptop:proj/HANDOFF-box.md']) 'markers recorded for the lines fcode added'
+  Ok ($null -eq $st.PSObject.Properties['exclude:box:proj/TASK.md']) 'no marker for a line that was the user''s'
+  # B: the laptop starts tracking HANDOFF-lap.md and TASK.md (upstream began to carry them)
+  Git-Commit $w.LP @('HANDOFF-lap.md', 'TASK.md')
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
+  Ok ($r.Out -match 'ghi chú HANDOFF-lap\.md giờ do git theo dõi \(trên laptop\): bản cũ trên box xóa được') ("one line for the user; out: " + $r.Out)
+  Ok ($r.Out -notmatch 'TASK\.md giờ do git') 'no line for a name whose exclude was not ours'
+  $bx = Get-Content "$($w.BP)\.git\info\exclude" -Raw
+  Ok ($bx -notmatch '(?m)^/HANDOFF-lap\.md\r?$') 'our line removed on the box'
+  Ok ($bx -match '(?m)^/TASK\.md\r?$' -and $bx -match '(?m)^/user-ignored\.txt\r?$' -and $bx -match '# my own comment') 'every other line stays'
+  Eq (Get-Content "$($w.BP)\HANDOFF-lap.md" -Raw) 'from laptop' 'the old copy is not deleted'
+  $st = Get-Content (Join-Path $w.U 'AppData\Local\fcode\handoff-state.json') -Raw | ConvertFrom-Json
+  Ok ($null -eq $st.PSObject.Properties['exclude:box:proj/HANDOFF-lap.md'] -and $null -eq $st.PSObject.Properties['proj/HANDOFF-lap.md']) 'state forgets the name'
+  $sj = Get-Content (Join-Path $w.U 'AppData\Local\fcode\phien-status.json') -Raw | ConvertFrom-Json
+  Eq (@($sj.notes.released) -join ',') 'proj/HANDOFF-lap.md' 'status lists it'
+  $m = Invoke-Fcode $w @(); Ok ($m.Out -match 'Ghi chú dự án: git đã theo dõi 1 file') ("menu warns; out: " + $m.Out)
+  # it is no longer synced: a change on the tracked side does not travel, and the line is not printed again
+  Put-File "$($w.LP)\HANDOFF-lap.md" 'changed on the laptop (tracked now)'
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
+  Eq (Get-Content "$($w.BP)\HANDOFF-lap.md" -Raw) 'from laptop' 'no longer synced'
+  Ok ($r.Out -notmatch 'giờ do git theo dõi') 'said once'
+  # A: the box starts tracking HANDOFF-box.md
+  Git-Commit $w.BP @('HANDOFF-box.md')
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
+  Ok ($r.Out -match 'ghi chú HANDOFF-box\.md giờ do git theo dõi \(trên box\): bản cũ trên laptop xóa được') ("line for the laptop side; out: " + $r.Out)
+  $lx = Get-Content "$($w.LP)\.git\info\exclude" -Raw
+  Ok ($lx -notmatch '(?m)^/HANDOFF-box\.md\r?$') 'our line removed on the laptop'
+  Ok ($lx -match '(?m)^/user-ignored\.txt\r?$' -and $lx -match '# my own comment') 'laptop: other lines stay'
+  Eq (Get-Content "$($w.LP)\HANDOFF-box.md" -Raw) 'from box' 'laptop copy not deleted'
+}
+T 'e2e: sending is split into <= 50 MB batches (one ssh each); a failing batch leaves the rest for the next run' {
+  $w = New-World 'e2e11'
+  [void](New-Item -ItemType Directory -Path (Join-Path $w.U 'Desktop\other'), (Join-Path $w.U 'Desktop\notonbox') -Force)
+  $a = New-Sess $w.LS 'aaaa1111-big1' $w.LP @('a'); Grow-Sess $a 30
+  $b = New-Sess $w.LS 'bbbb2222-big2' $w.LP @('b'); Grow-Sess $b 30
+  $c = New-Sess $w.LS 'cccc3333-sml3' $w.LP @('c'); Grow-Sess $c 10
+  $delta = $w.BP.Length - (ConvertTo-JsonStr $w.LP).Length + 2
+  $n0 = SshCount $w; $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
+  Eq ((SshCount $w) - $n0) 3 'one scan + two put streams (30 MB | 30+10 MB)'
+  foreach ($x in $a, $b, $c) { $bx = Join-Path $w.BS (Split-Path $x -Leaf); Ok (Test-Path $bx) "on the box: $(Split-Path $x -Leaf)"; Eq (Get-Item $bx).Length ((Get-Item $x).Length + $delta) 'complete' }
+  # a failing second batch: the first one is already on the box, the rest comes with the next run
+  $w2 = New-World 'e2e12'
+  [void](New-Item -ItemType Directory -Path (Join-Path $w2.U 'Desktop\other'), (Join-Path $w2.U 'Desktop\notonbox') -Force)
+  $p1 = New-Sess $w2.LS 'aaaa1111-fst1' $w2.LP @('a'); Grow-Sess $p1 30
+  $p2 = New-Sess $w2.LS 'bbbb2222-snd2' $w2.LP @('b'); Grow-Sess $p2 30
+  $r = Invoke-Fcode $w2 @('phien') @{ FAKE_SSH_FAIL_AFTER = [string]((SshCount $w2) + 2) }
+  Eq $r.Code 1 $r.Out
+  Ok (Test-Path (Join-Path $w2.BS (Split-Path $p1 -Leaf))) 'first batch arrived'
+  Ok (-not (Test-Path (Join-Path $w2.BS (Split-Path $p2 -Leaf)))) 'second batch did not'
+  Ok ($r.Out -match 'gửi phiên lên box không thành công') 'told'
+  $r = Invoke-Fcode $w2 @('phien'); Eq $r.Code 0 $r.Out
+  Ok (Test-Path (Join-Path $w2.BS (Split-Path $p2 -Leaf))) 'the next run sent the rest'
+  Ok (-not (Get-ChildItem (Join-Path $w2.U 'AppData\Local\Temp') -Directory -Filter 'fcode-phien-*' -ErrorAction SilentlyContinue)) 'staging dirs are removed'
 }
 # ============================== scheduled task (hidden) ==============================
 T 'task scheduler: registers a headless every-10-minutes task and the action shows no window' {

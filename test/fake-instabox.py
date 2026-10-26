@@ -16,6 +16,10 @@ if a and a[0] == 'ssh':
         sys.stderr.write('fake-instabox: ssh failed\n')
         sys.exit(255)
     log = os.environ.get('FAKE_SSH_LOG')
+    after = os.environ.get('FAKE_SSH_FAIL_AFTER')
+    if after and log and os.path.exists(log) and len(open(log).read().split()) >= int(after):
+        sys.stderr.write('fake-instabox: ssh failed (after n calls)\n')
+        sys.exit(255)
     if log:
         with open(log, 'a') as f:
             f.write('ssh\n')

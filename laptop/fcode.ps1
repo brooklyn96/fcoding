@@ -1112,16 +1112,27 @@ def scan_notes(d):
     return {'gitok': True, 'tracked': sorted(t), 'files': files}
 
 
+LAST_EXCL = [False]
+
+
+def exclude_path(d):
+    r = git(d, 'rev-parse', '--git-path', 'info/exclude')
+    if r is None or r.returncode != 0:
+        return None
+    p = r.stdout.decode('utf-8', 'replace').strip()
+    return p if os.path.isabs(p) else os.path.join(d, p)
+
+
 def ensure_excluded(d, name):
-    # dong "/<ten>" trong .git/info/exclude (khong dung .gitignore) neu git chua bo qua file nay
+    # dong "/<ten>" trong .git/info/exclude (khong dung .gitignore) neu git chua bo qua file nay.
+    # LAST_EXCL[0] = True chi khi LAN GOI NAY them dong (laptop ghi lai, de sau nay chi go dung dong do)
+    LAST_EXCL[0] = False
     ig = git(d, 'check-ignore', '-q', '--', name)
     if ig is None or ig.returncode == 0:
         return
-    r = git(d, 'rev-parse', '--git-path', 'info/exclude')
-    if r is None or r.returncode != 0:
+    p = exclude_path(d)
+    if not p:
         return
-    p = r.stdout.decode('utf-8', 'replace').strip()
-    p = p if os.path.isabs(p) else os.path.join(d, p)
     os.makedirs(os.path.dirname(p), exist_ok=True)
     cur = ''
     if os.path.exists(p):
@@ -1131,7 +1142,22 @@ def ensure_excluded(d, name):
         return
     with open(p, 'a', encoding='utf-8') as f:
         f.write(('' if not cur or cur.endswith('\n') else '\n') + '/' + name + '\n')
+    LAST_EXCL[0] = True
 
+
+def unexclude(d, name):
+    # go DUNG dong "/<ten>" (dong ensure_excluded da them); moi dong khac giu nguyen
+    p = exclude_path(d)
+    if not p or not os.path.exists(p):
+        return False
+    with open(p, encoding='utf-8', errors='replace', newline='') as f:
+        cur = f.read()
+    new = re.sub(r'(?m)^/' + re.escape(name) + r'\r?(?:\n|\Z)', '', cur)
+    if new == cur:
+        return False
+    with open(p, 'w', encoding='utf-8', newline='') as f:
+        f.write(new)
+    return True
 
 def part_name(p):
     # ten tam rieng cho tung lan chay (hai lan chay cung luc khong dam len nhau)
@@ -1400,21 +1426,35 @@ def cmd_put(_req):
                     cnt['blobs'] += 1
         projs = cfg_projects()
         placed = []
+        excl = []
         for it in man.get('notes', []):
             pn, name = it.get('project'), it.get('name')
             d = note_dir(projs, pn)
             if not d or not isinstance(name, str) or not NOTE_RX.match(name):
                 continue
             src = os.path.join(stage, 'notes', pn, name)
+            LAST_EXCL[0] = False
             if os.path.isfile(src) and place_note(d, name, src, it.get('expect') or '', it.get('sha') or '') == 'ok':
                 placed.append(pn + '/' + name)
+                if LAST_EXCL[0]:
+                    excl.append(pn + '/' + name)
         for it in man.get('ensure', []):
             pn, name = it.get('project'), it.get('name')
             d = note_dir(projs, pn)
             t = tracked_names(d) if d else None
             if d and t is not None and isinstance(name, str) and NOTE_RX.match(name) and name not in t and os.path.isfile(os.path.join(d, name)):
                 ensure_excluded(d, name)
+                if LAST_EXCL[0]:
+                    excl.append(pn + '/' + name)
+        unexcl = []
+        for it in man.get('unexclude', []):
+            pn, name = it.get('project'), it.get('name')
+            d = note_dir(projs, pn)   # the other side tracks the name now; the laptop only asks for it when it recorded that THIS line is fcode's
+            if d and isinstance(name, str) and NOTE_RX.match(name) and unexclude(d, name):
+                unexcl.append(pn + '/' + name)
         cnt['notePlaced'] = placed
+        cnt['exclAdded'] = excl
+        cnt['unexcluded'] = unexcl
         out_json(cnt)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
@@ -1824,6 +1864,20 @@ function Install-PhienFile([string]$Src, [string]$Dst, [string]$From, [string]$T
 }
 
 
+# --- chia gui len box thanh tung dot <= 50 MB moi luong tar (mot dot = mot lan ssh) ---
+$PhienBatchBytes = 52428800
+function New-PhienBatch([string]$Dir) {
+  [pscustomobject]@{ Dir = $Dir; Bytes = [long]0; Items = (New-Object System.Collections.ArrayList); Notes = (New-Object System.Collections.ArrayList)
+    Ensure = (New-Object System.Collections.ArrayList); Unexclude = (New-Object System.Collections.ArrayList); Refs = @{} }
+}
+# dot hien tai neu con cho cho them $Add byte, khong thi mo dot moi (mot muc lon hon 50 MB tu thanh mot dot rieng)
+function Get-PhienBatch($Batches, [string]$Root, [long]$Add, [long]$Limit = 52428800) {
+  $cur = if ($Batches.Count) { $Batches[$Batches.Count - 1] } else { $null }
+  if (-not $cur -or ($cur.Bytes -gt 0 -and $cur.Bytes + $Add -gt $Limit)) { $cur = New-PhienBatch (Join-Path $Root ('put' + $Batches.Count)); [void]$Batches.Add($cur) }
+  $cur.Bytes += $Add
+  $cur
+}
+
 # --- noi chuyen voi box ---
 function Test-BoxRunning {
   try {
@@ -1925,7 +1979,7 @@ function Write-PhienStatus([hashtable]$Stat, [bool]$Auto) {
       at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'); ok = [bool]$Stat.ok; copied = [int]$Stat.copied; skipped = [int]$Stat.skipped
       diverged = [int]$Stat.diverged; unknownFormat = @($Stat.unknown | ForEach-Object { [string]$_.Id } | Sort-Object -Unique)
       ompLaptop = [string]$Stat.ompL; ompBox = [string]$Stat.ompB; auto = $Auto
-      notes = [ordered]@{ copied = [int]$Stat.noteCopied; conflicts = @($Stat.noteConf) } }
+      notes = [ordered]@{ copied = [int]$Stat.noteCopied; conflicts = @($Stat.noteConf); released = @($Stat.noteReleased) } }
     [IO.File]::WriteAllText($p, ($o | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
   } catch { }
 }
@@ -1937,6 +1991,7 @@ function Get-PhienWarning {
     $s = [IO.File]::ReadAllText($p) | ConvertFrom-Json
     if (@($s.unknownFormat).Count -gt 0) { return "Cảnh báo: omp đổi định dạng phiên, $(@($s.unknownFormat).Count) phiên chưa đồng bộ. Hãy báo Claude." }
     if ($s.auto -and -not $s.ok) { return 'Cảnh báo: lần tự động đồng bộ phiên omp gần nhất bị lỗi. Chạy fcode phien để xem.' }
+    if (@($s.notes.released).Count -gt 0) { return "Ghi chú dự án: git đã theo dõi $(@($s.notes.released).Count) file, bản cũ xóa được (chạy fcode phien để xem tên)." }
   } catch { }
 }
 
@@ -1960,7 +2015,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
       return 0
     }
   }
-  $stat = @{ ran = $false; ok = $true; copied = 0; skipped = 0; diverged = 0; unknown = @(); ompL = ''; ompB = ''; noteCopied = 0; noteConf = @() }
+  $stat = @{ ran = $false; ok = $true; copied = 0; skipped = 0; diverged = 0; unknown = @(); ompL = ''; ompB = ''; noteCopied = 0; noteConf = @(); noteReleased = @() }
   try {
     $projs = Get-PhienProjects
     if ($projs.Count -eq 0) { Write-PhienOut "Chưa có project nào trong syncRepos ($ConfigFile)."; return 0 }
@@ -2011,14 +2066,14 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
     }
     $putStage = $null; $getStage = $null; $tmpRoot = Join-Path ([IO.Path]::GetTempPath()) ('fcode-phien-' + [guid]::NewGuid().ToString('N'))
     try {
-      $manifest = New-Object System.Collections.ArrayList; $getItems = New-Object System.Collections.ArrayList
-      $putJson = New-Object System.Collections.ArrayList
+      $batches = New-Object System.Collections.ArrayList; $getItems = New-Object System.Collections.ArrayList
+      $notePlanned = 0; $noteDel = New-Object System.Collections.ArrayList
       $laptopBlobDir = Join-Path $agent 'blobs'
       $lblobIx = Get-OmpBlobIndex $laptopBlobDir
-      $putRefs = @{}; $nPutSess = 0; $nGetSess = 0; $nSame = 0
+      $nPutSess = 0; $nGetSess = 0; $nSame = 0
       $plans = @{}
       $noteState = Read-PhienNoteState; $noteRec = @{}; $noteShaPut = @{}; $noteGetInfo = @{}; $noteSkipped = 0
-      $noteManifest = New-Object System.Collections.ArrayList; $noteEnsure = New-Object System.Collections.ArrayList; $noteGet = New-Object System.Collections.ArrayList
+      $noteGet = New-Object System.Collections.ArrayList
       foreach ($c in $ctx) {
         $plan = Get-PhienPlan $c.L $c.R $c.Benc $hashes $c.Lsd $lnow $rnow $PhienBusySec
         $plans[$c.Name] = $plan
@@ -2027,6 +2082,15 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
         $np = Get-PhienNotePlan $c.Name $c.LN $c.RN $noteState $lnow $rnow $PhienBusySec
         foreach ($cf in $np.Conflicts) { $stat.noteConf += $cf }
         foreach ($k in $np.Record.Keys) { $noteRec[$k] = $np.Record[$k] }
+        foreach ($rl in $np.Release) {
+          $stat.noteReleased += "$($c.Name)/$($rl.Name)"
+          Write-PhienOut "  [$($c.Name)] ghi chú $($rl.Name) giờ do git theo dõi (trên $($rl.TrackedOn)): bản cũ trên $($rl.OldOn) xóa được, fcode không còn đồng bộ file này"
+          if (-not $DryRun) {
+            $rk = "$($c.Name)/$($rl.Name)"
+            if ($rl.OldOn -eq 'laptop') { [void](Remove-PhienNoteExclude $c.LDir $rl.Name); [void]$noteDel.Add("exclude:laptop:$rk"); [void]$noteDel.Add($rk) }
+            else { [void]($(Get-PhienBatch $batches $tmpRoot 0).Unexclude.Add(@{ project = $c.Name; name = $rl.Name })) }
+          }
+        }
         if ($DryRun) {
           foreach ($n in $np.Put) { Write-PhienOut "  [$($c.Name)] sẽ gửi lên box: ghi chú $($n.Name)" }
           foreach ($n in $np.Get) { Write-PhienOut "  [$($c.Name)] sẽ lấy về laptop: ghi chú $($n.Name)" }
@@ -2036,28 +2100,30 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
         }
         # ghi chu goc project: chep sang thu muc tam, ghi vao manifest; lay ve thi chi ghi danh sach yeu cau
         foreach ($n in $np.Put) {
-          $nd = Join-Path $tmpRoot ('put\notes\' + $c.Name); [void](New-Item -ItemType Directory -Path $nd -Force)
+          $nb = Get-PhienBatch $batches $tmpRoot ((Get-Item -LiteralPath (Join-Path $c.LDir $n.Name)).Length)
+          $nd = Join-Path $nb.Dir ('notes\' + $c.Name); [void](New-Item -ItemType Directory -Path $nd -Force)
           $ns = Join-Path $nd $n.Name
           Copy-Item -LiteralPath (Join-Path $c.LDir $n.Name) -Destination $ns
           if ((Get-RangeSha $ns 0 (Get-Item -LiteralPath $ns).Length) -ne $n.Sha) { Remove-Item -LiteralPath $ns -Force; $noteSkipped++; continue }   # changed while copying: next run
-          [void]$noteManifest.Add(@{ project = $c.Name; name = $n.Name; expect = $n.Expect; sha = $n.Sha }); $noteShaPut["$($c.Name)/$($n.Name)"] = $n.Sha
+          [void]$nb.Notes.Add(@{ project = $c.Name; name = $n.Name; expect = $n.Expect; sha = $n.Sha }); $noteShaPut["$($c.Name)/$($n.Name)"] = $n.Sha; $notePlanned++
         }
-        foreach ($n in $np.Ensure) { [void]$noteEnsure.Add(@{ project = $c.Name; name = $n }) }
+        foreach ($n in $np.Ensure) { [void]($(Get-PhienBatch $batches $tmpRoot 0).Ensure.Add(@{ project = $c.Name; name = $n })) }
         foreach ($n in $np.Get) { [void]$noteGet.Add(@{ project = $c.Name; name = $n.Name }); $noteGetInfo["$($c.Name)/$($n.Name)"] = $n }
         # gui len box: chep sang thu muc tam (doi cwd), ghi manifest
-        $stageSess = Join-Path $tmpRoot ('put\sessions\' + $c.Benc)
         $lsz = @{}; foreach ($s in @($c.L)) { $lsz[[string]$s.name] = [long]$s.size; foreach ($f in @($s.files)) { $lsz[[string]$f.rel] = [long]$f.size } }
         foreach ($it in $plan.Put) {
           $rels = @(); if ($it.Top) { $rels += $it.Name }; $rels += @($it.Files)
           # a file that shrank since the scan: leave the whole item for the next run
           if (@($rels | Where-Object { (Get-Item -LiteralPath (Join-Path $c.Lsd ($_ -replace '/', '\')) -ErrorAction SilentlyContinue).Length -lt $lsz[$_] }).Count) { $noteSkipped++; continue }
+          $ib = Get-PhienBatch $batches $tmpRoot ([long]($rels | ForEach-Object { $lsz[$_] } | Measure-Object -Sum).Sum)
+          $stageSess = Join-Path $ib.Dir ('sessions\' + $c.Benc)
           foreach ($rel in $rels) {
             $dst = Join-Path $stageSess ($rel -replace '/', '\')
             $src = Join-Path $c.Lsd ($rel -replace '/', '\')
             [void](Copy-OmpSession $src $dst $c.LDir $c.BDir $lsz[$rel])
-            if ($rel.EndsWith('.jsonl')) { $putRefs[$src] = $true }
+            if ($rel.EndsWith('.jsonl')) { $ib.Refs[$src] = $true }
           }
-          [void]$manifest.Add(@{ enc = $c.Benc; top = $(if ($it.Top) { $it.Name } else { $null }); files = @($it.Files); origin = 'laptop' })
+          [void]$ib.Items.Add(@{ enc = $c.Benc; top = $(if ($it.Top) { $it.Name } else { $null }); files = @($it.Files); origin = 'laptop' })
           if ($it.Top) { $nPutSess++ }
         }
         if ($plan.Get.Count -gt 0) {
@@ -2078,28 +2144,35 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
       $vn = Get-PhienVersionNote $stat.ompL $stat.ompB; if ($vn) { Write-PhienOut $vn }
       if ($DryRun) { Write-PhienOut "Chạy thử (--thu): chưa chép và chưa ghi gì cả. $nSame phiên đã giống nhau."; return 0 }
       # --- gui len box ---
-      $putRes = $null; $missingBlobs = 0
-      if ($manifest.Count -gt 0 -or $noteManifest.Count -gt 0 -or $noteEnsure.Count -gt 0) {
-        $bl = Join-Path $tmpRoot 'put\blobs'
-        foreach ($hex in @(Get-OmpBlobRefs @($putRefs.Keys))) {
-          if ($boxBlobs.ContainsKey($hex)) { continue }
+      $putRes = $null; $missingBlobs = 0; $blobSent = @{}; $placedPut = 0
+      foreach ($pb in $batches) {
+        if ($pb.Items.Count -eq 0 -and $pb.Notes.Count -eq 0 -and $pb.Ensure.Count -eq 0 -and $pb.Unexclude.Count -eq 0) { continue }
+        [void](New-Item -ItemType Directory -Path $pb.Dir -Force)
+        $bl = Join-Path $pb.Dir 'blobs'
+        foreach ($hex in @(Get-OmpBlobRefs @($pb.Refs.Keys))) {
+          if ($boxBlobs.ContainsKey($hex) -or $blobSent.ContainsKey($hex)) { continue }
           if (-not $lblobIx.ContainsKey($hex)) { $missingBlobs++; continue }
           [void](New-Item -ItemType Directory -Path $bl -Force)
           foreach ($bn in $lblobIx[$hex]) { Copy-Item -LiteralPath (Join-Path $laptopBlobDir $bn) -Destination (Join-Path $bl $bn) }
+          $blobSent[$hex] = $true
         }
-        $put = Join-Path $tmpRoot 'put'; [void](New-Item -ItemType Directory -Path $put -Force)
-        [IO.File]::WriteAllText((Join-Path $put 'manifest.json'), (@{ items = @($manifest); notes = @($noteManifest); ensure = @($noteEnsure) } | ConvertTo-Json -Compress -Depth 6), (New-Object Text.UTF8Encoding($false)))
-        $tarFile = Join-Path $tmpRoot 'put.tar'
-        & (Find-TarExe) -cf $tarFile -C $put . 2>&1 | Out-Null
+        [IO.File]::WriteAllText((Join-Path $pb.Dir 'manifest.json'), (@{ items = @($pb.Items); notes = @($pb.Notes); ensure = @($pb.Ensure); unexclude = @($pb.Unexclude) } | ConvertTo-Json -Compress -Depth 6), (New-Object Text.UTF8Encoding($false)))
+        $tarFile = $pb.Dir + '.tar'
+        & (Find-TarExe) -cf $tarFile -C $pb.Dir . 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) { throw 'tar không đóng gói được' }
-        $putRes = Get-BoxJson (Invoke-BoxPy 'put' $null $tarFile)
-        if (-not $putRes) { Write-PhienOut 'lỗi: gửi phiên lên box không thành công'; $code = 1 }
-        else {
-          foreach ($k in @($putRes.notePlaced)) { $noteRec[[string]$k] = $noteShaPut[[string]$k]; $stat.noteCopied++ }
-          $noteSkipped += $noteManifest.Count - @($putRes.notePlaced).Count
+        $res = Get-BoxJson (Invoke-BoxPy 'put' $null $tarFile)
+        Remove-Item -LiteralPath $tarFile, $pb.Dir -Recurse -Force -ErrorAction SilentlyContinue   # free the disk before the next batch
+        if (-not $res) {
+          Write-PhienOut 'lỗi: gửi phiên lên box không thành công (các dot sau để lần tới)'; $code = 1
+          break
         }
+        if (-not $putRes) { $putRes = [pscustomobject]@{ new = 0; replaced = 0; same = 0; skip = 0; busy = 0; blobs = 0 } }
+        foreach ($k in 'new', 'replaced', 'same', 'skip', 'busy', 'blobs') { $putRes.$k += [int]$res.$k }
+        foreach ($k in @($res.notePlaced)) { $noteRec[[string]$k] = $noteShaPut[[string]$k]; $stat.noteCopied++; $placedPut++ }
+        foreach ($k in @($res.exclAdded)) { $noteRec["exclude:box:$k"] = '1' }
+        foreach ($k in @($res.unexcluded)) { [void]$noteDel.Add("exclude:box:$k"); [void]$noteDel.Add([string]$k) }
       }
-      # --- lay ve laptop ---
+      $noteSkipped += $notePlanned - $placedPut      # --- lay ve laptop ---
       $getRes = @{ new = 0; replaced = 0; same = 0; skip = 0; busy = 0; blobs = 0 }
       if ($getItems.Count -gt 0 -or $noteGet.Count -gt 0) {
         $req = @{ items = @($getItems); notes = @($noteGet); have = @($lblobIx.Values | ForEach-Object { $_ }) } | ConvertTo-Json -Compress -Depth 6
@@ -2136,7 +2209,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
             $key = "$($n.project)/$($n.name)"; $info = $noteGetInfo[$key]
             if (-not (Test-Path -LiteralPath $src)) { $noteSkipped++; continue }
             $ldirN = ($ctx | Where-Object { $_.Name -eq $n.project } | Select-Object -First 1).LDir
-            if ((Install-PhienNote $src $ldirN $n.name $info.Expect $gnow $PhienBusySec ([string]$info.Sha)) -eq 'ok') { $noteRec[$key] = [string]$info.Sha; $stat.noteCopied++ } else { $noteSkipped++ }
+            if ((Install-PhienNote $src $ldirN $n.name $info.Expect $gnow $PhienBusySec ([string]$info.Sha)) -eq 'ok') { $noteRec[$key] = [string]$info.Sha; $stat.noteCopied++; if ($script:PhienLastExclAdded) { $noteRec["exclude:laptop:$key"] = '1' } } else { $noteSkipped++ }
           }
           $gb = Join-Path $gt 'blobs'
           if (Test-Path -LiteralPath $gb) {
@@ -2161,7 +2234,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
       if ($skipped) { Write-PhienOut "$skipped file được giữ nguyên vì đã khác nhau hoặc đang được ghi" }
       $stat.copied = $up + $down; $stat.skipped = $skipped + @($plans.Values | ForEach-Object { $_.Notes } | Where-Object { $_ -like '*đang được ghi*' }).Count
       if ($stat.noteCopied -or $stat.noteConf.Count) { Write-PhienOut "ghi chú dự án: chép $($stat.noteCopied), xung đột $($stat.noteConf.Count)" }
-      if ($noteRec.Count) { foreach ($k in $noteRec.Keys) { $noteState[$k] = $noteRec[$k] }; try { Write-PhienNoteState $noteState } catch { } }
+      if ($noteRec.Count -or $noteDel.Count) { foreach ($k in $noteRec.Keys) { $noteState[$k] = $noteRec[$k] }; foreach ($k in $noteDel) { $noteState.Remove([string]$k) }; try { Write-PhienNoteState $noteState } catch { } }
       $stat.skipped += $noteSkipped
       Write-PhienOut ("Xong: $up file gửi lên box, $down file lấy về laptop" + $(if ($up + $down -eq 0) { ' (hai bên đã giống nhau)' } else { '' }))
       if (-not $Auto -and ($nPutSess + $nGetSess) -gt 0) { Write-PhienOut 'Nhớ đẩy code lên GitHub trước (git push) để hai bên cùng một bản code.' }
@@ -2219,23 +2292,29 @@ function Get-PhienLocalNotes([string]$Dir) {
 function Get-PhienNotePlan([string]$Proj, $LN, $RN, $State, [double]$LNow, [double]$RNow, [int]$Busy = 30) {
   $put = New-Object System.Collections.ArrayList; $get = New-Object System.Collections.ArrayList
   $ensure = New-Object System.Collections.ArrayList; $conf = New-Object System.Collections.ArrayList; $rec = @{}
+  $release = New-Object System.Collections.ArrayList
   if ($LN.gitok -and $RN.gitok) {
     $tracked = @($LN.tracked) + @($RN.tracked)
     $lm = @{}; foreach ($f in @($LN.files)) { $lm[[string]$f.name] = $f }
     $rm = @{}; foreach ($f in @($RN.files)) { $rm[[string]$f.name] = $f }
+    # git started tracking a name that fcode had placed + excluded on the OTHER side: stop syncing it and give that line back
+    foreach ($n in @($LN.tracked)) { if (-not (@($RN.tracked) -ccontains $n) -and $rm[$n] -and $State["exclude:box:$Proj/$n"]) { [void]$release.Add([pscustomobject]@{ Name = $n; TrackedOn = 'laptop'; OldOn = 'box' }) } }
+    foreach ($n in @($RN.tracked)) { if (-not (@($LN.tracked) -ccontains $n) -and $lm[$n] -and $State["exclude:laptop:$Proj/$n"]) { [void]$release.Add([pscustomobject]@{ Name = $n; TrackedOn = 'box'; OldOn = 'laptop' }) } }
     foreach ($n in @(@($lm.Keys) + @($rm.Keys) | Sort-Object -Unique)) {
       if ($tracked -ccontains $n) { continue }
       $l = $lm[$n]; $r = $rm[$n]; $key = "$Proj/$n"
       if ($l -and -not $r) { if ($LNow - $l.mtime -ge $Busy) { [void]$put.Add([pscustomobject]@{ Name = $n; Expect = ''; Sha = $l.sha }) }; continue }
       if ($r -and -not $l) { if ($RNow - $r.mtime -ge $Busy) { [void]$get.Add([pscustomobject]@{ Name = $n; Expect = ''; Sha = $r.sha }) }; continue }
-      if ($l.sha -eq $r.sha) { $rec[$key] = [string]$l.sha; if (-not $r.ign) { [void]$ensure.Add($n) }; continue }
+      # same content on both: record it; the box gets its exclude line only for files that were identical from the start (no record yet),
+      # never for a file that came from the box itself (the user may want to `git add` it there)
+      if ($l.sha -eq $r.sha) { $rec[$key] = [string]$l.sha; if (-not $r.ign -and -not $State[$key]) { [void]$ensure.Add($n) }; continue }
       $last = [string]$State[$key]
       if ($last -and $last -eq $l.sha) { if ($RNow - $r.mtime -ge $Busy) { [void]$get.Add([pscustomobject]@{ Name = $n; Expect = [string]$l.sha; Sha = $r.sha }) } }
       elseif ($last -and $last -eq $r.sha) { if ($LNow - $l.mtime -ge $Busy) { [void]$put.Add([pscustomobject]@{ Name = $n; Expect = [string]$r.sha; Sha = $l.sha }) } }
       else { [void]$conf.Add($key) }
     }
   }
-  [pscustomobject]@{ Put = @($put); Get = @($get); Ensure = @($ensure); Conflicts = @($conf); Record = $rec }
+  [pscustomobject]@{ Put = @($put); Get = @($get); Ensure = @($ensure); Conflicts = @($conf); Record = $rec; Release = @($release) }
 }
 
 function Get-PhienNoteStatePath { Join-Path $env:LOCALAPPDATA 'fcode\handoff-state.json' }
@@ -2254,18 +2333,34 @@ function Write-PhienNoteState([hashtable]$S) {
   if (Test-Path -LiteralPath $p) { [IO.File]::Replace($tmp, $p, [NullString]::Value) } else { [IO.File]::Move($tmp, $p) }
 }
 
-# them "/<ten>" vao .git/info/exclude (khong dung .gitignore) neu git chua bo qua file
+# them "/<ten>" vao .git/info/exclude (khong dung .gitignore) neu git chua bo qua file. Tra ve $true chi khi LAN NAY them dong
+# (noi goi ghi lai de sau nay chi go dung dong do)
 function Add-PhienNoteExclude([string]$Dir, [string]$Name) {
-  if ((Invoke-GitQuiet $Dir @('check-ignore', '-q', '--', $Name)).Code -eq 0) { return }
+  if ((Invoke-GitQuiet $Dir @('check-ignore', '-q', '--', $Name)).Code -eq 0) { return $false }
   $r = Invoke-GitQuiet $Dir @('rev-parse', '--git-path', 'info/exclude')
   $p = @($r.Out)[0]
-  if ($r.Code -ne 0 -or -not $p) { return }
+  if ($r.Code -ne 0 -or -not $p) { return $false }
   if (-not [IO.Path]::IsPathRooted($p)) { $p = Join-Path $Dir $p }
   $pd = Split-Path -Parent $p
   if (-not (Test-Path -LiteralPath $pd)) { [void](New-Item -ItemType Directory -Path $pd -Force) }
   $cur = if (Test-Path -LiteralPath $p) { [IO.File]::ReadAllText($p) } else { '' }
-  if (@($cur -split '\r?\n') -ccontains ('/' + $Name)) { return }
+  if (@($cur -split '\r?\n') -ccontains ('/' + $Name)) { return $false }
   [IO.File]::AppendAllText($p, $(if ($cur -and -not $cur.EndsWith("`n")) { "`n" } else { '' }) + '/' + $Name + "`n", (New-Object Text.UTF8Encoding($false)))
+  $true
+}
+
+# go DUNG dong "/<ten>" (dong fcode da them); moi dong khac trong .git/info/exclude giu nguyen. Tra ve $true neu da go
+function Remove-PhienNoteExclude([string]$Dir, [string]$Name) {
+  $r = Invoke-GitQuiet $Dir @('rev-parse', '--git-path', 'info/exclude')
+  $p = @($r.Out)[0]
+  if ($r.Code -ne 0 -or -not $p) { return $false }
+  if (-not [IO.Path]::IsPathRooted($p)) { $p = Join-Path $Dir $p }
+  if (-not (Test-Path -LiteralPath $p)) { return $false }
+  $cur = [IO.File]::ReadAllText($p)
+  $new = [regex]::Replace($cur, '(?m)^/' + [regex]::Escape($Name) + '\r?(?:\n|\z)', '')
+  if ($new -ceq $cur) { return $false }
+  [IO.File]::WriteAllText($p, $new, (New-Object Text.UTF8Encoding($false)))
+  $true
 }
 
 # dat mot file ghi chu da lay tu box vao goc project tren laptop. Tra ve: ok | changed | busy | tracked
@@ -2286,7 +2381,7 @@ function Install-PhienNote([string]$Src, [string]$Dir, [string]$Name, [string]$E
     if (Test-Path -LiteralPath $dst) { [IO.File]::Replace($part, $dst, [NullString]::Value) } else { [IO.File]::Move($part, $dst) }
     [IO.File]::SetLastWriteTimeUtc($dst, $mt)
   } finally { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }
-  Add-PhienNoteExclude $Dir $Name
+  $script:PhienLastExclAdded = [bool](Add-PhienNoteExclude $Dir $Name)
   'ok'
 }
 # trang thai che do tu dong (%LOCALAPPDATA%\fcode\phien-auto.json): box dang chay o lan kiem tra truoc, va luc (epoch giay) mo ssh
