@@ -5470,7 +5470,22 @@ test('upload: a client that goes away while the session list is still running gi
   assert.equal((await upPost(c, cookie, 'beta', JPG)).status, 200);
 }));
 
-test('upload: the per-request timer leaves a complete request alone: an SSE stream outlives bodyMs', () => withApp(async (c) => {
+test('upload: a client that goes away while the project stat is still running gives its slot back, twice; the next uploads are 200 (no leak)', () => withUpload(async (c, dirs, cookie) => {
+  const realStat = fs.promises.stat; // the server and the test share this process: slow the stat of the alpha folder only
+  fs.promises.stat = async (p, ...a) => { if (p === dirs.alpha) await sleep(600); return realStat.call(fs.promises, p, ...a); };
+  try {
+    for (let i = 0; i < 2; i++) { // two slots: two leaks would block every later upload
+      const p = partialUpload(c, cookie, 'alpha', JPG); // no session: the stat is the only await before the body
+      await sleep(200); // admitted, the slow stat is running
+      p.req.destroy();
+      await p.done;
+    }
+    await sleep(1000); // both slow stats have ended
+  } finally { fs.promises.stat = realStat; }
+  for (let i = 0; i < 3; i++) assert.equal((await upPost(c, cookie, 'alpha', JPG)).status, 200, `upload ${i}`);
+}));
+
+test('upload: the per-request timer leaves a complete request alone: an SSE stream outlives bodyMs',() => withApp(async (c) => {
   const { cookie } = await c.login();
   await mkSession(c, cookie);
   const s = await openStream(c.port, cookie);

@@ -1759,7 +1759,7 @@ export function createApp(opts = {}) {
   const validName = (n) => typeof n === 'string' && NAME_RE.test(n);
 
   // --- POST /api/projects/<name>/upload?session=<name> (CONTRACT A12) ---
-  // the raw body, at most UPLOAD_LIMIT bytes: past it the 413 is answered at once, reading stops, the bytes so far are dropped, and the
+  // the raw body, at most UPLOAD_LIMIT bytes: past it the 413 is answered at once, the bytes so far are dropped, and the
   // connection is closed after the answer (the rest of the body is never read, see the handler)
   function readUpload(req) {
     return new Promise((resolve, reject) => {
@@ -1768,7 +1768,7 @@ export function createApp(opts = {}) {
       const chunks = []; let size = 0;
       req.on('data', (c) => {
         size += c.length;
-        if (size > UPLOAD_LIMIT) { chunks.length = 0; req.pause(); reject(new HttpErr(413, 'too_big')); return; }
+        if (size > UPLOAD_LIMIT) { chunks.length = 0; reject(new HttpErr(413, 'too_big')); return; }
         chunks.push(c);
       });
       req.on('end', () => resolve(Buffer.concat(chunks)));
