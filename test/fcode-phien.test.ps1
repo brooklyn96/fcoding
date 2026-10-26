@@ -1384,6 +1384,31 @@ T 'add r5: exit 11 (folder exists or unsafe), exit 24 (HOOK_FAIL) stop without a
   }
   Ok ($r.Out -match 'Đã thêm nhưng có 1 mục cần xem lại') 'cleanup failure: added with a warning'
 }
+T 'add r6: re-add (only CFG_EXISTS) is success; CFG_WARN is a warning; exits 25 / 26 stop without a retry; codes that a retry cannot fix never say "chạy lại là an toàn"' {
+  $w = New-World 'add5'; $fa = Join-Path $w.W 'fake-add.sh'
+  $cases = @(
+    @{ B = 'echo "R CFG_EXISTS"; exit 0'; Code = 0; Rx = "'repo' đã có trên box, không cần thêm" },
+    @{ B = 'for c in TOKEN_OK READ_OK CLONED HOOK_OK WRITE_OK CFG_ADDED; do echo "R $c"; done; echo "R CFG_WARN fsync"; for c in V_BRANCH_OK V_PR_OK V_HOOK_OK V_SERVER_OK RULES_NO; do echo "R $c"; done; exit 30'; Code = 1; Rx = 'cảnh báo: đã thêm vào cấu hình FCode[\s\S]*Đã thêm nhưng có 1 mục cần xem lại' },
+    @{ B = 'echo "R TOKEN_OK"; echo "R READ_OK"; echo "R CLONED"; echo "R CRED_FAIL config"; exit 25'; Code = 1; Rx = 'box không ghi được cấu hình đăng nhập GitHub cho repo này' },
+    @{ B = 'echo "R URL_REWRITE rewrite"; exit 26'; Code = 1; Rx = 'cấu hình git trên box đang chuyển hướng địa chỉ GitHub \(insteadOf / pushInsteadOf / pushurl\) — cần gỡ trên box rồi chạy lại' },
+    @{ B = 'echo "R BAD_ARGS"; exit 2'; Code = 1; Rx = 'tên repo hoặc tên project không hợp lệ' },
+    @{ B = 'echo "R KEY_FAIL"; exit 20'; Code = 1; Rx = 'box không tạo được khoá SSH' },
+    @{ B = 'echo "R SOMETHING_NEW x"; exit 77'; Code = 1; Rx = 'Chưa xong \(mã 77\)\. Xem thông báo ở trên\.' })
+  foreach ($c in $cases) {
+    Remove-Item $w.Log -ErrorAction SilentlyContinue
+    New-FakeAdd $fa $c.B
+    $r = Invoke-Fcode $w @('add', 'owner/repo') @{ FCODE_ADD_SCRIPT = (ConvertTo-Posix $fa) }
+    Eq $r.Code $c.Code $r.Out; Ok ($r.Out -match $c.Rx) ("message; out: " + $r.Out)
+    Eq (@(Get-Content $w.Log | Where-Object { $_ -eq 'ssh script' }).Count) 1 'no retry'
+    Ok ($r.Out -notmatch 'chạy lại là an toàn' -or $c.B -match 'CFG_WARN') ("no false retry promise; out: " + $r.Out)
+  }
+}
+T 'sync r6: the 60 s `projects` deadline starts after the box is awake (a slow wake does not eat it)' {
+  $w = New-World 'syn4'
+  $r = Invoke-Fcode $w @('sync') @{ FAKE_WAKE_SLEEP = '5'; FCODE_PHIEN_TIMEOUT = '3' }
+  Ok ($r.Out -notmatch 'không đọc được danh sách project trên box') ("the project list was read; out: " + $r.Out)
+  Eq (@(Get-Content $w.Log | Where-Object { $_ -eq 'ssh projects' }).Count) 1 'asked once'
+}
 T 'sync: box projects missing on the laptop are found (OneDrive Desktop, names with spaces and brackets, several matches) or cloned (default folder, empty folder); wrong origin and non-git folders are refused; config keeps its other keys' {
   $w = New-World 'syn1'
   $gh = Join-Path $w.W 'github-test'; $own = Join-Path $gh 'owner'; [void](New-Item -ItemType Directory -Force -Path $own)
@@ -1427,7 +1452,10 @@ T 'sync: box projects missing on the laptop are found (OneDrive Desktop, names w
     @{ N = 'bom'; Pre = [byte[]](0xEF, 0xBB, 0xBF); Body = "{`r`n  `"box`": `"coder`",`r`n  `"syncRepos`": [`"C:\\x`"]`r`n}`r`n"; Want = @('C:\x', 'C:\new dir') },
     @{ N = 'nobom'; Pre = [byte[]]@(); Body = "{ `"box`": `"coder`", `"syncRepos`": [] }"; Want = @('C:\new dir') },
     @{ N = 'null'; Pre = [byte[]]@(); Body = "{ `"box`": `"coder`", `"syncRepos`": null }"; Want = @('C:\new dir') },
-    @{ N = 'string'; Pre = [byte[]](0xEF, 0xBB, 0xBF); Body = "{ `"syncRepos`": `"C:\\old`", `"box`": `"coder`" }"; Want = @('C:\old', 'C:\new dir') })
+    @{ N = 'string'; Pre = [byte[]](0xEF, 0xBB, 0xBF); Body = "{ `"syncRepos`": `"C:\\old`", `"box`": `"coder`" }"; Want = @('C:\old', 'C:\new dir') },
+    @{ N = 'number'; Pre = [byte[]]@(); Body = "{ `"syncRepos`": 12, `"box`": `"coder`" }"; Want = @('C:\new dir') },
+    @{ N = 'true'; Pre = [byte[]]@(); Body = "{ `"syncRepos`": true, `"box`": `"coder`" }"; Want = @('C:\new dir') },
+    @{ N = 'false'; Pre = [byte[]]@(); Body = "{ `"box`": `"coder`", `"syncRepos`": false }"; Want = @('C:\new dir') })
   foreach ($c in $cases) {
     $ConfigFile = Join-Path $w.W "cfg-$($c.N).json"
     [IO.File]::WriteAllBytes($ConfigFile, [byte[]](@($c.Pre) + @($utf8.GetBytes($c.Body))))
@@ -1438,8 +1466,14 @@ T 'sync: box projects missing on the laptop are found (OneDrive Desktop, names w
     Eq ([regex]::Matches($t, '"syncRepos"').Count) 1 "$($c.N): one syncRepos key"
     $j = $t | ConvertFrom-Json; Eq (@($j.syncRepos) -join '|') ($c.Want -join '|') "$($c.N): syncRepos"; Eq $j.box 'coder' "$($c.N): other key kept"
   }
-  # r5: a bad pasted path never throws, on this edition too
-  foreach ($p in 'C:\a:b', 'C:\a|b', 'C:\x\D?esktop\p', 'C:\a<b', 'C:\a"b', 'C:\a*') {
+  # r6: a config.json that is not UTF-8 is refused and never rewritten
+  $ConfigFile = Join-Path $w.W 'cfg-latin1.json'; $lb = [byte[]](@($utf8.GetBytes('{ "box": "c')) + @(0xE0) + @($utf8.GetBytes('", "syncRepos": [] }')))
+  [IO.File]::WriteAllBytes($ConfigFile, $lb)
+  $msg = ''; try { Add-SyncRepoConfig 'C:\new dir' } catch { $msg = $_.Exception.Message }
+  Eq $msg 'config.json không phải UTF-8, lưu lại dạng UTF-8 rồi chạy lại' 'refused'
+  Eq ([Convert]::ToBase64String([IO.File]::ReadAllBytes($ConfigFile))) ([Convert]::ToBase64String($lb)) 'bytes unchanged'
+  # r5: a bad pasted path never throws, on this edition too (r6: a tab or other control character too)
+  foreach ($p in 'C:\a:b', 'C:\a|b', 'C:\x\D?esktop\p', 'C:\a<b', 'C:\a"b', 'C:\a*', "C:\a`tb", "C:\a$([char]1)b") {
     $v = Test-SyncFolder $p 'owner/x'; Ok (-not $v.Ok) "refused: $p"; Eq $v.Why 'đường dẫn không hợp lệ' "why: $p"
   }
 }
@@ -1455,6 +1489,7 @@ T 'sync r5: a search root that is itself a git checkout is searched inside; root
     Eq (@($f.Found['owner/alpha']) -join '|') (Join-Path $d 'sub\alpha') 'found inside a root that is a git checkout'
     Ok (@($f.Where)[0] -eq "$d (4 cấp)") ("where: " + ($f.Where -join '; '))
     [Environment]::SetEnvironmentVariable('FCODE_FIND_SEC', '0')
+    $SyncRepos = @((Join-Path $d 'proj'))   # its parent is the Desktop root again: listed once
     $f = Find-LocalClones @{ 'owner/alpha' = $true }
     Ok (@($f.Where | Where-Object { $_ -match 'cấp\)$' }).Count -eq 0) ("no root claimed as searched: " + ($f.Where -join '; '))
     Ok (@($f.Where | Where-Object { $_ -eq "$d (chưa tìm)" }).Count -eq 1 -and @($f.Where)[-1] -match 'chưa tìm hết') ("marked: " + ($f.Where -join '; '))

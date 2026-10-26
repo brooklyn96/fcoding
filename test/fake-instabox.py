@@ -11,11 +11,13 @@
 #                                     kieu cut = cat ngang va loi; stall = dung han (khong doc / khong gui nua, cho toi 60 s);
 #                                     fail = khong chay chuong trinh, thoat 1 (loi o box, khong phai mat ket noi)
 #                                     noack = (put) cho chay het roi nuot cau tra loi va bao loi (mat xac nhan)
+#   FAKE_WAKE_SLEEP=<s>               wake takes <s> seconds
 #   FAKE_SSH_LOG=<file>               moi lan ssh mot dong "ssh <lenh>"; <file>.bytes: "<lenh> <byte vao> <byte ra>"
 import base64, json, os, re, subprocess, sys, tempfile, threading, time
 
 a = sys.argv[1:]
 if a and a[0] == 'wake':
+    time.sleep(float(os.environ.get('FAKE_WAKE_SLEEP') or 0))   # a slow cold start
     print('coder: running')
     sys.exit(0)
 if a and a[0] == 'ls':

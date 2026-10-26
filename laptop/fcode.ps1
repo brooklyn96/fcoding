@@ -83,7 +83,7 @@ function Find-LocalClones([hashtable]$Want) {
     if (-not $r.P -or -not (Test-Path -LiteralPath $r.P -PathType Container)) { continue }
     $rp = [IO.Path]::GetFullPath($r.P).TrimEnd('\'); $rk = $rp.ToLowerInvariant()
     if ($seenRoot.ContainsKey($rk) -and $seenRoot[$rk] -ge $r.D) { continue }
-    if ($sw.Elapsed.TotalSeconds -ge $lim) { [void]$where.Add("$rp (chưa tìm)"); continue }
+    if ($sw.Elapsed.TotalSeconds -ge $lim) { $seenRoot[$rk] = $r.D; [void]$where.Add("$rp (chưa tìm)"); continue }
     $seenRoot[$rk] = $r.D; [void]$where.Add("$rp ($($r.D) cấp)")
     $q = New-Object System.Collections.Queue; $q.Enqueue(@($rp, 0))
     while ($q.Count -and $sw.Elapsed.TotalSeconds -lt $lim) {
@@ -112,7 +112,7 @@ function Test-SyncFolder([string]$Path, [string]$Repo) {
   $p = $Path.Trim().Trim('"', "'").Trim()
   if (-not $p -or $p -notmatch '\A([A-Za-z]:\\|\\\\)') { return @{ Ok = $false; Why = 'cần đường dẫn đầy đủ, ví dụ C:\Users\ten\Desktop\du-an' } }
   # ky tu Windows khong cho trong ten (ca hai ban PowerShell); ':' chi duoc sau ky tu o dia
-  if ($p -match '[<>|?*"]' -or $p.Substring(2).Contains(':')) { return @{ Ok = $false; Why = 'đường dẫn không hợp lệ' } }
+  if ($p -match '[<>|?*"\x00-\x1f]' -or $p.Substring(2).Contains(':')) { return @{ Ok = $false; Why = 'đường dẫn không hợp lệ' } }
   try { $p = [IO.Path]::GetFullPath($p) } catch { return @{ Ok = $false; Why = 'đường dẫn không hợp lệ' } }
   if (Test-Path -LiteralPath $p -PathType Leaf) { return @{ Ok = $false; Why = 'đây là một file, không phải thư mục' } }
   if (-not (Test-Path -LiteralPath $p)) { return @{ Ok = $true; Clone = $true; Path = $p } }
@@ -165,12 +165,14 @@ function Add-SyncRepoConfig([string]$Path) {
   if ($CfgBroken) { throw "file cấu hình $ConfigFile bị hỏng, sửa tay trước" }
   $b = if (Test-Path -LiteralPath $ConfigFile) { [IO.File]::ReadAllBytes($ConfigFile) } else { [byte[]]@() }
   $bom = $b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF   # ReadAllText bo BOM nen phai doc byte
-  $raw = if ($bom) { (New-Object Text.UTF8Encoding($false)).GetString($b, 3, $b.Length - 3) } else { (New-Object Text.UTF8Encoding($false)).GetString($b) }
+  # giai ma nghiem ngat: file khong phai UTF-8 thi khong bao gio ghi de (se lam hong chu co dau)
+  try { $raw = if ($bom) { (New-Object Text.UTF8Encoding($false, $true)).GetString($b, 3, $b.Length - 3) } else { (New-Object Text.UTF8Encoding($false, $true)).GetString($b) } }
+  catch { throw 'config.json không phải UTF-8, lưu lại dạng UTF-8 rồi chạy lại' }
   $js = ConvertTo-JsonStr $Path
   $m = [regex]::Match($raw, '"syncRepos"\s*:\s*\[')
-  $mv = [regex]::Match($raw, '"syncRepos"\s*:\s*(null|"(?:[^"\\]|\\.)*")')   # null hoac mot chuoi: thay bang danh sach (giu chuoi cu)
+  $mv = [regex]::Match($raw, '"syncRepos"\s*:\s*(null|true|false|-?[0-9][0-9.eE+-]*|"(?:[^"\\]|\\.)*")')   # khong phai danh sach: thay bang danh sach (chi giu mot chuoi cu)
   if (-not $m.Success -and $mv.Success) {
-    $v = $mv.Groups[1].Value; $arr = if ($v -eq 'null') { $js } else { $v + ', ' + $js }
+    $v = $mv.Groups[1].Value; $arr = if ($v.StartsWith('"')) { $v + ', ' + $js } else { $js }
     $new = $raw.Substring(0, $mv.Groups[1].Index) + '[' + $arr + ']' + $raw.Substring($mv.Groups[1].Index + $v.Length)
   } elseif ($m.Success) {
     $inStr = $false; $esc = $false; $last = -1
@@ -201,9 +203,8 @@ function Add-SyncMissing {
   if ($env:FCODE_SYNC_REPOS) { return }   # danh sach dat tam cho lan chay nay: khong tim, khong ghi config
   Write-Host 'Đang hỏi box danh sách project...'
   $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-  # han 60 giay cho lenh nay (khong phai 900 giay cua mot dot chep phien)
-  $script:PhienDeadline = [DateTime]::UtcNow.AddSeconds([Math]::Min(60, (Get-PhienLimitSec $false)))
-  try { & (Get-InstaboxExe) wake $box *> $null; $bp = Get-BoxJson (Invoke-BoxPy 'projects' ([byte[]]@())) } catch { $bp = $null } finally { $ErrorActionPreference = $old; $script:PhienDeadline = $null }
+  # han 60 giay cho lenh nay (khong phai 900 giay cua mot dot chep phien), tinh tu luc box da thuc
+  try { & (Get-InstaboxExe) wake $box *> $null; $script:PhienDeadline = [DateTime]::UtcNow.AddSeconds([Math]::Min(60, (Get-PhienLimitSec $false))); $bp = Get-BoxJson (Invoke-BoxPy 'projects' ([byte[]]@())) } catch { $bp = $null } finally { $ErrorActionPreference = $old; $script:PhienDeadline = $null }
   if (-not $bp) { Write-Host 'cảnh báo: không đọc được danh sách project trên box; chỉ cập nhật các project đã có trên laptop.'; return }
   $have = @{}; foreach ($r in $SyncRepos) { $k = Get-LocalRepoKey $r; if ($k) { $have[$k] = $true } }
   $miss = @(@($bp.projects) | Where-Object { $_ -and $_.repo -and -not $have.ContainsKey([string]$_.repo) })
@@ -596,6 +597,7 @@ function Invoke-Add {
         'HOOK_OK'       { Write-Host '[4] Đã cài hook chặn push thẳng lên main/master' }
         'HOOK_EXISTS'   { Write-Host '[4] Hook chặn push lên main/master đã có sẵn' }
         'CFG_ADDED'     { Write-Host "[6] Đã thêm '$name' vào danh sách project của FCode (có bản sao lưu config, không đụng project khác)" }
+        'CFG_WARN*'     { Write-Host '[6] cảnh báo: đã thêm vào cấu hình FCode nhưng box chưa xác nhận ghi xuống đĩa (fsync); nếu box tắt đột ngột, chạy lại lệnh này'; $bad++ }
         'CFG_EXISTS'    { Write-Host "[6] '$name' đã có trong danh sách project của FCode" }
         'CFG_CONFLICT'  { Write-Host "lỗi: tên '$name' đang trỏ tới thư mục khác ($d). Đặt tên khác: fcode add $repo <tên>" }
         'CFG_BROKEN'    { Write-Host 'lỗi: file cấu hình FCode trên box (/data/home/.fcoding/config.json) bị hỏng hoặc không đọc được, nên chưa thêm project. Nhờ người quản lý box kiểm tra file đó rồi chạy lại.'; if ($d) { Write-Host "  (chi tiết: $d)" } }
@@ -620,6 +622,8 @@ function Invoke-Add {
       }
     }
     if ($code -eq 11) { Write-Host "Thư mục $name đã có trên box (hoặc không an toàn) — chọn tên khác: fcode add $repo <tên-khác>"; return 1 }
+    if ($code -eq 25) { Write-Host 'lỗi: box không ghi được cấu hình đăng nhập GitHub cho repo này, nên chưa thêm project.'; return 1 }
+    if ($code -eq 26) { Write-Host 'lỗi: cấu hình git trên box đang chuyển hướng địa chỉ GitHub (insteadOf / pushInsteadOf / pushurl) — cần gỡ trên box rồi chạy lại.'; return 1 }
     if ($code -eq 24) { Write-Host '[4] lỗi: không cài được chốt chặn push lên main, nên chưa thêm project.'; if ($hookD) { Write-Host "  (chi tiết: $hookD)" }; return 1 }
     if ($seen.Count -eq 0) {
       $d = ($lines | Where-Object { "$_".Trim() } | Select-Object -First 1)
@@ -627,7 +631,7 @@ function Invoke-Add {
       return 1
     }
     # loi can sua truoc (ten da dung, cau hinh hong, GitHub chan, mang, repo luu tru): thong bao cu the da in o tren, khong bao "chay lai cung lenh"
-    if ($code -in 3, 11, 21, 22, 23, 24, 42, 43, 44) { return 1 }
+    if ($code -in 2, 3, 11, 20, 21, 22, 23, 24, 25, 26, 42, 43, 44) { return 1 }
     if ($code -eq 40 -or $code -eq 41) {
       # can dan khoa cong khai vao GitHub (nguoi dung tu dan; khong tu them bang token/API)
       Write-Host ''
@@ -655,11 +659,17 @@ function Invoke-Add {
     }
     break
   }
+  # them lai mot project da co (box chi tra CFG_EXISTS, thoat 0): xong, khong lam gi them
+  if ($code -eq 0 -and $seen.ContainsKey('CFG_EXISTS') -and -not $seen.ContainsKey('CLONED') -and -not $seen.ContainsKey('READ_OK')) { Write-Host "'$name' đã có trên box, không cần thêm"; return 0 }
   # chi bao "Xong" khi script thoat 0 va that su qua: doc duoc + ghi duoc repo, va da vao cau hinh
   if ($code -eq 0 -and $seen.ContainsKey('READ_OK') -and $seen.ContainsKey('WRITE_OK') -and ($seen.ContainsKey('CFG_ADDED') -or $seen.ContainsKey('CFG_EXISTS'))) { }
-  elseif ($code -ne 0 -and $code -ne 30) { Write-Host "Chưa xong (mã $code). Xem thông báo ở trên rồi chạy lại cùng lệnh, chạy lại là an toàn."; return 1 }
-  elseif ($bad -eq 0) { Write-Host "Chưa xong (mã $code). Xem thông báo ở trên rồi chạy lại cùng lệnh, chạy lại là an toàn."; return 1 }
-  else { Write-Host "Đã thêm nhưng có $bad mục cần xem lại (cảnh báo ở trên). Chạy lại lệnh này là an toàn."; return 1 }
+  elseif ($code -ne 0 -and $code -ne 30) {
+    # chi noi "chay lai la an toan" khi chay lai co the giup (mang / box bi dung giua chung / het gio); ma la: chi bao ma
+    if ($code -in 1, 12, 124, 143, 255) { Write-Host "Chưa xong (mã $code). Xem thông báo ở trên rồi chạy lại cùng lệnh, chạy lại là an toàn." } else { Write-Host "Chưa xong (mã $code). Xem thông báo ở trên." }
+    return 1
+  }
+  elseif ($code -eq 0) { Write-Host "Chưa xong (mã $code). Xem thông báo ở trên rồi chạy lại cùng lệnh, chạy lại là an toàn."; return 1 }
+  else { Write-Host "Đã thêm nhưng có $([Math]::Max($bad, 1)) mục cần xem lại (cảnh báo ở trên). Chạy lại lệnh này là an toàn."; return 1 }
   Write-Host ''
   Write-Host "Xong. Mở app FCode, project $name đã có trong danh sách."
   if ($rules) { Write-Host 'Repo có CLAUDE.md/AGENTS.md nhắc tới deploy: omp sẽ theo quy tắc deploy của repo.' }
