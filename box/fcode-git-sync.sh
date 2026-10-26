@@ -10,11 +10,13 @@
 #      are on no origin/* branch; dirty = tracked or untracked changes.
 #   3. `git merge --ff-only origin/<default>` ONLY when ALL hold: behind > 0 and ahead == 0; HEAD is on the default branch;
 #      no tracked change (untracked files do not count); no merge / rebase / cherry-pick / revert / bisect / index.lock in
-#      progress; the repo uses no smudge / process filter (Git LFS and the like: a checkout would run slow external code);
-#      and no process of this user (omp, claude, codex, a shell, a tmux pane) has its cwd inside the work tree
-#      (/proc/<pid>/cwd; without /proc the project counts as busy). Hooks, submodule recursion, auto gc and overwriting of
-#      ignored files are off for that merge, so an untracked OR ignored file in the way makes it fail. The merge is never
-#      time-limited or killed (a half-written work tree is worse than a slow merge). A failure leaves the checkout as it was.
+#      progress; no smudge / process filter is both configured and used (Git LFS and the like: a checkout would run slow
+#      external code; see filters()); the run is younger than 10 min; and no process of this user (omp, claude, codex, a
+#      shell, a tmux pane) has its cwd inside the work tree (/proc/<pid>/cwd; without /proc the project counts as busy).
+#      Hooks, fsmonitor, submodule recursion, auto gc and overwriting of ignored files are off for that merge, so an
+#      untracked OR ignored file in the way makes it fail. The merge is never time-limited or killed (a half-written work
+#      tree is worse than a slow merge; the 10 min rule keeps systemd's 15 min unit timeout from ever hitting one).
+#      A failure leaves the checkout as it was.
 #      Why a project was not updated is recorded as autoSkip in the state file.
 #   4. write ~/.local/state/fcode/git-sync.json (atomic, mode 600).
 # Agents still sync first at the start of a task (see agents-git.md, "Sync first"): this timer only catches up an idle main.
@@ -32,6 +34,7 @@ STATE="$DIR/git-sync.json"
 ONLY="${1:-}"
 if [ -n "$ONLY" ]; then FETCH_T="${FCODE_GIT_FETCH_TIMEOUT:-30}" LOCK_W=15
 else FETCH_T="${FCODE_GIT_FETCH_TIMEOUT:-60}" LOCK_W=0; fi
+LATE_S="${FCODE_GIT_LATE_AFTER:-600}" # no merge is started once the run is this many seconds old (the unit's TimeoutStartSec is 15 min)
 
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # first line only, control characters dropped, URL credentials / tokens masked, at most 200 characters:
@@ -53,16 +56,25 @@ in_progress() {
   done
   return 1
 }
-# filters: the repo runs external code on checkout (a smudge / process filter in any config, or `filter=` in any attributes file)
+# filters <default branch>: the checkout would run external code. True only when a filter driver is configured
+# (filter.<name>.smudge or .process, in any config) AND that same <name> is used as `filter=<name>` by an attributes source:
+# a tracked .gitattributes in HEAD or in origin/<default> (the incoming side counts), info/attributes, core.attributesFile, or the XDG file.
+# A global `git lfs install` alone, or `filter=` without a driver, runs nothing and does not skip.
 filters() {
-  local f
-  [ -n "$(g config --get-regexp '^filter\..*\.(smudge|process)$' 2>/dev/null)" ] && return 0
-  g grep -q -e 'filter=' -- ':(glob).gitattributes' ':(glob)**/.gitattributes' 2>/dev/null && return 0
-  for f in "$(g rev-parse --git-path info/attributes 2>/dev/null)" "$(g config --type=path --get core.attributesFile 2>/dev/null)" "${XDG_CONFIG_HOME:-$HOME/.config}/git/attributes"; do
-    [ -n "$f" ] || continue
-    case $f in /*) ;; *) f="$P/$f" ;; esac
-    [ -f "$f" ] && grep -q 'filter=' "$f" 2>/dev/null && return 0
-  done
+  local names f txt
+  names=$(g config --get-regexp '^filter\..*\.(smudge|process)$' 2>/dev/null | sed -E 's/^filter\.(.*)\.(smudge|process)( .*)?$/\1/; t; d')
+  [ -n "$names" ] || return 1
+  txt=$({
+    for f in HEAD "refs/remotes/origin/$1"; do g grep -h -I -e 'filter=' "$f" -- ':(glob).gitattributes' ':(glob)**/.gitattributes'; done
+    for f in "$(g rev-parse --git-path info/attributes)" "$(g config --type=path --get core.attributesFile)" "${XDG_CONFIG_HOME:-$HOME/.config}/git/attributes"; do
+      [ -n "$f" ] || continue
+      case $f in /*) ;; *) f="$P/$f" ;; esac
+      [ -f "$f" ] && cat "$f"
+    done
+  } 2>/dev/null | tr -s ' \t' '\n\n')
+  while IFS= read -r f; do
+    printf '%s\n' "$txt" | grep -qxF "filter=$f" && return 0
+  done <<<"$names"
   return 1
 }
 # busy: a process of this user has its cwd inside the work tree the merge moves (the repo's top level, not the configured dir,
@@ -122,13 +134,14 @@ sync_one() {
 
     # fast-forward the default branch (timer run only), only when nothing can be in the way (see the header); the first failing check is the reason
     if [ -z "$ONLY" ] && [ "${behind:-0}" -gt 0 ]; then
-      if in_progress "$gd"; then skip=in_progress
+      if [ "$SECONDS" -ge "$LATE_S" ]; then skip=late # the run is old: systemd's TimeoutStartSec must never find a merge in flight
+      elif in_progress "$gd"; then skip=in_progress
       elif [ "$branch" != "$def" ]; then skip=on_branch
       elif ! out=$(g status --porcelain --untracked-files=no 2>/dev/null) || [ -n "$out" ]; then skip=dirty
       elif [ "${ahead:-1}" -ne 0 ]; then skip=ahead
-      elif filters; then skip=filters
+      elif filters "$def"; then skip=filters
       elif busy; then skip=busy
-      elif g -c gc.auto=0 -c maintenance.auto=false -c core.hooksPath=/dev/null -c submodule.recurse=false -c merge.autoStash=false \
+      elif g -c gc.auto=0 -c maintenance.auto=false -c core.hooksPath=/dev/null -c core.fsmonitor=false -c submodule.recurse=false -c merge.autoStash=false \
           merge --ff-only --quiet --no-edit --no-overwrite-ignore "refs/remotes/origin/$def" >/dev/null 2>&1; then
         updated=true
         behind=$(g rev-list --count "HEAD..origin/$def" 2>/dev/null) || behind=
