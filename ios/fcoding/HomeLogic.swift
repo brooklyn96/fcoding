@@ -1453,7 +1453,7 @@ enum HomeLogic {
         let cred = addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"FAILED\",\"detail\":\"config\"}")))
         eq("config message", cred.message, "Box không ghi được cấu hình đăng nhập GitHub cho repo này. Thử lại sau.")
         eq("config no bare detail", cred.detail == nil, true)
-        eq("failed other detail kept",addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"FAILED\",\"detail\":\"boom\"}"))).detail, "boom")
+        eq("failed other detail kept", addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"FAILED\",\"detail\":\"boom\"}"))).detail, "boom")
         eq("resubmit after failure", addReduce(arch, .submit(repo: "Me/Web", name: "web2")).phase, .posting)
         let done = addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED\",\"name\":\"web\"}")))
         eq("done", done.phase, .done)
