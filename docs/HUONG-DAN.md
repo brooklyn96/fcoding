@@ -312,7 +312,24 @@ Từ v1.3.2, bạn thêm dự án GitHub vào box ngay trên iPhone, không cầ
 
 **Khóa GitHub.** Box thử token GitHub của chính nó trước; chỉ một lần đẩy thử thật mới quyết định token có ghi được hay không. Nếu token không ghi được, app hiện một **khóa công khai**: trên GitHub mở repo, vào **Settings → Deploy keys → Add key**, dán khóa, tick **Allow write access**, bấm **Add key**, rồi quay lại app bấm **Thử lại**. Mỗi repo một khóa.
 
-**Lỗi có thể gặp**: tên đã dùng cho dự án khác; thư mục không an toàn hoặc nằm ngoài `/data/workspace`; repo đã lưu trữ (archived); luật bảo vệ nhánh chặn `box/*` (hãy cho phép `box/*`); lỗi mạng; không cài được chốt chặn.
+**Lỗi có thể gặp** (mã app / mã thoát của script, cùng bộ mã cho `fcode add`):
+
+| Mã (thoát) | Ý nghĩa và cách xử lý |
+|---|---|
+| `NEED_KEY` (40), `NEED_WRITE` (41) | Cần dán khóa công khai vào **Deploy keys** của repo (có tích ghi), rồi thử lại. |
+| `WRITE_BLOCKED` (42) | Luật bảo vệ nhánh chặn `box/*`: hãy cho phép `box/*`. |
+| `NET_FAIL` (43) | Lỗi mạng; thử lại. |
+| `REPO_ARCHIVED` (44) | Repo đã lưu trữ (archived), không ghi được. |
+| `DIR_CONFLICT` (11) | `/data/workspace/<tên>` đã có trên box hoặc không an toàn (liên kết tượng trưng, nằm ngoài thư mục làm việc). Box không bao giờ dùng lại thư mục có sẵn: chọn tên khác, hoặc xóa thư mục đó trên box. |
+| `NAME_USED` (23), `CFG_CONFLICT` (21), `CFG_BROKEN` (22) | Tên hoặc cấu hình đang dùng cho dự án khác, hoặc file cấu hình/ssh trên box hỏng; đổi tên hoặc sửa trên box. |
+| `CLONE_FAIL` (12) | Không tải được repo (xem dòng chi tiết). |
+| thoát 24 | Không cài được chốt chặn push lên `main`. |
+| thoát 25 | Box không ghi được cấu hình đăng nhập GitHub cho repo này. |
+| thoát 26 | Cấu hình git trên box đang chuyển hướng địa chỉ GitHub (`insteadOf`, `pushInsteadOf`, `pushurl`): gỡ trên box rồi chạy lại. |
+| `ADDED_WARN` (30) | Đã thêm nhưng có mục cần xem lại, ví dụ không xóa được nhánh thử `box/fcode-add-check-…` (xóa nhánh đó trên GitHub). Dự án vẫn dùng được. |
+| `TIMEOUT` (124) | Quá 10 phút nên bị dừng; chạy lại là an toàn. |
+
+Thêm lại một dự án đã có (cùng tên, cùng repo) không làm gì và báo thành công (`ADDED`, thoát 0).
 
 **Làm tay trên box**: `bash /data/home/fcoding/fcode-add.sh <chủ/repo> <tên>` (do `install.sh` cài). Mỗi lần thêm tự dừng sau 10 phút; thêm lỗi chỉ xóa thư mục do chính lần đó tạo ra, thư mục có sẵn từ trước không bao giờ bị xóa; thêm lại cùng một repo là an toàn. Cách làm tương đương trên laptop: `fcode add <chủ/repo> [tên]`.
 

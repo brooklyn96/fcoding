@@ -48,6 +48,60 @@ class HttpErr extends Error {
   constructor(status, code, extra = {}) { super(code); this.status = status; this.code = code; Object.assign(this, extra); }
 }
 
+// ---------- add a project (POST /api/projects, CONTRACT A11) ----------
+const CTRL_RE = /[\x00-\x1f\x7f]/;
+const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const PROJECT_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+// A pasted GitHub link -> owner/repo: https://[www.]github.com/o/r, github.com/o/r or git@github.com:o/r, then any of /, .git, ?query, #fragment and
+// extra path (/tree/main). Any other text is returned as it is (plain owner/repo, or something the repo rule then refuses: another host has a ":" or "@").
+const GITHUB_LINK_RE = /^(?:https:\/\/(?:www\.)?github\.com\/|(?:www\.)?github\.com\/|git@github\.com:)([^?#]*)/i;
+export function repoOfLink(s) {
+  const m = GITHUB_LINK_RE.exec(s);
+  if (!m) return s;
+  const [owner, repo = ''] = m[1].split('/');
+  return `${owner}/${repo}`;
+}
+// Same rules as `fcode add` (laptop/fcode.ps1 Invoke-Add), after repoOfLink: -> {repo, name} or a 400 bad_repo / bad_name. A null or empty name means "the repo part".
+export function parseAddRequest(b) {
+  const bad = (code) => new HttpErr(400, code);
+  if (typeof b.repo !== 'string' || CTRL_RE.test(b.repo)) throw bad('bad_repo');
+  const repo = repoOfLink(b.repo).replace(/\.git$/i, '');
+  if (!REPO_RE.test(repo) || /^\.+\//.test(repo) || /\/\.+$/.test(repo)) throw bad('bad_repo');
+  const given = b.name !== undefined && b.name !== null && b.name !== '';
+  if (given && (typeof b.name !== 'string' || CTRL_RE.test(b.name))) throw bad('bad_name');
+  const name = given ? b.name.toLowerCase().replace(/\.git$/, '') : repo.split('/')[1].toLowerCase();
+  if (!PROJECT_NAME_RE.test(name) || name === 'home') throw bad('bad_name');
+  return { repo, name };
+}
+// script exit code -> job code; anything else (or a signal) is FAILED. The script's "R <CODE> [detail]" lines add the public key and the detail.
+const ADD_CODES = { 0: 'ADDED', 30: 'ADDED_WARN', 40: 'NEED_KEY', 41: 'NEED_WRITE', 42: 'WRITE_BLOCKED', 43: 'NET_FAIL', 44: 'REPO_ARCHIVED',
+  11: 'DIR_CONFLICT', 21: 'CFG_CONFLICT', 22: 'CFG_BROKEN', 23: 'NAME_USED', 2: 'BAD_ARGS', 12: 'CLONE_FAIL',
+  124: 'TIMEOUT' }; // timeout(1): 124 = the deadline (its --kill-after kill ends it as a signal, not a code; the job's own deadline, kept when the server is gone)
+// the detail words the app matches: DIR_EXISTS 'exists', DIR_UNSAFE 'unsafe', HOOK_FAIL 'install' | 'verify'; also URL_REWRITE 'rewrite' (26) and CRED_FAIL 'config' (25); first line with text wins
+const ADD_DETAIL = ['SSH_DETAIL', 'CLONE_FAIL', 'DIR_EXISTS', 'DIR_UNSAFE', 'HOOK_FAIL', 'URL_REWRITE', 'CRED_FAIL', 'CFG_CONFLICT', 'CFG_BROKEN', 'CLEANUP_FAIL'];
+const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
+const ADD_SCRIPT = path.join(SERVER_DIR, 'fcode-add.sh'), ADD_SCRIPT_DEV = path.join(SERVER_DIR, 'box', 'fcode-add.sh'); // installed next to server.mjs, or in a checkout
+const GH_LIST_MS = 60e3, GH_PAGES = 3, GH_PAGE_SIZE = 100, GH_LIST_MAX = GH_PAGES * GH_PAGE_SIZE; // GET /api/github/repos: cache time, pages read, most repos listed
+// pages 1..3 of the newest-updated repos, one JSON object per line ("@json"); no --paginate (an account with thousands of repos would run out of time)
+const ghReposArgs = (page) => ['api', `/user/repos?affiliation=owner,collaborator,organization_member&sort=updated&per_page=${GH_PAGE_SIZE}&page=${page}`, '--jq',
+  '.[] | {repo: .full_name, private: .private, archived: .archived, canPush: (.permissions.push // false), updatedAt: .updated_at} | @json'];
+const ADD_TIMEOUT_MS = 10 * 60e3, ADD_KEEP_MS = 30 * 60e3, ADD_MAX_JOBS = 50, ADD_KILL_AFTER_S = 30, ADD_KILL_GRACE_MS = 45000, ADD_OUT_MAX = 256 * 1024;
+// a detail is one clean line of at most 200 characters; tokens and URL credentials never pass
+const jobText = (s) => Array.from(cleanLine(s).replace(/(gh[a-z]_|github_pat_)[A-Za-z0-9_]+/gi, '<token>').replace(/\/\/[^/\s@]*@/g, '//<cred>@')).slice(0, 200).join('');
+export function addOutcome(code, stdout) {
+  const lines = new Map();
+  for (const l of stdout.split('\n')) { const m = /^R (\S+)(?: (.*))?$/.exec(l.replace(/\r$/, '')); if (m) lines.set(m[1], m[2] ?? ''); }
+  const result = code === 21 && lines.has('ALIAS_FAIL') ? 'FAILED' : ADD_CODES[code] ?? 'FAILED'; // 21 is also "cannot write the ssh config"
+  // via: the way in that ended the run. A token run that fell back to a deploy key printed TOKEN_FALLBACK, then the key lines: key wins.
+  const via = lines.has('KEY_NEW') || lines.has('KEY_EXISTS') ? 'key' : lines.has('TOKEN_OK') ? 'token' : null;
+  const out = { state: code === 0 || code === 30 ? 'done' : 'failed', code: result, detail: null, via };
+  const found = code === 0 ? null : ADD_DETAIL.find((k) => lines.get(k));
+  if (found) out.detail = jobText(lines.get(found)) || null;
+  const pub = lines.get('PUBKEY'); // public key only: anything that is not one line "ssh-ed25519 <base64> [comment]" is dropped
+  if ((result === 'NEED_KEY' || result === 'NEED_WRITE') && /^ssh-ed25519 [A-Za-z0-9+/]+={0,2}( \S{1,200})?$/.test(pub ?? '')) out.pubkey = pub;
+  return out;
+}
+
 // ---------- config / devices / admin socket ----------
 export function defaultConfigDir() {
   if (process.env.PC_CONFIG_DIR) return process.env.PC_CONFIG_DIR;
@@ -857,6 +911,7 @@ export function createApp(opts = {}) {
   const cfgFile = path.join(configDir, 'config.json');
   const stampOf = () => { try { const s = fs.statSync(cfgFile); return `${s.mtimeMs}:${s.size}:${s.ino}`; } catch { return ''; } };
   let cfgStamp = stampOf();
+  let projectsDirty = false; // the project list changed: the next /api/home answers at once from the cache and refreshes in the background
   let text;
   try { text = fs.readFileSync(cfgFile, 'utf8'); } catch { throw new Error(`config.json missing or unreadable in ${configDir} (run install.sh)`); }
   let cfg = parseConfig(text);
@@ -903,6 +958,7 @@ export function createApp(opts = {}) {
       try { next = parseConfig(fs.readFileSync(cfgFile, 'utf8')); } catch (e) { log(`config reload failed, keeping the previous one: ${e.code || e.message}`); }
       if (next) {
         const rotated = !next.secret.equals(cfg.secret);
+        if (JSON.stringify(next.projects) !== JSON.stringify(cfg.projects)) { projects.clear(); projectsDirty = true; } // a project added or removed: the home list is read again
         cfg = next;
         if (rotated) { gen++; pendings = []; load([]); purge(); return; } // no old keyHash may match any more
       }
@@ -1490,7 +1546,9 @@ export function createApp(opts = {}) {
   }
   async function homeView() {
     // each part answers at once from its cache, or within homeWait the first time; a part not ready is empty and fills later
-    const [q, s, p, b, g] = await Promise.allSettled([quota.get(homeWait), spend.get(homeWait), projects.get(homeWait),
+    // right after a project was added or removed the cached list is not waited for (wait 0: the reply is at once, the refresh runs on)
+    const projWait = projectsDirty ? 0 : homeWait; projectsDirty = false;
+    const [q, s, p, b, g] = await Promise.allSettled([quota.get(homeWait), spend.get(homeWait), projects.get(projWait),
       instaboxKey ? staging.get(homeWait) : Promise.reject(new Error('no instabox key')), ompGuard.get(homeWait)]);
     const boxes = b.status === 'fulfilled' ? b.value.value : null; // no key, or instabox failed with nothing cached: every staging is null
     const t = now();
@@ -1502,12 +1560,14 @@ export function createApp(opts = {}) {
     let gits = new Map(); // read once per home reply; the projects part is cached, this is not
     try { gits = parseGitSync(fs.readFileSync(gitSyncFile, 'utf8')); } catch {}
     const withGit = (list) => list.map((x) => ({ ...x, git: gits.get(x.name) ?? NO_GIT, staging: boxes?.get(x.name) ?? null }));
+    const cachedProjects = new Map((p.status === 'fulfilled' ? p.value.value : []).map((x) => [x.name, x]));
     return {
       generatedAt: iso(t), box: boxInfo(),
       accounts: accounts.map((a) => ({ ...a, spend: view?.perAccount.get(a.id) ?? null })),
       totals: view?.totals ?? { spend: null, byHarness: [] },
       // not read yet (first request, slow gh): each project with nothing known and loading: true (a gh failure has no loading)
-      projects: withGit(p.status === 'fulfilled' ? p.value.value : cfg.projectNames.map((name) => ({ name, repo: null, branch: null, prs: null, lastRun: null, loading: true }))),
+      // in config order, each project from the cache by name (a stale list still serves the ones it knows), a new one as a loading placeholder
+      projects: withGit(cfg.projectNames.map((name) => cachedProjects.get(name) ?? { name, repo: null, branch: null, prs: null, lastRun: null, loading: true })),
       updates,
       omp: g.status === 'fulfilled' ? g.value.value : { version: null, formatOk: true, reason: null }, // not scanned yet: no alarm
     };
@@ -1543,6 +1603,96 @@ export function createApp(opts = {}) {
     job.then(() => resetJobs.delete(accountId), () => resetJobs.delete(accountId));
     return job;
   }
+
+  // --- POST /api/projects: the box script as a job (CONTRACT A11). argv only, never a shell; one running job per name; 10 min, then the
+  // whole process group is killed; ended jobs are kept 30 min. Only the script's "R <CODE> [detail]" lines are read: its stderr is dropped,
+  // and nothing but the name and the code is logged. FCODE_CFG points the script at THIS server's config.json. ---
+  const addSpec = specOf(opts.addScript ?? process.env.PC_ADD_SCRIPT ?? ['bash', [ADD_SCRIPT, ADD_SCRIPT_DEV].find((f) => fs.existsSync(f)) ?? ADD_SCRIPT]);
+  const addTimeout = opts.addTimeoutMs ?? (Number(process.env.PC_ADD_TIMEOUT_MS) || ADD_TIMEOUT_MS);
+  // on Linux the script runs under timeout(1): the deadline then holds on its own even when this server is gone (a crash, or a restart that
+  // leaves the job alone: install.sh uses KillMode=process); a graceful stop ends the jobs through close(). 124 maps to TIMEOUT; a kill-after kill ends as a signal.
+  const addKillAfter = Number(process.env.PC_ADD_KILL_AFTER_S) || ADD_KILL_AFTER_S; // test-only override, like PC_ADD_TIMEOUT_MS
+  const addWrap = process.platform === 'win32' ? [] : ['timeout', `--kill-after=${addKillAfter}`, String(addTimeout / 1000)];
+  const addJobs = new Map(); // id -> job
+  const addRunning = new Map(); // name -> its running job
+  const addStops = new Set(); // one per running child: ends it when the app closes
+  // ended jobs go after 30 min (checked on every submit and every poll); at most 50 are kept, the oldest finished first (a running one never)
+  function pruneAdd() {
+    for (const [k, j] of addJobs) if (j.state !== 'running' && now() - j.endedAt > ADD_KEEP_MS) addJobs.delete(k);
+    const ended = [...addJobs.values()].filter((j) => j.state !== 'running').sort((a, b) => a.endedAt - b.endedAt);
+    for (let over = addJobs.size - ADD_MAX_JOBS; over > 0 && ended.length; over--) addJobs.delete(ended.shift().id);
+  }
+  function startAdd(repo, name) {
+    pruneAdd();
+    const busy = addRunning.get(name);
+    if (busy) return busy;
+    const job = { id: crypto.randomBytes(16).toString('hex'), name, repo, state: 'running', code: null, detail: null, endedAt: 0 };
+    addJobs.set(job.id, job); addRunning.set(name, job);
+    pruneAdd();
+    let out = '', child, timer, grace;
+    const end = () => { clearTimeout(timer); addStops.delete(abort); };
+    const abort = () => { end(); killGroup('SIGTERM'); clearTimeout(grace); }; // the app closes
+    const finish = (res) => {
+      if (job.state !== 'running') return;
+      end();
+      Object.assign(job, res, { endedAt: now() });
+      if (res.pubkey) job.keyUrl = `https://github.com/${repo}/settings/keys/new`;
+      addRunning.delete(name);
+      log(`add-project ${name} ${job.code}`);
+    };
+    const killGroup = (sig) => { try { process.kill(process.platform === 'win32' ? child.pid : -child.pid, sig); } catch {} }; // -pid: the group
+    try {
+      const [cmd, ...pre] = [...addWrap, ...addSpec];
+      child = spawn(cmd, [...pre, repo, name], { stdio: ['ignore', 'pipe', 'ignore'], detached: true, windowsHide: true, env: { ...toolEnv(), FCODE_CFG: cfgFile } });
+    } catch { finish({ state: 'failed', code: 'FAILED' }); return job; }
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (c) => { if (out.length < ADD_OUT_MAX) out += c; });
+    child.on('error', () => finish({ state: 'failed', code: 'FAILED' }));
+    child.on('close', (code) => { clearTimeout(grace); finish(addOutcome(code, out)); }); // the job is gone: no late SIGKILL to a group id that may be reused
+    timer = setTimeout(() => {
+      finish({ state: 'failed', code: 'TIMEOUT' });
+      killGroup('SIGTERM'); // the script cleans up its clone on TERM; on Linux timeout(1) kills what is left at +30 s, this backstop only at +45 s
+      grace = setTimeout(() => killGroup('SIGKILL'), opts.addKillGraceMs ?? ADD_KILL_GRACE_MS); // opts.addKillGraceMs: tests
+      grace.unref();
+    }, addTimeout);
+    addStops.add(abort);
+    return job;
+  }
+  // GET /api/github/repos: what the box's gh login can see (the list is cached 60 s, one gh run at a time), with the project each repo is
+  // already on the box as (onBox: read from each project's origin on every request, so a project just added shows at once)
+  let ghList = null, ghPending = null; // {at, rows}
+  const githubRepos = () => {
+    if (ghList && now() - ghList.at < GH_LIST_MS) return Promise.resolve(ghList.rows);
+    if (!ghPending) {
+      const at = now();
+      ghPending = (async () => {
+        const rows = [];
+        for (let page = 1; page <= GH_PAGES; page++) { // pages 1..3, stopping at a short page
+          let n = 0;
+          for (const l of (await execTool(ghSpec, ghReposArgs(page), 30e3)).split('\n')) {
+            if (!l.trim()) continue;
+            n++;
+            let v; try { v = JSON.parse(l); } catch { continue; }
+            if (v && typeof v.repo === 'string' && /^[\w.-]+\/[\w.-]+$/.test(v.repo)) {
+              rows.push({ repo: v.repo, private: v.private === true, archived: v.archived === true, canPush: v.canPush === true, updatedAt: typeof v.updatedAt === 'string' ? iso(Date.parse(v.updatedAt)) : null });
+            }
+          }
+          if (n < GH_PAGE_SIZE) break;
+        }
+        rows.sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''));
+        ghList = { at, rows: rows.slice(0, GH_LIST_MAX) };
+        return ghList.rows;
+      })().finally(() => { ghPending = null; });
+    }
+    return ghPending;
+  };
+  async function boxRepos() { // lower-cased owner/name -> project name (the first project in config order)
+    const urls = await Promise.all(cfg.projectNames.map((name) => execTool(gitSpec, ['-C', cfg.projects[name], 'remote', 'get-url', 'origin'], 5000).then((s) => s.trim(), () => null)));
+    const m = new Map();
+    cfg.projectNames.forEach((name, i) => { const r = repoOf(urls[i])?.toLowerCase(); if (r && !m.has(r)) m.set(r, name); });
+    return m;
+  }
+  const addJob = (id) => { pruneAdd(); return addJobs.get(id); };
 
   // --- http helpers ---
   function json(res, status, obj, headers) {
@@ -1713,6 +1863,29 @@ export function createApp(opts = {}) {
     }
     if (pathname === '/api/overview') { want('GET'); return json(res, 200, await overview(ctx)); }
     if (pathname === '/api/home') { want('GET'); return json(res, 200, await homeView()); }
+    if (pathname === '/api/projects') {
+      want('POST');
+      const { repo, name } = parseAddRequest(parseJson(req, body));
+      return json(res, 202, { job: startAdd(repo, name).id });
+    }
+    if (seg.length === 5 && seg[0] === '' && seg[1] === 'api' && seg[2] === 'projects' && seg[3] === 'jobs') {
+      want('GET');
+      const j = addJob(seg[4]);
+      if (!j) throw new HttpErr(404, 'no_job');
+      return json(res, 200, { state: j.state, code: j.code, name: j.name, repo: j.repo, via: j.via ?? null, pubkey: j.pubkey, keyUrl: j.keyUrl, detail: j.detail });
+    }
+    if (pathname === '/api/github/repos') {
+      want('GET');
+      let rows;
+      try { rows = await githubRepos(); } catch (e) {
+        if (e.code === 'ENOENT' || e.code === 4 || /gh auth login|GH_TOKEN|not logged in|authentication required|HTTP 401|Bad credentials/i.test(e.stderr ?? '')) {
+          log('github repos: no token'); return json(res, 200, { repos: [], reason: 'no_github_token' });
+        }
+        log('github repos: unavailable'); throw new HttpErr(502, 'github_unavailable');
+      }
+      const onBox = await boxRepos();
+      return json(res, 200, { repos: rows.map((r) => ({ ...r, onBox: onBox.get(r.repo.toLowerCase()) ?? null })) });
+    }
     if (pathname === '/api/codex-reset') {
       want('POST');
       const { accountId, requestId } = parseJson(req, body);
@@ -1884,13 +2057,14 @@ export function createApp(opts = {}) {
   };
   const close = () => {
     clearInterval(boxTimer);
+    for (const abort of [...addStops]) abort();
     return Promise.all([
       new Promise((resolve) => { server.close(() => resolve()); server.closeAllConnections(); }),
       new Promise((resolve) => (adminServer.listening ? adminServer.close(() => resolve()) : resolve())),
     ]);
   };
   const homeIdle = () => Promise.all([quota, listing, spend, projects, staging, ompGuard].map((m) => m.settled())); // tests: no refresh still running
-  return { server, listen, close, devices, tickBox, homeIdle, stats: () => ({ streams, running, reads, waiting: queue.length, active: !!active }) };
+  return { server, listen, close, devices, tickBox, homeIdle, stats: () => ({ streams, running, reads, waiting: queue.length, active: !!active, addJobs: addJobs.size }) };
 }
 
 // ---------- CLI ----------
@@ -1966,6 +2140,8 @@ async function main() {
   process.on('uncaughtException', fatal('uncaughtException'));
   const lock = await acquireInstanceLock(dir); // before config, devices or admin.sock are touched
   const app = createApp({ configDir: dir });
+  // a stop or restart of the service (SIGTERM) ends the running add jobs cleanly (their clones are removed) before the process goes
+  for (const sig of ['SIGTERM', 'SIGINT']) process.once(sig, () => { setTimeout(() => process.exit(0), 5000).unref(); app.close().catch(() => {}).finally(() => process.exit(0)); });
   const port = await app.listen();
   void lock; // held until the process exits
   console.log(`fcoding listening on 0.0.0.0:${port}`);
