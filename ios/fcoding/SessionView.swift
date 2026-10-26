@@ -76,7 +76,9 @@ struct SessionView: View {
             }
 
             if let note = model.imageNote {
-                Button { if !model.imageBusy { model.imageNote = nil } } label: {
+                Button {
+                    if model.imageBusy { model.cancelImage() } else { model.imageNote = nil }
+                } label: {
                     HStack(spacing: 8) {
                         if model.imageBusy {
                             ProgressView().tint(.white).scaleEffect(0.8)
@@ -84,6 +86,10 @@ struct SessionView: View {
                             Image(systemName: model.imageFailed ? "exclamationmark.triangle.fill" : "photo")
                         }
                         Text(note)
+                        if model.imageCancellable {
+                            Spacer(minLength: 0)
+                            Image(systemName: "xmark.circle.fill").accessibilityHidden(true)
+                        }
                     }
                     .font(.footnote)
                     .foregroundColor(.white)
@@ -92,7 +98,7 @@ struct SessionView: View {
                     .padding(.vertical, 8)
                     .background(model.imageFailed ? Color.red.opacity(0.85) : Color(white: 0.2))
                 }
-                .accessibilityHint(model.imageBusy ? "" : "Chạm để ẩn")
+                .accessibilityHint(model.imageCancellable ? "Chạm để huỷ ảnh" : model.imageBusy ? "" : "Chạm để ẩn")
             }
 
             if composerShown {
