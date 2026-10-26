@@ -903,11 +903,10 @@ enum HomeLogic {
         var message: String?
         /// Added, but the box could not delete its check branch on GitHub: shown as a notice
         /// that stays until closed (a retry answers CFG_EXISTS without it), not as a toast.
-        struct Cleanup: Equatable, Identifiable {
+        struct Cleanup: Equatable {
             let branch: String
             /// The repo's branches page on GitHub.
             let url: URL
-            var id: String { branch }
         }
         var cleanup: Cleanup?
         var detail: String?
@@ -1470,14 +1469,17 @@ enum HomeLogic {
         eq("done", done.phase, .done)
         eq("done toast", done.message, "Đã thêm dự án web")
         eq("done no cleanup notice", done.cleanup == nil, true)
-        let addedWarn = addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\"refs/heads/box/fcode-add-check\"}")))
+        // The ref the box prints (fcode-add.sh): box/fcode-add-check-<name>-<epoch>-<pid>-<random>.
+        let addedWarn = addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\"refs/heads/box/fcode-add-check-web-1761480000-4242-17345\"}")))
         eq("done warn", addedWarn.phase, .done)
         func cleanupText(_ branch: String) -> String {
             "Đã thêm dự án web, nhưng box chưa xoá được nhánh kiểm tra \(branch) trên GitHub. Hãy xoá nhánh này trên GitHub."
         }
         eq("done warn cleanup notice", addedWarn.cleanup,
-           AddState.Cleanup(branch: "box/fcode-add-check", url: URL(string: "https://github.com/Me/Web/branches")!))
-        eq("done warn cleanup text", addedWarn.message, cleanupText("box/fcode-add-check"))
+           AddState.Cleanup(branch: "box/fcode-add-check-web-1761480000-4242-17345", url: URL(string: "https://github.com/Me/Web/branches")!))
+        eq("done warn cleanup text", addedWarn.message, cleanupText("box/fcode-add-check-web-1761480000-4242-17345"))
+        eq("done warn legacy ref", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\"refs/heads/box/fcode-add-check\"}"))).cleanup?.branch,
+           "box/fcode-add-check")
         let generic = "Đã thêm dự án, nhưng box kiểm tra lại chưa đạt hết, xem lại trên box."
         eq("done warn no detail", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\"}"))).message, generic)
         eq("done warn no detail toast", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\"}"))).cleanup == nil, true)

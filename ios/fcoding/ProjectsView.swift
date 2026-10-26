@@ -90,7 +90,8 @@ struct ProjectsView: View {
                 .overlay(alignment: .bottomTrailing) { fab }
                 .overlay(alignment: .top) { StatusBarCover() }
                 .overlay(alignment: .top) { CleanupNotice(added: $addedNotice) }
-                .overlay(alignment: .top) { ToastView(text: $toast) }
+                // No toast over the cleanup notice; a pending one shows once the notice is closed.
+                .overlay(alignment: .top) { if addedNotice == nil { ToastView(text: $toast) } }
                 .background(SwipeBackEnabler().frame(width: 0, height: 0))
             }
             .toolbar(.hidden, for: .navigationBar)
@@ -137,6 +138,12 @@ struct ProjectsView: View {
                 if let name = openAfterSheet {
                     openAfterSheet = nil
                     open(name)
+                }
+                // Read the cleanup notice once the sheet is gone (while it closes, VoiceOver would cut it off).
+                if let text = addedNotice?.message {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        UIAccessibility.post(notification: .announcement, argument: text)
+                    }
                 }
             }) { which in
                 sheetView(which).environmentObject(app)
@@ -591,7 +598,7 @@ struct CleanupNotice: View {
                     .fixedSize(horizontal: false, vertical: true)
                     Text(c.branch)
                         .scaledFont(13, design: .monospaced)
-                        .foregroundColor(Color(hex: 0xD1D1D6))
+                        .foregroundColor(.white)
                         .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -615,9 +622,7 @@ struct CleanupNotice: View {
                 .padding(.top, 12)
                 .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
                 .transition(reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity))
-                .accessibilityElement(children: .contain)
-                .onAppear { UIAccessibility.post(notification: .announcement, argument: a.message) }
-            }
+                .accessibilityElement(children: .contain)            }
         }
         .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: added)
     }
