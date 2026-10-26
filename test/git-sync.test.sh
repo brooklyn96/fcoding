@@ -320,7 +320,7 @@ if [ $LINUX = 1 ]; then
   H=$(hd ign); cfg ign; run
   eq "ignored file in the way: ff_failed, file and HEAD unchanged" "$(q projects.ign.autoSkip)/$(q projects.ign.autoUpdated)/$(cat "$T/ws/ign/TASK.md")/$(hd ign)/$(q projects.ign.behindDefault)" "ff_failed/false/box-only notes/$H/1"
 
-  # filters: any smudge / process filter driver configured in any scope (repo or global) turns the ff off; attributes are not read
+  # filters: any filter.* key configured in any scope (repo or global) turns the ff off; attributes are not read
   for n in fsm fpr fnone gplain; do mkproj $n; done
   ( cd "$T/ws/fnone" && echo '*.bin filter=lfs -text' >.gitattributes && git add . && git commit -qm attrs && git push -q origin main )  # attributes without any driver
   ( cd "$T/seed/fnone" && git pull -q origin main )
@@ -328,15 +328,17 @@ if [ $LINUX = 1 ]; then
   echo '*.bin filter=lfs' >"$T/ws/fnone/.git/info/attributes"
   c fsm config filter.lfs.smudge 'git-lfs smudge -- %f'
   c fpr config filter.lfs.process 'git-lfs filter-process'
-  c fnone config filter.x.clean cat                                            # a clean-only driver runs nothing on checkout
-  for n in fsm fpr fnone gplain; do eval "H_$n=$(hd $n)"; done
+  mkproj freq; adv freq a.txt r-freq
+  c freq config filter.x.clean cat; c freq config filter.x.required true       # required + clean only: git would die mid-checkout
+  for n in fsm fpr fnone gplain freq; do eval "H_$n=$(hd $n)"; done
   printf '[filter "lfs"]\n\tprocess = git-lfs filter-process\n\tsmudge = git-lfs smudge -- %%f\n\trequired = true\n' >"$HOME/.gitconfig"
   cfg gplain; run; rm -f "$HOME/.gitconfig"
   eq "global lfs config (git lfs install): even a plain repo is skipped (accepted, safe)" "$(q projects.gplain.autoSkip)/$(q projects.gplain.autoUpdated)/$(hd gplain)" "filters/false/$H_gplain"
-  cfg fsm fpr fnone gplain; run
+  cfg fsm fpr fnone gplain freq; run
+  eq "repo config filter.x.required=true + clean only: autoSkip filters, HEAD unchanged" "$(q projects.freq.autoSkip)/$(q projects.freq.autoUpdated)/$(hd freq)" "filters/false/$H_freq"
   eq "repo config filter.*.smudge: autoSkip filters, HEAD unchanged" "$(q projects.fsm.autoSkip)/$(q projects.fsm.autoUpdated)/$(hd fsm)/$(q projects.fsm.behindDefault)" "filters/false/$H_fsm/1"
   eq "repo config filter.*.process: autoSkip filters, HEAD unchanged" "$(q projects.fpr.autoSkip)/$(q projects.fpr.autoUpdated)/$(hd fpr)/$(q projects.fpr.behindDefault)" "filters/false/$H_fpr/1"
-  eq "filter= attributes (HEAD, info) and a clean-only driver, no smudge/process: fast-forwarded" "$(q projects.fnone.autoSkip)/$(q projects.fnone.autoUpdated)/$(hd fnone)" "null/true/$(git -C "$T/remotes/fnone.git" rev-parse main)"
+  eq "filter= attributes (HEAD, info) but no filter.* config: fast-forwarded" "$(q projects.fnone.autoSkip)/$(q projects.fnone.autoUpdated)/$(hd fnone)" "null/true/$(git -C "$T/remotes/fnone.git" rev-parse main)"
   eq "no driver left (global config removed): the plain repo fast-forwards" "$(q projects.gplain.autoSkip)/$(q projects.gplain.autoUpdated)" "null/true"
 
   # late: a run older than FCODE_GIT_LATE_AFTER seconds (600 by default) starts no merge; a bad value means 600

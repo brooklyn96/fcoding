@@ -10,7 +10,7 @@
 #      are on no origin/* branch; dirty = tracked or untracked changes.
 #   3. `git merge --ff-only origin/<default>` ONLY when ALL hold: behind > 0 and ahead == 0; HEAD is on the default branch;
 #      no tracked change (untracked files do not count); no merge / rebase / cherry-pick / revert / bisect / index.lock in
-#      progress; no smudge / process filter driver is configured in any scope (Git LFS and the like: a checkout would run
+#      progress; no filter.* config key exists in any scope (Git LFS and the like: a checkout would run
 #      slow external code; a global `git lfs install` thus turns this step off on the box); the run is younger than 10 min; and no process of this user (omp, claude, codex, a
 #      shell, a tmux pane) has its cwd inside the work tree (/proc/<pid>/cwd; without /proc the project counts as busy).
 #      Hooks, fsmonitor, submodule recursion, auto gc and overwriting of ignored files are off for that merge, so an
@@ -57,10 +57,10 @@ in_progress() {
   done
   return 1
 }
-# filters: any smudge / process filter driver is configured in any scope (repo, global, system): a checkout could run slow external
-# code (Git LFS and the like). No attributes parsing: a global `git lfs install` therefore turns the auto fast-forward off on this
-# box, which is accepted (safe; agents still sync first).
-filters() { [ -n "$(g config --get-regexp '^filter\..*\.(smudge|process)$' 2>/dev/null)" ]; }
+# filters: any filter.* key is configured in any scope (repo, global, system): a checkout could run slow external code, or die
+# mid-way (a `required` driver that cannot smudge), e.g. Git LFS. No attributes parsing: a global `git lfs install` therefore
+# turns the auto fast-forward off on this box, which is accepted (safe; agents still sync first).
+filters() { [ -n "$(g config --get-regexp '^filter\.' 2>/dev/null)" ]; }
 # busy: a process of this user has its cwd inside the work tree the merge moves (the repo's top level, not the configured dir,
 # which can be a subdirectory), or we cannot tell (no /proc). omp, claude, codex, a shell and a tmux pane all show up here.
 # The scan runs in a subshell with cwd / so neither it nor its children can match; this script's own pid is skipped.
