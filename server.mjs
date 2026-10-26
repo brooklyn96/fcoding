@@ -22,6 +22,10 @@ const LONG_TEXT = 500; // bytes; longer single lines are pasted, not typed
 const UPLOAD_LIMIT = 10 * 1024 * 1024;
 const UPLOAD_KEEP_MS = 7 * 24 * 3600e3; // a file in .fcode/uploads older than this is deleted by the next upload
 const UPLOAD_NAME_RE = /^\d{8}-\d{6}-[0-9a-f]{6}\.(?:jpg|png)$/;
+const UPLOAD_SLOTS = 2; // uploads in flight at once (counted before a body byte is read); one more is 429 busy
+const UPLOAD_REQUEST_MS = 120e3; // http request timeout: a 10 MiB photo on a weak link; the JSON routes keep BODY_MS
+const BODY_MS = 15e3; // a JSON body that takes longer than this is cut
+const NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0; // not defined on Windows
 const UPLOAD_TYPES = new Map([
   ['image/jpeg', { ext: 'jpg', magic: Buffer.from([0xff, 0xd8, 0xff]) }],
   ['image/png', { ext: 'png', magic: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) }],
@@ -894,6 +898,7 @@ export function createApp(opts = {}) {
   const pingMs = opts.pingMs ?? 15000;
   const drainTimeout = opts.drainTimeoutMs ?? DRAIN_TIMEOUT;
   const pasteEnterDelay = opts.pasteEnterDelayMs ?? 120;
+  const bodyMs = opts.bodyMs ?? BODY_MS, uploadRequestMs = opts.uploadRequestMs ?? UPLOAD_REQUEST_MS; // tests only: shorter bounds
   const now = opts.now || Date.now;
   const writeFile = opts.writePrivate || writePrivate;
   let gitSpec = opts.git ?? process.env.PC_GIT ?? 'git';
@@ -1715,14 +1720,15 @@ export function createApp(opts = {}) {
   function readBody(req) {
     return new Promise((resolve, reject) => {
       const chunks = []; let size = 0; let over = false;
+      const timer = setTimeout(() => req.destroy(), bodyMs); // server.requestTimeout is long (the image upload); a JSON body keeps this short bound
       req.on('data', (c) => {
         size += c.length;
         if (size > BODY_LIMIT) { over = true; chunks.length = 0; if (size > 16 * BODY_LIMIT) req.destroy(); return; }
         if (!over) chunks.push(c);
       });
-      req.on('end', () => (over ? reject(new HttpErr(413, 'too_large')) : resolve(Buffer.concat(chunks))));
-      req.on('error', () => reject(new HttpErr(400, 'invalid')));
-      req.on('close', () => reject(new HttpErr(499, 'cancelled'))); // no-op once settled
+      req.on('end', () => { clearTimeout(timer); over ? reject(new HttpErr(413, 'too_large')) : resolve(Buffer.concat(chunks)); });
+      req.on('error', () => { clearTimeout(timer); reject(new HttpErr(400, 'invalid')); });
+      req.on('close', () => { clearTimeout(timer); reject(new HttpErr(499, 'cancelled')); }); // no-op once settled
     });
   }
   function parseJson(req, buf) {
@@ -1770,45 +1776,69 @@ export function createApp(opts = {}) {
       req.on('close', () => reject(new HttpErr(499, 'cancelled'))); // no-op once settled
     });
   }
-  // best effort: `/.fcode/` once in the work tree's own info/exclude (never .gitignore); one at a time so two uploads cannot both add it
+  // best effort: `/<prefix>.fcode/` once in the work tree's own info/exclude (never .gitignore); prefix = where the project sits inside the repo
+  // (`git rev-parse --show-prefix`, empty at the top), so a project that is a sub-folder is hidden too. One at a time so two uploads cannot both add it
+  // (at most UPLOAD_SLOTS are ever waiting here). A symlink at info/ or info/exclude is left alone (nothing is hidden, the upload stays).
   let excludeChain = Promise.resolve();
   const hideFromGit = (dir) => (excludeChain = excludeChain.then(async () => {
     try {
-      const out = await execTool(gitSpec, ['-C', dir, '-c', 'core.fsmonitor=false', 'rev-parse', '--is-inside-work-tree', '--git-path', 'info/exclude'], 5000);
-      const [inside, rel] = out.split('\n');
+      const out = await execTool(gitSpec, ['-C', dir, '-c', 'core.fsmonitor=false', 'rev-parse', '--is-inside-work-tree', '--git-path', 'info/exclude', '--show-prefix'], 10000);
+      const [inside, rel, prefix = ''] = out.split(/\r?\n/);
       if (inside.trim() !== 'true' || !rel) return;
-      const file = path.resolve(dir, rel.trim());
+      const line = `/${prefix.replace(/[\\*?[]/g, '\\$&')}.fcode/`; // glob characters of a folder name are escaped
+      const file = path.resolve(dir, rel.trim()), info = path.dirname(file);
+      for (const p of [info, file]) {
+        try { if ((await fs.promises.lstat(p)).isSymbolicLink()) return; } catch (e) { if (e.code !== 'ENOENT') return; }
+      }
       let text = '';
-      try { text = await fs.promises.readFile(file, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') return; }
-      if (text.split(/\r?\n/).some((l) => l.trim() === '/.fcode/')) return;
-      await fs.promises.mkdir(path.dirname(file), { recursive: true });
-      await fs.promises.appendFile(file, `${text && !text.endsWith('\n') ? '\n' : ''}/.fcode/\n`);
+      try { text = await fs.promises.readFile(file, { encoding: 'utf8', flag: fs.constants.O_RDONLY | NOFOLLOW }); } catch (e) { if (e.code !== 'ENOENT') return; }
+      if (text.split(/\r?\n/).some((l) => l.trim() === line)) return;
+      await fs.promises.mkdir(info, { recursive: true });
+      const fh = await fs.promises.open(file, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | NOFOLLOW, 0o644);
+      try { await fh.write(`${text && !text.endsWith('\n') ? '\n' : ''}${line}\n`); } finally { await fh.close(); }
     } catch {} // not a git work tree, or no git: nothing to hide
   }));
-  // regular files named like our uploads and older than UPLOAD_KEEP_MS; anything else in the folder is left alone
+  // regular files named like our uploads and older than UPLOAD_KEEP_MS; anything else in the folder is left alone, a link is never followed.
+  // Runs on upload only; one file failing never stops the rest.
   async function sweepUploads(up) {
-    try {
-      for (const e of await fs.promises.readdir(up, { withFileTypes: true })) {
-        if (!e.isFile() || !UPLOAD_NAME_RE.test(e.name)) continue;
-        const f = path.join(up, e.name);
-        if (now() - (await fs.promises.lstat(f)).mtimeMs > UPLOAD_KEEP_MS) await fs.promises.unlink(f);
-      }
-    } catch {}
+    let names;
+    try { names = await fs.promises.readdir(up); } catch { return; }
+    for (const n of names) {
+      if (!UPLOAD_NAME_RE.test(n)) continue;
+      try {
+        const f = path.join(up, n), st = await fs.promises.lstat(f);
+        if (st.isFile() && now() - st.mtimeMs > UPLOAD_KEEP_MS) await fs.promises.unlink(f);
+      } catch {}
+    }
   }
   // the absolute path ALONE into the session's input, never Enter. claude, omp and unknown: bracketed paste; codex: one send-keys -l (a paste stays text there).
   // A path with whitespace or a quote is not attached. true only after tmux answered 0.
-  async function attachPath(session, agent, file, ctx) {
+  // s = the session as it was when the upload was accepted. The body took time: inside the job, right before tmux, it must still be the same session
+  // (same name, project, agent kind and creation time), else nothing is sent (the name may now belong to another project's session).
+  async function attachPath(s, file, ctx) {
     if (/[\s'"]/.test(file)) return false;
     try {
-      await mutate(ctx, () => (agent === 'codex' ? run(ctx, ['send-keys', '-t', pane(session), '-l', '--', file]) : pasteText(session, file, ctx)));
-      return true;
+      return await mutate(ctx, async () => {
+        const cur = (await listSessions(ctx)).find((x) => x.name === s.name);
+        if (!cur || cur.project !== s.project || cur.harness !== s.harness || cur.created !== s.created) return false;
+        await (s.harness === 'codex' ? run(ctx, ['send-keys', '-t', pane(s.name), '-l', '--', file]) : pasteText(s.name, file, ctx));
+        return true;
+      });
     } catch (e) {
       if (gateStop(e)) throw e;
       return false;
     }
   }
+  // admission first: at most UPLOAD_SLOTS in flight, counted before any body byte is read (the 429 reads nothing, like the 413 that is answered unread);
+  // the slot is freed on every way out
+  let uploads = 0;
   async function upload(req, res, url, ctx, rawName) {
     if (req.method !== 'POST') throw new HttpErr(405, 'method');
+    if (uploads >= UPLOAD_SLOTS) throw new HttpErr(429, 'busy');
+    uploads++;
+    try { return await storeUpload(req, res, url, ctx, rawName); } finally { uploads--; }
+  }
+  async function storeUpload(req, res, url, ctx, rawName) {
     let project = '';
     try { project = decodeURIComponent(rawName); } catch {}
     const dir = validProject(project) ? cfg.projects[project] : null;
@@ -1816,14 +1846,13 @@ export function createApp(opts = {}) {
     const type = UPLOAD_TYPES.get((req.headers['content-type'] || '').split(';')[0].trim().toLowerCase());
     if (!type) throw new HttpErr(415, 'bad_type');
     const session = url.searchParams.get('session'); // checked before anything is written
-    let agent = null;
+    let found = null;
     if (session !== null) {
-      const s = (await listSessions(ctx)).find((x) => x.name === session && x.project === project);
-      if (!s) throw new HttpErr(404, 'no_session');
-      agent = s.harness;
+      found = (await listSessions(ctx)).find((x) => x.name === session && x.project === project);
+      if (!found) throw new HttpErr(404, 'no_session');
     }
     const buf = await readUpload(req);
-    if (!valid(ctx)) throw gateErr(ctx);
+    if (!valid(ctx)) throw gateErr(ctx); // the device may have been revoked while the body came in
     if (!buf.length) throw new HttpErr(400, 'empty');
     if (!buf.subarray(0, type.magic.length).equals(type.magic)) throw new HttpErr(415, 'bad_type');
     await hideFromGit(dir);
@@ -1838,13 +1867,13 @@ export function createApp(opts = {}) {
       let fh;
       for (let i = 0; !fh; i++) {
         file = path.join(up, `${stamp}-${crypto.randomBytes(3).toString('hex')}.${type.ext}`);
-        try { fh = await fs.promises.open(file, 'wx', 0o600); } catch (e) { if (e.code !== 'EEXIST' || i >= 4) throw e; }
+        try { fh = await fs.promises.open(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NOFOLLOW, 0o600); } catch (e) { if (e.code !== 'EEXIST' || i >= 4) throw e; }
       }
       try { await fh.writeFile(buf); } catch (e) { await fh.close(); await fs.promises.unlink(file).catch(() => {}); throw e; }
       await fh.close();
     } catch { throw new HttpErr(500, 'storage'); }
     await sweepUploads(up);
-    return json(res, 200, { path: file, attached: session === null ? false : await attachPath(session, agent, file, ctx) });
+    return json(res, 200, { path: file, attached: found ? await attachPath(found, file, ctx) : false });
   }
 
   // --- SSE ---
@@ -2130,7 +2159,7 @@ export function createApp(opts = {}) {
   }
 
   // The handler never rejects: every failure path ends in a response (or a closed socket).
-  const server = http.createServer(async (req, res) => {
+  const server = http.createServer({ connectionsCheckingInterval: Math.min(30000, uploadRequestMs / 4) }, async (req, res) => {
     const t0 = Date.now();
     const ctx = { cancelled: false, device: null, gen: -1 };
     res.on('close', () => { if (!res.writableFinished) { ctx.cancelled = true; ctx.onCancel?.(); } });
@@ -2156,8 +2185,8 @@ export function createApp(opts = {}) {
     if (socket.writable && !socket.destroyed) socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
     else socket.destroy();
   });
-  server.requestTimeout = 15000;
-  server.headersTimeout = 10000;
+  server.requestTimeout = uploadRequestMs; // long, for the image upload; readBody cuts a JSON body at bodyMs on its own
+  server.headersTimeout = Math.min(10000, uploadRequestMs);
   const listen = async (port = Number(process.env.PC_PORT) || cfg.port || 7681, host = '0.0.0.0') => {
     await listenAdmin();
     try {
