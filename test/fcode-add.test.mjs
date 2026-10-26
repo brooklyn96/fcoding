@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import http from 'node:http';
 import { createApp, adminRequest } from '../server.mjs';
@@ -49,7 +49,8 @@ function world(push = 'true') {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-fa-'));
   const e = { root, home: path.join(root, 'home'), bin: path.join(root, 'bin'), gh: path.join(root, 'gh'), ws: path.join(root, 'ws'), ssh: path.join(root, 'ssh'),
     cfgDir: path.join(root, 'cfg'), ghlog: path.join(root, 'gh.log'), push, rewrites: [] };
-  for (const d of [e.home, e.bin, e.gh, e.ws, e.cfgDir]) fs.mkdirSync(d, { recursive: true });
+  e.tmp = path.join(root, 'tmp');
+  for (const d of [e.home, e.bin, e.gh, e.ws, e.cfgDir, e.tmp]) fs.mkdirSync(d, { recursive: true });
   fs.chmodSync(e.cfgDir, 0o700);
   e.cfg = path.join(e.cfgDir, 'config.json');
   fs.writeFileSync(e.cfg, JSON.stringify({ cookieSecret: Buffer.alloc(32, 7).toString('base64'), projects: { other: '/data/workspace/other' }, port: 7681, keep: 1 }, null, 2) + '\n', { mode: 0o600 });
@@ -76,17 +77,26 @@ function bare(e, repo, hookName) {
   return dir;
 }
 function scriptEnv(e, extra = {}) {
-  const env = { PATH: `${e.bin}:${process.env.PATH}`, HOME: e.home, LANG: 'C.UTF-8', GIT_CONFIG_NOSYSTEM: '1', FCODE_SSH_DIR: e.ssh, FCODE_WORKSPACE: e.ws, FCODE_CFG: e.cfg,
+  const env = { PATH: `${e.bin}:${process.env.PATH}`, HOME: e.home, TMPDIR: e.tmp, LANG: 'C.UTF-8', GIT_CONFIG_NOSYSTEM: '1', FCODE_SSH_DIR: e.ssh, FCODE_WORKSPACE: e.ws, FCODE_CFG: e.cfg,
     FAKE_GH_LOG: e.ghlog, FAKE_GH_PUSH: e.push, GH_TOKEN: TOKEN, GIT_CONFIG_COUNT: String(e.rewrites.length), ...extra };
   e.rewrites.forEach(([from, to], i) => { env[`GIT_CONFIG_KEY_${i}`] = `url.${to}.insteadOf`; env[`GIT_CONFIG_VALUE_${i}`] = from; });
   return env;
 }
+const shape = (code, stdout, stderr) => {
+  const lines = stdout.split('\n').map((l) => /^R (\S+)(?: (.*))?$/.exec(l)).filter(Boolean).map((m) => [m[1], m[2] ?? '']);
+  return { code, lines, codes: lines.map((l) => l[0]), detail: (c) => lines.find((l) => l[0] === c)?.[1], stdout, stderr };
+};
 function run(e, repo, name, extra = {}) {
   const env = scriptEnv(e, extra);
   const r = spawnSync('bash', [SCRIPT, ...(repo === undefined ? [] : [repo]), ...(name === undefined ? [] : [name])], { env, encoding: 'utf8', timeout: 120e3 });
-  const lines = r.stdout.split('\n').map((l) => /^R (\S+)(?: (.*))?$/.exec(l)).filter(Boolean).map((m) => [m[1], m[2] ?? '']);
-  return { code: r.status, lines, codes: lines.map((l) => l[0]), detail: (c) => lines.find((l) => l[0] === c)?.[1], stdout: r.stdout, stderr: r.stderr };
+  return shape(r.status, r.stdout, r.stderr);
 }
+const runAsync = (e, repo, name, extra = {}) => new Promise((resolve) => { // several at once
+  const p = spawn('bash', [SCRIPT, repo, name], { env: scriptEnv(e, extra), stdio: ['ignore', 'pipe', 'pipe'] });
+  let out = '', er = '';
+  p.stdout.on('data', (d) => { out += d; }); p.stderr.on('data', (d) => { er += d; });
+  p.on('close', (code) => resolve(shape(code, out, er)));
+});
 const projects = (e) => JSON.parse(fs.readFileSync(e.cfg, 'utf8')).projects;
 const git = (e, dir, ...a) => sh('git', ['-C', dir, ...a], e);
 const gitOr = (e, dir, ...a) => spawnSync('git', ['-C', dir, ...a], { encoding: 'utf8', env: { PATH: process.env.PATH, HOME: e.home, GIT_CONFIG_NOSYSTEM: '1' } }).stdout.trim();
@@ -96,6 +106,8 @@ const noToken = (e, r) => {
   assert.ok(!r.stdout.includes(TOKEN) && !r.stderr.includes(TOKEN), 'printed');
   for (const f of files(e.root)) assert.ok(!fs.readFileSync(f).includes(TOKEN), `written: ${f}`);
 };
+// every mktemp of the script (TMPDIR = e.tmp) is gone: also after a TOKEN_FALLBACK re-exec, which skips the EXIT trap
+const tmpClean = (e) => assert.deepEqual(fs.readdirSync(e.tmp), [], 'temp files left behind');
 const done = (e) => fs.rmSync(e.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 const TAIL = ['V_BRANCH_OK', 'V_PR_OK', 'V_HOOK_OK', 'V_SERVER_OK', 'RULES_NO'];
 
@@ -128,6 +140,8 @@ test('token path: gh can push -> https clone, repo-local gh credential helper, n
     assert.equal(spawnSync(hookFile, ['origin', 'x'], { input: 'refs/heads/x 0 refs/heads/main 0\n' }).status, 1);
     assert.equal(spawnSync(hookFile, ['origin', 'x'], { input: 'refs/heads/box/x 0 refs/heads/box/x 0\n' }).status, 0);
     assert.equal(git(e, remote, 'for-each-ref', 'refs/heads/box'), '');
+    assert.equal(git(e, dir, 'config', '--local', '--get', 'core.hooksPath'), path.join(dir, '.git', 'hooks')); // git is pointed at the clone's own hooks
+    tmpClean(e);
     // gh was asked only for the permission; its credential helper never ran (the clone is local here)
     const calls = fs.readFileSync(e.ghlog, 'utf8').trim().split('\n');
     assert.deepEqual(calls.filter((c) => c.startsWith('api')), ['api repos/o/r --jq .permissions.push']);
@@ -179,12 +193,12 @@ test('token path falls back when the write check is refused for permission (the 
     bare(e, 'o/r', 'ro'); e.map('r');
     const r = run(e, 'o/r', 'r'); // also proves the lock is not held by the first pass (no deadlock on the re-exec)
     assert.equal(r.code, 41, r.stdout + r.stderr);
-    assert.deepEqual(r.codes, ['TOKEN_OK', 'READ_OK', 'CLONED', 'HOOK_OK', 'TOKEN_FALLBACK', 'KEY_NEW', 'ALIAS_ADDED', 'READ_OK', 'CLONE_EXISTS', 'HOOK_EXISTS', 'SSH_DETAIL', 'PUBKEY', 'NEED_WRITE']); // one SSH_DETAIL: the refused token write prints none
+    // the token run's clone is removed before the key run starts (that one clones again), and the key run's own clone goes when it fails; one SSH_DETAIL
+    assert.deepEqual(r.codes, ['TOKEN_OK', 'READ_OK', 'CLONED', 'HOOK_OK', 'TOKEN_FALLBACK', 'KEY_NEW', 'ALIAS_ADDED', 'READ_OK', 'CLONED', 'HOOK_OK', 'SSH_DETAIL', 'PUBKEY', 'NEED_WRITE']);
     assert.match(r.detail('PUBKEY'), /^ssh-ed25519 [A-Za-z0-9+/]+ fcode-o\/r$/);
-    const dir = path.join(e.ws, 'r');
-    assert.equal(git(e, dir, 'config', '--get', 'remote.origin.url'), 'git@github-r:o/r.git');
-    assert.equal(gitOr(e, dir, 'config', '--local', '--get-regexp', 'credential'), ''); // the helper was taken out again
+    assert.equal(fs.existsSync(path.join(e.ws, 'r')), false); // no orphan clone
     assert.equal(projects(e).r, undefined); // nothing added
+    tmpClean(e);
     noToken(e, r);
     // the private key never reaches the output
     const priv = fs.readFileSync(path.join(e.ssh, 'id_ed25519_r'), 'utf8').split('\n').filter((l) => l && !l.startsWith('-----'));
@@ -246,6 +260,8 @@ test('key path outcomes: NEED_KEY (public key printed), NEED_WRITE, WRITE_BLOCKE
       assert.equal(r.codes.at(-1), last);
       assert.ok(!r.codes.includes('TOKEN_FALLBACK') || (hookName === 'ro' && token), 'only a permission refusal falls back');
       assert.equal(projects(e).r, undefined);
+      assert.equal(fs.existsSync(path.join(e.ws, 'r')), false, 'the clone this run made is removed when the project is not added');
+      tmpClean(e);
       noToken(e, r);
     } finally { done(e); }
   }
@@ -265,12 +281,16 @@ test('key path outcomes: NEED_KEY (public key printed), NEED_WRITE, WRITE_BLOCKE
   for (const token of [false, true]) {
     e = world(token ? 'true' : 'false');
     try {
-      bare(e, 'o/r', 'nodelete'); e.map('r');
+      const remote = bare(e, 'o/r', 'nodelete'); e.map('r');
       const r = run(e, 'o/r', 'r');
       assert.equal(r.code, 30, r.stdout + r.stderr);
-      assert.equal(r.detail('CLEANUP_FAIL'), 'refs/heads/box/fcode-add-check');
+      // the probe ref is unique per run: box/fcode-add-check-<name>-<epoch>-<pid>; that exact branch is named, and it is the one left on the remote
+      const branch = r.detail('CLEANUP_FAIL');
+      assert.match(branch, /^refs\/heads\/box\/fcode-add-check-r-\d+-\d+-\d+$/);
+      assert.equal(git(e, remote, 'for-each-ref', '--format=%(refname)', 'refs/heads/box'), branch);
       assert.ok(r.codes.includes('CFG_ADDED') && r.codes.includes('WRITE_OK'));
       assert.equal(projects(e).r, path.join(e.ws, 'r'));
+      tmpClean(e);
     } finally { done(e); }
   }
 });
@@ -406,5 +426,235 @@ test('server + real script: the deploy key route answers NEED_KEY with the publi
       const priv = fs.readFileSync(path.join(e.ssh, 'id_ed25519_r'), 'utf8').split('\n').filter((l) => l && !l.startsWith('-----'));
       for (const l of priv) assert.ok(!j.text.includes(l));
     });
+  } finally { done(e); }
+});
+// ======================= round 2: write proof, hook, paths, cleanup, durability =======================
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(fn, ms = 30000) { const end = Date.now() + ms; for (;;) { if (fn()) return; if (Date.now() > end) throw new Error('until: timed out'); await sleep(50); } }
+const boxRefs = (e, remote) => git(e, remote, 'for-each-ref', '--format=%(refname)', 'refs/heads/box').split('\n').filter(Boolean);
+
+test('write proof: an old check branch is no proof; a denied delete (permission) fails the check, so the token route falls back and the key route ends in NEED_WRITE', { skip }, () => {
+  const e = world('true');
+  try {
+    const remote = bare(e, 'o/r'); e.map('r');
+    git(e, remote, 'update-ref', 'refs/heads/box/fcode-add-check', git(e, remote, 'rev-parse', 'main')); // what the old script left behind
+    // a branch may be created, but its deletion is refused for permission
+    fs.writeFileSync(path.join(remote, 'hooks', 'pre-receive'), hook(`  [ "$n" = ${ZERO} ] && { echo "remote: Permission to o/r.git denied to box." >&2; exit 1; }`), { mode: 0o755 });
+    const r = run(e, 'o/r', 'r');
+    assert.equal(r.code, 41, r.stdout + r.stderr);
+    assert.deepEqual(r.codes, ['TOKEN_OK', 'READ_OK', 'CLONED', 'HOOK_OK', 'TOKEN_FALLBACK', 'KEY_NEW', 'ALIAS_ADDED', 'READ_OK', 'CLONED', 'HOOK_OK', 'SSH_DETAIL', 'PUBKEY', 'NEED_WRITE']);
+    assert.ok(!r.codes.includes('WRITE_OK') && !r.codes.includes('CFG_ADDED'));
+    assert.equal(projects(e).r, undefined);
+    assert.equal(fs.existsSync(path.join(e.ws, 'r')), false);
+    // the old branch was never touched; each run left only its own probe (named by the job), never the fixed old name
+    const refs = boxRefs(e, remote);
+    assert.ok(refs.includes('refs/heads/box/fcode-add-check'));
+    assert.equal(refs.filter((x) => /^refs\/heads\/box\/fcode-add-check-r-\d+-\d+-\d+$/.test(x)).length, 2);
+    tmpClean(e);
+  } finally { done(e); }
+  // a key that can only read: creating the probe is refused for permission, an old check branch changes nothing
+  const e2 = world('false');
+  try {
+    const remote = bare(e2, 'o/r', 'ro'); e2.map('r');
+    git(e2, remote, 'update-ref', 'refs/heads/box/fcode-add-check', git(e2, remote, 'rev-parse', 'main'));
+    const r = run(e2, 'o/r', 'r');
+    assert.deepEqual([r.code, r.codes.at(-1)], [41, 'NEED_WRITE'], r.stdout + r.stderr);
+    assert.ok(!r.codes.includes('WRITE_OK') && projects(e2).r === undefined);
+  } finally { done(e2); }
+});
+
+test('write proof: two adds of one repo under different names each create and delete only their own probe branch', { skip }, async () => {
+  const e = world('true');
+  try {
+    const remote = bare(e, 'o/r');
+    const log = path.join(e.root, 'refs.log');
+    fs.writeFileSync(path.join(remote, 'hooks', 'pre-receive'), hook(`  echo "$o $n $r" >>${log}; sleep 1`), { mode: 0o755 }); // slow: the two runs overlap
+    const [a, b] = await Promise.all([runAsync(e, 'o/r', 'ra'), runAsync(e, 'o/r', 'rb')]);
+    for (const r of [a, b]) { assert.equal(r.code, 0, r.stdout + r.stderr); assert.ok(r.codes.includes('WRITE_OK') && !r.codes.includes('CLEANUP_FAIL')); }
+    const rows = fs.readFileSync(log, 'utf8').trim().split('\n').map((l) => l.split(' '));
+    assert.equal(rows.length, 4); // each run: one create, one delete
+    for (const name of ['ra', 'rb']) {
+      const mine = rows.filter((x) => x[2].startsWith(`refs/heads/box/fcode-add-check-${name}-`));
+      assert.equal(mine.length, 2, name);
+      assert.equal(mine[0][2], mine[1][2]); // the same probe: created, then deleted
+      assert.ok(mine[0][0] === ZERO && mine[1][1] === ZERO && mine[1][0] === mine[0][1], 'created, then deleted with the commit it created');
+    }
+    assert.deepEqual(boxRefs(e, remote), []);
+    assert.deepEqual(Object.keys(projects(e)).sort(), ['other', 'ra', 'rb']);
+    tmpClean(e);
+  } finally { done(e); }
+});
+
+test('hook: git uses the clone\'s own hooks even when a global core.hooksPath points elsewhere (checked by a real push, not by running the file)', { skip }, () => {
+  const e = world('true');
+  try {
+    const empty = path.join(e.root, 'global-hooks'); fs.mkdirSync(empty);
+    fs.writeFileSync(path.join(e.home, '.gitconfig'), `[core]\n\thooksPath = ${empty}\n`);
+    bare(e, 'o/r'); const target = path.join(e.root, 'target.git'); sh('git', ['init', '-q', '--bare', target], e); // empty: every push has something to send, so the hook is asked
+    const r = run(e, 'o/r', 'r');
+    assert.deepEqual([r.code, r.codes], [0, ['TOKEN_OK', 'READ_OK', 'CLONED', 'HOOK_OK', 'WRITE_OK', 'CFG_ADDED', ...TAIL]], r.stdout + r.stderr);
+    const dir = path.join(e.ws, 'r');
+    assert.equal(git(e, dir, 'config', '--local', '--get', 'core.hooksPath'), path.join(dir, '.git', 'hooks'));
+    const push = (ref) => spawnSync('git', ['-C', dir, 'push', '-q', target, `HEAD:${ref}`], { encoding: 'utf8', env: { PATH: process.env.PATH, HOME: e.home, GIT_CONFIG_NOSYSTEM: '1' } });
+    const toMain = push('refs/heads/main');
+    assert.notEqual(toMain.status, 0);
+    assert.match(toMain.stderr, /blocked on this box/);
+    assert.equal(push('refs/heads/box/z').status, 0);
+  } finally { done(e); }
+});
+
+test('hook: an install failure fails the add before the project is registered; a fresh clone is removed, an existing folder is kept', { skip }, () => {
+  const e = world('true');
+  try {
+    const remote = bare(e, 'o/r');
+    const tpl = path.join(e.root, 'tpl'); fs.mkdirSync(tpl); fs.writeFileSync(path.join(tpl, 'hooks'), 'a file where the hooks folder should be');
+    const extra = { GIT_TEMPLATE_DIR: tpl };
+    let r = run(e, 'o/r', 'r', extra);
+    assert.deepEqual([r.code, r.codes], [24, ['TOKEN_OK', 'READ_OK', 'CLONED', 'HOOK_FAIL']], r.stdout + r.stderr);
+    assert.equal(r.detail('HOOK_FAIL'), 'install'); // the install error itself ends the run, not only the later verification
+    assert.equal(fs.existsSync(path.join(e.ws, 'r')), false);
+    assert.equal(projects(e).r, undefined);
+    tmpClean(e);
+    // a folder that was there before is never removed
+    const dir = path.join(e.ws, 'r');
+    sh('git', ['clone', '-q', remote, dir], { ...e, extra });
+    sh('git', ['-C', dir, 'remote', 'set-url', 'origin', 'https://github.com/o/r.git'], e);
+    r = run(e, 'o/r', 'r', extra);
+    assert.deepEqual([r.code, r.codes.at(-1)], [24, 'HOOK_FAIL'], r.stdout + r.stderr);
+    assert.ok(fs.existsSync(path.join(dir, '.git')));
+    assert.equal(projects(e).r, undefined);
+  } finally { done(e); }
+});
+
+test('paths: a symlinked target, a .git that is a link, or a git dir outside the workspace is refused before any change; a symlinked workspace is fine', { skip }, () => {
+  const e = world('true');
+  try {
+    bare(e, 'o/r');
+    const out = path.join(e.root, 'outside'); fs.mkdirSync(out);
+    const clone = path.join(out, 'clone');
+    sh('git', ['clone', '-q', path.join(e.gh, 'o/r.git'), clone], e);
+    sh('git', ['-C', clone, 'remote', 'set-url', 'origin', 'https://github.com/o/r.git'], e); // the origin matches, so only the path rules can refuse it
+    const snap = () => JSON.stringify([fs.readFileSync(path.join(clone, '.git', 'config'), 'utf8'), fs.readdirSync(path.join(clone, '.git', 'hooks')).sort()]);
+    const before = snap();
+    const target = path.join(e.ws, 'r');
+    // 1. the workspace entry is a link to the outside clone
+    fs.symlinkSync(clone, target);
+    let r = run(e, 'o/r', 'r');
+    assert.deepEqual([r.code, r.codes], [11, ['DIR_UNSAFE']], r.stdout + r.stderr);
+    assert.equal(snap(), before);
+    fs.unlinkSync(target);
+    // 2. a real folder whose .git is a link to the outside git dir
+    fs.mkdirSync(target); fs.symlinkSync(path.join(clone, '.git'), path.join(target, '.git'));
+    r = run(e, 'o/r', 'r');
+    assert.deepEqual([r.code, r.codes], [11, ['DIR_UNSAFE']]);
+    assert.equal(snap(), before);
+    fs.rmSync(target, { recursive: true });
+    // 3. .git is a file that points at the outside git dir
+    fs.mkdirSync(target); fs.writeFileSync(path.join(target, '.git'), `gitdir: ${path.join(clone, '.git')}\n`);
+    r = run(e, 'o/r', 'r');
+    assert.deepEqual([r.code, r.codes], [11, ['DIR_NOTGIT']]);
+    assert.equal(snap(), before);
+    fs.rmSync(target, { recursive: true });
+    assert.equal(projects(e).r, undefined);
+    assert.deepEqual(fs.readdirSync(e.ws), []);
+    tmpClean(e);
+    // a workspace that is itself a link to a real folder is fine, and so is a rerun inside it
+    const link = path.join(e.root, 'ws-link'); fs.symlinkSync(e.ws, link);
+    r = run(e, 'o/r', 'r', { FCODE_WORKSPACE: link });
+    assert.deepEqual([r.code, r.codes.slice(0, 3)], [0, ['TOKEN_OK', 'READ_OK', 'CLONED']], r.stdout + r.stderr);
+    assert.equal(run(e, 'o/r', 'r', { FCODE_WORKSPACE: link }).code, 0);
+  } finally { done(e); }
+});
+
+test('cleanup: a name whose key or alias belongs to another repo is NAME_USED before the token route clones anything', { skip }, () => {
+  const e = world('true');
+  try {
+    bare(e, 'o/r');
+    fs.mkdirSync(e.ssh, { recursive: true });
+    fs.writeFileSync(path.join(e.ssh, 'config'), '\n# fcode add: someone/else\nHost github-r\n  HostName github.com\n');
+    const r = run(e, 'o/r', 'r');
+    assert.deepEqual([r.code, r.codes], [23, ['NAME_USED']], r.stdout + r.stderr);
+    assert.deepEqual(fs.readdirSync(e.ws), []);
+    assert.ok(!fs.existsSync(e.ghlog), 'gh was not even asked');
+    tmpClean(e);
+  } finally { done(e); }
+});
+
+test('cleanup: a failed add removes the clone this run made, never a folder that was already there (also across the token fallback)', { skip }, () => {
+  // a folder that existed before: a refused write (token, then key) leaves it, drops only the credential helper
+  const e = world('true');
+  try {
+    const remote = bare(e, 'o/r', 'ro'); e.map('r');
+    const dir = path.join(e.ws, 'r');
+    sh('git', ['clone', '-q', remote, dir], e);
+    sh('git', ['-C', dir, 'remote', 'set-url', 'origin', 'https://github.com/o/r.git'], e);
+    const r = run(e, 'o/r', 'r');
+    assert.equal(r.code, 41, r.stdout + r.stderr);
+    assert.ok(r.codes.includes('TOKEN_FALLBACK') && r.codes.includes('NEED_WRITE'));
+    assert.ok(fs.existsSync(path.join(dir, '.git')), 'the folder that was there stays');
+    assert.equal(gitOr(e, dir, 'config', '--local', '--get-regexp', 'credential'), '');
+    assert.equal(projects(e).r, undefined);
+    tmpClean(e);
+  } finally { done(e); }
+  // the registration itself fails (config folder not writable): the new clone goes, nothing is registered
+  if (process.getuid?.() !== 0) {
+    const e2 = world('true');
+    try {
+      bare(e2, 'o/r');
+      fs.chmodSync(e2.cfgDir, 0o500);
+      const r = run(e2, 'o/r', 'r');
+      assert.deepEqual([r.code, r.codes.at(-1)], [22, 'CFG_BROKEN'], r.stdout + r.stderr);
+      assert.equal(fs.existsSync(path.join(e2.ws, 'r')), false);
+      tmpClean(e2);
+    } finally { fs.chmodSync(e2.cfgDir, 0o700); done(e2); }
+  }
+});
+
+test('cleanup: a TERM (the server stopping, a timeout) while the write check runs removes the new clone and the temp files', { skip }, async () => {
+  const e = world('true');
+  try {
+    const remote = bare(e, 'o/r');
+    const marker = path.join(e.root, 'in-hook');
+    fs.writeFileSync(path.join(remote, 'hooks', 'pre-receive'), hook(`  case "$r" in refs/heads/box/*) touch ${marker}; sleep 60;; esac`), { mode: 0o755 });
+    const p = spawn('bash', [SCRIPT, 'o/r', 'r'], { env: scriptEnv(e), stdio: 'ignore', detached: true });
+    const exited = new Promise((resolve) => p.on('close', (code, sig) => resolve([code, sig])));
+    await until(() => fs.existsSync(marker));
+    assert.ok(fs.existsSync(path.join(e.ws, 'r')));
+    process.kill(-p.pid, 'SIGTERM'); // the whole group, as the server does
+    const [code] = await exited;
+    assert.equal(code, 143);
+    assert.equal(fs.existsSync(path.join(e.ws, 'r')), false);
+    assert.equal(projects(e).r, undefined);
+    tmpClean(e);
+  } finally { done(e); }
+});
+
+test('durability: config.json and its backup are fsynced before the rename, then the folder is', { skip }, () => {
+  const e = world('true');
+  try {
+    bare(e, 'o/r');
+    const py = path.join(e.root, 'py'); fs.mkdirSync(py);
+    const log = path.join(e.root, 'fsync.log');
+    fs.writeFileSync(path.join(py, 'sitecustomize.py'), `import os
+_log = os.environ['FSYNC_LOG']; _fsync, _replace = os.fsync, os.replace
+def _w(s):
+    with open(_log, 'a') as f: f.write(s + '\\n')
+def fsync(fd):
+    try: p = os.readlink('/proc/self/fd/%d' % fd)
+    except OSError: p = '?'
+    _w('fsync ' + p); return _fsync(fd)
+def replace(a, b, *x, **k):
+    _w('replace %s %s' % (a, b)); return _replace(a, b, *x, **k)
+os.fsync = fsync; os.replace = replace
+`);
+    const r = run(e, 'o/r', 'r', { PYTHONPATH: py, FSYNC_LOG: log });
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    const rows = fs.readFileSync(log, 'utf8').trim().split('\n');
+    assert.equal(rows.length, 4, rows.join('\n'));
+    assert.match(rows[0], new RegExp(`^fsync ${e.cfg.replace(/\./g, '\\.')}\\.bak-`)); // the backup, on disk first
+    assert.match(rows[1], new RegExp(`^fsync ${e.cfgDir}/\\.config\\.json\\..*\\.tmp$`)); // the new file, before the rename
+    assert.match(rows[2], new RegExp(`^replace ${e.cfgDir}/\\.config\\.json\\..*\\.tmp ${e.cfg.replace(/\./g, '\\.')}$`));
+    assert.equal(rows[3], `fsync ${e.cfgDir}`); // then the folder
+    assert.equal(projects(e).r, path.join(e.ws, 'r'));
   } finally { done(e); }
 });

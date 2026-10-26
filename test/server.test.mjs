@@ -4073,15 +4073,15 @@ test('add project: a job still running is never dropped by the 30 minute clean-u
 
 // ---------- GET /api/github/repos: what the box's gh login sees, and which of it is already on the box ----------
 const ghRow = (repo, o = {}) => JSON.stringify({ repo, private: false, archived: false, canPush: true, updatedAt: '2026-10-01T00:00:00Z', ...o });
-const GH_LIST_KEY = 'api --paginate /user/repos?affiliation=owner,collaborator,organization_member&sort=updated&per_page=100 --jq';
+const GH_LIST_KEY = 'api /user/repos?affiliation=owner,collaborator,organization_member&sort=updated&per_page=100&page=1 --jq';
 const ghRepos = (c, o = {}) => c.req('GET', '/api/github/repos', { cookie: c.cookie, ...o });
-const ghCalls = (c) => c.toolCalls('api --paginate');
+const ghCalls = (c) => c.toolCalls('api /user/repos');
 
 test('github repos: needs a session; GET only; the gh call is exactly the contract one', () => homeApp(async (c) => {
   assert.equal((await c.req('GET', '/api/github/repos')).status, 401);
   assert.equal((await c.req('POST', '/api/github/repos', { cookie: c.cookie, body: {} })).status, 405);
   assert.equal(ghCalls(c).length, 0);
-  c.setRules([['api --paginate', { stdout: ghRow('o/a') + '\n' }], ...baseRules()]);
+  c.setRules([['api /user/repos', { stdout: ghRow('o/a') + '\n' }], ...baseRules()]);
   const r = await ghRepos(c);
   assert.equal(r.status, 200);
   assert.equal(ghCalls(c).length, 1);
@@ -4099,7 +4099,7 @@ test('github repos: fields, sort by updatedAt descending, at most 300, bad lines
     JSON.stringify({ repo: 'o/odd', private: 'yes', archived: 1, canPush: null, updatedAt: 'garbage' }), // not booleans: false; not a date: null, last
     JSON.stringify({ repo: 'o/nodate' }),
   ];
-  c.setRules([['api --paginate', { stdout: lines.join('\n') + '\n' }], ...baseRules()]);
+  c.setRules([['api /user/repos', { stdout: lines.join('\n') + '\n' }], ...baseRules()]);
   const r = await ghRepos(c);
   assert.deepEqual(r.json, { repos: [
     { repo: 'o/new', private: true, archived: false, canPush: true, updatedAt: '2026-10-25T10:00:00.000Z', onBox: null },
@@ -4109,12 +4109,16 @@ test('github repos: fields, sort by updatedAt descending, at most 300, bad lines
     { repo: 'o/nodate', private: false, archived: false, canPush: false, updatedAt: null, onBox: null },
   ] });
   // 450 repos: the 300 most recently updated
-  const many = Array.from({ length: 450 }, (_, i) => ghRow(`o/r${i}`, { updatedAt: new Date(Date.UTC(2026, 0, 1) + i * 1000).toISOString() }));
-  c.setRules([['api --paginate', { stdout: many.join('\n') + '\n' }], ...baseRules()]);
+  // (gh answers newest first, 100 a page; the server reads pages 1..3 only)
+  const many = Array.from({ length: 450 }, (_, i) => ghRow(`o/r${449 - i}`, { updatedAt: new Date(Date.UTC(2026, 0, 1) + (449 - i) * 1000).toISOString() }));
+  const page = (n) => many.slice((n - 1) * 100, n * 100).join('\n') + '\n';
+  c.setRules([['&page=1 --jq', { stdout: page(1) }], ['&page=2 --jq', { stdout: page(2) }], ['&page=3 --jq', { stdout: page(3) }], ['&page=4 --jq', { stdout: page(4) }], ...baseRules()]);
   c.clock.t += 61e3;
+  const before = ghCalls(c).length;
   const big = (await ghRepos(c)).json.repos;
   assert.equal(big.length, 300);
   assert.deepEqual([big[0].repo, big[299].repo], ['o/r449', 'o/r150']);
+  assert.equal(ghCalls(c).length - before, 3); // never a page 4
 }));
 
 test('github repos: onBox is the project whose origin points at the repo, in every URL form, lower-cased; a project that cannot answer is ignored', () => homeApp(async (c) => {
@@ -4126,7 +4130,7 @@ test('github repos: onBox is the project whose origin points at the repo, in eve
   };
   setProjects(c, { ...Object.fromEntries(Object.keys(origins).map((k) => [`p-${k}`, d(k)])), 'p-none': d('none') });
   c.setRules([
-    ['api --paginate', { stdout: ['owner-a/repo-a', 'OWNER-B/Repo-B', 'owner-c/repo-c', 'owner-d/repo-d', 'owner-e/repo-e', 'owner-f/repo-f', 'owner-g/repo-g', 'owner-h/repo-h', 'owner-n/none', 'o/free'].map((r) => ghRow(r)).join('\n') + '\n' }],
+    ['api /user/repos', { stdout: ['owner-a/repo-a', 'OWNER-B/Repo-B', 'owner-c/repo-c', 'owner-d/repo-d', 'owner-e/repo-e', 'owner-f/repo-f', 'owner-g/repo-g', 'owner-h/repo-h', 'owner-n/none', 'o/free'].map((r) => ghRow(r)).join('\n') + '\n' }],
     ...Object.entries(origins).map(([k, u]) => [`-C ${d(k)} remote get-url origin`, { stdout: `${u}\n` }]),
     [`-C ${d('none')} remote get-url origin`, { code: 128, stderr: 'fatal: not a git repository' }],
     ...baseRules(),
@@ -4140,7 +4144,7 @@ test('github repos: onBox is the project whose origin points at the repo, in eve
 }));
 
 test('github repos: the gh list is cached 60 s and shared by concurrent requests; onBox is read at every request', () => homeApp(async (c) => {
-  c.setRules([['api --paginate', { stdout: ghRow('o/a', { updatedAt: '2026-01-01T00:00:00Z' }) + '\n' + ghRow('o/b') + '\n', delay: 150 }], ...baseRules()]);
+  c.setRules([['api /user/repos', { stdout: ghRow('o/a', { updatedAt: '2026-01-01T00:00:00Z' }) + '\n' + ghRow('o/b') + '\n', delay: 150 }], ...baseRules()]);
   const [x, y, z] = await Promise.all([ghRepos(c), ghRepos(c), ghRepos(c)]);
   assert.deepEqual([x.status, y.status, z.status], [200, 200, 200]);
   assert.equal(ghCalls(c).length, 1);
@@ -4150,7 +4154,7 @@ test('github repos: the gh list is cached 60 s and shared by concurrent requests
   assert.equal(ghCalls(c).length, 1);
   // a project added meanwhile shows at once (no new gh run)
   setProjects(c, { alpha: ABS, 'my.proj': ABS, fresh: path.join(ABS, 'fresh') });
-  c.setRules([['api --paginate', { stdout: ghRow('o/NEW') + '\n' }], [`-C ${path.join(ABS, 'fresh')} remote get-url origin`, { stdout: 'git@github.com:o/b.git\n' }], ...baseRules()]);
+  c.setRules([['api /user/repos', { stdout: ghRow('o/NEW') + '\n' }], [`-C ${path.join(ABS, 'fresh')} remote get-url origin`, { stdout: 'git@github.com:o/b.git\n' }], ...baseRules()]);
   const m = (await ghRepos(c)).json.repos;
   assert.deepEqual(m.map((r) => [r.repo, r.onBox]), [['o/b', 'fresh'], ['o/a', null]]);
   assert.equal(ghCalls(c).length, 1);
@@ -4167,29 +4171,29 @@ test('github repos: no usable GitHub login is 200 no_github_token; any other gh 
   ];
   for (const r of noToken) {
     c.clock.t += 61e3;
-    c.setRules([['api --paginate', r], ...baseRules()]);
+    c.setRules([['api /user/repos', r], ...baseRules()]);
     const x = await ghRepos(c);
     assert.deepEqual([x.status, x.json], [200, { repos: [], reason: 'no_github_token' }], r.stderr);
   }
   for (const r of [{ code: 1, stderr: 'gh: Bad gateway (HTTP 502) token=ghp_SECRETSECRET' }, { code: 1, stderr: 'gh: HTTP 403: rate limit exceeded' }, { code: 2 }]) {
     c.clock.t += 61e3;
-    c.setRules([['api --paginate', r], ...baseRules()]);
+    c.setRules([['api /user/repos', r], ...baseRules()]);
     const x = await ghRepos(c);
     assert.deepEqual([x.status, x.json], [502, { error: 'github_unavailable' }], JSON.stringify(r));
     assert.ok(!x.text.includes('ghp_') && !x.text.includes('rate limit'));
   }
   c.clock.t += 61e3;
-  c.setRules([['api --paginate', { code: 0, stdout: '' }], ...baseRules()]); // gh ran and listed nothing: an empty list, not an error
+  c.setRules([['api /user/repos', { code: 0, stdout: '' }], ...baseRules()]); // gh ran and listed nothing: an empty list, not an error
   assert.deepEqual((await ghRepos(c)).json, { repos: [] });
   assert.ok(!c.logs.join('\n').includes('ghp_SECRET') && !c.logs.join('\n').includes('rate limit'));
   // a failure is not cached: the next request asks again, and a good answer then works at once
-  c.setRules([['api --paginate', { code: 1, stderr: 'boom' }], ...baseRules()]);
+  c.setRules([['api /user/repos', { code: 1, stderr: 'boom' }], ...baseRules()]);
   c.clock.t += 61e3;
   assert.equal((await ghRepos(c)).status, 502);
   const n = ghCalls(c).length;
   assert.equal((await ghRepos(c)).status, 502);
   assert.equal(ghCalls(c).length, n + 1);
-  c.setRules([['api --paginate', { stdout: ghRow('o/ok') + '\n' }], ...baseRules()]);
+  c.setRules([['api /user/repos', { stdout: ghRow('o/ok') + '\n' }], ...baseRules()]);
   assert.deepEqual((await ghRepos(c)).json.repos.map((r) => r.repo), ['o/ok']);
 }));
 
@@ -4207,4 +4211,134 @@ test('install.sh installs box/fcode-add.sh next to server.mjs, where POST /api/p
   assert.ok(!sh.includes(13), 'LF only');
   assert.equal(sh.subarray(0, 12).toString(), '#!/bin/bash\n');
   assert.ok(/^\* text eol=lf|^\*\.sh text eol=lf/m.test(fs.readFileSync(path.join(here, '..', '.gitattributes'), 'utf8')));
+});
+test('github repos: pages 1..3 of per_page=100, stopping at a short page; never --paginate; a failing page is a 502 and is not cached', () => homeApp(async (c) => {
+  const full = (from) => Array.from({ length: 100 }, (_, i) => ghRow(`o/p${from + i}`, { updatedAt: new Date(Date.UTC(2026, 0, 1) + (1000 - from - i) * 1000).toISOString() })).join('\n') + '\n';
+  const urls = () => ghCalls(c).map((l) => /per_page=(\d+)&page=(\d+)/.exec(l)?.slice(1).join(':'));
+  // a short first page: one call
+  c.setRules([['&page=1 --jq', { stdout: ghRow('o/a') + '\n' }], ['&page=2 --jq', { stdout: 'must not be asked\n' }], ...baseRules()]);
+  assert.deepEqual((await ghRepos(c)).json.repos.map((r) => r.repo), ['o/a']);
+  assert.deepEqual(urls(), ['100:1']);
+  // an exactly full first page asks for the second; a short second page ends it
+  c.clock.t += 61e3;
+  c.setRules([['&page=1 --jq', { stdout: full(0) }], ['&page=2 --jq', { stdout: ghRow('o/last') + '\n' }], ['&page=3 --jq', { stdout: 'must not be asked\n' }], ...baseRules()]);
+  const two = (await ghRepos(c)).json.repos;
+  assert.equal(two.length, 101);
+  assert.deepEqual(urls().slice(1), ['100:1', '100:2']);
+  // an empty reply (no repos) is one call and an empty list
+  c.clock.t += 61e3;
+  c.setRules([['&page=1 --jq', { stdout: '' }], ...baseRules()]);
+  assert.deepEqual((await ghRepos(c)).json, { repos: [] });
+  assert.equal(urls().length, 4);
+  // page 2 failing after a good page 1: 502, nothing cached (the next request starts again from page 1)
+  c.clock.t += 61e3;
+  c.setRules([['&page=1 --jq', { stdout: full(0) }], ['&page=2 --jq', { code: 1, stderr: 'gh: Bad gateway (HTTP 502)' }], ...baseRules()]);
+  const bad = await ghRepos(c);
+  assert.deepEqual([bad.status, bad.json], [502, { error: 'github_unavailable' }]);
+  const n = ghCalls(c).length;
+  assert.equal((await ghRepos(c)).status, 502);
+  assert.equal(ghCalls(c).length, n + 2);
+  assert.ok(ghCalls(c).every((l) => !l.includes('--paginate')));
+}));
+
+test('add project: the new project is in the first /api/home after the add, even when the refresh of the list is slow (cached ones stay, the new one is a loading card)', () => addApp(async (c) => {
+  const before = await c.warm((h) => h.projects.length === 2 && h.projects.every((p) => !p.loading));
+  assert.deepEqual(before.projects.map((p) => p.name), ['alpha', 'my.proj']);
+  // gh and git now answer slowly: a refresh of the list takes 3 s
+  c.setRules(baseRules().map(([k, v]) => (/remote get-url|rev-parse|pr list|run list|workflow list/.test(k) ? [k, { ...v, delay: 3000 }] : [k, v])));
+  c.plan({ lines: ['R CFG_ADDED'], addProject: ABS });
+  const j = await c.jobEnd((await c.add({ repo: 'o/fresh' })).json.job);
+  assert.equal(j.code, 'ADDED');
+  const t0 = Date.now();
+  const first = await c.home();
+  assert.ok(Date.now() - t0 < 2500, `answered at once, not after the slow refresh (${Date.now() - t0} ms)`);
+  assert.deepEqual(first.projects.map((p) => [p.name, p.loading === true]), [['alpha', false], ['my.proj', false], ['fresh', true]]);
+  assert.equal(first.projects[0].repo, 'owner/repo'); // the cached cards keep their data
+  // the refresh went on in the background: a later reload has the new card filled in
+  const later = await c.homeUntil((h) => h.projects.length === 3 && h.projects.every((p) => !p.loading));
+  assert.deepEqual(later.projects.map((p) => p.name), ['alpha', 'my.proj', 'fresh']);
+  // removing a project drops its card at once as well
+  setProjects(c, { alpha: ABS });
+  assert.deepEqual((await c.home()).projects.map((p) => p.name), ['alpha']);
+}));
+
+test('add project: ended jobs are pruned on every submit, and at most 50 are kept (the oldest finished go first, a running one never)', () => addApp(async (c) => {
+  c.plan({ lines: ['R CFG_ADDED'] });
+  const ids = [];
+  for (let i = 0; i < 55; i++) {
+    const id = (await c.add({ repo: `o/n${i}` })).json.job; // submitted, never polled by the app
+    await waitFor(async () => (await c.job(id)).json.state !== 'running');
+    c.clock.t += 1000; // a distinct end time for each
+    ids.push(id);
+  }
+  assert.ok(c.app.stats().addJobs <= 50, `kept ${c.app.stats().addJobs}`);
+  assert.equal((await c.job(ids[0])).status, 404); // the oldest finished is gone
+  assert.equal((await c.job(ids[54])).status, 200);
+  // a running job is never the one dropped
+  c.plan({ sleep: 800 });
+  const run = (await c.add({ repo: 'o/slow' })).json.job;
+  for (let i = 0; i < 3; i++) { c.plan({ lines: [] }); await c.jobEnd((await c.add({ repo: `o/m${i}` })).json.job); c.plan({ sleep: 800 }); }
+  assert.equal((await c.job(run)).json.state === 'running' || (await c.job(run)).status === 200, true);
+  await c.jobEnd(run);
+  // the submit of a name that is running (answered with that job, nothing started) prunes too: only that job is left
+  c.plan({ sleep: 1500 });
+  const live = (await c.add({ repo: 'o/live' })).json.job;
+  c.clock.t += 31 * 60e3;
+  assert.equal((await c.add({ repo: 'o/live' })).json.job, live);
+  assert.equal(c.app.stats().addJobs, 1);
+  await c.jobEnd(live);
+  // expired ones go on a submit, with no poll in between
+  c.clock.t += 31 * 60e3;
+  c.plan({ lines: ['R CFG_ADDED'] });
+  await c.jobEnd((await c.add({ repo: 'o/after' })).json.job);
+  assert.ok(c.app.stats().addJobs <= 2, `kept ${c.app.stats().addJobs}`); // only the new one (and, maybe, a job still ending)
+}));
+// the job's deadline and the server's stop, on a real server process (POSIX: process groups and timeout(1))
+async function addServerProc(fn, { timeoutMs = 2500 } = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-addp-'));
+  fs.writeFileSync(path.join(dir, 'fake-add.mjs'), ADD_FAKE_SRC);
+  fs.writeFileSync(path.join(dir, 'plan.json'), JSON.stringify({ sleep: 120e3, child: true }));
+  const c0 = await freshDir();
+  const port = await freePort();
+  const child = spawn(process.execPath, [SERVER], { stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, PC_CONFIG_DIR: c0.configDir, PC_PORT: String(port), PC_ADD_TIMEOUT_MS: String(timeoutMs), PC_ADD_SCRIPT: JSON.stringify([process.execPath, path.join(dir, 'fake-add.mjs'), dir]) } });
+  const listening = new Promise((resolve) => child.stdout.on('data', (d) => { if (String(d).includes('fcoding listening')) resolve(); }));
+  const exited = new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })));
+  const pids = () => { try { return Number(fs.readFileSync(path.join(dir, 'child.pid'), 'utf8')); } catch { return 0; } };
+  try {
+    await listening;
+    const p = await adminRequest(c0.configDir, { cmd: 'pair', name: 't' });
+    const login = await request(port, 'POST', '/api/pair', { body: { code: p.code } });
+    const cookie = login.headers['set-cookie'][0].split(';')[0];
+    const post = await request(port, 'POST', '/api/projects', { cookie, body: { repo: 'o/r' } });
+    assert.equal(post.status, 202, post.text);
+    const grand = await waitFor(() => pids());
+    assert.ok(alive(grand));
+    await fn({ child, exited, grand, pid: child.pid, cookie, port });
+  } finally {
+    try { process.kill(pids(), 'SIGKILL'); } catch {}
+    try { child.kill('SIGKILL'); } catch {}
+    await exited;
+    fs.rmSync(c0.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+}
+
+test('add project: the job ends by its own deadline after the server is killed (no stray process, no lock held for ever)', { skip: process.platform === 'win32' && 'POSIX' }, () => addServerProc(async ({ child, exited, grand }) => {
+  child.kill('SIGKILL'); // a crash: nothing runs close(), the job's process group is left alone
+  await exited;
+  assert.ok(alive(grand), 'the job survives the crash for now');
+  await waitFor(() => !alive(grand), 15000); // timeout(1) at 2.5 s: TERM to the group (kill-after 10 s)
+}));
+
+test('add project: a stop of the service (SIGTERM, SIGINT) ends the running job and its group, then the process exits', { skip: process.platform === 'win32' && 'POSIX' }, async () => {
+  for (const sig of ['SIGTERM', 'SIGINT']) {
+    await addServerProc(async ({ child, exited, grand }) => {
+      child.kill(sig);
+      const r = await Promise.race([exited, new Promise((x) => setTimeout(x, 8000, 'hung'))]);
+      assert.notEqual(r, 'hung', `${sig}: the server did not exit`);
+      assert.equal(r.code, 0, sig);
+      await waitFor(() => !alive(grand), 5000); // the group got TERM from close()
+    }, { timeoutMs: 600e3 });
+  }
 });

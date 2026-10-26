@@ -75,15 +75,16 @@ export function parseAddRequest(b) {
 }
 // script exit code -> job code; anything else (or a signal) is FAILED. The script's "R <CODE> [detail]" lines add the public key and the detail.
 const ADD_CODES = { 0: 'ADDED', 30: 'ADDED_WARN', 40: 'NEED_KEY', 41: 'NEED_WRITE', 42: 'WRITE_BLOCKED', 43: 'NET_FAIL', 44: 'REPO_ARCHIVED',
-  11: 'DIR_CONFLICT', 21: 'CFG_CONFLICT', 22: 'CFG_BROKEN', 23: 'NAME_USED', 2: 'BAD_ARGS', 12: 'CLONE_FAIL' };
+  11: 'DIR_CONFLICT', 21: 'CFG_CONFLICT', 22: 'CFG_BROKEN', 23: 'NAME_USED', 2: 'BAD_ARGS', 12: 'CLONE_FAIL',
+  124: 'TIMEOUT', 137: 'TIMEOUT' }; // timeout(1): 124 = the deadline, 137 = it had to kill (the job's own deadline, kept when the server is gone)
 const ADD_DETAIL = ['SSH_DETAIL', 'CLONE_FAIL', 'DIR_OTHER', 'DIR_NOTGIT', 'CFG_CONFLICT', 'CFG_BROKEN', 'CLEANUP_FAIL']; // first one with text wins
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ADD_SCRIPT = path.join(SERVER_DIR, 'fcode-add.sh'), ADD_SCRIPT_DEV = path.join(SERVER_DIR, 'box', 'fcode-add.sh'); // installed next to server.mjs, or in a checkout
-const GH_LIST_MS = 60e3, GH_LIST_MAX = 300; // GET /api/github/repos: cache time and the most repos listed
-// one JSON object per line ("@json"), whatever the page size: --paginate prints each page's result in turn
-const GH_REPOS_ARGS = ['api', '--paginate', '/user/repos?affiliation=owner,collaborator,organization_member&sort=updated&per_page=100', '--jq',
+const GH_LIST_MS = 60e3, GH_PAGES = 3, GH_PAGE_SIZE = 100, GH_LIST_MAX = GH_PAGES * GH_PAGE_SIZE; // GET /api/github/repos: cache time, pages read, most repos listed
+// pages 1..3 of the newest-updated repos, one JSON object per line ("@json"); no --paginate (an account with thousands of repos would run out of time)
+const ghReposArgs = (page) => ['api', `/user/repos?affiliation=owner,collaborator,organization_member&sort=updated&per_page=${GH_PAGE_SIZE}&page=${page}`, '--jq',
   '.[] | {repo: .full_name, private: .private, archived: .archived, canPush: (.permissions.push // false), updatedAt: .updated_at} | @json'];
-const ADD_TIMEOUT_MS = 10 * 60e3, ADD_KEEP_MS = 30 * 60e3, ADD_KILL_GRACE_MS = 3000, ADD_OUT_MAX = 256 * 1024;
+const ADD_TIMEOUT_MS = 10 * 60e3, ADD_KEEP_MS = 30 * 60e3, ADD_MAX_JOBS = 50, ADD_KILL_GRACE_MS = 3000, ADD_OUT_MAX = 256 * 1024;
 // a detail is one clean line of at most 200 characters; tokens and URL credentials never pass
 const jobText = (s) => Array.from(cleanLine(s).replace(/(gh[a-z]_|github_pat_)[A-Za-z0-9_]+/gi, '<token>').replace(/\/\/[^/\s@]*@/g, '//<cred>@')).slice(0, 200).join('');
 export function addOutcome(code, stdout) {
@@ -834,6 +835,7 @@ export function createApp(opts = {}) {
   const cfgFile = path.join(configDir, 'config.json');
   const stampOf = () => { try { const s = fs.statSync(cfgFile); return `${s.mtimeMs}:${s.size}:${s.ino}`; } catch { return ''; } };
   let cfgStamp = stampOf();
+  let projectsDirty = false; // the project list changed: the next /api/home answers at once from the cache and refreshes in the background
   let text;
   try { text = fs.readFileSync(cfgFile, 'utf8'); } catch { throw new Error(`config.json missing or unreadable in ${configDir} (run install.sh)`); }
   let cfg = parseConfig(text);
@@ -880,7 +882,7 @@ export function createApp(opts = {}) {
       try { next = parseConfig(fs.readFileSync(cfgFile, 'utf8')); } catch (e) { log(`config reload failed, keeping the previous one: ${e.code || e.message}`); }
       if (next) {
         const rotated = !next.secret.equals(cfg.secret);
-        if (JSON.stringify(next.projects) !== JSON.stringify(cfg.projects)) projects.clear(); // a project added or removed: the home list is read again
+        if (JSON.stringify(next.projects) !== JSON.stringify(cfg.projects)) { projects.clear(); projectsDirty = true; } // a project added or removed: the home list is read again
         cfg = next;
         if (rotated) { gen++; pendings = []; load([]); purge(); return; } // no old keyHash may match any more
       }
@@ -1369,7 +1371,9 @@ export function createApp(opts = {}) {
   }
   async function homeView() {
     // each part answers at once from its cache, or within homeWait the first time; a part not ready is empty and fills later
-    const [q, s, p] = await Promise.allSettled([quota.get(homeWait), spend.get(homeWait), projects.get(homeWait)]);
+    // right after a project was added or removed the cached list is not waited for (wait 0: the reply is at once, the refresh runs on)
+    const projWait = projectsDirty ? 0 : homeWait; projectsDirty = false;
+    const [q, s, p] = await Promise.allSettled([quota.get(homeWait), spend.get(homeWait), projects.get(projWait)]);
     const t = now();
     const qv = q.status === 'fulfilled' ? q.value : null;
     const accounts = qv ? qv.value.accounts.map((a) => ({ ...a, stale: a.stale || !qv.fresh })) : [];
@@ -1379,12 +1383,14 @@ export function createApp(opts = {}) {
     let gits = new Map(); // read once per home reply; the projects part is cached, this is not
     try { gits = parseGitSync(fs.readFileSync(gitSyncFile, 'utf8')); } catch {}
     const withGit = (list) => list.map((x) => ({ ...x, git: gits.get(x.name) ?? NO_GIT }));
+    const cachedProjects = new Map((p.status === 'fulfilled' ? p.value.value : []).map((x) => [x.name, x]));
     return {
       generatedAt: iso(t), box: boxInfo(),
       accounts: accounts.map((a) => ({ ...a, spend: view?.perAccount.get(a.id) ?? null })),
       totals: view?.totals ?? { spend: null, byHarness: [] },
       // not read yet (first request, slow gh): each project with nothing known and loading: true (a gh failure has no loading)
-      projects: withGit(p.status === 'fulfilled' ? p.value.value : cfg.projectNames.map((name) => ({ name, repo: null, branch: null, prs: null, lastRun: null, loading: true }))),
+      // in config order, each project from the cache by name (a stale list still serves the ones it knows), a new one as a loading placeholder
+      projects: withGit(cfg.projectNames.map((name) => cachedProjects.get(name) ?? { name, repo: null, branch: null, prs: null, lastRun: null, loading: true })),
       updates,
     };
   }
@@ -1424,15 +1430,26 @@ export function createApp(opts = {}) {
   // whole process group is killed; ended jobs are kept 30 min. Only the script's "R <CODE> [detail]" lines are read: its stderr is dropped,
   // and nothing but the name and the code is logged. FCODE_CFG points the script at THIS server's config.json. ---
   const addSpec = specOf(opts.addScript ?? process.env.PC_ADD_SCRIPT ?? ['bash', [ADD_SCRIPT, ADD_SCRIPT_DEV].find((f) => fs.existsSync(f)) ?? ADD_SCRIPT]);
-  const addTimeout = opts.addTimeoutMs ?? ADD_TIMEOUT_MS;
+  const addTimeout = opts.addTimeoutMs ?? (Number(process.env.PC_ADD_TIMEOUT_MS) || ADD_TIMEOUT_MS);
+  // on Linux the script runs under timeout(1): the deadline then holds on its own even when this server is gone (a crash, or a restart that
+  // leaves the job alone: install.sh uses KillMode=process); a graceful stop ends the jobs through close(). 124 / 137 map to TIMEOUT.
+  const addWrap = process.platform === 'win32' ? [] : ['timeout', '--kill-after=10', String(addTimeout / 1000)];
   const addJobs = new Map(); // id -> job
   const addRunning = new Map(); // name -> its running job
   const addStops = new Set(); // one per running child: ends it when the app closes
+  // ended jobs go after 30 min (checked on every submit and every poll); at most 50 are kept, the oldest finished first (a running one never)
+  function pruneAdd() {
+    for (const [k, j] of addJobs) if (j.state !== 'running' && now() - j.endedAt > ADD_KEEP_MS) addJobs.delete(k);
+    const ended = [...addJobs.values()].filter((j) => j.state !== 'running').sort((a, b) => a.endedAt - b.endedAt);
+    for (let over = addJobs.size - ADD_MAX_JOBS; over > 0 && ended.length; over--) addJobs.delete(ended.shift().id);
+  }
   function startAdd(repo, name) {
+    pruneAdd();
     const busy = addRunning.get(name);
     if (busy) return busy;
     const job = { id: crypto.randomBytes(16).toString('hex'), name, repo, state: 'running', code: null, detail: null, endedAt: 0 };
     addJobs.set(job.id, job); addRunning.set(name, job);
+    pruneAdd();
     let out = '', child, timer, grace;
     const end = () => { clearTimeout(timer); addStops.delete(abort); };
     const abort = () => { end(); killGroup('SIGTERM'); clearTimeout(grace); }; // the app closes
@@ -1446,7 +1463,7 @@ export function createApp(opts = {}) {
     };
     const killGroup = (sig) => { try { process.kill(process.platform === 'win32' ? child.pid : -child.pid, sig); } catch {} }; // -pid: the group
     try {
-      const [cmd, ...pre] = addSpec;
+      const [cmd, ...pre] = [...addWrap, ...addSpec];
       child = spawn(cmd, [...pre, repo, name], { stdio: ['ignore', 'pipe', 'ignore'], detached: true, windowsHide: true, env: { ...toolEnv(), FCODE_CFG: cfgFile } });
     } catch { finish({ state: 'failed', code: 'FAILED' }); return job; }
     child.stdout.setEncoding('utf8');
@@ -1469,18 +1486,24 @@ export function createApp(opts = {}) {
     if (ghList && now() - ghList.at < GH_LIST_MS) return Promise.resolve(ghList.rows);
     if (!ghPending) {
       const at = now();
-      ghPending = execTool(ghSpec, GH_REPOS_ARGS, 30e3).then((out) => {
+      ghPending = (async () => {
         const rows = [];
-        for (const l of out.split('\n')) {
-          let v; try { v = JSON.parse(l); } catch { continue; }
-          if (v && typeof v.repo === 'string' && /^[\w.-]+\/[\w.-]+$/.test(v.repo)) {
-            rows.push({ repo: v.repo, private: v.private === true, archived: v.archived === true, canPush: v.canPush === true, updatedAt: typeof v.updatedAt === 'string' ? iso(Date.parse(v.updatedAt)) : null });
+        for (let page = 1; page <= GH_PAGES; page++) { // pages 1..3, stopping at a short page
+          let n = 0;
+          for (const l of (await execTool(ghSpec, ghReposArgs(page), 30e3)).split('\n')) {
+            if (!l.trim()) continue;
+            n++;
+            let v; try { v = JSON.parse(l); } catch { continue; }
+            if (v && typeof v.repo === 'string' && /^[\w.-]+\/[\w.-]+$/.test(v.repo)) {
+              rows.push({ repo: v.repo, private: v.private === true, archived: v.archived === true, canPush: v.canPush === true, updatedAt: typeof v.updatedAt === 'string' ? iso(Date.parse(v.updatedAt)) : null });
+            }
           }
+          if (n < GH_PAGE_SIZE) break;
         }
         rows.sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''));
         ghList = { at, rows: rows.slice(0, GH_LIST_MAX) };
         return ghList.rows;
-      }).finally(() => { ghPending = null; });
+      })().finally(() => { ghPending = null; });
     }
     return ghPending;
   };
@@ -1490,10 +1513,7 @@ export function createApp(opts = {}) {
     cfg.projectNames.forEach((name, i) => { const r = repoOf(urls[i])?.toLowerCase(); if (r && !m.has(r)) m.set(r, name); });
     return m;
   }
-  const addJob = (id) => {
-    for (const [k, j] of addJobs) if (j.state !== 'running' && now() - j.endedAt > ADD_KEEP_MS) addJobs.delete(k);
-    return addJobs.get(id);
-  };
+  const addJob = (id) => { pruneAdd(); return addJobs.get(id); };
 
   // --- http helpers ---
   function json(res, status, obj, headers) {
@@ -1836,7 +1856,7 @@ export function createApp(opts = {}) {
     ]);
   };
   const homeIdle = () => Promise.all([quota, listing, spend, projects].map((m) => m.settled())); // tests: no refresh still running
-  return { server, listen, close, devices, tickBox, homeIdle, stats: () => ({ streams, running, reads, waiting: queue.length, active: !!active }) };
+  return { server, listen, close, devices, tickBox, homeIdle, stats: () => ({ streams, running, reads, waiting: queue.length, active: !!active, addJobs: addJobs.size }) };
 }
 
 // ---------- CLI ----------
@@ -1912,6 +1932,8 @@ async function main() {
   process.on('uncaughtException', fatal('uncaughtException'));
   const lock = await acquireInstanceLock(dir); // before config, devices or admin.sock are touched
   const app = createApp({ configDir: dir });
+  // a stop or restart of the service (SIGTERM) ends the running add jobs cleanly (their clones are removed) before the process goes
+  for (const sig of ['SIGTERM', 'SIGINT']) process.once(sig, () => { setTimeout(() => process.exit(0), 5000).unref(); app.close().catch(() => {}).finally(() => process.exit(0)); });
   const port = await app.listen();
   void lock; // held until the process exits
   console.log(`fcoding listening on 0.0.0.0:${port}`);
