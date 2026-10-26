@@ -807,6 +807,21 @@ enum HomeLogic {
         n != "home" && n.range(of: "^[a-z0-9][a-z0-9._-]{0,63}$", options: .regularExpression) != nil
     }
 
+    /// The server's detail keywords that addCodeMessage turns into text (and so need no detail line).
+    private static let dirConflictDetails = ["exists", "unsafe"]
+    private static let hookFailDetails = ["install", "verify"]
+
+    /// True when the message already says everything this detail says: DIR_CONFLICT with no detail,
+    /// "exists" or "unsafe"; FAILED with "install" or "verify". Any other detail (a path, owner/repo) stays.
+    static func addDetailIsKeyword(_ code: String?, _ detail: String?) -> Bool {
+        let d = detail ?? ""
+        switch code {
+        case "DIR_CONFLICT": return d.isEmpty || dirConflictDetails.contains(d)
+        case "FAILED": return hookFailDetails.contains(d)
+        default: return false
+        }
+    }
+
     /// One short line per failed job code. `detail` and `name` (the job's project name) refine
     /// DIR_CONFLICT ("exists" / "unsafe") and FAILED ("install" / "verify").
     static func addCodeMessage(_ code: String?, detail: String? = nil, name: String = "") -> String {
@@ -817,7 +832,7 @@ enum HomeLogic {
             let dir = name.isEmpty ? "này" : name
             return detail == "unsafe" ? "Thư mục \(dir) trên box không an toàn. Chọn tên khác."
                                       : "Thư mục \(dir) đã có trên box. Chọn tên khác."
-        case "FAILED" where detail == "install" || detail == "verify":
+        case "FAILED" where addDetailIsKeyword(code, detail):
             return "Box không cài được chốt chặn push lên main. Thử lại sau."
         case "REPO_ARCHIVED": return "Repo đã lưu trữ (archived), không ghi được."
         case "WRITE_BLOCKED": return "GitHub chặn tạo nhánh box/*, xem lại luật bảo vệ nhánh."
@@ -971,7 +986,7 @@ enum HomeLogic {
                 }
                 s.detail = detail?.isEmpty == false ? detail : nil
                 // The message already says it: do not show the bare keyword under it.
-                if job.code == "DIR_CONFLICT" || (job.code == "FAILED" && ["install", "verify"].contains(detail ?? "")) { s.detail = nil }
+                if addDetailIsKeyword(job.code, detail) { s.detail = nil }
             default:
                 break   // "running", or a state this app does not know: keep polling
             }
@@ -1421,8 +1436,13 @@ enum HomeLogic {
         let hook = addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"FAILED\",\"detail\":\"verify\"}")))
         eq("hook message", hook.message, "Box không cài được chốt chặn push lên main. Thử lại sau.")
         eq("hook no bare detail", hook.detail == nil, true)
-        eq("failed other detail kept", addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"FAILED\",\"detail\":\"boom\"}"))).detail, "boom")
-        eq("resubmit after failure", addReduce(arch,.submit(repo: "Me/Web", name: "web2")).phase, .posting)
+        eq("hook install no bare detail", addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"FAILED\",\"detail\":\"install\"}"))).detail == nil, true)
+        eq("dir unsafe no bare detail", addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"DIR_CONFLICT\",\"detail\":\"unsafe\"}"))).detail == nil, true)
+        let dirOther = addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"DIR_CONFLICT\",\"detail\":\"/data/workspace/web\"}")))
+        eq("dir unknown detail kept", dirOther.detail, "/data/workspace/web")
+        eq("dir unknown detail message", dirOther.message, "Thư mục web đã có trên box. Chọn tên khác.")
+        eq("failed other detail kept",addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"FAILED\",\"detail\":\"boom\"}"))).detail, "boom")
+        eq("resubmit after failure", addReduce(arch, .submit(repo: "Me/Web", name: "web2")).phase, .posting)
         let done = addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED\",\"name\":\"web\"}")))
         eq("done", done.phase, .done)
         eq("done toast", done.message, "Đã thêm dự án web")
