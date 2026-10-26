@@ -93,7 +93,26 @@ extension API {
         let data = try await call("POST", "api/open", body: ["project": project, "harness": harness, "fresh": true])
         return try JSONDecoder().decode(OpenResponse.self, from: data)
     }
+
+    func ompSessions(project: String) async throws -> [OmpSession] {
+        try await get("api/projects/\(project)/omp-sessions", as: OmpSessionsReply.self).sessions
+    }
+
+    /// POST resume: the tmux session running `omp -r <id>` (reused when it is already open).
+    func resumeOmp(project: String, id: String) async throws -> String {
+        let data = try await call("POST", "api/projects/\(project)/omp-sessions/\(id)/resume", body: [:])
+        return try JSONDecoder().decode(ResumeResponse.self, from: data).session
+    }
+
+    /// POST staging/start: `{ok:true, state:"starting"|"running"}`, or `{ok:false, error}`.
+    func startStaging(project: String) async throws -> StagingStartResponse {
+        let data = try await call("POST", "api/projects/\(project)/staging/start", body: [:])
+        return try JSONDecoder().decode(StagingStartResponse.self, from: data)
+    }
 }
+
+struct ResumeResponse: Decodable { let session: String }
+struct StagingStartResponse: Decodable { let ok: Bool?; let error: String?; let state: String? }
 
 struct SessionInfo: Decodable, Identifiable, Hashable {
     let name: String

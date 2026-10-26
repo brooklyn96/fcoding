@@ -17,14 +17,28 @@ final class HomeModel: ObservableObject {
     func serverNow(_ date: Date = Date()) -> Date { date.addingTimeInterval(offset) }
 
     private var current: Task<Void, Never>?
+    /// Requests started so far, and the number of the one in flight.
+    private var starts = 0
+    private var currentIndex = 0
 
-    /// One request at a time; a call during one waits for it.
-    func load(_ app: AppState) async {
-        if let running = current { await running.value; return }
-        let task = Task { await self.fetch(app) }
+    /// One request at a time; a call during one waits for it. `fresh`: the reply must come from
+    /// a request started after this call (one already in flight may carry older server state).
+    func load(_ app: AppState, fresh: Bool = false) async {
+        let needed = starts + 1
+        while let running = current {
+            if !fresh || currentIndex >= needed { await running.value; return }
+            await running.value
+        }
+        starts += 1
+        let index = starts
+        currentIndex = index
+        // Cleared inside the task, so a waiter never sees a finished task as still running.
+        let task = Task {
+            await self.fetch(app)
+            if self.currentIndex == index { self.current = nil }
+        }
         current = task
         await task.value
-        current = nil
     }
 
     private func fetch(_ app: AppState) async {
@@ -76,5 +90,53 @@ final class HomeModel: ObservableObject {
             }
         }
         return outcome
+    }
+
+    /// When "Bật" was tapped per project (this phone's clock); the chip shows "đang bật…" meanwhile.
+    @Published private(set) var stagingStarted: [String: Date] = [:]
+    /// The project list is on screen and the app in the foreground (ProjectsView's `polling`);
+    /// the follow-up loads after "Bật" stop when it is not.
+    var visible = false
+
+    /// POST staging/start; returns the error text, nil on success. The server caches the box
+    /// state for 30 s, so the home reply is fetched a few times until it can say "running".
+    func startStaging(_ project: String, app: AppState) async -> String? {
+        guard let api = app.api else { return unpairedNotice }
+        stagingStarted[project] = Date()
+        var failure: String?
+        var replyState: String?
+        do {
+            let reply = try await api.startStaging(project: project)
+            replyState = reply.state
+            if reply.ok == false {
+                failure = HomeLogic.stagingFailure(status: 200, code: reply.error) ?? "Không bật được staging."
+            }
+        } catch {
+            let e = error as? APIError
+            failure = HomeLogic.stagingFailure(status: e?.status ?? 0, code: e?.code)
+                ?? "Không bật được staging: " + (app.report(error) ?? "lỗi mạng").lowercased(with: Locale(identifier: "vi"))
+        }
+        if failure != nil {
+            stagingStarted[project] = nil
+            return failure
+        }
+        // The "đang bật…" override stays until a load started after this reply shows running (or
+        // its 180 s window ends): a load already in flight may still carry the cached old state.
+        let reloads = HomeLogic.stagingReloads(replyState: replyState)
+        Task {
+            var waited = 0.0
+            for at in reloads {
+                try? await Task.sleep(nanoseconds: UInt64((at - waited) * 1_000_000_000))
+                waited = at
+                // Off screen: ProjectsView loads home again as soon as the list is back.
+                guard self.visible else { break }
+                await self.load(app, fresh: true)
+                if self.home?.projects.first(where: { $0.name == project })?.staging?.state == "running" {
+                    self.stagingStarted[project] = nil
+                    break
+                }
+            }
+        }
+        return nil
     }
 }

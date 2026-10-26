@@ -226,6 +226,8 @@ struct HomeGuideView: View {
             "Mỗi thẻ dự án cho biết số **PR** đang mở, kết quả **checks** và lần **deploy** gần nhất.",
             "Chạm vào thẻ để chỉ xem phiên của dự án đó; chạm **Tất cả** để xem lại hết.",
             "Giữ lâu một thẻ, hoặc bấm **…**, để mở phiên mới cho dự án đó.",
+            "Dòng **Staging** cho biết box staging đang chạy hay đang nghỉ; bấm **Bật** để bật nó.",
+            "Trong **…** có **Phiên omp gần đây** (cả phiên từ laptop): bấm **Tiếp tục** để làm tiếp trên box.",
         ]),
     ]
 
@@ -305,13 +307,21 @@ struct NewSessionSheet: View {
     let loadError: String?
     let sessions: [OverviewSession]
     let initialProject: String?
+    /// Server clock minus phone clock (HomeModel.offset), for the omp sessions' times.
+    var clockOffset: TimeInterval = 0
     let onOpened: (String) -> Void
     @EnvironmentObject private var app: AppState
     @Environment(\.dismiss) private var dismiss
     @State private var picked: String?
-    /// The harness whose POST /api/open is in flight; the sheet cannot be closed meanwhile.
+    /// The harness whose POST /api/open is in flight, or "r:<id>" for an omp resume; the sheet
+    /// cannot be closed meanwhile.
     @State private var opening: String?
     @State private var errorText: String?
+    /// Recent omp sessions of the shown project; nil while loading.
+    @State private var omp: [OmpSession]?
+    @State private var ompError: String?
+    /// The server has no omp-sessions route: the section is left out.
+    @State private var ompHidden = false
 
     static let harnesses = ["omp", "claude", "codex"]
 
@@ -319,8 +329,15 @@ struct NewSessionSheet: View {
         SheetScaffold {
             if let p = picked ?? initialProject {
                 let back: (String, () -> Void) = initialProject != nil ? ("Huỷ", { dismiss() })
-                                                                         : ("‹ Dự án", { picked = nil; errorText = nil })
-                SheetHeader(title: initialProject ?? "Phiên mới", left: back)
+                                                                         : ("‹ Dự án", {
+                                                                             picked = nil
+                                                                             errorText = nil
+                                                                             // The next project must not show this one's rows.
+                                                                             omp = nil
+                                                                             ompError = nil
+                                                                         })
+                // Off while a session opens: a late reply would open it after the sheet is gone.
+                SheetHeader(title: initialProject ?? "Phiên mới", left: back).disabled(opening != nil)
                 (Text(initialProject != nil ? "" : "Bước 2/2 · ") + Text("Chọn chương trình cho ") + Text(p).bold())
                     .stepCaption()
                 options(Self.harnesses) { h in
@@ -336,6 +353,10 @@ struct NewSessionSheet: View {
                 }
                 if let errorText = errorText {
                     Label(errorText, systemImage: "exclamationmark.triangle").scaledFont(13).foregroundColor(.redTone)
+                        .padding(.bottom, 14)
+                }
+                if !ompHidden {
+                    ompSection(p).task(id: p) { await loadOmp(p) }
                 }
             } else {
                 SheetHeader(title: "Phiên mới", left: ("Huỷ", { dismiss() }))
@@ -397,6 +418,127 @@ struct NewSessionSheet: View {
         }
         .buttonStyle(.plain)
         .disabled(disabled)
+    }
+
+    // MARK: Recent omp sessions (laptop and box), "Tiếp tục" resumes one in a box tmux session
+
+    private func ompSection(_ project: String) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Phiên omp gần đây")
+                .scaledFont(13)
+                .foregroundColor(.l2)
+                .padding(.horizontal, 4)
+                .padding(.bottom, 6)
+                .accessibilityAddTraits(.isHeader)
+            if let list = omp, !list.isEmpty {
+                VStack(spacing: 0) {
+                    ForEach(list.indices, id: \.self) { i in
+                        if i > 0 { Rectangle().fill(Color.hair).frame(height: 0.5) }
+                        ompRow(list[i], project: project)
+                    }
+                }
+                .background(Color.grp2, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            } else {
+                HStack(spacing: 8) {
+                    if let ompError = ompError {
+                        Label(ompError, systemImage: "exclamationmark.triangle").foregroundColor(.redTone)
+                    } else if omp == nil {
+                        ProgressView()
+                        Text("Đang tải…").foregroundColor(.l2)
+                    } else {
+                        Text("Chưa có phiên omp nào cho dự án này.").foregroundColor(.l2)
+                    }
+                }
+                .scaledFont(14)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                .padding(.horizontal, 12)
+                .background(Color.grp2, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
+        }
+    }
+
+    private func ompRow(_ s: OmpSession, project: String) -> some View {
+        let title = HomeLogic.ompTitle(s.title), origin = HomeLogic.ompOrigin(s.origin)
+        let when = HomeLogic.ompWhen(s, now: Date().addingTimeInterval(clockOffset))
+        return HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .scaledFont(15, weight: .semibold)
+                    .foregroundColor(s.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .l2 : .primary)
+                    .lineLimit(2)
+                HStack(spacing: 6) {
+                    HStack(spacing: 3) {
+                        Image(systemName: origin == "laptop" ? "laptopcomputer" : "server.rack").scaledFont(9)
+                        Text(origin).font(.system(.caption2, design: .monospaced, weight: .semibold))
+                    }
+                    .foregroundColor(origin == "laptop" ? .accentBlue : HarnessStyle.color("omp"))
+                    .padding(.horizontal, 6)
+                    .frame(minHeight: 17)
+                    .background((origin == "laptop" ? Color.accentBlue : HarnessStyle.color("omp")).opacity(0.17),
+                                in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                    if !when.isEmpty { Text(when).scaledFont(12.5).foregroundColor(.l2) }
+                }
+                .lineLimit(1)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(title + ", từ " + origin + (when.isEmpty ? "" : ", " + when))
+            Spacer(minLength: 4)
+            if opening == "r:" + s.id {
+                ProgressView().frame(minWidth: 44, minHeight: 44)
+            } else {
+                Button { Task { await resume(project, s) } } label: {
+                    Text("Tiếp tục")
+                        .scaledFont(14.5, weight: .semibold)
+                        .foregroundColor(.accentBlue)
+                        .padding(.horizontal, 14)
+                        .frame(minHeight: 32)
+                        .background(Color.fill3, in: Capsule())
+                        .frame(minHeight: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(opening != nil)
+                .opacity(opening != nil ? 0.5 : 1)
+                .accessibilityLabel("Tiếp tục phiên " + title)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(minHeight: 56)
+    }
+
+    private func loadOmp(_ project: String) async {
+        guard let api = app.api else { return }
+        omp = nil
+        ompError = nil
+        do {
+            omp = try await api.ompSessions(project: project)
+        } catch {
+            if error is CancellationError || (error as? URLError)?.code == .cancelled { return }
+            let e = error as? APIError
+            if HomeLogic.ompListHidden(status: e?.status ?? 0, code: e?.code) {
+                ompHidden = true
+            } else {
+                ompError = e?.code == "unknown_project" ? "Dự án này không có trên box." : app.report(error)
+            }
+        }
+    }
+
+    private func resume(_ project: String, _ s: OmpSession) async {
+        guard let api = app.api, opening == nil else { return }
+        opening = "r:" + s.id
+        defer { opening = nil }
+        do {
+            let name = try await api.resumeOmp(project: project, id: s.id)
+            errorText = nil
+            onOpened(name)
+            dismiss()
+        } catch {
+            let e = error as? APIError
+            errorText = HomeLogic.ompResumeFailure(status: e?.status ?? 0, code: e?.code) ?? app.report(error)
+            if e?.code == "unknown_session" { await loadOmp(project) }
+        }
     }
 
     private func detail(_ project: String) -> String {
