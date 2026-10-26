@@ -323,15 +323,16 @@ Từ v1.3.2, bạn thêm dự án GitHub vào box ngay trên iPhone, không cầ
 | `DIR_CONFLICT` (11) | `/data/workspace/<tên>` đã có trên box hoặc không an toàn (liên kết tượng trưng, nằm ngoài thư mục làm việc). Box không bao giờ dùng lại thư mục có sẵn: chọn tên khác, hoặc xóa thư mục đó trên box. |
 | `NAME_USED` (23), `CFG_CONFLICT` (21), `CFG_BROKEN` (22) | Tên hoặc cấu hình đang dùng cho dự án khác, hoặc file cấu hình/ssh trên box hỏng; đổi tên hoặc sửa trên box. |
 | `CLONE_FAIL` (12) | Không tải được repo (xem dòng chi tiết). |
+| `KEY_FAIL` (20), `ALIAS_FAIL` (21) | Box không tạo được khóa SSH hoặc không ghi được cấu hình SSH. |
 | thoát 24 | Không cài được chốt chặn push lên `main`. |
 | thoát 25 | Box không ghi được cấu hình đăng nhập GitHub cho repo này. |
 | thoát 26 | Cấu hình git trên box đang chuyển hướng địa chỉ GitHub (`insteadOf`, `pushInsteadOf`, `pushurl`): gỡ trên box rồi chạy lại. |
 | `ADDED_WARN` (30) | Đã thêm nhưng có mục cần xem lại, ví dụ không xóa được nhánh thử `box/fcode-add-check-…` (xóa nhánh đó trên GitHub). Dự án vẫn dùng được. |
-| `TIMEOUT` (124) | Quá 10 phút nên bị dừng; chạy lại là an toàn. |
+| `TIMEOUT` (124 / 137) | Quá 10 phút nên bị dừng; chạy lại là an toàn. |
 
 Thêm lại một dự án đã có (cùng tên, cùng repo) không làm gì và báo thành công (`ADDED`, thoát 0).
 
-**Làm tay trên box**: `bash /data/home/fcoding/fcode-add.sh <chủ/repo> <tên>` (do `install.sh` cài). Mỗi lần thêm tự dừng sau 10 phút; thêm lỗi chỉ xóa thư mục do chính lần đó tạo ra, thư mục có sẵn từ trước không bao giờ bị xóa; thêm lại cùng một repo là an toàn. Cách làm tương đương trên laptop: `fcode add <chủ/repo> [tên]`.
+**Làm tay trên box**: `timeout --kill-after=30 600 bash /data/home/fcoding/fcode-add.sh <chủ/repo> <tên>` (script do `install.sh` cài; tự nó không có giới hạn thời gian, nên lệnh làm tay cần `timeout` như trên). Giới hạn 10 phút tự động chỉ áp dụng khi thêm từ app và bằng `fcode add`; thêm lỗi chỉ xóa thư mục do chính lần đó tạo ra, thư mục có sẵn từ trước không bao giờ bị xóa; thêm lại cùng một repo là an toàn. Cách làm tương đương trên laptop: `fcode add <chủ/repo> [tên]`.
 
 ## 8. Dùng từ laptop
 
