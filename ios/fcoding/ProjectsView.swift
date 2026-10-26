@@ -29,6 +29,8 @@ struct ProjectsView: View {
     @State private var lastOpened: String?
     @State private var flash: String?
     @State private var toast: String?
+    /// An add that finished with a cleanup warning: its notice stays until "Đã hiểu".
+    @State private var addedNotice: HomeLogic.AddState?
 
     /// Poll only while the list itself is on screen and the app is in the foreground.
     private var polling: Bool { path.isEmpty && scenePhase == .active }
@@ -87,6 +89,7 @@ struct ProjectsView: View {
                 .safeAreaInset(edge: .bottom) { Color.clear.frame(height: 60) }
                 .overlay(alignment: .bottomTrailing) { fab }
                 .overlay(alignment: .top) { StatusBarCover() }
+                .overlay(alignment: .top) { CleanupNotice(added: $addedNotice) }
                 .overlay(alignment: .top) { ToastView(text: $toast) }
                 .background(SwipeBackEnabler().frame(width: 0, height: 0))
             }
@@ -169,8 +172,8 @@ struct ProjectsView: View {
                             sessions: allSessions,
                             initialProject: project,
                             onOpened: { openAfterSheet = $0 },
-                            onAdded: { text in
-                                toast = text
+                            onAdded: { result in
+                                if result.cleanup != nil { addedNotice = result } else { toast = result.message }
                                 // The new project shows on the cards and in "+" without waiting for the next poll.
                                 Task {
                                     async let cards: Void = home.load(app, fresh: true)
@@ -564,6 +567,59 @@ struct ToastView: View {
             }
         }
         .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: text)
+    }
+}
+
+/// Added, but the box could not delete its check branch on GitHub: unlike the toast it stays
+/// until "Đã hiểu", wraps, and the branch can be selected and copied.
+struct CleanupNotice: View {
+    @Binding var added: HomeLogic.AddState?
+    @Environment(\.openURL) private var openURL
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        Group {
+            if let a = added, let c = a.cleanup {
+                VStack(alignment: .leading, spacing: 10) {
+                    Label {
+                        Text(a.message ?? "").textSelection(.enabled)
+                    } icon: {
+                        Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orangeTone)
+                    }
+                    .scaledFont(14.5)
+                    .foregroundColor(.white)
+                    .fixedSize(horizontal: false, vertical: true)
+                    Text(c.branch)
+                        .scaledFont(13, design: .monospaced)
+                        .foregroundColor(Color(hex: 0xD1D1D6))
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .background(Color.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .accessibilityLabel("Nhánh kiểm tra")
+                        .accessibilityValue(c.branch)
+                    HStack(spacing: 10) {
+                        Button("Mở GitHub") { openURL(c.url) }
+                            .accessibilityHint("Mở trang các nhánh của repo")
+                        Button("Đã hiểu") { added = nil }
+                    }
+                    .buttonStyle(PrimaryButtonStyle(fill: .grp2, text: .accentBlue))
+                }
+                .padding(14)
+                .background(Color.grp, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Color.orangeTone.opacity(0.6), lineWidth: 1))
+                .shadow(color: .black.opacity(0.5), radius: 12, y: 6)
+                .padding(.horizontal, 16)
+                .padding(.top, 12)
+                .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
+                .transition(reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity))
+                .accessibilityElement(children: .contain)
+                .onAppear { UIAccessibility.post(notification: .announcement, argument: a.message) }
+            }
+        }
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: added)
     }
 }
 

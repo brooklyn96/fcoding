@@ -308,8 +308,8 @@ struct NewSessionSheet: View {
     let sessions: [OverviewSession]
     let initialProject: String?
     let onOpened: (String) -> Void
-    /// A project was added (toast text); the sheet then closes.
-    let onAdded: (String) -> Void
+    /// A project was added (the finished add: toast text or cleanup notice); the sheet then closes.
+    let onAdded: (HomeLogic.AddState) -> Void
     @EnvironmentObject private var app: AppState
     @Environment(\.dismiss) private var dismiss
     @State private var picked: String?
@@ -344,8 +344,8 @@ struct NewSessionSheet: View {
                     Label(errorText, systemImage: "exclamationmark.triangle").scaledFont(13).foregroundColor(.redTone)
                 }
             } else if adding {
-                AddProjectForm(onBack: { adding = false }, onAdded: { text in
-                    onAdded(text)
+                AddProjectForm(onBack: { adding = false }, onAdded: { result in
+                    onAdded(result)
                     dismiss()
                 })
             } else {
@@ -466,7 +466,7 @@ private extension Text {
 
 struct AddProjectForm: View {
     let onBack: () -> Void
-    let onAdded: (String) -> Void
+    let onAdded: (HomeLogic.AddState) -> Void
     @EnvironmentObject private var app: AppState
     @Environment(\.openURL) private var openURL
     @State private var repoText = ""
@@ -711,7 +711,7 @@ struct AddProjectForm: View {
 
     private func send(_ event: HomeLogic.AddEvent) {
         add = HomeLogic.addReduce(add, event)
-        if add.phase == .done { onAdded(add.message ?? "") }
+        if add.phase == .done { onAdded(add) }
     }
 
     /// The effect of each phase; a new phase (or closing the form) cancels the one before.
