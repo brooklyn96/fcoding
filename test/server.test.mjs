@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import { createApp, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, strictOrigin, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock,
-  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, parseUpdates, resetReply, RESET_MSG, BOX, memo, codexChildMeta, parseGitSync } from '../server.mjs';
+  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, parseUpdates, resetReply, RESET_MSG, BOX, memo, codexChildMeta, parseGitSync, repoOfLink } from '../server.mjs';
 
 process.env.TZ = 'America/Los_Angeles'; // spend days follow config.json timeZone, never the process zone: a third zone proves it
 
@@ -3775,4 +3775,436 @@ test('open fresh: an open while a sync still runs (even past an earlier open\'s 
       assert.equal(logsOf(c).length, 1); // the warning is once per sync
     }, { gitSync: s.spec, gitSyncMs: 2500 });
   } finally { s.cleanup(); }
+});
+
+// ---------- add a project from the app (A11): POST /api/projects, GET /api/projects/jobs/<id> ----------
+// the box script is replaced by a fake that reads plan.json next to it: prints R lines, may add the project to config.json
+// (the way the real script does), starts a grandchild, sleeps, exits with a code
+const ADD_FAKE_SRC = `import fs from 'node:fs'; import path from 'node:path'; import { spawn } from 'node:child_process';
+const [dir, ...argv] = process.argv.slice(2);
+fs.appendFileSync(path.join(dir, 'calls.jsonl'), JSON.stringify({ argv, cfg: process.env.FCODE_CFG }) + '\\n');
+const plan = JSON.parse(fs.readFileSync(path.join(dir, 'plan.json'), 'utf8'));
+for (const l of plan.lines ?? []) fs.writeSync(1, l + '\\n');
+if (plan.addProject) {
+  const f = process.env.FCODE_CFG; const c = JSON.parse(fs.readFileSync(f, 'utf8'));
+  c.projects[argv[1]] = plan.addProject; fs.writeFileSync(f + '.tmp', JSON.stringify(c), { mode: 0o600 }); fs.renameSync(f + '.tmp', f);
+}
+if (plan.child) { const k = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }); fs.writeFileSync(path.join(dir, 'child.pid'), String(k.pid)); }
+setTimeout(() => process.exit(plan.exit ?? 0), plan.sleep ?? 0);
+`;
+const ADD_PUB = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl fcode-o/r';
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+async function addApp(fn, extra = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-add-'));
+  fs.writeFileSync(path.join(dir, 'fake-add.mjs'), ADD_FAKE_SRC);
+  const plan = (p) => fs.writeFileSync(path.join(dir, 'plan.json'), JSON.stringify(p));
+  plan({});
+  const calls = () => { try { return fs.readFileSync(path.join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } };
+  try {
+    await homeApp(async (c) => {
+      c.plan = plan; c.addCalls = calls;
+      c.add = (body, o = {}) => c.req('POST', '/api/projects', { cookie: c.cookie, body, ...o });
+      c.job = (id) => c.req('GET', `/api/projects/jobs/${id}`, { cookie: c.cookie });
+      c.jobEnd = async (id) => (await waitFor(async () => { const r = await c.job(id); return r.json?.state !== 'running' && r; })).json;
+      await fn(c, dir);
+    }, { addScript: [process.execPath, path.join(dir, 'fake-add.mjs'), dir], ...extra });
+  } finally {
+    try { process.kill(Number(fs.readFileSync(path.join(dir, 'child.pid'), 'utf8')), 'SIGKILL'); } catch {}
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+}
+
+test('add project: every route needs a session and the X-PC header; wrong methods and bad bodies are refused', () => addApp(async (c) => {
+  for (const [m, p] of [['POST', '/api/projects'], ['GET', '/api/projects/jobs/abc'], ['GET', '/api/projects']]) {
+    assert.equal((await c.req(m, p, { body: m === 'POST' ? { repo: 'o/r' } : undefined })).status, 401, `${m} ${p}`);
+  }
+  assert.equal((await c.req('POST', '/api/projects', { cookie: 'pc_sid=forged', body: { repo: 'o/r' } })).status, 401);
+  assert.equal((await c.add({ repo: 'o/r' }, { pc: false })).status, 403);
+  assert.equal((await c.req('GET', '/api/projects', { cookie: c.cookie })).status, 405);
+  assert.equal((await c.req('PUT', '/api/projects', { cookie: c.cookie, body: { repo: 'o/r' } })).status, 405);
+  assert.equal((await c.req('POST', '/api/projects/jobs/abc', { cookie: c.cookie, body: {} })).status, 405);
+  assert.equal((await c.req('DELETE', '/api/projects/jobs/abc', { cookie: c.cookie })).status, 405);
+  assert.equal((await c.req('POST', '/api/projects', { cookie: c.cookie, raw: '{"repo":"o/r"}', headers: { 'Content-Type': 'text/plain' } })).status, 415);
+  for (const raw of ['nope', '[]', '"o/r"', 'null']) assert.equal((await c.req('POST', '/api/projects', { cookie: c.cookie, raw, headers: JSON_CT })).status, 400, raw);
+  const gone = await c.job('0123456789abcdef');
+  assert.deepEqual([gone.status, gone.json], [404, { error: 'no_job' }]);
+  assert.deepEqual([(await c.job('..%2Fx')).status, (await c.job('__proto__')).status], [404, 404]);
+  assert.equal(c.addCalls().length, 0); // nothing was started
+}));
+
+test('add project validation: repo and name rules of fcode add; a refusal starts nothing', () => addApp(async (c) => {
+  const bad = async (body, error) => { const r = await c.add(body); assert.deepEqual([r.status, r.json], [400, { error }], JSON.stringify(body)); };
+  for (const repo of [undefined, null, 5, true, ['o/r'], { a: 1 }, '', 'owner', 'a/b/c', '/repo', 'owner/', 'o r/x', 'o/r x', 'o/r\n', '\no/r', 'o/r\t', 'o/r\0', 'o/r\x7f',
+    './repo', '../repo', '.../repo', 'owner/.', 'owner/..', 'owner/...', 'owner/.git', 'owner/..git', 'o/r;ls', 'o/r$(x)', 'o/r`x`', 'o/r|x', 'o/ré', 'ő/r', 'o\\r', ' o/r', 'o/r '])
+    await bad({ repo }, 'bad_repo');
+  for (const name of ['home', 'HOME', 'Home.git', '-x', '.x', '_x', 'a b', 'a/b', 'a\\b', 'x\n', '\nx', 'x\0', 'x\x7f', 'ñ', 'a'.repeat(65), 5, true, ['x'], { a: 1 }, ' x', 'x ', '..', '.git', 'a;b'])
+    await bad({ repo: 'o/r', name }, 'bad_name');
+  await bad({ repo: 'o/_x' }, 'bad_name'); // the default name (lower-cased repo part) is checked like a typed one
+  await bad({ repo: 'o/-x' }, 'bad_name');
+  await bad({ repo: 'o/.x' }, 'bad_name');
+  await bad({ repo: 'o/Home' }, 'bad_name');
+  await bad({ repo: 'o/' + 'a'.repeat(65) }, 'bad_name');
+  await bad({ repo: 'bad repo', name: 'bad name' }, 'bad_repo'); // the repo is judged first
+  assert.equal(c.addCalls().length, 0);
+  // accepted: the exact argv the script gets, lower-cased name, .git stripped, null / empty / missing name = the repo part
+  const ok = async (body, repo, name) => {
+    const r = await c.add(body); assert.equal(r.status, 202, JSON.stringify(body));
+    const j = await c.jobEnd(r.json.job); assert.deepEqual([j.name, j.repo, j.state], [name, repo, 'done'], JSON.stringify(body));
+    assert.deepEqual(c.addCalls().at(-1).argv, [repo, name], JSON.stringify(body));
+  };
+  await ok({ repo: 'Owner/My.Repo' }, 'Owner/My.Repo', 'my.repo');
+  await ok({ repo: 'o/r.git' }, 'o/r', 'r');
+  await ok({ repo: 'o/r.GIT' }, 'o/r', 'r');
+  await ok({ repo: 'o/r', name: null }, 'o/r', 'r');
+  await ok({ repo: 'o/r', name: '' }, 'o/r', 'r');
+  await ok({ repo: 'o/r', name: 'Other.Git' }, 'o/r', 'other');
+  await ok({ repo: 'o/r', name: 'K' }, 'o/r', 'k');
+  await ok({ repo: '-o_.x/_.-y', name: 'a'.repeat(64) }, '-o_.x/_.-y', 'a'.repeat(64));
+  await ok({ repo: 'o/1', name: '0.-_' }, 'o/1', '0.-_');
+  assert.equal(c.addCalls().length, 9);
+}));
+
+test('add project: a pasted GitHub link is reduced to owner/repo; any other host is bad_repo', () => addApp(async (c) => {
+  assert.equal(repoOfLink('plain/repo'), 'plain/repo');
+  const good = {
+    'https://github.com/o/r': 'o/r', 'https://www.github.com/o/r': 'o/r', 'https://GitHub.com/o/r': 'o/r', 'https://github.com/o/r/': 'o/r', 'https://github.com/o/r.git': 'o/r',
+    'https://github.com/o/r.git/': 'o/r', 'https://github.com/o/r?tab=readme': 'o/r', 'https://github.com/o/r#readme': 'o/r', 'https://github.com/o/r/?a=b#c': 'o/r',
+    'https://github.com/o/r/tree/main': 'o/r', 'https://github.com/o/r/tree/main/src/x.js': 'o/r', 'https://github.com/o/r/issues/12?x=1': 'o/r',
+    'github.com/o/r': 'o/r', 'www.github.com/o/r': 'o/r', 'github.com/o/r.git': 'o/r', 'github.com/o/r/pull/3': 'o/r',
+    'git@github.com:o/r.git': 'o/r', 'git@github.com:o/r': 'o/r', 'git@GitHub.com:o/r.git': 'o/r',
+    'o/r': 'o/r', 'o/r.git': 'o/r', 'My-Owner/My.Repo.git': 'My-Owner/My.Repo', 'https://github.com/My-Owner/My.Repo.git': 'My-Owner/My.Repo',
+  };
+  for (const [link, repo] of Object.entries(good)) {
+    assert.equal(repoOfLink(link).replace(/\.git$/i, ''), repo, link);
+    const r = await c.add({ repo: link });
+    assert.equal(r.status, 202, link);
+    const j = await c.jobEnd(r.json.job);
+    assert.deepEqual([j.repo, j.name], [repo, repo.split('/')[1].toLowerCase()], link);
+    assert.deepEqual(c.addCalls().at(-1).argv, [repo, repo.split('/')[1].toLowerCase()], link);
+  }
+  const n = c.addCalls().length;
+  for (const link of ['https://gitlab.com/o/r', 'https://bitbucket.org/o/r', 'https://github.com.evil.com/o/r', 'https://evil.com/github.com/o/r', 'https://evil.com/?u=github.com/o/r',
+    'https://github.com@evil.com/o/r', 'https://user@github.com/o/r', 'https://user:pw@github.com/o/r', 'https://github.com:443/o/r', 'https://githubxcom/o/r', 'https://notgithub.com/o/r',
+    'https://gist.github.com/o/r', 'https://api.github.com/repos/o/r', 'http://github.com/o/r', 'ssh://git@github.com/o/r', 'git@gitlab.com:o/r.git', 'git@github.com.evil.com:o/r.git',
+    'git@evil.com:github.com/o/r', 'ftp://github.com/o/r', 'github.com.evil.com/o/r', 'xgithub.com/o/r', 'https://github.com/o', 'https://github.com/o/', 'https://github.com/', 'https://github.com',
+    'github.com/o', 'git@github.com:o', 'git@github.com:', 'https://github.com//r', 'https://github.com//o/r', 'https://github.com/o/%2e%2e', 'https://github.com/o/r%2Fx', 'https://github.com/o/..',
+    'https://github.com/o/r\n', 'https://github.com/o/r?x=\n1', 'https://github.com/o/r#\u0000', 'https://github.com/o/r/tree/ma\tin', ' https://github.com/o/r', 'https://github.com/ o/r', 'https://github.com/o/r\0', 'javascript:github.com/o/r', 'o/r/tree/main', 'https://github.com/o/r s']) {
+    const r = await c.add({ repo: link });
+    assert.deepEqual([r.status, r.json], [400, { error: 'bad_repo' }], JSON.stringify(link));
+  }
+  assert.equal(c.addCalls().length, n);
+}));
+
+test('add project: every exit code of the script ends the job in its state and code', () => addApp(async (c) => {
+  const R = (...l) => l;
+  const sshd = 'R SSH_DETAIL Permission denied (publickey).';
+  const cases = [
+    [0, R('R KEY_NEW', 'R READ_OK', 'R WRITE_OK', 'R CFG_ADDED', 'R V_BRANCH_OK main'), 'done', 'ADDED', null],
+    [30, R('R CFG_ADDED', 'R CLEANUP_FAIL refs/heads/box/fcode-add-check'), 'done', 'ADDED_WARN', 'refs/heads/box/fcode-add-check'],
+    [30, R('R V_PR_BAD'), 'done', 'ADDED_WARN', null],
+    [0, R('R TOKEN_OK', 'R READ_OK', 'R WRITE_OK', 'R CFG_ADDED'), 'done', 'ADDED', null], // the token path
+    [30, R('R TOKEN_OK', 'R CLEANUP_FAIL refs/heads/box/fcode-add-check'), 'done', 'ADDED_WARN', 'refs/heads/box/fcode-add-check'],
+    [0, R('R KEY_EXISTS', 'R READ_OK', 'R CFG_EXISTS'), 'done', 'ADDED', null],
+    [0, R('R TOKEN_OK', 'R TOKEN_FALLBACK', 'R KEY_NEW', 'R CFG_ADDED'), 'done', 'ADDED', null], // token refused, then the deploy key: via key
+    [43, R('R TOKEN_OK', 'R SSH_DETAIL fatal: unable to access', 'R NET_FAIL'), 'failed', 'NET_FAIL', 'fatal: unable to access'],
+    [40, R(sshd, `R PUBKEY ${ADD_PUB}`, 'R NEED_KEY'), 'failed', 'NEED_KEY', 'Permission denied (publickey).', true],
+    [41, R('R SSH_DETAIL ERROR: The key you are authenticating with has been marked as read only.', `R PUBKEY ${ADD_PUB}`, 'R NEED_WRITE'), 'failed', 'NEED_WRITE', 'ERROR: The key you are authenticating with has been marked as read only.', true],
+    [42, R('R SSH_DETAIL ! [remote rejected] (protected branch hook declined)', 'R WRITE_BLOCKED'), 'failed', 'WRITE_BLOCKED', '! [remote rejected] (protected branch hook declined)'],
+    [43, R('R SSH_DETAIL ssh: connect to host github.com port 22: Connection timed out', 'R NET_FAIL'), 'failed', 'NET_FAIL', 'ssh: connect to host github.com port 22: Connection timed out'],
+    [44, R('R SSH_DETAIL archived', 'R REPO_ARCHIVED'), 'failed', 'REPO_ARCHIVED', 'archived'],
+    [11, R('R DIR_OTHER other/repo'), 'failed', 'DIR_CONFLICT', 'other/repo'],
+    [11, R('R DIR_NOTGIT /data/workspace/r'), 'failed', 'DIR_CONFLICT', '/data/workspace/r'],
+    [21, R('R CFG_CONFLICT /data/workspace/else'), 'failed', 'CFG_CONFLICT', '/data/workspace/else'],
+    [21, R('R ALIAS_FAIL'), 'failed', 'FAILED', null], // 21 is also "cannot write the ssh config": not a name clash
+    [23, R('R NAME_USED'), 'failed', 'NAME_USED', null],
+    [22, R('R CFG_BROKEN ValueError'), 'failed', 'CFG_BROKEN', 'ValueError'],
+    [2, R('R BAD_ARGS'), 'failed', 'BAD_ARGS', null],
+    [12, R('R CLONE_FAIL fatal: repository not found'), 'failed', 'CLONE_FAIL', 'fatal: repository not found'],
+    [20, R('R KEY_FAIL'), 'failed', 'FAILED', null],
+    [1, [], 'failed', 'FAILED', null], [3, [], 'failed', 'FAILED', null], [10, [], 'failed', 'FAILED', null], [31, [], 'failed', 'FAILED', null], [45, [], 'failed', 'FAILED', null],
+    [127, [], 'failed', 'FAILED', null], [255, [], 'failed', 'FAILED', null],
+  ];
+  for (const [exit, lines, state, code, detail, key] of cases) {
+    c.plan({ exit, lines });
+    const r = await c.add({ repo: 'o/r' });
+    assert.equal(r.status, 202);
+    const j = await c.jobEnd(r.json.job);
+    const via = lines.some((l) => /^R KEY_(NEW|EXISTS)/.test(l)) ? 'key' : lines.includes('R TOKEN_OK') ? 'token' : null;
+    const want = { state, code, name: 'r', repo: 'o/r', via, detail, ...(key && { pubkey: ADD_PUB, keyUrl: 'https://github.com/o/r/settings/keys/new' }) };
+    assert.deepEqual(j, want, `exit ${exit} ${lines.join(' / ')}`);
+  }
+  // a public key only for the two key codes, and only when it is one: a private key, or anything else, in its place never reaches the answer
+  const PRIV = '-----BEGIN OPENSSH PRIVATE KEY-----';
+  for (const [exit, pk] of [[40, PRIV], [40, 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQ x'], [40, 'ssh-ed25519 AAAA<script> x'], [41, 'ssh-ed25519 AAAA x y'], [40, ''], [1, ADD_PUB], [43, ADD_PUB], [0, ADD_PUB]]) {
+    c.plan({ exit, lines: [`R PUBKEY ${pk}`, PRIV, 'R NEED_KEY'] });
+    const r = await c.jobEnd((await c.add({ repo: 'o/r' })).json.job);
+    assert.ok(!('pubkey' in r) && !('keyUrl' in r), `${exit} ${pk}`);
+  }
+  // a bare "R" noise line, a banner and CRLF do not matter
+  c.plan({ exit: 40, lines: ['hello', 'Rx NEED_KEY', 'R', `R PUBKEY ${ADD_PUB}\r`, 'x R NEED_KEY'] });
+  assert.equal((await c.jobEnd((await c.add({ repo: 'o/r' })).json.job)).pubkey, ADD_PUB);
+  // the line after a good public key is not read as part of it
+  c.plan({ exit: 40, lines: [`R PUBKEY ${ADD_PUB}`, PRIV, 'b3BlbnNzaC1rZXk'] });
+  const pj = await c.jobEnd((await c.add({ repo: 'o/r' })).json.job);
+  assert.equal(pj.pubkey, ADD_PUB);
+  assert.ok(!JSON.stringify(pj).includes('PRIVATE') && !JSON.stringify(pj).includes('b3Blbn'));
+  // a command that cannot start
+  const dead = await boot({ addScript: [path.join(os.tmpdir(), 'no-such-fcode-add-xyz')] });
+  try {
+    const cookie = (await dead.login()).cookie;
+    const id = (await dead.req('POST', '/api/projects', { cookie, body: { repo: 'o/r' } })).json.job;
+    const j = (await waitFor(async () => { const r = await dead.req('GET', `/api/projects/jobs/${id}`, { cookie }); return r.json.state !== 'running' && r; })).json;
+    assert.deepEqual([j.state, j.code], ['failed', 'FAILED']);
+  } finally { await dead.close(); }
+}));
+
+test('add project: detail is one clean line of at most 200 characters; tokens, URL credentials and private keys never pass; the logs hold the name and the code only', () => addApp(async (c) => {
+  const dirty = `\x1b[31mfatal: https://ghp_AbC123xyz:x@github.com/o/r github_pat_11ABC_def and ghs_QRS and gho_Tok1 ‮\x07 ${'x'.repeat(300)}`;
+  c.plan({ exit: 43, lines: [`R SSH_DETAIL ${dirty}`, `R PUBKEY ${ADD_PUB}`, 'R NET_FAIL', '-----BEGIN OPENSSH PRIVATE KEY-----', 'b3BlbnNzaC1rZXk=', 'token=ghp_ZZZZ'] });
+  const r = await c.add({ repo: 'o/r' });
+  const jr = await c.job(r.json.job); // may still run: wait
+  const j = await c.jobEnd(r.json.job);
+  assert.ok(j.detail.length <= 200 && j.detail.length > 100, j.detail.length);
+  for (const bad of ['ghp_', 'AbC123', 'github_pat_', 'ghs_', 'gho_', 'Tok1', 'x:x@', '\x1b', '\x07', '‮']) assert.ok(!j.detail.includes(bad), bad);
+  assert.ok(j.detail.includes('<token>'));
+  const all = JSON.stringify([jr.json, j]) + c.logs.join('\n');
+  for (const bad of ['PRIVATE', 'b3BlbnNzaC1rZXk', 'ghp_', 'github_pat_', 'AAAAC3NzaC1lZDI1NTE5']) assert.ok(!all.includes(bad), bad);
+  assert.deepEqual(c.logs.filter((l) => l.startsWith('add-project')), ['add-project r NET_FAIL']);
+  // the script is pointed at this server's config.json and gets exactly [repo, name]
+  const call = c.addCalls().at(-1);
+  assert.equal(call.cfg, path.join(c.configDir, 'config.json'));
+  assert.deepEqual(call.argv, ['o/r', 'r']);
+}));
+
+test('add project: one running job per name; a second POST joins it; another name or a finished job starts its own', () => addApp(async (c) => {
+  c.plan({ sleep: 700, lines: ['R CFG_ADDED'] });
+  const a = (await c.add({ repo: 'o/r' })).json.job;
+  assert.match(a, /^[0-9a-f]{32}$/);
+  const b = await c.add({ repo: 'o/r' });
+  assert.deepEqual([b.status, b.json.job], [202, a]);
+  assert.equal((await c.add({ repo: 'https://github.com/o/r', name: 'R' })).json.job, a); // the name is what counts (lower-cased)
+  assert.equal((await c.add({ repo: 'other/r' })).json.job, a); // same name, another repo: still the running job (it tells its repo)
+  const run = await c.job(a);
+  assert.deepEqual([run.status, run.json.state, run.json.code, run.json.name, run.json.repo, run.json.via, run.json.detail], [200, 'running', null, 'r', 'o/r', null, null]);
+  assert.ok(!('pubkey' in run.json) && !('keyUrl' in run.json));
+  const d = (await c.add({ repo: 'o/r', name: 'second' })).json.job;
+  assert.notEqual(d, a);
+  assert.equal((await c.jobEnd(a)).state, 'done');
+  await c.jobEnd(d);
+  assert.equal(c.addCalls().length, 2); // one run per name
+  const e = (await c.add({ repo: 'o/r' })).json.job; // the first has ended: a new run, a new id; the old id still answers
+  assert.notEqual(e, a);
+  assert.equal((await c.job(a)).json.state, 'done');
+  await c.jobEnd(e);
+  assert.equal(c.addCalls().length, 3);
+  // two POSTs at the same moment: one run
+  c.plan({ sleep: 300 });
+  const both = await Promise.all([c.add({ repo: 'o/q' }), c.add({ repo: 'o/q' }), c.add({ repo: 'o/q' })]);
+  assert.equal(new Set(both.map((x) => x.json.job)).size, 1);
+  await c.jobEnd(both[0].json.job);
+  assert.equal(c.addCalls().filter((x) => x.argv[1] === 'q').length, 1);
+}));
+
+test('add project: after the timeout the job is TIMEOUT and the whole process group is killed; the name is free again', () => addApp(async (c, dir) => {
+  c.plan({ sleep: 60e3, child: true, lines: ['R KEY_NEW'] });
+  const t0 = Date.now();
+  const id = (await c.add({ repo: 'o/r' })).json.job;
+  assert.equal((await c.job(id)).json.state, 'running');
+  const j = await c.jobEnd(id);
+  assert.deepEqual([j.state, j.code], ['failed', 'TIMEOUT']);
+  assert.ok(Date.now() - t0 < 10e3, 'ended by the timeout, not by the script');
+  assert.ok(!('pubkey' in j));
+  const child = Number(await waitFor(() => { try { return fs.readFileSync(path.join(dir, 'child.pid'), 'utf8'); } catch { return ''; } }));
+  if (process.platform !== 'win32') { // a process group (POSIX): the script's own child dies with it
+    await waitFor(() => !alive(child), 5000);
+  } else try { process.kill(child, 'SIGKILL'); } catch {} // Windows has no process groups here: only the script itself is ended
+  assert.deepEqual(c.logs.filter((l) => l.startsWith('add-project')), ['add-project r TIMEOUT']);
+  c.plan({});
+  const again = (await c.add({ repo: 'o/r' })).json.job;
+  assert.notEqual(again, id);
+  assert.equal((await c.jobEnd(again)).code, 'ADDED');
+}, { addTimeoutMs: 400 }));
+
+test('add project: closing the app ends a running script and its group', { skip: process.platform === 'win32' && 'process groups' }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-add-'));
+  fs.writeFileSync(path.join(dir, 'fake-add.mjs'), ADD_FAKE_SRC);
+  fs.writeFileSync(path.join(dir, 'plan.json'), JSON.stringify({ sleep: 60e3, child: true }));
+  const c = await boot({ addScript: [process.execPath, path.join(dir, 'fake-add.mjs'), dir] });
+  try {
+    const cookie = (await c.login()).cookie;
+    assert.equal((await c.req('POST', '/api/projects', { cookie, body: { repo: 'o/r' } })).status, 202);
+    const child = Number(await waitFor(() => { try { return fs.readFileSync(path.join(dir, 'child.pid'), 'utf8'); } catch { return ''; } }));
+    assert.ok(alive(child));
+    await c.close();
+    await waitFor(() => !alive(child), 5000);
+  } finally { try { process.kill(Number(fs.readFileSync(path.join(dir, 'child.pid'), 'utf8')), 'SIGKILL'); } catch {} fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+});
+
+test('add project: the new project is in /api/home, /api/meta and /api/overview at once, with no restart; ended jobs are kept 30 minutes', () => addApp(async (c) => {
+  const before = await c.warm((h) => h.projects.length === 2 && h.projects.every((p) => !p.loading)); // the project list is cached 120 s
+  assert.deepEqual(before.projects.map((p) => p.name), ['alpha', 'my.proj']);
+  c.plan({ lines: ['R READ_OK', 'R WRITE_OK', 'R CFG_ADDED'], addProject: ABS }); // what the script does: a new "projects" entry, written by rename
+  const id = (await c.add({ repo: 'o/Fresh.Repo' })).json.job;
+  const j = await c.jobEnd(id);
+  assert.deepEqual([j.state, j.code, j.name], ['done', 'ADDED', 'fresh.repo']);
+  const home = await c.home();
+  assert.deepEqual(home.projects.map((p) => p.name), ['alpha', 'my.proj', 'fresh.repo']);
+  assert.deepEqual((await c.req('GET', '/api/meta', { cookie: c.cookie })).json.projects, ['alpha', 'my.proj', 'fresh.repo']);
+  assert.ok((await c.req('GET', '/api/overview', { cookie: c.cookie })).json.projects.some((p) => p.name === 'fresh.repo'));
+  // and it can be opened as a session
+  assert.equal((await c.req('POST', '/api/open', { cookie: c.cookie, body: { project: 'fresh.repo', harness: 'shell' } })).status, 200);
+  // the logins are untouched by the projects-only change
+  assert.equal((await c.req('GET', '/api/me', { cookie: c.cookie })).status, 200);
+  // retention: 29 minutes after the end it still answers, 31 does not
+  c.clock.t += 29 * 60e3;
+  assert.equal((await c.job(id)).status, 200);
+  c.clock.t += 2 * 60e3;
+  assert.deepEqual([(await c.job(id)).status, (await c.job(id)).json], [404, { error: 'no_job' }]);
+}));
+
+test('add project: a job still running is never dropped by the 30 minute clean-up', () => addApp(async (c) => {
+  c.plan({ sleep: 600 });
+  const id = (await c.add({ repo: 'o/r' })).json.job;
+  c.clock.t += 45 * 60e3;
+  assert.equal((await c.job(id)).json.state, 'running');
+  assert.equal((await c.jobEnd(id)).state, 'done');
+  assert.equal((await c.job(id)).status, 200); // 30 minutes count from its end
+}));
+
+// ---------- GET /api/github/repos: what the box's gh login sees, and which of it is already on the box ----------
+const ghRow = (repo, o = {}) => JSON.stringify({ repo, private: false, archived: false, canPush: true, updatedAt: '2026-10-01T00:00:00Z', ...o });
+const GH_LIST_KEY = 'api --paginate /user/repos?affiliation=owner,collaborator,organization_member&sort=updated&per_page=100 --jq';
+const ghRepos = (c, o = {}) => c.req('GET', '/api/github/repos', { cookie: c.cookie, ...o });
+const ghCalls = (c) => c.toolCalls('api --paginate');
+
+test('github repos: needs a session; GET only; the gh call is exactly the contract one', () => homeApp(async (c) => {
+  assert.equal((await c.req('GET', '/api/github/repos')).status, 401);
+  assert.equal((await c.req('POST', '/api/github/repos', { cookie: c.cookie, body: {} })).status, 405);
+  assert.equal(ghCalls(c).length, 0);
+  c.setRules([['api --paginate', { stdout: ghRow('o/a') + '\n' }], ...baseRules()]);
+  const r = await ghRepos(c);
+  assert.equal(r.status, 200);
+  assert.equal(ghCalls(c).length, 1);
+  assert.ok(ghCalls(c)[0].startsWith(GH_LIST_KEY), ghCalls(c)[0]);
+  const jq = ghCalls(c)[0].slice(GH_LIST_KEY.length);
+  for (const f of ['.full_name', '.private', '.archived', '.permissions.push', '.updated_at', '@json']) assert.ok(jq.includes(f), f);
+}));
+
+test('github repos: fields, sort by updatedAt descending, at most 300, bad lines skipped', () => homeApp(async (c) => {
+  const lines = [
+    ghRow('o/old', { updatedAt: '2025-01-01T00:00:00Z' }),
+    ghRow('o/new', { private: true, updatedAt: '2026-10-25T10:00:00Z' }),
+    'not json', '', '[]', '{"repo":5}', '{"repo":"bad repo"}', '{"repo":"a/b/c"}', 'null',
+    ghRow('o/ro', { canPush: false, archived: true, updatedAt: '2026-06-01T12:34:56.789Z' }),
+    JSON.stringify({ repo: 'o/odd', private: 'yes', archived: 1, canPush: null, updatedAt: 'garbage' }), // not booleans: false; not a date: null, last
+    JSON.stringify({ repo: 'o/nodate' }),
+  ];
+  c.setRules([['api --paginate', { stdout: lines.join('\n') + '\n' }], ...baseRules()]);
+  const r = await ghRepos(c);
+  assert.deepEqual(r.json, { repos: [
+    { repo: 'o/new', private: true, archived: false, canPush: true, updatedAt: '2026-10-25T10:00:00.000Z', onBox: null },
+    { repo: 'o/ro', private: false, archived: true, canPush: false, updatedAt: '2026-06-01T12:34:56.789Z', onBox: null },
+    { repo: 'o/old', private: false, archived: false, canPush: true, updatedAt: '2025-01-01T00:00:00.000Z', onBox: null },
+    { repo: 'o/odd', private: false, archived: false, canPush: false, updatedAt: null, onBox: null },
+    { repo: 'o/nodate', private: false, archived: false, canPush: false, updatedAt: null, onBox: null },
+  ] });
+  // 450 repos: the 300 most recently updated
+  const many = Array.from({ length: 450 }, (_, i) => ghRow(`o/r${i}`, { updatedAt: new Date(Date.UTC(2026, 0, 1) + i * 1000).toISOString() }));
+  c.setRules([['api --paginate', { stdout: many.join('\n') + '\n' }], ...baseRules()]);
+  c.clock.t += 61e3;
+  const big = (await ghRepos(c)).json.repos;
+  assert.equal(big.length, 300);
+  assert.deepEqual([big[0].repo, big[299].repo], ['o/r449', 'o/r150']);
+}));
+
+test('github repos: onBox is the project whose origin points at the repo, in every URL form, lower-cased; a project that cannot answer is ignored', () => homeApp(async (c) => {
+  const d = (n) => path.join(ABS, `box-${n}`);
+  const origins = {
+    a: 'git@github.com:Owner-A/Repo-A.git', b: 'https://github.com/owner-b/repo-b', c: 'https://github.com/owner-c/repo-c.git', d: 'git@github-work:owner-d/repo-d.git',
+    e: 'ssh://git@github.com/owner-e/repo-e.git', f: 'https://x-access-token:ghp_NOTREAL@github.com/owner-f/repo-f.git', g: 'git@gitlab.com:owner-g/repo-g.git',
+    h: 'https://github.com/owner-h/repo-h/', i: 'git@github.com:owner-a/repo-a.git', // i: the same repo as a (the first project wins)
+  };
+  setProjects(c, { ...Object.fromEntries(Object.keys(origins).map((k) => [`p-${k}`, d(k)])), 'p-none': d('none') });
+  c.setRules([
+    ['api --paginate', { stdout: ['owner-a/repo-a', 'OWNER-B/Repo-B', 'owner-c/repo-c', 'owner-d/repo-d', 'owner-e/repo-e', 'owner-f/repo-f', 'owner-g/repo-g', 'owner-h/repo-h', 'owner-n/none', 'o/free'].map((r) => ghRow(r)).join('\n') + '\n' }],
+    ...Object.entries(origins).map(([k, u]) => [`-C ${d(k)} remote get-url origin`, { stdout: `${u}\n` }]),
+    [`-C ${d('none')} remote get-url origin`, { code: 128, stderr: 'fatal: not a git repository' }],
+    ...baseRules(),
+  ]);
+  const by = Object.fromEntries((await ghRepos(c)).json.repos.map((r) => [r.repo.toLowerCase(), r.onBox]));
+  assert.deepEqual(by, {
+    'owner-a/repo-a': 'p-a', 'owner-b/repo-b': 'p-b', 'owner-c/repo-c': 'p-c', 'owner-d/repo-d': 'p-d', 'owner-e/repo-e': 'p-e', 'owner-f/repo-f': 'p-f',
+    'owner-g/repo-g': null, 'owner-h/repo-h': 'p-h', 'owner-n/none': null, 'o/free': null,
+  });
+  assert.ok(!JSON.stringify(by).includes('ghp_') && !c.logs.join('\n').includes('ghp_'));
+}));
+
+test('github repos: the gh list is cached 60 s and shared by concurrent requests; onBox is read at every request', () => homeApp(async (c) => {
+  c.setRules([['api --paginate', { stdout: ghRow('o/a', { updatedAt: '2026-01-01T00:00:00Z' }) + '\n' + ghRow('o/b') + '\n', delay: 150 }], ...baseRules()]);
+  const [x, y, z] = await Promise.all([ghRepos(c), ghRepos(c), ghRepos(c)]);
+  assert.deepEqual([x.status, y.status, z.status], [200, 200, 200]);
+  assert.equal(ghCalls(c).length, 1);
+  assert.deepEqual(x.json, y.json);
+  c.clock.t += 59e3;
+  await ghRepos(c);
+  assert.equal(ghCalls(c).length, 1);
+  // a project added meanwhile shows at once (no new gh run)
+  setProjects(c, { alpha: ABS, 'my.proj': ABS, fresh: path.join(ABS, 'fresh') });
+  c.setRules([['api --paginate', { stdout: ghRow('o/NEW') + '\n' }], [`-C ${path.join(ABS, 'fresh')} remote get-url origin`, { stdout: 'git@github.com:o/b.git\n' }], ...baseRules()]);
+  const m = (await ghRepos(c)).json.repos;
+  assert.deepEqual(m.map((r) => [r.repo, r.onBox]), [['o/b', 'fresh'], ['o/a', null]]);
+  assert.equal(ghCalls(c).length, 1);
+  c.clock.t += 2e3; // 61 s: read again, with the new rules
+  assert.deepEqual((await ghRepos(c)).json.repos.map((r) => r.repo), ['o/NEW']);
+  assert.equal(ghCalls(c).length, 2);
+}));
+
+test('github repos: no usable GitHub login is 200 no_github_token; any other gh failure is 502 github_unavailable, never cached, never with gh output', () => homeApp(async (c) => {
+  const noToken = [
+    { code: 4, stderr: 'To get started with GitHub CLI, please run:  gh auth login\nAlternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.' },
+    { code: 1, stderr: 'gh: Bad credentials (HTTP 401)' },
+    { code: 1, stderr: 'gh: You are not logged in to any GitHub hosts. Run gh auth login to authenticate.' },
+  ];
+  for (const r of noToken) {
+    c.clock.t += 61e3;
+    c.setRules([['api --paginate', r], ...baseRules()]);
+    const x = await ghRepos(c);
+    assert.deepEqual([x.status, x.json], [200, { repos: [], reason: 'no_github_token' }], r.stderr);
+  }
+  for (const r of [{ code: 1, stderr: 'gh: Bad gateway (HTTP 502) token=ghp_SECRETSECRET' }, { code: 1, stderr: 'gh: HTTP 403: rate limit exceeded' }, { code: 2 }]) {
+    c.clock.t += 61e3;
+    c.setRules([['api --paginate', r], ...baseRules()]);
+    const x = await ghRepos(c);
+    assert.deepEqual([x.status, x.json], [502, { error: 'github_unavailable' }], JSON.stringify(r));
+    assert.ok(!x.text.includes('ghp_') && !x.text.includes('rate limit'));
+  }
+  c.clock.t += 61e3;
+  c.setRules([['api --paginate', { code: 0, stdout: '' }], ...baseRules()]); // gh ran and listed nothing: an empty list, not an error
+  assert.deepEqual((await ghRepos(c)).json, { repos: [] });
+  assert.ok(!c.logs.join('\n').includes('ghp_SECRET') && !c.logs.join('\n').includes('rate limit'));
+  // a failure is not cached: the next request asks again, and a good answer then works at once
+  c.setRules([['api --paginate', { code: 1, stderr: 'boom' }], ...baseRules()]);
+  c.clock.t += 61e3;
+  assert.equal((await ghRepos(c)).status, 502);
+  const n = ghCalls(c).length;
+  assert.equal((await ghRepos(c)).status, 502);
+  assert.equal(ghCalls(c).length, n + 1);
+  c.setRules([['api --paginate', { stdout: ghRow('o/ok') + '\n' }], ...baseRules()]);
+  assert.deepEqual((await ghRepos(c)).json.repos.map((r) => r.repo), ['o/ok']);
+}));
+
+test('github repos: gh not installed is 200 no_github_token', () => withApp(async (c) => {
+  const cookie = (await c.login()).cookie;
+  const r = await c.req('GET', '/api/github/repos', { cookie });
+  assert.deepEqual([r.status, r.json], [200, { repos: [], reason: 'no_github_token' }]);
+}, { gh: [path.join(os.tmpdir(), 'no-such-gh-xyz')] }));
+
+test('install.sh installs box/fcode-add.sh next to server.mjs, where POST /api/projects looks for it; the script is LF and executable-ready', () => {
+  const install = fs.readFileSync(path.join(here, '..', 'install.sh'), 'utf8');
+  assert.match(install, /install -m 755 "\$SRC\/box\/fcode-add\.sh" "\$APP\/fcode-add\.sh"/);
+  assert.ok(/^APP=\/data\/home\/fcoding$/m.test(install));
+  const sh = fs.readFileSync(path.join(here, '..', 'box', 'fcode-add.sh'));
+  assert.ok(!sh.includes(13), 'LF only');
+  assert.equal(sh.subarray(0, 12).toString(), '#!/bin/bash\n');
+  assert.ok(/^\* text eol=lf|^\*\.sh text eol=lf/m.test(fs.readFileSync(path.join(here, '..', '.gitattributes'), 'utf8')));
 });

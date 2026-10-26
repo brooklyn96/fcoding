@@ -91,7 +91,7 @@ journalctl --user -u fcoding -n 50
 
 ### Danh sách dự án
 
-Các dự án hiện trong app nằm trong `config.json`, mục `projects`. Sau lần cài đầu mục này **trống**, nên nút **+** trong app báo "Chưa có dự án nào trong cấu hình máy chủ" cho tới khi bạn thêm dự án. Cách thêm: chạy `fcode add <chủ/repo>` trên laptop (xem [mục 8](#8-dùng-từ-laptop)), hoặc sửa `config.json` trên box như dưới đây. Mỗi dự án là một tên và một đường dẫn tuyệt đối trên box:
+Các dự án hiện trong app nằm trong `config.json`, mục `projects`. Sau lần cài đầu mục này **trống**, nên nút **+** trong app báo "Chưa có dự án nào trong cấu hình máy chủ" cho tới khi bạn thêm dự án. Cách thêm: bấm **+** rồi **Thêm dự án** trong app (xem [mục 7](#7-dùng-hằng-ngày)), hoặc chạy `fcode add <chủ/repo>` trên laptop (xem [mục 8](#8-dùng-từ-laptop)), hoặc sửa `config.json` trên box như dưới đây. Mỗi dự án là một tên và một đường dẫn tuyệt đối trên box:
 
 ```json
 {
@@ -259,6 +259,8 @@ Hướng dẫn đầy đủ cho app nằm ở [ios/README.md, mục 4](ios/READM
 - Vuốt trái một phiên: **Đổi tên** hoặc **Đóng** (có hỏi xác nhận; chương trình trong phiên bị tắt).
 
 **Tạo phiên mới**: bấm nút tròn **+** ở góc dưới bên phải. Chọn dự án, rồi chọn chương trình (omp, claude hoặc codex). Nút này luôn tạo phiên **mới** (tên như `web-claude`, `web-claude-2`, …) và không bao giờ mở lại phiên cũ; muốn vào phiên cũ thì mở từ danh sách. App không còn liệt kê shell, dù máy chủ vẫn chạy được shell.
+
+**Thêm dự án** (nút **+**, dòng **Thêm dự án** ở đầu): dán link repo GitHub (ví dụ `https://github.com/ten-tai-khoan/ten-repo`, dạng `git@github.com:…` hoặc `ten-tai-khoan/ten-repo` đều được) hoặc chọn một repo trong danh sách "Hoặc chọn repo", đặt tên nếu muốn, rồi bấm **Thêm**. Box tải repo về `/data/workspace/<tên>`, cài hook chặn push thẳng lên `main`/`master`, thử ghi một nhánh `box/...` rồi xoá ngay, và thêm dự án vào `config.json`; xong thì dự án hiện ngay trong danh sách, không cần khởi động lại. Box thử trước bằng `gh` (token `GH_TOKEN`): clone qua HTTPS rồi đẩy thử và xoá một nhánh tạm; nếu ghi được thì dùng chính token ấy (token không bao giờ được in hay ghi ra file). GitHub báo "có quyền ghi" chưa chắc đúng với token, nên chỉ lần ghi thử thật mới quyết định. Nếu token bị từ chối, app hiện một khóa công khai để bạn dán vào trang **Deploy keys** của repo (tích "Allow write access"), rồi bấm **Thử lại**. Danh sách repo lấy từ `gh api /user/repos` và nhớ 60 giây; repo đã có trên box, repo lưu trữ hoặc chỉ-đọc hiện mờ. Lệnh trên box: `bash /data/home/fcoding/fcode-add.sh <chủ/repo> <tên>` (cùng kịch bản mà `fcode add` dùng).
 
 **Hạn mức** (chạm ô hạn mức): tổng chi phí 30 ngày, rồi từng tài khoản: thanh dùng của từng khung giờ, xu hướng 30 ngày, chi phí "Hôm nay / Hôm qua / 30 ngày / Ước tính tuần". **Reset**: Codex dùng lượt reset ngay trong app (có hỏi xác nhận); Claude chỉ mở trang claude.ai. Xem thêm "Màn hình chính: hạn mức, chi phí, dự án" ở mục 3.
 

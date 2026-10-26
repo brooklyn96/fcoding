@@ -12,6 +12,8 @@ command -v tmux >/dev/null || echo "warning: tmux not found; install it before u
 
 mkdir -p "$APP"
 [ "$SRC" = "$APP" ] || install -m 644 "$SRC/server.mjs" "$APP/server.mjs"
+# the box script behind "Thêm dự án" (POST /api/projects runs it from next to server.mjs; see CONTRACT.md A11)
+[ ! -f "$SRC/box/fcode-add.sh" ] || install -m 755 "$SRC/box/fcode-add.sh" "$APP/fcode-add.sh"
 
 mkdir -p "$CFG"
 chmod 700 "$CFG"
