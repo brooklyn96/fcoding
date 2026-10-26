@@ -22,9 +22,10 @@ const LONG_TEXT = 500; // bytes; longer single lines are pasted, not typed
 const UPLOAD_LIMIT = 10 * 1024 * 1024;
 const UPLOAD_KEEP_MS = 7 * 24 * 3600e3; // a file in .fcode/uploads older than this is deleted by the next upload
 const UPLOAD_NAME_RE = /^\d{8}-\d{6}-[0-9a-f]{6}\.(?:jpg|png)$/;
+const UPLOAD_ROUTE = /^\/api\/projects\/([^/]+)\/upload$/;
 const UPLOAD_SLOTS = 2; // uploads in flight at once (counted before a body byte is read); one more is 429 busy
-const UPLOAD_REQUEST_MS = 120e3; // http request timeout: a 10 MiB photo on a weak link; the JSON routes keep BODY_MS
-const BODY_MS = 15e3; // a JSON body that takes longer than this is cut
+const UPLOAD_REQUEST_MS = 120e3; // an admitted upload's body window (and http requestTimeout): a 10 MiB photo on a weak link
+const BODY_MS = 15e3; // every other request, and an upload before it is admitted, is cut when not complete after this
 const NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0; // not defined on Windows
 const UPLOAD_TYPES = new Map([
   ['image/jpeg', { ext: 'jpg', magic: Buffer.from([0xff, 0xd8, 0xff]) }],
@@ -1719,16 +1720,15 @@ export function createApp(opts = {}) {
   }
   function readBody(req) {
     return new Promise((resolve, reject) => {
-      const chunks = []; let size = 0; let over = false;
-      const timer = setTimeout(() => req.destroy(), bodyMs); // server.requestTimeout is long (the image upload); a JSON body keeps this short bound
+      const chunks = []; let size = 0; let over = false; // the time bound is the per-request timer of the handler (ctx.cut)
       req.on('data', (c) => {
         size += c.length;
         if (size > BODY_LIMIT) { over = true; chunks.length = 0; if (size > 16 * BODY_LIMIT) req.destroy(); return; }
         if (!over) chunks.push(c);
       });
-      req.on('end', () => { clearTimeout(timer); over ? reject(new HttpErr(413, 'too_large')) : resolve(Buffer.concat(chunks)); });
-      req.on('error', () => { clearTimeout(timer); reject(new HttpErr(400, 'invalid')); });
-      req.on('close', () => { clearTimeout(timer); reject(new HttpErr(499, 'cancelled')); }); // no-op once settled
+      req.on('end', () => { over ? reject(new HttpErr(413, 'too_large')) : resolve(Buffer.concat(chunks)); });
+      req.on('error', () => reject(new HttpErr(400, 'invalid')));
+      req.on('close', () => reject(new HttpErr(499, 'cancelled'))); // no-op once settled
     });
   }
   function parseJson(req, buf) {
@@ -1759,16 +1759,16 @@ export function createApp(opts = {}) {
   const validName = (n) => typeof n === 'string' && NAME_RE.test(n);
 
   // --- POST /api/projects/<name>/upload?session=<name> (CONTRACT A12) ---
-  // the raw body, at most UPLOAD_LIMIT bytes: past it the 413 is answered at once and the rest is read and thrown away (never kept; destroyed at 16x)
+  // the raw body, at most UPLOAD_LIMIT bytes: past it the 413 is answered at once, reading stops, the bytes so far are dropped, and the
+  // connection is closed after the answer (the rest of the body is never read, see the handler)
   function readUpload(req) {
     return new Promise((resolve, reject) => {
       const declared = req.headers['content-length'];
       if (declared !== undefined && Number(declared) > UPLOAD_LIMIT) return reject(new HttpErr(413, 'too_big'));
-      const chunks = []; let size = 0, over = false;
+      const chunks = []; let size = 0;
       req.on('data', (c) => {
         size += c.length;
-        if (over) { if (size > 16 * UPLOAD_LIMIT) req.destroy(); return; }
-        if (size > UPLOAD_LIMIT) { over = true; chunks.length = 0; reject(new HttpErr(413, 'too_big')); return; }
+        if (size > UPLOAD_LIMIT) { chunks.length = 0; req.pause(); reject(new HttpErr(413, 'too_big')); return; }
         chunks.push(c);
       });
       req.on('end', () => resolve(Buffer.concat(chunks)));
@@ -1829,8 +1829,8 @@ export function createApp(opts = {}) {
       return false;
     }
   }
-  // admission first: at most UPLOAD_SLOTS in flight, counted before any body byte is read (the 429 reads nothing, like the 413 that is answered unread);
-  // the slot is freed on every way out
+  // admission first: at most UPLOAD_SLOTS in flight, counted before any body byte is read (the 429 reads nothing; the handler closes the connection
+  // after every refused upload, so the unread body is never drained); the slot is freed in this one finally, on every way out
   let uploads = 0;
   async function upload(req, res, url, ctx, rawName) {
     if (req.method !== 'POST') throw new HttpErr(405, 'method');
@@ -1839,18 +1839,24 @@ export function createApp(opts = {}) {
     try { return await storeUpload(req, res, url, ctx, rawName); } finally { uploads--; }
   }
   async function storeUpload(req, res, url, ctx, rawName) {
+    // The client may be gone at any await below (ctx.cancelled is set by the response 'close' the handler registered before the first await; a
+    // request destroyed by the timer is req.destroyed). Nothing would ever settle readUpload once the request has closed, so stop here instead.
+    const alive = () => { if (ctx.cancelled || req.destroyed) throw new HttpErr(499, 'cancelled'); };
     let project = '';
     try { project = decodeURIComponent(rawName); } catch {}
     const dir = validProject(project) ? cfg.projects[project] : null;
     if (!dir || !(await fs.promises.stat(dir).then((s) => s.isDirectory(), () => false))) throw new HttpErr(404, 'no_project');
+    alive();
     const type = UPLOAD_TYPES.get((req.headers['content-type'] || '').split(';')[0].trim().toLowerCase());
     if (!type) throw new HttpErr(415, 'bad_type');
     const session = url.searchParams.get('session'); // checked before anything is written
     let found = null;
     if (session !== null) {
       found = (await listSessions(ctx)).find((x) => x.name === session && x.project === project);
+      alive();
       if (!found) throw new HttpErr(404, 'no_session');
     }
+    ctx.cut(uploadRequestMs); // auth, CSRF, project, type, session and the slot are all in: only now the body gets the long window (else the short one of the handler)
     const buf = await readUpload(req);
     if (!valid(ctx)) throw gateErr(ctx); // the device may have been revoked while the body came in
     if (!buf.length) throw new HttpErr(400, 'empty');
@@ -1966,7 +1972,7 @@ export function createApp(opts = {}) {
       if (!valid(ctx)) throw new HttpErr(401, 'unauthorized');
     }
     if (!isApi) throw new HttpErr(404, 'not_found');
-    const um = /^\/api\/projects\/([^/]+)\/upload$/.exec(pathname); // v1.3.3: reads its own raw body, so it must come before the 64 KB JSON readBody below
+    const um = UPLOAD_ROUTE.exec(pathname); // v1.3.3: reads its own raw body, so it must come before the 64 KB JSON readBody below
     if (um) return upload(req, res, url, ctx, um[1]);
     if (isPair) { // counted before the body: oversized, slow and invalid bodies use up the quota too
       if (method !== 'POST') throw new HttpErr(405, 'method');
@@ -2163,6 +2169,12 @@ export function createApp(opts = {}) {
     const t0 = Date.now();
     const ctx = { cancelled: false, device: null, gen: -1 };
     res.on('close', () => { if (!res.writableFinished) { ctx.cancelled = true; ctx.onCancel?.(); } });
+    // ONE timer per request, set before anything else (also for requests that are refused before their body is read, which Node would drain
+    // until requestTimeout): a request that is not complete after `ms` is destroyed. Short (bodyMs) by default; only the upload route, once
+    // everything that can refuse it has passed, swaps it for the long one. A complete request is never touched (SSE, a response still being built).
+    ctx.cut = (ms) => { clearTimeout(ctx.cutTimer); ctx.cutTimer = setTimeout(() => { if (!req.complete) req.destroy(); }, ms).unref(); };
+    ctx.cut(bodyMs);
+    req.on('close', () => clearTimeout(ctx.cutTimer));
     let target = '(bad-target)';
     try {
       for (const [k, v] of Object.entries(SEC_HEADERS)) res.setHeader(k, v);
@@ -2176,6 +2188,10 @@ export function createApp(opts = {}) {
       try {
         if (res.headersSent || res.destroyed) return res.end();
         const err = e instanceof HttpErr ? e : new HttpErr(500, 'internal');
+        // a refused upload (401/403/404/405/413/415/429/400...) did not consume its body: answer with Connection: close and cut the request once
+        // the answer is flushed; nothing is drained, so a client cannot keep the socket busy by sending the body anyway. Known cost: a client whose
+        // body is still in flight when the socket closes gets a reset, and the reset can overtake the answer (the app then shows its network message).
+        if (UPLOAD_ROUTE.test(target)) { res.setHeader('Connection', 'close'); res.once('finish', () => req.destroy()); }
         json(res, err.status, { error: err.code });
       } catch {}
     }
@@ -2185,7 +2201,7 @@ export function createApp(opts = {}) {
     if (socket.writable && !socket.destroyed) socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
     else socket.destroy();
   });
-  server.requestTimeout = uploadRequestMs; // long, for the image upload; readBody cuts a JSON body at bodyMs on its own
+  server.requestTimeout = uploadRequestMs; // the outer bound (120 s); every request is cut at bodyMs by ctx.cut unless the upload route has been admitted
   server.headersTimeout = Math.min(10000, uploadRequestMs);
   const listen = async (port = Number(process.env.PC_PORT) || cfg.port || 7681, host = '0.0.0.0') => {
     await listenAdmin();

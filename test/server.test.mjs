@@ -4950,27 +4950,21 @@ test('upload: the 64 KB JSON limit does not apply; exactly 10 MiB is stored, 10 
   assert.equal(big.status, 200, big.text);
   assert.equal(fs.statSync(big.json.path).size, UPLOAD_MAX);
   fs.rmSync(path.join(dirs.alpha, '.fcode'), { recursive: true, force: true });
-  const over = await upPost(c, cookie, 'alpha', sized(JPG, UPLOAD_MAX + 1));
-  assert.deepEqual([over.status, over.json], [413, { error: 'too_big' }]);
+  // 10 MiB + 1 declared: refused on the Content-Length alone, so a few bytes of the body are enough (the server closes the connection after the
+  // 413; a client that is still writing megabytes may lose the answer to the reset on some systems, see the "refused upload closes" test)
+  const over = partialUpload(c, cookie, 'alpha', JPG, { length: UPLOAD_MAX + 1 });
+  const o = await over.done; over.req.destroy();
+  assert.deepEqual([o.status, o.json], [413, { error: 'too_big' }]);
   assert.equal(fs.existsSync(path.join(dirs.alpha, '.fcode')), false);
   // the same server still answers (the connection was not left in a bad state)
   assert.equal((await upPost(c, cookie, 'alpha', JPG)).status, 200);
 }));
 
 test('upload: a chunked body over 10 MiB is answered 413 while it is still being sent (the stream is not read to its end), nothing is written', () => withUpload(async (c, dirs, cookie) => {
-  const r = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { req.destroy(); reject(new Error('no answer before the body ended: the server buffers the whole body')); }, 8000);
-    const req = http.request({ host: '127.0.0.1', port: c.port, method: 'POST', path: upUrl('alpha'),
-      headers: { 'X-PC': '1', Cookie: cookie, 'Content-Type': 'image/jpeg', 'Transfer-Encoding': 'chunked' } }, (res) => {
-      const chunks = [];
-      res.on('data', (d) => chunks.push(d));
-      res.on('end', () => { clearTimeout(timer); resolve({ status: res.statusCode, json: JSON.parse(Buffer.concat(chunks).toString()) }); });
-    });
-    req.on('error', (e) => { if (e.code !== 'ECONNRESET') { clearTimeout(timer); reject(e); } });
-    req.write(sized(JPG, 1 << 20));
-    for (let i = 0; i < 10; i++) req.write(Buffer.alloc(1 << 20, 1)); // 11 MiB, and req.end() is never called
-  });
-  assert.deepEqual([r.status, r.json], [413, { error: 'too_big' }]);
+  // the client never ends the body: only an answer sent while it is still writing, then a closed connection, can end this
+  const r = await blast(c, [...upHead(cookie, 'alpha'), 'Transfer-Encoding: chunked'], { chunked: true });
+  assert.equal(r.timedOut, false, 'the server kept reading (or waiting for) the body');
+  assertRefused(r, 413, UPLOAD_MAX + (1 << 20)); // the cap, and at most 1 MiB more that was already on its way
   assert.equal(fs.existsSync(path.join(dirs.alpha, '.fcode')), false);
 }));
 
@@ -5343,3 +5337,148 @@ test('upload: a git that hangs is killed after 10 s and the upload goes on', () 
   assert.equal(r.status, 200, r.text);
   assert.ok(took >= 9500 && took < 25000, `took ${took} ms`);
 }, { git: [process.execPath, '-e', 'setTimeout(() => {}, 60000)', '--'] })); // the arguments the server adds come after `--`: they are the script's, not node's
+
+// ---- 1.3.3 rework r3: short by default, long only when admitted; the client-gone check; refused uploads close the connection ----
+const upHead = (cookie, project, { session, type = 'image/jpeg', method = 'POST', pc = true, length } = {}) => [
+  `${method} ${upUrl(project, session)} HTTP/1.1`, 'Host: x', ...(pc ? ['X-PC: 1'] : []), ...(cookie ? [`Cookie: ${cookie}`] : []),
+  ...(type ? [`Content-Type: ${type}`] : []), ...(length ? [`Content-Length: ${length}`] : []),
+];
+// A raw client: the head, then `size` bytes (64 KiB) of body at a time (Content-Length or chunked) until the server closes the connection or `max`
+// bytes are out. read = what the server's side of that socket really took in (its bytesRead): a server that drains the rest of a refused body shows it here.
+function blast(c, head, { chunked = false, max = 48 << 20, size = 65536 } = {}) {
+  const socks = []; const onConn = (s) => socks.push(s);
+  c.app.server.on('connection', onConn);
+  return new Promise((resolve) => {
+    const s = net.connect(c.port, '127.0.0.1');
+    let sent = 0, text = '', timedOut = false;
+    const piece = Buffer.alloc(size, 1);
+    const frame = chunked ? Buffer.concat([Buffer.from(`${size.toString(16)}\r\n`), piece, Buffer.from('\r\n')]) : piece;
+    const pump = () => {
+      for (let i = 0; i < 4 && !s.destroyed && sent < max; i++) { sent += piece.length; if (!s.write(frame)) return void s.once('drain', () => setTimeout(pump, 1)); }
+      if (!s.destroyed && sent < max) setTimeout(pump, 1);
+    };
+    const timer = setTimeout(() => { timedOut = true; s.destroy(); }, 8000);
+    s.on('connect', () => { s.write(`${head.join('\r\n')}\r\n\r\n`); pump(); });
+    s.on('data', (d) => { text += d; });
+    s.on('error', () => {});
+    s.on('close', () => {
+      clearTimeout(timer); c.app.server.off('connection', onConn);
+      resolve({ sent, text, timedOut, status: Number(/^HTTP\/1\.1 (\d+)/.exec(text)?.[1]) || null, read: socks[0]?.bytesRead ?? 0 });
+    });
+  });
+}
+// a refused upload whose client keeps writing megabytes: the server closes the connection and took in at most `maxRead` bytes. The reset that
+// follows the close can overtake the answer for such a client (measured on Linux and Windows loopback), so the answer is checked only when it
+// came; the guaranteed answer is tested with a client that has not gone beyond its first bytes (the "gets its answer" test).
+function assertRefused(r, status, maxRead) {
+  assert.equal(r.timedOut, false, 'the connection was not closed');
+  assert.ok(r.read <= maxRead, `the server took in ${r.read} bytes of a refused upload (client sent ${r.sent})`);
+  if (r.status === null) return;
+  assert.equal(r.status, status, r.text.slice(0, 200));
+  assert.match(r.text, /\r\nconnection: close\r\n/i);
+}
+
+test('upload: every refused upload (429, 413 mid-stream, 401, 403, 404, 415, 405) is answered with Connection: close and the connection is cut; its unread body is not drained', () => withUpload(async (c, dirs, cookie) => {
+  const big = 50e6, small = 1 << 20; // the server takes in about 64 KiB of a refused body here; 1 MiB is far below the 48 MiB the client has ready
+  const A = partialUpload(c, cookie, 'alpha', JPG), B = partialUpload(c, cookie, 'alpha', JPG);
+  await sleep(300); // both admitted: the next one is 429
+  assertRefused(await blast(c, upHead(cookie, 'alpha', { length: big })), 429, small);
+  A.req.destroy(); B.req.destroy();
+  assert.ok(await until(async () => (await upPost(c, cookie, 'beta', JPG)).status === 200), 'slots come back');
+  assertRefused(await blast(c, [...upHead(cookie, 'alpha'), 'Transfer-Encoding: chunked'], { chunked: true }), 413, UPLOAD_MAX + small);
+  assertRefused(await blast(c, upHead(undefined, 'alpha', { length: big })), 401, small);
+  assertRefused(await blast(c, upHead(cookie, 'alpha', { length: big, pc: false })), 403, small);
+  assertRefused(await blast(c, upHead(cookie, 'nope', { length: big })), 404, small);
+  assertRefused(await blast(c, upHead(cookie, 'alpha', { length: big, session: 'ghost' })), 404, small);
+  assertRefused(await blast(c, upHead(cookie, 'alpha', { length: big, type: 'text/plain' })), 415, small);
+  assertRefused(await blast(c, upHead(cookie, 'alpha', { length: big, method: 'PUT' })), 405, small);
+  assert.equal((await upPost(c, cookie, 'alpha', JPG)).status, 200, 'the server is fine afterwards');
+}));
+
+test('upload: a refused upload whose body has only just begun gets its answer (status, error code, Connection: close) and then the server closes the connection', () => withUpload(async (c, dirs, cookie) => {
+  const A = partialUpload(c, cookie, 'alpha', JPG), B = partialUpload(c, cookie, 'alpha', JPG);
+  await sleep(300); // both slots taken
+  const L = { length: 5000 }; // declared, only 4 bytes of it are sent
+  const got = [[429, 'busy', await blast(c, upHead(cookie, 'alpha', L), { max: 1, size: 4 })]];
+  A.req.destroy(); B.req.destroy();
+  assert.ok(await until(async () => (await upPost(c, cookie, 'beta', JPG)).status === 200), 'slots come back');
+  for (const [status, error, head] of [
+    [401, 'unauthorized', upHead(undefined, 'alpha', L)], [403, 'forbidden', upHead(cookie, 'alpha', { ...L, pc: false })],
+    [404, 'no_project', upHead(cookie, 'nope', L)], [404, 'no_session', upHead(cookie, 'alpha', { ...L, session: 'ghost' })],
+    [415, 'bad_type', upHead(cookie, 'alpha', { ...L, type: 'text/plain' })], [405, 'method', upHead(cookie, 'alpha', { ...L, method: 'PUT' })],
+    [413, 'too_big', upHead(cookie, 'alpha', { length: UPLOAD_MAX + 1 })],
+  ]) got.push([status, error, await blast(c, head, { max: 1, size: 4 })]);
+  for (const [status, error, r] of got) {
+    assert.equal(r.timedOut, false, `${status} ${error}: the server did not close the connection`);
+    assert.ok(r.text.startsWith(`HTTP/1.1 ${status}`), `${status} ${error}: ${r.text.slice(0, 80)}`);
+    assert.match(r.text, /\r\nconnection: close\r\n/i, `${status} ${error}`);
+    assert.ok(r.text.includes(`{"error":"${error}"}`), `${status} ${error}: ${r.text.slice(-80)}`);
+  }
+}));
+
+test('upload: a refused request that trickles its body is cut at the short bound (bodyMs), never at the long one; an upload refused before its admission is closed at once', () => withUpload(async (c, dirs, cookie) => {
+  // test-only bounds: bodyMs 400, uploadRequestMs 4000 (15 s and 120 s in production)
+  const trickle = (head) => new Promise((resolve) => {
+    const t0 = Date.now(), s = net.connect(c.port, '127.0.0.1');
+    let text = '';
+    const tick = setInterval(() => { if (!s.destroyed) s.write('x'); }, 50);
+    s.on('connect', () => s.write(`${head.join('\r\n')}\r\n\r\n`));
+    s.on('data', (d) => { text += d; });
+    s.on('error', () => {});
+    s.on('close', () => { clearInterval(tick); clearTimeout(guard); resolve({ ms: Date.now() - t0, text }); });
+    const guard = setTimeout(() => s.destroy(), 6000);
+  });
+  const json = (cookie2, pc) => ['POST /api/send/x HTTP/1.1', 'Host: x', ...(pc ? ['X-PC: 1'] : []), ...(cookie2 ? [`Cookie: ${cookie2}`] : []), 'Content-Type: application/json', 'Content-Length: 100000000'];
+  for (const [what, head, status] of [['401', json(undefined, true), 401], ['403', json(cookie, false), 403]]) {
+    const r = await trickle(head);
+    assert.ok(r.text.startsWith(`HTTP/1.1 ${status}`), `${what}: ${r.text.slice(0, 40)}`);
+    assert.ok(r.ms >= 300 && r.ms < 2500, `${what}: the connection lasted ${r.ms} ms`); // the 401/403 left the body unread; the 400 ms timer cuts it
+  }
+  const up = await trickle(upHead(undefined, 'alpha', { length: 100000000 }));
+  assert.ok(up.text.startsWith('HTTP/1.1 401') && /connection: close/i.test(up.text), up.text.slice(0, 120));
+  assert.ok(up.ms < 2500, `a refused upload stayed ${up.ms} ms`);
+}, { bodyMs: 400, uploadRequestMs: 4000 }));
+
+test('upload: before it is admitted and checked the body has only the short window: a slow session list does not buy the long one', () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 's', 'claude');
+  await withEnv({ FAKE_TMUX_DELAYS: JSON.stringify({ 'list-sessions': 900 }) }, async () => {
+    const t0 = Date.now();
+    const p = partialUpload(c, cookie, 'alpha', JPG, { session: 's' }); // its body never comes
+    const r = await p.done;
+    assert.ok(r.error && Date.now() - t0 < 2000, `an unfinished body was waited for ${Date.now() - t0} ms: ${JSON.stringify(r)}`); // cut at 400 ms, while the list was still running
+    await sleep(700); // the list ends, the upload sees the closed request and stops
+  });
+  for (let i = 0; i < 3; i++) assert.equal((await upPost(c, cookie, 'alpha', JPG, { session: 's' })).status, 200, `slot ${i}`);
+  // while an admitted upload (everything passed) keeps the long window: its body may take much longer than bodyMs
+  const q = partialUpload(c, cookie, 'alpha', JPG, { session: 's' });
+  await sleep(1200); q.finish();
+  assert.equal((await q.done).status, 200);
+}, { bodyMs: 400, uploadRequestMs: 4000 }));
+
+test('upload: a client that goes away while the session list is still running gives its slot back, twice; the next uploads are 200 (no leak)', () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 's', 'claude');
+  await withEnv({ FAKE_TMUX_DELAYS: JSON.stringify({ 'list-sessions': 800 }) }, async () => {
+    for (let i = 0; i < 2; i++) { // two slots: two leaks would block every later upload
+      const p = partialUpload(c, cookie, 'alpha', JPG, { session: 's' });
+      await sleep(250); // admitted, the slow list is running
+      p.req.destroy();
+      await p.done;
+    }
+    await sleep(1300); // both slow lists have ended
+  });
+  for (let i = 0; i < 3; i++) assert.equal((await upPost(c, cookie, 'alpha', JPG, { session: 's' })).status, 200, `upload ${i}`);
+  assert.equal((await upPost(c, cookie, 'beta', JPG)).status, 200);
+}));
+
+test('upload: the per-request timer leaves a complete request alone: an SSE stream outlives bodyMs', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  await mkSession(c, cookie);
+  const s = await openStream(c.port, cookie);
+  assert.equal(s.status, 200);
+  let buf = ''; s.res.setEncoding('utf8'); s.res.on('data', (d) => { buf += d; });
+  let closed = false; s.res.on('close', () => { closed = true; });
+  await sleep(1200); // four times bodyMs
+  assert.equal(closed, false, 'the stream was cut');
+  assert.ok(buf.includes('event: screen'));
+  s.req.destroy();
+}, { bodyMs: 300 }));
