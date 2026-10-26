@@ -235,16 +235,31 @@ struct HomeRun: Decodable {
     }
 }
 
+/// Box copy vs GitHub (git-sync state); every field nil when the box has no entry.
+struct HomeGit: Decodable {
+    var behind: Int?
+    var error: String?
+
+    private enum K: String, CodingKey { case behind, error }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        behind = c.value(.behind)
+        error = c.value(.error)
+    }
+}
+
 struct HomeProject: Decodable {
     var name: String
     var branch: String?
     /// nil = the server could not read them (gh failed).
     var prs: [HomePR]?
     var lastRun: HomeRun?
+    /// nil on an older server.
+    var git: HomeGit?
     /// Placeholder before the server's first gh read (not a failure).
     var loading = false
 
-    private enum K: String, CodingKey { case name, branch, prs, lastRun, loading }
+    private enum K: String, CodingKey { case name, branch, prs, lastRun, git, loading }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: K.self)
         name = c.value(.name) ?? ""
@@ -252,6 +267,7 @@ struct HomeProject: Decodable {
         let list: [HomePR] = c.list(.prs)
         prs = c.contains(.prs) && !((try? c.decodeNil(forKey: .prs)) ?? true) ? list : nil
         lastRun = c.value(.lastRun)
+        git = c.value(.git)
         loading = c.value(.loading) ?? false
     }
 }
@@ -487,7 +503,7 @@ enum HomeLogic {
 
     // MARK: Projects
 
-    enum Tone { case ok, fail, pending, none }
+    enum Tone { case ok, fail, pending, warn, none }
 
     /// Third line of a project card.
     static func deployLine(_ run: HomeRun?, now: Date) -> (text: String, tone: Tone) {
@@ -499,6 +515,14 @@ enum HomeLogic {
         case "in_progress", "queued", "pending": return ("◷ đang deploy", .pending)
         default: return ("deploy: \(run.status)", .none)
         }
+    }
+
+    /// Extra card line under the branch line: the box copy is behind GitHub or cannot sync.
+    /// `label` (VoiceOver) spells out the short visible text when it differs.
+    static func gitLine(_ git: HomeGit?) -> (text: String, tone: Tone, label: String?)? {
+        if let n = git?.behind, n > 0 { return ("⚠ chậm \(n) commit", .warn, "chậm \(n) commit so với GitHub") }
+        if git?.error != nil { return ("⚠ không đồng bộ được", .warn, nil) }
+        return nil
     }
 
     /// First line of a project card (markdown bold for the count).
@@ -844,6 +868,18 @@ enum HomeLogic {
         eq("all part loading", allPrLine(projects(two + "," + ld + "," + fail)), "**2** PR · đang đọc")
         eq("all part failed", allPrLine(projects(two + "," + fail)), "**2** PR · thiếu 1 dự án")
         eq("all no projects", allPrLine([]), "**0** PR đang mở")
+        eq("git old server", projects(none).first.map { $0.git == nil }, true)
+        eq("git nil", gitLine(nil) == nil, true)
+        eq("git null fields", gitLine(projects("{\"name\":\"e\",\"git\":{\"behind\":null,\"error\":null}}").first?.git) == nil, true)
+        eq("git behind 0", gitLine(projects("{\"name\":\"e\",\"git\":{\"behind\":0,\"dirty\":false,\"error\":null}}").first?.git) == nil, true)
+        let behind3 = gitLine(projects("{\"name\":\"e\",\"git\":{\"behind\":3,\"branch\":\"main\",\"error\":null}}").first?.git)
+        eq("git behind 3", behind3?.text, "⚠ chậm 3 commit")
+        eq("git behind tone", behind3?.tone, Tone.warn)
+        eq("git behind label", behind3?.label, "chậm 3 commit so với GitHub")
+        let gitErr = gitLine(projects("{\"name\":\"e\",\"git\":{\"behind\":null,\"error\":\"fetch failed\"}}").first?.git)
+        eq("git error", gitErr?.text, "⚠ không đồng bộ được")
+        eq("git error tone", gitErr?.tone, Tone.warn)
+        eq("git error no label", gitErr.map { $0.label == nil }, true)
         eq("decode empty", (try? JSONDecoder().decode(HomeData.self, from: Data("{}".utf8)))?.accounts.count, 0)
 
         // Codex reset replies

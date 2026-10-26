@@ -286,7 +286,8 @@ struct ProjectsView: View {
 
     private var rail: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 10) {
+            // Top-aligned: a card with the git line is one line taller.
+            HStack(alignment: .top, spacing: 10) {
                 projectCard("all")
                 ForEach(projectNames, id: \.self) { projectCard($0) }
             }
@@ -316,9 +317,14 @@ struct ProjectsView: View {
             let checks = HomeLogic.checksLine(prs, branch: branch)
             let deploy = HomeLogic.deployLine(info?.lastRun, now: home.serverNow())
             let reading = info?.loading == true
+            let git = HomeLogic.gitLine(info?.git)
             lines = [
                 ProjectLine(text: Text(LocalizedStringKey(HomeLogic.prLine(info)))),
                 ProjectLine(text: Text(checks.text.isEmpty ? " " : checks.text), color: checks.tone.color),
+            ] + (git.map { g -> [ProjectLine] in
+                let t = Text(g.text)
+                return [ProjectLine(text: g.label.map { t.accessibilityLabel($0) } ?? t, color: g.tone.color)]
+            } ?? []) + [
                 // Before the first gh read there is no deploy to report yet.
                 ProjectLine(text: Text(reading ? " " : deploy.text), color: deploy.tone.color),
             ]
@@ -498,7 +504,7 @@ extension HomeLogic.Tone {
         switch self {
         case .ok: return .greenTone
         case .fail: return .redTone
-        case .pending: return .orangeTone
+        case .pending, .warn: return .orangeTone
         case .none: return .l3
         }
     }
