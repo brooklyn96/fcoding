@@ -807,11 +807,18 @@ enum HomeLogic {
         n != "home" && n.range(of: "^[a-z0-9][a-z0-9._-]{0,63}$", options: .regularExpression) != nil
     }
 
-    /// One short line per failed job code.
-    static func addCodeMessage(_ code: String?) -> String {
+    /// One short line per failed job code. `detail` and `name` (the job's project name) refine
+    /// DIR_CONFLICT ("exists" / "unsafe") and FAILED ("install" / "verify").
+    static func addCodeMessage(_ code: String?, detail: String? = nil, name: String = "") -> String {
         switch code {
         case "NET_FAIL": return "Box không kết nối được GitHub, thử lại sau."
-        case "NAME_USED", "CFG_CONFLICT", "DIR_CONFLICT": return "Tên này đã dùng cho dự án khác, đặt tên khác."
+        case "NAME_USED", "CFG_CONFLICT": return "Tên này đã dùng cho dự án khác, đặt tên khác."
+        case "DIR_CONFLICT":
+            let dir = name.isEmpty ? "này" : name
+            return detail == "unsafe" ? "Thư mục \(dir) trên box không an toàn. Chọn tên khác."
+                                      : "Thư mục \(dir) đã có trên box. Chọn tên khác."
+        case "FAILED" where detail == "install" || detail == "verify":
+            return "Box không cài được chốt chặn push lên main. Thử lại sau."
         case "REPO_ARCHIVED": return "Repo đã lưu trữ (archived), không ghi được."
         case "WRITE_BLOCKED": return "GitHub chặn tạo nhánh box/*, xem lại luật bảo vệ nhánh."
         case "CFG_BROKEN": return "Cấu hình FCode trên box bị hỏng, nhờ người quản lý box kiểm tra."
@@ -960,9 +967,11 @@ enum HomeLogic {
                     s.keyUrl = keyPage(job.keyUrl)
                 } else {
                     s.phase = .failed
-                    s.message = addCodeMessage(job.code)
+                    s.message = addCodeMessage(job.code, detail: detail, name: s.name)
                 }
                 s.detail = detail?.isEmpty == false ? detail : nil
+                // The message already says it: do not show the bare keyword under it.
+                if job.code == "DIR_CONFLICT" || (job.code == "FAILED" && ["install", "verify"].contains(detail ?? "")) { s.detail = nil }
             default:
                 break   // "running", or a state this app does not know: keep polling
             }
@@ -1319,9 +1328,18 @@ enum HomeLogic {
 
         // Add project: code messages
         eq("msg net", addCodeMessage("NET_FAIL"), "Box không kết nối được GitHub, thử lại sau.")
-        for c in ["NAME_USED", "CFG_CONFLICT", "DIR_CONFLICT"] {
+        for c in ["NAME_USED", "CFG_CONFLICT"] {
             eq("msg \(c)", addCodeMessage(c), "Tên này đã dùng cho dự án khác, đặt tên khác.")
         }
+        eq("msg dir exists", addCodeMessage("DIR_CONFLICT", detail: "exists", name: "web"), "Thư mục web đã có trên box. Chọn tên khác.")
+        eq("msg dir no detail", addCodeMessage("DIR_CONFLICT", detail: nil, name: "web"), "Thư mục web đã có trên box. Chọn tên khác.")
+        eq("msg dir unsafe", addCodeMessage("DIR_CONFLICT", detail: "unsafe", name: "web"), "Thư mục web trên box không an toàn. Chọn tên khác.")
+        eq("msg dir no name", addCodeMessage("DIR_CONFLICT"), "Thư mục này đã có trên box. Chọn tên khác.")
+        for d in ["install", "verify"] {
+            eq("msg hook \(d)", addCodeMessage("FAILED", detail: d), "Box không cài được chốt chặn push lên main. Thử lại sau.")
+        }
+        eq("msg failed other detail", addCodeMessage("FAILED", detail: "x"), "Không thêm được dự án, thử lại sau.")
+        eq("msg hook detail other code", addCodeMessage("CLONE_FAIL", detail: "install"), "Không tải được repo về box, thử lại sau ít phút.")
         eq("msg archived", addCodeMessage("REPO_ARCHIVED"), "Repo đã lưu trữ (archived), không ghi được.")
         eq("msg blocked", addCodeMessage("WRITE_BLOCKED"), "GitHub chặn tạo nhánh box/*, xem lại luật bảo vệ nhánh.")
         eq("msg timeout", addCodeMessage("TIMEOUT"), "Quá 10 phút chưa xong, thử lại sau.")
@@ -1393,7 +1411,18 @@ enum HomeLogic {
         eq("failed code", arch.phase, .failed)
         eq("failed message", arch.message, "Repo đã lưu trữ (archived), không ghi được.")
         eq("failed detail", arch.detail, "archived")
-        eq("resubmit after failure", addReduce(arch, .submit(repo: "Me/Web", name: "web2")).phase, .posting)
+        let dirEx = addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"DIR_CONFLICT\",\"detail\":\"exists\"}")))
+        eq("dir exists message", dirEx.message, "Thư mục web đã có trên box. Chọn tên khác.")
+        eq("dir exists no bare detail", dirEx.detail == nil, true)
+        eq("dir unsafe message", addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"DIR_CONFLICT\",\"detail\":\"unsafe\"}"))).message,
+           "Thư mục web trên box không an toàn. Chọn tên khác.")
+        eq("dir no detail message", addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"DIR_CONFLICT\"}"))).message,
+           "Thư mục web đã có trên box. Chọn tên khác.")
+        let hook = addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"FAILED\",\"detail\":\"verify\"}")))
+        eq("hook message", hook.message, "Box không cài được chốt chặn push lên main. Thử lại sau.")
+        eq("hook no bare detail", hook.detail == nil, true)
+        eq("failed other detail kept", addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"FAILED\",\"detail\":\"boom\"}"))).detail, "boom")
+        eq("resubmit after failure", addReduce(arch,.submit(repo: "Me/Web", name: "web2")).phase, .posting)
         let done = addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED\",\"name\":\"web\"}")))
         eq("done", done.phase, .done)
         eq("done toast", done.message, "Đã thêm dự án web")
