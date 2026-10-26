@@ -506,7 +506,7 @@ function Show-Help {
   Write-Host '      Ví dụ: fcode ipa'
   Write-Host '  fcode add <chủ/repo> [tên]'
   Write-Host '      Thêm một project GitHub vào box để omp làm việc và app FCode hiện trong danh sách.'
-  Write-Host '      Lần đầu cho mỗi repo, lệnh sẽ hướng dẫn bạn dán một khoá vào trang GitHub của repo (làm một lần).'
+  Write-Host '      Nếu token GitHub của box ghi được repo thì xong ngay; nếu không, lệnh hướng dẫn bạn dán một khoá vào trang GitHub của repo (một lần cho mỗi repo).'
   Write-Host '      Ví dụ: fcode add ten-tai-khoan/ten-repo    hoặc    fcode add ten-tai-khoan/ten-repo ten-ngan'
   Write-Host '  fcode pair [tên thiết bị]'
   Write-Host '      Tạo mã ghép (kèm mã QR) để ghép một iPhone mới với server FCode. Mã dùng 1 lần và hết hạn nhanh.'
@@ -854,7 +854,7 @@ done
 $FcodeAddRun = (@'
 s="${FCODE_ADD_SCRIPT:-/data/home/fcoding/fcode-add.sh}"
 [ -f "$s" ] || { echo "R NO_SCRIPT"; exit 3; }
-exec timeout --kill-after="${FCODE_ADD_KILL_AFTER_S:-30}" "${FCODE_ADD_TIMEOUT_S:-600}" bash "$s" "$@"
+exec env -u INSTABOX_API_KEY timeout --kill-after="${FCODE_ADD_KILL_AFTER_S:-30}" "${FCODE_ADD_TIMEOUT_S:-600}" bash "$s" "$@"
 '@) -replace "`r`n", "`n"
 
 # fcode-pair tren box (server worker them --qr). $1 = ten thiet bi (co the rong).

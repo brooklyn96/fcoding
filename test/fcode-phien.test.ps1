@@ -1424,7 +1424,7 @@ T 'add r6: re-add (only CFG_EXISTS) is success; CFG_WARN is a warning; exits 25 
 T 'add r7: the box script runs under the same timeout as the server (600 s, KILL 30 s later); a stalled script is stopped and told as a safe retry' {
   $runAst = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$FcodeAddRun' }, $true)
   $FcodeAddRun = $null; Invoke-Expression $runAst.Extent.Text
-  Ok ($FcodeAddRun -match '(?m)^exec timeout --kill-after="\$\{FCODE_ADD_KILL_AFTER_S:-30\}" "\$\{FCODE_ADD_TIMEOUT_S:-600\}" bash "\$s" "\$@"$') ("wrapper: " + $FcodeAddRun)
+  Ok ($FcodeAddRun -match '(?m)^exec env -u INSTABOX_API_KEY timeout --kill-after="\$\{FCODE_ADD_KILL_AFTER_S:-30\}" "\$\{FCODE_ADD_TIMEOUT_S:-600\}" bash "\$s" "\$@"$') ("wrapper: " + $FcodeAddRun)
   $w = New-World 'add6'; $fa = Join-Path $w.W 'fake-add.sh'
   foreach ($c in @(@{ B = "echo 'R TOKEN_OK'`nsleep 297"; Code = 124 }, @{ B = "trap '' TERM`necho 'R TOKEN_OK'`nsleep 297"; Code = 137 })) {
     New-FakeAdd $fa $c.B
