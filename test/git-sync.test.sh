@@ -370,6 +370,44 @@ else
   echo "note: no Linux /proc here, the auto fast-forward and busy tests are skipped"
 fi
 
+# ---- GH_TOKEN for the timer (it has none of its own): GH_TOKEN alone is taken from the vault file, as text, when the environment has none ----
+# A `timeout` shim (first on the script's PATH) records the GH_TOKEN | INSTABOX_API_KEY the fetch would see; it then runs the real one.
+REALTO=$(command -v timeout) && {
+  mkdir -p "$HOME/.local/bin"
+  cat >"$HOME/.local/bin/timeout" <<SHIM
+#!/bin/sh
+printf '%s|%s\n' "\${GH_TOKEN-unset}" "\${INSTABOX_API_KEY-unset}" >>"$T/envseen"
+exec "$REALTO" "\$@"
+SHIM
+  chmod +x "$HOME/.local/bin/timeout"
+  mkproj tk; adv tk a.txt r-tk; cfg tk
+  # tokrun [VAR=value ...]: one timer run with no GH_TOKEN / INSTABOX_API_KEY in the environment (unless given); prints what the fetch saw
+  tokrun() { : >"$T/envseen"; env -u GH_TOKEN -u INSTABOX_API_KEY "$@" bash "$SYNC" >"$T/run.out" 2>&1; tr '\n' ' ' <"$T/envseen" | sed 's/ $//'; }
+  V="$T/vault-env"
+  printf 'echo noise\nexport INSTABOX_API_KEY=ikey-secret-9\nexport GH_TOKEN_X=nope\nexport GH_TOKEN="tok-vault-1"\nexport OTHER=zz\n' >"$V"
+  eq "vault: GH_TOKEN reaches the fetch, INSTABOX_API_KEY does not" "$(tokrun FCODE_SECRETS_ENV="$V")" "tok-vault-1|unset"
+  eq "vault: fetched fine, quiet, token in neither git-sync.json nor stderr, key not either" "$(q projects.tk.error)/$(wc -c <"$T/run.out" | tr -d ' ')/$(grep -rlE 'tok-vault-1|ikey-secret-9' "$HOME/.local/state" "$T/run.out" | wc -l | tr -d ' ')" "null/0/0"
+  printf 'GH_TOKEN=tok_bare.2\r\nINSTABOX_API_KEY=ikey-2\r\n' >"$V"
+  eq "vault: bare line with CRLF" "$(tokrun FCODE_SECRETS_ENV="$V")" "tok_bare.2|unset"
+  printf "export GH_TOKEN='tok-single'\n" >"$V"
+  eq "vault: single quotes" "$(tokrun FCODE_SECRETS_ENV="$V")" "tok-single|unset"
+  printf 'export GH_TOKEN=$(touch "%s/pwned")\n' "$T" >"$V"
+  eq "vault: a value that is not token-like is dropped and nothing is executed (the file is never sourced)" "$(tokrun FCODE_SECRETS_ENV="$V")/$([ -e "$T/pwned" ] && echo pwned || echo none)" "unset|unset/none"
+  printf 'export GH_TOKEN="a b"\n' >"$V"
+  eq "vault: a value with a space is dropped" "$(tokrun FCODE_SECRETS_ENV="$V")" "unset|unset"
+  printf 'export GH_TOKEN=tok-vault-1\n' >"$V"
+  eq "an already set GH_TOKEN wins over the vault" "$(tokrun FCODE_SECRETS_ENV="$V" GH_TOKEN=mine)" "mine|unset"
+  eq "no vault file: unchanged, no token" "$(tokrun FCODE_SECRETS_ENV="$T/missing-vault")/$(q projects.tk.error)" "unset|unset/null"
+  mkdir -p "$T/vault-dir"
+  eq "vault path is not a readable file: unchanged, no token, quiet" "$(tokrun FCODE_SECRETS_ENV="$T/vault-dir")/$(wc -c <"$T/run.out" | tr -d ' ')" "unset|unset/0"
+  printf 'export INSTABOX_API_KEY=ikey-3\n' >"$V"
+  eq "vault without a GH_TOKEN line: nothing taken (INSTABOX_API_KEY never)" "$(tokrun FCODE_SECRETS_ENV="$V")" "unset|unset"
+  printf 'export GH_TOKEN=tok-vault-1\n' >"$V"
+  : >"$T/envseen"; env -u GH_TOKEN -u INSTABOX_API_KEY FCODE_SECRETS_ENV="$V" bash "$SYNC" tk >"$T/run.out" 2>&1
+  eq "single-project run also gets it, same 55 s plan (one fetch)" "$(tr '\n' ' ' <"$T/envseen" | sed 's/ $//')" "tok-vault-1|unset"
+  rm -f "$HOME/.local/bin/timeout"
+} || echo "note: no timeout command here, the GH_TOKEN tests are skipped"
+
 # ---- the script has no git command that writes to a repository except the one fast-forward ----
 CODE=$(sed 's/[[:space:]]#[[:space:]].*//; /^[[:space:]]*#/d' "$SYNC" | grep -v 'for f in MERGE_HEAD' | sed 's/\^{commit}//g') # (the marker names rebase-merge/-apply and the rev-parse peel are not git commands)
 eq "no checkout/reset/push/switch/rebase/update-ref/stash/pull/clean/commit/branch/tag in the code (comments aside)" "$(printf '%s\n' "$CODE" | grep -cE '\b(checkout|reset|push|switch|rebase|update-ref|stash|pull|clean|commit|branch -[dDmM]|tag -d)\b')" 0

@@ -20,6 +20,7 @@
 #      Why a project was not updated is recorded as autoSkip in the state file.
 #   4. write ~/.local/state/fcode/git-sync.json (atomic, mode 600).
 # Agents still sync first at the start of a task (see agents-git.md, "Sync first"): this timer only catches up an idle main.
+# GH_TOKEN (private https projects) is taken from the instabox vault file when the environment has none; see the block before the project loop.
 # One run at a time (flock). Quiet: problems go in the state file; stderr only when the script itself cannot run.
 # One project failing never stops the others. Exit 0 unless the script itself is broken.
 # `fcode-git-sync <project>`: the same for that one project only (shorter timeouts, the whole run within about 55 s: 15 s lock wait + 30 s fetch + 5 s kill + counts); the
@@ -139,6 +140,21 @@ command -v node >/dev/null || { echo "fcode-git-sync: node is missing" >&2; exit
 mkdir -p "$DIR" && chmod 700 "$DIR" 2>/dev/null
 exec 9>"$DIR/git-sync.lock"
 { if [ "$LOCK_W" -gt 0 ]; then flock -w "$LOCK_W" 9; else flock -n 9; fi; } || exit 0 # another run is active (a single-project run waits up to LOCK_W s)
+
+# The timer unit has no GH_TOKEN (a systemd user unit gets no login environment), so the fetch of a project added by the token route
+# (https origin + the repo's `!gh auth git-credential` helper) would fail on every run. Take GH_TOKEN alone from the instabox vault
+# file, the way start.sh does (install.sh): the one line `[export ]GH_TOKEN=...` is read as text (the file is never sourced), the
+# value must look like a token, and nothing else (INSTABOX_API_KEY included) is taken. An already set GH_TOKEN wins. It only lives in
+# this process's environment for git's children: never written to the state file, never printed.
+vf=${FCODE_SECRETS_ENV:-/run/instabox/secrets/env}
+if [ -z "${GH_TOKEN:-}" ] && [ -r "$vf" ]; then
+  t=$(sed -n -E '/^(export[[:space:]]+)?GH_TOKEN=/{s///p;q;}' "$vf" 2>/dev/null | tr -d '\r')
+  case $t in \"*\") t=${t#\"}; t=${t%\"} ;; \'*\') t=${t#\'}; t=${t%\'} ;; esac
+  case $t in ''|*[!A-Za-z0-9._-]*) t= ;; esac
+  if [ -n "$t" ]; then GH_TOKEN=$t; export GH_TOKEN; fi
+  unset t
+fi
+unset vf
 
 rm -f "$STATE".*.tmp # left by a run that was killed while writing (we hold the lock)
 ROWS=$(mktemp "$DIR/rows.XXXXXX") || exit 1
