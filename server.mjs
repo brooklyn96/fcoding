@@ -1145,8 +1145,8 @@ export function createApp(opts = {}) {
     return base.slice(0, 32 - suffix.length).replace(/-+$/, '') + suffix;
   };
 
-  // `fcode-git-sync <project>` before a new session, so it starts on the newest code when a fast-forward is safe. Never blocks the open
-  // and is NEVER killed (a kill during `git merge --ff-only` can leave a half-updated tree): an open waits for it at most gitSyncMs, or
+  // `fcode-git-sync <project>` before a new session: it only fetches and refreshes the behind / ahead / dirty counts of the card, it never
+  // changes the checkout. Never blocks the open and is never killed: an open waits for it at most gitSyncMs, or
   // until the open is cancelled, then goes on; the child keeps running, detached and unref'd with its output ignored, and ends by its
   // own limits. One sync per project at a time: an open that arrives meanwhile joins it instead of starting another. A missing
   // command or a failure only log one line. ctx.onCancel is free until mutate takes it.

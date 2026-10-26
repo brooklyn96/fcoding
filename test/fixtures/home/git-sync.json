@@ -2,11 +2,11 @@
   "updatedAt": "2026-10-25T19:30:00Z",
   "projects": {
     "alpha": {
-      "branch": "main", "default": "main", "dirty": true, "behindDefault": 3, "aheadOfOrigin": 0, "fastForwarded": false,
+      "branch": "main", "default": "main", "dirty": true, "behindDefault": 3, "aheadOfOrigin": 0,
       "lastFetchAt": "2026-10-25T19:29:00Z", "error": null
     },
     "my.proj": {
-      "branch": "feature/x", "default": "main", "dirty": false, "behindDefault": 0, "aheadOfOrigin": 2, "fastForwarded": false,
+      "branch": "feature/x", "default": "main", "dirty": false, "behindDefault": 0, "aheadOfOrigin": 2,
       "lastFetchAt": "2026-10-25T19:00:00Z", "error": "fetch failed: could not resolve host"
     },
     "odd": {
