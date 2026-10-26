@@ -801,6 +801,7 @@ enum HomeLogic {
     static func stagingFailure(status: Int, code: String?) -> String? {
         if code == "no_instabox_key" { return "Box chưa có API key instabox" }
         if code == "no_staging_box" { return "Dự án này chưa có máy staging" }
+        if code == "staging_unavailable" { return "Chưa đọc được trạng thái máy staging, thử lại sau" }
         if code == "unknown_project" { return "Dự án này không có trên box." }
         if [404, 405, 501].contains(status) { return "Máy chủ chưa hỗ trợ, cập nhật máy chủ trước." }
         return nil
@@ -834,6 +835,7 @@ enum HomeLogic {
     /// Known failures of POST resume; nil = an ordinary error, worded by the caller.
     static func ompResumeFailure(status: Int, code: String?) -> String? {
         if code == "unknown_session" { return "Phiên này không còn trên box." }
+        if code == "unknown_format" { return "Phiên này dùng định dạng omp mới — nhắn Claude để cập nhật FCode" }
         if status == 500 && code == "harness_exited" { return "Không mở được omp trên box (chương trình thoát ngay)." }
         if code == "unknown_project" { return "Dự án này không có trên box." }
         if [404, 405, 501].contains(status) { return "Máy chủ chưa hỗ trợ, cập nhật máy chủ trước." }
@@ -1172,7 +1174,12 @@ enum HomeLogic {
         eq("omp resume gone", ompResumeFailure(status: 404, code: "unknown_session"), "Phiên này không còn trên box.")
         eq("omp resume exited", ompResumeFailure(status: 500, code: "harness_exited"),
            "Không mở được omp trên box (chương trình thoát ngay).")
-        eq("omp resume other", ompResumeFailure(status: 503, code: "busy") == nil, true)
+        eq("omp resume unknown format", ompResumeFailure(status: 409, code: "unknown_format"),
+           "Phiên này dùng định dạng omp mới — nhắn Claude để cập nhật FCode")
+        eq("omp resume 409 exists generic", ompResumeFailure(status: 409, code: "exists") == nil, true)
+        eq("staging unavailable", stagingFailure(status: 503, code: "staging_unavailable"),
+           "Chưa đọc được trạng thái máy staging, thử lại sau")
+        eq("omp resume other",ompResumeFailure(status: 503, code: "busy") == nil, true)
         return failures
     }
 }
