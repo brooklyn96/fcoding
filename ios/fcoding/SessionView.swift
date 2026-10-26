@@ -1,3 +1,4 @@
+import PhotosUI
 import SwiftUI
 
 struct SessionView: View {
@@ -73,11 +74,32 @@ struct SessionView: View {
                 .accessibilityHint("Chạm để ẩn")
             }
 
+            if let note = model.imageNote {
+                Button { if !model.imageBusy { model.imageNote = nil } } label: {
+                    HStack(spacing: 8) {
+                        if model.imageBusy {
+                            ProgressView().tint(.white).scaleEffect(0.8)
+                        } else {
+                            Image(systemName: "photo")
+                        }
+                        Text(note)
+                    }
+                    .font(.footnote)
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(Color(white: 0.2))
+                }
+                .accessibilityHint(model.imageBusy ? "" : "Chạm để ẩn")
+            }
+
             if composerShown {
                 ComposerView(
                     draftKey: "draft.\(name)",
                     onSend: { text, enter in
                         bottomRequest += 1
+                        if !model.imageBusy { model.imageNote = nil }
                         return model.send(text, enter: enter)
                     },
                     onKey: { key in model.key(key) },
@@ -85,7 +107,9 @@ struct SessionView: View {
                     isOmp: chipHarness == "omp",
                     pinned: $composerPinned,
                     onHide: hideComposer,
-                    onSent: { if !composerPinned { hideComposer() } }
+                    onSent: { if !composerPinned { hideComposer() } },
+                    imageBusy: model.imageBusy,
+                    onImage: { image in model.attachImage(image) }
                 )
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
@@ -515,6 +539,14 @@ struct ComposerView: View {
     let onHide: () -> Void
     /// After a successful send that emptied the draft.
     let onSent: () -> Void
+    /// An image is being converted or uploaded: the image button shows a spinner.
+    var imageBusy = false
+    /// A picked or shot image (nil: the picked file could not be read).
+    let onImage: (UIImage?) -> Void
+    @State private var showPhotos = false
+    @State private var showCamera = false
+    @State private var photoItem: PhotosPickerItem?
+    private var hasCamera: Bool { UIImagePickerController.isSourceTypeAvailable(.camera) }
     @Environment(\.verticalSizeClass) private var verticalSizeClass
     @State private var draft = ""
     @State private var sending = false
@@ -558,6 +590,7 @@ struct ComposerView: View {
 
             HStack(alignment: .bottom, spacing: 6) {
                 if compact { keysToggle }
+                imageButton
                 field
                 if compact {
                     pinButton
@@ -576,6 +609,22 @@ struct ComposerView: View {
                 .gesture(swipeDown)
         }
         .overlay(alignment: .top) { Divider() }
+        .photosPicker(isPresented: $showPhotos, selection: $photoItem, matching: .images)
+        .onChange(of: photoItem) { item in
+            guard let item = item else { return }
+            photoItem = nil
+            Task {
+                let data = try? await item.loadTransferable(type: Data.self)
+                pickedImage(data.flatMap { UIImage(data: $0) })
+            }
+        }
+        .fullScreenCover(isPresented: $showCamera) {
+            CameraPicker { image in
+                showCamera = false
+                if let image = image { pickedImage(image) }
+            }
+            .ignoresSafeArea()
+        }
         .onAppear {
             if draft.isEmpty, let saved = UserDefaults.standard.string(forKey: draftKey) { draft = saved }
         }
@@ -660,6 +709,36 @@ struct ComposerView: View {
         }
         .disabled(sending) // hiding mid-send would drop the composer before the draft is cleared
         .accessibilityLabel("Ẩn khung gõ")
+    }
+
+    /// One button, two choices: camera (only on a device that has one) or the photo library.
+    private var imageButton: some View {
+        Menu {
+            if hasCamera {
+                Button { showCamera = true } label: { Label("Chụp ảnh", systemImage: "camera") }
+            }
+            Button { showPhotos = true } label: { Label("Chọn ảnh", systemImage: "photo.on.rectangle") }
+        } label: {
+            ZStack {
+                if imageBusy {
+                    ProgressView().scaleEffect(0.8)
+                } else {
+                    Image(systemName: "photo").font(.system(size: 16, weight: .semibold))
+                }
+            }
+            .frame(width: 44, height: 36)
+            .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8))
+            .foregroundColor(.accentColor)
+        }
+        .disabled(imageBusy)
+        .accessibilityLabel(imageBusy ? "Đang gửi ảnh" : "Gửi ảnh")
+        .accessibilityHint("Chụp ảnh hoặc chọn ảnh để gắn vào phiên")
+    }
+
+    /// Hands the image up, then puts the cursor back in the field for the message.
+    private func pickedImage(_ image: UIImage?) {
+        onImage(image)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { focused.wrappedValue = true }
     }
 
     private var keysToggle: some View {

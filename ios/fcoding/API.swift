@@ -121,8 +121,22 @@ extension API {
 
     /// GET /api/github/repos (contract v2): the repos the box can pick from.
     func githubRepos() async throws -> GitHubRepos { try await get("api/github/repos", as: GitHubRepos.self) }
+
+    /// POST /api/projects/<name>/upload?session=<s> (CONTRACT A12): a raw JPEG body; the server
+    /// saves it under the project's .fcode/uploads and, when it can, puts its path in the session's
+    /// input (no Enter).
+    func uploadImage(project: String, session: String, jpeg: Data) async throws -> UploadReply {
+        var req = try request("POST", "api/projects/\(project)/upload",
+                              query: [URLQueryItem(name: "session", value: session)], timeout: 60)
+        req.httpBody = jpeg
+        req.setValue("image/jpeg", forHTTPHeaderField: "Content-Type")
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        try API.check(resp, data, token: token)
+        return try JSONDecoder().decode(UploadReply.self, from: data)
+    }
 }
 
+struct UploadReply: Decodable { let path: String; let attached: Bool }
 struct ResumeResponse: Decodable { let session: String }
 struct StagingStartResponse: Decodable { let ok: Bool?; let error: String?; let state: String? }
 struct AddProjectReply: Decodable { let job: String }

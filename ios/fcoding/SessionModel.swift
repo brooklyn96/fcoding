@@ -238,6 +238,71 @@ final class SessionModel: ObservableObject {
         }
     }
 
+    // MARK: - Image attach
+
+    /// An image is being converted or sent (one at a time).
+    @Published private(set) var imageBusy = false
+    /// Neutral status line for the image: sending, attached, saved but not attached.
+    @Published var imageNote: String?
+
+    /// Converts the image to JPEG, finds the session's project, uploads it (queued in the input
+    /// chain, so a send tapped meanwhile lands after the path). Errors go to `errorText`.
+    /// `image == nil`: the picked file could not be read.
+    func attachImage(_ image: UIImage?) {
+        guard !imageBusy else { return }
+        imageBusy = true
+        errorText = nil
+        imageNote = "Đang gửi ảnh…"
+        Task { [weak self] in
+            var jpeg: Data?
+            var failure: Error?
+            if let image = image {
+                do { jpeg = try await Task.detached(priority: .userInitiated) { try ImageAttach.jpeg(image) }.value }
+                catch { failure = error }
+            } else {
+                failure = APIError(status: 0, code: "bad_type")
+            }
+            guard let self = self else { return }
+            guard let jpeg = jpeg else { self.finishImage(nil, failure); return }
+            _ = self.enqueue { [weak self] in
+                guard let self = self else { return false }
+                guard let api = self.app?.api else { self.finishImage(nil, nil); return false }
+                do {
+                    // The session's project, from the server (a renamed session keeps its project).
+                    let sessions = try await api.get("api/sessions", as: SessionsResponse.self).sessions
+                    guard let project = sessions.first(where: { $0.name == self.name })?.project, !project.isEmpty else {
+                        throw APIError(status: 404, code: "no_session")
+                    }
+                    let reply = try await api.uploadImage(project: project, session: self.name, jpeg: jpeg)
+                    self.finishImage(reply, nil)
+                    return true
+                } catch {
+                    self.finishImage(nil, error)
+                    return false
+                }
+            }
+        }
+    }
+
+    private func finishImage(_ reply: UploadReply?, _ error: Error?) {
+        imageBusy = false
+        imageNote = nil
+        let said: String?
+        if let reply = reply {
+            imageNote = reply.attached ? "Đã gắn ảnh — gõ lời nhắn rồi gửi" : "Đã lưu ảnh nhưng chưa gắn được vào phiên"
+            said = imageNote
+        } else if error is CancellationError {
+            said = nil
+        } else if let e = error as? APIError, e.status == 401 {
+            errorText = app?.report(e)
+            said = errorText
+        } else {
+            errorText = error.map(ImageAttach.message) ?? "Không gửi được ảnh, thử lại"
+            said = errorText
+        }
+        if let said = said { UIAccessibility.post(notification: .announcement, argument: said) }
+    }
+
     /// Tells tmux how many columns/rows fit in `size` at this font size (debounced, skipped if unchanged).
     func resize(to size: CGSize, fontSize: Double) {
         let font = UIFont.monospacedSystemFont(ofSize: CGFloat(fontSize), weight: .regular)
