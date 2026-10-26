@@ -520,7 +520,8 @@ struct AddProjectForm: View {
             if add.busy {
                 HStack(spacing: 8) {
                     ProgressView()
-                    Text("Đang tải repo về box…").scaledFont(14).foregroundColor(.l2)
+                    Text("Đang tải repo về box… (có thể đóng, box vẫn tải tiếp)").scaledFont(14).foregroundColor(.l2)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 .accessibilityElement(children: .combine)
             } else if let write = needKey {
@@ -593,8 +594,8 @@ struct AddProjectForm: View {
         let state = HomeLogic.repoRow(r)
         let sub = [state.note ?? "", HomeLogic.repoUpdated(r.updatedAt, now: Date())].filter { !$0.isEmpty }
         return Button {
+            // The name stays as typed: empty, the placeholder (and the POST) take the default of the current link.
             repoText = "https://github.com/" + r.repo
-            nameText = HomeLogic.projectName(repo: r.repo, typed: "")
             withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.3)) { proxy.scrollTo("addTop", anchor: .top) }
         } label: {
             VStack(alignment: .leading, spacing: 2) {
@@ -662,7 +663,7 @@ struct AddProjectForm: View {
             "Bấm **Add key**, rồi quay lại đây bấm **Thử lại**.",
         ]
         return VStack(alignment: .leading, spacing: 0) {
-            Text(write ? "GitHub đã nhận khóa nhưng khóa chưa có quyền ghi. Xóa khóa “fcode coder” cũ ở trang Deploy keys, rồi làm lại các bước sau:"
+            Text(write ? "GitHub đã nhận khóa nhưng khóa chưa có quyền ghi. Xoá khóa “fcode coder” cũ ở trang Deploy keys, rồi làm lại các bước sau:"
                        : "GitHub chưa cho box vào repo này (hoặc link repo chưa đúng). Làm một lần như sau:")
                 .sheetBody()
             VStack(alignment: .leading, spacing: 6) {
@@ -685,6 +686,7 @@ struct AddProjectForm: View {
                 .padding(10)
                 .background(Color.grp2, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 .accessibilityLabel("Khóa công khai của box")
+                .accessibilityValue(add.pubkey ?? "")
                 .padding(.bottom, 10)
             HStack(spacing: 10) {
                 Button(copied ? "Đã sao chép" : "Sao chép khóa") {

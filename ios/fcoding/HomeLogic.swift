@@ -933,8 +933,11 @@ enum HomeLogic {
             case "done":
                 let name = job.name ?? s.name
                 s.phase = .done
+                // ADDED_WARN detail = the test branch GitHub kept (CLEANUP_FAIL), as refs/heads/<branch>.
+                let branch = (detail ?? "").replacingOccurrences(of: "^refs/heads/", with: "", options: .regularExpression)
                 s.message = job.code == "ADDED_WARN"
-                    ? "Đã thêm \(name). GitHub không cho box xoá nhánh thử, hãy xoá bằng tay." : "Đã thêm dự án \(name)"
+                    ? "Đã thêm \(name). GitHub không cho box xoá nhánh thử" + (branch.isEmpty ? "" : " \(branch)") + ", hãy xoá bằng tay."
+                    : "Đã thêm dự án \(name)"
             case "failed":
                 let key = job.pubkey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 if ["NEED_KEY", "NEED_WRITE"].contains(job.code ?? ""), !key.isEmpty {
@@ -1370,7 +1373,19 @@ enum HomeLogic {
         eq("done toast", done.message, "Đã thêm dự án web")
         let addedWarn = addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\"refs/heads/box/x\"}")))
         eq("done warn", addedWarn.phase, .done)
-        eq("done warn toast", addedWarn.message, "Đã thêm web. GitHub không cho box xoá nhánh thử, hãy xoá bằng tay.")
+        eq("done warn toast", addedWarn.message, "Đã thêm web. GitHub không cho box xoá nhánh thử box/x, hãy xoá bằng tay.")
+        eq("done warn no detail", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\"}"))).message,
+           "Đã thêm web. GitHub không cho box xoá nhánh thử, hãy xoá bằng tay.")
+        eq("done warn bare branch", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\" box/y \"}"))).message,
+           "Đã thêm web. GitHub không cho box xoá nhánh thử box/y, hãy xoá bằng tay.")
+        // A picked repo leaves the name empty: the default follows the link sent, never an older one.
+        let picked = addReduce(AddState(), .submit(repo: "https://github.com/me/old-app", name: ""))
+        eq("picked default name", picked.name, "old-app")
+        let changed = addReduce(addReduce(picked, .postFailed(status: 503, code: "", text: nil)),
+                                .submit(repo: "https://github.com/me/New-App/tree/main", name: ""))
+        eq("link change new default", changed.name, "new-app")
+        eq("link change repo", changed.repo, "me/New-App")
+        eq("typed name kept over link", addReduce(AddState(), .submit(repo: "me/x", name: "mine")).name, "mine")
         eq("late poll after done ignored", addReduce(done, .polled(job("{\"state\":\"failed\",\"code\":\"NET_FAIL\"}"))).phase, .done)
         eq("late poll error after done ignored", addReduce(done, .pollFailed(status: 404, code: "no_job", text: nil)).phase, .done)
         let posting = addReduce(AddState(), .submit(repo: "me/x", name: ""))
