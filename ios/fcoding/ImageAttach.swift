@@ -61,10 +61,11 @@ enum ImageAttach {
             case "too_big": return "Ảnh quá lớn"
             case "bad_type", "empty": return "Ảnh không đọc được"
             case "no_session", "no_project": return "Phiên đã đóng"
-            case "busy": return "Đang gửi ảnh khác, thử lại sau"
+            case "load_timeout": return "Không tải được ảnh, thử lại"
             default: break
             }
             if e.status == 413 { return "Ảnh quá lớn" }
+            // Only the upload admission (429) means another image; a 503 "busy" (read gate) does not.
             if e.status == 429 { return "Đang gửi ảnh khác, thử lại sau" }
             if e.status == 415 { return "Ảnh không đọc được" }
         }

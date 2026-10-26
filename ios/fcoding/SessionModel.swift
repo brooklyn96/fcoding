@@ -273,39 +273,66 @@ final class SessionModel: ObservableObject {
         UIAccessibility.post(notification: .announcement, argument: text)
     }
 
-    /// Makes the JPEG, then finds the session's project and uploads it in the input chain.
+    /// Takes the image's input-chain slot at once (at selection), so every later send or key waits
+    /// behind it. Inside that slot: make the JPEG (load + conversion, bounded by 60 s), then find the
+    /// session's project and upload.
     private func attach(_ makeJPEG: @escaping @MainActor () async throws -> Data) {
         guard !imageBusy else { return }
         imageBusy = true
         imageFailed = false
         imageNote = "Đang gửi ảnh…"
-        Task { [weak self] in
-            let jpeg: Data
-            do { jpeg = try await makeJPEG() } catch { self?.finishImage(nil, error); return }
-            guard let self = self else { return }
-            _ = self.enqueue { [weak self] in
-                guard let self = self else { return false }
+        _ = enqueue { [weak self] in
+            guard let self = self else { return false }
+            do {
+                let jpeg = try await self.withinLoadLimit(makeJPEG)
                 guard let api = self.app?.api else { self.finishImage(nil, nil); return false }
-                do {
-                    // The session's project, from the server (a renamed session keeps its project).
-                    let sessions = try await api.get("api/sessions", as: SessionsResponse.self).sessions
-                    guard let project = sessions.first(where: { $0.name == self.name })?.project, !project.isEmpty else {
-                        throw APIError(status: 404, code: "no_session")
-                    }
-                    let reply = try await api.uploadImage(project: project, session: self.name, jpeg: jpeg)
-                    self.finishImage(reply, nil)
-                    return true
-                } catch {
-                    self.finishImage(nil, error)
-                    return false
+                // The session's project, from the server (a renamed session keeps its project).
+                let sessions = try await api.get("api/sessions", as: SessionsResponse.self).sessions
+                guard let project = sessions.first(where: { $0.name == self.name })?.project, !project.isEmpty else {
+                    throw APIError(status: 404, code: "no_session")
                 }
+                let reply = try await api.uploadImage(project: project, session: self.name, jpeg: jpeg)
+                self.finishImage(reply, nil)
+                return true
+            } catch {
+                self.finishImage(nil, error)
+                return false
             }
         }
     }
 
+    /// Waiter of the current load race; resumed once, by the JPEG or by the 60 s timer.
+    private var loadWait: CheckedContinuation<Data, Error>?
+
+    /// `make()` or, after 60 s, APIError "load_timeout". An unstructured race, so a load that ignores
+    /// cancellation (a stalled iCloud original) cannot hold the input chain; its late result is dropped.
+    private func withinLoadLimit(_ make: @escaping @MainActor () async throws -> Data) async throws -> Data {
+        try await withCheckedThrowingContinuation { (c: CheckedContinuation<Data, Error>) in
+            loadWait = c
+            let work = Task { [weak self] in
+                let result: Result<Data, Error>
+                do { result = .success(try await make()) } catch { result = .failure(error) }
+                self?.endLoad(result)
+            }
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 60_000_000_000)
+                guard let self = self, self.loadWait != nil else { return }
+                work.cancel()
+                self.endLoad(.failure(APIError(status: 0, code: "load_timeout")))
+            }
+        }
+    }
+
+    private func endLoad(_ result: Result<Data, Error>) {
+        guard let c = loadWait else { return }
+        loadWait = nil
+        c.resume(with: result)
+    }
+
     private func finishImage(_ reply: UploadReply?, _ error: Error?) {
         imageBusy = false
-        imageFailed = reply == nil
+        // Saved but not attached is a warning too: kept on Send like the errors.
+        imageFailed = reply?.attached != true
         if let reply = reply {
             imageNote = reply.attached ? "Đã gắn ảnh — gõ lời nhắn rồi gửi" : "Đã lưu ảnh nhưng chưa gắn được vào phiên"
         } else if error is CancellationError {
