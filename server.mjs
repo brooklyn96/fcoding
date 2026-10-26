@@ -48,6 +48,60 @@ class HttpErr extends Error {
   constructor(status, code, extra = {}) { super(code); this.status = status; this.code = code; Object.assign(this, extra); }
 }
 
+// ---------- add a project (POST /api/projects, CONTRACT A11) ----------
+const CTRL_RE = /[\x00-\x1f\x7f]/;
+const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const PROJECT_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+// A pasted GitHub link -> owner/repo: https://[www.]github.com/o/r, github.com/o/r or git@github.com:o/r, then any of /, .git, ?query, #fragment and
+// extra path (/tree/main). Any other text is returned as it is (plain owner/repo, or something the repo rule then refuses: another host has a ":" or "@").
+const GITHUB_LINK_RE = /^(?:https:\/\/(?:www\.)?github\.com\/|(?:www\.)?github\.com\/|git@github\.com:)([^?#]*)/i;
+export function repoOfLink(s) {
+  const m = GITHUB_LINK_RE.exec(s);
+  if (!m) return s;
+  const [owner, repo = ''] = m[1].split('/');
+  return `${owner}/${repo}`;
+}
+// Same rules as `fcode add` (laptop/fcode.ps1 Invoke-Add), after repoOfLink: -> {repo, name} or a 400 bad_repo / bad_name. A null or empty name means "the repo part".
+export function parseAddRequest(b) {
+  const bad = (code) => new HttpErr(400, code);
+  if (typeof b.repo !== 'string' || CTRL_RE.test(b.repo)) throw bad('bad_repo');
+  const repo = repoOfLink(b.repo).replace(/\.git$/i, '');
+  if (!REPO_RE.test(repo) || /^\.+\//.test(repo) || /\/\.+$/.test(repo)) throw bad('bad_repo');
+  const given = b.name !== undefined && b.name !== null && b.name !== '';
+  if (given && (typeof b.name !== 'string' || CTRL_RE.test(b.name))) throw bad('bad_name');
+  const name = given ? b.name.toLowerCase().replace(/\.git$/, '') : repo.split('/')[1].toLowerCase();
+  if (!PROJECT_NAME_RE.test(name) || name === 'home') throw bad('bad_name');
+  return { repo, name };
+}
+// script exit code -> job code; anything else (or a signal) is FAILED. The script's "R <CODE> [detail]" lines add the public key and the detail.
+const ADD_CODES = { 0: 'ADDED', 30: 'ADDED_WARN', 40: 'NEED_KEY', 41: 'NEED_WRITE', 42: 'WRITE_BLOCKED', 43: 'NET_FAIL', 44: 'REPO_ARCHIVED',
+  11: 'DIR_CONFLICT', 21: 'CFG_CONFLICT', 22: 'CFG_BROKEN', 23: 'NAME_USED', 2: 'BAD_ARGS', 12: 'CLONE_FAIL',
+  124: 'TIMEOUT' }; // timeout(1): 124 = the deadline (its --kill-after kill ends it as a signal, not a code; the job's own deadline, kept when the server is gone)
+// the detail words the app matches: DIR_EXISTS 'exists', DIR_UNSAFE 'unsafe', HOOK_FAIL 'install' | 'verify'; also URL_REWRITE 'rewrite' (26) and CRED_FAIL 'config' (25); first line with text wins
+const ADD_DETAIL = ['SSH_DETAIL', 'CLONE_FAIL', 'DIR_EXISTS', 'DIR_UNSAFE', 'HOOK_FAIL', 'URL_REWRITE', 'CRED_FAIL', 'CFG_CONFLICT', 'CFG_BROKEN', 'CLEANUP_FAIL'];
+const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
+const ADD_SCRIPT = path.join(SERVER_DIR, 'fcode-add.sh'), ADD_SCRIPT_DEV = path.join(SERVER_DIR, 'box', 'fcode-add.sh'); // installed next to server.mjs, or in a checkout
+const GH_LIST_MS = 60e3, GH_PAGES = 3, GH_PAGE_SIZE = 100, GH_LIST_MAX = GH_PAGES * GH_PAGE_SIZE; // GET /api/github/repos: cache time, pages read, most repos listed
+// pages 1..3 of the newest-updated repos, one JSON object per line ("@json"); no --paginate (an account with thousands of repos would run out of time)
+const ghReposArgs = (page) => ['api', `/user/repos?affiliation=owner,collaborator,organization_member&sort=updated&per_page=${GH_PAGE_SIZE}&page=${page}`, '--jq',
+  '.[] | {repo: .full_name, private: .private, archived: .archived, canPush: (.permissions.push // false), updatedAt: .updated_at} | @json'];
+const ADD_TIMEOUT_MS = 10 * 60e3, ADD_KEEP_MS = 30 * 60e3, ADD_MAX_JOBS = 50, ADD_KILL_AFTER_S = 30, ADD_KILL_GRACE_MS = 45000, ADD_OUT_MAX = 256 * 1024;
+// a detail is one clean line of at most 200 characters; tokens and URL credentials never pass
+const jobText = (s) => Array.from(cleanLine(s).replace(/(gh[a-z]_|github_pat_)[A-Za-z0-9_]+/gi, '<token>').replace(/\/\/[^/\s@]*@/g, '//<cred>@')).slice(0, 200).join('');
+export function addOutcome(code, stdout) {
+  const lines = new Map();
+  for (const l of stdout.split('\n')) { const m = /^R (\S+)(?: (.*))?$/.exec(l.replace(/\r$/, '')); if (m) lines.set(m[1], m[2] ?? ''); }
+  const result = code === 21 && lines.has('ALIAS_FAIL') ? 'FAILED' : ADD_CODES[code] ?? 'FAILED'; // 21 is also "cannot write the ssh config"
+  // via: the way in that ended the run. A token run that fell back to a deploy key printed TOKEN_FALLBACK, then the key lines: key wins.
+  const via = lines.has('KEY_NEW') || lines.has('KEY_EXISTS') ? 'key' : lines.has('TOKEN_OK') ? 'token' : null;
+  const out = { state: code === 0 || code === 30 ? 'done' : 'failed', code: result, detail: null, via };
+  const found = code === 0 ? null : ADD_DETAIL.find((k) => lines.get(k));
+  if (found) out.detail = jobText(lines.get(found)) || null;
+  const pub = lines.get('PUBKEY'); // public key only: anything that is not one line "ssh-ed25519 <base64> [comment]" is dropped
+  if ((result === 'NEED_KEY' || result === 'NEED_WRITE') && /^ssh-ed25519 [A-Za-z0-9+/]+={0,2}( \S{1,200})?$/.test(pub ?? '')) out.pubkey = pub;
+  return out;
+}
+
 // ---------- config / devices / admin socket ----------
 export function defaultConfigDir() {
   if (process.env.PC_CONFIG_DIR) return process.env.PC_CONFIG_DIR;
@@ -680,16 +734,18 @@ export function resetReply(text) {
 const toolEnv = () => ({ ...process.env, LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', NO_COLOR: '1', GH_PROMPT_DISABLED: '1', GIT_OPTIONAL_LOCKS: '0',
   PATH: `${home}/.local/bin:${home}/.bun/bin:${process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'}` });
 // a child with a timeout, never a shell; rejects with stdout/stderr attached
-function execTool(spec, args, timeout) {
+function execTool(spec, args, timeout, env = toolEnv()) {
   return new Promise((resolve, reject) => {
     const [cmd, ...pre] = spec;
-    execFile(cmd, [...pre, ...args], { encoding: 'utf8', timeout, maxBuffer: 32 << 20, windowsHide: true, env: toolEnv() },
+    execFile(cmd, [...pre, ...args], { encoding: 'utf8', timeout, maxBuffer: 32 << 20, windowsHide: true, env },
       (err, stdout, stderr) => (err ? reject(Object.assign(err, { stdout, stderr })) : resolve(stdout)));
   });
 }
 // git-sync.json of the box timer (fcode-git-sync) -> Map project name -> the `git` object of GET /api/home. A missing, unreadable or
-// broken file, or a project it does not list, is NO_GIT (every field null); a field of the wrong type is null on its own.
-const NO_GIT = Object.freeze({ behind: null, ahead: null, dirty: null, branch: null, syncedAt: null, error: null });
+// broken file, or a project it does not list, is NO_GIT (every field null; autoUpdated false); a field of the wrong type is null on its own.
+// autoUpdated / autoSkip: what the timer's fast-forward did (an entry of an older script has neither: false / null).
+const AUTO_SKIPS = ['in_progress', 'on_branch', 'dirty', 'ahead', 'filters', 'busy', 'late', 'ff_failed'];
+const NO_GIT = Object.freeze({ behind: null, ahead: null, dirty: null, branch: null, syncedAt: null, error: null, autoUpdated: false, autoSkip: null });
 const textOf = (v) => { const t = str(v); return t ? clip(cleanLine(t)) || null : null; };
 const count = (v) => (Number.isInteger(v) && v >= 0 ? v : null);
 const isoOf = (v) => (typeof v === 'string' ? iso(Date.parse(v)) : null);
@@ -704,10 +760,80 @@ export function parseGitSync(text) {
       behind: count(v.behindDefault), ahead: count(v.aheadOfOrigin),
       dirty: typeof v.dirty === 'boolean' ? v.dirty : null,
       branch: textOf(v.branch), syncedAt: isoOf(v.lastFetchAt), error: textOf(v.error),
+      autoUpdated: v.autoUpdated === true, autoSkip: AUTO_SKIPS.includes(v.autoSkip) ? v.autoSkip : null,
     });
   }
   return out;
 }
+// --- v1.3.2: omp sessions of a project, instabox staging box ---
+// omp keeps a project's sessions in <agent dir>/sessions/<encoded cwd> (omp's own rule: under tmpdir "-tmp-<rel>", under home "-<rel>" ("-" for
+// home itself), else "--<abs path>--"; "/", "\" and ":" become "-", nothing else changes). homeDir / tmpDir are parameters for tests.
+export function ompDirName(cwd, homeDir = home, tmpDir = os.tmpdir()) {
+  const abs = path.resolve(cwd);
+  const within = (base) => { const r = path.relative(path.resolve(base), abs); return r === '' || (!r.startsWith('..') && !path.isAbsolute(r)) ? r : null; };
+  const dash = (s) => s.replace(/[/\\:]/g, '-');
+  const t = within(tmpDir), h = within(homeDir);
+  if (t !== null) return t ? `-tmp-${dash(t)}` : '-tmp';
+  if (h !== null) return `-${dash(h)}`;
+  return `--${dash(abs.replace(/^[/\\]/, ''))}--`;
+}
+const OMP_ID_RE = /^[0-9a-f-]{8,64}$/;
+const OMP_LIST_MAX = 10, OMP_HEAD_BYTES = 64 * 1024, OMP_TITLE_CHARS = 60;
+// session files are <timestamp>_<id>.jsonl: the id is what follows the last "_"
+const ompIdOf = (file) => { const m = /_([^_/\\]+)\.jsonl$/.exec(file); return m && OMP_ID_RE.test(m[1]) ? m[1] : null; };
+// omp session format guard: the header (`type:"session"`) versions this server understands. The laptop sync (laptop/fcode.ps1) keeps the same list.
+export const KNOWN_VERSIONS = [3];
+// What the first two lines of a session file say, from its first bytes only (message bodies are never read):
+// {title, version, cwd, empty}. version / cwd come from the header (null when there is none or it does not parse: unknown format);
+// empty = nothing after the title and header lines. buf = the file's first bytes, size = the whole file.
+export function ompHead(buf, size) {
+  const rec = (a, b) => { try { const v = JSON.parse(buf.toString('utf8', a, b)); return v && typeof v === 'object' ? v : null; } catch { return null; } };
+  const out = (header, title, end) => ({
+    title: title ? Array.from(cleanLine(title)).slice(0, OMP_TITLE_CHARS).join('').trim() : '',
+    version: header?.type === 'session' && Number.isInteger(header.version) ? header.version : null,
+    cwd: header?.type === 'session' ? str(header.cwd) : null,
+    empty: !(size > end + 1),
+  });
+  const i1 = buf.indexOf(10);
+  if (i1 < 0) return { title: '', version: null, cwd: null, empty: true }; // not even one whole line yet
+  const first = rec(0, i1);
+  if (first?.type === 'session') return out(first, str(first.title), i1);
+  if (first?.type !== 'title') return { title: '', version: null, cwd: null, empty: false };
+  let i2 = buf.indexOf(10, i1 + 1);
+  if (i2 < 0 && size <= buf.length) i2 = buf.length; // a header with no newline after it: the file ends there
+  if (i2 < 0) return { title: '', version: null, cwd: null, empty: false }; // the header line is longer than what was read
+  const header = rec(i1 + 1, i2);
+  return out(header, str(first.title) ?? (header?.type === 'session' ? str(header.title) : null), i2);
+}
+async function readStart(file, n) {
+  let fh;
+  try {
+    fh = await fs.promises.open(file, 'r');
+    const buf = Buffer.alloc(n);
+    const { bytesRead } = await fh.read(buf, 0, n, 0);
+    return buf.subarray(0, bytesRead);
+  } catch { return null; } finally { await fh?.close().catch(() => {}); }
+}
+// instabox ls --json -> Map box name -> {state, updatedAt}; state running|suspended|stopped|starting, anything else "unknown".
+// A box asked to run that is not running yet counts as starting.
+const STAGING_STATES = ['running', 'suspended', 'stopped', 'starting'];
+export function parseStaging(list) {
+  const out = new Map();
+  for (const b of Array.isArray(list) ? list : []) {
+    if (typeof b?.name !== 'string') continue;
+    const s = typeof b.state === 'string' ? b.state : '';
+    out.set(b.name, { state: b.desiredState === 'running' && s !== 'running' ? 'starting' : STAGING_STATES.includes(s) ? s : 'unknown', updatedAt: isoOf(b.updatedAt) });
+  }
+  return out;
+}
+// the instabox key reaches the service through start.sh; the server keeps it in memory and takes it out of its own environment, so the
+// tmux server and every harness session it starts never inherit it
+function takeInstaboxKey() {
+  const k = process.env.INSTABOX_API_KEY;
+  delete process.env.INSTABOX_API_KEY;
+  return typeof k === 'string' && k.trim() ? k.trim() : null;
+}
+const STAGING_TTL = 30e3, STAGING_START_MS = 60e3, GUARD_TTL = 10 * 60e3, GUARD_SCAN = 20, GUARD_YOUNG_MS = 30e3;
 const GIT_SYNC_MS = 8e3; // openFresh: how long fcode-git-sync may take before the new session is made anyway (fcode-new and the app wait 20 s in all)
 // Stale-while-revalidate, one refresh at a time. get(wait): a value younger than ttl as is; an older one at once while a refresh
 // runs in the background. With no value yet, or after clear(), the refresh is waited for at most `wait` ms; then the old value
@@ -775,6 +901,9 @@ export function createApp(opts = {}) {
   const updatesFile = opts.updatesFile ?? path.join(home, '.local', 'state', 'fcode-update', 'status.json');
   const gitSyncFile = opts.gitSyncFile ?? path.join(home, '.local', 'state', 'fcode', 'git-sync.json');
   const gitSyncMs = opts.gitSyncMs ?? GIT_SYNC_MS;
+  const ompRoot = opts.ompSessionsRoot ?? path.join(process.env.PI_CODING_AGENT_DIR || path.join(home, '.omp', 'agent'), 'sessions');
+  const instaboxSpec = specOf(opts.instabox ?? process.env.PC_INSTABOX ?? 'instabox');
+  const instaboxKey = opts.instaboxKey !== undefined ? opts.instaboxKey : takeInstaboxKey(); // null: no key, staging is off
 
   secureConfigDir(configDir);
 
@@ -782,6 +911,7 @@ export function createApp(opts = {}) {
   const cfgFile = path.join(configDir, 'config.json');
   const stampOf = () => { try { const s = fs.statSync(cfgFile); return `${s.mtimeMs}:${s.size}:${s.ino}`; } catch { return ''; } };
   let cfgStamp = stampOf();
+  let projectsDirty = false; // the project list changed: the next /api/home answers at once from the cache and refreshes in the background
   let text;
   try { text = fs.readFileSync(cfgFile, 'utf8'); } catch { throw new Error(`config.json missing or unreadable in ${configDir} (run install.sh)`); }
   let cfg = parseConfig(text);
@@ -828,6 +958,7 @@ export function createApp(opts = {}) {
       try { next = parseConfig(fs.readFileSync(cfgFile, 'utf8')); } catch (e) { log(`config reload failed, keeping the previous one: ${e.code || e.message}`); }
       if (next) {
         const rotated = !next.secret.equals(cfg.secret);
+        if (JSON.stringify(next.projects) !== JSON.stringify(cfg.projects)) { projects.clear(); projectsDirty = true; } // a project added or removed: the home list is read again
         cfg = next;
         if (rotated) { gen++; pendings = []; load([]); purge(); return; } // no old keyHash may match any more
       }
@@ -1044,9 +1175,9 @@ export function createApp(opts = {}) {
   const validProject = (p) => typeof p === 'string' && cfg.projectNames.includes(p);
   const validHarness = (h) => typeof h === 'string' && Object.hasOwn(HARNESSES, h);
   // runs inside a mutation job
-  async function createSession(name, project, harness, ctx) {
+  async function createSession(name, project, harness, ctx, command = HARNESSES[harness]) {
     try {
-      await run(ctx, ['new-session', '-d', '-s', name, '-c', cfg.projects[project], HARNESS_ENV + HARNESSES[harness]]);
+      await run(ctx, ['new-session', '-d', '-s', name, '-c', cfg.projects[project], HARNESS_ENV + command]);
     } catch (e) {
       if (/duplicate session/i.test(e.stderr || '')) throw new HttpErr(409, 'exists');
       throw e;
@@ -1145,8 +1276,8 @@ export function createApp(opts = {}) {
     return base.slice(0, 32 - suffix.length).replace(/-+$/, '') + suffix;
   };
 
-  // `fcode-git-sync <project>` before a new session: it only fetches and refreshes the behind / ahead / dirty counts of the card, it never
-  // changes the checkout. Never blocks the open and is never killed: an open waits for it at most gitSyncMs, or
+  // `fcode-git-sync <project>` before a new session: it only fetches and refreshes the behind / ahead / dirty counts of the card (a single-project run never
+  // fast-forwards; only the box's 5-minute timer may). This server never changes a checkout. Never blocks the open and is never killed: an open waits for it at most gitSyncMs, or
   // until the open is cancelled, then goes on; the child keeps running, detached and unref'd with its output ignored, and ends by its
   // own limits. One sync per project at a time: an open that arrives meanwhile joins it instead of starting another. A missing
   // command or a failure only log one line. ctx.onCancel is free until mutate takes it.
@@ -1205,6 +1336,105 @@ export function createApp(opts = {}) {
       }
       throw new HttpErr(409, 'exists');
     });
+  }
+
+  // --- omp sessions of a project (GET /api/projects/<name>/omp-sessions, POST .../<id>/resume) ---
+  // the top-level session files (never the nested ones) of the project's encoded dir: [{name, id}]; none when the dir is missing
+  async function ompFiles(dir) {
+    let ents;
+    try { ents = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { return []; }
+    return ents.flatMap((e) => { const id = e.isFile() ? ompIdOf(e.name) : null; return id ? [{ name: e.name, id }] : []; });
+  }
+  // newest 10 non-empty sessions: {id, title, updatedAt, origin}. Only the first bytes of a file and its .fcode-origin sidecar are read.
+  async function ompSessions(project) {
+    const dir = path.join(ompRoot, ompDirName(cfg.projects[project]));
+    const files = [];
+    for (const f of await ompFiles(dir)) {
+      try { const st = await fs.promises.stat(path.join(dir, f.name)); files.push({ ...f, mtime: st.mtimeMs, size: st.size }); } catch {}
+    }
+    files.sort((a, b) => b.mtime - a.mtime || (a.name < b.name ? 1 : -1));
+    const out = [];
+    for (const f of files) {
+      if (out.length >= OMP_LIST_MAX) break;
+      const buf = await readStart(path.join(dir, f.name), Math.min(f.size, OMP_HEAD_BYTES));
+      const head = buf && ompHead(buf, f.size);
+      if (!head || head.empty || !KNOWN_VERSIONS.includes(head.version)) continue; // empty, or a format this server does not know: not offered
+      const mark = await readStart(path.join(dir, `${f.name.slice(0, -6)}.fcode-origin`), 16); // laptop's sync marks what it copied here
+      out.push({ id: f.id, title: head.title, updatedAt: iso(f.mtime), origin: mark?.toString('utf8').trim() === 'laptop' ? 'laptop' : 'box' });
+    }
+    return out;
+  }
+  // omp format guard: `omp --version` and the headers of the newest GUARD_SCAN sessions of every project dir under the sessions root.
+  // formatOk = false when a header has a version outside KNOWN_VERSIONS (reason "unknown_version:<v>"), or is missing / unreadable in a
+  // complete file (not empty, not modified in the last 30 s: reason "no_header"), or when a session whose header cwd is a configured project sits outside the project's encoded dir
+  // (reason "dir_rule": omp changed how it names the dir). Checked at most every 10 min (the first one at start); a failed scan is
+  // not an alarm (formatOk stays true, reason null).
+  async function ompGuardScan() {
+    const version = await execTool(ompSpec, ['--version'], 10e3).then((s) => /\d+(?:\.\d+)+\S*/.exec(s)?.[0] ?? (str(s)?.slice(0, 40) ?? null), () => null);
+    const files = [];
+    try {
+      for (const d of await fs.promises.readdir(ompRoot, { withFileTypes: true })) {
+        if (!d.isDirectory()) continue;
+        const dir = path.join(ompRoot, d.name);
+        for (const f of await ompFiles(dir)) {
+          try { const st = await fs.promises.stat(path.join(dir, f.name)); files.push({ dir: d.name, file: path.join(dir, f.name), mtime: st.mtimeMs, size: st.size }); } catch {}
+        }
+      }
+    } catch { return { version, formatOk: true, reason: null }; }
+    files.sort((a, b) => b.mtime - a.mtime);
+    const wanted = new Map(cfg.projectNames.map((p) => [path.resolve(cfg.projects[p]), p]));
+    let reason = null;
+    for (const f of files.slice(0, GUARD_SCAN)) {
+      const buf = await readStart(f.file, Math.min(f.size, OMP_HEAD_BYTES));
+      const head = buf && ompHead(buf, f.size);
+      if (!head) continue;
+      // no usable header in a file that is empty or younger than 30 s is one being created (or a crash leftover): not an alarm
+      if (head.version === null && (head.empty || now() - f.mtime < GUARD_YOUNG_MS)) continue;
+      if (head.version === null) reason ??= 'no_header';
+      else if (!KNOWN_VERSIONS.includes(head.version)) reason ??= `unknown_version:${head.version}`;
+      else if (head.cwd && wanted.has(path.resolve(head.cwd)) && ompDirName(head.cwd) !== f.dir) reason ??= 'dir_rule';
+    }
+    return { version, formatOk: reason === null, reason };
+  }
+  const ompGuard = memo(GUARD_TTL, ompGuardScan, now);
+  ompGuard.get().catch(() => {}); // at start, in the background
+  // "<project>-omp-r-<last 8 of the id>": omp ids are UUIDv7, whose first 8 digits are a timestamp (65 s steps), the last 8 are random.
+  // The project part is shortened, never the id part, so the name stays within 32 characters
+  const resumeName = (project, id) => {
+    const tail = `omp-r-${id.slice(-8)}`.replace(/[^a-z0-9-]+/g, '-');
+    const base = project.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+/, '').slice(0, 32 - tail.length - 1).replace(/-+$/, '');
+    return base ? `${base}-${tail}` : tail;
+  };
+  // runs inside a mutation job: `omp -r <id>` launched like the omp harness; a session of that name from an earlier resume is reused
+  async function resumeOmp(project, id, ctx) {
+    const name = resumeName(project, id);
+    if (!NAME_RE.test(name)) throw new HttpErr(400, 'invalid');
+    const old = (await listSessions(ctx)).find((x) => x.name === name);
+    if (old) {
+      if (old.project !== project || old.harness !== 'omp') throw new HttpErr(409, 'exists');
+      return name;
+    }
+    await createSession(name, project, 'omp', ctx, `${HARNESSES.omp} -r ${shq(id)}`);
+    return name;
+  }
+
+  // --- staging box: `instabox ls --json` (30 s) and `instabox start <box> --no-wait`, box name = project name ---
+  const lsBoxes = async () => parseStaging(JSON.parse(await execTool(instaboxSpec, ['ls', '--json'], 15e3, { ...toolEnv(), INSTABOX_API_KEY: instaboxKey })));
+  const staging = memo(STAGING_TTL, lsBoxes, now);
+  const startingBoxes = new Set(); // projects whose `instabox start` runs now
+  // detached and unref'd with its output ignored; a failure only logs one line (never the key)
+  function startBox(project) {
+    startingBoxes.add(project);
+    let over = false;
+    const end = (why) => { if (over) return; over = true; startingBoxes.delete(project); staging.clear(); if (why) log(`staging-start ${project}: ${why}`); };
+    try {
+      const [cmd, ...pre] = instaboxSpec;
+      const child = spawn(cmd, [...pre, 'start', project, '--no-wait'], { stdio: 'ignore', detached: true, windowsHide: true, timeout: STAGING_START_MS,
+        env: { ...toolEnv(), INSTABOX_API_KEY: instaboxKey } });
+      child.on('error', (e) => end(e.code === 'ENOENT' ? 'command not found' : 'cannot start'));
+      child.on('exit', (code, sig) => end(code === 0 ? '' : `exit ${code ?? sig}`));
+      child.unref();
+    } catch { end('cannot start'); }
   }
 
   // runs inside a mutation job; every step re-checks through run(ctx)
@@ -1316,7 +1546,11 @@ export function createApp(opts = {}) {
   }
   async function homeView() {
     // each part answers at once from its cache, or within homeWait the first time; a part not ready is empty and fills later
-    const [q, s, p] = await Promise.allSettled([quota.get(homeWait), spend.get(homeWait), projects.get(homeWait)]);
+    // right after a project was added or removed the cached list is not waited for (wait 0: the reply is at once, the refresh runs on)
+    const projWait = projectsDirty ? 0 : homeWait; projectsDirty = false;
+    const [q, s, p, b, g] = await Promise.allSettled([quota.get(homeWait), spend.get(homeWait), projects.get(projWait),
+      instaboxKey ? staging.get(homeWait) : Promise.reject(new Error('no instabox key')), ompGuard.get(homeWait)]);
+    const boxes = b.status === 'fulfilled' ? b.value.value : null; // no key, or instabox failed with nothing cached: every staging is null
     const t = now();
     const qv = q.status === 'fulfilled' ? q.value : null;
     const accounts = qv ? qv.value.accounts.map((a) => ({ ...a, stale: a.stale || !qv.fresh })) : [];
@@ -1325,14 +1559,17 @@ export function createApp(opts = {}) {
     try { updates = parseUpdates(fs.readFileSync(updatesFile, 'utf8')); } catch {}
     let gits = new Map(); // read once per home reply; the projects part is cached, this is not
     try { gits = parseGitSync(fs.readFileSync(gitSyncFile, 'utf8')); } catch {}
-    const withGit = (list) => list.map((x) => ({ ...x, git: gits.get(x.name) ?? NO_GIT }));
+    const withGit = (list) => list.map((x) => ({ ...x, git: gits.get(x.name) ?? NO_GIT, staging: boxes?.get(x.name) ?? null }));
+    const cachedProjects = new Map((p.status === 'fulfilled' ? p.value.value : []).map((x) => [x.name, x]));
     return {
       generatedAt: iso(t), box: boxInfo(),
       accounts: accounts.map((a) => ({ ...a, spend: view?.perAccount.get(a.id) ?? null })),
       totals: view?.totals ?? { spend: null, byHarness: [] },
       // not read yet (first request, slow gh): each project with nothing known and loading: true (a gh failure has no loading)
-      projects: withGit(p.status === 'fulfilled' ? p.value.value : cfg.projectNames.map((name) => ({ name, repo: null, branch: null, prs: null, lastRun: null, loading: true }))),
+      // in config order, each project from the cache by name (a stale list still serves the ones it knows), a new one as a loading placeholder
+      projects: withGit(cfg.projectNames.map((name) => cachedProjects.get(name) ?? { name, repo: null, branch: null, prs: null, lastRun: null, loading: true })),
       updates,
+      omp: g.status === 'fulfilled' ? g.value.value : { version: null, formatOk: true, reason: null }, // not scanned yet: no alarm
     };
   }
   // POST /api/codex-reset: one reset per account at a time; the same requestId joins a running reset, and a final answer
@@ -1366,6 +1603,96 @@ export function createApp(opts = {}) {
     job.then(() => resetJobs.delete(accountId), () => resetJobs.delete(accountId));
     return job;
   }
+
+  // --- POST /api/projects: the box script as a job (CONTRACT A11). argv only, never a shell; one running job per name; 10 min, then the
+  // whole process group is killed; ended jobs are kept 30 min. Only the script's "R <CODE> [detail]" lines are read: its stderr is dropped,
+  // and nothing but the name and the code is logged. FCODE_CFG points the script at THIS server's config.json. ---
+  const addSpec = specOf(opts.addScript ?? process.env.PC_ADD_SCRIPT ?? ['bash', [ADD_SCRIPT, ADD_SCRIPT_DEV].find((f) => fs.existsSync(f)) ?? ADD_SCRIPT]);
+  const addTimeout = opts.addTimeoutMs ?? (Number(process.env.PC_ADD_TIMEOUT_MS) || ADD_TIMEOUT_MS);
+  // on Linux the script runs under timeout(1): the deadline then holds on its own even when this server is gone (a crash, or a restart that
+  // leaves the job alone: install.sh uses KillMode=process); a graceful stop ends the jobs through close(). 124 maps to TIMEOUT; a kill-after kill ends as a signal.
+  const addKillAfter = Number(process.env.PC_ADD_KILL_AFTER_S) || ADD_KILL_AFTER_S; // test-only override, like PC_ADD_TIMEOUT_MS
+  const addWrap = process.platform === 'win32' ? [] : ['timeout', `--kill-after=${addKillAfter}`, String(addTimeout / 1000)];
+  const addJobs = new Map(); // id -> job
+  const addRunning = new Map(); // name -> its running job
+  const addStops = new Set(); // one per running child: ends it when the app closes
+  // ended jobs go after 30 min (checked on every submit and every poll); at most 50 are kept, the oldest finished first (a running one never)
+  function pruneAdd() {
+    for (const [k, j] of addJobs) if (j.state !== 'running' && now() - j.endedAt > ADD_KEEP_MS) addJobs.delete(k);
+    const ended = [...addJobs.values()].filter((j) => j.state !== 'running').sort((a, b) => a.endedAt - b.endedAt);
+    for (let over = addJobs.size - ADD_MAX_JOBS; over > 0 && ended.length; over--) addJobs.delete(ended.shift().id);
+  }
+  function startAdd(repo, name) {
+    pruneAdd();
+    const busy = addRunning.get(name);
+    if (busy) return busy;
+    const job = { id: crypto.randomBytes(16).toString('hex'), name, repo, state: 'running', code: null, detail: null, endedAt: 0 };
+    addJobs.set(job.id, job); addRunning.set(name, job);
+    pruneAdd();
+    let out = '', child, timer, grace;
+    const end = () => { clearTimeout(timer); addStops.delete(abort); };
+    const abort = () => { end(); killGroup('SIGTERM'); clearTimeout(grace); }; // the app closes
+    const finish = (res) => {
+      if (job.state !== 'running') return;
+      end();
+      Object.assign(job, res, { endedAt: now() });
+      if (res.pubkey) job.keyUrl = `https://github.com/${repo}/settings/keys/new`;
+      addRunning.delete(name);
+      log(`add-project ${name} ${job.code}`);
+    };
+    const killGroup = (sig) => { try { process.kill(process.platform === 'win32' ? child.pid : -child.pid, sig); } catch {} }; // -pid: the group
+    try {
+      const [cmd, ...pre] = [...addWrap, ...addSpec];
+      child = spawn(cmd, [...pre, repo, name], { stdio: ['ignore', 'pipe', 'ignore'], detached: true, windowsHide: true, env: { ...toolEnv(), FCODE_CFG: cfgFile } });
+    } catch { finish({ state: 'failed', code: 'FAILED' }); return job; }
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (c) => { if (out.length < ADD_OUT_MAX) out += c; });
+    child.on('error', () => finish({ state: 'failed', code: 'FAILED' }));
+    child.on('close', (code) => { clearTimeout(grace); finish(addOutcome(code, out)); }); // the job is gone: no late SIGKILL to a group id that may be reused
+    timer = setTimeout(() => {
+      finish({ state: 'failed', code: 'TIMEOUT' });
+      killGroup('SIGTERM'); // the script cleans up its clone on TERM; on Linux timeout(1) kills what is left at +30 s, this backstop only at +45 s
+      grace = setTimeout(() => killGroup('SIGKILL'), opts.addKillGraceMs ?? ADD_KILL_GRACE_MS); // opts.addKillGraceMs: tests
+      grace.unref();
+    }, addTimeout);
+    addStops.add(abort);
+    return job;
+  }
+  // GET /api/github/repos: what the box's gh login can see (the list is cached 60 s, one gh run at a time), with the project each repo is
+  // already on the box as (onBox: read from each project's origin on every request, so a project just added shows at once)
+  let ghList = null, ghPending = null; // {at, rows}
+  const githubRepos = () => {
+    if (ghList && now() - ghList.at < GH_LIST_MS) return Promise.resolve(ghList.rows);
+    if (!ghPending) {
+      const at = now();
+      ghPending = (async () => {
+        const rows = [];
+        for (let page = 1; page <= GH_PAGES; page++) { // pages 1..3, stopping at a short page
+          let n = 0;
+          for (const l of (await execTool(ghSpec, ghReposArgs(page), 30e3)).split('\n')) {
+            if (!l.trim()) continue;
+            n++;
+            let v; try { v = JSON.parse(l); } catch { continue; }
+            if (v && typeof v.repo === 'string' && /^[\w.-]+\/[\w.-]+$/.test(v.repo)) {
+              rows.push({ repo: v.repo, private: v.private === true, archived: v.archived === true, canPush: v.canPush === true, updatedAt: typeof v.updatedAt === 'string' ? iso(Date.parse(v.updatedAt)) : null });
+            }
+          }
+          if (n < GH_PAGE_SIZE) break;
+        }
+        rows.sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''));
+        ghList = { at, rows: rows.slice(0, GH_LIST_MAX) };
+        return ghList.rows;
+      })().finally(() => { ghPending = null; });
+    }
+    return ghPending;
+  };
+  async function boxRepos() { // lower-cased owner/name -> project name (the first project in config order)
+    const urls = await Promise.all(cfg.projectNames.map((name) => execTool(gitSpec, ['-C', cfg.projects[name], 'remote', 'get-url', 'origin'], 5000).then((s) => s.trim(), () => null)));
+    const m = new Map();
+    cfg.projectNames.forEach((name, i) => { const r = repoOf(urls[i])?.toLowerCase(); if (r && !m.has(r)) m.set(r, name); });
+    return m;
+  }
+  const addJob = (id) => { pruneAdd(); return addJobs.get(id); };
 
   // --- http helpers ---
   function json(res, status, obj, headers) {
@@ -1536,6 +1863,29 @@ export function createApp(opts = {}) {
     }
     if (pathname === '/api/overview') { want('GET'); return json(res, 200, await overview(ctx)); }
     if (pathname === '/api/home') { want('GET'); return json(res, 200, await homeView()); }
+    if (pathname === '/api/projects') {
+      want('POST');
+      const { repo, name } = parseAddRequest(parseJson(req, body));
+      return json(res, 202, { job: startAdd(repo, name).id });
+    }
+    if (seg.length === 5 && seg[0] === '' && seg[1] === 'api' && seg[2] === 'projects' && seg[3] === 'jobs' && seg[4] !== 'omp-sessions') { // a project named "jobs" keeps its omp-sessions list (CONTRACT A9); a job id is hex, never that word
+      want('GET');
+      const j = addJob(seg[4]);
+      if (!j) throw new HttpErr(404, 'no_job');
+      return json(res, 200, { state: j.state, code: j.code, name: j.name, repo: j.repo, via: j.via ?? null, pubkey: j.pubkey, keyUrl: j.keyUrl, detail: j.detail });
+    }
+    if (pathname === '/api/github/repos') {
+      want('GET');
+      let rows;
+      try { rows = await githubRepos(); } catch (e) {
+        if (e.code === 'ENOENT' || e.code === 4 || /gh auth login|GH_TOKEN|not logged in|authentication required|HTTP 401|Bad credentials/i.test(e.stderr ?? '')) {
+          log('github repos: no token'); return json(res, 200, { repos: [], reason: 'no_github_token' });
+        }
+        log('github repos: unavailable'); throw new HttpErr(502, 'github_unavailable');
+      }
+      const onBox = await boxRepos();
+      return json(res, 200, { repos: rows.map((r) => ({ ...r, onBox: onBox.get(r.repo.toLowerCase()) ?? null })) });
+    }
     if (pathname === '/api/codex-reset') {
       want('POST');
       const { accountId, requestId } = parseJson(req, body);
@@ -1575,6 +1925,35 @@ export function createApp(opts = {}) {
         }
       });
       return json(res, 200, { name, created });
+    }
+
+    // v1.3.2: /api/projects/<name>/omp-sessions, /api/projects/<name>/omp-sessions/<id>/resume, /api/projects/<name>/staging/start
+    const pm = /^\/api\/projects\/([^/]+)\/(?:(omp-sessions)|omp-sessions\/([^/]+)\/(resume)|(staging)\/start)$/.exec(pathname);
+    if (pm) {
+      want(pm[2] ? 'GET' : 'POST');
+      const unescape = (s) => { try { return decodeURIComponent(s); } catch { return ''; } };
+      const project = unescape(pm[1]);
+      const refuse = (status, error) => json(res, status, { ok: false, error });
+      if (!validProject(project)) return refuse(404, 'unknown_project');
+      if (pm[2]) return json(res, 200, { ok: true, sessions: await ompSessions(project) });
+      if (pm[4]) { // resume
+        const id = unescape(pm[3]);
+        const dir = path.join(ompRoot, ompDirName(cfg.projects[project]));
+        const file = OMP_ID_RE.test(id) ? (await ompFiles(dir)).find((f) => f.id === id) : null;
+        const st = file && await fs.promises.stat(path.join(dir, file.name)).catch(() => null);
+        if (!st) return refuse(404, 'unknown_session');
+        const buf = await readStart(path.join(dir, file.name), Math.min(st.size, OMP_HEAD_BYTES));
+        if (!buf || !KNOWN_VERSIONS.includes(ompHead(buf, st.size).version)) return refuse(409, 'unknown_format'); // the list never offers it either
+        return json(res, 200, { ok: true, session: await mutate(ctx, () => resumeOmp(project, id, ctx)) });
+      }
+      // staging/start: only a box that `instabox ls` lists under the project's name; a running or starting one is left alone
+      if (!instaboxKey) return refuse(409, 'no_instabox_key');
+      let box;
+      try { box = (await lsBoxes()).get(project); } catch { return refuse(503, 'staging_unavailable'); } // the state now (a fresh ls), never a cached one
+      if (!box) return refuse(404, 'no_staging_box');
+      if (box.state === 'running' || box.state === 'starting' || startingBoxes.has(project)) return json(res, 200, { ok: true, state: box.state === 'running' ? 'running' : 'starting' });
+      startBox(project);
+      return json(res, 200, { ok: true, state: 'starting' });
     }
 
     // /api/<verb>/<name>
@@ -1678,13 +2057,14 @@ export function createApp(opts = {}) {
   };
   const close = () => {
     clearInterval(boxTimer);
+    for (const abort of [...addStops]) abort();
     return Promise.all([
       new Promise((resolve) => { server.close(() => resolve()); server.closeAllConnections(); }),
       new Promise((resolve) => (adminServer.listening ? adminServer.close(() => resolve()) : resolve())),
     ]);
   };
-  const homeIdle = () => Promise.all([quota, listing, spend, projects].map((m) => m.settled())); // tests: no refresh still running
-  return { server, listen, close, devices, tickBox, homeIdle, stats: () => ({ streams, running, reads, waiting: queue.length, active: !!active }) };
+  const homeIdle = () => Promise.all([quota, listing, spend, projects, staging, ompGuard].map((m) => m.settled())); // tests: no refresh still running
+  return { server, listen, close, devices, tickBox, homeIdle, stats: () => ({ streams, running, reads, waiting: queue.length, active: !!active, addJobs: addJobs.size }) };
 }
 
 // ---------- CLI ----------
@@ -1760,6 +2140,8 @@ async function main() {
   process.on('uncaughtException', fatal('uncaughtException'));
   const lock = await acquireInstanceLock(dir); // before config, devices or admin.sock are touched
   const app = createApp({ configDir: dir });
+  // a stop or restart of the service (SIGTERM) ends the running add jobs cleanly (their clones are removed) before the process goes
+  for (const sig of ['SIGTERM', 'SIGINT']) process.once(sig, () => { setTimeout(() => process.exit(0), 5000).unref(); app.close().catch(() => {}).finally(() => process.exit(0)); });
   const port = await app.listen();
   void lock; // held until the process exits
   console.log(`fcoding listening on 0.0.0.0:${port}`);

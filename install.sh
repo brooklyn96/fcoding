@@ -12,6 +12,8 @@ command -v tmux >/dev/null || echo "warning: tmux not found; install it before u
 
 mkdir -p "$APP"
 [ "$SRC" = "$APP" ] || install -m 644 "$SRC/server.mjs" "$APP/server.mjs"
+# the box script behind "Thêm dự án" (POST /api/projects runs it from next to server.mjs; see CONTRACT.md A11)
+[ ! -f "$SRC/box/fcode-add.sh" ] || install -m 755 "$SRC/box/fcode-add.sh" "$APP/fcode-add.sh"
 
 mkdir -p "$CFG"
 chmod 700 "$CFG"
@@ -70,6 +72,8 @@ fi
 
 # KillMode=process: the tmux server (and every harness session) is started by this service;
 # restarting or crashing the service must not take it down. StartLimitIntervalSec=0: always restart.
+# An "add project" job (fcode-add.sh) is a child in its own process group: systemctl stop / restart sends SIGTERM to the server, whose handler
+# ends the job and its group (CONTRACT A11); after a crash KillMode=process leaves it alone, and the job's own timeout(1) deadline ends it.
 # PATH for the harnesses is set by server.mjs itself (~/.local/bin, ~/.bun/bin, system dirs).
 # The home screen's project list runs gh, which needs GH_TOKEN. A login shell gets it from the instabox vault file
 # (/etc/profile.d/zz-instabox-secrets.sh sources /run/instabox/secrets/env, which lives in RAM); the service takes
@@ -82,6 +86,18 @@ if [ -z "${GH_TOKEN:-}" ] && [ -r "$f" ]; then
   if [ -n "$t" ]; then GH_TOKEN=$t; export GH_TOKEN; fi
   unset t
 fi
+# The staging box start button (server.mjs) needs INSTABOX_API_KEY alone, from the one line `export INSTABOX_API_KEY=...` of
+# ~/.config/fcode/instabox.env. The line is read as text (the file is never sourced), the value must look like a key, and nothing else
+# is taken. No file or no such line: the service starts without it and staging stays off.
+k=${FCODE_INSTABOX_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/fcode/instabox.env}
+if [ -z "${INSTABOX_API_KEY:-}" ] && [ -r "$k" ]; then
+  t=$(sed -n '/^export INSTABOX_API_KEY=/{s///p;q;}' "$k" 2>/dev/null | tr -d '\r')
+  case $t in \"*\") t=${t#\"}; t=${t%\"} ;; \'*\') t=${t#\'}; t=${t%\'} ;; esac
+  case $t in ''|*[!A-Za-z0-9._-]*) t= ;; esac
+  if [ -n "$t" ]; then INSTABOX_API_KEY=$t; export INSTABOX_API_KEY; fi
+  unset t
+fi
+unset k
 exec "$@"
 START
 chmod 755 "$APP/start.sh"
@@ -122,4 +138,5 @@ Revoke a device:  PC_CONFIG_DIR=$CFG node $APP/server.mjs --revoke <id>     (or 
 Projects: edit $CFG/config.json ("projects": {"name": "/abs/dir"}); the server reloads it by itself.
 Paired devices survive restarts. Changing cookieSecret in config.json unpairs every device.
 Publish:  instabox port publish <box> 7681
+Staging:  the app's "Bật" button runs instabox start <project>; put  export INSTABOX_API_KEY=...  in ~/.config/fcode/instabox.env (chmod 600), then systemctl --user restart fcoding
 MSG

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Tests for box/fcode-git-sync.sh: it only fetches and reports; it never changes a repository.
-# Needs: bash, git, node (flock only for the overlap test). Everything runs in a temp HOME with temp bare remotes;
+# Tests for box/fcode-git-sync.sh: it fetches and reports, and fast-forwards the default branch of a project that is idle and
+# clean (and nothing else: it never pushes, stashes, resets or touches another branch).
+# Needs: bash, git, node (flock only for the overlap test; Linux /proc for the fast-forward and busy tests). Everything runs in a temp HOME with temp bare remotes;
 # it never touches the real box, a real remote or the real home.
 # Usage: bash test/git-sync.test.sh
 set -u
@@ -11,9 +12,12 @@ T=$(mktemp -d) || exit 1
 trap 'rm -rf "$T"' EXIT
 export HOME="$T/home"
 export GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
+export FCODE_SECRETS_ENV="$T/no-vault" # a path that does not exist: no run in this suite reads the real /run/instabox/secrets/env (tokrun sets its own fake vault)
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 mkdir -p "$HOME" "$T/bin"
 
+# LINUX=1: /proc/<pid>/cwd can be read here, so the script can tell busy projects (its fast-forward then runs); else every project counts as busy
+LINUX=0; [ -n "$(readlink /proc/self/cwd 2>/dev/null)" ] && LINUX=1
 PASS=0; FAIL=0
 ok() { PASS=$((PASS + 1)); echo "ok   $1"; }
 no() { FAIL=$((FAIL + 1)); echo "FAIL $1"; }
@@ -68,39 +72,46 @@ run; eq "run exits 0" "$?" 0
 [ -s "$T/run.out" ] && no "quiet run (printed: $(head -c 200 "$T/run.out"))" || ok "quiet run"
 eq "nothing was pushed: every remote has only main" "$(for r in "$T"/remotes/*.git; do git -C "$r" for-each-ref --format='%(refname)' refs/heads; done | grep -vc '^refs/heads/main$')" 0
 
-# 1. behind: reported, NOT updated
-eq "behind: behindDefault 2, ahead 0, clean" "$(q projects.behind.behindDefault)/$(q projects.behind.aheadOfOrigin)/$(q projects.behind.dirty)" 2/0/false
-eq "behind: HEAD and files unchanged (no fast-forward)" "$(hd behind)/$(cat "$T/ws/behind/a.txt" "$T/ws/behind/b.txt")" "$H_behind/$BEHIND_FILES"
+# 1. behind, idle, clean, on main: fast-forwarded (on a host without /proc the project counts as busy and stays put)
+if [ $LINUX = 1 ]; then
+  eq "behind: fast-forwarded to origin/main, behind 0, ahead 0, clean" "$(hd behind)/$(q projects.behind.behindDefault)/$(q projects.behind.aheadOfOrigin)/$(q projects.behind.dirty)" "$(git -C "$T/remotes/behind.git" rev-parse main)/0/0/false"
+  eq "behind: files updated, autoUpdated true, autoSkip null" "$(cat "$T/ws/behind/a.txt" "$T/ws/behind/b.txt" | tr '\n' ' ')/$(q projects.behind.autoUpdated)/$(q projects.behind.autoSkip)" "r1 r2 /true/null"
+else
+  eq "behind (no /proc): untouched, autoSkip busy" "$(hd behind)/$BEHIND_FILES/$(q projects.behind.behindDefault)/$(q projects.behind.autoSkip)" "$H_behind/$BEHIND_FILES/2/busy"
+fi
 eq "behind: origin/main did move (fetched)" "$(c behind rev-parse origin/main)" "$(git -C "$T/remotes/behind.git" rev-parse main)"
 eq "behind: no .git/FETCH_HEAD written by the script" "$([ -e "$T/ws/behind/.git/FETCH_HEAD" ] && echo exists || echo none)" none
 eq "behind: default and branch" "$(q projects.behind.default)/$(q projects.behind.branch)" main/main
 # 2. dirty
 eq "dirty: change and untracked file kept, HEAD unchanged" "$(cat "$T/ws/dirty/b.txt")/$([ -e "$T/ws/dirty/new.txt" ] && echo y)/$(hd dirty)" "local/y/$H_dirty"
-eq "dirty: dirty true, behind 1" "$(q projects.dirty.dirty)/$(q projects.dirty.behindDefault)" true/1
+eq "dirty: dirty true, behind 1, autoSkip dirty, not updated" "$(q projects.dirty.dirty)/$(q projects.dirty.behindDefault)/$(q projects.dirty.autoSkip)/$(q projects.dirty.autoUpdated)" true/1/dirty/false
 # 3. other branch
 eq "branch: still on box/topic, HEAD unchanged" "$(c branch symbolic-ref --short HEAD)/$(hd branch)" "box/topic/$H_branch"
-eq "branch: name, behind 1, ahead 0 (nothing of its own)" "$(q projects.branch.branch)/$(q projects.branch.behindDefault)/$(q projects.branch.aheadOfOrigin)" box/topic/1/0
+eq "branch: name, behind 1, ahead 0 (nothing of its own), autoSkip on_branch" "$(q projects.branch.branch)/$(q projects.branch.behindDefault)/$(q projects.branch.aheadOfOrigin)/$(q projects.branch.autoSkip)" box/topic/1/0/on_branch
 # 4. diverged
-eq "diverged: HEAD unchanged, behind 1, ahead 1" "$(hd diverged)/$(q projects.diverged.behindDefault)/$(q projects.diverged.aheadOfOrigin)" "$H_diverged/1/1"
+eq "diverged: HEAD unchanged, behind 1, ahead 1, autoSkip ahead" "$(hd diverged)/$(q projects.diverged.behindDefault)/$(q projects.diverged.aheadOfOrigin)/$(q projects.diverged.autoSkip)" "$H_diverged/1/1/ahead"
 # 5. mid-rebase and lock: reported, untouched
-eq "rebase: HEAD unchanged, branch (detached), dirty" "$(hd rebase)/$(q projects.rebase.branch)/$(q projects.rebase.dirty)" "$H_rebase/(detached)/true"
+eq "rebase: HEAD unchanged, branch (detached), dirty, behind 0 (stopped on origin/main): nothing to update" "$(hd rebase)/$(q projects.rebase.branch)/$(q projects.rebase.dirty)/$(q projects.rebase.behindDefault)/$(q projects.rebase.autoSkip)" "$H_rebase/(detached)/true/0/null"
 [ -d "$T/ws/rebase/.git/rebase-merge" ] || [ -d "$T/ws/rebase/.git/rebase-apply" ] && ok "rebase: still in progress" || no "rebase: still in progress"
-eq "index.lock: still there, HEAD unchanged, behind reported" "$([ -e "$T/ws/lock/.git/index.lock" ] && echo y)/$(hd lock)/$(q projects.lock.behindDefault)" "y/$H_lock/1"
+eq "index.lock: still there, HEAD unchanged, behind reported, autoSkip in_progress" "$([ -e "$T/ws/lock/.git/index.lock" ] && echo y)/$(hd lock)/$(q projects.lock.behindDefault)/$(q projects.lock.autoSkip)" "y/$H_lock/1/in_progress"
 # 6. up to date
-eq "same: behind 0, ahead 0, no error" "$(q projects.same.behindDefault)/$(q projects.same.aheadOfOrigin)/$(q projects.same.error)" 0/0/null
+eq "same: behind 0, ahead 0, no error, nothing to update" "$(q projects.same.behindDefault)/$(q projects.same.aheadOfOrigin)/$(q projects.same.error)/$(q projects.same.autoUpdated)/$(q projects.same.autoSkip)" 0/0/null/false/null
 eq "same: lastFetchAt set" "$([ "$(q projects.same.lastFetchAt)" != null ] && echo set)" set
 # 7. failures stay local to their project
 eq "bad: error recorded" "$(q projects.bad.error | cut -c1-13)" "fetch failed:"
 eq "bad: no lastFetchAt" "$(q projects.bad.lastFetchAt)" null
 eq "gone: error recorded" "$(q projects.gone.error)" "not a git repository"
-eq "behind still reported although bad+gone come first" "$(q projects.behind.behindDefault)" 2
+if [ $LINUX = 1 ]; then eq "behind still handled although bad+gone come first" "$(q projects.behind.behindDefault)/$(q projects.behind.autoUpdated)" 0/true
+else eq "behind still reported although bad+gone come first" "$(q projects.behind.behindDefault)" 2; fi
 # 8. state file
 node -e 'const s = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); if (!/^\d{4}-\d\d-\d\dT[\d:]+Z$/.test(s.updatedAt) || Object.keys(s.projects).length !== 9) process.exit(1)' "$STATEF" && ok "state JSON valid: updatedAt + 9 projects" || no "state JSON valid"
-node -e 'const p = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).projects.same; const k = Object.keys(p).sort().join(); if (k !== "aheadOfOrigin,behindDefault,branch,default,dirty,error,lastFetchAt") process.exit(1)' "$STATEF" && ok "state: per-project fields (no fastForwarded)" || no "state: per-project fields"
+node -e 'const p = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).projects.same; const k = Object.keys(p).sort().join(); if (k !== "aheadOfOrigin,autoSkip,autoUpdated,behindDefault,branch,default,dirty,error,lastFetchAt") process.exit(1)' "$STATEF" && ok "state: per-project fields (old ones kept, autoUpdated + autoSkip added)" || no "state: per-project fields"
 [ "$(uname)" = Linux ] && eq "state file mode 600" "$(stat -c %a "$STATEF")" 600
 eq "no temp files left in the state dir" "$(ls -A "$HOME/.local/state/fcode" | grep -vcE '^(git-sync.json|git-sync.lock)$')" 0
 
 # second run: a new remote commit shows up in behindDefault; a failing fetch keeps the old lastFetchAt
+# ('same' gets a tracked change first, so these fetch-only checks are not about the fast-forward, which has its own section)
+echo wip >"$T/ws/same/b.txt"
 adv same a.txt r-new
 sleep 1; run
 eq "run 2: behindDefault after a new remote commit" "$(q projects.same.behindDefault)/$(hd same)" "1/$H_same"
@@ -174,6 +185,7 @@ eq "ahead: upstream origin/main, one new local commit -> 1" "$(q projects.up.ahe
 # ---- several remote.origin.url values: the FIRST one is used, like `git fetch origin` ----
 echo "# two urls"
 mkproj mu; adv mu a.txt r-mu; mkproj mv; adv mv a.txt r-mv1; adv mv b.txt r-mv2
+echo wip >"$T/ws/mu/b.txt"; echo wip >"$T/ws/mv/a.txt"                  # tracked changes: these are fetch checks, not fast-forward ones
 c mu config --add remote.origin.url "$T/remotes/nope.git"               # second url does not exist
 c mv config --add remote.origin.url "$T/remotes/behind.git"             # second url is another, reachable repository
 cfg mu mv; run
@@ -182,7 +194,7 @@ eq "two urls (second reachable): origin/main comes from the first url" "$(c mv r
 
 # ---- a project called __proto__ is an ordinary entry ----
 echo "# __proto__"
-mkproj proto; adv proto a.txt rp; mv "$T/ws/proto" "$T/ws/__proto__"
+mkproj proto; adv proto a.txt rp; echo wip >"$T/ws/proto/b.txt"; mv "$T/ws/proto" "$T/ws/__proto__"
 cfg __proto__ same; run
 eq "__proto__: its own entry, next to the other" "$(keys)" "__proto__,same"
 eq "__proto__: values" "$(q projects.__proto__.branch)/$(q projects.__proto__.behindDefault)/$(q projects.__proto__.error)" main/1/null
@@ -218,10 +230,11 @@ echo "# single project"
 for n in sa sb; do mkproj $n; adv $n a.txt "remote-$n"; done
 cfg sa sb; bash "$SYNC" >/dev/null 2>&1
 adv sa a.txt remote-sa2; adv sb a.txt remote-sb2
-SB_BEFORE=$(qj projects.sb); SA_HEAD=$(hd sa); SB_ORIGIN=$(c sb rev-parse origin/main)
+SB_BEFORE=$(qj projects.sb); SB_HEAD=$(hd sb); SB_ORIGIN=$(c sb rev-parse origin/main); SA_HEAD=$(hd sa)
 bash "$SYNC" sa >"$T/one.out" 2>&1; eq "single: exit 0, quiet" "$?/$(wc -c <"$T/one.out" | tr -d ' ')" "0/0"
-eq "single: sa reports the new commit, HEAD untouched" "$(q projects.sa.behindDefault)/$(hd sa)" "2/$SA_HEAD"
-eq "single: sb untouched (entry kept, not fetched)" "$(qj projects.sb)/$(c sb rev-parse origin/main)" "$SB_BEFORE/$SB_ORIGIN"
+# the single-project run is look-only: sa is fetched (origin/main moved) and counted, but never fast-forwarded
+eq "single: sa fetched, never fast-forwarded (HEAD unchanged, autoUpdated false, autoSkip null)" "$(q projects.sa.behindDefault)/$(q projects.sa.autoUpdated)/$(q projects.sa.autoSkip)/$(hd sa)/$(c sa rev-parse origin/main)" "$([ $LINUX = 1 ] && echo 1 || echo 2)/false/null/$SA_HEAD/$(git -C "$T/remotes/sa.git" rev-parse main)"
+eq "single: sb untouched (entry kept, not fetched, not fast-forwarded)" "$(qj projects.sb)/$(c sb rev-parse origin/main)/$(hd sb)" "$SB_BEFORE/$SB_ORIGIN/$SB_HEAD"
 eq "single: both entries still in the state" "$(keys)" "sa,sb"
 SUM=$(cksum <"$STATEF")
 bash "$SYNC" nope >"$T/one.out" 2>&1; eq "single: unknown project, exit 0" "$?" 0
@@ -232,8 +245,174 @@ rm -f "$HOME/.fcoding/config.json"; rm -f "$STATEF"
 run; eq "no config: exit 0" "$?" 0
 [ -e "$STATEF" ] && no "no config: state not written" || ok "no config: state not written"
 
-# ---- the script has no git command that writes to a repository's work tree, index or branches ----
-eq "no merge/checkout/reset/push/switch/rebase/update-ref/stash/pull/clean in the code (comments aside)" "$(sed 's/[[:space:]]#[[:space:]].*//; /^[[:space:]]*#/d' "$SYNC" | grep -cE '\b(merge|checkout|reset|push|switch|rebase|update-ref|stash|pull|clean)\b')" 0
+# ---- automatic fast-forward: when it happens, when it is skipped, and what it never touches ----
+echo "# auto fast-forward"
+if [ $LINUX = 1 ]; then
+  # fixtures: every project is on main with a clean tree and the remote is 2 commits ahead, then each case spoils one thing
+  for n in ff skipb skipd skipa skipp ffu ffx busy pre; do mkproj $n; adv $n a.txt "r-$n-1"; adv $n b.txt "r-$n-2"; done
+  # ff: other branch + annotated tag + a hook + an untracked file that does not clash
+  ( cd "$T/ws/ff" && git branch keep && git tag -a keeptag -m k && echo scratch >scratch.txt \
+    && printf '#!/bin/sh\ntouch "%s/hook-ran"\n' "$T" >.git/hooks/post-merge && chmod +x .git/hooks/post-merge )
+  # skip reasons
+  c skipb switch -q -c box/topic
+  echo wip >"$T/ws/skipd/b.txt"                                                  # unstaged tracked change
+  ( cd "$T/ws/skipa" && echo mine >mine.txt && git add . && git commit -qm mine ) # a local commit on main, remote also moved
+  ( cd "$T/ws/skipp" && git rev-parse HEAD >.git/MERGE_HEAD )                    # a merge under way (clean tree, on main)
+  # ff_failed 1: the remote adds new.txt, and an untracked new.txt is in the way
+  ( cd "$T/seed/ffu" && echo remote >new.txt && git add . && git commit -qm newfile && git push -q origin main ); echo mine >"$T/ws/ffu/new.txt"
+  # ff_failed 2: HEAD's commit is on origin/side only, so ahead is 0 but main cannot fast-forward
+  ( cd "$T/ws/ffx" && echo x >x.txt && git add . && git commit -qm x && git push -q origin HEAD:refs/heads/side )
+  # busy: a process with its cwd inside the project (a subdirectory), and a sibling dir whose name only starts the same
+  mkdir -p "$T/ws/busy/sub" "$T/ws/pre-other"; : >"$T/ws/busy/sub/.keep"
+  cfg ff skipb skipd skipa skipp ffu ffx busy pre
+  for n in ff skipb skipd skipa skipp ffu ffx busy pre; do eval "A_$n=$(hd $n)"; done
+  FF_FILES=$(cd "$T/ws/ffu" && git status --porcelain --untracked-files=all | tr '\n' ' ')
+  REMOTES_BEFORE=$(for r in "$T"/remotes/{ff,skipb,skipd,skipa,skipp,ffu,ffx,busy,pre}.git; do git -C "$r" for-each-ref --format='%(refname) %(objectname)'; done | cksum)
+  ( cd "$T/ws/busy/sub" && exec sleep 60 ) & BUSY1=$!
+  ( cd "$T/ws/pre-other" && exec sleep 60 ) & BUSY2=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [ "$(readlink /proc/$BUSY1/cwd 2>/dev/null)" = "$T/ws/busy/sub" ] && [ "$(readlink /proc/$BUSY2/cwd 2>/dev/null)" = "$T/ws/pre-other" ] && break; sleep 0.3; done
+  run; eq "autoff: run exits 0, quiet" "$?/$(wc -c <"$T/run.out" | tr -d ' ')" "0/0"
+  REMOTE_MAIN=$(git -C "$T/remotes/ff.git" rev-parse main)
+  # the one that happens
+  eq "ff: HEAD is origin/main, files updated, on main" "$(hd ff)/$(c ff symbolic-ref --short HEAD)/$(cat "$T/ws/ff/a.txt" "$T/ws/ff/b.txt" | tr '\n' ' ')" "$REMOTE_MAIN/main/r-ff-1 r-ff-2 "
+  eq "ff: state autoUpdated true, autoSkip null, behind 0, ahead 0" "$(q projects.ff.autoUpdated)/$(q projects.ff.autoSkip)/$(q projects.ff.behindDefault)/$(q projects.ff.aheadOfOrigin)" true/null/0/0
+  eq "ff: untracked file kept (and reported as dirty), tree otherwise clean" "$(cat "$T/ws/ff/scratch.txt")/$(q projects.ff.dirty)/$(c ff status --porcelain)" "scratch/true/?? scratch.txt"
+  eq "ff: no merge commit (history is the remote's, linear)" "$(c ff rev-list --count --merges HEAD)/$(c ff rev-list --count HEAD)" "0/3"
+  eq "ff: other branch and tag untouched, no stash" "$(c ff rev-parse keep)/$(c ff rev-parse keeptag^{commit})/$(c ff stash list | wc -l | tr -d ' ')" "$(c ff rev-parse HEAD~2)/$(c ff rev-parse HEAD~2)/0"
+  eq "ff: repo hooks do not run for the automatic merge" "$([ -e "$T/hook-ran" ] && echo ran || echo none)" none
+  # the skips: each one leaves HEAD (and what is there) as it was and says why
+  eq "skip on_branch: still on box/topic, HEAD unchanged" "$(q projects.skipb.autoSkip)/$(q projects.skipb.autoUpdated)/$(hd skipb)/$(c skipb symbolic-ref --short HEAD)/$(q projects.skipb.behindDefault)" "on_branch/false/$A_skipb/box/topic/2"
+  eq "skip dirty: tracked change kept, HEAD unchanged" "$(q projects.skipd.autoSkip)/$(hd skipd)/$(cat "$T/ws/skipd/b.txt")" "dirty/$A_skipd/wip"
+  eq "skip ahead: autoSkip ahead, HEAD unchanged, ahead 1 behind 2" "$(q projects.skipa.autoSkip)/$(hd skipa)/$(q projects.skipa.aheadOfOrigin)/$(q projects.skipa.behindDefault)" "ahead/$A_skipa/1/2"
+  eq "skip in_progress (MERGE_HEAD): HEAD unchanged, marker kept" "$(q projects.skipp.autoSkip)/$(hd skipp)/$([ -e "$T/ws/skipp/.git/MERGE_HEAD" ] && echo y)" "in_progress/$A_skipp/y"
+  eq "skip busy: HEAD unchanged, behind 2" "$(q projects.busy.autoSkip)/$(q projects.busy.autoUpdated)/$(hd busy)/$(q projects.busy.behindDefault)" "busy/false/$A_busy/2"
+  eq "busy: a sibling dir with the same name prefix does not block" "$(q projects.pre.autoUpdated)/$(q projects.pre.autoSkip)/$(hd pre)" "true/null/$(git -C "$T/remotes/pre.git" rev-parse main)"
+  # ff_failed: checkout as it was
+  eq "ff_failed (untracked file in the way): reason, HEAD and file unchanged" "$(q projects.ffu.autoSkip)/$(q projects.ffu.autoUpdated)/$(hd ffu)/$(cat "$T/ws/ffu/new.txt")/$(cd "$T/ws/ffu" && git status --porcelain --untracked-files=all | tr '\n' ' ')" "ff_failed/false/$A_ffu/mine/$FF_FILES"
+  eq "ff_failed (main diverged from origin/main, ahead 0): reason, HEAD unchanged" "$(q projects.ffx.autoSkip)/$(q projects.ffx.aheadOfOrigin)/$(q projects.ffx.behindDefault)/$(hd ffx)" "ff_failed/0/2/$A_ffx"
+  # while the sleeper runs: not busy once it is gone -> the next run fast-forwards (and in_progress/dirty/branch stay skipped)
+  kill $BUSY1 $BUSY2 2>/dev/null; wait $BUSY1 $BUSY2 2>/dev/null
+  run
+  eq "busy gone: next run fast-forwards busy" "$(q projects.busy.autoUpdated)/$(q projects.busy.autoSkip)/$(hd busy)/$(q projects.busy.behindDefault)" "true/null/$(git -C "$T/remotes/busy.git" rev-parse main)/0"
+  eq "ff again: nothing to do, autoUpdated back to false" "$(q projects.ff.autoUpdated)/$(q projects.ff.autoSkip)/$(hd ff)" "false/null/$REMOTE_MAIN"
+  eq "still skipped: on_branch, dirty, ahead, in_progress" "$(q projects.skipb.autoSkip)/$(q projects.skipd.autoSkip)/$(q projects.skipa.autoSkip)/$(q projects.skipp.autoSkip)" "on_branch/dirty/ahead/in_progress"
+  eq "skipped projects: HEADs still unchanged" "$(hd skipb)/$(hd skipd)/$(hd skipa)/$(hd skipp)/$(hd ffu)" "$A_skipb/$A_skipd/$A_skipa/$A_skipp/$A_ffu"
+  # nothing was pushed by the script: every remote ref is as the test left it (ffx's side branch is the test's own push)
+  eq "nothing pushed: every remote ref unchanged" "$(for r in "$T"/remotes/{ff,skipb,skipd,skipa,skipp,ffu,ffx,busy,pre}.git; do git -C "$r" for-each-ref --format='%(refname) %(objectname)'; done | cksum)" "$REMOTES_BEFORE"
+  # every other in-progress marker is a skip too (clean tree, on main, behind)
+  for m in CHERRY_PICK_HEAD REVERT_HEAD REBASE_HEAD BISECT_LOG index.lock rebase-merge rebase-apply sequencer; do
+    n="m_${m//[.-]/_}"; mkproj "$n"; adv "$n" a.txt rm; cfg "$n"
+    case $m in
+      rebase-merge|rebase-apply|sequencer) mkdir "$T/ws/$n/.git/$m" ;;
+      index.lock|BISECT_LOG) : >"$T/ws/$n/.git/$m" ;;
+      *) c "$n" rev-parse HEAD >"$T/ws/$n/.git/$m" ;;
+    esac
+    H=$(hd "$n"); run
+    eq "skip in_progress ($m): reason, HEAD unchanged" "$(q projects.$n.autoSkip)/$(hd "$n")" "in_progress/$H"
+  done
+  # control for the hook test: the same hook does run when git merges with hooks on
+  mkproj hk; adv hk a.txt hk1; printf '#!/bin/sh\ntouch "%s/hook-control"\n' "$T" >"$T/ws/hk/.git/hooks/post-merge"; chmod +x "$T/ws/hk/.git/hooks/post-merge"
+  c hk fetch -q origin; c hk merge -q --ff-only origin/main
+  eq "control: the post-merge hook runs under a plain git merge" "$([ -e "$T/hook-control" ] && echo ran || echo none)" ran
+
+  # ignored file in the way (the laptop handoff puts TASK.md & co. in .git/info/exclude): the merge must not replace it
+  mkproj ign; echo TASK.md >>"$T/ws/ign/.git/info/exclude"; echo "box-only notes" >"$T/ws/ign/TASK.md"
+  ( cd "$T/seed/ign" && echo "remote task" >TASK.md && git add . && git commit -qm task && git push -q origin main )
+  H=$(hd ign); cfg ign; run
+  eq "ignored file in the way: ff_failed, file and HEAD unchanged" "$(q projects.ign.autoSkip)/$(q projects.ign.autoUpdated)/$(cat "$T/ws/ign/TASK.md")/$(hd ign)/$(q projects.ign.behindDefault)" "ff_failed/false/box-only notes/$H/1"
+
+  # filters: any filter.* key configured in any scope (repo or global) turns the ff off; attributes are not read
+  for n in fsm fpr fnone gplain; do mkproj $n; done
+  ( cd "$T/ws/fnone" && echo '*.bin filter=lfs -text' >.gitattributes && git add . && git commit -qm attrs && git push -q origin main )  # attributes without any driver
+  ( cd "$T/seed/fnone" && git pull -q origin main )
+  for n in fsm fpr fnone gplain; do adv $n a.txt "r-$n"; done
+  echo '*.bin filter=lfs' >"$T/ws/fnone/.git/info/attributes"
+  c fsm config filter.lfs.smudge 'git-lfs smudge -- %f'
+  c fpr config filter.lfs.process 'git-lfs filter-process'
+  mkproj freq; adv freq a.txt r-freq
+  c freq config filter.x.clean cat; c freq config filter.x.required true       # required + clean only: git would die mid-checkout
+  for n in fsm fpr fnone gplain freq; do eval "H_$n=$(hd $n)"; done
+  printf '[filter "lfs"]\n\tprocess = git-lfs filter-process\n\tsmudge = git-lfs smudge -- %%f\n\trequired = true\n' >"$HOME/.gitconfig"
+  cfg gplain; run; rm -f "$HOME/.gitconfig"
+  eq "global lfs config (git lfs install): even a plain repo is skipped (accepted, safe)" "$(q projects.gplain.autoSkip)/$(q projects.gplain.autoUpdated)/$(hd gplain)" "filters/false/$H_gplain"
+  cfg fsm fpr fnone gplain freq; run
+  eq "repo config filter.x.required=true + clean only: autoSkip filters, HEAD unchanged" "$(q projects.freq.autoSkip)/$(q projects.freq.autoUpdated)/$(hd freq)" "filters/false/$H_freq"
+  eq "repo config filter.*.smudge: autoSkip filters, HEAD unchanged" "$(q projects.fsm.autoSkip)/$(q projects.fsm.autoUpdated)/$(hd fsm)/$(q projects.fsm.behindDefault)" "filters/false/$H_fsm/1"
+  eq "repo config filter.*.process: autoSkip filters, HEAD unchanged" "$(q projects.fpr.autoSkip)/$(q projects.fpr.autoUpdated)/$(hd fpr)/$(q projects.fpr.behindDefault)" "filters/false/$H_fpr/1"
+  eq "filter= attributes (HEAD, info) but no filter.* config: fast-forwarded" "$(q projects.fnone.autoSkip)/$(q projects.fnone.autoUpdated)/$(hd fnone)" "null/true/$(git -C "$T/remotes/fnone.git" rev-parse main)"
+  eq "no driver left (global config removed): the plain repo fast-forwards" "$(q projects.gplain.autoSkip)/$(q projects.gplain.autoUpdated)" "null/true"
+
+  # late: a run older than FCODE_GIT_LATE_AFTER seconds (600 by default) starts no merge; a bad value means 600
+  mkproj lat; adv lat a.txt r-lat; H=$(hd lat); cfg lat
+  FCODE_GIT_LATE_AFTER=0 bash "$SYNC" >/dev/null 2>&1
+  eq "late: no merge, autoSkip late, HEAD unchanged, behind 1" "$(q projects.lat.autoSkip)/$(q projects.lat.autoUpdated)/$(hd lat)/$(q projects.lat.behindDefault)" "late/false/$H/1"
+  FCODE_GIT_LATE_AFTER=abc bash "$SYNC" >/dev/null 2>&1
+  eq "late: a non-numeric FCODE_GIT_LATE_AFTER falls back to 600 (not late, fast-forwards, no shell error)" "$(q projects.lat.autoUpdated)/$(q projects.lat.autoSkip)" "true/null"
+  mkproj lat2; adv lat2 a.txt r-lat2; cfg lat2
+  FCODE_GIT_LATE_AFTER= bash "$SYNC" >"$T/late.out" 2>&1
+  eq "late: an empty FCODE_GIT_LATE_AFTER falls back to 600, quiet" "$(q projects.lat2.autoUpdated)/$(wc -c <"$T/late.out" | tr -d ' ')" "true/0"
+
+  # busy root is the work tree: a project configured as a subdirectory of a checkout is busy while a process sits in a sibling dir
+  mkproj mono; ( cd "$T/ws/mono" && mkdir web api && echo w >web/w.txt && echo a >api/a.txt && git add . && git commit -qm dirs && git push -q origin main )
+  ( cd "$T/seed/mono" && git pull -q origin main && echo m >b.txt && git add . && git commit -qm m && git push -q origin main )
+  printf '{"projects":{"monoweb":"%s"}}\n' "$T/ws/mono/web" >"$HOME/.fcoding/config.json"
+  H=$(hd mono); ( cd "$T/ws/mono/api" && exec sleep 60 ) & BUSY3=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [ "$(readlink /proc/$BUSY3/cwd 2>/dev/null)" = "$T/ws/mono/api" ] && break; sleep 0.3; done
+  run; eq "busy root: a process in a sibling dir of the configured subdir blocks the ff" "$(q projects.monoweb.autoSkip)/$(hd mono)/$(cat "$T/ws/mono/b.txt")" "busy/$H/one"
+  kill $BUSY3 2>/dev/null; wait $BUSY3 2>/dev/null
+  run; eq "busy root: once it is gone the ff happens" "$(q projects.monoweb.autoUpdated)/$(cat "$T/ws/mono/b.txt")" "true/m"
+
+  # a single-project run (the server runs it right before opening a session) never fast-forwards
+  mkproj sing; adv sing a.txt r-sing; cfg sing; H=$(hd sing)
+  bash "$SYNC" sing >"$T/one.out" 2>&1
+  eq "single-project run: fetched, behind 1, but no ff (autoUpdated false, autoSkip null, HEAD unchanged)" "$(q projects.sing.behindDefault)/$(q projects.sing.autoUpdated)/$(q projects.sing.autoSkip)/$(hd sing)/$(c sing rev-parse origin/main)" "1/false/null/$H/$(git -C "$T/remotes/sing.git" rev-parse main)"
+  run; eq "the timer run then fast-forwards it" "$(q projects.sing.autoUpdated)/$(hd sing)" "true/$(git -C "$T/remotes/sing.git" rev-parse main)"
+else
+  echo "note: no Linux /proc here, the auto fast-forward and busy tests are skipped"
+fi
+
+# ---- GH_TOKEN for the timer (it has none of its own): GH_TOKEN alone is taken from the vault file, as text, when the environment has none ----
+# A `timeout` shim (first on the script's PATH) records the GH_TOKEN | INSTABOX_API_KEY the fetch would see; it then runs the real one.
+REALTO=$(command -v timeout) && {
+  mkdir -p "$HOME/.local/bin"
+  cat >"$HOME/.local/bin/timeout" <<SHIM
+#!/bin/sh
+printf '%s|%s\n' "\${GH_TOKEN-unset}" "\${INSTABOX_API_KEY-unset}" >>"$T/envseen"
+exec "$REALTO" "\$@"
+SHIM
+  chmod +x "$HOME/.local/bin/timeout"
+  mkproj tk; adv tk a.txt r-tk; cfg tk
+  # tokrun [VAR=value ...]: one timer run with no GH_TOKEN / INSTABOX_API_KEY in the environment (unless given); prints what the fetch saw
+  tokrun() { : >"$T/envseen"; env -u GH_TOKEN -u INSTABOX_API_KEY "$@" bash "$SYNC" >"$T/run.out" 2>&1; tr '\n' ' ' <"$T/envseen" | sed 's/ $//'; }
+  V="$T/vault-env"
+  printf 'echo noise\nexport INSTABOX_API_KEY=ikey-secret-9\nexport GH_TOKEN_X=nope\nexport OLD_GH_TOKEN=bad\n#GH_TOKEN=bad\nexport GH_TOKEN="tok-vault-1"\nexport OTHER=zz\n' >"$V"
+  eq "vault: GH_TOKEN reaches the fetch, INSTABOX_API_KEY does not" "$(tokrun FCODE_SECRETS_ENV="$V")" "tok-vault-1|unset"
+  eq "vault: fetched fine, quiet, token in neither git-sync.json nor stderr, key not either" "$(q projects.tk.error)/$(wc -c <"$T/run.out" | tr -d ' ')/$(grep -rlE 'tok-vault-1|ikey-secret-9' "$HOME/.local/state" "$T/run.out" | wc -l | tr -d ' ')" "null/0/0"
+  printf 'GH_TOKEN=tok_bare.2\r\nINSTABOX_API_KEY=ikey-2\r\n' >"$V"
+  eq "vault: bare line with CRLF" "$(tokrun FCODE_SECRETS_ENV="$V")" "tok_bare.2|unset"
+  printf "export GH_TOKEN='tok-single'\n" >"$V"
+  eq "vault: single quotes" "$(tokrun FCODE_SECRETS_ENV="$V")" "tok-single|unset"
+  printf 'export GH_TOKEN=$(touch "%s/pwned")\n' "$T" >"$V"
+  eq "vault: a value that is not token-like is dropped and nothing is executed (the file is never sourced)" "$(tokrun FCODE_SECRETS_ENV="$V")/$([ -e "$T/pwned" ] && echo pwned || echo none)" "unset|unset/none"
+  printf 'export GH_TOKEN="a b"\n' >"$V"
+  eq "vault: a value with a space is dropped" "$(tokrun FCODE_SECRETS_ENV="$V")" "unset|unset"
+  printf 'export GH_TOKEN=tok-vault-1\n' >"$V"
+  eq "an already set GH_TOKEN wins over the vault" "$(tokrun FCODE_SECRETS_ENV="$V" GH_TOKEN=mine)" "mine|unset"
+  eq "no vault file: unchanged, no token" "$(tokrun FCODE_SECRETS_ENV="$T/missing-vault")/$(q projects.tk.error)" "unset|unset/null"
+  mkdir -p "$T/vault-dir"
+  eq "vault path is not a readable file: unchanged, no token, quiet" "$(tokrun FCODE_SECRETS_ENV="$T/vault-dir")/$(wc -c <"$T/run.out" | tr -d ' ')" "unset|unset/0"
+  printf 'export INSTABOX_API_KEY=ikey-3\n' >"$V"
+  eq "vault without a GH_TOKEN line: nothing taken (INSTABOX_API_KEY never)" "$(tokrun FCODE_SECRETS_ENV="$V")" "unset|unset"
+  printf 'export GH_TOKEN=tok-vault-1\n' >"$V"
+  : >"$T/envseen"; env -u GH_TOKEN -u INSTABOX_API_KEY FCODE_SECRETS_ENV="$V" bash "$SYNC" tk >"$T/run.out" 2>&1
+  eq "single-project run also gets it, same 55 s plan (one fetch)" "$(tr '\n' ' ' <"$T/envseen" | sed 's/ $//')" "tok-vault-1|unset"
+  rm -f "$HOME/.local/bin/timeout"
+} || echo "note: no timeout command here, the GH_TOKEN tests are skipped"
+
+# ---- the script has no git command that writes to a repository except the one fast-forward ----
+CODE=$(sed 's/[[:space:]]#[[:space:]].*//; /^[[:space:]]*#/d' "$SYNC" | grep -v 'for f in MERGE_HEAD' | sed 's/\^{commit}//g') # (the marker names rebase-merge/-apply and the rev-parse peel are not git commands)
+eq "no checkout/reset/push/switch/rebase/update-ref/stash/pull/clean/commit/branch/tag in the code (comments aside)" "$(printf '%s\n' "$CODE" | grep -cE '\b(checkout|reset|push|switch|rebase|update-ref|stash|pull|clean|commit|branch -[dDmM]|tag -d)\b')" 0
+eq "the only merge is one --ff-only --no-overwrite-ignore on origin/<default>, hooks/gc/maintenance off, never under timeout" "$(printf '%s\n' "$CODE" | grep -cE '\bmerge\b' | tr -d ' ')/$(printf '%s\n' "$CODE" | grep -c 'merge --ff-only --quiet --no-edit --no-overwrite-ignore "refs/remotes/origin/\$def"')/$(printf '%s\n' "$CODE" | grep -c 'core.hooksPath=/dev/null')/$(printf '%s\n' "$CODE" | grep -c 'gc.auto=0 -c maintenance.auto=false -c core.hooksPath=/dev/null -c core.fsmonitor=false')/$(printf '%s\n' "$CODE" | grep -cE '\bx [0-9]')" "2/1/1/1/0"
 eq "the one fetch names the url and the explicit refspec, no prune, no tags, no FETCH_HEAD" "$(grep -c "fetch --no-write-fetch-head --no-tags --no-prune --no-recurse-submodules" "$SYNC")/$(grep -c "'+refs/heads/\*:refs/remotes/origin/\*'" "$SYNC")" 1/1
 
 echo

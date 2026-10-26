@@ -29,6 +29,8 @@ struct ProjectsView: View {
     @State private var lastOpened: String?
     @State private var flash: String?
     @State private var toast: String?
+    /// An add that finished with a cleanup warning: its notice stays until "Đã hiểu".
+    @State private var addedNotice: HomeLogic.AddState?
 
     /// Poll only while the list itself is on screen and the app is in the foreground.
     private var polling: Bool { path.isEmpty && scenePhase == .active }
@@ -61,6 +63,18 @@ struct ProjectsView: View {
                         .accessibilityHint("Chạm để ẩn")
                         .homeRow(top: 0, bottom: 8)
                     }
+                    if let banner = HomeLogic.ompFormatBanner(home.home) {
+                        Label(banner, systemImage: "exclamationmark.triangle")
+                            .scaledFont(14)
+                            .foregroundColor(.orangeTone)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 10)
+                            .background(Color.orangeTone.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .accessibilityElement(children: .combine)
+                            .homeRow(top: 0, bottom: 8)
+                    }
                     if let errorText = model.errorText {
                         Label(errorText, systemImage: "exclamationmark.triangle")
                             .font(.footnote)
@@ -87,7 +101,9 @@ struct ProjectsView: View {
                 .safeAreaInset(edge: .bottom) { Color.clear.frame(height: 60) }
                 .overlay(alignment: .bottomTrailing) { fab }
                 .overlay(alignment: .top) { StatusBarCover() }
-                .overlay(alignment: .top) { ToastView(text: $toast) }
+                .overlay(alignment: .top) { CleanupNotice(added: $addedNotice) }
+                // No toast over the cleanup notice; a pending one shows once the notice is closed.
+                .overlay(alignment: .top) { if addedNotice == nil { ToastView(text: $toast) } }
                 .background(SwipeBackEnabler().frame(width: 0, height: 0))
             }
             .toolbar(.hidden, for: .navigationBar)
@@ -102,7 +118,9 @@ struct ProjectsView: View {
                 }
             }
             .task(id: polling) {
-                guard polling else { return }
+                let on = polling
+                await MainActor.run { home.visible = on }
+                guard on else { return }
                 while !Task.isCancelled {
                     await home.load(app)
                     try? await Task.sleep(nanoseconds: 60_000_000_000)
@@ -134,6 +152,12 @@ struct ProjectsView: View {
                 if let name = openAfterSheet {
                     openAfterSheet = nil
                     open(name)
+                }
+                // Read the cleanup notice once the sheet is gone (while it closes, VoiceOver would cut it off).
+                if let text = addedNotice?.message {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        UIAccessibility.post(notification: .announcement, argument: text)
+                    }
                 }
             }) { which in
                 sheetView(which).environmentObject(app)
@@ -168,7 +192,17 @@ struct ProjectsView: View {
                             loadError: model.errorText,
                             sessions: allSessions,
                             initialProject: project,
-                            onOpened: { openAfterSheet = $0 })
+                            clockOffset: home.offset,
+                            onOpened: { openAfterSheet = $0 },
+                            onAdded: { result in
+                                if result.cleanup != nil { addedNotice = result } else { toast = result.message }
+                                // The new project shows on the cards and in "+" without waiting for the next poll.
+                                Task {
+                                    async let cards: Void = home.load(app, fresh: true)
+                                    await model.load(app)
+                                    await cards
+                                }
+                            })
         case .rename(let name):
             RenameSheet(name: name, taken: Set(allSessions.map(\.name))) { newName in
                 await model.rename(name, to: newName, app: app)
@@ -334,7 +368,16 @@ struct ProjectsView: View {
                            waiting: waiting > 0, lines: lines, selected: project == id,
                            onTap: { withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) { project = id } },
                            onMore: { sheet = .new(project: id == "all" ? nil : id) },
-                           showMore: id != "all")
+                           showMore: id != "all",
+                           staging: id == "all" ? nil
+                               : HomeLogic.stagingChip(info?.staging, startedAt: home.stagingStarted[id], now: Date()),
+                           onStartStaging: { startStaging(id) })
+    }
+
+    private func startStaging(_ project: String) {
+        Task {
+            if let failure = await home.startStaging(project, app: app) { toast = failure }
+        }
     }
 
     // MARK: - Sessions
@@ -558,6 +601,58 @@ struct ToastView: View {
     }
 }
 
+/// Added, but the box could not delete its check branch on GitHub: unlike the toast it stays
+/// until "Đã hiểu", wraps, and the branch can be selected and copied.
+struct CleanupNotice: View {
+    @Binding var added: HomeLogic.AddState?
+    @Environment(\.openURL) private var openURL
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        Group {
+            if let a = added, let c = a.cleanup {
+                VStack(alignment: .leading, spacing: 10) {
+                    Label {
+                        Text(a.message ?? "").textSelection(.enabled)
+                    } icon: {
+                        Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orangeTone)
+                    }
+                    .scaledFont(14.5)
+                    .foregroundColor(.white)
+                    .fixedSize(horizontal: false, vertical: true)
+                    Text(c.branch)
+                        .scaledFont(13, design: .monospaced)
+                        .foregroundColor(.white)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .background(Color.black, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .accessibilityLabel("Nhánh kiểm tra")
+                        .accessibilityValue(c.branch)
+                    HStack(spacing: 10) {
+                        Button("Mở GitHub") { openURL(c.url) }
+                            .accessibilityHint("Mở trang các nhánh của repo")
+                        Button("Đã hiểu") { added = nil }
+                    }
+                    .buttonStyle(PrimaryButtonStyle(fill: .grp2, text: .accentBlue))
+                }
+                .padding(14)
+                .background(Color.grp, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Color.orangeTone.opacity(0.6), lineWidth: 1))
+                .shadow(color: .black.opacity(0.5), radius: 12, y: 6)
+                .padding(.horizontal, 16)
+                .padding(.top, 12)
+                .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
+                .transition(reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity))
+                .accessibilityElement(children: .contain)
+            }
+        }
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: added)
+    }
+}
+
 // MARK: - Project card
 
 struct ProjectLine {
@@ -576,6 +671,8 @@ struct ProjectCard: View {
     let onTap: () -> Void
     let onMore: () -> Void
     let showMore: Bool
+    var staging: HomeLogic.StagingChip? = nil
+    var onStartStaging: () -> Void = {}
     @State private var pressing = false
 
     var body: some View {
@@ -598,6 +695,7 @@ struct ProjectCard: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.85)
             }
+            if let s = staging { stagingRow(s) }
         }
         .padding(.top, 11).padding(.horizontal, 12).padding(.bottom, 10)
         .frame(width: 182, alignment: .topLeading)
@@ -632,6 +730,38 @@ struct ProjectCard: View {
         // A double tap filters (the combined "…" button would otherwise take it).
         .accessibilityAction(.default, onTap)
         .accessibilityAction(named: "Mở phiên mới", onMore)
+        .accessibilityActions {
+            if staging?.canStart == true { Button("Bật staging", action: onStartStaging) }
+        }
+    }
+
+    /// Bottom line: the staging box state, with "Bật" while it is paused or off.
+    private func stagingRow(_ s: HomeLogic.StagingChip) -> some View {
+        HStack(spacing: 6) {
+            StatusDot(state: s.dot)
+            Text(s.text)
+                .scaledFont(12.5)
+                .foregroundColor(.l2)
+                .lineLimit(1)
+                .minimumScaleFactor(0.85)
+            Spacer(minLength: 0)
+            if s.canStart {
+                Button(action: onStartStaging) {
+                    Text("Bật")
+                        .scaledFont(12.5, weight: .semibold)
+                        .foregroundColor(.accentBlue)
+                        .padding(.horizontal, 10)
+                        .frame(minHeight: 24)
+                        .background(Color.fill3, in: Capsule())
+                        .padding(.vertical, 4)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Bật staging")
+            }
+        }
+        .frame(minHeight: 24)
+        .padding(.top, 3)
     }
 }
 

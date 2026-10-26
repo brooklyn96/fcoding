@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 // MARK: - Sheet chrome (mockup .sheet: header row that scrolls, 16 pt sides)
 
@@ -226,6 +227,9 @@ struct HomeGuideView: View {
             "Mỗi thẻ dự án cho biết số **PR** đang mở, kết quả **checks** và lần **deploy** gần nhất.",
             "Chạm vào thẻ để chỉ xem phiên của dự án đó; chạm **Tất cả** để xem lại hết.",
             "Giữ lâu một thẻ, hoặc bấm **…**, để mở phiên mới cho dự án đó.",
+            "Dòng **Staging** cho biết box staging đang chạy hay đang nghỉ; bấm **Bật** để bật nó.",
+            "Trong **…** có **Phiên omp gần đây** (cả phiên từ laptop): bấm **Tiếp tục** để làm tiếp trên box.",
+            "Thêm dự án: bấm **+** → **Thêm dự án**, dán link repo GitHub hoặc chọn repo trong danh sách, rồi bấm **Thêm**.",
         ]),
     ]
 
@@ -305,13 +309,25 @@ struct NewSessionSheet: View {
     let loadError: String?
     let sessions: [OverviewSession]
     let initialProject: String?
+    /// Server clock minus phone clock (HomeModel.offset), for the omp sessions' times.
+    var clockOffset: TimeInterval = 0
     let onOpened: (String) -> Void
+    /// A project was added (the finished add: toast text or cleanup notice); the sheet then closes.
+    let onAdded: (HomeLogic.AddState) -> Void
     @EnvironmentObject private var app: AppState
     @Environment(\.dismiss) private var dismiss
     @State private var picked: String?
-    /// The harness whose POST /api/open is in flight; the sheet cannot be closed meanwhile.
+    /// Step 1 shows the "Thêm dự án" form instead of the list.
+    @State private var adding = false
+    /// The harness whose POST /api/open is in flight, or "r:<id>" for an omp resume; the sheet
+    /// cannot be closed meanwhile.
     @State private var opening: String?
     @State private var errorText: String?
+    /// Recent omp sessions of the shown project; nil while loading.
+    @State private var omp: [OmpSession]?
+    @State private var ompError: String?
+    /// The server has no omp-sessions route: the section is left out.
+    @State private var ompHidden = false
 
     static let harnesses = ["omp", "claude", "codex"]
 
@@ -319,8 +335,15 @@ struct NewSessionSheet: View {
         SheetScaffold {
             if let p = picked ?? initialProject {
                 let back: (String, () -> Void) = initialProject != nil ? ("Huỷ", { dismiss() })
-                                                                         : ("‹ Dự án", { picked = nil; errorText = nil })
-                SheetHeader(title: initialProject ?? "Phiên mới", left: back)
+                                                                         : ("‹ Dự án", {
+                                                                             picked = nil
+                                                                             errorText = nil
+                                                                             // The next project must not show this one's rows.
+                                                                             omp = nil
+                                                                             ompError = nil
+                                                                         })
+                // Off while a session opens: a late reply would open it after the sheet is gone.
+                SheetHeader(title: initialProject ?? "Phiên mới", left: back).disabled(opening != nil)
                 (Text(initialProject != nil ? "" : "Bước 2/2 · ") + Text("Chọn chương trình cho ") + Text(p).bold())
                     .stepCaption()
                 options(Self.harnesses) { h in
@@ -336,14 +359,25 @@ struct NewSessionSheet: View {
                 }
                 if let errorText = errorText {
                     Label(errorText, systemImage: "exclamationmark.triangle").scaledFont(13).foregroundColor(.redTone)
+                        .padding(.bottom, 14)
                 }
+                if !ompHidden {
+                    ompSection(p).task(id: p) { await loadOmp(p) }
+                }
+            } else if adding {
+                AddProjectForm(onBack: { adding = false }, onAdded: { result in
+                    onAdded(result)
+                    dismiss()
+                })
             } else {
                 SheetHeader(title: "Phiên mới", left: ("Huỷ", { dismiss() }))
                 Text("Bước 1/2 · Chọn dự án").stepCaption()
                 if let projects = projects {
                     if projects.isEmpty {
                         Text("Chưa có dự án nào trong cấu hình máy chủ.").sheetBody()
+                        addRow
                     } else {
+                        addRow
                         options(projects) { p in
                                 row(disabled: false, action: { picked = p }) {
                                     Image(systemName: "folder")
@@ -375,6 +409,26 @@ struct NewSessionSheet: View {
         Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundColor(.l3)
     }
 
+    /// "Thêm dự án": clone a GitHub repo onto the box and add it to the list.
+    private var addRow: some View {
+        options(["add"]) { _ in
+            row(disabled: false, action: { adding = true }) {
+                Image(systemName: "plus")
+                    .scaledFont(16, weight: .semibold)
+                    .foregroundColor(.greenTone)
+                    .frame(width: 34, height: 34)
+                    .background(Color.greenTone.opacity(0.16), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Thêm dự án").scaledFont(15, weight: .semibold)
+                    Text("tải một repo GitHub về box").scaledFont(13).foregroundColor(.l2)
+                }
+                Spacer()
+                chevron
+            }
+        }
+    }
+
     /// Grouped rows with 0.5 pt hairlines between them (mockup .opts).
     private func options<C: View>(_ items: [String], @ViewBuilder _ content: @escaping (String) -> C) -> some View {
         VStack(spacing: 0) {
@@ -397,6 +451,127 @@ struct NewSessionSheet: View {
         }
         .buttonStyle(.plain)
         .disabled(disabled)
+    }
+
+    // MARK: Recent omp sessions (laptop and box), "Tiếp tục" resumes one in a box tmux session
+
+    private func ompSection(_ project: String) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Phiên omp gần đây")
+                .scaledFont(13)
+                .foregroundColor(.l2)
+                .padding(.horizontal, 4)
+                .padding(.bottom, 6)
+                .accessibilityAddTraits(.isHeader)
+            if let list = omp, !list.isEmpty {
+                VStack(spacing: 0) {
+                    ForEach(list.indices, id: \.self) { i in
+                        if i > 0 { Rectangle().fill(Color.hair).frame(height: 0.5) }
+                        ompRow(list[i], project: project)
+                    }
+                }
+                .background(Color.grp2, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            } else {
+                HStack(spacing: 8) {
+                    if let ompError = ompError {
+                        Label(ompError, systemImage: "exclamationmark.triangle").foregroundColor(.redTone)
+                    } else if omp == nil {
+                        ProgressView()
+                        Text("Đang tải…").foregroundColor(.l2)
+                    } else {
+                        Text("Chưa có phiên omp nào cho dự án này.").foregroundColor(.l2)
+                    }
+                }
+                .scaledFont(14)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                .padding(.horizontal, 12)
+                .background(Color.grp2, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
+        }
+    }
+
+    private func ompRow(_ s: OmpSession, project: String) -> some View {
+        let title = HomeLogic.ompTitle(s.title), origin = HomeLogic.ompOrigin(s.origin)
+        let when = HomeLogic.ompWhen(s, now: Date().addingTimeInterval(clockOffset))
+        return HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .scaledFont(15, weight: .semibold)
+                    .foregroundColor(s.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .l2 : .primary)
+                    .lineLimit(2)
+                HStack(spacing: 6) {
+                    HStack(spacing: 3) {
+                        Image(systemName: origin == "laptop" ? "laptopcomputer" : "server.rack").scaledFont(9)
+                        Text(origin).font(.system(.caption2, design: .monospaced, weight: .semibold))
+                    }
+                    .foregroundColor(origin == "laptop" ? .accentBlue : HarnessStyle.color("omp"))
+                    .padding(.horizontal, 6)
+                    .frame(minHeight: 17)
+                    .background((origin == "laptop" ? Color.accentBlue : HarnessStyle.color("omp")).opacity(0.17),
+                                in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                    if !when.isEmpty { Text(when).scaledFont(12.5).foregroundColor(.l2) }
+                }
+                .lineLimit(1)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(title + ", từ " + origin + (when.isEmpty ? "" : ", " + when))
+            Spacer(minLength: 4)
+            if opening == "r:" + s.id {
+                ProgressView().frame(minWidth: 44, minHeight: 44)
+            } else {
+                Button { Task { await resume(project, s) } } label: {
+                    Text("Tiếp tục")
+                        .scaledFont(14.5, weight: .semibold)
+                        .foregroundColor(.accentBlue)
+                        .padding(.horizontal, 14)
+                        .frame(minHeight: 32)
+                        .background(Color.fill3, in: Capsule())
+                        .frame(minHeight: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(opening != nil)
+                .opacity(opening != nil ? 0.5 : 1)
+                .accessibilityLabel("Tiếp tục phiên " + title)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(minHeight: 56)
+    }
+
+    private func loadOmp(_ project: String) async {
+        guard let api = app.api else { return }
+        omp = nil
+        ompError = nil
+        do {
+            omp = try await api.ompSessions(project: project)
+        } catch {
+            if error is CancellationError || (error as? URLError)?.code == .cancelled { return }
+            let e = error as? APIError
+            if HomeLogic.ompListHidden(status: e?.status ?? 0, code: e?.code) {
+                ompHidden = true
+            } else {
+                ompError = e?.code == "unknown_project" ? "Dự án này không có trên box." : app.report(error)
+            }
+        }
+    }
+
+    private func resume(_ project: String, _ s: OmpSession) async {
+        guard let api = app.api, opening == nil else { return }
+        opening = "r:" + s.id
+        defer { opening = nil }
+        do {
+            let name = try await api.resumeOmp(project: project, id: s.id)
+            errorText = nil
+            onOpened(name)
+            dismiss()
+        } catch {
+            let e = error as? APIError
+            errorText = HomeLogic.ompResumeFailure(status: e?.status ?? 0, code: e?.code) ?? app.report(error)
+            if e?.code == "unknown_session" { await loadOmp(project) }
+        }
     }
 
     private func detail(_ project: String) -> String {
@@ -426,6 +601,290 @@ struct NewSessionSheet: View {
 private extension Text {
     func stepCaption() -> some View {
         scaledFont(13).foregroundColor(.l2).frame(maxWidth: .infinity).multilineTextAlignment(.center).padding(.bottom, 10)
+    }
+}
+
+// MARK: - Add project (POST /api/projects, then GET the job every 2 s while the form is shown)
+
+struct AddProjectForm: View {
+    let onBack: () -> Void
+    let onAdded: (HomeLogic.AddState) -> Void
+    @EnvironmentObject private var app: AppState
+    @Environment(\.openURL) private var openURL
+    @State private var repoText = ""
+    @State private var nameText = ""
+    @State private var add = HomeLogic.AddState()
+    @State private var copied = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// "Hoặc chọn repo": nil while loading; `listNote` replaces it; `listHidden` on an older server.
+    @State private var repos: [GitHubRepo]?
+    @State private var listNote: (text: String, retry: Bool)?
+    @State private var listHidden = false
+    @State private var listLoad = 0
+    @State private var query = ""
+
+    /// The write flag of the NEED_KEY / NEED_WRITE step; nil otherwise.
+    private var needKey: Bool? {
+        if case .needKey(let write) = add.phase { return write }
+        return nil
+    }
+
+    var body: some View {
+        let repo = HomeLogic.cleanRepo(repoText)
+        let locked = add.busy || needKey != nil
+        // The name placeholder: the default name once the link is valid.
+        let fallback = HomeLogic.validRepo(repo) ? HomeLogic.projectName(repo: repo, typed: "") : "theo tên repo"
+        ScrollViewReader { proxy in
+        VStack(alignment: .leading, spacing: 0) {
+            SheetHeader(title: "Thêm dự án", left: ("‹ Dự án", onBack)).id("addTop")
+            caption("Link repo GitHub")
+            field("https://github.com/ten-tai-khoan/ten-repo", text: $repoText, label: "Link repo GitHub")
+                .keyboardType(.URL)
+                .disabled(locked)
+            // The owner/repo the box will clone (the link reduced), or a blank line.
+            Text(HomeLogic.validRepo(repo) ? "Repo: " + repo : " ")
+                .scaledFont(13, design: .monospaced)
+                .foregroundColor(.l2)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .padding(.top, 6)
+                .padding(.bottom, 12)
+            caption("Tên (không bắt buộc)")
+            field(fallback, text: $nameText, label: "Tên dự án")
+                .disabled(locked)
+                .padding(.bottom, 14)
+            if needKey == nil {
+                Button("Thêm") { send(.submit(repo: repoText, name: nameText)) }
+                    .buttonStyle(PrimaryButtonStyle())
+                    .disabled(add.busy || repo.isEmpty)
+                    .padding(.bottom, 12)
+            }
+            if add.busy {
+                HStack(spacing: 8) {
+                    ProgressView()
+                    Text("Đang tải repo về box… (có thể đóng, box vẫn tải tiếp)").scaledFont(14).foregroundColor(.l2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .accessibilityElement(children: .combine)
+            } else if let write = needKey {
+                keySteps(write)
+            } else if let message = add.message {
+                Label(message, systemImage: "exclamationmark.triangle")
+                    .scaledFont(13)
+                    .foregroundColor(.redTone)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let detail = add.detail {
+                    Text(detail).scaledFont(12).foregroundColor(.l3).padding(.top, 4).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            if !locked && !listHidden { repoList(proxy) }
+        }
+        }
+        .task(id: add.phase) { await run(add.phase) }
+        .task(id: listLoad) { await loadRepos() }
+    }
+
+    // MARK: Repo list
+
+    @ViewBuilder
+    private func repoList(_ proxy: ScrollViewProxy) -> some View {
+        Text("Hoặc chọn repo").scaledFont(13).foregroundColor(.l2).padding(.top, 22).padding(.bottom, 6)
+        if let note = listNote {
+            Text(note.text).sheetBody()
+            if note.retry {
+                Button("Thử lại") {
+                    listNote = nil
+                    listLoad += 1
+                }
+                .buttonStyle(PrimaryButtonStyle(fill: .grp2, text: .accentBlue))
+            }
+        } else if let repos = repos {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass").foregroundColor(.l3).accessibilityHidden(true)
+                TextField("Tìm repo", text: $query)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .accessibilityLabel("Tìm repo")
+            }
+            .scaledFont(15)
+            .padding(.horizontal, 12)
+            .frame(minHeight: 44)
+            .background(Color.grp2, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .padding(.bottom, 10)
+            let shown = HomeLogic.filterRepos(repos, query: query)
+            if shown.isEmpty {
+                Text(repos.isEmpty ? "Chưa có repo nào." : "Không có repo khớp.").sheetBody()
+            } else {
+                LazyVStack(spacing: 0) {
+                    ForEach(Array(shown.enumerated()), id: \.element.id) { i, r in
+                        if i > 0 { Rectangle().fill(Color.hair).frame(height: 0.5) }
+                        repoRow(r, proxy)
+                    }
+                }
+                .background(Color.grp2, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
+        } else {
+            HStack(spacing: 8) {
+                ProgressView()
+                Text("Đang tải danh sách repo…").scaledFont(14).foregroundColor(.l2)
+            }
+            .accessibilityElement(children: .combine)
+        }
+    }
+
+    private func repoRow(_ r: GitHubRepo, _ proxy: ScrollViewProxy) -> some View {
+        let state = HomeLogic.repoRow(r)
+        let sub = [state.note ?? "", HomeLogic.repoUpdated(r.updatedAt, now: Date())].filter { !$0.isEmpty }
+        return Button {
+            // The name stays as typed: empty, the placeholder (and the POST) take the default of the current link.
+            repoText = "https://github.com/" + r.repo
+            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.3)) { proxy.scrollTo("addTop", anchor: .top) }
+        } label: {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(r.repo).scaledFont(15, weight: .semibold).lineLimit(1).truncationMode(.middle)
+                    if r.isPrivate {
+                        Text("riêng tư")
+                            .scaledFont(11, weight: .semibold)
+                            .foregroundColor(.orangeTone)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(Color.orangeTone.opacity(0.16), in: Capsule())
+                    }
+                }
+                if !sub.isEmpty { Text(sub.joined(separator: " · ")).scaledFont(13).foregroundColor(.l2) }
+            }
+            .frame(maxWidth: .infinity, minHeight: 56, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!state.pickable)
+        .opacity(state.pickable ? 1 : 0.45)
+        .accessibilityHint(state.pickable ? "Chạm để điền link repo" : "")
+    }
+
+    private func loadRepos() async {
+        guard let api = app.api else { return }
+        do {
+            let reply = try await api.githubRepos()
+            if let note = HomeLogic.repoListNote(reason: reply.reason, status: nil, text: nil) { listNote = note } else { repos = reply.repos }
+        } catch {
+            if Task.isCancelled { return }
+            let e = error as? APIError
+            if let note = HomeLogic.repoListNote(reason: nil, status: e?.status ?? 0, text: app.report(error)) {
+                listNote = note
+            } else {
+                listHidden = true
+            }
+        }
+    }
+
+    private func caption(_ s: String) -> some View {
+        Text(s).scaledFont(13).foregroundColor(.l2).padding(.bottom, 6)
+    }
+
+    private func field(_ placeholder: String, text: Binding<String>, label: String) -> some View {
+        TextField(placeholder, text: text)
+            .scaledFont(15, design: .monospaced)
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+            .padding(.horizontal, 12)
+            .frame(minHeight: 44)
+            .background(Color.grp2, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .accessibilityLabel(label)
+    }
+
+    /// NEED_KEY / NEED_WRITE: the user adds the box's public key on GitHub, then retries.
+    private func keySteps(_ write: Bool) -> some View {
+        let steps = [
+            "Bấm **Sao chép khóa** bên dưới.",
+            "Bấm **Mở GitHub**, dán khóa vào ô **Key**, đặt tên **fcode coder**.",
+            "Tích ô **Allow write access** (box cần quyền ghi).",
+            "Bấm **Add key**, rồi quay lại đây bấm **Thử lại**.",
+        ]
+        return VStack(alignment: .leading, spacing: 0) {
+            Text(write ? "GitHub đã nhận khóa nhưng khóa chưa có quyền ghi. Xoá khóa “fcode coder” cũ ở trang Deploy keys, rồi làm lại các bước sau:"
+                       : "GitHub chưa cho box vào repo này (hoặc link repo chưa đúng). Làm một lần như sau:")
+                .sheetBody()
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(steps.indices, id: \.self) { k in
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text("\(k + 1).").monospacedDigit()
+                        Text(HomeGuideView.styled(steps[k]))
+                    }
+                    .scaledFont(14.5)
+                    .foregroundColor(.l2)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(.bottom, 12)
+            Text(add.pubkey ?? "")
+                .scaledFont(12, design: .monospaced)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(10)
+                .background(Color.grp2, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .accessibilityLabel("Khóa công khai của box")
+                .accessibilityValue(add.pubkey ?? "")
+                .padding(.bottom, 10)
+            HStack(spacing: 10) {
+                Button(copied ? "Đã sao chép" : "Sao chép khóa") {
+                    UIPasteboard.general.string = add.pubkey
+                    copied = true
+                }
+                Button("Mở GitHub") { if let url = add.keyUrl { openURL(url) } }
+                    .disabled(add.keyUrl == nil)
+            }
+            .buttonStyle(PrimaryButtonStyle(fill: .grp2, text: .accentBlue))
+            .padding(.bottom, 10)
+            if let detail = add.detail {
+                Text(detail).scaledFont(12).foregroundColor(.l3).padding(.bottom, 10).fixedSize(horizontal: false, vertical: true)
+            }
+            Button("Thử lại") {
+                copied = false
+                send(.retry)
+            }
+            .buttonStyle(PrimaryButtonStyle())
+        }
+    }
+
+    private func send(_ event: HomeLogic.AddEvent) {
+        add = HomeLogic.addReduce(add, event)
+        if add.phase == .done { onAdded(add) }
+    }
+
+    /// The effect of each phase; a new phase (or closing the form) cancels the one before.
+    private func run(_ phase: HomeLogic.AddState.Phase) async {
+        guard let api = app.api else { return }
+        switch phase {
+        case .posting:
+            do {
+                let job = try await api.addProject(repo: add.repo, name: add.name)
+                if !Task.isCancelled { send(.accepted(job: job)) }
+            } catch {
+                if Task.isCancelled { return }
+                let e = error as? APIError
+                send(.postFailed(status: e?.status ?? 0, code: e?.code ?? "", text: app.report(error)))
+            }
+        case .polling(let id):
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                if Task.isCancelled { return }
+                do {
+                    let job = try await api.projectJob(id)
+                    if !Task.isCancelled { send(.polled(job)) }
+                } catch {
+                    if Task.isCancelled { return }
+                    let e = error as? APIError
+                    send(.pollFailed(status: e?.status ?? 0, code: e?.code ?? "", text: app.report(error)))
+                }
+            }
+        default:
+            return
+        }
     }
 }
 
