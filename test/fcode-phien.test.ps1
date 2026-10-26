@@ -412,14 +412,14 @@ function New-World([string]$Name) {
     BS = Join-Path $bh ('.omp\agent\sessions\' + (Get-OmpEncodedDir $bp ($bh -replace '\\', '/') (Join-Path $u 'AppData\Local\Temp')))
     LBlobs = Join-Path $u '.omp\agent\blobs'; BBlobs = Join-Path $bh '.omp\agent\blobs'; Log = Join-Path $w 'ssh.log' }
 }
-function Invoke-Fcode($World, [string[]]$FArgs, [hashtable]$ExtraEnv = @{}) {
+function Invoke-Fcode($World, [string[]]$FArgs, [hashtable]$ExtraEnv = @{}, [string]$InText = $null) {
   $ErrorActionPreference = 'Continue'   # Windows PowerShell 5.1 turns native stderr into errors under Stop
   $save = @{}
   $set = @{ USERPROFILE = $World.U; LOCALAPPDATA = (Join-Path $World.U 'AppData\Local'); FCODE_PHIEN_BOXENV = ('HOME=' + ($World.BH -replace '\\', '/') + ' FCODE_CFG=' + ($World.Cfg -replace '\\', '/')); FAKE_SSH_LOG = $World.Log; TEMP = (Join-Path $World.U 'AppData\Local\Temp'); TMP = (Join-Path $World.U 'AppData\Local\Temp') }
   foreach ($k in $ExtraEnv.Keys) { $set[$k] = $ExtraEnv[$k] }
   foreach ($k in $set.Keys) { $save[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k, $set[$k]) }
   try {
-    $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Fcode @FArgs 2>&1 | Out-String
+    $out = if ($InText) { $InText | & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Fcode @FArgs 2>&1 | Out-String } else { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Fcode @FArgs 2>&1 | Out-String }
     [pscustomobject]@{ Code = $LASTEXITCODE; Out = $out }
   } finally { foreach ($k in $save.Keys) { [Environment]::SetEnvironmentVariable($k, $(if ($null -eq $save[$k]) { [NullString]::Value } else { $save[$k] })) } }
 }
@@ -701,11 +701,11 @@ if ($env:FCODE_TEST_BOX) {
     $w = New-World 'real1'
     [void](New-Item -ItemType Directory -Path (Join-Path $w.U 'Desktop\other'), (Join-Path $w.U 'Desktop\notonbox') -Force)
     [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ instabox = $RealIb; box = 'coder'; syncRepos = @($w.LP) } | ConvertTo-Json -Compress))
-    $enc = Get-OmpEncodedDir $bp $bt '/tmp'
+    $enc = Get-OmpEncodedDir $bp $bt "$bt/tmp"
     $sd = "$bt/.omp/agent/sessions/$enc"
     try {
       $cfgB64 = [Convert]::ToBase64String($utf8.GetBytes((@{ projects = @{ proj = $bp } } | ConvertTo-Json -Compress)))
-      [void](Invoke-RealBox "mkdir -p $bp $sd $bt/.omp/agent/blobs && git -C $bp init -q && echo $cfgB64 | base64 -d > $bt/cfg.json && echo ready")
+      [void](Invoke-RealBox "mkdir -p $bp $sd $bt/tmp $bt/.omp/agent/blobs && git -C $bp init -q && echo $cfgB64 | base64 -d > $bt/cfg.json && echo ready")
       # box side fixtures (made on the box): one session + one handoff
       $bid = 'b0000000-0000-7000-8000-00000000000b'; $bname = "2026-10-19T10-00-00-000Z_$bid.jsonl"
       $bcontent = (@('{"type":"title","v":1,"title":"B","updatedAt":"2026-10-25T16:18:25.246Z","pad":"  "}', ('{"cwd":"' + $bp + '","id":"' + $bid + '","timestamp":"t","type":"session","version":3}'), (Msg 'b')) -join "`n") + "`n"
@@ -717,7 +717,7 @@ if ($env:FCODE_TEST_BOX) {
       $a = New-Sess $w.LS 'a0000000-0000-7000-8000-00000000000a' $w.LP @('a', ('blob:sha256:' + $h1)) 'A' "`n" '2026-10-20T10-00-00-000Z'
       [void](New-Item -ItemType Directory -Path $w.LBlobs); [IO.File]::WriteAllText((Join-Path $w.LBlobs ($h1 + '.png')), 'png'); Set-Age (Join-Path $w.LBlobs ($h1 + '.png')) 600
       Put-File "$($w.LP)\HANDOFF-laptop.md" 'laptop handoff'
-      $env0 = @{ FCODE_PHIEN_BOXENV = "HOME=$bt FCODE_CFG=$bt/cfg.json" }
+      $env0 = @{ FCODE_PHIEN_BOXENV = "HOME=$bt TMPDIR=$bt/tmp FCODE_CFG=$bt/cfg.json" }   # TMPDIR: the leftover sweep stays inside the throwaway dir
       $r = Invoke-Fcode $w @('phien') $env0; Eq $r.Code 0 $r.Out
       Ok ($r.Out -match '== proj: gửi 1 phiên lên box, lấy 1 phiên về') ("summary; out: " + $r.Out)
       Ok (Test-Path (Join-Path $w.LS $bname)) 'box session arrived on the laptop'
@@ -731,7 +731,7 @@ if ($env:FCODE_TEST_BOX) {
       Ok ((Invoke-RealBox "cat $bp/.git/info/exclude") -match '(?m)^/HANDOFF-laptop\.md$') 'exclude on the box'
       Ok ((Invoke-RealBox "git -C $bp status --porcelain") -notmatch 'HANDOFF-laptop') 'the synced note does not show in box git status (the box-made source file is left as it was)'
       # omp itself, on the box, in the throwaway profile
-      $o = Invoke-RealBox "cd $bp && printf '{`"id`":`"1`",`"type`":`"get_state`"}\n' | HOME=$bt PI_CODING_AGENT_DIR=$bt/.omp/agent timeout 60 /data/home/.local/bin/omp --mode rpc --no-extensions --no-skills --no-rules --no-title --model openai/gpt-5.5 --api-key sk-dummy -r a0000000 | grep -o '`"sessionFile`":`"[^`"]*`"' | head -n 1"
+      $o = Invoke-RealBox "cd $bp && printf '{`"id`":`"1`",`"type`":`"get_state`"}\n' | HOME=$bt TMPDIR=$bt/tmp PI_CODING_AGENT_DIR=$bt/.omp/agent timeout 60 /data/home/.local/bin/omp --mode rpc --no-extensions --no-skills --no-rules --no-title --model openai/gpt-5.5 --api-key sk-dummy -r a0000000 | grep -o '`"sessionFile`":`"[^`"]*`"' | head -n 1"
       Ok ($o -like "*$($aname)*") "omp on the box resolved the synced session: $o"
       # second run
       $r2 = Invoke-Fcode $w @('phien') $env0; Eq $r2.Code 0 $r2.Out
@@ -742,12 +742,12 @@ if ($env:FCODE_TEST_BOX) {
     $bt = Invoke-RealBox 'mktemp -d /tmp/fcode-phien-test-XXXXXXXX'; Ok ($bt -match '\A/tmp/fcode-phien-test-[A-Za-z0-9]{8}\z') "throwaway dir: $bt"; $bp = "$bt/ws/proj"
     $w = New-World 'real2'
     [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ instabox = $RealIb; box = 'coder'; syncRepos = @($w.LP) } | ConvertTo-Json -Compress))
-    $sd = "$bt/.omp/agent/sessions/$(Get-OmpEncodedDir $bp $bt '/tmp')"
+    $sd = "$bt/.omp/agent/sessions/$(Get-OmpEncodedDir $bp $bt "$bt/tmp")"
     try {
       $cfgB64 = [Convert]::ToBase64String($utf8.GetBytes((@{ projects = @{ proj = $bp } } | ConvertTo-Json -Compress)))
-      [void](Invoke-RealBox "mkdir -p $bp $sd && echo $cfgB64 | base64 -d > $bt/cfg.json")
+      [void](Invoke-RealBox "mkdir -p $bp $sd $bt/tmp && echo $cfgB64 | base64 -d > $bt/cfg.json")
       $a = New-Sess $w.LS 'a0000000-0000-7000-8000-0000000000b5' $w.LP @('a') 'A' "`n" '2026-10-20T10-00-00-000Z'; $an = Split-Path $a -Leaf
-      $env0 = @{ FCODE_PHIEN_BOXENV = "HOME=$bt FCODE_CFG=$bt/cfg.json" }
+      $env0 = @{ FCODE_PHIEN_BOXENV = "HOME=$bt TMPDIR=$bt/tmp FCODE_CFG=$bt/cfg.json" }
       $r = Invoke-Fcode $w @('phien') $env0; Eq $r.Code 0 $r.Out
       $len0 = Invoke-RealBox "stat -c %s $sd/$an"
       Add-Msgs $a @('b')
@@ -1144,13 +1144,13 @@ T 'e2e: the auto deadline holds while stdin is blocked: the stalled call is kill
   $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
   Ok ((Test-Path (Join-Path $w.BS (Split-Path $a -Leaf))) -and (Test-Path (Join-Path $w.BS (Split-Path $b -Leaf)))) 'the next run sends both'
 }
-function New-Origin([string]$Bare) {
+function New-Origin([string]$Bare, [string]$Branch = 'main') {
   $ErrorActionPreference = 'Continue'
-  & git -c init.defaultBranch=main init -q --bare $Bare 2>&1 | Out-Null
-  & git -c init.defaultBranch=main init -q "$Bare-work" 2>&1 | Out-Null
-  Put-File "$Bare-work\README.md" 'r'; Git-Commit "$Bare-work" @('README.md'); & git -C "$Bare-work" push -q $Bare HEAD:main 2>&1 | Out-Null
+  & git -c init.defaultBranch=$Branch init -q --bare $Bare 2>&1 | Out-Null
+  & git -c init.defaultBranch=$Branch init -q "$Bare-work" 2>&1 | Out-Null
+  Put-File "$Bare-work\README.md" 'r'; Git-Commit "$Bare-work" @('README.md'); & git -C "$Bare-work" push -q $Bare "HEAD:$Branch" 2>&1 | Out-Null
 }
-function Push-Origin([string]$Bare, [string]$Name, [string]$Text) { $ErrorActionPreference = 'Continue'; Put-File "$Bare-work\$Name" $Text; Git-Commit "$Bare-work" @($Name); & git -C "$Bare-work" push -q $Bare HEAD:main 2>&1 | Out-Null }
+function Push-Origin([string]$Bare, [string]$Name, [string]$Text, [string]$Branch = 'main') { $ErrorActionPreference = 'Continue'; Put-File "$Bare-work\$Name" $Text; Git-Commit "$Bare-work" @($Name); & git -C "$Bare-work" push -q $Bare "HEAD:$Branch" 2>&1 | Out-Null }
 function Fetch-Origin([string]$Dir, [string]$Bare) { $ErrorActionPreference = 'Continue'; & git -C $Dir remote add origin $Bare 2>&1 | Out-Null; & git -C $Dir fetch -q origin 2>&1 | Out-Null }
 T 'e2e: a note that origin/<default> already tracks is never synced (laptop and box), and fcode''s own exclude line is given back once upstream tracks it' {
   $w = New-W2 'e2e26'
@@ -1171,6 +1171,184 @@ T 'e2e: a note that origin/<default> already tracks is never synced (laptop and 
   Ok ($r.Out -match 'ghi chú HANDOFF-rel\.md giờ do git theo dõi \(trên origin\): bản cũ trên laptop xóa được') ("release line; out: " + $r.Out)
   Ok ((Get-Content "$($w.LP)\.git\info\exclude" -Raw) -notmatch '(?m)^/HANDOFF-rel\.md\r?$') 'our line given back on the laptop'
   Eq (Get-Content "$($w.LP)\HANDOFF-rel.md" -Raw) 'from box' 'the old copy is not deleted'
+}
+
+# ============================== round 4: run order, leftovers, master fallback, sidecar order ==============================
+function Get-PhienStat($w) { Get-Content (Join-Path $w.U 'AppData\Local\fcode\phien-status.json') -Raw | ConvertFrom-Json }
+T 'e2e r4: a file > 50 MB that is cut every time goes last: the small sessions of both directions still sync, the status names it, a later good run finishes it' {
+  $w = New-W2 'e2e30'
+  $a = New-Sess $w.LS '0000000a-big1' $w.LP @('a'); Put-Big (Join-Path $a.Replace('.jsonl', '') 'huge.log') 60 51   # lowest id: planned first
+  $b = New-Sess $w.LS 'ffffffff-sml1' $w.LP @('b')
+  $c = New-Sess $w.BS 'cccccccc-box1' $w.BP @('c')
+  foreach ($i in 1, 2) {
+    $r = Invoke-Fcode $w @('phien') @{ FAKE_SSH_CUT = 'put:*:20000000:cut' }
+    Eq $r.Code 1 $r.Out
+    Ok (Test-Path (Join-Path $w.BS (Split-Path $b -Leaf))) "run $($i): the small laptop session after it is on the box"
+    Ok (Test-Path (Join-Path $w.LS (Split-Path $c -Leaf))) "run $($i): the box-only session came to the laptop"
+    Ok (-not (Test-Path (Join-Path $w.BS (Split-Path $a -Leaf)))) "run $($i): the big session's top waits"
+    Ok ($r.Out -match 'phiên lớn: \S*huge\.log chưa chép xong') ("named; out: " + $r.Out)
+    Ok (@(@((Get-PhienStat $w).unfinished) | Where-Object { $_ -like '*huge.log' }).Count -eq 1) 'unfinished in phien-status.json'
+  }
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
+  Ok (Test-Path (Join-Path $w.BS (Split-Path $a -Leaf))) 'a good run finishes it'; Eq @((Get-PhienStat $w).unfinished).Count 0 'status cleared'
+}
+T 'e2e r4: the same for a file > 50 MB on the box that is cut every time on the way down' {
+  $w = New-W2 'e2e31'
+  $a = New-Sess $w.BS '0000000b-big2' $w.BP @('a'); Put-Big (Join-Path $a.Replace('.jsonl', '') 'huge.log') 60 52
+  $b = New-Sess $w.BS 'fffffffe-sml2' $w.BP @('b')
+  $c = New-Sess $w.LS 'cccccccd-lap2' $w.LP @('c')
+  $r = Invoke-Fcode $w @('phien') @{ FAKE_SSH_CUT = 'get:*:20000000:cut' }
+  Eq $r.Code 1 $r.Out
+  Ok (Test-Path (Join-Path $w.LS (Split-Path $b -Leaf))) 'the small box session came down'
+  Ok (Test-Path (Join-Path $w.BS (Split-Path $c -Leaf))) 'the laptop session went up'
+  Ok (-not (Test-Path (Join-Path $w.LS (Split-Path $a -Leaf)))) 'the big top waits'
+  Ok ($r.Out -match 'phiên lớn: \S*huge\.log chưa chép xong') ("named; out: " + $r.Out)
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
+  Ok (Test-Path (Join-Path $w.LS (Split-Path $a -Leaf))) 'a good run finishes it'
+}
+T 'e2e r4: a batch that fails on the box (not a lost connection) is recorded and the run goes on with the next batch' {
+  $w = New-W2 'e2e32'
+  $a = New-Sess $w.LS '1111aaaa-fl1' $w.LP @('a'); Grow-Sess $a 30
+  $b = New-Sess $w.LS '2222bbbb-fl2' $w.LP @('b'); Grow-Sess $b 30
+  $r = Invoke-Fcode $w @('phien') @{ FAKE_SSH_CUT = 'put:1:0:fail' }
+  Eq $r.Code 1 $r.Out
+  Eq (Calls $w 'put') 2 'the second batch is still sent'
+  Eq (@($a, $b | Where-Object { Test-Path (Join-Path $w.BS (Split-Path $_ -Leaf)) }).Count) 1 'the second session is on the box'
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
+  Eq (@($a, $b | Where-Object { Test-Path (Join-Path $w.BS (Split-Path $_ -Leaf)) }).Count) 2 'the next run sends the failed one'
+}
+T 'e2e r4: leftovers of a cut-off run older than 1 h are removed at the start on both sides; fresh ones and other files stay' {
+  $w = New-W2 'e2e33'
+  [void](New-Sess $w.LS '4444dddd-lft' $w.LP @('a'))
+  $lt = Join-Path $w.U 'AppData\Local\Temp'; $bt = Join-Path $w.W 'boxtmp'
+  [void](New-Item -ItemType Directory -Force -Path $lt, $bt, $w.BS, $w.LBlobs)
+  $old = [DateTime]::UtcNow.AddHours(-2)
+  $mk = { param([string]$p, [bool]$dir, [bool]$aged)
+    $t = if ($aged) { $old } else { [DateTime]::UtcNow }
+    if ($dir) { [void](New-Item -ItemType Directory -Force -Path $p); Put-File (Join-Path $p 'x.tar') 'x'; [IO.File]::SetLastWriteTimeUtc((Join-Path $p 'x.tar'), $t); [IO.Directory]::SetLastWriteTimeUtc($p, $t) }
+    else { Put-File $p 'x'; [IO.File]::SetLastWriteTimeUtc($p, $t) } }
+  & $mk "$lt\fcode-phien-0ld" $true $true; & $mk "$lt\fcode-phien-n3w" $true $false; & $mk "$lt\other-old" $true $true
+  & $mk "$($w.LS)\x.jsonl.fcode-part-1-abc" $false $true; & $mk "$($w.LS)\y.jsonl.fcode-part-2-def" $false $false
+  & $mk "$($w.LBlobs)\.$('ab' * 32).fcode-part-3-ghi" $false $true
+  & $mk "$bt\fcode-phien-0ld" $true $true; & $mk "$bt\fcode-phien-n3w" $true $false; & $mk "$bt\other-old" $true $true
+  & $mk "$($w.BS)\z.jsonl.fcode-part-9-xyz" $false $true; & $mk "$($w.BS)\w.jsonl.fcode-part-8-uvw" $false $false
+  $env0 = @{ FCODE_PHIEN_BOXENV = ('HOME=' + ($w.BH -replace '\\', '/') + ' FCODE_CFG=' + ($w.Cfg -replace '\\', '/') + ' TMPDIR=' + ($bt -replace '\\', '/')) }
+  $r = Invoke-Fcode $w @('phien') $env0; Eq $r.Code 0 $r.Out
+  Ok (-not (Test-Path "$lt\fcode-phien-0ld")) 'laptop: old staging dir removed'; Ok (Test-Path "$lt\fcode-phien-n3w") 'laptop: fresh staging dir kept'; Ok (Test-Path "$lt\other-old") 'laptop: other names untouched'
+  Ok (-not (Test-Path "$($w.LS)\x.jsonl.fcode-part-1-abc")) 'laptop: old part file removed'; Ok (Test-Path "$($w.LS)\y.jsonl.fcode-part-2-def") 'laptop: fresh part file kept'
+  Ok (-not (Test-Path "$($w.LBlobs)\.$('ab' * 32).fcode-part-3-ghi")) 'laptop: old blob part removed'
+  Ok (-not (Test-Path "$bt\fcode-phien-0ld")) 'box: old staging dir removed'; Ok (Test-Path "$bt\fcode-phien-n3w") 'box: fresh staging dir kept'; Ok (Test-Path "$bt\other-old") 'box: other names untouched'
+  Ok (-not (Test-Path "$($w.BS)\z.jsonl.fcode-part-9-xyz")) 'box: old part file removed'; Ok (Test-Path "$($w.BS)\w.jsonl.fcode-part-8-uvw") 'box: fresh part file kept'
+}
+function Set-NoOriginHead([string]$Dir) { $ErrorActionPreference = 'Continue'; & git -C $Dir remote set-head origin -d 2>&1 | Out-Null }
+T 'e2e r4: origin/<default> falls back to origin/master when origin/HEAD is not set (laptop and box)' {
+  $w = New-W2 'e2e34'
+  New-GitDir $w.LP; New-GitDir $w.BP
+  $bl = Join-Path $w.W 'om-l.git'; $bb = Join-Path $w.W 'om-b.git'; New-Origin $bl 'master'; New-Origin $bb 'master'
+  Push-Origin $bl 'HANDOFF-m1.md' 'u' 'master'; Push-Origin $bb 'HANDOFF-m2.md' 'u' 'master'
+  Fetch-Origin $w.LP $bl; Fetch-Origin $w.BP $bb; Set-NoOriginHead $w.LP; Set-NoOriginHead $w.BP
+  Ok (-not (Test-Path "$($w.LP)\.git\refs\remotes\origin\HEAD") -and -not (Test-Path "$($w.BP)\.git\refs\remotes\origin\HEAD")) 'no origin/HEAD on either side'
+  Ok ((Get-PhienUpstreamNotes $w.LP) -ccontains 'HANDOFF-m1.md') 'the laptop reads origin/master'
+  Put-File "$($w.LP)\HANDOFF-m1.md" 'laptop copy'; Put-File "$($w.BP)\HANDOFF-m2.md" 'box copy'
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
+  Ok (-not (Test-Path "$($w.BP)\HANDOFF-m1.md")) 'laptop note tracked on origin/master: not sent'
+  Ok (-not (Test-Path "$($w.LP)\HANDOFF-m2.md")) 'box note tracked on origin/master: not fetched'
+}
+T 'e2e r4: the .fcode-origin sidecar is written only after the top is in place' {
+  $w = New-W2 'e2e35'
+  $a = New-Sess $w.LS '5555eeee-side' $w.LP @('a')
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
+  $bt = Join-Path $w.BS (Split-Path $a -Leaf); $sc = $bt.Replace('.jsonl', '.fcode-origin')
+  Ok (Test-Path $sc) 'sidecar after a good placement'
+  Remove-Item $sc; Add-Msgs $a @('b'); $before = Body $bt
+  $fs = [IO.File]::Open($bt, 'Open', 'Read', 'ReadWrite')   # no delete sharing: the box program cannot replace the file
+  try { $r = Invoke-Fcode $w @('phien') } finally { $fs.Dispose() }
+  Eq $r.Code 1 $r.Out
+  Ok (-not (Test-Path $sc)) 'no sidecar while the top could not be replaced'; Eq (Body $bt) $before 'top unchanged'
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
+  Ok (Test-Path $sc) 'sidecar once the top is placed'
+}
+T 'e2e r4: phien matches a laptop folder to a box project by its GitHub repo when the folder name differs; a box project with no laptop folder is only noted' {
+  $w = New-World 'e2e36'
+  $ld = Join-Path $w.U 'Desktop\New folder (2)'; New-GitDir $ld; & git -C $ld remote add origin https://github.com/Owner/Proj.git
+  New-GitDir $w.BP; & git -C $w.BP remote add origin git@github-proj:owner/proj.git
+  [IO.File]::WriteAllText($w.Cfg, (@{ projects = @{ proj = $w.BP; zeta = ($w.W -replace '\\', '/') + '/boxws/zeta' } } | ConvertTo-Json -Compress))
+  [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ instabox = $Cmd; box = 'coder'; syncRepos = @($ld) } | ConvertTo-Json -Compress))
+  $lsd = Join-Path $w.U ('.omp\agent\sessions\' + (Get-OmpEncodedDir $ld $w.U (Join-Path $w.U 'AppData\Local\Temp')))
+  $a = New-Sess $lsd 'abcdabcd-rep1' $ld @('a')
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
+  $bt = Join-Path $w.BS (Split-Path $a -Leaf)
+  Ok (Test-Path $bt) ("synced into box project proj; out: " + $r.Out); Ok ((Latin $bt).Contains('"cwd":"' + $w.BP + '"')) 'cwd = the box project dir'
+  Ok ($r.Out -match 'project trên box chưa có trên laptop: zeta') 'the new box project is noted'
+  Eq (@((Get-PhienStat $w).newProjects) -join ',') 'zeta' 'and recorded in the status'
+  $r = Invoke-Fcode $w @('phien', '--tu-dong'); Eq $r.Code 0 $r.Out   # the auto run never asks
+}
+
+# ============================== round 4: fcode add (installed box script) and fcode sync (find / ask / clone) ==============================
+function ConvertTo-Posix([string]$p) { '/' + $p.Substring(0, 1).ToLowerInvariant() + ($p.Substring(2) -replace '\\', '/') }
+function New-FakeAdd([string]$Path, [string]$Body) { [IO.File]::WriteAllText($Path, ((("#!/bin/bash`n" + $Body + "`n") -replace "`r`n", "`n")), $utf8) }
+T 'add: fcode add runs the script installed on the box (token path: no key step), with the repo and name as arguments' {
+  $w = New-World 'add1'; $fa = Join-Path $w.W 'fake-add.sh'; $log = ($w.W -replace '\\', '/') + '/add.log'
+  New-FakeAdd $fa ('echo "ARGS $1 $2" >> "' + $log + '"; for c in TOKEN_OK READ_OK CLONED HOOK_OK WRITE_OK CFG_ADDED V_BRANCH_OK RULES_NO; do echo "R $c"; done; exit 0')
+  $r = Invoke-Fcode $w @('add', 'Owner/Repo-X') @{ FCODE_ADD_SCRIPT = (ConvertTo-Posix $fa) }
+  Eq $r.Code 0 $r.Out
+  Ok ($r.Out -match 'Box dùng khoá GitHub sẵn có \(token\)' -and $r.Out -match 'Xong\. Mở app FCode') ("token path told; out: " + $r.Out)
+  Ok ($r.Out -notmatch 'Deploy keys|settings/keys') 'no key step'
+  Eq ((Get-Content ($log -replace '/', '\')) -join '|') 'ARGS Owner/Repo-X repo-x' 'arguments'
+  Ok ($r.Out -match 'chạy fcode sync') 'points to fcode sync for the laptop copy'
+}
+T 'add: a box without the installed script is told to update the box' {
+  $w = New-World 'add2'
+  $r = Invoke-Fcode $w @('add', 'owner/repo') @{ FCODE_ADD_SCRIPT = (ConvertTo-Posix (Join-Path $w.W 'missing\fcode-add.sh')) }
+  Eq $r.Code 1 $r.Out
+  Ok ($r.Out -match 'box chưa có script thêm dự án' -and $r.Out -match 'cd ~/fcode-src && git pull && bash install\.sh') ("told; out: " + $r.Out)
+  Eq (@(Get-Content $w.Log | Where-Object { $_ -eq 'ssh script' }).Count) 1 'no retry'
+}
+T 'add: NEED_KEY shows the key and the steps, waits for Enter, then the retry succeeds' {
+  $w = New-World 'add3'; $fa = Join-Path $w.W 'fake-add.sh'; $cnt = ($w.W -replace '\\', '/') + '/n'
+  New-FakeAdd $fa ('n=$(cat "' + $cnt + '" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "' + $cnt + '"' + "`n" +
+    'if [ $n -eq 1 ]; then echo "R KEY_NEW"; echo "R ALIAS_ADDED"; echo "R PUBKEY ssh-ed25519 AAAAfakekey"; echo "R NEED_KEY"; exit 40; fi' + "`n" +
+    'for c in KEY_EXISTS ALIAS_EXISTS READ_OK CLONED HOOK_OK WRITE_OK CFG_ADDED; do echo "R $c"; done; exit 0')
+  $r = Invoke-Fcode $w @('add', 'owner/repo') @{ FCODE_ADD_SCRIPT = (ConvertTo-Posix $fa) } "`n"
+  Eq $r.Code 0 $r.Out
+  Ok ($r.Out -match 'Khoá của box \(copy cả dòng\): ssh-ed25519 AAAAfakekey' -and $r.Out -match 'settings/keys/new' -and $r.Out -match 'Xong\.') ("key flow; out: " + $r.Out)
+  Eq (@(Get-Content $w.Log | Where-Object { $_ -eq 'ssh script' }).Count) 2 'retried once'
+}
+T 'sync: box projects missing on the laptop are found (OneDrive Desktop, names with spaces and brackets, several matches) or cloned (default folder, empty folder); wrong origin and non-git folders are refused; config keeps its other keys' {
+  $w = New-World 'syn1'
+  $gh = Join-Path $w.W 'github-test'; $own = Join-Path $gh 'owner'; [void](New-Item -ItemType Directory -Force -Path $own)
+  foreach ($n in 'alpha', 'beta', 'gamma', 'delta') { New-Origin (Join-Path $own "$n.git") }
+  $bw = ($w.W -replace '\\', '/') + '/boxws'; $proj = @{}
+  foreach ($n in 'alpha', 'beta', 'gamma', 'delta') { $d = "$bw/$n"; New-GitDir ($d -replace '/', '\'); & git -C $d remote add origin "git@github-$($n):owner/$n.git"; $proj[$n] = $d }
+  [IO.File]::WriteAllText($w.Cfg, (@{ projects = $proj } | ConvertTo-Json -Compress))
+  $desk = Join-Path $w.U 'OneDrive\Desktop'; $docs = Join-Path $w.U 'Documents'; [void](New-Item -ItemType Directory -Force -Path $desk, $docs)
+  $ErrorActionPreference = 'Continue'
+  & git clone -q (Join-Path $own 'alpha.git') "$desk\New folder (2)\alpha" 2>&1 | Out-Null
+  & git clone -q (Join-Path $own 'beta.git') "$desk\beta" 2>&1 | Out-Null
+  & git clone -q (Join-Path $own 'beta.git') "$desk\New folder\beta [old]" 2>&1 | Out-Null
+  $ErrorActionPreference = 'Stop'
+  $wrong = Join-Path $w.W 'elsewhere\wrong'; New-GitDir $wrong; & git -C $wrong remote add origin https://github.com/owner/other.git
+  $nongit = Join-Path $w.W 'elsewhere\notgit'; Put-File "$nongit\a.txt" 'x'
+  $empty = Join-Path $w.W 'elsewhere\work [x]\gamma'; [void](New-Item -ItemType Directory -Force -Path $empty)
+  $cfgFile = Join-Path $w.U '.fcode\config.json'
+  [IO.File]::WriteAllText($cfgFile, "{`r`n  `"instabox`": $(ConvertTo-JsonStr $Cmd),`r`n  `"box`": `"coder`",`r`n  `"syncRepos`": [],`r`n  `"ipaTag`": `"latest`"`r`n}`r`n")
+  $env0 = @{ FCODE_DESKTOP = $desk; FCODE_DOCUMENTS = $docs; FCODE_GITHUB_BASE = $gh }
+  # box order: alpha (one found), beta (two found: pick 2), delta (none: Enter = default), gamma (none: wrong origin, not git, then an empty folder)
+  $r = Invoke-Fcode $w @('sync') $env0 ("`n2`n`n" + "$wrong`n$nongit`n$empty`n")
+  Eq $r.Code 0 $r.Out
+  Ok ($r.Out -match [regex]::Escape("Đã tìm bản có sẵn trong: $desk (4 cấp)")) ("where it looked; out: " + $r.Out)
+  Ok ($r.Out -match [regex]::Escape("Đã có owner/alpha ở $desk\New folder (2)\alpha")) 'one found: offered'
+  Ok ($r.Out -match 'Có 2 bản owner/beta') 'several found: listed'
+  Ok ($r.Out -match 'đây là repo owner/other, không phải owner/gamma') 'wrong origin refused'
+  Ok ($r.Out -match 'thư mục này không phải git') 'non-git folder refused'
+  $c = Get-Content $cfgFile -Raw
+  Ok ($c -match '"ipaTag": "latest"' -and $c -match '"box": "coder"') 'other keys and their layout kept'
+  $sr = @(($c | ConvertFrom-Json).syncRepos)
+  Eq (($sr | Sort-Object) -join '|') ((@("$desk\New folder (2)\alpha", "$desk\New folder\beta [old]", "$desk\delta", $empty) | Sort-Object) -join '|') 'syncRepos'
+  Ok ((Test-Path -LiteralPath "$desk\delta\.git") -and (Test-Path -LiteralPath "$empty\.git")) 'cloned into the default folder and into the empty folder'
+  Ok ($r.Out -match '== beta \[old\]' -and $r.Out -match '== delta' -and $r.Out -match 'main: đã mới nhất') 'synced at once'
+  $r = Invoke-Fcode $w @('sync') $env0
+  Eq $r.Code 0 $r.Out; Ok ($r.Out -notmatch 'chưa có trên laptop') 'second run: nothing to add, nothing asked'
 }
 
 # ============================== scheduled task (hidden) ==============================
