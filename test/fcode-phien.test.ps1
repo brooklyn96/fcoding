@@ -32,13 +32,15 @@ $tokens = $null; $errs = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($Fcode, [ref]$tokens, [ref]$errs)
 if ($errs.Count) { throw "fcode.ps1 does not parse: $($errs[0].Message)" }
 $wanted = 'Test-WinPath', 'Resolve-OmpPath', 'Get-OmpUnder', 'Join-OmpName', 'Get-OmpEncodedDir', 'ConvertTo-Epoch', 'Convert-OmpCwd', 'ConvertTo-JsonStr',
-  'Get-OmpHeaderSpan', 'Open-ShareRead', 'Read-Head', 'Get-OmpBodyOff', 'Test-OmpNonEmpty', 'Get-RangeSha', 'Get-PhienOff', 'Test-PhienPrefix', 'Get-PhienKnownVersions', 'Test-PhienKnownVersion', 'Get-OmpHeaderVersion', 'Get-OmpHeaderInfo', 'Get-PhienVersionNote', 'Get-PhienUnknownNote', 'Get-PhienNoteRx', 'Get-PhienNoteSpecs', 'Invoke-GitQuiet', 'Get-PhienLocalNotes', 'Get-PhienNotePlan', 'Get-PhienNoteStatePath', 'Read-PhienNoteState', 'Write-PhienNoteState', 'Add-PhienNoteExclude', 'Install-PhienNote',
+  'Get-OmpHeaderSpan', 'Open-ShareRead', 'Read-Head', 'Get-OmpBodyOff', 'Test-OmpNonEmpty', 'Get-RangeSha', 'Get-PhienOff', 'Test-PhienPrefix', 'Get-PhienKnownVersions', 'Test-PhienKnownVersion', 'Get-OmpHeaderVersion', 'Get-OmpHeaderInfo', 'Get-PhienVersionNote', 'Get-PhienUnknownNote', 'Get-PhienNoteRx', 'Get-PhienNoteSpecs', 'Invoke-GitQuiet', 'Get-PhienLocalNotes', 'Get-PhienNotePlan', 'Get-PhienNoteStatePath', 'Read-PhienNoteState', 'Write-PhienNoteState', 'Get-PhienExcludeFile', 'Add-PhienExcludeLine', 'Install-PhienNote',
   'Copy-OmpSession', 'Get-OmpBlobRefs', 'Get-OmpBlobIndex', 'Get-PhienLocalScan', 'Compare-PhienFile', 'Get-PhienPlan', 'Install-PhienFile',
   'Install-PhienTask', 'Remove-PhienTask', 'New-PhienPartName', 'Get-PhienBoxBlobSet', 'New-PhienBatch', 'Get-PhienBatch', 'Remove-PhienNoteExclude',
   'Get-PhienDirFiles', 'Get-PhienIdOf', 'Test-PhienDeps', 'Get-PhienUnitBytes', 'Get-PhienUpstreamNotes',
   'Add-SyncRepoConfig', 'Test-SyncFolder', 'Get-RepoKey', 'Get-GitDirOrigin', 'Find-LocalClones', 'Get-SyncDesktop', 'Get-FcodeAddLimitVars', 'Get-MocPolicy', 'Write-MocPolicy',
-  'Test-PhienTimeUp', 'Assert-PhienTime', 'Stop-PhienProc', 'ConvertTo-PhienArg', 'Invoke-PhienExe'
+  'Test-PhienTimeUp', 'Get-PhienChildMs', 'Stop-PhienProc', 'ConvertTo-PhienArg', 'Invoke-PhienExe'
 foreach ($fn in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in $wanted }, $true)) { . ([scriptblock]::Create($fn.Extent.Text)) }
+# the git half and the file half that Install-PhienNote uses (git first, then the move, then the line), as one call for the exclude tests below
+function Add-PhienNoteExclude([string]$Dir, [string]$Name) { $f = Get-PhienExcludeFile $Dir $Name; [bool]($f -and (Add-PhienExcludeLine $f $Name)) }
 $pyAssign = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$PhienPy' }, $true)
 Invoke-Expression $pyAssign.Extent.Text
 foreach ($mn in '$MocBegin', '$MocEnd', '$MocRx', '$MocBlock') {   # the profile hook text and its markers, exactly as `fcode moc bat` writes them
@@ -421,13 +423,20 @@ function New-World([string]$Name) {
     BS = Join-Path $bh ('.omp\agent\sessions\' + (Get-OmpEncodedDir $bp ($bh -replace '\\', '/') (Join-Path $u 'AppData\Local\Temp')))
     LBlobs = Join-Path $u '.omp\agent\blobs'; BBlobs = Join-Path $bh '.omp\agent\blobs'; Log = Join-Path $w 'ssh.log' }
 }
-function Invoke-Fcode($World, [string[]]$FArgs, [hashtable]$ExtraEnv = @{}, [string]$InText = $null) {
+# -NoWait: start it hidden and return the process (for the kill test); otherwise run it and return {Code; Out}
+function Invoke-Fcode($World, [string[]]$FArgs, [hashtable]$ExtraEnv = @{}, [string]$InText = $null, [switch]$NoWait) {
   $ErrorActionPreference = 'Continue'   # Windows PowerShell 5.1 turns native stderr into errors under Stop
   $save = @{}
   $set = @{ USERPROFILE = $World.U; LOCALAPPDATA = (Join-Path $World.U 'AppData\Local'); FCODE_PHIEN_BOXENV = ('HOME=' + ($World.BH -replace '\\', '/') + ' FCODE_CFG=' + ($World.Cfg -replace '\\', '/')); FAKE_SSH_LOG = $World.Log; TEMP = (Join-Path $World.U 'AppData\Local\Temp'); TMP = (Join-Path $World.U 'AppData\Local\Temp') }
   foreach ($k in $ExtraEnv.Keys) { $set[$k] = $ExtraEnv[$k] }
   foreach ($k in $set.Keys) { $save[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k, $set[$k]) }
   try {
+    if ($NoWait) {
+      $psi = New-Object Diagnostics.ProcessStartInfo 'powershell.exe'
+      $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $Fcode + '" ' + ($FArgs -join ' ')
+      $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+      return [Diagnostics.Process]::Start($psi)
+    }
     $out = if ($InText) { $InText | & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Fcode @FArgs 2>&1 | Out-String } else { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Fcode @FArgs 2>&1 | Out-String }
     [pscustomobject]@{ Code = $LASTEXITCODE; Out = $out }
   } finally { foreach ($k in $save.Keys) { [Environment]::SetEnvironmentVariable($k, $(if ($null -eq $save[$k]) { [NullString]::Value } else { $save[$k] })) } }
@@ -1583,6 +1592,8 @@ function Use-LoggedIb($w, [string]$Stall = '') {
   $hang = switch ($Stall) {
     'ls' { "if /i `"%1`"==`"ls`" ping -n 60 127.0.0.1 >nul`r`n" }
     'put2' { "if /i not `"%1`"==`"ssh`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`nfindstr /c:`"ssh put`" `"%FAKE_SSH_LOG%`" >nul 2>&1 || goto run`r`nping -n 60 127.0.0.1 >nul`r`n:run`r`n" }
+    # 'put1late': the first `ssh ... put` waits until the epoch second in FAKE_PUT_UNTIL, then runs as the fake decides (an item still under way when the deadline passes)
+    'put1late' { "if /i not `"%1`"==`"ssh`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`nfindstr /c:`"ssh put`" `"%FAKE_SSH_LOG%`" >nul 2>&1 && goto run`r`npython -c `"import os,time;time.sleep(max(0,float(os.environ['FAKE_PUT_UNTIL'])-time.time()))`"`r`n:run`r`n" }
     default { '' }
   }
   [IO.File]::WriteAllText($wrap, "@echo off`r`necho %1 >>`"$($w.IbLog)`"`r`n${hang}call `"$Cmd`" %*`r`nexit /b %errorlevel%`r`n")
@@ -1635,6 +1646,7 @@ T 'nhanh: lock busy: exit 0 at once with a message, nothing else is touched' {
     Eq ((Screen-Lines $r.Out) -join '|') 'phien: đang có lần đồng bộ khác, bỏ qua' 'one line'
     Ok ($sec -lt 25) "no waiting for the lock ($([Math]::Round($sec)) s)"
     Eq (IbCalls $w).Count 0 'not even `instabox ls`'
+    Ok ((Read-PhienLog $w) -match 'đang có lần đồng bộ khác, bỏ qua') 'the busy line is in phien.log too'
   } finally { try { $mx.ReleaseMutex() } catch { }; $mx.Dispose() }
 }
 T 'nhanh: the 20 s cap ends the run cleanly: exit 0, message, no later batch, nothing half-placed; the next run finishes' {
@@ -1691,28 +1703,34 @@ foreach ($shim in 'omp', 'git') {
     Eq (BoxSessions $w) 0 'nothing was sent'
   }
 }
-T 'nhanh r2: Invoke-PhienExe: arguments reach the program intact, exit code and lines come back; with a deadline the program and its children are killed (124); no time left = not even started' {
+T 'nhanh r3: Invoke-PhienExe: arguments reach the program intact, exit code and lines come back; with a deadline a child gets the time left + 5 s (at least 3 s), then it and its children are killed (124)' {
   $py = (Get-Command python -CommandType Application | Select-Object -First 1).Source
   $r = Invoke-PhienExe $py @('-c', 'import sys;[print(a) for a in sys.argv[1:]];sys.exit(3)', 'a b', 'say "hi"', 'end\', 'x\"y', '')
   Eq $r.Code 3 'exit code'; Eq ($r.Out -join '|') 'a b|say "hi"|end\|x\"y|' 'arguments (spaces, quotes, trailing backslash, empty) and lines'
-  $script:PhienDeadline = [DateTime]::UtcNow.AddSeconds(3)
+  $script:PhienDeadline = [DateTime]::UtcNow.AddSeconds(2)
   try {
     $t0 = Get-Date; $r = Invoke-PhienExe $env:ComSpec @('/c', 'ping -n 40 127.0.0.1 >nul'); $sec = ((Get-Date) - $t0).TotalSeconds
-    Eq $r.Code 124 'killed at the deadline'; Ok ($sec -lt 15) "returned at the deadline ($([Math]::Round($sec)) s, the program runs 39 s)"
-    $script:PhienDeadline = [DateTime]::UtcNow.AddMilliseconds(300)
+    Eq $r.Code 124 'killed'; Ok ($sec -ge 6 -and $sec -lt 14) "killed after the time left + 5 s grace ($([Math]::Round($sec, 1)) s, 2 s were left, the program runs 39 s)"
+    $script:PhienDeadline = [DateTime]::UtcNow.AddSeconds(-30)
+    $t0 = Get-Date; $r = Invoke-PhienExe $env:ComSpec @('/c', 'ping -n 40 127.0.0.1 >nul'); $sec = ((Get-Date) - $t0).TotalSeconds
+    Eq $r.Code 124 'killed'; Ok ($sec -ge 2.5 -and $sec -lt 9) "past the deadline a child still gets the 3 s floor ($([Math]::Round($sec, 1)) s)"
     $mark = Join-Path $Root 'exe-started.txt'
-    $r = Invoke-PhienExe $env:ComSpec @('/c', "echo x > `"$mark`""); Eq $r.Code 124 'less than 1 s left'; Ok (-not (Test-Path $mark)) 'the program was not started'
+    $r = Invoke-PhienExe $py @('-c', "open(r'$mark', 'w').write('x')"); Eq $r.Code 0 'a short child of an item that has started still runs to its end'; Ok (Test-Path $mark) 'it ran'
   } finally { $script:PhienDeadline = $null }
 }
-T 'nhanh r2: local hashing and scanning stop at the deadline (no work after the cap), and run normally without one' {
-  $w = New-World 'q9'; $s = New-Sess $w.LS '99999999-qs09' $w.LP @('a', 'b')
-  Ok ((Get-RangeSha $s 0 10) -match '\A[0-9a-f]{64}\z') 'hash works without a deadline'; Eq @(Get-PhienLocalScan $w.LS).Count 1 'scan works without a deadline'
+# Q2: the deadline is checked only between items; nothing inside one stops for it (no half-done item: a note placed without its exclude line, a cut scan)
+T 'nhanh r3: nothing inside an item stops for the deadline: hash, scan, notes, git and a note install run to their end after it has passed' {
+  $w = New-World 'q9'; $s = New-Sess $w.LS '99999999-qs09' $w.LP @('a', 'b'); New-GitDir $w.LP
+  $src = Join-Path $w.W 'note-src.md'; Put-File $src 'from box'
   $script:PhienDeadline = [DateTime]::UtcNow.AddSeconds(-5)
   try {
-    foreach ($case in @{ N = 'hash'; B = { Get-RangeSha $s 0 10 } }, @{ N = 'scan'; B = { Get-PhienLocalScan $w.LS } }, @{ N = 'notes'; B = { Get-PhienLocalNotes $w.LP } }, @{ N = 'git'; B = { Invoke-GitQuiet $w.LP @('status') } }) {
-      $msg = ''; try { [void](& $case.B) } catch { $msg = "$($_.Exception.Message)" }
-      Eq $msg 'phien-cap' "$($case.N) stops once the deadline has passed"
-    }
+    Ok ((Get-RangeSha $s 0 10) -match '\A[0-9a-f]{64}\z') 'hash'
+    Eq @(Get-PhienLocalScan $w.LS).Count 1 'scan'
+    Eq (Get-PhienLocalNotes $w.LP).gitok $true 'notes'
+    Eq (Invoke-GitQuiet $w.LP @('status')).Code 0 'git'
+    Eq (Install-PhienNote $src $w.LP 'HANDOFF-dl.md' '' (ConvertTo-Epoch (Get-Date))) 'ok' 'a note install is one whole item'
+    Eq (Get-Content "$($w.LP)\HANDOFF-dl.md" -Raw) 'from box' 'placed'
+    Ok ((Get-Content "$($w.LP)\.git\info\exclude" -Raw) -match '(?m)^/HANDOFF-dl\.md\r?$') 'and excluded'
   } finally { $script:PhienDeadline = $null }
 }
 # L4: the cap line is for a run that stopped on the cap; a real error keeps its exit code and its own one line (a second batch that is cut by the cap does not wipe it)
@@ -1745,6 +1763,95 @@ T 'nhanh r2: a cut quick run leaves phien-auto.json alone; the next 10-minute au
   Eq (BoxSessions $w) 0 'nothing arrived yet'
   $r = Invoke-Fcode $w @('phien', '--tu-dong'); Eq $r.Code 0 $r.Out
   Eq (BoxSessions $w) 1 'the auto run did not skip behind the gap'
+}
+
+# ---- r3 "safe points only": an item (a batch, a note) ends whole or not at all; the deadline only stops the run between items ----
+function Body-Sha([string]$p) { $o = Get-PhienOff $p; Get-RangeSha $p $o ((Get-Item -LiteralPath $p).Length - $o) }
+# Q1: Install-PhienNote does every git call before it places the note; a git that never answers check-ignore / --git-path is killed (3 s floor or
+# time left + 5 s) and the note waits: never placed without its exclude line
+T 'nhanh r3: a note from the box with a git that stalls (check-ignore, --git-path): never placed without its exclude line; the next run places and excludes it' {
+  $w = New-W2 'q13'; Use-LoggedIb $w
+  New-GitDir $w.LP; New-GitDir $w.BP
+  Put-File "$($w.BP)\HANDOFF.md" 'box handoff'
+  $realGit = (Get-Command git -CommandType Application | Select-Object -First 1).Source
+  $bin = Join-Path $w.W 'shim'; [void](New-Item -ItemType Directory -Path $bin -Force); $glog = Join-Path $w.W 'git-calls.log'
+  [IO.File]::WriteAllText((Join-Path $bin 'git.cmd'), "@echo off`r`n>>`"$glog`" echo %*`r`necho %* | findstr /c:`"check-ignore`" /c:`"--git-path`" >nul || goto run`r`nping -n 60 127.0.0.1 >nul`r`nexit /b 1`r`n:run`r`n`"$realGit`" %*`r`nexit /b %errorlevel%`r`n")
+  $t0 = Get-Date; $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '15'; PATH = ($bin + ';' + $env:PATH) }; $sec = ((Get-Date) - $t0).TotalSeconds
+  Ok ((Get-Content $glog -Raw) -match 'check-ignore') ('the note install reached git (the stall was hit): ' + $r.Out)
+  Eq $r.Code 0 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $CapMsg 'a git that did not answer in time is a cut, not an error'
+  Ok ($sec -lt 35) "bounded by the cap + 5 s ($([Math]::Round($sec)) s, the stall is 60 s)"
+  $exf = "$($w.LP)\.git\info\exclude"; $ex = if (Test-Path $exf) { Get-Content $exf -Raw } else { '' }
+  Ok (-not (Test-Path "$($w.LP)\HANDOFF.md") -or $ex -match '(?m)^/HANDOFF\.md\r?$') 'never placed without its exclude line'
+  Eq (@(Get-ChildItem $w.LP -Force -Filter '*.fcode-part*').Count) 0 'no part file in the project'
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Eq (Get-Content "$($w.LP)\HANDOFF.md" -Raw) 'box handoff' 'the next run places it'
+  Ok ((Get-Content $exf -Raw) -match '(?m)^/HANDOFF\.md\r?$') 'and excludes it'
+  Ok (((& git -C $w.LP status --porcelain | Out-String)) -notmatch 'HANDOFF') 'git status on the laptop does not list it'
+}
+# Q2: a batch that is under way when the deadline passes is finished whole (its child has the 5 s grace); the run then stops before the next batch
+T 'nhanh r3: a batch still under way when the deadline passes ends whole (placed, all of it); no next batch starts; the next run sends the rest' {
+  $w = New-W2 'q14'; Use-LoggedIb $w 'put1late'
+  $a = New-Sess $w.LS 'aaaa1414-it01' $w.LP @('a'); Grow-Sess $a 30
+  $b = New-Sess $w.LS 'bbbb1414-it02' $w.LP @('b'); Grow-Sess $b 30
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '15'; FAKE_PUT_UNTIL = "$((ConvertTo-Epoch (Get-Date)) + 15.5)" }
+  Eq $r.Code 0 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $CapMsg 'the cap line only'
+  Eq (Calls $w 'put') 1 'no batch is started after the deadline'
+  $on = @($a, $b | Where-Object { Test-Path (Join-Path $w.BS (Split-Path $_ -Leaf)) })
+  Eq $on.Count 1 'the batch under way at the deadline was placed, the next one was not started'
+  Eq (Body-Sha (Join-Path $w.BS (Split-Path $on[0] -Leaf))) (Body-Sha $on[0]) 'placed whole'
+  Eq (Parts $w.LS) 0 'no part file on the laptop'; Eq (Parts $w.BS) 0 'no part file on the box'
+  Ok (-not (Get-ChildItem (Join-Path $w.U 'AppData\Local\Temp') -Directory -Filter 'fcode-phien-*' -ErrorAction SilentlyContinue)) 'staging removed'
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out; Eq (Screen-Lines $r.Out).Count 0 $r.Out
+  Eq (BoxSessions $w) 2 'the next run sends the other one'
+}
+T 'nhanh r3: an earlier batch failure, then the deadline at the next safe point: exit 1 and the failure line (the cap does not erase it)' {
+  $w = New-W2 'q15'; Use-LoggedIb $w 'put1late'
+  $a = New-Sess $w.LS 'aaaa1515-ef01' $w.LP @('a'); Grow-Sess $a 30
+  $b = New-Sess $w.LS 'bbbb1515-ef02' $w.LP @('b'); Grow-Sess $b 30
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '15'; FAKE_PUT_UNTIL = "$((ConvertTo-Epoch (Get-Date)) + 15.5)"; FAKE_SSH_CUT = 'put:1:0:fail' }
+  Eq $r.Code 1 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $FailMsg 'the failure line only'
+  Eq (Calls $w 'put') 1 'the run stopped at the safe point after the failed batch'
+  $log = Read-PhienLog $w
+  Ok ($log -match 'gửi phiên lên box không thành công') 'the failure is logged'; Ok ($log -match [regex]::Escape($CapMsg)) 'and the cap'
+}
+# Q6: a run killed at any point (the hook's 25 s kill, Ctrl+C) never leaves a half-written file under a real name; what it left (its staging in
+# %TEMP%, part files) carries its PID and is removed at the start of the next run, however fresh; a live run's part file stays
+T 'nhanh r3: a run killed mid-way leaves nothing half-written; the next run removes its staging and part files at once and finishes' {
+  $w = New-W2 'q16'; Use-LoggedIb $w
+  $a = New-Sess $w.LS 'aaaa1616-kil1' $w.LP @('a'); Grow-Sess $a 5
+  $lt = Join-Path $w.U 'AppData\Local\Temp'; [void](New-Item -ItemType Directory -Force -Path $lt)
+  $p = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '60'; FAKE_SSH_CUT = 'put:1:0:stall' } -NoWait
+  $kpid = $p.Id
+  try {
+    $until = (Get-Date).AddSeconds(40)
+    while ((Calls $w 'put') -lt 1 -and (Get-Date) -lt $until -and -not $p.HasExited) { Start-Sleep -Milliseconds 200 }
+    Ok ((Calls $w 'put') -eq 1 -and -not $p.HasExited) 'the run is in the middle of sending'
+  } finally { Stop-PhienProc $p; [void]$p.WaitForExit(15000); $p.Dispose() }
+  $left = @(Get-ChildItem $lt -Directory -Filter "fcode-phien-$kpid-*")
+  Eq $left.Count 1 'the killed run left its staging behind (fresh, under 1 h)'
+  Eq (BoxSessions $w) 0 'nothing half-sent is placed on the box'; Eq (Parts $w.LS) 0 'no part file of a session on the laptop'
+  $dead = "$($w.LS)\x.jsonl.fcode-part-$kpid-abcdef", "$($w.LP)\HANDOFF-k.md.fcode-part-$kpid-abcdef"
+  $live = "$($w.LS)\y.jsonl.fcode-part-$PID-abcdef"   # this test process is alive and older than the file: a run that is still going
+  foreach ($f in @($dead) + @($live)) { Put-File $f 'x' }
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '60' }; Eq $r.Code 0 $r.Out
+  Ok (-not (Test-Path $left[0].FullName)) 'the staging of the killed run is removed at the start'
+  foreach ($f in $dead) { Ok (-not (Test-Path $f)) "part file of the killed run removed: $(Split-Path $f -Leaf)" }
+  Ok (Test-Path $live) 'the part file of a live run stays'
+  Ok (Test-Path (Join-Path $w.BS (Split-Path $a -Leaf))) 'the next run sends the session'
+}
+# Q4: quick mode keeps the script's ErrorActionPreference ('Stop'): a cmdlet error is an error as in `fcode phien`, never a silent partial run
+T 'nhanh r3: a cmdlet error (a folder that cannot be listed) is an error in quick mode too: exit 1, the failure line, the reason in phien.log' {
+  $w = New-W2 'q17'; Use-LoggedIb $w
+  $s = New-Sess $w.LS 'eeee1717-acl1' $w.LP @('a')
+  $lk = Join-Path $w.LS ([IO.Path]::GetFileNameWithoutExtension($s) + '\locked'); Put-File "$lk\x.txt" 'x'
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+  & icacls.exe $lk /deny "${me}:(OI)(CI)(RD)" | Out-Null
+  try {
+    $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh')
+    Eq $r.Code 1 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $FailMsg 'one failure line'
+    Ok ((Read-PhienLog $w) -match 'lỗi: ') 'the reason is in phien.log'
+    Eq (BoxSessions $w) 0 'no partial listing was sent as if it were complete'
+  } finally { & icacls.exe $lk /remove:d $me | Out-Null }
 }
 
 # ============================== 1.3.3: fcode moc (profile hook) ==============================

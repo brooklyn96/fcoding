@@ -309,6 +309,7 @@ Hướng dẫn đầy đủ cho app nằm ở [ios/README.md, mục 4](../ios/RE
 | "Ảnh không đọc được" | Chọn lại một ảnh khác. |
 | "Phiên đã đóng" (khi gửi ảnh) | Phiên đã thoát; mở lại phiên rồi gửi lại. |
 | "Không gửi được ảnh, thử lại" | Kiểm tra mạng rồi gửi lại. |
+| "Không tải được ảnh, thử lại" | Ảnh chưa lấy được ra khỏi thư viện; chọn lại ảnh. |
 | "Không kết nối được máy chủ." | Kiểm tra mạng, địa chỉ máy chủ và dịch vụ `fcoding` trên box. |
 
 ### Thêm dự án từ app
@@ -348,16 +349,17 @@ Thêm lại một dự án đã có (cùng tên, cùng repo) không làm gì và
 Từ v1.3.3, bạn gửi ảnh cho trợ lý ngay trong phiên, ví dụ chụp một màn hình lỗi:
 
 1. Trong phiên, chạm **nút bàn phím** để mở ô nhập, rồi bấm **nút ảnh** (hình bức ảnh) bên trái ô.
-2. Chọn **Chụp ảnh** (mở camera; không hiện nếu máy không có camera) hoặc **Chọn ảnh** (chọn một ảnh trong thư viện). Lần đầu chụp, iPhone hỏi quyền camera: bấm **OK**. Lỡ từ chối thì app báo `Camera đang bị tắt cho FCode: vào Cài đặt → FCode → bật Camera`: vào **Cài đặt → FCode → bật Camera** rồi chụp lại.
+2. Chọn **Chụp ảnh** (mở camera; không hiện nếu máy không có camera) hoặc **Chọn ảnh** (chọn một ảnh trong thư viện). Lần đầu chụp, iPhone hỏi quyền camera: bấm **OK**. Lỡ từ chối thì lần sau bấm **Chụp ảnh**, app báo `Camera đang bị tắt cho FCode: vào Cài đặt → FCode → bật Camera`: vào **Cài đặt → FCode → bật Camera** rồi chụp lại.
 3. App hiện `Đang gửi ảnh…`. Khi xong, app báo `Đã gắn ảnh — gõ lời nhắn rồi gửi`: đường dẫn ảnh đã nằm sẵn trong ô nhập của trợ lý, nhưng **chưa gửi** (app không tự bấm Enter). Trong lúc ảnh đang gửi, nút **Gửi** và nút ảnh tạm không bấm được (vẫn gõ chữ được), để tin nhắn không chạy trước ảnh.
 4. Gõ lời nhắn của bạn (ví dụ "sửa lỗi trong ảnh này") rồi gửi như bình thường.
 
 Chi tiết cần biết:
 
 - App tự thu nhỏ ảnh (cạnh dài tối đa 2048 điểm ảnh) và đổi mọi định dạng (kể cả HEIC) sang JPEG trước khi gửi. Ảnh vẫn lớn hơn 10 MB sau khi thu nhỏ thì bị từ chối (`Ảnh quá lớn`).
-- Ảnh được lưu trên box ở thư mục `.fcode/uploads` trong dự án. FCode tự giấu thư mục này khỏi git bằng danh sách bỏ qua riêng của git (`.git/info/exclude`, không sửa `.gitignore`), nên ảnh không hiện thành thay đổi và không bị đưa lên GitHub; dự án nằm trong thư mục con của một kho git lớn hơn cũng được giấu.
-- Ảnh cũ hơn 7 ngày bị xoá vào lần kế tiếp bạn gửi một ảnh (không gửi ảnh thì chưa xoá).
+- Ảnh được lưu trên box ở thư mục `.fcode/uploads` trong dự án. FCode tự giấu thư mục này khỏi git bằng danh sách bỏ qua riêng của git (`.git/info/exclude`, không sửa `.gitignore`), nên thường ảnh không hiện thành thay đổi và không bị đưa lên GitHub; dự án nằm trong thư mục con của một kho git lớn hơn cũng được giấu. Việc giấu này là cố gắng hết sức: nếu hiếm khi box không cập nhật được cài đặt git của dự án, ảnh vẫn được lưu và có thể hiện trong `git status`; khi đó đừng thêm `.fcode/` vào một lần commit.
+- Ảnh cũ hơn 7 ngày bị xoá vào lần kế tiếp bạn gửi ảnh vào dự án đó (không gửi ảnh vào dự án đó thì chưa xoá).
 - Nếu app báo `Đang gửi ảnh khác, thử lại sau` thì box đang nhận ảnh của lượt trước: đợi vài giây rồi gửi lại.
+- Nếu app báo `Không tải được ảnh, thử lại` thì ảnh chưa lấy được ra khỏi thư viện (quá 60 giây): bấm chọn lại ảnh.
 - Nếu app báo `Đã lưu ảnh nhưng chưa gắn được vào phiên` thì ảnh đã được lưu nhưng đường dẫn chưa vào được ô nhập (thường vì đường dẫn dự án có dấu cách). Bạn vẫn dùng được ảnh, chỉ cần nhờ trợ lý đọc ảnh mới nhất trong `.fcode/uploads`.
 
 ## 8. Dùng từ laptop
@@ -460,13 +462,13 @@ fcode moc tat          # tắt
 Sau khi bật, mỗi lần bạn gõ `omp`, `claude` hoặc `codex` trong thư mục của một dự án có trong `syncRepos` (hoặc trong thư mục con của nó), FCode làm theo thứ tự:
 
 1. Đồng bộ dự án đó trước (như `fcode phien <dự án> --nhanh`), rồi mở agent như bình thường với đúng các tham số bạn gõ.
-2. Khi bạn đóng agent, FCode đồng bộ thêm một lần nữa ở chế độ ngầm: không hiện cửa sổ, không làm bạn phải chờ. Lần này bắt đầu sau khoảng 35 giây (để phiên vừa đóng kịp "nguội") và cũng chỉ chạy tối đa khoảng 20 giây.
+2. Khi bạn đóng agent, FCode đồng bộ thêm một lần nữa ở chế độ ngầm: không hiện cửa sổ, không làm bạn phải chờ. Lần này bắt đầu sau khoảng 35 giây (để phiên vừa đóng kịp "nguội") và cũng dừng ở khoảng 20 giây.
 
 Cần biết:
 
 - **Màn hình êm**: đồng bộ xong bình thường thì không hiện gì (chi tiết ghi ở `%USERPROFILE%\.fcode\phien.log`). Nếu có chuyện, màn hình hiện tối đa **một dòng** ở cuối, và agent luôn được mở.
 - **Không đánh thức box.** Box đang ngủ thì hiện `phien: box đang ngủ, bỏ qua` và agent mở ngay. Lần tự động mỗi 10 phút ở trên vẫn là phương án dự phòng.
-- **Tối đa khoảng 20 giây** mỗi lần; các lệnh con (ssh, tar, kiểm tra box) cũng bị dừng đúng hạn. Hết giờ thì dừng gọn, hiện `phien: hết 20 giây, phần còn lại chạy lần sau`, phần còn lại để lần sau làm tiếp (lần tự động 10 phút làm tiếp luôn, không chờ thêm 40 phút).
+- **Dừng ở khoảng 20 giây** mỗi lần (có thể dư vài giây khi một bước đang hoàn tất); FCode chỉ dừng giữa hai việc, không bao giờ bỏ dở một file, và các lệnh con (ssh, tar, kiểm tra box) cũng bị dừng đúng hạn. Hết giờ thì hiện `phien: hết 20 giây, phần còn lại chạy lần sau`; phần còn lại làm tiếp ở lần mở agent sau, hoặc ở lần tự động kế tiếp theo lịch thường (lần đồng bộ nhanh không đẩy lùi lịch đó).
 - Đang có một lần đồng bộ khác chạy thì hiện `phien: đang có lần đồng bộ khác, bỏ qua` và mở agent luôn.
 - **Đồng bộ lỗi không chặn agent**: agent vẫn mở, màn hình chỉ hiện đúng một dòng `phien: không đồng bộ được, xem phien.log`.
 - Mở agent ở thư mục không thuộc dự án nào thì không đồng bộ gì, agent chạy như thường.
