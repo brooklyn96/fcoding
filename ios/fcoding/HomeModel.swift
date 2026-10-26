@@ -18,13 +18,20 @@ final class HomeModel: ObservableObject {
 
     private var current: Task<Void, Never>?
 
-    /// One request at a time; a call during one waits for it.
-    func load(_ app: AppState) async {
-        if let running = current { await running.value; return }
-        let task = Task { await self.fetch(app) }
+    /// One request at a time; a call during one waits for it. `fresh`: the reply must come from a
+    /// request started after this call (a project was just added), so one in flight is not enough.
+    func load(_ app: AppState, fresh: Bool = false) async {
+        if let running = current {
+            await running.value
+            guard fresh else { return }
+            if let next = current { await next.value; return }
+        }
+        let task = Task {
+            await self.fetch(app)
+            self.current = nil
+        }
         current = task
         await task.value
-        current = nil
     }
 
     private func fetch(_ app: AppState) async {

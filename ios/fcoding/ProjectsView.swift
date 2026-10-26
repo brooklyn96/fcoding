@@ -168,7 +168,16 @@ struct ProjectsView: View {
                             loadError: model.errorText,
                             sessions: allSessions,
                             initialProject: project,
-                            onOpened: { openAfterSheet = $0 })
+                            onOpened: { openAfterSheet = $0 },
+                            onAdded: { text in
+                                toast = text
+                                // The new project shows on the cards and in "+" without waiting for the next poll.
+                                Task {
+                                    async let cards: Void = home.load(app, fresh: true)
+                                    await model.load(app)
+                                    await cards
+                                }
+                            })
         case .rename(let name):
             RenameSheet(name: name, taken: Set(allSessions.map(\.name))) { newName in
                 await model.rename(name, to: newName, app: app)
