@@ -348,6 +348,68 @@ struct CodexResetReply: Decodable {
     }
 }
 
+/// GET /api/projects/jobs/<id> (CONTRACT A11): one "Thêm dự án" job.
+struct ProjectJob: Decodable, Equatable {
+    /// "running" | "done" | "failed"
+    var state: String
+    var code: String?
+    var name: String?
+    var repo: String?
+    /// Only for NEED_KEY / NEED_WRITE.
+    var pubkey: String?
+    var keyUrl: String?
+    var detail: String?
+
+    private enum K: String, CodingKey { case state, code, name, repo, pubkey, keyUrl, detail }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        state = c.value(.state) ?? ""
+        code = c.value(.code)
+        name = c.value(.name)
+        repo = c.value(.repo)
+        pubkey = c.value(.pubkey)
+        keyUrl = c.value(.keyUrl)
+        detail = c.value(.detail)
+    }
+}
+
+/// GET /api/github/repos (contract v2): the repos the box's GitHub token can see, newest first.
+struct GitHubRepos: Decodable {
+    var repos: [GitHubRepo] = []
+    /// "no_github_token": the box has no GitHub login, so the list is empty.
+    var reason: String?
+
+    private enum K: String, CodingKey { case repos, reason }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        let all: [GitHubRepo] = c.list(.repos)
+        repos = all.filter { !$0.repo.isEmpty }
+        reason = c.value(.reason)
+    }
+}
+
+struct GitHubRepo: Decodable, Identifiable {
+    var repo: String
+    var isPrivate = false
+    var archived = false
+    var canPush = false
+    var updatedAt: Date?
+    /// The box project already cloned from this repo.
+    var onBox: String?
+    var id: String { repo }
+
+    private enum K: String, CodingKey { case repo, isPrivate = "private", archived, canPush, updatedAt, onBox }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        repo = c.value(.repo) ?? ""
+        isPrivate = c.value(.isPrivate) ?? false
+        archived = c.value(.archived) ?? false
+        canPush = c.value(.canPush) ?? false
+        updatedAt = c.date(.updatedAt)
+        onBox = c.value(.onBox)
+    }
+}
+
 /// One element that may fail to decode on its own.
 private struct Failable<T: Decodable>: Decodable {
     let value: T?
@@ -842,6 +904,261 @@ enum HomeLogic {
         return nil
     }
 
+    // MARK: Add project (CONTRACT A11: the same rules as `fcode add`)
+
+    static let badRepoText = "Link repo chưa đúng: dán link GitHub, ví dụ https://github.com/ten-tai-khoan/ten-repo."
+    static let badNameText = "Tên chưa đúng: chỉ chữ thường không dấu, số và . _ - (tối đa 64), không dùng “home”."
+
+    /// A pasted GitHub link (https://[www.]github.com/o/r[/tree/…][?…][#…], github.com/o/r,
+    /// git@github.com:o/r.git) or a plain o/r, reduced to o/r: spaces trimmed, a trailing ".git"
+    /// (any case) dropped. Another host stays as typed, so validRepo refuses it.
+    static func cleanRepo(_ s: String) -> String {
+        var r = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        var link = false
+        if let m = r.range(of: "^git@github\\.com:", options: [.regularExpression, .caseInsensitive]) {
+            r.removeSubrange(m)
+            link = true
+        } else if let m = r.range(of: "^(https://)?(www\\.)?github\\.com/", options: [.regularExpression, .caseInsensitive]) {
+            r.removeSubrange(m)
+            link = true
+        }
+        if link {
+            r = String(r.prefix { $0 != "?" && $0 != "#" })
+            r = r.split(separator: "/", omittingEmptySubsequences: false).prefix(2).joined(separator: "/")
+        }
+        return r.replacingOccurrences(of: "\\.git$", with: "", options: [.regularExpression, .caseInsensitive])
+    }
+
+    /// owner/repo with A-Z a-z 0-9 _ . - only; neither part only dots.
+    static func validRepo(_ r: String) -> Bool {
+        r.range(of: "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", options: .regularExpression) != nil
+            && r.range(of: "^\\.+/|/\\.+$", options: .regularExpression) == nil
+    }
+
+    /// The typed name lower-cased (a trailing ".git" dropped), else the repo part lower-cased.
+    static func projectName(repo: String, typed: String) -> String {
+        let t = typed.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !t.isEmpty { return t.lowercased().replacingOccurrences(of: "\\.git$", with: "", options: .regularExpression) }
+        guard let slash = repo.firstIndex(of: "/") else { return "" }
+        return repo[repo.index(after: slash)...].lowercased()
+    }
+
+    static func validProjectName(_ n: String) -> Bool {
+        n != "home" && n.range(of: "^[a-z0-9][a-z0-9._-]{0,63}$", options: .regularExpression) != nil
+    }
+
+    /// The server's detail keywords that addCodeMessage turns into text (and so need no detail line).
+    private static let dirConflictDetails = ["exists", "unsafe"]
+    private static let pushGuardText = "Box không cài được chốt chặn push lên main. Thử lại sau."
+    private static let failDetailTexts = [
+        "install": pushGuardText, "verify": pushGuardText,
+        "rewrite": "Cấu hình git trên box đang đổi hướng địa chỉ GitHub. Nhờ người quản lý box gỡ cấu hình đó rồi thử lại.",
+        "config": "Box không ghi được cấu hình đăng nhập GitHub cho repo này. Thử lại sau.",
+    ]
+
+    /// True when the message already says everything this detail says: DIR_CONFLICT with no detail,
+    /// "exists" or "unsafe"; FAILED with "install", "verify", "rewrite" or "config". Any other detail
+    /// (a path, owner/repo) stays.
+    static func addDetailIsKeyword(_ code: String?, _ detail: String?) -> Bool {
+        let d = detail ?? ""
+        switch code {
+        case "DIR_CONFLICT": return d.isEmpty || dirConflictDetails.contains(d)
+        case "FAILED": return failDetailTexts[d] != nil
+        default: return false
+        }
+    }
+
+    /// One short line per failed job code. `detail` and `name` (the job's project name) refine
+    /// DIR_CONFLICT ("exists" / "unsafe") and FAILED ("install" / "verify" / "rewrite" / "config").
+    static func addCodeMessage(_ code: String?, detail: String? = nil, name: String = "") -> String {
+        switch code {
+        case "NET_FAIL": return "Box không kết nối được GitHub, thử lại sau."
+        case "NAME_USED", "CFG_CONFLICT": return "Tên này đã dùng cho dự án khác, đặt tên khác."
+        case "DIR_CONFLICT":
+            let dir = name.isEmpty ? "này" : name
+            return detail == "unsafe" ? "Thư mục \(dir) trên box không an toàn. Chọn tên khác."
+                                      : "Thư mục \(dir) đã có trên box. Chọn tên khác."
+        case "FAILED" where addDetailIsKeyword(code, detail):
+            return failDetailTexts[detail ?? ""] ?? pushGuardText
+        case "REPO_ARCHIVED": return "Repo đã lưu trữ (archived), không ghi được."
+        case "WRITE_BLOCKED": return "GitHub chặn tạo nhánh box/*, xem lại luật bảo vệ nhánh."
+        case "CFG_BROKEN": return "Cấu hình FCode trên box bị hỏng, nhờ người quản lý box kiểm tra."
+        case "BAD_ARGS": return "Repo hoặc tên dự án không hợp lệ."
+        case "CLONE_FAIL": return "Không tải được repo về box, thử lại sau ít phút."
+        case "TIMEOUT": return "Quá 10 phút chưa xong, thử lại sau."
+        case "NEED_KEY", "NEED_WRITE": return "Box chưa có quyền vào repo này trên GitHub, thử lại."
+        default: return "Không thêm được dự án, thử lại sau."
+        }
+    }
+
+    /// The key page, only on github.com.
+    static func keyPage(_ s: String?) -> URL? {
+        guard let s = s, s.hasPrefix("https://github.com/") else { return nil }
+        return URL(string: s)
+    }
+
+    // MARK: Repo list ("Hoặc chọn repo")
+
+    static let noTokenText = "Box chưa có khóa GitHub để liệt kê repo, dán link repo ở trên."
+    static let repoListFailText = "Không tải được danh sách repo, thử lại."
+
+    /// The repos whose owner/name contains every word of the search (any case).
+    static func filterRepos(_ repos: [GitHubRepo], query: String) -> [GitHubRepo] {
+        let words = query.lowercased().split(whereSeparator: { $0 == " " || $0 == "\t" })
+        return words.isEmpty ? repos : repos.filter { r in words.allSatisfy { r.repo.lowercased().contains($0) } }
+    }
+
+    /// Greyed with a note when it cannot be picked: on the box already, or read only.
+    static func repoRow(_ r: GitHubRepo) -> (pickable: Bool, note: String?) {
+        if r.onBox != nil { return (false, "đã có trên box") }
+        if r.archived || !r.canPush { return (false, "chỉ đọc") }
+        return (true, nil)
+    }
+
+    /// "cập nhật 3 ngày trước" within 30 days, then "cập nhật 05/03/2025"; "" when unknown.
+    static func repoUpdated(_ d: Date?, now: Date, calendar: Calendar = .current) -> String {
+        guard let d = d else { return "" }
+        if now.timeIntervalSince(d) < 30 * 86400 { return "cập nhật " + ago(now.timeIntervalSince(d)) }
+        let c = calendar.dateComponents([.day, .month, .year], from: d)
+        return "cập nhật \(pad2(c.day ?? 0))/\(pad2(c.month ?? 0))/\(c.year ?? 0)"
+    }
+
+    /// The line shown instead of the list: nil = show the list (or hide it quietly on a server
+    /// without the route); `retry` = offer "Thử lại".
+    static func repoListNote(reason: String?, status: Int?, text: String?) -> (text: String, retry: Bool)? {
+        if let status = status {
+            if [404, 405, 501].contains(status) { return nil }
+            return (status == 502 ? repoListFailText : text ?? repoListFailText, true)
+        }
+        return reason == "no_github_token" ? (noTokenText, false) : nil
+    }
+
+    struct AddState: Equatable {
+        enum Phase: Hashable { case form, posting, polling(String), needKey(write: Bool), failed, done }
+        var phase: Phase = .form
+        /// What is sent (cleaned): kept for "Thử lại".
+        var repo = ""
+        var name = ""
+        /// The error line; once done, the toast text (or the cleanup notice's text).
+        var message: String?
+        /// Added, but the box could not delete its check branch on GitHub: shown as a notice
+        /// that stays until closed (a retry answers CFG_EXISTS without it), not as a toast.
+        struct Cleanup: Equatable {
+            let branch: String
+            /// The repo's branches page on GitHub.
+            let url: URL
+        }
+        var cleanup: Cleanup?
+        var detail: String?
+        var pubkey: String?
+        var keyUrl: URL?
+        /// Polls in a row that failed (network); the 5th ends the wait.
+        var pollErrors = 0
+
+        var busy: Bool {
+            switch phase {
+            case .posting, .polling: return true
+            default: return false
+            }
+        }
+    }
+
+    enum AddEvent {
+        case submit(repo: String, name: String)
+        /// The same POST again (after the key was added on GitHub).
+        case retry
+        case accepted(job: String)
+        /// `text`: the app's generic message for the error.
+        case postFailed(status: Int, code: String, text: String?)
+        case polled(ProjectJob)
+        case pollFailed(status: Int, code: String, text: String?)
+    }
+
+    /// The add sheet's state machine: form → posting → polling (every 2 s) → done / needKey / failed.
+    static func addReduce(_ old: AddState, _ event: AddEvent) -> AddState {
+        var s = old
+        switch event {
+        case let .submit(repo, name):
+            guard !s.busy else { return s }
+            let r = cleanRepo(repo), n = projectName(repo: r, typed: name)
+            s = AddState(phase: .form, repo: r, name: n)
+            if !validRepo(r) { s.message = badRepoText } else if !validProjectName(n) { s.message = badNameText } else { s.phase = .posting }
+        case .retry:
+            guard !s.busy, validRepo(s.repo), validProjectName(s.name) else { return s }
+            s = AddState(phase: .posting, repo: s.repo, name: s.name)
+        case let .accepted(job):
+            guard s.phase == .posting else { return s }
+            if job.range(of: "^[A-Za-z0-9_-]{1,64}$", options: .regularExpression) != nil {
+                s.phase = .polling(job)
+            } else {
+                s.phase = .failed
+                s.message = "Máy chủ trả lời không hợp lệ."
+            }
+        case let .postFailed(status, code, text):
+            guard s.phase == .posting else { return s }
+            s.phase = .failed
+            if status == 400 && code == "bad_repo" { s.message = badRepoText }
+            else if status == 400 && code == "bad_name" { s.message = badNameText }
+            else if [404, 405, 501].contains(status) { s.message = "Máy chủ chưa hỗ trợ thêm dự án, cập nhật máy chủ trước." }
+            else { s.message = text ?? "Không thêm được dự án, thử lại." }
+        case let .polled(job):
+            guard case .polling = s.phase else { return s }
+            s.pollErrors = 0
+            // The server reuses a running job for the same name: a job for another repo (or name) is
+            // not ours, so neither its key nor its success is shown.
+            guard job.name == s.name, job.repo?.lowercased() == s.repo.lowercased() else {
+                s.phase = .failed
+                s.message = "Tên này đang được dùng để thêm repo khác, đặt tên khác."
+                return s
+            }
+            let detail = job.detail?.trimmingCharacters(in: .whitespacesAndNewlines)
+            switch job.state {
+            case "done":
+                let name = job.name ?? s.name
+                s.phase = .done
+                if job.code == "ADDED_WARN" {
+                    // Exit 30 covers every failed check; only CLEANUP_FAIL's detail is the check branch.
+                    let d = detail ?? ""
+                    if d.range(of: "^(refs/heads/)?box/fcode-add-check(-[a-z0-9-]+)?$", options: .regularExpression) != nil {
+                        let branch = d.replacingOccurrences(of: "^refs/heads/", with: "", options: .regularExpression)
+                        s.message = "Đã thêm dự án \(name), nhưng box chưa xoá được nhánh kiểm tra \(branch) trên GitHub. Hãy xoá nhánh này trên GitHub."
+                        // s.repo passed validRepo (owner/repo), so the URL always parses.
+                        s.cleanup = URL(string: "https://github.com/\(s.repo)/branches").map { AddState.Cleanup(branch: branch, url: $0) }
+                    } else {
+                        s.message = "Đã thêm dự án, nhưng box kiểm tra lại chưa đạt hết, xem lại trên box."
+                    }
+                } else {
+                    s.message = "Đã thêm dự án \(name)"
+                }
+            case "failed":
+                let key = job.pubkey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if ["NEED_KEY", "NEED_WRITE"].contains(job.code ?? ""), !key.isEmpty {
+                    s.phase = .needKey(write: job.code == "NEED_WRITE")
+                    s.pubkey = key
+                    s.keyUrl = keyPage(job.keyUrl)
+                } else {
+                    s.phase = .failed
+                    s.message = addCodeMessage(job.code, detail: detail, name: s.name)
+                }
+                s.detail = detail?.isEmpty == false ? detail : nil
+                // The message already says it: do not show the bare keyword under it.
+                if addDetailIsKeyword(job.code, detail) { s.detail = nil }
+            default:
+                break   // "running", or a state this app does not know: keep polling
+            }
+        case let .pollFailed(status, _, text):
+            guard case .polling = s.phase else { return s }
+            if status == 404 || status == 401 || s.pollErrors >= 4 {
+                s.phase = .failed
+                s.message = status == 404 ? "Máy chủ không còn giữ việc thêm này. Bấm Thêm để thử lại."
+                                          : text ?? "Mất kết nối với box, thử lại."
+            } else {
+                s.pollErrors += 1
+            }
+        }
+        return s
+    }
+
     // MARK: - Self-test
 
     /// Fixed cases; one line per failure (empty = all pass). Run by the CI self-test step.
@@ -1180,6 +1497,265 @@ enum HomeLogic {
         eq("staging unavailable", stagingFailure(status: 503, code: "staging_unavailable"),
            "Chưa đọc được trạng thái máy staging, thử lại sau")
         eq("omp resume other",ompResumeFailure(status: 503, code: "busy") == nil, true)
+        // Add project: validation (Invoke-Add rules)
+        eq("repo clean .git", cleanRepo("  Me/My.Repo.GIT \n"), "Me/My.Repo")
+        eq("link https", cleanRepo("https://github.com/Me/Web"), "Me/Web")
+        eq("link www", cleanRepo("https://www.github.com/Me/Web"), "Me/Web")
+        eq("link slash", cleanRepo("https://github.com/Me/Web/"), "Me/Web")
+        eq("link .git", cleanRepo("https://github.com/Me/Web.git"), "Me/Web")
+        eq("link query", cleanRepo("https://github.com/Me/Web?tab=readme"), "Me/Web")
+        eq("link fragment", cleanRepo("https://github.com/Me/Web#readme"), "Me/Web")
+        eq("link tree", cleanRepo("https://github.com/Me/Web/tree/main/src"), "Me/Web")
+        eq("link no scheme", cleanRepo("github.com/Me/Web"), "Me/Web")
+        eq("link upper host", cleanRepo("HTTPS://GitHub.com/Me/Web"), "Me/Web")
+        eq("link ssh", cleanRepo("git@github.com:Me/Web.git"), "Me/Web")
+        eq("link plain", cleanRepo("Me/Web"), "Me/Web")
+        eq("link pasted newline", cleanRepo("https://github.com/Me/Web\n"), "Me/Web")
+        eq("link pasted crlf tabs", cleanRepo("\t https://github.com/Me/Web.git\r\n"), "Me/Web")
+        let pasted = addReduce(AddState(), .submit(repo: " https://github.com/Me/Web\n", name: "\tSite\n"))
+        eq("pasted link posts", pasted.phase, .posting)
+        eq("pasted link sent trimmed", pasted.repo, "Me/Web")
+        eq("pasted name sent trimmed", pasted.name, "site")
+        eq("link owner only", validRepo(cleanRepo("https://github.com/Me")), false)
+        eq("link other host", validRepo(cleanRepo("https://gitlab.com/Me/Web")), false)
+        eq("link other host bare", validRepo(cleanRepo("gitlab.com/Me/Web")), false)
+        eq("link http", validRepo(cleanRepo("http://github.com/Me/Web")), false)
+        eq("link other ssh", validRepo(cleanRepo("git@gitlab.com:Me/Web.git")), false)
+        eq("link look-alike", validRepo(cleanRepo("https://github.com.evil.io/Me/Web")), false)
+        eq("link plain extra path", validRepo(cleanRepo("Me/Web/tree/main")), false)
+        eq("repo ok", validRepo("ten-tai-khoan/ten_repo.v2"), true)
+        eq("repo no slash", validRepo("repo"), false)
+        eq("repo two slashes", validRepo("a/b/c"), false)
+        eq("repo dots owner", validRepo("../x"), false)
+        eq("repo dots name", validRepo("me/.."), false)
+        eq("repo dot inside", validRepo("me/.x"), true)
+        eq("repo space", validRepo("me/my repo"), false)
+        eq("repo url", validRepo("https://github.com/me/x"), false)
+        eq("repo control", validRepo("me/x\u{7}"), false)
+        eq("repo empty", validRepo(""), false)
+        eq("default name", projectName(repo: "Me/My.Repo", typed: ""), "my.repo")
+        eq("default name spaces", projectName(repo: "me/x", typed: "   "), "x")
+        eq("typed name lower", projectName(repo: "me/x", typed: " Web.git "), "web")
+        eq("name ok", validProjectName("my.repo_2-x"), true)
+        eq("name home", validProjectName("home"), false)
+        eq("name lead dot", validProjectName(".x"), false)
+        eq("name lead underscore", validProjectName("_x"), false)
+        eq("name 64", validProjectName(String(repeating: "a", count: 64)), true)
+        eq("name 65", validProjectName(String(repeating: "a", count: 65)), false)
+        eq("name accent", validProjectName("dự-án"), false)
+        eq("name empty", validProjectName(""), false)
+
+        // Add project: the repo list
+        let list = try? JSONDecoder().decode(GitHubRepos.self, from: Data("""
+        {"repos":[{"repo":"me/web","private":true,"archived":false,"canPush":true,"updatedAt":"2027-01-14T08:00:00Z","onBox":null},
+                  {"repo":"me/deal-sync","private":false,"archived":false,"canPush":true,"updatedAt":"2026-12-01T00:00:00Z","onBox":"deal-sync"},
+                  {"repo":"Org/Old-App","private":false,"archived":true,"canPush":true,"updatedAt":null,"onBox":null},
+                  {"repo":"org/docs","private":false,"archived":false,"canPush":false},
+                  {"private":true}, 7]}
+        """.utf8))
+        let repos = list?.repos ?? []
+        eq("repos decode", repos.map(\.repo), ["me/web", "me/deal-sync", "Org/Old-App", "org/docs"])
+        eq("repos private", repos.first?.isPrivate, true)
+        eq("repos reason none", list.map { $0.reason == nil }, true)
+        eq("repos no token", (try? JSONDecoder().decode(GitHubRepos.self, from: Data("{\"repos\":[],\"reason\":\"no_github_token\"}".utf8)))?.reason,
+           "no_github_token")
+        eq("filter empty", filterRepos(repos, query: "  ").count, 4)
+        eq("filter case", filterRepos(repos, query: "OLD").map(\.repo), ["Org/Old-App"])
+        eq("filter words", filterRepos(repos, query: "org doc").map(\.repo), ["org/docs"])
+        eq("filter owner", filterRepos(repos, query: "me/").map(\.repo), ["me/web", "me/deal-sync"])
+        eq("filter none", filterRepos(repos, query: "zzz").count, 0)
+        eq("row pickable", repoRow(repos[0]).pickable, true)
+        eq("row pickable no note", repoRow(repos[0]).note == nil, true)
+        eq("row on box", repoRow(repos[1]).note, "đã có trên box")
+        eq("row on box greyed", repoRow(repos[1]).pickable, false)
+        eq("row archived", repoRow(repos[2]).note, "chỉ đọc")
+        eq("row no push", repoRow(repos[3]).note, "chỉ đọc")
+        eq("row no push greyed", repoRow(repos[3]).pickable, false)
+        eq("updated recent", repoUpdated(repos[0].updatedAt, now: now, calendar: cal), "cập nhật 1 ngày trước")
+        eq("updated old", repoUpdated(repos[1].updatedAt, now: now, calendar: cal), "cập nhật 01/12/2026")
+        eq("updated unknown", repoUpdated(nil, now: now), "")
+        eq("list no token", repoListNote(reason: "no_github_token", status: nil, text: nil)?.text, noTokenText)
+        eq("list no token no retry", repoListNote(reason: "no_github_token", status: nil, text: nil)?.retry, false)
+        eq("list ok", repoListNote(reason: nil, status: nil, text: nil) == nil, true)
+        eq("list 502", repoListNote(reason: nil, status: 502, text: "x")?.text, repoListFailText)
+        eq("list 502 retry", repoListNote(reason: nil, status: 502, text: "x")?.retry, true)
+        eq("list network", repoListNote(reason: nil, status: 0, text: "Mất kết nối mạng.")?.text, "Mất kết nối mạng.")
+        eq("list old server hidden", repoListNote(reason: nil, status: 404, text: "x") == nil, true)
+
+        // Add project: code messages
+        eq("msg net", addCodeMessage("NET_FAIL"), "Box không kết nối được GitHub, thử lại sau.")
+        for c in ["NAME_USED", "CFG_CONFLICT"] {
+            eq("msg \(c)", addCodeMessage(c), "Tên này đã dùng cho dự án khác, đặt tên khác.")
+        }
+        eq("msg dir exists", addCodeMessage("DIR_CONFLICT", detail: "exists", name: "web"), "Thư mục web đã có trên box. Chọn tên khác.")
+        eq("msg dir no detail", addCodeMessage("DIR_CONFLICT", detail: nil, name: "web"), "Thư mục web đã có trên box. Chọn tên khác.")
+        eq("msg dir unsafe", addCodeMessage("DIR_CONFLICT", detail: "unsafe", name: "web"), "Thư mục web trên box không an toàn. Chọn tên khác.")
+        eq("msg dir no name", addCodeMessage("DIR_CONFLICT"), "Thư mục này đã có trên box. Chọn tên khác.")
+        for d in ["install", "verify"] {
+            eq("msg hook \(d)", addCodeMessage("FAILED", detail: d), "Box không cài được chốt chặn push lên main. Thử lại sau.")
+        }
+        eq("msg failed other detail", addCodeMessage("FAILED", detail: "x"), "Không thêm được dự án, thử lại sau.")
+        eq("msg hook detail other code", addCodeMessage("CLONE_FAIL", detail: "install"), "Không tải được repo về box, thử lại sau ít phút.")
+        eq("msg archived", addCodeMessage("REPO_ARCHIVED"), "Repo đã lưu trữ (archived), không ghi được.")
+        eq("msg blocked", addCodeMessage("WRITE_BLOCKED"), "GitHub chặn tạo nhánh box/*, xem lại luật bảo vệ nhánh.")
+        eq("msg timeout", addCodeMessage("TIMEOUT"), "Quá 10 phút chưa xong, thử lại sau.")
+        eq("msg unknown", addCodeMessage("XYZ"), "Không thêm được dự án, thử lại sau.")
+        eq("msg nil", addCodeMessage(nil), "Không thêm được dự án, thử lại sau.")
+        for c in ["CFG_BROKEN", "BAD_ARGS", "CLONE_FAIL", "FAILED"] {
+            eq("msg \(c) one line", addCodeMessage(c).contains("\n"), false)
+        }
+        eq("key page github", keyPage("https://github.com/me/x/settings/keys/new")?.absoluteString,
+           "https://github.com/me/x/settings/keys/new")
+        eq("key page other host", keyPage("https://evil.example/x") == nil, true)
+        eq("key page nil", keyPage(nil) == nil, true)
+
+        // Add project: the poll state machine
+        /// A job reply; name "web" and repo "Me/Web" (what `a` submits) unless the JSON sets them.
+        func job(_ json: String) -> ProjectJob {
+            var j = json
+            if !j.contains("\"name\"") { j = "{\"name\":\"web\"," + j.dropFirst() }
+            if !j.contains("\"repo\"") { j = "{\"repo\":\"Me/Web\"," + j.dropFirst() }
+            return try! JSONDecoder().decode(ProjectJob.self, from: Data(j.utf8))
+        }
+        var a = addReduce(AddState(), .submit(repo: "me/x", name: "home"))
+        eq("submit bad name", a.phase, .form)
+        eq("submit bad name text", a.message, badNameText)
+        a = addReduce(AddState(), .submit(repo: "x", name: ""))
+        eq("submit bad repo text", a.message, badRepoText)
+        a = addReduce(AddState(), .submit(repo: " Me/Web.git ", name: ""))
+        eq("submit posts", a.phase, .posting)
+        eq("submit repo", a.repo, "Me/Web")
+        eq("submit name", a.name, "web")
+        eq("busy posting", a.busy, true)
+        eq("submit while busy ignored", addReduce(a, .submit(repo: "o/p", name: "")).repo, "Me/Web")
+        eq("bad job id", addReduce(a, .accepted(job: "../x")).phase, .failed)
+        a = addReduce(a, .accepted(job: "j1"))
+        eq("accepted polls", a.phase, .polling("j1"))
+        a = addReduce(a, .polled(job("{\"state\":\"running\",\"code\":null}")))
+        eq("running keeps polling", a.phase, .polling("j1"))
+        a = addReduce(a, .polled(job("{\"state\":\"queued\"}")))
+        eq("unknown state keeps polling", a.phase, .polling("j1"))
+        var net = a
+        for _ in 0..<4 { net = addReduce(net, .pollFailed(status: 0, code: "", text: "Mất kết nối mạng.")) }
+        eq("4 poll errors keep polling", net.phase, .polling("j1"))
+        eq("poll error count", net.pollErrors, 4)
+        eq("poll ok resets count", addReduce(net, .polled(job("{\"state\":\"running\"}"))).pollErrors, 0)
+        net = addReduce(net, .pollFailed(status: 0, code: "", text: "Mất kết nối mạng."))
+        eq("5th poll error fails", net.phase, .failed)
+        eq("5th poll error text", net.message, "Mất kết nối mạng.")
+        let gone = addReduce(a, .pollFailed(status: 404, code: "no_job", text: nil))
+        eq("no_job fails", gone.phase, .failed)
+        eq("no_job text", gone.message, "Máy chủ không còn giữ việc thêm này. Bấm Thêm để thử lại.")
+        let need = addReduce(a, .polled(job("""
+        {"state":"failed","code":"NEED_KEY","name":"web","repo":"Me/Web","pubkey":"ssh-ed25519 AAAA fcode","keyUrl":"https://github.com/Me/Web/settings/keys/new","detail":null}
+        """)))
+        eq("need key", need.phase, .needKey(write: false))
+        eq("need key pubkey", need.pubkey, "ssh-ed25519 AAAA fcode")
+        eq("need key url", need.keyUrl?.absoluteString, "https://github.com/Me/Web/settings/keys/new")
+        eq("need key not busy", need.busy, false)
+        let again = addReduce(need, .retry)
+        eq("retry posts again", again.phase, .posting)
+        eq("retry same repo", again.repo, "Me/Web")
+        eq("retry same name", again.name, "web")
+        eq("retry clears key", again.pubkey == nil, true)
+        let write = addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"NEED_WRITE\",\"pubkey\":\"ssh-ed25519 B\",\"keyUrl\":\"http://x\"}")))
+        eq("need write", write.phase, .needKey(write: true))
+        eq("need write bad url dropped", write.keyUrl == nil, true)
+        let nokey = addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"NEED_KEY\"}")))
+        eq("need key without pubkey fails", nokey.phase, .failed)
+        let arch = addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"REPO_ARCHIVED\",\"detail\":\"  archived  \"}")))
+        eq("failed code", arch.phase, .failed)
+        eq("failed message", arch.message, "Repo đã lưu trữ (archived), không ghi được.")
+        eq("failed detail", arch.detail, "archived")
+        let dirEx = addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"DIR_CONFLICT\",\"detail\":\"exists\"}")))
+        eq("dir exists message", dirEx.message, "Thư mục web đã có trên box. Chọn tên khác.")
+        eq("dir exists no bare detail", dirEx.detail == nil, true)
+        eq("dir unsafe message", addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"DIR_CONFLICT\",\"detail\":\"unsafe\"}"))).message,
+           "Thư mục web trên box không an toàn. Chọn tên khác.")
+        eq("dir no detail message", addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"DIR_CONFLICT\"}"))).message,
+           "Thư mục web đã có trên box. Chọn tên khác.")
+        let hook = addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"FAILED\",\"detail\":\"verify\"}")))
+        eq("hook message", hook.message, "Box không cài được chốt chặn push lên main. Thử lại sau.")
+        eq("hook no bare detail", hook.detail == nil, true)
+        eq("hook install no bare detail", addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"FAILED\",\"detail\":\"install\"}"))).detail == nil, true)
+        eq("dir unsafe no bare detail", addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"DIR_CONFLICT\",\"detail\":\"unsafe\"}"))).detail == nil, true)
+        let dirOther = addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"DIR_CONFLICT\",\"detail\":\"/data/workspace/web\"}")))
+        eq("dir unknown detail kept", dirOther.detail, "/data/workspace/web")
+        eq("dir unknown detail message", dirOther.message, "Thư mục web đã có trên box. Chọn tên khác.")
+        let rewrite = addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"FAILED\",\"detail\":\"rewrite\"}")))
+        eq("rewrite message", rewrite.message, "Cấu hình git trên box đang đổi hướng địa chỉ GitHub. Nhờ người quản lý box gỡ cấu hình đó rồi thử lại.")
+        eq("rewrite no bare detail", rewrite.detail == nil, true)
+        let cred = addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"FAILED\",\"detail\":\"config\"}")))
+        eq("config message", cred.message, "Box không ghi được cấu hình đăng nhập GitHub cho repo này. Thử lại sau.")
+        eq("config no bare detail", cred.detail == nil, true)
+        eq("failed other detail kept", addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"FAILED\",\"detail\":\"boom\"}"))).detail, "boom")
+        eq("resubmit after failure", addReduce(arch, .submit(repo: "Me/Web", name: "web2")).phase, .posting)
+        let done = addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED\",\"name\":\"web\"}")))
+        eq("done", done.phase, .done)
+        eq("done toast", done.message, "Đã thêm dự án web")
+        eq("done no cleanup notice", done.cleanup == nil, true)
+        // The ref the box prints (fcode-add.sh): box/fcode-add-check-<name>-<epoch>-<pid>-<random>.
+        let addedWarn = addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\"refs/heads/box/fcode-add-check-web-1761480000-4242-17345\"}")))
+        eq("done warn", addedWarn.phase, .done)
+        func cleanupText(_ branch: String) -> String {
+            "Đã thêm dự án web, nhưng box chưa xoá được nhánh kiểm tra \(branch) trên GitHub. Hãy xoá nhánh này trên GitHub."
+        }
+        eq("done warn cleanup notice", addedWarn.cleanup,
+           AddState.Cleanup(branch: "box/fcode-add-check-web-1761480000-4242-17345", url: URL(string: "https://github.com/Me/Web/branches")!))
+        eq("done warn cleanup text", addedWarn.message, cleanupText("box/fcode-add-check-web-1761480000-4242-17345"))
+        eq("done warn legacy ref", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\"refs/heads/box/fcode-add-check\"}"))).cleanup?.branch,
+           "box/fcode-add-check")
+        let generic = "Đã thêm dự án, nhưng box kiểm tra lại chưa đạt hết, xem lại trên box."
+        eq("done warn no detail", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\"}"))).message, generic)
+        eq("done warn no detail toast", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\"}"))).cleanup == nil, true)
+        eq("done warn other detail", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\"refs/heads/box/x\"}"))).message,
+           generic)
+        eq("done warn cfg detail", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\"pr list failed\"}"))).message,
+           generic)
+        eq("done warn bare branch", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\" box/fcode-add-check \"}"))).message,
+           cleanupText("box/fcode-add-check"))
+        let suffixed = addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\"refs/heads/box/fcode-add-check-k3x9-2\"}")))
+        eq("done warn suffixed ref", suffixed.message, cleanupText("box/fcode-add-check-k3x9-2"))
+        eq("done warn suffixed branch", suffixed.cleanup?.branch, "box/fcode-add-check-k3x9-2")
+        eq("done warn suffixed bare", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\"box/fcode-add-check-ab12\"}"))).message,
+           cleanupText("box/fcode-add-check-ab12"))
+        let badSuffix = addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\"box/fcode-add-check-AB_1\"}")))
+        eq("done warn bad suffix", badSuffix.message, generic)
+        eq("done warn bad suffix toast", badSuffix.cleanup == nil, true)
+        eq("done warn empty suffix", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\"box/fcode-add-check-\"}"))).message,
+           generic)
+        eq("done warn suffix then path", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\"box/fcode-add-check-x/y\"}"))).message,
+           generic)
+        // Another sheet's job (the server dedupes by name): never its key or its success.
+        let conflict = "Tên này đang được dùng để thêm repo khác, đặt tên khác."
+        let alice = addReduce(a, .polled(job("""
+        {"state":"failed","code":"NEED_KEY","name":"web","repo":"alice/web","pubkey":"ssh-ed25519 ALICE","keyUrl":"https://github.com/alice/web/settings/keys/new"}
+        """)))
+        eq("other repo job fails", alice.phase, .failed)
+        eq("other repo job message", alice.message, conflict)
+        eq("other repo job no key", alice.pubkey == nil, true)
+        eq("other repo done not ours", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED\",\"repo\":\"alice/web\"}"))).phase, .failed)
+        eq("other repo running stops", addReduce(a, .polled(job("{\"state\":\"running\",\"repo\":\"alice/web\"}"))).phase, .failed)
+        eq("other name job", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED\",\"name\":\"web2\"}"))).message, conflict)
+        eq("job without repo not ours", addReduce(a, .polled(job("{\"state\":\"done\",\"repo\":null}"))).phase, .failed)
+        eq("repo case ignored", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED\",\"repo\":\"ME/WEB\"}"))).phase, .done)
+        // A picked repo leaves the name empty: the default follows the link sent, never an older one.
+        let picked = addReduce(AddState(), .submit(repo: "https://github.com/me/old-app", name: ""))
+        eq("picked default name", picked.name, "old-app")
+        let changed = addReduce(addReduce(picked, .postFailed(status: 503, code: "", text: nil)),
+                                .submit(repo: "https://github.com/me/New-App/tree/main", name: ""))
+        eq("link change new default", changed.name, "new-app")
+        eq("link change repo", changed.repo, "me/New-App")
+        eq("typed name kept over link", addReduce(AddState(), .submit(repo: "me/x", name: "mine")).name, "mine")
+        eq("late poll after done ignored", addReduce(done, .polled(job("{\"state\":\"failed\",\"code\":\"NET_FAIL\"}"))).phase, .done)
+        eq("late poll error after done ignored", addReduce(done, .pollFailed(status: 404, code: "no_job", text: nil)).phase, .done)
+        let posting = addReduce(AddState(), .submit(repo: "me/x", name: ""))
+        eq("post bad_repo", addReduce(posting, .postFailed(status: 400, code: "bad_repo", text: "x")).message, badRepoText)
+        eq("post bad_name", addReduce(posting, .postFailed(status: 400, code: "bad_name", text: "x")).message, badNameText)
+        eq("post old server", addReduce(posting, .postFailed(status: 404, code: "not_found", text: "x")).message,
+           "Máy chủ chưa hỗ trợ thêm dự án, cập nhật máy chủ trước.")
+        eq("post other", addReduce(posting, .postFailed(status: 503, code: "", text: "Box đang bận, thử lại sau.")).message,
+           "Box đang bận, thử lại sau.")
         return failures
     }
 }

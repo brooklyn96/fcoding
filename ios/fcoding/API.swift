@@ -109,10 +109,23 @@ extension API {
         let data = try await call("POST", "api/projects/\(project)/staging/start", body: [:])
         return try JSONDecoder().decode(StagingStartResponse.self, from: data)
     }
+
+    /// POST /api/projects (CONTRACT A11): starts the clone job, returns its id (the same id while
+    /// a job for that name runs).
+    func addProject(repo: String, name: String) async throws -> String {
+        let data = try await call("POST", "api/projects", body: ["repo": repo, "name": name])
+        return try JSONDecoder().decode(AddProjectReply.self, from: data).job
+    }
+
+    func projectJob(_ id: String) async throws -> ProjectJob { try await get("api/projects/jobs/" + id, as: ProjectJob.self) }
+
+    /// GET /api/github/repos (contract v2): the repos the box can pick from.
+    func githubRepos() async throws -> GitHubRepos { try await get("api/github/repos", as: GitHubRepos.self) }
 }
 
 struct ResumeResponse: Decodable { let session: String }
 struct StagingStartResponse: Decodable { let ok: Bool?; let error: String?; let state: String? }
+struct AddProjectReply: Decodable { let job: String }
 
 struct SessionInfo: Decodable, Identifiable, Hashable {
     let name: String
