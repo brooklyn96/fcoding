@@ -331,7 +331,7 @@ function Show-Help {
   Write-Host '      Cùng lượt này đồng bộ cả ghi chú ở thư mục gốc project (HANDOFF*.md, CLAUDE.md, AGENTS.md, WORKFLOW.md, agent_state.md, TASK.md, CLAUDE.local.md) khi git không theo dõi chúng; file nào hai máy cùng sửa thì giữ nguyên và báo.'
   Write-Host '      Ví dụ: fcode phien    hoặc    fcode phien deal-sync'
   Write-Host '  fcode phien --thu [project]'
-  Write-Host '      Chạy thử: chỉ liệt kê những phiên sẽ được chép đi đâu, không chép và không ghi gì.'
+  Write-Host '      Chạy thử: chỉ liệt kê những phiên sẽ được chép đi đâu, không chép gì (chỉ ghi lại giờ vừa kết nối box).'
   Write-Host '      Ví dụ: fcode phien --thu'
   Write-Host '  fcode phien tu-dong bat   |   fcode phien tu-dong tat'
   Write-Host '      Bật / tắt tự động đồng bộ phiên mỗi 10 phút, chạy ngầm (không hiện cửa sổ), chỉ khi box đang chạy, và chỉ mở kết nối khi box vừa bật hoặc cách lần mở trước từ 40 phút (để box tự nghỉ được).'
@@ -891,7 +891,8 @@ if [ -n "$name" ]; then exec fcode-pair "$name" --qr; else exec fcode-pair --qr;
 $PhienPy = (@'
 #!/usr/bin/env python3
 # fcode phien (chay tren box): doc / gui / nhan phien chat omp. Chi laptop goi lenh nay (qua instabox ssh).
-# Lenh: scan | hash | get | put. Yeu cau (JSON) di qua stdin; ket qua la dong "FCODE-JSON {...}" hoac luong tar sau dong "FCODE-TAR".
+# Lenh: scan | hash | get | put. Dong 1 cua stdin la chinh chuong trinh nay (deflate + base64, do lenh nap doc); phan con lai la
+# yeu cau (JSON) hoac luong tar; ket qua la dong "FCODE-JSON {...}" hoac luong tar sau dong "FCODE-TAR".
 # Chi ghi trong ~/.omp/agent/sessions/<thu-muc-du-an>/ va ~/.omp/agent/blobs/. Khong bao gio xoa, khong doc noi dung tin nhan.
 import hashlib, io, json, ntpath, os, posixpath, re, shutil, subprocess, sys, tarfile, tempfile, time
 
@@ -1089,7 +1090,7 @@ def file_sha(p):
     return h.hexdigest()
 
 
-def tracked_names(d):
+def index_names(d):
     # ten cac file ghi chu ma git DANG theo doi (ke ca file bi xoa khoi thu muc lam viec); None neu khong phai repo
     r = git(d, 'ls-files', '-z', '--', *NOTE_SPECS)
     if r is None or r.returncode != 0:
@@ -1097,10 +1098,25 @@ def tracked_names(d):
     return set(x for x in r.stdout.decode('utf-8', 'replace').split('\0') if NOTE_RX.match(x))
 
 
+def upstream_names(d):
+    # ghi chu nam trong nhanh mac dinh cua origin (ban da fetch): git se mang file do toi, nen cung tinh la da theo doi
+    r = git(d, 'symbolic-ref', '-q', 'refs/remotes/origin/HEAD')
+    ref = r.stdout.decode('utf-8', 'replace').strip() if r is not None and r.returncode == 0 else ''
+    r = git(d, 'ls-tree', '-z', '--name-only', ref or 'refs/remotes/origin/main')
+    if r is None or r.returncode != 0:
+        return set()
+    return set(x for x in r.stdout.decode('utf-8', 'replace').split('\0') if NOTE_RX.match(x))
+
+
+def tracked_names(d):
+    t = index_names(d)
+    return None if t is None else t | upstream_names(d)
+
+
 def scan_notes(d):
-    t = tracked_names(d) if os.path.isdir(d) else None
+    t = index_names(d) if os.path.isdir(d) else None
     if t is None:
-        return {'gitok': False, 'tracked': [], 'files': []}
+        return {'gitok': False, 'tracked': [], 'upstream': [], 'files': []}
     files = []
     for n in sorted(os.listdir(d)):
         p = os.path.join(d, n)
@@ -1109,7 +1125,7 @@ def scan_notes(d):
             ig = git(d, 'check-ignore', '-q', '--', n)
             files.append({'name': n, 'size': st.st_size, 'mtime': st.st_mtime, 'sha': file_sha(p),
                           'ign': bool(ig and ig.returncode == 0)})
-    return {'gitok': True, 'tracked': sorted(t), 'files': files}
+    return {'gitok': True, 'tracked': sorted(t), 'upstream': sorted(upstream_names(d)), 'files': files}
 
 
 LAST_EXCL = [False]
@@ -1197,44 +1213,79 @@ def place_note(d, name, src, expect, sha=''):
 
 
 # ---- scan ----
+def refs_of(path, size):
+    # blob:sha256:<hex> trong `size` byte dau cua file (dung phan da quet, khong doc qua)
+    s = set()
+    try:
+        with open(path, 'rb') as f:
+            left, tail = size, b''
+            while left > 0:
+                b = f.read(min(1 << 20, left))
+                if not b:
+                    break
+                left -= len(b)
+                buf = tail + b
+                for m in RX_BLOB.finditer(buf):
+                    s.add(m.group(1).decode())
+                tail = buf[-75:]
+    except OSError:
+        pass
+    return s
+
+
+def dir_files(d, base):
+    # cac file trong thu muc di kem <base>/ va blob ma cac .jsonl trong do nhac toi
+    files, refs = [], set()
+    sd = os.path.join(d, base)
+    for root, _dirs, fs in os.walk(sd):
+        for f in sorted(fs):
+            if '.fcode-part' in f:
+                continue
+            fp = os.path.join(root, f)
+            try:
+                s2 = os.stat(fp)
+            except OSError:
+                continue
+            j = f.endswith('.jsonl')
+            files.append({'rel': base + '/' + os.path.relpath(fp, sd).replace(os.sep, '/'), 'size': s2.st_size, 'mtime': s2.st_mtime,
+                          'off': body_off(fp) if j else 0, 'ver': header_version(fp) if j else None})
+            if j:
+                refs |= refs_of(fp, s2.st_size)
+    return files, refs
+
+
+def sid_of(n):
+    return n[n.rfind('_') + 1:-6] if '_' in n else ''
+
+
 def scan_dir(d):
     res = []
     try:
         names = sorted(os.listdir(d))
     except OSError:
         return res
+    tops = set(n[:-6] for n in names if n.endswith('.jsonl'))
     for n in names:
         p = os.path.join(d, n)
-        if not n.endswith('.jsonl') or not os.path.isfile(p):
+        if '.fcode-part' in n:
             continue
-        st = os.stat(p)
-        base = n[:-6]
-        sid = n[n.rfind('_') + 1:-6] if '_' in n else ''
-        files = []
-        sd = os.path.join(d, base)
-        if os.path.isdir(sd):
-            for root, _dirs, fs in os.walk(sd):
-                for f in sorted(fs):
-                    if '.fcode-part' in f:
-                        continue
-                    fp = os.path.join(root, f)
-                    try:
-                        s2 = os.stat(fp)
-                    except OSError:
-                        continue
-                    files.append({
-                        'rel': base + '/' + os.path.relpath(fp, sd).replace(os.sep, '/'),
-                        'size': s2.st_size, 'mtime': s2.st_mtime,
-                        'off': body_off(fp) if f.endswith('.jsonl') else 0,
-                        'ver': header_version(fp) if f.endswith('.jsonl') else None})
-        org = ''
-        try:
-            with open(os.path.join(d, base + '.fcode-origin'), encoding='utf-8') as f:
-                org = f.read(32).strip()
-        except OSError:
-            pass
-        res.append({'name': n, 'id': sid, 'size': st.st_size, 'mtime': st.st_mtime, 'off': body_off(p), 'ver': header_version(p),
-                    'ne': nonempty(p), 'files': files, 'origin': org})
+        if n.endswith('.jsonl') and os.path.isfile(p):
+            st = os.stat(p)
+            base = n[:-6]
+            files, refs = dir_files(d, base)
+            org = ''
+            try:
+                with open(os.path.join(d, base + '.fcode-origin'), encoding='utf-8') as f:
+                    org = f.read(32).strip()
+            except OSError:
+                pass
+            res.append({'name': n, 'id': sid_of(n), 'size': st.st_size, 'mtime': st.st_mtime, 'off': body_off(p), 'ver': header_version(p),
+                        'ne': nonempty(p), 'files': files, 'origin': org, 'refs': sorted(refs | refs_of(p, st.st_size))})
+        elif n not in tops and os.path.isdir(p):
+            # thu muc di kem ma file .jsonl chua toi (lan truoc dung giua chung): chi la danh sach file da nhan, khong phai phien
+            files, _r = dir_files(d, n)
+            res.append({'name': n + '.jsonl', 'id': sid_of(n + '.jsonl'), 'orphan': True, 'size': 0, 'mtime': 0, 'off': 0, 'ver': None,
+                        'ne': False, 'files': files, 'origin': '', 'refs': []})
     return res
 
 
@@ -1257,10 +1308,11 @@ def cmd_scan(req):
         e = project_enc(d)
         out.append({'name': name, 'dir': d, 'enc': e, 'sessions': scan_dir(os.path.join(SESS, e)), 'notes': scan_notes(d)})
     try:
-        blobs = sorted(n for n in os.listdir(BLOBS) if RX_BLOBNAME.match(n))
+        blobs = sorted(n for n in os.listdir(BLOBS) if RX_BLOBNAME.match(n) and os.path.isfile(os.path.join(BLOBS, n)))
     except OSError:
         blobs = []
-    out_json({'now': NOW, 'projects': out, 'blobs': blobs, 'omp': omp_version()})
+    out_json({'now': NOW, 'projects': out, 'blobs': blobs, 'blobsize': dict((n, os.path.getsize(os.path.join(BLOBS, n))) for n in blobs),
+              'omp': omp_version()})
 
 
 def cmd_hash(req):
@@ -1275,24 +1327,9 @@ def cmd_hash(req):
     out_json({'h': res})
 
 
-# ---- get: tar cua phien da chon + blob con thieu o laptop ----
-def blob_refs(path):
-    s = set()
-    try:
-        with open(path, 'rb') as f:
-            for line in f:
-                if b'blob:sha256:' in line:
-                    for m in RX_BLOB.finditer(line):
-                        s.add(m.group(1).decode())
-    except OSError:
-        pass
-    return s
-
-
+# ---- get: tar cua dung cac file laptop xin (mot dot <= 50 MB; laptop tu chon blob nao can) ----
 def cmd_get(req):
-    have = set(req.get('have', []))
     adds = []
-    refs = set()
     projs = cfg_projects()
     for it in req.get('notes', []):
         pn, name = it.get('project'), it.get('name')
@@ -1304,33 +1341,16 @@ def cmd_get(req):
         if t is None or name in t or not os.path.isfile(p) or NOW - os.path.getmtime(p) < BUSY:
             continue
         adds.append((p, 'notes/' + pn + '/' + name, None))
-    for it in req.get('items', []):
-        e = safe_enc(it.get('enc'))
-        if not e:
+    for it in req.get('files', []):
+        e, r, planned = safe_enc(it.get('enc')), safe_rel(it.get('rel', '')), it.get('size')
+        if not e or not r or not isinstance(planned, int):
             continue
-        rels = []
-        if it.get('top'):
-            rels.append(it['top'])
-        rels += it.get('files', [])
-        sizes = it.get('sizes') if isinstance(it.get('sizes'), dict) else {}
-        for r in rels:
-            planned = sizes.get(r) if isinstance(sizes.get(r), int) else None
-            r = safe_rel(r)
-            if not r:
-                continue
-            p = os.path.join(SESS, e, *r.split('/'))
-            if not os.path.isfile(p) or NOW - os.path.getmtime(p) < BUSY:
-                continue
-            adds.append((p, 'sessions/' + e + '/' + r, planned))
-            if p.endswith('.jsonl'):
-                refs |= blob_refs(p)
-    try:
-        bl = os.listdir(BLOBS)
-    except OSError:
-        bl = []
-    for n in sorted(bl):
-        m = RX_BLOBNAME.match(n)
-        if m and m.group(1) in refs and n not in have:
+        p = os.path.join(SESS, e, *r.split('/'))
+        if not os.path.isfile(p) or NOW - os.path.getmtime(p) < BUSY:
+            continue
+        adds.append((p, 'sessions/' + e + '/' + r, planned))
+    for n in req.get('blobs', []):
+        if isinstance(n, str) and RX_BLOBNAME.match(n) and os.path.isfile(os.path.join(BLOBS, n)):
             adds.append((os.path.join(BLOBS, n), 'blobs/' + n, None))
     sys.stdout.buffer.write(b'FCODE-TAR\n')
     sys.stdout.buffer.flush()
@@ -1346,13 +1366,43 @@ def cmd_get(req):
 
 
 # ---- put: nhan tar tu laptop, dat vao dung cho theo luat chi-noi-them ----
-def place_file(src, dst):
+OPEN = []
+
+
+def held_open(p):
+    # mot tien trinh cua user nay (omp trong tmux) dang mo file: /proc/<pid>/fd tro toi no (nhu busy() cua fcode-git-sync.sh).
+    # Doc mot lan moi lan chay; khong co /proc (may khac Linux) thi khong biet duoc, coi nhu khong mo.
+    if not OPEN:
+        s = set()
+        try:
+            pids = os.listdir('/proc')
+        except OSError:
+            pids = []
+        me = str(os.getpid())
+        for pid in pids:
+            if not pid.isdigit() or pid == me:
+                continue
+            fd = '/proc/' + pid + '/fd'
+            try:
+                fds = os.listdir(fd)
+            except OSError:
+                continue
+            for x in fds:
+                try:
+                    s.add(os.readlink(fd + '/' + x))
+                except OSError:
+                    pass
+        OPEN.append(s)
+    return os.path.realpath(p) in OPEN[0]
+
+
+def place_file(src, dst, before=None):
     if src.endswith('.jsonl') and header_version(src) not in KNOWN_VERSIONS:
         return 'skip'
     if not os.path.exists(dst):
         status = 'new'
     else:
-        if NOW - os.path.getmtime(dst) < BUSY:
+        if NOW - os.path.getmtime(dst) < BUSY or held_open(dst):
             return 'busy'
         a, b = eff(dst), eff(src)
         if b == a:
@@ -1361,6 +1411,8 @@ def place_file(src, dst):
             return 'skip'
         status = 'replaced'
     os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if before:
+        before()
     part = part_name(dst)
     try:
         shutil.copyfile(src, part)
@@ -1392,38 +1444,71 @@ def cmd_put(_req):
                     t.extract(m, stage)
         with open(os.path.join(stage, 'manifest.json'), encoding='utf-8') as f:
             man = json.load(f)
-        cnt = {'new': 0, 'replaced': 0, 'same': 0, 'skip': 0, 'busy': 0, 'blobs': 0}
-        for it in man.get('items', []):
-            e = safe_enc(it.get('enc'))
-            if not e:
-                continue
-            dest = os.path.join(SESS, e)
-            top = it.get('top')
-            if top:
-                r = safe_rel(top)
-                src = os.path.join(stage, 'sessions', e, *r.split('/')) if r else None
-                if src and os.path.isfile(src):
-                    st = place_file(src, os.path.join(dest, *r.split('/')))
-                    cnt[st] += 1
-                    if st in ('new', 'replaced') and it.get('origin') == 'laptop':
-                        with open(os.path.join(dest, r[:-6] + '.fcode-origin'), 'w', encoding='utf-8') as f:
-                            f.write('laptop\n')
-            for rel in it.get('files', []):
-                r = safe_rel(rel)
-                src = os.path.join(stage, 'sessions', e, *r.split('/')) if r else None
-                if src and os.path.isfile(src):
-                    cnt[place_file(src, os.path.join(dest, *r.split('/')))] += 1
+        # thu tu dat: blob, file trong thu muc di kem, .jsonl long ben trong, file origin, va file .jsonl chinh SAU CUNG
+        # (chi khi moi file no can da co du tren box), nen mot phien khong bao gio trong nhu da du khi con thieu
+        cnt = {'new': 0, 'replaced': 0, 'same': 0, 'skip': 0, 'busy': 0, 'blobs': 0, 'failed': 0}
+        busyf, defer = [], []
         bs = os.path.join(stage, 'blobs')
         if os.path.isdir(bs):
             for n in sorted(os.listdir(bs)):
                 if RX_BLOBNAME.match(n) and not os.path.exists(os.path.join(BLOBS, n)):
-                    os.makedirs(BLOBS, exist_ok=True)
                     tmp = part_name(os.path.join(BLOBS, '.' + n))
-                    shutil.copyfile(os.path.join(bs, n), tmp)
-                    st = os.stat(os.path.join(bs, n))
-                    os.utime(tmp, (st.st_atime, st.st_mtime))
-                    os.replace(tmp, os.path.join(BLOBS, n))
-                    cnt['blobs'] += 1
+                    try:
+                        os.makedirs(BLOBS, exist_ok=True)
+                        shutil.copyfile(os.path.join(bs, n), tmp)
+                        st = os.stat(os.path.join(bs, n))
+                        os.utime(tmp, (st.st_atime, st.st_mtime))
+                        os.replace(tmp, os.path.join(BLOBS, n))
+                        cnt['blobs'] += 1
+                    except OSError:
+                        cnt['failed'] += 1
+                        if os.path.isfile(tmp):
+                            os.unlink(tmp)
+
+        def put1(e, r, before=None):
+            src = os.path.join(stage, 'sessions', e, *r.split('/'))
+            if not os.path.isfile(src):
+                return
+            try:
+                st = place_file(src, os.path.join(SESS, e, *r.split('/')), before)
+            except OSError:
+                st = 'failed'
+            cnt[st] += 1
+            if st == 'busy':
+                busyf.append(r)
+        fl = []
+        for it in man.get('files', []):
+            e, r = safe_enc(it.get('enc')), safe_rel(it.get('rel', ''))
+            if e and r:
+                fl.append((r.endswith('.jsonl'), e, r))
+        for _j, e, r in sorted(fl, key=lambda x: x[0]):
+            put1(e, r)
+        try:
+            have = set(m.group(1) for m in (RX_BLOBNAME.match(n) for n in os.listdir(BLOBS)) if m and os.path.isfile(os.path.join(BLOBS, m.group(0))))
+        except OSError:
+            have = set()
+        for t in man.get('tops', []):
+            e, r = safe_enc(t.get('enc')), safe_rel(t.get('rel', ''))
+            if not e or not r:
+                continue
+            dest = os.path.join(SESS, e)
+            ok = all(h in have for h in t.get('blobs') or [])
+            for d in t.get('deps') or []:
+                dr, dn = safe_rel(d.get('r', '')), d.get('n')
+                p = os.path.join(dest, *dr.split('/')) if dr else ''
+                if not dr or not isinstance(dn, int) or not os.path.isfile(p) or eff(p) < dn:
+                    ok = False
+                    break
+            if not ok:
+                defer.append(r)
+                continue
+
+            def side(dest=dest, r=r):
+                with open(os.path.join(dest, r[:-6] + '.fcode-origin'), 'w', encoding='utf-8') as f:
+                    f.write('laptop\n')
+            put1(e, r, side if t.get('origin') == 'laptop' else None)
+        cnt['busyFiles'] = busyf
+        cnt['deferred'] = defer
         projs = cfg_projects()
         placed = []
         excl = []
@@ -1701,17 +1786,24 @@ function Copy-OmpSession([string]$Src, [string]$Dst, [string]$From, [string]$To,
   $changed
 }
 
-# tat ca blob:sha256:<hex> trong cac file .jsonl (chi doc, khong in noi dung)
-function Get-OmpBlobRefs([string[]]$Files) {
+# tat ca blob:sha256:<hex> trong cac file .jsonl (chi doc, khong in noi dung). $Lens[i] >= 0: chi doc ngan ay byte dau (phan da quet)
+function Get-OmpBlobRefs([string[]]$Files, [long[]]$Lens = @()) {
   $set = @{}
   $rx = [regex]'blob:sha256:([a-f0-9]{64})'
-  foreach ($f in $Files) {
-    $sr = New-Object IO.StreamReader((Open-ShareRead $f), [Text.Encoding]::GetEncoding(28591), $false, 1048576)
+  $lat = [Text.Encoding]::GetEncoding(28591)
+  for ($i = 0; $i -lt @($Files).Count; $i++) {
+    $left = if ($i -lt $Lens.Count -and $Lens[$i] -ge 0) { $Lens[$i] } else { [long]::MaxValue }
+    $fs = Open-ShareRead $Files[$i]
     try {
-      while ($null -ne ($line = $sr.ReadLine())) {
-        if ($line.IndexOf('blob:sha256:', [StringComparison]::Ordinal) -ge 0) { foreach ($m in $rx.Matches($line)) { $set[$m.Groups[1].Value] = $true } }
+      $buf = New-Object byte[] 1048576; $tail = ''
+      while ($left -gt 0) {
+        $n = $fs.Read($buf, 0, [int][Math]::Min([long]$buf.Length, $left)); if ($n -le 0) { break }
+        $left -= $n
+        $s = $tail + $lat.GetString($buf, 0, $n)
+        foreach ($m in $rx.Matches($s)) { $set[$m.Groups[1].Value] = $true }
+        $tail = if ($s.Length -gt 75) { $s.Substring($s.Length - 75) } else { $s }
       }
-    } finally { $sr.Dispose() }
+    } finally { $fs.Dispose() }
   }
   @($set.Keys | Sort-Object)
 }
@@ -1731,32 +1823,48 @@ function Get-OmpBlobIndex([string]$BlobDir) {
   $ix
 }
 
-# danh sach phien o mot thu muc sessions\<enc> tren laptop, cung dang voi `scan` cua box
+# cac file trong thu muc di kem <Base>\ cua mot phien (cung dang voi `dir_files` cua box)
+function Get-PhienDirFiles([string]$Dir, [string]$Base) {
+  $files = New-Object System.Collections.ArrayList
+  $sd = Join-Path $Dir $Base
+  if (Test-Path -LiteralPath $sd -PathType Container) {
+    foreach ($f in (Get-ChildItem -LiteralPath $sd -Recurse -File -Force)) {
+      if ($f.Name.Contains('.fcode-part')) { continue }
+      $hi = if ($f.Name.EndsWith('.jsonl')) { Get-OmpHeaderInfo $f.FullName } else { [pscustomobject]@{ Off = 0; Ver = $null } }
+      [void]$files.Add([pscustomobject]@{
+        rel = $Base + '/' + $f.FullName.Substring($sd.Length + 1).Replace('\', '/')
+        size = $f.Length; mtime = (ConvertTo-Epoch $f.LastWriteTimeUtc); off = $hi.Off; ver = $hi.Ver; path = $f.FullName })
+    }
+  }
+  , @($files)
+}
+function Get-PhienIdOf([string]$Name) { $u = $Name.LastIndexOf('_'); if ($u -ge 0) { $Name.Substring($u + 1, $Name.Length - $u - 7) } else { '' } }
+
+# danh sach phien o mot thu muc sessions\<enc> tren laptop, cung dang voi `scan` cua box. Mot thu muc di kem ma file .jsonl chua toi
+# (lan truoc dung giua chung) cung duoc liet ke voi orphan = $true: chi la danh sach file da nhan, khong bao gio la mot phien de chep.
 function Get-PhienLocalScan([string]$Dir) {
   $res = New-Object System.Collections.ArrayList
   if (-not (Test-Path -LiteralPath $Dir)) { return , @() }
+  $tops = @{}
   foreach ($fi in (Get-ChildItem -LiteralPath $Dir -File -Filter '*.jsonl' | Sort-Object Name)) {
-    $n = $fi.Name; $base = $n.Substring(0, $n.Length - 6)
-    $u = $n.LastIndexOf('_')
-    $files = New-Object System.Collections.ArrayList
-    $sd = Join-Path $Dir $base
-    if (Test-Path -LiteralPath $sd -PathType Container) {
-      foreach ($f in (Get-ChildItem -LiteralPath $sd -Recurse -File -Force)) {
-        if ($f.Name.Contains('.fcode-part')) { continue }
-        $hi = if ($f.Name.EndsWith('.jsonl')) { Get-OmpHeaderInfo $f.FullName } else { [pscustomobject]@{ Off = 0; Ver = $null } }
-        [void]$files.Add([pscustomobject]@{
-          rel = $base + '/' + $f.FullName.Substring($sd.Length + 1).Replace('\', '/')
-          size = $f.Length; mtime = (ConvertTo-Epoch $f.LastWriteTimeUtc); off = $hi.Off; ver = $hi.Ver })
-      }
-    }
+    if ($fi.Name.Contains('.fcode-part')) { continue }
+    $n = $fi.Name; $base = $n.Substring(0, $n.Length - 6); $tops[$base] = $true
+    $files = Get-PhienDirFiles $Dir $base
     $org = ''
     $sc = Join-Path $Dir ($base + '.fcode-origin')
     if (Test-Path -LiteralPath $sc) { try { $org = ([IO.File]::ReadAllText($sc)).Trim() } catch { } }
     $top = Get-OmpHeaderInfo $fi.FullName
+    $js = @($files | Where-Object { $_.rel.EndsWith('.jsonl') })
+    $refs = Get-OmpBlobRefs (@($fi.FullName) + @($js | ForEach-Object { $_.path })) ([long[]](@($fi.Length) + @($js | ForEach-Object { $_.size })))
     [void]$res.Add([pscustomobject]@{
-      name = $n; id = $(if ($u -ge 0) { $n.Substring($u + 1, $n.Length - $u - 7) } else { '' })
+      name = $n; id = (Get-PhienIdOf $n)
       size = $fi.Length; mtime = (ConvertTo-Epoch $fi.LastWriteTimeUtc); off = $top.Off; ver = $top.Ver
-      ne = (Test-OmpNonEmpty $fi.FullName); files = @($files); origin = $org })
+      ne = (Test-OmpNonEmpty $fi.FullName); files = $files; origin = $org; refs = @($refs) })
+  }
+  foreach ($di in (Get-ChildItem -LiteralPath $Dir -Directory -Force | Sort-Object Name)) {
+    if ($tops.ContainsKey($di.Name) -or $di.Name.Contains('.fcode-part')) { continue }
+    [void]$res.Add([pscustomobject]@{ name = $di.Name + '.jsonl'; id = (Get-PhienIdOf ($di.Name + '.jsonl')); orphan = $true; size = 0; mtime = 0; off = 0; ver = $null
+      ne = $false; files = (Get-PhienDirFiles $Dir $di.Name); origin = ''; refs = @() })
   }
   , @($res)
 }
@@ -1778,68 +1886,97 @@ function Compare-PhienFile($L, $R, [string]$Enc, [string]$Rel, [hashtable]$BoxHa
   if ($bh -and $lh -and $bh -eq $lh) { if ($a -eq $b) { 'same' } elseif ($a -lt $b) { 'get' } else { 'put' } } else { 'diverged' }
 }
 
-# ke hoach cho mot project: Put/Get = danh sach {Id; Name; Top; Files}; Need = cac hash can hoi box; Notes = loi cho nguoi dung
-function Get-PhienPlan($L, $R, [string]$Enc, [hashtable]$BoxHash, [string]$LDir, [double]$LNow, [double]$RNow, [int]$Busy = 30) {
+# ke hoach cho mot project, so tung FILE: Put/Get = danh sach {Id; Name; Top; Files; Blobs; Deps; DepBlobs}; Need = cac hash can hoi box.
+# Top (file .jsonl chinh) chi di khi moi file di kem va blob cua no da co hoac cung di; Deps/DepBlobs = nhung gi ben nhan phai thay
+# tren dia truoc khi dat Top. Thu muc mo coi (orphan) chi la danh sach file ben nhan da co. $LBlobs/$RBlobs: hex -> co tren laptop/box.
+function Get-PhienPlan($L, $R, [string]$Enc, [hashtable]$BoxHash, [string]$LDir, [double]$LNow, [double]$RNow, [int]$Busy = 30, [hashtable]$LBlobs = @{}, [hashtable]$RBlobs = @{}) {
   $put = New-Object System.Collections.ArrayList; $get = New-Object System.Collections.ArrayList
   $notes = New-Object System.Collections.ArrayList; $need = New-Object System.Collections.ArrayList
   $unknown = New-Object System.Collections.ArrayList; $diverged = 0
-  $same = 0
-  $lm = @{}; foreach ($s in @($L)) { $lm[[string]$s.id] = $s }
-  $rm = @{}; foreach ($s in @($R)) { $rm[[string]$s.id] = $s }
+  $same = 0; $incomplete = 0; $deferred = 0
+  $lm = @{}; foreach ($s in @($L)) { if ($s) { $lm[[string]$s.id] = $s } }
+  $rm = @{}; foreach ($s in @($R)) { if ($s) { $rm[[string]$s.id] = $s } }
   $ids = @(@($lm.Keys) + @($rm.Keys) | Sort-Object -Unique)
   foreach ($id in $ids) {
     $l = $lm[$id]; $r = $rm[$id]
+    $lr = [bool]($l -and -not $l.orphan); $rr = [bool]($r -and -not $r.orphan)
+    if (-not $lr -and -not $rr) { continue }
     $lab = if ($id.Length -gt 8) { $id.Substring(0, 8) } else { $id }
-    if ($l -and -not $r) {
-      if (-not $l.ne) { continue }
-      if (-not (Test-PhienKnownVersion $l.ver)) { [void]$unknown.Add([pscustomobject]@{ Id = $id; Ver = $l.ver }); continue }
-      $bad = @($l.files | Where-Object { $_.rel.EndsWith('.jsonl') -and -not (Test-PhienKnownVersion $_.ver) } | Select-Object -First 1)
-      if ($bad.Count) { [void]$unknown.Add([pscustomobject]@{ Id = $id; Ver = $bad[0].ver }); continue }
+    if ($lr -and $rr) {
+      if ($l.name -cne $r.name) { [void]$notes.Add("phiên $lab có tên file khác nhau ở hai máy, giữ nguyên cả hai"); continue }
+      if (-not $l.ne -and -not $r.ne) { continue }
+      if (-not (Test-PhienKnownVersion $l.ver) -or -not (Test-PhienKnownVersion $r.ver)) {
+        [void]$unknown.Add([pscustomobject]@{ Id = $id; Ver = $(if (Test-PhienKnownVersion $l.ver) { $r.ver } else { $l.ver }) }); continue
+      }
+    } else {
+      $s = if ($lr) { $l } else { $r }
+      if (-not $s.ne) { continue }
+      if (-not (Test-PhienKnownVersion $s.ver)) { [void]$unknown.Add([pscustomobject]@{ Id = $id; Ver = $s.ver }); continue }
+    }
+    # a nested .jsonl with an unknown header on a real side: the whole session waits (never guess a format)
+    $bad = @(@($(if ($lr) { $l.files })) + @($(if ($rr) { $r.files })) | Where-Object { $_ -and $_.rel.EndsWith('.jsonl') -and -not (Test-PhienKnownVersion $_.ver) } | Select-Object -First 1)
+    if ($bad.Count) { [void]$unknown.Add([pscustomobject]@{ Id = $id; Ver = $bad[0].ver }); continue }
+    if ($lr -and $rr) {
+      $t = Compare-PhienFile $l $r $Enc $l.name $BoxHash $LDir $need
+      if ($t -eq 'diverged') { $diverged++; [void]$notes.Add("phiên $lab đã khác nhau ở hai máy, giữ nguyên cả hai"); continue }
+      if ($t -ne 'same' -and (($LNow - $l.mtime -lt $Busy) -or ($RNow - $r.mtime -lt $Busy))) { [void]$notes.Add("phiên $lab đang được ghi, sẽ đồng bộ lần sau"); continue }
+    } elseif ($lr) {
       if ($LNow - $l.mtime -lt $Busy) { [void]$notes.Add("phiên $lab đang được ghi trên laptop, sẽ đồng bộ lần sau"); continue }
-      [void]$put.Add([pscustomobject]@{ Id = $id; Name = $l.name; Top = $true; Files = @($l.files | Where-Object { $LNow - $_.mtime -ge $Busy } | ForEach-Object { $_.rel }) })
-      continue
-    }
-    if ($r -and -not $l) {
-      if (-not $r.ne) { continue }
-      if (-not (Test-PhienKnownVersion $r.ver)) { [void]$unknown.Add([pscustomobject]@{ Id = $id; Ver = $r.ver }); continue }
-      $bad = @($r.files | Where-Object { $_.rel.EndsWith('.jsonl') -and -not (Test-PhienKnownVersion $_.ver) } | Select-Object -First 1)
-      if ($bad.Count) { [void]$unknown.Add([pscustomobject]@{ Id = $id; Ver = $bad[0].ver }); continue }
+      $t = 'put'
+    } else {
       if ($RNow - $r.mtime -lt $Busy) { [void]$notes.Add("phiên $lab đang được ghi trên box, sẽ đồng bộ lần sau"); continue }
-      [void]$get.Add([pscustomobject]@{ Id = $id; Name = $r.name; Top = $true; Files = @($r.files | Where-Object { $RNow - $_.mtime -ge $Busy } | ForEach-Object { $_.rel }) })
-      continue
+      $t = 'get'
     }
-    if ($l.name -cne $r.name) { [void]$notes.Add("phiên $lab có tên file khác nhau ở hai máy, giữ nguyên cả hai"); continue }
-    if (-not $l.ne -and -not $r.ne) { continue }
-    if (-not (Test-PhienKnownVersion $l.ver) -or -not (Test-PhienKnownVersion $r.ver)) {
-      [void]$unknown.Add([pscustomobject]@{ Id = $id; Ver = $(if (Test-PhienKnownVersion $l.ver) { $r.ver } else { $l.ver }) }); continue
-    }
-    $t = Compare-PhienFile $l $r $Enc $l.name $BoxHash $LDir $need
-    if ($t -eq 'diverged') { $diverged++; [void]$notes.Add("phiên $lab đã khác nhau ở hai máy, giữ nguyên cả hai"); continue }
-    if ($t -ne 'same' -and (($LNow - $l.mtime -lt $Busy) -or ($RNow - $r.mtime -lt $Busy))) {
-      [void]$notes.Add("phiên $lab đang được ghi, sẽ đồng bộ lần sau"); continue
-    }
-    $lf = @{}; foreach ($f in @($l.files)) { $lf[$f.rel] = $f }
-    $rf = @{}; foreach ($f in @($r.files)) { $rf[$f.rel] = $f }
+    # per file: missing or a prefix on the other side -> copy; a file being written or not comparable now holds the top back
+    $lf = @{}; if ($l) { foreach ($f in @($l.files)) { if ($f) { $lf[$f.rel] = $f } } }
+    $rf = @{}; if ($r) { foreach ($f in @($r.files)) { if ($f) { $rf[$f.rel] = $f } } }
     $pf = New-Object System.Collections.ArrayList; $gf = New-Object System.Collections.ArrayList
+    $pd = $false; $gd = $false
     foreach ($rel in @(@($lf.Keys) + @($rf.Keys) | Sort-Object -Unique)) {
       $x = $lf[$rel]; $y = $rf[$rel]
-      if ($rel.EndsWith('.jsonl') -and (($x -and -not (Test-PhienKnownVersion $x.ver)) -or ($y -and -not (Test-PhienKnownVersion $y.ver)))) {
-        [void]$unknown.Add([pscustomobject]@{ Id = $id; Ver = $(if ($x -and -not (Test-PhienKnownVersion $x.ver)) { $x.ver } else { $y.ver }) }); continue
-      }
-      if ($x -and -not $y) { if ($LNow - $x.mtime -ge $Busy) { [void]$pf.Add($rel) }; continue }
-      if ($y -and -not $x) { if ($RNow - $y.mtime -ge $Busy) { [void]$gf.Add($rel) }; continue }
+      if ($x -and -not $y) { if ($lr) { if ($LNow - $x.mtime -ge $Busy) { [void]$pf.Add($rel) } else { $pd = $true } }; continue }
+      if ($y -and -not $x) { if ($rr) { if ($RNow - $y.mtime -ge $Busy) { [void]$gf.Add($rel) } else { $gd = $true } }; continue }
       $c = Compare-PhienFile $x $y $Enc $rel $BoxHash $LDir $need
-      if ($c -eq 'same' -or $c -eq 'need') { continue }
-      if ($c -eq 'diverged') { $diverged++; [void]$notes.Add("file $rel của phiên $lab đã khác nhau ở hai máy, giữ nguyên cả hai"); continue }
-      if (($LNow - $x.mtime -lt $Busy) -or ($RNow - $y.mtime -lt $Busy)) { continue }
-      if ($c -eq 'put') { [void]$pf.Add($rel) } else { [void]$gf.Add($rel) }
+      if ($c -eq 'same') { continue }
+      if ($c -eq 'need') { $pd = $true; $gd = $true; continue }
+      if ($c -eq 'diverged') { $diverged++; [void]$notes.Add("file $rel của phiên $lab đã khác nhau ở hai máy, giữ nguyên cả hai"); $pd = $true; $gd = $true; continue }
+      $bz = ($LNow - $x.mtime -lt $Busy) -or ($RNow - $y.mtime -lt $Busy)
+      if ($c -eq 'put') { if ($lr) { if ($bz) { $pd = $true } else { [void]$pf.Add($rel) } } }
+      elseif ($rr) { if ($bz) { $gd = $true } else { [void]$gf.Add($rel) } }
     }
     if ($t -eq 'need') { continue }
-    if ($t -eq 'put' -or $pf.Count -gt 0) { [void]$put.Add([pscustomobject]@{ Id = $id; Name = $l.name; Top = ($t -eq 'put'); Files = @($pf) }) }
-    if ($t -eq 'get' -or $gf.Count -gt 0) { [void]$get.Add([pscustomobject]@{ Id = $id; Name = $l.name; Top = ($t -eq 'get'); Files = @($gf) }) }
-    if ($t -eq 'same' -and $pf.Count -eq 0 -and $gf.Count -eq 0) { $same++ }
+    # blobs: an equal .jsonl does not prove its blobs are there; every blob a real side refers to and the other side lacks is copied
+    $pb = New-Object System.Collections.ArrayList; $gb = New-Object System.Collections.ArrayList; $miss = @{}
+    if ($lr) { foreach ($h in @($l.refs)) { if (-not $h -or $RBlobs.ContainsKey($h)) { continue }; if ($LBlobs.ContainsKey($h)) { [void]$pb.Add($h) } else { $miss[$h] = $true } } }
+    if ($rr) { foreach ($h in @($r.refs)) { if (-not $h -or $LBlobs.ContainsKey($h)) { continue }; if ($RBlobs.ContainsKey($h)) { [void]$gb.Add($h) } else { $miss[$h] = $true } } }
+    if ($miss.Count) { $incomplete++; [void]$notes.Add("phiên $lab thiếu $($miss.Count) file đính kèm (blob) ở máy gửi, phiên chưa đầy đủ") }
+    $tp = ($t -eq 'put') -and -not $pd; $tg = ($t -eq 'get') -and -not $gd
+    if (($t -eq 'put' -and $pd) -or ($t -eq 'get' -and $gd)) { $deferred++; [void]$notes.Add("phiên $lab còn file đi kèm chưa chép được, file chính để lần sau") }
+    if ($tp -or $pf.Count -or $pb.Count) {
+      [void]$put.Add([pscustomobject]@{ Id = $id; Name = $l.name; Top = $tp; Files = @($pf); Blobs = @($pb)
+        Deps = @($(if ($tp) { foreach ($f in @($l.files)) { if ($f) { @{ r = $f.rel; n = [long]$f.size - [long]$f.off } } } }))
+        DepBlobs = @($(if ($tp) { @($l.refs) | Where-Object { $_ -and ($LBlobs.ContainsKey($_) -or $RBlobs.ContainsKey($_)) } })) })
+    }
+    if ($tg -or $gf.Count -or $gb.Count) {
+      [void]$get.Add([pscustomobject]@{ Id = $id; Name = $r.name; Top = $tg; Files = @($gf); Blobs = @($gb)
+        Deps = @($(if ($tg) { foreach ($f in @($r.files)) { if ($f) { @{ r = $f.rel; n = [long]$f.size - [long]$f.off } } } }))
+        DepBlobs = @($(if ($tg) { @($r.refs) | Where-Object { $_ -and ($LBlobs.ContainsKey($_) -or $RBlobs.ContainsKey($_)) } })) })
+    }
+    if ($t -eq 'same' -and -not ($pf.Count + $gf.Count + $pb.Count + $gb.Count + $miss.Count) -and -not ($pd -or $gd)) { $same++ }
   }
-  [pscustomobject]@{ Put = @($put); Get = @($get); Need = @($need); Notes = @($notes); Same = $same; Unknown = @($unknown); Diverged = $diverged }
+  [pscustomobject]@{ Put = @($put); Get = @($get); Need = @($need); Notes = @($notes); Same = $same; Unknown = @($unknown); Diverged = $diverged; Incomplete = $incomplete; Deferred = $deferred }
+}
+
+# ben nhan: moi file di kem (do dai phan than >= n) va moi blob (theo hex) ma file chinh can da co tren dia chua
+function Test-PhienDeps([string]$Dir, $Deps, $DepBlobs, [hashtable]$BlobIx) {
+  foreach ($h in @($DepBlobs)) { if ($h -and -not $BlobIx.ContainsKey([string]$h)) { return $false } }
+  foreach ($d in @($Deps)) {
+    if (-not $d) { continue }
+    $p = Join-Path $Dir (([string]$d.r) -replace '/', '\')
+    if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { return $false }
+    if (((Get-Item -LiteralPath $p).Length - (Get-PhienOff $p)) -lt [long]$d.n) { return $false }
+  }
+  $true
 }
 
 # dat mot file da nhan (o thu muc tam) vao dich theo luat chi-noi-them. Tra ve: new | replaced | same | skip | busy
@@ -1864,68 +2001,102 @@ function Install-PhienFile([string]$Src, [string]$Dst, [string]$From, [string]$T
 }
 
 
-# --- chia gui len box thanh tung dot <= 50 MB moi luong tar (mot dot = mot lan ssh) ---
+# --- chia thanh tung dot <= 50 MB moi luong tar, tinh ca phan tar them vao (mot dot = mot lan ssh; gui va nhan deu vay) ---
 $PhienBatchBytes = 52428800
+$PhienBatchLimit = $PhienBatchBytes - 131072   # cho cho manifest, dong chuong trinh va phan cuoi tar
 function New-PhienBatch([string]$Dir) {
-  [pscustomobject]@{ Dir = $Dir; Bytes = [long]0; Items = (New-Object System.Collections.ArrayList); Notes = (New-Object System.Collections.ArrayList)
-    Ensure = (New-Object System.Collections.ArrayList); Unexclude = (New-Object System.Collections.ArrayList); Refs = @{} }
+  [pscustomobject]@{ Dir = $Dir; Bytes = [long]0; Items = (New-Object System.Collections.ArrayList)
+    Ensure = (New-Object System.Collections.ArrayList); Unexclude = (New-Object System.Collections.ArrayList) }
 }
-# dot hien tai neu con cho cho them $Add byte, khong thi mo dot moi (mot muc lon hon 50 MB tu thanh mot dot rieng)
+# dot hien tai neu con cho cho them $Add byte, khong thi mo dot moi (mot file lon hon 50 MB tu thanh mot dot rieng)
 function Get-PhienBatch($Batches, [string]$Root, [long]$Add, [long]$Limit = 52428800) {
   $cur = if ($Batches.Count) { $Batches[$Batches.Count - 1] } else { $null }
   if (-not $cur -or ($cur.Bytes -gt 0 -and $cur.Bytes + $Add -gt $Limit)) { $cur = New-PhienBatch (Join-Path $Root ('put' + $Batches.Count)); [void]$Batches.Add($cur) }
   $cur.Bytes += $Add
   $cur
 }
+# so byte toi da mot file chiem trong luong tar: dau muc 512 + phan mo rong pax + lam tron 512; .jsonl con co the dai them do doi cwd
+function Get-PhienUnitBytes([long]$Size, [string]$Rel = '', [long]$Extra = 0) {
+  $s = $Size + $(if ($Rel.EndsWith('.jsonl')) { 4096 } else { 0 })
+  2560 + [long]([Math]::Ceiling($s / 512) * 512) + $Extra + 3 * $Rel.Length + 80
+}
 
 # --- noi chuyen voi box ---
+# 'running' | 'stopped' | 'unknown' (instabox ls loi, JSON hong, khong thay box hoac khong co trang thai): unknown khong doi gi ca
 function Test-BoxRunning {
   try {
     $j = & (Get-InstaboxExe) ls --json 2>$null | Out-String
-    $b = @($j | ConvertFrom-Json) | Where-Object { $_.name -eq $box } | Select-Object -First 1
-    [bool]($b -and "$($b.state)" -eq 'running')
-  } catch { $false }
+    if ($LASTEXITCODE -ne 0) { return 'unknown' }
+    $list = $j | ConvertFrom-Json
+    $b = $null; foreach ($x in $list) { foreach ($y in @($x)) { if ($y -and $y.name -eq $box) { $b = $y } } }
+    if (-not $b -or -not "$($b.state)") { return 'unknown' }
+    if ("$($b.state)" -eq 'running') { 'running' } else { 'stopped' }
+  } catch { 'unknown' }
+}
+
+# gioi han giay: lan tu dong = MOT han cho ca lan chay (420 s, duoi 8 phut cua Task Scheduler); chay tay = 900 s moi lan goi box.
+# Chi de thu: FCODE_PHIEN_TIMEOUT=<giay>.
+function Get-PhienLimitSec([bool]$Auto) { if ("$env:FCODE_PHIEN_TIMEOUT" -match '\A[0-9]{1,5}\z') { [int]$env:FCODE_PHIEN_TIMEOUT } elseif ($Auto) { 420 } else { 900 } }
+function Test-PhienTimeUp { [bool]($script:PhienDeadline -and [DateTime]::UtcNow -ge $script:PhienDeadline) }
+# dung tien trinh va moi tien trinh con cua no (instabox -> ssh); Windows PowerShell 5.1 khong co Kill($true) nen dung taskkill
+function Stop-PhienProc($p) {
+  try { $p.Kill($true) } catch { try { & taskkill.exe /PID $p.Id /T /F 2>&1 | Out-Null } catch { }; try { $p.Kill() } catch { } }
 }
 
 # chay $PhienPy tren box. Tra ve @{Code; Out = byte[]; Err}. stdin: $InBytes hoac noi dung file $InFile.
-function Invoke-BoxPy([string]$Cmd, [byte[]]$InBytes, [string]$InFile, [int]$TimeoutSec = 0) {
-  if ($TimeoutSec -le 0) { $TimeoutSec = if ($script:PhienAutoRun) { 420 } else { 900 } }   # lan tu dong: duoi gioi han 8 phut cua Task Scheduler
+# Han chot tinh tu truoc khi ghi byte stdin dau tien; stdin ghi bat dong bo, nen box dung doc thi den han van dung duoc.
+function Invoke-BoxPy([string]$Cmd, [byte[]]$InBytes, [string]$InFile) {
   if ($box -notmatch '\A[A-Za-z0-9._-]+\z') { throw "tên box '$box' không hợp lệ" }
-  # chuong trinh python di qua dong lenh duoi dang deflate + base64 (~7 KB), nen stdin con nguyen cho luong tar
-  # chu thich va dong trong bo di truoc khi nen: dong lenh ngan hon (gioi han 8191 ky tu cua cmd.exe khi chay thu bang instabox gia)
+  $sec = Get-PhienLimitSec $false
+  if ($script:PhienDeadline) {
+    $sec = ($script:PhienDeadline - [DateTime]::UtcNow).TotalSeconds
+    if ($sec -lt 1) { return [pscustomobject]@{ Code = 124; Out = [byte[]]@(); Err = 'hết thời gian của lượt này' } }
+  }
+  $end = [DateTime]::UtcNow.AddSeconds($sec)
+  # chuong trinh python (deflate + base64) la dong dau cua stdin; dong lenh chi co lenh nap ngan (khong vuong gioi han do dai)
+  # chu thich va dong trong bo di truoc khi nen
   $src = (($PhienPy -split "`n") | Where-Object { $_.Trim() -and -not $_.TrimStart().StartsWith('#') }) -join "`n"
   $raw = [Text.Encoding]::UTF8.GetBytes($src)
   $zs = New-Object IO.MemoryStream
   $ds = New-Object IO.Compression.DeflateStream($zs, [IO.Compression.CompressionMode]::Compress, $true)
   $ds.Write($raw, 0, $raw.Length); $ds.Dispose()
-  $b64 = [Convert]::ToBase64String($zs.ToArray())
+  $head = [Text.Encoding]::ASCII.GetBytes([Convert]::ToBase64String($zs.ToArray()) + "`n")
   $pre = ''
   # chi de thu: FCODE_PHIEN_BOXENV="HOME=/tmp/x FCODE_CFG=/tmp/y" doi moi truong cua chuong trinh tren box
   if ($env:FCODE_PHIEN_BOXENV) {
     if ($env:FCODE_PHIEN_BOXENV -notmatch '\A[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:@-]*( [A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:@-]*)*\z') { throw 'FCODE_PHIEN_BOXENV không hợp lệ' }
     $pre = 'env ' + $env:FCODE_PHIEN_BOXENV + ' '
   }
-  $remote = $pre + "python3 -c 'import base64,sys,zlib;exec(zlib.decompress(base64.b64decode(sys.argv[1]),-15).decode())' $b64 $Cmd"
+  $remote = $pre + "python3 -c 'import base64,sys,zlib;exec(zlib.decompress(base64.b64decode(sys.stdin.buffer.readline()),-15).decode())' $Cmd"
   $psi = New-Object Diagnostics.ProcessStartInfo
   $psi.FileName = Get-InstaboxExe
   $psi.Arguments = 'ssh ' + $box + ' -- "' + $remote + '"'
   $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
   $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
-  $p = [Diagnostics.Process]::Start($psi)
-  $ms = New-Object IO.MemoryStream
-  $t1 = $p.StandardOutput.BaseStream.CopyToAsync($ms)
-  $t2 = $p.StandardError.ReadToEndAsync()
+  $body = if ($InFile) { [IO.File]::OpenRead($InFile) } else { New-Object IO.MemoryStream(, [byte[]]$(if ($InBytes) { $InBytes } else { @() })) }
   try {
-    $si = $p.StandardInput.BaseStream
+    $p = [Diagnostics.Process]::Start($psi)
     try {
-      if ($InFile) { $f = [IO.File]::OpenRead($InFile); try { $f.CopyTo($si) } finally { $f.Dispose() } }
-      elseif ($InBytes) { $si.Write($InBytes, 0, $InBytes.Length) }
-      $si.Close()
-    } catch [IO.IOException] { }
-    if (-not $p.WaitForExit($TimeoutSec * 1000)) { try { $p.Kill() } catch { }; return [pscustomobject]@{ Code = 124; Out = [byte[]]@(); Err = 'quá thời gian chờ' } }
-    $t1.Wait(); $t2.Wait()
-    [pscustomobject]@{ Code = $p.ExitCode; Out = $ms.ToArray(); Err = $t2.Result }
-  } finally { $p.Dispose() }
+      $ms = New-Object IO.MemoryStream
+      $t1 = $p.StandardOutput.BaseStream.CopyToAsync($ms)
+      $t2 = $p.StandardError.ReadToEndAsync()
+      $si = $p.StandardInput.BaseStream
+      $tin = $si.WriteAsync($head, 0, $head.Length); $step = 0
+      while ($true) {
+        if ($null -ne $tin -and $tin.IsCompleted) {
+          if ($step -eq 0 -and -not $tin.IsFaulted) { $step = 1; $tin = $body.CopyToAsync($si) }
+          else { try { $si.Close() } catch { }; $tin = $null }
+        }
+        $left = ($end - [DateTime]::UtcNow).TotalMilliseconds
+        if ($left -le 0) { Stop-PhienProc $p; return [pscustomobject]@{ Code = 124; Out = [byte[]]@(); Err = 'quá thời gian chờ' } }
+        if ($p.WaitForExit([int][Math]::Min(100, $left))) { break }
+      }
+      $left = [Math]::Max(5000, ($end - [DateTime]::UtcNow).TotalMilliseconds)
+      if (-not $t1.Wait([int]$left)) { Stop-PhienProc $p; return [pscustomobject]@{ Code = 124; Out = [byte[]]@(); Err = 'quá thời gian chờ' } }
+      [void]$t2.Wait(5000)
+      [pscustomobject]@{ Code = $p.ExitCode; Out = $ms.ToArray(); Err = $(if ($t2.IsCompleted) { $t2.Result } else { '' }) }
+    } finally { $p.Dispose() }
+  } finally { $body.Dispose() }
 }
 
 # doc dong "FCODE-JSON {..}" trong ket qua; $null neu khong co
@@ -1979,7 +2150,7 @@ function Write-PhienStatus([hashtable]$Stat, [bool]$Auto) {
       at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ'); ok = [bool]$Stat.ok; copied = [int]$Stat.copied; skipped = [int]$Stat.skipped
       diverged = [int]$Stat.diverged; unknownFormat = @($Stat.unknown | ForEach-Object { [string]$_.Id } | Sort-Object -Unique)
       ompLaptop = [string]$Stat.ompL; ompBox = [string]$Stat.ompB; auto = $Auto
-      notes = [ordered]@{ copied = [int]$Stat.noteCopied; conflicts = @($Stat.noteConf); released = @($Stat.noteReleased) } }
+      notes = [ordered]@{ copied = [int]$Stat.noteCopied; conflicts = @($Stat.noteConf); released = @($Stat.noteReleased) }; unfinished = @($Stat.unfinished) }
     [IO.File]::WriteAllText($p, ($o | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
   } catch { }
 }
@@ -1996,13 +2167,19 @@ function Get-PhienWarning {
 }
 
 # dong bo mot hay moi project. Tra ve 0 xong, 1 loi.
+# Chep theo tung FILE, tung dot <= 50 MB (mot dot = mot lan ssh), ca hai chieu: dot nao xong thi nam lai ben nhan, lan sau chi chep
+# phan con thieu. Ben nhan dat blob, file di kem, .jsonl long ben trong, roi file .jsonl chinh sau cung (khi moi thu no can da co).
 function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [bool]$BoxKnownRunning = $false) {
   $script:PhienQuiet = $Auto; $script:PhienLines = New-Object System.Collections.Generic.List[string]
   $code = 0
+  # lan tu dong: MOT han chot cho ca lan chay, tinh tu luc tien trinh bat dau (nhu gioi han 8 phut cua Task Scheduler)
+  $script:PhienDeadline = if ($Auto) { [Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().AddSeconds((Get-PhienLimitSec $true)) } else { $null }
   $mx = $null; $held = $false
   if (-not $DryRun) {
     try {
-      $mx = New-Object Threading.Mutex($false, 'Local\fcode-phien')
+      # chi de thu: FCODE_PHIEN_LOCK doi ten khoa (bo test dung ten rieng, khong dung khoa that)
+      $lk = if ("$env:FCODE_PHIEN_LOCK" -match '\A[A-Za-z0-9\\._-]{1,200}\z') { $env:FCODE_PHIEN_LOCK } else { 'Local\fcode-phien' }
+      $mx = New-Object Threading.Mutex($false, $lk)
       try { $held = $mx.WaitOne(0) } catch [Threading.AbandonedMutexException] { $held = $true }
       if (-not $held -and -not $Auto) {
         Write-Host 'Đang có một lượt đồng bộ khác chạy (tự động), chờ nó xong...'
@@ -2015,7 +2192,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
       return 0
     }
   }
-  $stat = @{ ran = $false; ok = $true; copied = 0; skipped = 0; diverged = 0; unknown = @(); ompL = ''; ompB = ''; noteCopied = 0; noteConf = @(); noteReleased = @() }
+  $stat = @{ ran = $false; ok = $true; copied = 0; skipped = 0; diverged = 0; unknown = @(); ompL = ''; ompB = ''; noteCopied = 0; noteConf = @(); noteReleased = @(); unfinished = @() }
   try {
     $projs = Get-PhienProjects
     if ($projs.Count -eq 0) { Write-PhienOut "Chưa có project nào trong syncRepos ($ConfigFile)."; return 0 }
@@ -2025,14 +2202,14 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
       if (-not $projs.Contains($o)) { Write-PhienOut "Không thấy project '$Only' trong syncRepos. Có: $($names -join ', ')"; return 1 }
       $names = @($o)
     }
-    if ($Auto) { if (-not $BoxKnownRunning -and -not (Test-BoxRunning)) { return 0 } }
+    if ($Auto) { if (-not $BoxKnownRunning -and (Test-BoxRunning) -ne 'running') { return 0 } }
     else { & (Get-InstaboxExe) wake $box *> $null }
     $stat.ran = $true; $stat.ompL = Get-OmpVersion
-    # moc cho lan tu dong sau: ghi truoc khi mo ssh (lan loi hay bi dung giua chung cung tinh)
+    # moc cho lan tu dong sau: ghi truoc khi mo ssh (lan loi, bi dung giua chung hay chay thu cung tinh: ssh nao cung la hoat dong cua box)
     Write-PhienAutoState @{ boxRunning = $true; lastSshAt = (ConvertTo-Epoch (Get-Date)) }
-    $script:PhienAutoRun = $Auto
     $agent = Get-OmpAgentDir
     $sessRoot = Join-Path $agent 'sessions'
+    $laptopBlobDir = Join-Path $agent 'blobs'
     $lnow = ConvertTo-Epoch (Get-Date)
     $r = Invoke-BoxPy 'scan' ([Text.Encoding]::UTF8.GetBytes((@{ projects = @($names) } | ConvertTo-Json -Compress)))
     $scan = Get-BoxJson $r
@@ -2045,6 +2222,10 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
     $rnow = [double]$scan.now
     $stat.ompB = [string]$scan.omp
     $boxBlobs = Get-PhienBoxBlobSet $scan.blobs
+    $boxBlobNames = @{}
+    foreach ($n in @($scan.blobs)) { if (([string]$n) -match '\A([a-f0-9]{64})') { $hx = $Matches[1]; if (-not $boxBlobNames.ContainsKey($hx)) { $boxBlobNames[$hx] = New-Object System.Collections.ArrayList }; [void]$boxBlobNames[$hx].Add([string]$n) } }
+    $boxBlobSize = @{}; if ($scan.blobsize) { foreach ($pr in $scan.blobsize.PSObject.Properties) { $boxBlobSize[$pr.Name] = [long]$pr.Value } }
+    $lblobIx = Get-OmpBlobIndex $laptopBlobDir
     $ctx = @()
     foreach ($bp in @($scan.projects)) {
       $ldir = $projs[[string]$bp.name]
@@ -2056,7 +2237,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
     $hashes = @{}
     $need = @()
     foreach ($c in $ctx) {
-      $need += @((Get-PhienPlan $c.L $c.R $c.Benc @{} $c.Lsd $lnow $rnow $PhienBusySec).Need)
+      $need += @((Get-PhienPlan $c.L $c.R $c.Benc @{} $c.Lsd $lnow $rnow $PhienBusySec $lblobIx $boxBlobs).Need)
     }
     if ($need.Count -gt 0) {
       $q = @{ q = @($need | ForEach-Object { @{ enc = $_.enc; rel = $_.rel; len = $_.len } }) } | ConvertTo-Json -Compress -Depth 4
@@ -2064,20 +2245,19 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
       if ($h) { foreach ($pr in $h.h.PSObject.Properties) { $hashes[$pr.Name] = $pr.Value } }
       else { Write-PhienOut 'cảnh báo: không so sánh được các phiên đã đổi ở hai máy, bỏ qua chúng lần này' }
     }
-    $putStage = $null; $getStage = $null; $tmpRoot = Join-Path ([IO.Path]::GetTempPath()) ('fcode-phien-' + [guid]::NewGuid().ToString('N'))
+    $tmpRoot = Join-Path ([IO.Path]::GetTempPath()) ('fcode-phien-' + [guid]::NewGuid().ToString('N'))
     try {
-      $batches = New-Object System.Collections.ArrayList; $getItems = New-Object System.Collections.ArrayList
-      $notePlanned = 0; $noteDel = New-Object System.Collections.ArrayList
-      $laptopBlobDir = Join-Path $agent 'blobs'
-      $lblobIx = Get-OmpBlobIndex $laptopBlobDir
-      $nPutSess = 0; $nGetSess = 0; $nSame = 0
-      $plans = @{}
-      $noteState = Read-PhienNoteState; $noteRec = @{}; $noteShaPut = @{}; $noteGetInfo = @{}; $noteSkipped = 0
-      $noteGet = New-Object System.Collections.ArrayList
+      $putU = New-Object System.Collections.ArrayList; $getU = New-Object System.Collections.ArrayList
+      $putN = New-Object System.Collections.ArrayList; $getN = New-Object System.Collections.ArrayList
+      $ensure = New-Object System.Collections.ArrayList; $unexcl = New-Object System.Collections.ArrayList
+      $noteDel = New-Object System.Collections.ArrayList
+      $nPutSess = 0; $nGetSess = 0; $nSame = 0; $planIncomplete = 0
+      $plans = @{}; $queuedBlob = @{}
+      $noteState = Read-PhienNoteState; $noteRec = @{}; $noteShaPut = @{}; $noteGetInfo = @{}; $noteSkipped = 0; $fileSkipped = 0
       foreach ($c in $ctx) {
-        $plan = Get-PhienPlan $c.L $c.R $c.Benc $hashes $c.Lsd $lnow $rnow $PhienBusySec
+        $plan = Get-PhienPlan $c.L $c.R $c.Benc $hashes $c.Lsd $lnow $rnow $PhienBusySec $lblobIx $boxBlobs
         $plans[$c.Name] = $plan
-        $nSame += $plan.Same
+        $nSame += $plan.Same; $planIncomplete += $plan.Incomplete + $plan.Deferred
         $stat.unknown += @($plan.Unknown); $stat.diverged += $plan.Diverged
         $np = Get-PhienNotePlan $c.Name $c.LN $c.RN $noteState $lnow $rnow $PhienBusySec
         foreach ($cf in $np.Conflicts) { $stat.noteConf += $cf }
@@ -2088,7 +2268,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
           if (-not $DryRun) {
             $rk = "$($c.Name)/$($rl.Name)"
             if ($rl.OldOn -eq 'laptop') { [void](Remove-PhienNoteExclude $c.LDir $rl.Name); [void]$noteDel.Add("exclude:laptop:$rk"); [void]$noteDel.Add($rk) }
-            else { [void]($(Get-PhienBatch $batches $tmpRoot 0).Unexclude.Add(@{ project = $c.Name; name = $rl.Name })) }
+            else { [void]$unexcl.Add(@{ project = $c.Name; name = $rl.Name }) }
           }
         }
         if ($DryRun) {
@@ -2098,43 +2278,35 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
           foreach ($it in $plan.Get) { Write-PhienOut ("  [$($c.Name)] sẽ lấy về laptop: " + (Format-PhienItem $it)) }
           continue
         }
-        # ghi chu goc project: chep sang thu muc tam, ghi vao manifest; lay ve thi chi ghi danh sach yeu cau
-        foreach ($n in $np.Put) {
-          $nb = Get-PhienBatch $batches $tmpRoot ((Get-Item -LiteralPath (Join-Path $c.LDir $n.Name)).Length)
-          $nd = Join-Path $nb.Dir ('notes\' + $c.Name); [void](New-Item -ItemType Directory -Path $nd -Force)
-          $ns = Join-Path $nd $n.Name
-          Copy-Item -LiteralPath (Join-Path $c.LDir $n.Name) -Destination $ns
-          if ((Get-RangeSha $ns 0 (Get-Item -LiteralPath $ns).Length) -ne $n.Sha) { Remove-Item -LiteralPath $ns -Force; $noteSkipped++; continue }   # changed while copying: next run
-          [void]$nb.Notes.Add(@{ project = $c.Name; name = $n.Name; expect = $n.Expect; sha = $n.Sha }); $noteShaPut["$($c.Name)/$($n.Name)"] = $n.Sha; $notePlanned++
-        }
-        foreach ($n in $np.Ensure) { [void]($(Get-PhienBatch $batches $tmpRoot 0).Ensure.Add(@{ project = $c.Name; name = $n })) }
-        foreach ($n in $np.Get) { [void]$noteGet.Add(@{ project = $c.Name; name = $n.Name }); $noteGetInfo["$($c.Name)/$($n.Name)"] = $n }
-        # gui len box: chep sang thu muc tam (doi cwd), ghi manifest
+        # cac phan se chep (moi phan mot file), theo thu tu: ghi chu; roi tung phien: blob, file di kem, .jsonl long ben trong, file chinh
+        $lnm = @{}; foreach ($f in @($c.LN.files)) { $lnm[[string]$f.name] = $f }
+        $rnm = @{}; foreach ($f in @($c.RN.files)) { $rnm[[string]$f.name] = $f }
+        foreach ($n in $np.Put) { [void]$putN.Add(@{ K = 'note'; C = $c; Name = $n.Name; Size = [long]$lnm[$n.Name].size; Expect = $n.Expect; Sha = $n.Sha }) }
+        foreach ($n in $np.Ensure) { [void]$ensure.Add(@{ project = $c.Name; name = $n }) }
+        foreach ($n in $np.Get) { [void]$getN.Add(@{ K = 'note'; C = $c; Name = $n.Name; Size = [long]$rnm[$n.Name].size }); $noteGetInfo["$($c.Name)/$($n.Name)"] = $n }
         $lsz = @{}; foreach ($s in @($c.L)) { $lsz[[string]$s.name] = [long]$s.size; foreach ($f in @($s.files)) { $lsz[[string]$f.rel] = [long]$f.size } }
-        foreach ($it in $plan.Put) {
-          $rels = @(); if ($it.Top) { $rels += $it.Name }; $rels += @($it.Files)
-          # a file that shrank since the scan: leave the whole item for the next run
-          if (@($rels | Where-Object { (Get-Item -LiteralPath (Join-Path $c.Lsd ($_ -replace '/', '\')) -ErrorAction SilentlyContinue).Length -lt $lsz[$_] }).Count) { $noteSkipped++; continue }
-          $ib = Get-PhienBatch $batches $tmpRoot ([long]($rels | ForEach-Object { $lsz[$_] } | Measure-Object -Sum).Sum)
-          $stageSess = Join-Path $ib.Dir ('sessions\' + $c.Benc)
-          foreach ($rel in $rels) {
-            $dst = Join-Path $stageSess ($rel -replace '/', '\')
-            $src = Join-Path $c.Lsd ($rel -replace '/', '\')
-            [void](Copy-OmpSession $src $dst $c.LDir $c.BDir $lsz[$rel])
-            if ($rel.EndsWith('.jsonl')) { $ib.Refs[$src] = $true }
-          }
-          [void]$ib.Items.Add(@{ enc = $c.Benc; top = $(if ($it.Top) { $it.Name } else { $null }); files = @($it.Files); origin = 'laptop' })
-          if ($it.Top) { $nPutSess++ }
-        }
-        if ($plan.Get.Count -gt 0) {
-          $rsz = @{}; foreach ($s in @($c.R)) { $rsz[[string]$s.name] = [long]$s.size; foreach ($f in @($s.files)) { $rsz[[string]$f.rel] = [long]$f.size } }
-          foreach ($it in $plan.Get) {
-            $sz = @{}; foreach ($rel in @(@($(if ($it.Top) { $it.Name })) + @($it.Files))) { if ($rel) { $sz[$rel] = $rsz[$rel] } }
-            [void]$getItems.Add(@{ enc = $c.Benc; top = $(if ($it.Top) { $it.Name } else { $null }); files = @($it.Files); sizes = $sz }); if ($it.Top) { $nGetSess++ }
+        $rsz = @{}; foreach ($s in @($c.R)) { $rsz[[string]$s.name] = [long]$s.size; foreach ($f in @($s.files)) { $rsz[[string]$f.rel] = [long]$f.size } }
+        foreach ($dir in 'put', 'get') {
+          $items = $plan.Put; $us = $putU; $sz = $lsz   # plain assignments: an `if` expression would unroll an empty list to $null
+          if ($dir -eq 'get') { $items = $plan.Get; $us = $getU; $sz = $rsz }
+          foreach ($it in $items) {
+            foreach ($hx in @($it.Blobs)) {
+              $bns = if ($dir -eq 'put') { @($lblobIx[$hx]) } else { @($boxBlobNames[$hx]) }
+              foreach ($bn in $bns) {
+                if (-not $bn -or $queuedBlob.ContainsKey("$dir/$bn")) { continue }
+                $queuedBlob["$dir/$bn"] = $true
+                $bsz = if ($dir -eq 'put') { (Get-Item -LiteralPath (Join-Path $laptopBlobDir $bn)).Length } else { [long]$boxBlobSize[[string]$bn] }
+                [void]$us.Add(@{ K = 'blob'; Name = [string]$bn; Size = [long]$bsz })
+              }
+            }
+            foreach ($rel in @(@($it.Files | Where-Object { -not $_.EndsWith('.jsonl') }) + @($it.Files | Where-Object { $_.EndsWith('.jsonl') }))) { if ($rel) { [void]$us.Add(@{ K = 'file'; C = $c; Rel = $rel; Size = $sz[$rel] }) } }
+            if ($it.Top) {
+              [void]$us.Add(@{ K = 'top'; C = $c; Rel = $it.Name; Size = $sz[$it.Name]; Deps = @($it.Deps); DepBlobs = @($it.DepBlobs) })
+              if ($dir -eq 'put') { $nPutSess++ } else { $nGetSess++ }
+            }
           }
         }
       }
-      $summary = New-Object System.Collections.Generic.List[string]
       foreach ($c in $ctx) {
         $pl = $plans[$c.Name]
         foreach ($nt in $pl.Notes) { Write-PhienOut "  [$($c.Name)] $nt" }
@@ -2142,101 +2314,145 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
       foreach ($cf in $stat.noteConf) { Write-PhienOut ('  ' + ($cf -replace '/.*$', '') + ': handoff ' + ($cf -replace '^[^/]*/', '') + ' khác nhau ở hai máy, giữ nguyên cả hai') }
       $un = Get-PhienUnknownNote $stat.unknown; if ($un) { Write-PhienOut $un }
       $vn = Get-PhienVersionNote $stat.ompL $stat.ompB; if ($vn) { Write-PhienOut $vn }
-      if ($DryRun) { Write-PhienOut "Chạy thử (--thu): chưa chép và chưa ghi gì cả. $nSame phiên đã giống nhau."; return 0 }
-      # --- gui len box ---
-      $putRes = $null; $missingBlobs = 0; $blobSent = @{}; $placedPut = 0
-      foreach ($pb in $batches) {
-        if ($pb.Items.Count -eq 0 -and $pb.Notes.Count -eq 0 -and $pb.Ensure.Count -eq 0 -and $pb.Unexclude.Count -eq 0) { continue }
+      if ($DryRun) { Write-PhienOut "Chạy thử (--thu): chưa chép gì (chỉ ghi lại giờ vừa kết nối box). $nSame phiên đã giống nhau."; return 0 }
+      # chia dot: <= 50 MB moi dot, tinh ca phan tar them vao; mot file lon hon thi di mot minh mot dot
+      $est = { param($u) $x = [long]0; if ($u.K -eq 'top') { foreach ($d in @($u.Deps)) { if ($d) { $x += 3 * ([string]$d.r).Length + 40 } }; $x += 70 * @($u.DepBlobs).Count }; Get-PhienUnitBytes ([long]$u.Size) $(if ($u.Rel) { [string]$u.Rel } else { [string]$u.Name }) $x }
+      $putB = New-Object System.Collections.ArrayList; $getB = New-Object System.Collections.ArrayList
+      foreach ($u in @(@($putN) + @($putU))) { [void](Get-PhienBatch $putB (Join-Path $tmpRoot 'put') (& $est $u) $PhienBatchLimit).Items.Add($u) }
+      foreach ($u in @(@($getN) + @($getU))) { [void](Get-PhienBatch $getB (Join-Path $tmpRoot 'get') (& $est $u) $PhienBatchLimit).Items.Add($u) }
+      if (($ensure.Count -or $unexcl.Count) -and -not $putB.Count) { [void]$putB.Add((New-PhienBatch (Join-Path $tmpRoot 'put\put0'))) }
+      if ($putB.Count) { foreach ($x in $ensure) { [void]$putB[0].Ensure.Add($x) }; foreach ($x in $unexcl) { [void]$putB[0].Unexclude.Add($x) } }
+      $notePlanned = $putN.Count; $placedPut = 0
+      $saveNotes = { if ($noteRec.Count -or $noteDel.Count) { foreach ($k in $noteRec.Keys) { $noteState[$k] = $noteRec[$k] }; foreach ($k in $noteDel) { $noteState.Remove([string]$k) }; try { Write-PhienNoteState $noteState } catch { } } }
+      $bigName = { param($b) if ($b.Items.Count -eq 1 -and $b.Bytes -gt $PhienBatchLimit) { $u = $b.Items[0]; if ($u.Rel) { [string]$u.Rel } else { [string]$u.Name } } }
+      $deferredTops = New-Object System.Collections.ArrayList; $busyFiles = New-Object System.Collections.ArrayList
+      # --- gui len box: tung dot mot (chep sang thu muc tam, doi cwd, dong goi, gui, xoa) ---
+      $putRes = @{ new = 0; replaced = 0; same = 0; skip = 0; busy = 0; blobs = 0; failed = 0 }
+      foreach ($pb in $putB) {
+        if (Test-PhienTimeUp) { Write-PhienOut 'hết thời gian của lượt này: phần còn lại để lần sau'; $code = 1; break }
         [void](New-Item -ItemType Directory -Path $pb.Dir -Force)
-        $bl = Join-Path $pb.Dir 'blobs'
-        foreach ($hex in @(Get-OmpBlobRefs @($pb.Refs.Keys))) {
-          if ($boxBlobs.ContainsKey($hex) -or $blobSent.ContainsKey($hex)) { continue }
-          if (-not $lblobIx.ContainsKey($hex)) { $missingBlobs++; continue }
-          [void](New-Item -ItemType Directory -Path $bl -Force)
-          foreach ($bn in $lblobIx[$hex]) { Copy-Item -LiteralPath (Join-Path $laptopBlobDir $bn) -Destination (Join-Path $bl $bn) }
-          $blobSent[$hex] = $true
+        $mf = New-Object System.Collections.ArrayList; $mt = New-Object System.Collections.ArrayList; $mn = New-Object System.Collections.ArrayList
+        foreach ($u in $pb.Items) {
+          if ($u.K -eq 'blob') {
+            $bd = Join-Path $pb.Dir 'blobs'; [void](New-Item -ItemType Directory -Path $bd -Force)
+            Copy-Item -LiteralPath (Join-Path $laptopBlobDir $u.Name) -Destination (Join-Path $bd $u.Name)
+          } elseif ($u.K -eq 'note') {
+            $nd = Join-Path $pb.Dir ('notes\' + $u.C.Name); [void](New-Item -ItemType Directory -Path $nd -Force)
+            $ns = Join-Path $nd $u.Name
+            Copy-Item -LiteralPath (Join-Path $u.C.LDir $u.Name) -Destination $ns
+            if ((Get-RangeSha $ns 0 (Get-Item -LiteralPath $ns).Length) -ne $u.Sha) { Remove-Item -LiteralPath $ns -Force; continue }   # changed while copying: next run
+            [void]$mn.Add(@{ project = $u.C.Name; name = $u.Name; expect = $u.Expect; sha = $u.Sha }); $noteShaPut["$($u.C.Name)/$($u.Name)"] = $u.Sha
+          } else {
+            $src = Join-Path $u.C.Lsd ($u.Rel -replace '/', '\')
+            $cur = Get-Item -LiteralPath $src -ErrorAction SilentlyContinue
+            if (-not $cur -or $cur.Length -lt [long]$u.Size) { $fileSkipped++; continue }   # shrank since the scan: left for the next run
+            [void](Copy-OmpSession $src (Join-Path $pb.Dir ('sessions\' + $u.C.Benc + '\' + ($u.Rel -replace '/', '\'))) $u.C.LDir $u.C.BDir ([long]$u.Size))
+            if ($u.K -eq 'top') { [void]$mt.Add(@{ enc = $u.C.Benc; rel = $u.Rel; origin = 'laptop'; deps = @($u.Deps); blobs = @($u.DepBlobs) }) }
+            else { [void]$mf.Add(@{ enc = $u.C.Benc; rel = $u.Rel }) }
+          }
         }
-        [IO.File]::WriteAllText((Join-Path $pb.Dir 'manifest.json'), (@{ items = @($pb.Items); notes = @($pb.Notes); ensure = @($pb.Ensure); unexclude = @($pb.Unexclude) } | ConvertTo-Json -Compress -Depth 6), (New-Object Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText((Join-Path $pb.Dir 'manifest.json'), (@{ files = @($mf); tops = @($mt); notes = @($mn); ensure = @($pb.Ensure); unexclude = @($pb.Unexclude) } | ConvertTo-Json -Compress -Depth 6), (New-Object Text.UTF8Encoding($false)))
         $tarFile = $pb.Dir + '.tar'
         & (Find-TarExe) -cf $tarFile -C $pb.Dir . 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) { throw 'tar không đóng gói được' }
         $res = Get-BoxJson (Invoke-BoxPy 'put' $null $tarFile)
         Remove-Item -LiteralPath $tarFile, $pb.Dir -Recurse -Force -ErrorAction SilentlyContinue   # free the disk before the next batch
         if (-not $res) {
-          Write-PhienOut 'lỗi: gửi phiên lên box không thành công (các dot sau để lần tới)'; $code = 1
-          break
+          Write-PhienOut 'lỗi: gửi phiên lên box không thành công (các đợt sau để lần tới)'
+          $bn = & $bigName $pb; if ($bn) { Write-PhienOut "phiên lớn: $bn chưa chép xong"; $stat.unfinished += $bn }
+          $code = 1; break
         }
-        if (-not $putRes) { $putRes = [pscustomobject]@{ new = 0; replaced = 0; same = 0; skip = 0; busy = 0; blobs = 0 } }
-        foreach ($k in 'new', 'replaced', 'same', 'skip', 'busy', 'blobs') { $putRes.$k += [int]$res.$k }
-        foreach ($k in @($res.notePlaced)) { $noteRec[[string]$k] = $noteShaPut[[string]$k]; $stat.noteCopied++; $placedPut++ }
-        foreach ($k in @($res.exclAdded)) { $noteRec["exclude:box:$k"] = '1' }
-        foreach ($k in @($res.unexcluded)) { [void]$noteDel.Add("exclude:box:$k"); [void]$noteDel.Add([string]$k) }
+        foreach ($k in @($putRes.Keys)) { $putRes[$k] += [int]$res.$k }
+        foreach ($x in @($res.deferred)) { if ($x) { [void]$deferredTops.Add([string]$x) } }
+        foreach ($x in @($res.busyFiles)) { if ($x) { [void]$busyFiles.Add([string]$x) } }
+        foreach ($k in @($res.notePlaced)) { if ($k) { $noteRec[[string]$k] = $noteShaPut[[string]$k]; $stat.noteCopied++; $placedPut++ } }
+        foreach ($k in @($res.exclAdded)) { if ($k) { $noteRec["exclude:box:$k"] = '1' } }
+        foreach ($k in @($res.unexcluded)) { if ($k) { [void]$noteDel.Add("exclude:box:$k"); [void]$noteDel.Add([string]$k) } }
+        & $saveNotes
       }
-      $noteSkipped += $notePlanned - $placedPut      # --- lay ve laptop ---
-      $getRes = @{ new = 0; replaced = 0; same = 0; skip = 0; busy = 0; blobs = 0 }
-      if ($getItems.Count -gt 0 -or $noteGet.Count -gt 0) {
-        $req = @{ items = @($getItems); notes = @($noteGet); have = @($lblobIx.Values | ForEach-Object { $_ }) } | ConvertTo-Json -Compress -Depth 6
-        $g = Invoke-BoxPy 'get' ([Text.Encoding]::UTF8.GetBytes($req))
-        $mk = [Text.Encoding]::ASCII.GetBytes("FCODE-TAR`n"); $pos = -1
-        if ($g.Code -eq 0) {
-          for ($i = 0; $i -le $g.Out.Length - $mk.Length; $i++) {
-            if ($g.Out[$i] -eq $mk[0]) { $ok = $true; for ($j = 1; $j -lt $mk.Length; $j++) { if ($g.Out[$i + $j] -ne $mk[$j]) { $ok = $false; break } }; if ($ok) { $pos = $i + $mk.Length; break } }
-            if ($i -gt 65536) { break }
+      $noteSkipped += $notePlanned - $placedPut
+      # --- lay ve laptop: tung dot mot; dot nao loi (cat ngang, het gio) thi khong dat gi cua dot do ---
+      $getRes = @{ new = 0; replaced = 0; same = 0; skip = 0; busy = 0; blobs = 0; failed = 0 }
+      $mk = [Text.Encoding]::ASCII.GetBytes("FCODE-TAR`n")
+      if ($code -eq 0) {
+        foreach ($gbt in $getB) {
+          if (Test-PhienTimeUp) { Write-PhienOut 'hết thời gian của lượt này: phần còn lại để lần sau'; $code = 1; break }
+          $qf = New-Object System.Collections.ArrayList; $qb = New-Object System.Collections.ArrayList; $qn = New-Object System.Collections.ArrayList
+          foreach ($u in $gbt.Items) {
+            if ($u.K -eq 'blob') { [void]$qb.Add($u.Name) } elseif ($u.K -eq 'note') { [void]$qn.Add(@{ project = $u.C.Name; name = $u.Name }) } else { [void]$qf.Add(@{ enc = $u.C.Benc; rel = $u.Rel; size = [long]$u.Size }) }
           }
-        }
-        if ($pos -lt 0) { Write-PhienOut 'lỗi: lấy phiên từ box về không thành công'; $code = 1 }
-        else {
-          $gt = Join-Path $tmpRoot 'get'; [void](New-Item -ItemType Directory -Path $gt -Force)
-          $gtar = Join-Path $tmpRoot 'get.tar'
-          $fsT = [IO.File]::Create($gtar); try { $fsT.Write($g.Out, $pos, $g.Out.Length - $pos) } finally { $fsT.Dispose() }
-          & (Find-TarExe) -xf $gtar -C $gt 2>&1 | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw 'tar không giải nén được' }
+          $req = @{ files = @($qf); blobs = @($qb); notes = @($qn) } | ConvertTo-Json -Compress -Depth 5
+          $g = Invoke-BoxPy 'get' ([Text.Encoding]::UTF8.GetBytes($req))
+          $pos = -1
+          if ($g.Code -eq 0) {
+            for ($i = 0; $i -le $g.Out.Length - $mk.Length; $i++) {
+              if ($g.Out[$i] -eq $mk[0]) { $ok = $true; for ($j = 1; $j -lt $mk.Length; $j++) { if ($g.Out[$i + $j] -ne $mk[$j]) { $ok = $false; break } }; if ($ok) { $pos = $i + $mk.Length; break } }
+              if ($i -gt 65536) { break }
+            }
+          }
+          $gt = $gbt.Dir; $gtar = $gt + '.tar'; $xok = $false
+          if ($pos -ge 0) {
+            [void](New-Item -ItemType Directory -Path $gt -Force)
+            $fsT = [IO.File]::Create($gtar); try { $fsT.Write($g.Out, $pos, $g.Out.Length - $pos) } finally { $fsT.Dispose() }
+            & (Find-TarExe) -xf $gtar -C $gt 2>&1 | Out-Null
+            $xok = ($LASTEXITCODE -eq 0)
+          }
+          $g = $null
+          if (-not $xok) {
+            Remove-Item -LiteralPath $gtar, $gt -Recurse -Force -ErrorAction SilentlyContinue
+            Write-PhienOut 'lỗi: lấy phiên từ box về không thành công (các đợt sau để lần tới)'
+            $bn = & $bigName $gbt; if ($bn) { Write-PhienOut "phiên lớn: $bn chưa chép xong"; $stat.unfinished += $bn }
+            $code = 1; break
+          }
           $gnow = ConvertTo-Epoch (Get-Date)
-          foreach ($c in $ctx) {
-            $pl = $plans[$c.Name]
-            foreach ($it in $pl.Get) {
-              $rels = @(); if ($it.Top) { $rels += $it.Name }; $rels += @($it.Files)
-              foreach ($rel in $rels) {
-                $src = Join-Path $gt ('sessions\' + $c.Benc + '\' + ($rel -replace '/', '\'))
-                if (-not (Test-Path -LiteralPath $src)) { continue }
-                $st = Install-PhienFile $src (Join-Path $c.Lsd ($rel -replace '/', '\')) $c.BDir $c.LDir $gnow $PhienBusySec
-                $getRes[$st]++
-              }
-            }
+          # 1. blob
+          foreach ($u in @($gbt.Items | Where-Object { $_.K -eq 'blob' })) {
+            $f = Join-Path $gt ('blobs\' + $u.Name)
+            if ($u.Name -notmatch '^[a-f0-9]{64}(?:\.[A-Za-z0-9][A-Za-z0-9._-]{0,31})?$' -or -not (Test-Path -LiteralPath $f) -or (Get-Item -LiteralPath $f).Length -ne [long]$u.Size) { continue }
+            $dst = Join-Path $laptopBlobDir $u.Name
+            if (Test-Path -LiteralPath $dst) { continue }
+            $part = New-PhienPartName (Join-Path $laptopBlobDir ('.' + $u.Name))
+            try { [void](New-Item -ItemType Directory -Path $laptopBlobDir -Force -ErrorAction Stop); [IO.File]::Copy($f, $part, $true); [IO.File]::Move($part, $dst); $getRes.blobs++ }
+            catch { $getRes.failed++; Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }
           }
-          foreach ($n in $noteGet) {
-            $src = Join-Path $gt ('notes\' + $n.project + '\' + $n.name)
-            $key = "$($n.project)/$($n.name)"; $info = $noteGetInfo[$key]
+          $lblobIx = Get-OmpBlobIndex $laptopBlobDir
+          # 2. file di kem, roi .jsonl long ben trong; 3. file chinh, chi khi moi thu no can da co tren laptop
+          $files = @($gbt.Items | Where-Object { $_.K -eq 'file' })
+          foreach ($u in @(@($files | Where-Object { -not $_.Rel.EndsWith('.jsonl') }) + @($files | Where-Object { $_.Rel.EndsWith('.jsonl') }) + @($gbt.Items | Where-Object { $_.K -eq 'top' }))) {
+            if (-not $u) { continue }
+            $src = Join-Path $gt ('sessions\' + $u.C.Benc + '\' + ($u.Rel -replace '/', '\'))
+            if (-not (Test-Path -LiteralPath $src) -or (Get-Item -LiteralPath $src).Length -ne [long]$u.Size) { continue }   # left out by the box (being written, shrank)
+            if ($u.K -eq 'top' -and -not (Test-PhienDeps $u.C.Lsd $u.Deps $u.DepBlobs $lblobIx)) { [void]$deferredTops.Add([string]$u.Rel); continue }
+            try { $st = Install-PhienFile $src (Join-Path $u.C.Lsd ($u.Rel -replace '/', '\')) $u.C.BDir $u.C.LDir $gnow $PhienBusySec } catch { $st = 'failed' }
+            $getRes[$st]++
+          }
+          # 4. ghi chu
+          foreach ($u in @($gbt.Items | Where-Object { $_.K -eq 'note' })) {
+            $src = Join-Path $gt ('notes\' + $u.C.Name + '\' + $u.Name)
+            $key = "$($u.C.Name)/$($u.Name)"; $info = $noteGetInfo[$key]
             if (-not (Test-Path -LiteralPath $src)) { $noteSkipped++; continue }
-            $ldirN = ($ctx | Where-Object { $_.Name -eq $n.project } | Select-Object -First 1).LDir
-            if ((Install-PhienNote $src $ldirN $n.name $info.Expect $gnow $PhienBusySec ([string]$info.Sha)) -eq 'ok') { $noteRec[$key] = [string]$info.Sha; $stat.noteCopied++; if ($script:PhienLastExclAdded) { $noteRec["exclude:laptop:$key"] = '1' } } else { $noteSkipped++ }
+            if ((Install-PhienNote $src $u.C.LDir $u.Name $info.Expect $gnow $PhienBusySec ([string]$info.Sha)) -eq 'ok') { $noteRec[$key] = [string]$info.Sha; $stat.noteCopied++; if ($script:PhienLastExclAdded) { $noteRec["exclude:laptop:$key"] = '1' } } else { $noteSkipped++ }
           }
-          $gb = Join-Path $gt 'blobs'
-          if (Test-Path -LiteralPath $gb) {
-            [void](New-Item -ItemType Directory -Path $laptopBlobDir -Force)
-            foreach ($f in [IO.Directory]::GetFiles($gb)) {
-              $bn = [IO.Path]::GetFileName($f)
-              if ($bn -notmatch '^[a-f0-9]{64}(?:\.[A-Za-z0-9][A-Za-z0-9._-]{0,31})?$') { continue }
-              $dst = Join-Path $laptopBlobDir $bn
-              if (Test-Path -LiteralPath $dst) { continue }
-              $part = New-PhienPartName (Join-Path $laptopBlobDir ('.' + $bn))
-              [IO.File]::Copy($f, $part, $true); [IO.File]::Move($part, $dst); $getRes.blobs++
-            }
-          }
+          Remove-Item -LiteralPath $gtar, $gt -Recurse -Force -ErrorAction SilentlyContinue
+          & $saveNotes
         }
       }
       # --- bao cao ---
-      $up = if ($putRes) { [int]$putRes.new + [int]$putRes.replaced } else { 0 }
+      $up = [int]$putRes.new + [int]$putRes.replaced
       $down = [int]$getRes.new + [int]$getRes.replaced
       foreach ($c in $ctx) { $pl = $plans[$c.Name]; Write-PhienOut ("== $($c.Name): gửi $(@($pl.Put | Where-Object { $_.Top }).Count) phiên lên box, lấy $(@($pl.Get | Where-Object { $_.Top }).Count) phiên về, $($pl.Same) đã giống nhau") }
-      if ($missingBlobs) { Write-PhienOut "cảnh báo: $missingBlobs file đính kèm (blob) không thấy trên laptop nên chưa gửi" }
-      $skipped = [int]$getRes.skip + [int]$getRes.busy + $(if ($putRes) { [int]$putRes.skip + [int]$putRes.busy } else { 0 })
+      if ($deferredTops.Count) { Write-PhienOut "$($deferredTops.Count) phiên chưa đặt file chính vì file đi kèm chưa đủ, lần sau làm tiếp" }
+      if ($busyFiles.Count) { Write-PhienOut "$($busyFiles.Count) file đang mở trên box (omp đang chạy phiên đó), để lần sau" }
+      $failed = [int]$putRes.failed + [int]$getRes.failed
+      if ($failed) { Write-PhienOut "lỗi: $failed file chưa ghi được ở máy nhận, lần sau làm tiếp"; $code = 1 }
+      $skipped = [int]$getRes.skip + [int]$getRes.busy + [int]$putRes.skip + [int]$putRes.busy
       if ($skipped) { Write-PhienOut "$skipped file được giữ nguyên vì đã khác nhau hoặc đang được ghi" }
-      $stat.copied = $up + $down; $stat.skipped = $skipped + @($plans.Values | ForEach-Object { $_.Notes } | Where-Object { $_ -like '*đang được ghi*' }).Count
+      $stat.copied = $up + $down; $stat.skipped = $skipped + $fileSkipped + @($plans.Values | ForEach-Object { $_.Notes } | Where-Object { $_ -like '*đang được ghi*' }).Count
       if ($stat.noteCopied -or $stat.noteConf.Count) { Write-PhienOut "ghi chú dự án: chép $($stat.noteCopied), xung đột $($stat.noteConf.Count)" }
-      if ($noteRec.Count -or $noteDel.Count) { foreach ($k in $noteRec.Keys) { $noteState[$k] = $noteRec[$k] }; foreach ($k in $noteDel) { $noteState.Remove([string]$k) }; try { Write-PhienNoteState $noteState } catch { } }
+      & $saveNotes
       $stat.skipped += $noteSkipped
-      Write-PhienOut ("Xong: $up file gửi lên box, $down file lấy về laptop" + $(if ($up + $down -eq 0) { ' (hai bên đã giống nhau)' } else { '' }))
+      $open = $planIncomplete + $deferredTops.Count + $busyFiles.Count + $failed + $fileSkipped + $code
+      Write-PhienOut ("Xong: $up file gửi lên box, $down file lấy về laptop" + $(if ($up + $down -eq 0 -and $open -eq 0) { ' (hai bên đã giống nhau)' } else { '' }))
       if (-not $Auto -and ($nPutSess + $nGetSess) -gt 0) { Write-PhienOut 'Nhớ đẩy code lên GitHub trước (git push) để hai bên cùng một bản code.' }
     } finally { Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue }
     if ($code -ne 0) { $stat.ok = $false }
@@ -2255,7 +2471,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
 # mot dong cho che do chay thu: ma phien (8 ky tu dau) va so file
 function Format-PhienItem($it) {
   $id = [string]$it.Id; if ($id.Length -gt 8) { $id = $id.Substring(0, 8) }
-  $n = @($it.Files).Count
+  $n = @($it.Files).Count + @($it.Blobs | Where-Object { $_ }).Count
   if ($it.Top) { if ($n) { "phiên $id (và $n file đi kèm)" } else { "phiên $id" } } else { "$n file đi kèm của phiên $id" }
 }
 
@@ -2273,10 +2489,20 @@ function Invoke-GitQuiet([string]$Dir, [string[]]$GitArgs) {
   [pscustomobject]@{ Code = $c; Out = @($o | ForEach-Object { "$_" }) }
 }
 
-# cung dang voi `scan_notes` cua box: @{gitok; tracked; files = {name,size,mtime,sha,ign}}
+# ghi chu nam trong nhanh mac dinh cua origin (ban da fetch): git se mang file do toi, nen cung tinh la da theo doi (nhu box `upstream_names`)
+function Get-PhienUpstreamNotes([string]$Dir) {
+  $h = Invoke-GitQuiet $Dir @('symbolic-ref', '-q', 'refs/remotes/origin/HEAD')
+  $ref = if ($h.Code -eq 0 -and @($h.Out)[0]) { [string]@($h.Out)[0] } else { 'refs/remotes/origin/main' }
+  $r = Invoke-GitQuiet $Dir @('ls-tree', '--name-only', $ref)
+  if ($r.Code -ne 0) { return , @() }
+  $rx = Get-PhienNoteRx
+  , @($r.Out | Where-Object { $_ -cmatch $rx } | Sort-Object)
+}
+
+# cung dang voi `scan_notes` cua box: @{gitok; tracked (index); upstream (origin/<mac dinh>); files = {name,size,mtime,sha,ign}}
 function Get-PhienLocalNotes([string]$Dir) {
   $r = Invoke-GitQuiet $Dir (@('ls-files', '--') + (Get-PhienNoteSpecs))
-  if ($r.Code -ne 0) { return [pscustomobject]@{ gitok = $false; tracked = @(); files = @() } }
+  if ($r.Code -ne 0) { return [pscustomobject]@{ gitok = $false; tracked = @(); upstream = @(); files = @() } }
   $rx = Get-PhienNoteRx
   $files = New-Object System.Collections.ArrayList
   foreach ($f in (Get-ChildItem -LiteralPath $Dir -File -Force | Sort-Object Name)) {
@@ -2284,7 +2510,7 @@ function Get-PhienLocalNotes([string]$Dir) {
     $ig = Invoke-GitQuiet $Dir @('check-ignore', '-q', '--', $f.Name)
     [void]$files.Add([pscustomobject]@{ name = $f.Name; size = $f.Length; mtime = (ConvertTo-Epoch $f.LastWriteTimeUtc); sha = (Get-RangeSha $f.FullName 0 $f.Length); ign = ($ig.Code -eq 0) })
   }
-  [pscustomobject]@{ gitok = $true; tracked = @($r.Out | Where-Object { $_ -cmatch $rx } | Sort-Object); files = @($files) }
+  [pscustomobject]@{ gitok = $true; tracked = @($r.Out | Where-Object { $_ -cmatch $rx } | Sort-Object); upstream = (Get-PhienUpstreamNotes $Dir); files = @($files) }
 }
 
 # ke hoach cho mot project: Put/Get = {Name; Expect (sha hien co o dich, '' neu chua co); Sha (sha noi dung se chep)};
@@ -2294,12 +2520,16 @@ function Get-PhienNotePlan([string]$Proj, $LN, $RN, $State, [double]$LNow, [doub
   $ensure = New-Object System.Collections.ArrayList; $conf = New-Object System.Collections.ArrayList; $rec = @{}
   $release = New-Object System.Collections.ArrayList
   if ($LN.gitok -and $RN.gitok) {
-    $tracked = @($LN.tracked) + @($RN.tracked)
+    # tracked = in either index, or in either side's origin/<default> (git brings it there with the next pull)
+    $lt = @(@($LN.tracked) | Where-Object { $_ }); $rt = @(@($RN.tracked) | Where-Object { $_ })
+    $up = @(@($LN.upstream) + @($RN.upstream) | Where-Object { $_ })
+    $tracked = $lt + $rt + $up
     $lm = @{}; foreach ($f in @($LN.files)) { $lm[[string]$f.name] = $f }
     $rm = @{}; foreach ($f in @($RN.files)) { $rm[[string]$f.name] = $f }
-    # git started tracking a name that fcode had placed + excluded on the OTHER side: stop syncing it and give that line back
-    foreach ($n in @($LN.tracked)) { if (-not (@($RN.tracked) -ccontains $n) -and $rm[$n] -and $State["exclude:box:$Proj/$n"]) { [void]$release.Add([pscustomobject]@{ Name = $n; TrackedOn = 'laptop'; OldOn = 'box' }) } }
-    foreach ($n in @($RN.tracked)) { if (-not (@($LN.tracked) -ccontains $n) -and $lm[$n] -and $State["exclude:laptop:$Proj/$n"]) { [void]$release.Add([pscustomobject]@{ Name = $n; TrackedOn = 'box'; OldOn = 'laptop' }) } }
+    # git tracks a name now (other index or upstream) and fcode had placed + excluded the untracked copy on one side: stop syncing it
+    # and give that one line back
+    foreach ($n in @($lt + $up | Sort-Object -Unique)) { if (-not ($rt -ccontains $n) -and $rm[$n] -and $State["exclude:box:$Proj/$n"]) { [void]$release.Add([pscustomobject]@{ Name = $n; TrackedOn = $(if ($lt -ccontains $n) { 'laptop' } else { 'origin' }); OldOn = 'box' }) } }
+    foreach ($n in @($rt + $up | Sort-Object -Unique)) { if (-not ($lt -ccontains $n) -and $lm[$n] -and $State["exclude:laptop:$Proj/$n"]) { [void]$release.Add([pscustomobject]@{ Name = $n; TrackedOn = $(if ($rt -ccontains $n) { 'box' } else { 'origin' }); OldOn = 'laptop' }) } }
     foreach ($n in @(@($lm.Keys) + @($rm.Keys) | Sort-Object -Unique)) {
       if ($tracked -ccontains $n) { continue }
       $l = $lm[$n]; $r = $rm[$n]; $key = "$Proj/$n"
@@ -2367,7 +2597,7 @@ function Remove-PhienNoteExclude([string]$Dir, [string]$Name) {
 function Install-PhienNote([string]$Src, [string]$Dir, [string]$Name, [string]$Expect, [double]$Now, [int]$Busy = 30, [string]$Sha = '') {
   if ($Sha -and (Get-RangeSha $Src 0 (Get-Item -LiteralPath $Src).Length) -ne $Sha) { return 'changed' }
   $t = Invoke-GitQuiet $Dir @('ls-files', '--', $Name)
-  if ($t.Code -ne 0 -or $t.Out -ccontains $Name) { return 'tracked' }
+  if ($t.Code -ne 0 -or $t.Out -ccontains $Name -or (Get-PhienUpstreamNotes $Dir) -ccontains $Name) { return 'tracked' }
   $dst = Join-Path $Dir $Name
   if (Test-Path -LiteralPath $dst) {
     $di = Get-Item -LiteralPath $dst
@@ -2411,7 +2641,10 @@ $PhienAutoGapSec = 2400
 function Invoke-PhienAutoRun {
   $as = Read-PhienAutoState
   $last = if ($as) { [double]$as.lastSshAt } else { 0 }
-  if (-not (Test-BoxRunning)) {
+  $bs = Test-BoxRunning
+  # instabox ls loi / tra ve thu khong doc duoc: khong biet box ra sao -> khong ssh va KHONG doi trang thai (khong tu tao ra "box vua chay")
+  if ($bs -eq 'unknown') { Add-PhienLog @('không đọc được trạng thái box (instabox ls lỗi): bỏ qua lần này, giữ nguyên trạng thái'); return 0 }
+  if ($bs -ne 'running') {
     if ($as -and $as.boxRunning) { Add-PhienLog @('box không chạy nữa, tạm nghỉ') }
     Write-PhienAutoState @{ boxRunning = $false; lastSshAt = $last }
     return 0

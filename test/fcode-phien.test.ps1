@@ -3,6 +3,7 @@
 # Needs python (3.8+) on PATH: the box program ($PhienPy) is run locally through test/fake-instabox.cmd, so the real
 # ~/.omp and the real box are never touched. Everything lives in a temp folder that is removed at the end.
 #   FCODE_TEST_BOX=1   also run one end-to-end pass on the real instabox box (throwaway HOME there; laptop side = temp USERPROFILE).
+#   FCODE_TEST_ONLY=<regex>   run only the tests whose name matches (used for the mutant runs)
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $Repo = Split-Path -Parent $PSScriptRoot
@@ -11,8 +12,11 @@ $Root = Join-Path ([IO.Path]::GetTempPath()) ('fcode-phien-test-' + [guid]::NewG
 [void](New-Item -ItemType Directory -Path $Root)
 Set-Location -LiteralPath $Root   # stray files from child processes (e.g. PowerShell's module cache) land here and are removed with it
 $script:pass = 0; $script:fail = 0
+# a lock name of our own: never the real `Local\fcode-phien` (the user's task or a second suite run would collide)
+$env:FCODE_PHIEN_LOCK = 'Local\fcode-phien-test-' + [guid]::NewGuid().ToString('N')
 
 function T([string]$Name, [scriptblock]$Body) {
+  if ($env:FCODE_TEST_ONLY -and $Name -notmatch $env:FCODE_TEST_ONLY) { return }
   try { & $Body; $script:pass++; Write-Host "PASS $Name" }
   catch { $script:fail++; Write-Host "FAIL $Name :: $($_.Exception.Message)" }
 }
@@ -26,7 +30,8 @@ if ($errs.Count) { throw "fcode.ps1 does not parse: $($errs[0].Message)" }
 $wanted = 'Test-WinPath', 'Resolve-OmpPath', 'Get-OmpUnder', 'Join-OmpName', 'Get-OmpEncodedDir', 'ConvertTo-Epoch', 'Convert-OmpCwd', 'ConvertTo-JsonStr',
   'Get-OmpHeaderSpan', 'Open-ShareRead', 'Read-Head', 'Get-OmpBodyOff', 'Test-OmpNonEmpty', 'Get-RangeSha', 'Get-PhienOff', 'Test-PhienPrefix', 'Get-PhienKnownVersions', 'Test-PhienKnownVersion', 'Get-OmpHeaderVersion', 'Get-OmpHeaderInfo', 'Get-PhienVersionNote', 'Get-PhienUnknownNote', 'Get-PhienNoteRx', 'Get-PhienNoteSpecs', 'Invoke-GitQuiet', 'Get-PhienLocalNotes', 'Get-PhienNotePlan', 'Get-PhienNoteStatePath', 'Read-PhienNoteState', 'Write-PhienNoteState', 'Add-PhienNoteExclude', 'Install-PhienNote',
   'Copy-OmpSession', 'Get-OmpBlobRefs', 'Get-OmpBlobIndex', 'Get-PhienLocalScan', 'Compare-PhienFile', 'Get-PhienPlan', 'Install-PhienFile',
-  'Install-PhienTask', 'Remove-PhienTask', 'New-PhienPartName', 'Get-PhienBoxBlobSet', 'New-PhienBatch', 'Get-PhienBatch', 'Remove-PhienNoteExclude'
+  'Install-PhienTask', 'Remove-PhienTask', 'New-PhienPartName', 'Get-PhienBoxBlobSet', 'New-PhienBatch', 'Get-PhienBatch', 'Remove-PhienNoteExclude',
+  'Get-PhienDirFiles', 'Get-PhienIdOf', 'Test-PhienDeps', 'Get-PhienUnitBytes', 'Get-PhienUpstreamNotes'
 foreach ($fn in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in $wanted }, $true)) { . ([scriptblock]::Create($fn.Extent.Text)) }
 $pyAssign = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$PhienPy' }, $true)
 Invoke-Expression $pyAssign.Extent.Text
@@ -249,7 +254,7 @@ T 'format guard: version note' {
 }
 # ============================== project notes (HANDOFF*.md, CLAUDE.md, ...) ==============================
 function Nt([string]$Name, [string]$Sha, [double]$Age = 600, [bool]$Ign = $true) { [pscustomobject]@{ name = $Name; size = 1; mtime = ((ConvertTo-Epoch (Get-Date)) - $Age); sha = $Sha; ign = $Ign } }
-function NS($Files, $Tracked = @(), [bool]$GitOk = $true) { [pscustomobject]@{ gitok = $GitOk; tracked = @($Tracked); files = @($Files) } }
+function NS($Files, $Tracked = @(), [bool]$GitOk = $true, $Upstream = @()) { [pscustomobject]@{ gitok = $GitOk; tracked = @($Tracked); upstream = @($Upstream); files = @($Files) } }
 T 'notes: name list' {
   $rx = Get-PhienNoteRx
   foreach ($n in 'HANDOFF.md', 'HANDOFF-mobile-1.md', 'HANDOFFnotes.md', 'CLAUDE.md', 'AGENTS.md', 'WORKFLOW.md', 'agent_state.md', 'TASK.md', 'CLAUDE.local.md', 'HANDOFF-ghi chú.md') { Ok ($n -cmatch $rx) "$n should match" }
@@ -284,7 +289,7 @@ T 'notes planner: copy, record, overwrite rule, conflicts, tracked, busy, git mi
 }
 function New-GitDir([string]$Dir) { $ErrorActionPreference = 'Continue'; [void](New-Item -ItemType Directory -Path $Dir -Force); & git -C $Dir init -q 2>&1 | Out-Null; if ($LASTEXITCODE -ne 0) { throw 'git init' } }
 function Git-Commit([string]$Dir, [string[]]$Files) { $ErrorActionPreference = 'Continue'; & git -C $Dir -c core.autocrlf=false add -- @Files 2>&1 | Out-Null; & git -C $Dir -c user.name=t -c user.email=t@t commit -q -m x 2>&1 | Out-Null }
-function Put-File([string]$Path, [string]$Text, [int]$Age = 600) { [IO.File]::WriteAllText($Path, $Text, $utf8); Set-Age $Path $Age }
+function Put-File([string]$Path, [string]$Text, [int]$Age = 600) { [void][IO.Directory]::CreateDirectory((Split-Path $Path)); [IO.File]::WriteAllText($Path, $Text, $utf8); Set-Age $Path $Age }
 T 'notes: local scan sees untracked/ignored root notes only, tracked names are listed' {
   $d = Join-Path $Root 'nt1'; New-GitDir $d
   Put-File "$d\HANDOFF-x.md" 'h'; Put-File "$d\CLAUDE.md" 'tracked'; Put-File "$d\TASK.md" 't'; Put-File "$d\README.md" 'r'; Put-File "$d\.gitignore" "TASK.md`n"
@@ -692,7 +697,7 @@ if ($env:FCODE_TEST_BOX) {
     $o.Result.Trim()
   }
   T 'real box: both ways, cwd rewritten, blob, notes, second run copies nothing, omp on the box resolves the session' {
-    $bt = '/tmp/fcode-phien-test-' + [guid]::NewGuid().ToString('N').Substring(0, 8); $bp = "$bt/ws/proj"
+    $bt = Invoke-RealBox 'mktemp -d /tmp/fcode-phien-test-XXXXXXXX'; Ok ($bt -match '\A/tmp/fcode-phien-test-[A-Za-z0-9]{8}\z') "throwaway dir: $bt"; $bp = "$bt/ws/proj"
     $w = New-World 'real1'
     [void](New-Item -ItemType Directory -Path (Join-Path $w.U 'Desktop\other'), (Join-Path $w.U 'Desktop\notonbox') -Force)
     [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ instabox = $RealIb; box = 'coder'; syncRepos = @($w.LP) } | ConvertTo-Json -Compress))
@@ -732,6 +737,28 @@ if ($env:FCODE_TEST_BOX) {
       $r2 = Invoke-Fcode $w @('phien') $env0; Eq $r2.Code 0 $r2.Out
       Ok ($r2.Out -match '0 file gửi lên box, 0 file lấy về laptop' -and $r2.Out -notmatch 'chép [1-9]') ("second run copies nothing; out: " + $r2.Out)
     } finally { [void](Invoke-RealBox "rm -rf $bt") }
+  }
+  T 'real box: a session file that a box process holds open is left alone (busy) and its top waits; once closed, the next run updates it' {
+    $bt = Invoke-RealBox 'mktemp -d /tmp/fcode-phien-test-XXXXXXXX'; Ok ($bt -match '\A/tmp/fcode-phien-test-[A-Za-z0-9]{8}\z') "throwaway dir: $bt"; $bp = "$bt/ws/proj"
+    $w = New-World 'real2'
+    [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ instabox = $RealIb; box = 'coder'; syncRepos = @($w.LP) } | ConvertTo-Json -Compress))
+    $sd = "$bt/.omp/agent/sessions/$(Get-OmpEncodedDir $bp $bt '/tmp')"
+    try {
+      $cfgB64 = [Convert]::ToBase64String($utf8.GetBytes((@{ projects = @{ proj = $bp } } | ConvertTo-Json -Compress)))
+      [void](Invoke-RealBox "mkdir -p $bp $sd && echo $cfgB64 | base64 -d > $bt/cfg.json")
+      $a = New-Sess $w.LS 'a0000000-0000-7000-8000-0000000000b5' $w.LP @('a') 'A' "`n" '2026-10-20T10-00-00-000Z'; $an = Split-Path $a -Leaf
+      $env0 = @{ FCODE_PHIEN_BOXENV = "HOME=$bt FCODE_CFG=$bt/cfg.json" }
+      $r = Invoke-Fcode $w @('phien') $env0; Eq $r.Code 0 $r.Out
+      $len0 = Invoke-RealBox "stat -c %s $sd/$an"
+      Add-Msgs $a @('b')
+      [void](Invoke-RealBox "nohup sh -c 'echo `$`$ > $bt/pid; exec 3>>$sd/$an; exec sleep 120' </dev/null >/dev/null 2>&1 & sleep 1; echo started")
+      $r = Invoke-Fcode $w @('phien') $env0
+      Ok ($r.Out -match '1 file đang mở trên box') ("told; out: " + $r.Out)
+      Eq (Invoke-RealBox "stat -c %s $sd/$an") $len0 'the held file is unchanged'
+      [void](Invoke-RealBox "kill `$(cat $bt/pid); sleep 1; echo ok")
+      $r = Invoke-Fcode $w @('phien') $env0; Eq $r.Code 0 $r.Out
+      Eq (Invoke-RealBox "grep -c '`"id`":`"b`"' $sd/$an") '1' 'updated once nothing holds it'
+    } finally { [void](Invoke-RealBox "kill `$(cat $bt/pid 2>/dev/null) 2>/dev/null; rm -rf $bt; echo ok") }
   }
 }
 T 'e2e: equal-length sessions with other content are reported and left alone' {
@@ -797,7 +824,7 @@ T 'e2e: a manual run waits for the auto-run lock; an auto run that finds the loc
   $w = New-World 'e2e10'
   [void](New-Item -ItemType Directory -Path (Join-Path $w.U 'Desktop\other'), (Join-Path $w.U 'Desktop\notonbox') -Force)
   $ls = New-Sess $w.LS '66666666-lock' $w.LP @('a')
-  $mx = New-Object Threading.Mutex($false, 'Local\fcode-phien'); Ok ($mx.WaitOne(0)) 'the test holds the lock'
+  $mx = New-Object Threading.Mutex($false, $env:FCODE_PHIEN_LOCK); Ok ($mx.WaitOne(0)) 'the test holds the lock'
   try {
     Set-AutoState $w $true 41
     $n0 = SshCount $w; $r = Invoke-Fcode $w @('phien', '--tu-dong'); Eq $r.Code 0; Eq (SshCount $w) $n0 'lock busy: the auto run opens no ssh'
@@ -841,7 +868,7 @@ T 'P3: box program `get` cuts each file at the planned size and skips a file tha
   try {
     foreach ($case in @(@{ n = 'cut'; planned = $size - 30; want = $size - 30 }, @{ n = 'whole'; planned = $size; want = $size }, @{ n = 'shrunk'; planned = $size + 50; want = -1 })) {
       $req = Join-Path $Root "pg-$($case.n).json"; $out = Join-Path $Root "pg-$($case.n).bin"
-      [IO.File]::WriteAllText($req, (@{ items = @(@{ enc = $enc; top = $name; files = @(); sizes = @{ $name = $case.planned } }); have = @() } | ConvertTo-Json -Compress -Depth 5), $utf8)
+      [IO.File]::WriteAllText($req, (@{ files = @(@{ enc = $enc; rel = $name; size = $case.planned }); blobs = @() } | ConvertTo-Json -Compress -Depth 5), $utf8)
       cmd /c "python -I `"$PyFile`" get < `"$req`" > `"$out`""
       $bytes = Read-Bytes $out; $mk = $utf8.GetBytes("FCODE-TAR`n"); $pos = -1
       for ($i = 0; $i -lt 200 -and $pos -lt 0; $i++) { if ($bytes[$i] -eq $mk[0] -and [Linq.Enumerable]::SequenceEqual([byte[]]$bytes[$i..($i + $mk.Length - 1)], [byte[]]$mk)) { $pos = $i + $mk.Length } }
@@ -940,6 +967,212 @@ T 'e2e: sending is split into <= 50 MB batches (one ssh each); a failing batch l
   Ok (Test-Path (Join-Path $w2.BS (Split-Path $p2 -Leaf))) 'the next run sent the rest'
   Ok (-not (Get-ChildItem (Join-Path $w2.U 'AppData\Local\Temp') -Directory -Filter 'fcode-phien-*' -ErrorAction SilentlyContinue)) 'staging dirs are removed'
 }
+# ============================== round 3: by file, dependencies first, top last ==============================
+function Put-Big([string]$Path, [int]$MB, [int]$Seed) {
+  [void](New-Item -ItemType Directory -Path (Split-Path $Path) -Force)
+  $c = New-Object byte[] 1048576; (New-Object Random $Seed).NextBytes($c)
+  $fs = [IO.File]::Create($Path); try { for ($i = 0; $i -lt $MB; $i++) { $c[0] = [byte]$i; $fs.Write($c, 0, $c.Length) } } finally { $fs.Dispose() }
+  Set-Age $Path 600
+}
+function Sha([string]$p) { (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash }
+function PutBytes($w) { $f = "$($w.Log).bytes"; if (Test-Path $f) { @(Get-Content $f | Where-Object { $_ -like 'put *' } | ForEach-Object { [long](($_ -split ' ')[1]) }) } else { @() } }
+function Calls($w, [string]$Cmd) { if (Test-Path $w.Log) { @(Get-Content $w.Log | Where-Object { $_ -eq "ssh $Cmd" }).Count } else { 0 } }
+function Body([string]$p) { $b = Read-Bytes $p; $o = Get-PhienOff $p; [Convert]::ToBase64String($b, $o, $b.Length - $o) }
+function Parts([string]$d) { @(Get-ChildItem -LiteralPath $d -Recurse -Force -Filter '*.fcode-part*' -ErrorAction SilentlyContinue).Count }
+
+T 'planner: an orphan dir on the receiver is inventory only (files it has are skipped, never a source); a busy dependency holds the top back' {
+  $L = Join-Path $Root 'orp\L'; $B = Join-Path $Root 'orp\B'
+  $s1 = New-Sess $L 'orp00001' 'C:\p' @('a'); $b1 = (Split-Path $s1 -Leaf).Replace('.jsonl', '')
+  Put-File (Join-Path $L "$b1\f1.log") 'one'; Put-File (Join-Path $L "$b1\f2.log") 'two'
+  [void](New-Item -ItemType Directory -Path (Join-Path $B $b1) -Force); Copy-Item (Join-Path $L "$b1\f1.log") (Join-Path $B "$b1\f1.log")   # an earlier batch got f1 there
+  Put-File (Join-Path $B '2026-10-25T16-18-25-246Z_orp00002\x.log') 'box orphan'                                                         # orphan with no session anywhere
+  $s3 = New-Sess $L 'orp00003' 'C:\p' @('a'); $b3 = (Split-Path $s3 -Leaf).Replace('.jsonl', '')
+  Put-File (Join-Path $L "$b3\ok.log") 'ok'; Put-File (Join-Path $L "$b3\busy.log") 'being written'; [IO.File]::SetLastWriteTimeUtc((Join-Path $L "$b3\busy.log"), [DateTime]::UtcNow)
+  $ls = Get-PhienLocalScan $L; $rs = Get-PhienLocalScan $B
+  Ok (@($rs | Where-Object { $_.orphan }).Count -eq 2) 'the box scan lists both orphan dirs'
+  $n = ConvertTo-Epoch (Get-Date)
+  $p = Get-PhienPlan $ls $rs 'E' @{} $L $n $n 30
+  $i1 = @($p.Put | Where-Object Id -eq 'orp00001')[0]
+  Ok ($i1.Top) 'top of orp00001 goes'; Eq (($i1.Files | ForEach-Object { Split-Path $_ -Leaf }) -join ',') 'f2.log' 'only the file the receiver lacks'
+  Eq ((@($i1.Deps | ForEach-Object { Split-Path $_.r -Leaf }) | Sort-Object) -join ',') 'f1.log,f2.log' 'the top names every dependency'
+  Ok (-not ($p.Put + $p.Get | Where-Object Id -eq 'orp00002')) 'an orphan is never a source'
+  $i3 = @($p.Put | Where-Object Id -eq 'orp00003')[0]
+  Ok (-not $i3.Top) 'a busy dependency holds the top back'; Eq (($i3.Files | ForEach-Object { Split-Path $_ -Leaf }) -join ',') 'ok.log' 'the ready file still goes'
+  Eq $p.Deferred 1; Ok (@($p.Notes | Where-Object { $_ -like '*orp00003*file chính để lần sau*' }).Count -eq 1) 'told'
+}
+T 'planner: equal tops do not prove the blobs: a missing blob is copied either way; missing on both is incomplete, never "same"' {
+  $L = Join-Path $Root 'eqb\L'; $B = Join-Path $Root 'eqb\B'
+  $h1 = '11' * 32; $h2 = '22' * 32; $h3 = '33' * 32
+  foreach ($x in @(@('eqb00001', $h1), @('eqb00002', $h2), @('eqb00003', $h3))) { [void](New-Sess $L $x[0] 'C:\p' @('a', "blob:sha256:$($x[1])")); [void](New-Sess $B $x[0] '/d/p' @('a', "blob:sha256:$($x[1])")) }
+  [void](New-Sess $L 'eqb00004' 'C:\p' @('a')); [void](New-Sess $B 'eqb00004' '/d/p' @('a'))
+  $n = ConvertTo-Epoch (Get-Date)
+  $p = Get-PhienPlan (Get-PhienLocalScan $L) (Get-PhienLocalScan $B) 'E' @{} $L $n $n 30 @{ $h1 = $true } @{ $h2 = $true }
+  Eq ((@($p.Put | ForEach-Object { "$($_.Id):$($_.Top):$($_.Blobs -join '')" })) -join ' ') "eqb00001:False:$h1" 'the laptop blob goes to the box'
+  Eq ((@($p.Get | ForEach-Object { "$($_.Id):$($_.Top):$($_.Blobs -join '')" })) -join ' ') "eqb00002:False:$h2" 'the box blob comes to the laptop'
+  Eq $p.Incomplete 1 'missing on both sides'; Ok (@($p.Notes | Where-Object { $_ -like '*eqb00003*thiếu 1 file đính kèm*' }).Count -eq 1) 'reported'
+  Eq $p.Same 1 'only eqb00004 counts as the same'
+}
+T 'notes planner: a name in origin/<default> counts as tracked (never synced) and gives back fcode''s own exclude line' {
+  $now = ConvertTo-Epoch (Get-Date)
+  $p = Get-PhienNotePlan 'proj' (NS @((Nt 'U.md' 'u1')) @() $true @('U.md')) (NS @()) @{} $now $now; Eq ($p.Put.Count + $p.Get.Count) 0 'in the laptop upstream'
+  $p = Get-PhienNotePlan 'proj' (NS @()) (NS @((Nt 'V.md' 'v1')) @() $true @('V.md')) @{} $now $now; Eq ($p.Put.Count + $p.Get.Count) 0 'in the box upstream'
+  $p = Get-PhienNotePlan 'proj' (NS @((Nt 'W.md' 'w1'))) (NS @() @() $true @('W.md')) @{ 'exclude:laptop:proj/W.md' = '1' } $now $now
+  Eq (($p.Release | ForEach-Object { "$($_.Name):$($_.TrackedOn):$($_.OldOn)" }) -join ',') 'W.md:origin:laptop' 'release (upstream only, no index tracks it)'
+  $p = Get-PhienNotePlan 'proj' (NS @((Nt 'X.md' 'x1')) @('X.md')) (NS @() @() $true @('X.md')) @{ 'exclude:laptop:proj/X.md' = '1' } $now $now
+  Eq $p.Release.Count 0 'the laptop index tracks it itself: its copy is not an old one'
+}
+function New-W2([string]$Name) { $w = New-World $Name; [void](New-Item -ItemType Directory -Path (Join-Path $w.U 'Desktop\other'), (Join-Path $w.U 'Desktop\notonbox') -Force); $w }
+# one session over many files: top + 7 x 8 MB tool logs + a nested subagent .jsonl, and two referenced blobs (1 MB each)
+function New-BigSess([string]$SessDir, [string]$BlobDir, [string]$Cwd, [string]$Id, [string[]]$Msgs, [string]$Nl) {
+  $h1 = 'd1' * 32; $h2 = 'e2' * 32
+  $top = New-Sess $SessDir $Id $Cwd (@($Msgs) + @("blob:sha256:$h1"))
+  $sd = $top.Replace('.jsonl', '')
+  [void](New-Sess (Join-Path $sd 'subagents') 'nest0001' ($Cwd + $Nl + 'x') @('n', "blob:sha256:$h2"))
+  for ($i = 1; $i -le 7; $i++) { Put-Big (Join-Path $sd "tool-$i.log") 8 $i }
+  Put-Big (Join-Path $BlobDir ($h1 + '.png')) 1 21; Put-Big (Join-Path $BlobDir $h2) 1 22
+  [pscustomobject]@{ Top = $top; Dir = $sd; H1 = $h1; H2 = $h2 }
+}
+T 'e2e: a session > 50 MB over many files, laptop -> box: a cut batch keeps the earlier ones, nothing half-done is placed, the top waits; the next run sends only the rest' {
+  $w = New-W2 'e2e20'
+  $s = New-BigSess $w.LS $w.LBlobs $w.LP 'b1g00000-0000-7000-8000-000000000001' @('a') '\'
+  $name = Split-Path $s.Top -Leaf; $bt = Join-Path $w.BS $name; $bd = $bt.Replace('.jsonl', '')
+  $r = Invoke-Fcode $w @('phien') @{ FAKE_SSH_CUT = 'put:2:4000000:cut' }
+  Eq $r.Code 1 $r.Out; Ok ($r.Out -match 'gửi phiên lên box không thành công') ("told; out: " + $r.Out)
+  Ok (-not (Test-Path $bt)) 'the top is not placed'; Ok (-not (Test-Path ($bt.Replace('.jsonl', '.fcode-origin')))) 'no origin either'
+  Ok ((Test-Path (Join-Path $w.BBlobs ($s.H1 + '.png'))) -and (Test-Path (Join-Path $w.BBlobs $s.H2))) 'the blobs of batch 1 are there'
+  $have = @(1..7 | Where-Object { Test-Path (Join-Path $bd "tool-$_.log") })
+  Ok ($have.Count -ge 1 -and $have.Count -lt 7) "batch 1 stayed, batch 2 did not (have: $($have -join ','))"
+  foreach ($i in $have) { Eq (Sha (Join-Path $bd "tool-$i.log")) (Sha (Join-Path $s.Dir "tool-$i.log")) "tool-$i whole"; Eq (Mt1 (Join-Path $bd "tool-$i.log")) (Mt1 (Join-Path $s.Dir "tool-$i.log")) "tool-$i mtime" }
+  Ok (-not (Test-Path (Join-Path $bd 'subagents'))) 'the nested .jsonl of the cut batch is not there'
+  Eq (Parts $w.BH) 0 'no part files'
+  $n0 = @(PutBytes $w).Count
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
+  $pb = @(PutBytes $w); Eq ($pb.Count - $n0) 1 'one more put'
+  Ok ($pb[-1] -lt ((7 - $have.Count) * 8MB + 4MB)) "only the rest was sent ($($pb[-1]) bytes)"
+  for ($i = 1; $i -le 7; $i++) { Eq (Sha (Join-Path $bd "tool-$i.log")) (Sha (Join-Path $s.Dir "tool-$i.log")) "tool-$i body"; Eq (Mt1 (Join-Path $bd "tool-$i.log")) (Mt1 (Join-Path $s.Dir "tool-$i.log")) "tool-$i mtime" }
+  $nb = @(Get-ChildItem (Join-Path $bd 'subagents') -Filter '*.jsonl')[0].FullName; $nl = @(Get-ChildItem (Join-Path $s.Dir 'subagents') -Filter '*.jsonl')[0].FullName
+  Ok ((Latin $nb).Contains('"cwd":"' + $w.BP + '/x"')) 'nested header rewritten'; Eq (Body $nb) (Body $nl) 'nested body'; Eq (Mt1 $nb) (Mt1 $nl) 'nested mtime'
+  Ok ((Latin $bt).Contains('"cwd":"' + $w.BP + '"')) 'top header rewritten'; Eq (Body $bt) (Body $s.Top) 'top body'; Eq (Mt1 $bt) (Mt1 $s.Top) 'top mtime'
+  Eq ((Get-Content ($bt.Replace('.jsonl', '.fcode-origin')) -Raw).Trim()) 'laptop' 'origin'
+  Ok (@($pb | Where-Object { $_ -gt 52428800 }).Count -eq 0) "every put stream <= 50 MB with the tar overhead ($($pb -join ','))"
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0; Ok ($r.Out -match '0 file gửi lên box, 0 file lấy về laptop \(hai bên đã giống nhau\)') ("then a no-op; out: " + $r.Out)
+}
+T 'e2e: a session > 50 MB over many files, box -> laptop: a cut batch keeps the earlier ones, the old laptop top stays unchanged, the next run fetches only the rest' {
+  $w = New-W2 'e2e21'
+  $id = 'b1g00000-0000-7000-8000-000000000002'
+  $old = New-Sess $w.LS $id $w.LP @('a')                                                    # the laptop has the start of the conversation
+  $s = New-BigSess $w.BS $w.BBlobs $w.BP $id @('a', 'b') '/'                                # the box went on, with many new files
+  $oldBytes = [Convert]::ToBase64String((Read-Bytes $old)); $ld = $old.Replace('.jsonl', '')
+  $r = Invoke-Fcode $w @('phien') @{ FAKE_SSH_CUT = 'get:2:4000000:cut' }
+  Eq $r.Code 1 $r.Out; Ok ($r.Out -match 'lấy phiên từ box về không thành công') ("told; out: " + $r.Out)
+  Eq ([Convert]::ToBase64String((Read-Bytes $old))) $oldBytes 'the laptop top is unchanged'
+  Ok ((Test-Path (Join-Path $w.LBlobs ($s.H1 + '.png'))) -and (Test-Path (Join-Path $w.LBlobs $s.H2))) 'blobs of batch 1 arrived'
+  $have = @(1..7 | Where-Object { Test-Path (Join-Path $ld "tool-$_.log") })
+  Ok ($have.Count -ge 1 -and $have.Count -lt 7) "batch 1 stayed, batch 2 did not (have: $($have -join ','))"
+  foreach ($i in $have) { Eq (Sha (Join-Path $ld "tool-$i.log")) (Sha (Join-Path $s.Dir "tool-$i.log")) "tool-$i whole" }
+  Eq (Parts $w.U) 0 'no part files'
+  $g0 = Calls $w 'get'
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
+  Eq ((Calls $w 'get') - $g0) 1 'one more get'
+  $gb = @(Get-Content "$($w.Log).bytes" | Where-Object { $_ -like 'get *' } | ForEach-Object { [long](($_ -split ' ')[2]) })
+  Ok ($gb[-1] -lt ((7 - $have.Count) * 8MB + 4MB)) "only the rest came ($($gb[-1]) bytes)"
+  Ok (@($gb | Where-Object { $_ -gt 52428800 }).Count -eq 0) "every get stream <= 50 MB ($($gb -join ','))"
+  for ($i = 1; $i -le 7; $i++) { Eq (Sha (Join-Path $ld "tool-$i.log")) (Sha (Join-Path $s.Dir "tool-$i.log")) "tool-$i body"; Eq (Mt1 (Join-Path $ld "tool-$i.log")) (Mt1 (Join-Path $s.Dir "tool-$i.log")) "tool-$i mtime" }
+  $nl = @(Get-ChildItem (Join-Path $ld 'subagents') -Filter '*.jsonl')[0].FullName; $nb = @(Get-ChildItem (Join-Path $s.Dir 'subagents') -Filter '*.jsonl')[0].FullName
+  Ok ((Latin $nl).Contains('"cwd":' + (ConvertTo-JsonStr ($w.LP + '\x')))) 'nested header rewritten'; Eq (Body $nl) (Body $nb) 'nested body'
+  Ok ((Latin $old).Contains('"cwd":' + (ConvertTo-JsonStr $w.LP))) 'top header rewritten'; Eq (Body $old) (Body $s.Top) 'top body = the box conversation'; Eq (Mt1 $old) (Mt1 $s.Top) 'top mtime'
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0; Ok ($r.Out -match '0 file gửi lên box, 0 file lấy về laptop \(hai bên đã giống nhau\)') ("then a no-op; out: " + $r.Out)
+}
+T 'e2e: a blob that cannot be placed holds the top back (box and laptop); after the fix the next run completes, then a no-op' {
+  $w = New-W2 'e2e22'
+  $h1 = 'f3' * 32; $h2 = 'f4' * 32
+  $ls = New-Sess $w.LS '12121212-blbf' $w.LP @('a', "blob:sha256:$h1"); Put-File (Join-Path $ls.Replace('.jsonl', '') '1.log') 'log'
+  Put-Big (Join-Path $w.LBlobs $h1) 1 31
+  $bs = New-Sess $w.BS '34343434-blbf' $w.BP @('b', "blob:sha256:$h2"); Put-Big (Join-Path $w.BBlobs $h2) 1 32
+  # a directory squats on each blob's name at the receiver: the blob cannot be placed there
+  [void](New-Item -ItemType Directory (Join-Path $w.BBlobs $h1)); [void](New-Item -ItemType Directory (Join-Path $w.LBlobs $h2))
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
+  $bt = Join-Path $w.BS (Split-Path $ls -Leaf); $lt = Join-Path $w.LS (Split-Path $bs -Leaf)
+  Ok (-not (Test-Path $bt)) 'box: the top waits'; Ok (Test-Path (Join-Path $w.BS ((Split-Path $ls -Leaf).Replace('.jsonl', '') + '\1.log'))) 'box: its other file is placed'
+  Ok (-not (Test-Path $lt)) 'laptop: the top waits'
+  Ok ($r.Out -match '2 phiên chưa đặt file chính vì file đi kèm chưa đủ') ("told; out: " + $r.Out)
+  Ok ($r.Out -notmatch 'hai bên đã giống nhau') 'never "same"'
+  Remove-Item (Join-Path $w.BBlobs $h1), (Join-Path $w.LBlobs $h2)
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
+  Ok ((Test-Path $bt) -and (Test-Path (Join-Path $w.BBlobs $h1))) 'box complete'; Ok ((Test-Path $lt) -and (Test-Path (Join-Path $w.LBlobs $h2))) 'laptop complete'
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0; Ok ($r.Out -match '0 file gửi lên box, 0 file lấy về laptop \(hai bên đã giống nhau\)') ("no-op; out: " + $r.Out)
+}
+T 'e2e: a lost acknowledgement (the box placed everything, the answer never came) is recovered by the next run, then a no-op' {
+  $w = New-W2 'e2e23'
+  $h1 = 'a7' * 32
+  $ls = New-Sess $w.LS '56565656-nack' $w.LP @('a', "blob:sha256:$h1"); Put-File (Join-Path $ls.Replace('.jsonl', '') '1.log') 'log'; Put-Big (Join-Path $w.LBlobs $h1) 1 41
+  $r = Invoke-Fcode $w @('phien') @{ FAKE_SSH_CUT = 'put:1:0:noack' }; Eq $r.Code 1 $r.Out
+  $bt = Join-Path $w.BS (Split-Path $ls -Leaf); Ok (Test-Path $bt) 'the box did place it'
+  $p0 = Calls $w 'put'
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out; Eq ((Calls $w 'put') - $p0) 0 'nothing to send again'
+  Ok ($r.Out -match '0 file gửi lên box, 0 file lấy về laptop \(hai bên đã giống nhau\)') ("recovered; out: " + $r.Out)
+  Eq (Body $bt) (Body $ls) 'complete'; Ok (Test-Path (Join-Path $w.BBlobs $h1)) 'blob there'
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0; Ok ($r.Out -match 'hai bên đã giống nhau') 'no-op'
+}
+T 'e2e: auto run: a failed or unreadable `instabox ls` opens no ssh and leaves phien-auto.json unchanged; the next good check inside 40 min opens none either' {
+  $w = New-W2 'e2e24'
+  [void](New-Sess $w.LS '78787878-lsfl' $w.LP @('a'))
+  Set-AutoState $w $true 10
+  $sp = Join-Path $w.U 'AppData\Local\fcode\phien-auto.json'; $before = [IO.File]::ReadAllText($sp)
+  foreach ($m in 'fail', 'bad', 'nostate') {
+    $r = Invoke-Fcode $w @('phien', '--tu-dong') @{ FAKE_LS = $m }; Eq $r.Code 0 $r.Out
+    Eq (SshCount $w) 0 "ls $($m): no ssh"; Eq ([IO.File]::ReadAllText($sp)) $before "ls $($m): state unchanged"
+  }
+  Ok ((Get-Content (Join-Path $w.U '.fcode\phien.log') -Raw) -match 'không đọc được trạng thái box') 'logged'
+  $r = Invoke-Fcode $w @('phien', '--tu-dong'); Eq $r.Code 0 $r.Out
+  Eq (SshCount $w) 0 'recovery 10 min after the last ssh: still no ssh (no false "box just started")'
+  Ok ((Get-AutoState $w).boxRunning -and [Math]::Abs((Get-AutoState $w).lastSshAt - ($before | ConvertFrom-Json).lastSshAt) -lt 1) 'last ssh time kept'
+}
+T 'e2e: the auto deadline holds while stdin is blocked: the stalled call is killed, no later batch starts, earlier work stays' {
+  $w = New-W2 'e2e25'
+  $a = New-Sess $w.LS 'aaaa1111-dln1' $w.LP @('a'); Grow-Sess $a 30
+  $b = New-Sess $w.LS 'bbbb2222-dln2' $w.LP @('b'); Grow-Sess $b 30
+  Set-AutoState $w $true 41
+  $t0 = Get-Date
+  $r = Invoke-Fcode $w @('phien', '--tu-dong') @{ FCODE_PHIEN_TIMEOUT = '25'; FAKE_SSH_CUT = 'put:1:0:stall' }
+  $sec = ((Get-Date) - $t0).TotalSeconds
+  Eq $r.Code 1 $r.Out; Ok ($sec -lt 45) "ended at the deadline ($([Math]::Round($sec)) s, stall is 60 s)"
+  Eq (Calls $w 'put') 1 'no batch is started after the deadline'
+  Ok (-not (Test-Path (Join-Path $w.BS (Split-Path $a -Leaf))) -and -not (Test-Path (Join-Path $w.BS (Split-Path $b -Leaf)))) 'nothing half-sent is placed'
+  Ok ((Get-Content (Join-Path $w.U '.fcode\phien.log') -Raw) -match 'gửi phiên lên box không thành công') 'logged'
+  Ok (-not (Get-ChildItem (Join-Path $w.U 'AppData\Local\Temp') -Directory -Filter 'fcode-phien-*' -ErrorAction SilentlyContinue)) 'staging removed'
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
+  Ok ((Test-Path (Join-Path $w.BS (Split-Path $a -Leaf))) -and (Test-Path (Join-Path $w.BS (Split-Path $b -Leaf)))) 'the next run sends both'
+}
+function New-Origin([string]$Bare) {
+  $ErrorActionPreference = 'Continue'
+  & git -c init.defaultBranch=main init -q --bare $Bare 2>&1 | Out-Null
+  & git -c init.defaultBranch=main init -q "$Bare-work" 2>&1 | Out-Null
+  Put-File "$Bare-work\README.md" 'r'; Git-Commit "$Bare-work" @('README.md'); & git -C "$Bare-work" push -q $Bare HEAD:main 2>&1 | Out-Null
+}
+function Push-Origin([string]$Bare, [string]$Name, [string]$Text) { $ErrorActionPreference = 'Continue'; Put-File "$Bare-work\$Name" $Text; Git-Commit "$Bare-work" @($Name); & git -C "$Bare-work" push -q $Bare HEAD:main 2>&1 | Out-Null }
+function Fetch-Origin([string]$Dir, [string]$Bare) { $ErrorActionPreference = 'Continue'; & git -C $Dir remote add origin $Bare 2>&1 | Out-Null; & git -C $Dir fetch -q origin 2>&1 | Out-Null }
+T 'e2e: a note that origin/<default> already tracks is never synced (laptop and box), and fcode''s own exclude line is given back once upstream tracks it' {
+  $w = New-W2 'e2e26'
+  New-GitDir $w.LP; New-GitDir $w.BP
+  # each side has its own origin, so a name only one side's origin tracks proves that side's check on its own
+  $bl = Join-Path $w.W 'origin-l.git'; $bb = Join-Path $w.W 'origin-b.git'; New-Origin $bl; New-Origin $bb
+  Push-Origin $bl 'HANDOFF-up.md' 'upstream'; Push-Origin $bb 'HANDOFF-up2.md' 'upstream 2'
+  Put-File "$($w.BP)\HANDOFF-rel.md" 'from box'                       # box -> laptop (the laptop gets fcode's exclude line)
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
+  Ok ((Get-Content "$($w.LP)\.git\info\exclude" -Raw) -match '(?m)^/HANDOFF-rel\.md\r?$') 'laptop exclude has our line'
+  Fetch-Origin $w.LP $bl; Fetch-Origin $w.BP $bb
+  Ok ((Get-PhienUpstreamNotes $w.LP) -ccontains 'HANDOFF-up.md') 'laptop scan sees the upstream name'
+  Put-File "$($w.LP)\HANDOFF-up.md" 'laptop copy, untracked here'; Put-File "$($w.BP)\HANDOFF-up2.md" 'box copy, untracked there'
+  Push-Origin $bl 'HANDOFF-rel.md' 'now in git'; Push-Origin $bb 'HANDOFF-rel.md' 'now in git'; Fetch-Origin $w.LP $bl; Fetch-Origin $w.BP $bb
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
+  Ok (-not (Test-Path "$($w.BP)\HANDOFF-up.md")) 'laptop note tracked upstream: not sent to the box'
+  Ok (-not (Test-Path "$($w.LP)\HANDOFF-up2.md")) 'box note tracked upstream: not fetched to the laptop'
+  Ok ($r.Out -match 'ghi chú HANDOFF-rel\.md giờ do git theo dõi \(trên origin\): bản cũ trên laptop xóa được') ("release line; out: " + $r.Out)
+  Ok ((Get-Content "$($w.LP)\.git\info\exclude" -Raw) -notmatch '(?m)^/HANDOFF-rel\.md\r?$') 'our line given back on the laptop'
+  Eq (Get-Content "$($w.LP)\HANDOFF-rel.md" -Raw) 'from box' 'the old copy is not deleted'
+}
+
 # ============================== scheduled task (hidden) ==============================
 T 'task scheduler: registers a headless every-10-minutes task and the action shows no window' {
   $tp = '\FCode-test\'; $tn = 'phien-test-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
