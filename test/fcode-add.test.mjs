@@ -28,6 +28,7 @@ case "$1 $2" in
       *) echo "To get started with GitHub CLI, please run:  gh auth login" >&2; exit 4;;
     esac;;
   "pr list") exit 0;;
+  "auth git-credential") [ "$3" = get ] && printf 'username=ghuser\npassword=%s\n' "\${GH_TOKEN:-none}"; exit 0;;
 esac
 exit 1
 `;
@@ -99,6 +100,7 @@ const runAsync = (e, repo, name, extra = {}) => new Promise((resolve) => { // se
 });
 const projects = (e) => JSON.parse(fs.readFileSync(e.cfg, 'utf8')).projects;
 const git = (e, dir, ...a) => sh('git', ['-C', dir, ...a], e);
+const gitRaw = (e, dir, ...a) => spawnSync('git', ['-C', dir, ...a], { encoding: 'utf8', env: { PATH: process.env.PATH, HOME: e.home, GIT_CONFIG_NOSYSTEM: '1' } }).stdout;
 const gitOr = (e, dir, ...a) => spawnSync('git', ['-C', dir, ...a], { encoding: 'utf8', env: { PATH: process.env.PATH, HOME: e.home, GIT_CONFIG_NOSYSTEM: '1' } }).stdout.trim();
 const files = (d) => fs.readdirSync(d, { withFileTypes: true }).flatMap((x) => (x.isDirectory() ? (x.name === 'gh' ? [] : files(path.join(d, x.name))) : x.isFile() ? [path.join(d, x.name)] : []));
 // nothing the world holds, and nothing the script printed, may contain the token (the bare repos under gh/ are the fake GitHub: not scanned)
@@ -125,9 +127,9 @@ test('token path: gh can push -> https clone, repo-local gh credential helper, n
     assert.deepEqual([r.code, r.codes], [0, ['TOKEN_OK', 'READ_OK', 'CLONED', 'HOOK_OK', 'WRITE_OK', 'CFG_ADDED', ...TAIL]], r.stdout + r.stderr);
     const dir = path.join(e.ws, 'r');
     assert.equal(git(e, dir, 'config', '--get', 'remote.origin.url'), 'https://github.com/o/r.git'); // not the local path, no token in it
-    assert.equal(git(e, dir, 'config', '--local', '--get', 'credential.https://github.com.helper'), '!gh auth git-credential');
+    // the repo's helper chain: an empty value first (it resets what system/global config bring), then gh; nothing global
+    assert.equal(gitRaw(e, dir, 'config', '--local', '--get-all', 'credential.helper'), '\n!gh auth git-credential\n');
     assert.equal(gitOr(e, dir, 'config', '--global', '--get-all', 'credential.helper'), ''); // never global
-    assert.deepEqual(gitOr(e, dir, 'config', '--local', '--get-regexp', 'credential').split('\n'), ['credential.https://github.com.helper !gh auth git-credential']);
     // no deploy key and no alias were made
     assert.deepEqual(fs.existsSync(e.ssh) ? fs.readdirSync(e.ssh).filter((f) => !f.startsWith('.fcode-add-')) : [], []);
     assert.equal(projects(e).r, dir);
@@ -147,10 +149,15 @@ test('token path: gh can push -> https clone, repo-local gh credential helper, n
     assert.deepEqual(calls.filter((c) => c.startsWith('api')), ['api repos/o/r --jq .permissions.push']);
     assert.ok(!calls.some((c) => c.includes('git-credential')));
     noToken(e, r);
-    // rerun: the same, nothing new
+    // rerun of a project that is already registered with this origin: success, and NOTHING is touched (no gh call, no probe, no config change)
+    const cfgBefore = fs.readFileSync(e.cfg, 'utf8'), confBefore = fs.readFileSync(path.join(dir, '.git', 'config'), 'utf8'), ghBefore = fs.readFileSync(e.ghlog, 'utf8');
     const again = run(e, 'o/r', 'r');
-    assert.deepEqual([again.code, again.codes], [0, ['TOKEN_OK', 'READ_OK', 'CLONE_EXISTS', 'HOOK_EXISTS', 'WRITE_OK', 'CFG_EXISTS', ...TAIL]], again.stdout);
-    assert.equal(gitOr(e, dir, 'config', '--local', '--get-all', 'credential.https://github.com.helper'), '!gh auth git-credential');
+    assert.deepEqual([again.code, again.codes], [0, ['CFG_EXISTS']], again.stdout + again.stderr);
+    assert.equal(fs.readFileSync(e.cfg, 'utf8'), cfgBefore);
+    assert.equal(fs.readFileSync(path.join(dir, '.git', 'config'), 'utf8'), confBefore);
+    assert.equal(fs.readFileSync(e.ghlog, 'utf8'), ghBefore);
+    assert.deepEqual(boxRefs(e, remote), []);
+    tmpClean(e);
     noToken(e, again);
   } finally { done(e); }
 });
@@ -169,8 +176,8 @@ test('key path: gh cannot push (or is not logged in, or FCODE_NO_TOKEN) -> deplo
       assert.match(fs.readFileSync(path.join(e.ssh, 'config'), 'utf8'), /# fcode add: o\/r\nHost github-r\n {2}HostName github\.com\n/);
       assert.equal(projects(e).r, dir);
       noToken(e, r);
-      const again = run(e, 'o/r', 'r', extra);
-      assert.deepEqual([again.code, again.codes], [0, ['KEY_EXISTS', 'ALIAS_EXISTS', 'READ_OK', 'CLONE_EXISTS', 'HOOK_EXISTS', 'WRITE_OK', 'CFG_EXISTS', ...TAIL]], again.stdout);
+      const again = run(e, 'o/r', 'r', extra); // already registered with this origin: success, nothing touched
+      assert.deepEqual([again.code, again.codes], [0, ['CFG_EXISTS']], again.stdout);
     } finally { done(e); }
   }
 });
@@ -307,16 +314,28 @@ test('arguments, config and folder checks: exit codes and nothing created', { sk
     }
     assert.deepEqual(fs.readdirSync(e.ws), []);
     assert.equal(run(e, 'o/r.git', 'r').code, 0); // .git is stripped
-    // another project already has this folder name
-    fs.mkdirSync(path.join(e.ws, 'taken'));
+    // a folder of that name is never adopted, whatever it is: a plain folder, a file, a clone of another repo, a clone of THIS repo that is not registered
+    const taken = path.join(e.ws, 'taken');
+    fs.mkdirSync(taken);
     let r = run(e, 'o/r', 'taken');
-    assert.deepEqual([r.code, r.codes], [11, ['DIR_NOTGIT']]);
-    fs.rmSync(path.join(e.ws, 'taken'), { recursive: true });
-    bare(e, 'a/b');
-    sh('git', ['clone', '-q', path.join(e.gh, 'a/b.git'), path.join(e.ws, 'taken')], e);
-    sh('git', ['-C', path.join(e.ws, 'taken'), 'remote', 'set-url', 'origin', 'https://github.com/a/b.git'], e);
+    assert.deepEqual([r.code, r.codes, r.detail('DIR_EXISTS')], [11, ['DIR_EXISTS'], 'exists']);
+    fs.rmSync(taken, { recursive: true });
+    fs.writeFileSync(taken, 'a file');
     r = run(e, 'o/r', 'taken');
-    assert.deepEqual([r.code, r.codes, r.detail('DIR_OTHER')], [11, ['DIR_OTHER'], 'a/b']);
+    assert.deepEqual([r.code, r.codes, r.detail('DIR_EXISTS')], [11, ['DIR_EXISTS'], 'exists']);
+    fs.rmSync(taken);
+    bare(e, 'a/b');
+    for (const origin of ['https://github.com/a/b.git', 'https://github.com/o/r.git']) {
+      sh('git', ['clone', '-q', path.join(e.gh, 'a/b.git'), taken], e);
+      sh('git', ['-C', taken, 'remote', 'set-url', 'origin', origin], e);
+      const before = fs.readFileSync(path.join(taken, '.git', 'config'), 'utf8');
+      r = run(e, 'o/r', 'taken');
+      assert.deepEqual([r.code, r.codes, r.detail('DIR_EXISTS')], [11, ['DIR_EXISTS'], 'exists'], origin);
+      assert.equal(fs.readFileSync(path.join(taken, '.git', 'config'), 'utf8'), before); // untouched
+      assert.deepEqual(fs.readdirSync(path.join(taken, '.git', 'hooks')).filter((x) => x === 'pre-push'), []);
+      fs.rmSync(taken, { recursive: true });
+    }
+    assert.equal(projects(e).taken, undefined);
   } finally { done(e); }
   // config: broken, or the name already points elsewhere
   e = world('true');
@@ -340,7 +359,7 @@ test('arguments, config and folder checks: exit codes and nothing created', { sk
     bare(e, 'o/r'); e.map('r');
     assert.equal(run(e, 'o/r', 'r').code, 0);
     const clash = run(e, 'someone/else', 'r'); // the folder is o/r's
-    assert.deepEqual([clash.code, clash.codes, clash.detail('DIR_OTHER')], [11, ['DIR_OTHER'], 'o/r']);
+    assert.deepEqual([clash.code, clash.codes, clash.detail('DIR_EXISTS')], [11, ['DIR_EXISTS'], 'exists']);
     fs.rmSync(path.join(e.ws, 'r'), { recursive: true }); // folder and config entry gone, key and alias stay
     fs.writeFileSync(e.cfg, JSON.stringify({ projects: {} }), { mode: 0o600 });
     const used = run(e, 'someone/else', 'r');
@@ -349,14 +368,13 @@ test('arguments, config and folder checks: exit codes and nothing created', { sk
   } finally { done(e); }
 });
 
-test('a project that already uses an ssh key keeps it, even when gh could push', { skip }, () => {
+test('a project added by key is not touched by a rerun, even when gh could push now (idempotent: CFG_EXISTS only)', { skip }, () => {
   const e = world('true');
   try {
     bare(e, 'o/r'); e.map('r');
     assert.equal(run(e, 'o/r', 'r', { FCODE_NO_TOKEN: '1' }).code, 0); // added by key
     const r = run(e, 'o/r', 'r'); // gh would say push = true now
-    assert.deepEqual([r.code, r.codes.slice(0, 5)], [0, ['KEY_EXISTS', 'ALIAS_EXISTS', 'READ_OK', 'CLONE_EXISTS', 'HOOK_EXISTS']], r.stdout);
-    assert.ok(!r.codes.includes('TOKEN_OK'));
+    assert.deepEqual([r.code, r.codes], [0, ['CFG_EXISTS']], r.stdout);
     assert.equal(git(e, path.join(e.ws, 'r'), 'config', '--get', 'remote.origin.url'), 'git@github-r:o/r.git');
   } finally { done(e); }
 });
@@ -404,8 +422,8 @@ test('server + real script: a pasted link adds the project by token; it is in /a
       assert.deepEqual((await call('GET', '/api/meta')).json.projects, ['other', 'r']);
       assert.deepEqual((await call('GET', '/api/home')).json.projects.map((p) => p.name), ['other', 'r']); // the server's own config file, rewritten by the script
       assert.equal(projects(e).r, path.join(e.ws, 'r'));
-      const again = await add({ repo: 'o/r' }); // safe to run again
-      assert.deepEqual([again.json.state, again.json.code, again.json.via], ['done', 'ADDED', 'token']);
+      const again = await add({ repo: 'o/r' }); // safe to run again: registered with this origin, so nothing is touched (no TOKEN_OK line: via null)
+      assert.deepEqual([again.json.state, again.json.code, again.json.via, again.json.detail], ['done', 'ADDED', null, null]);
       noToken(e, { stdout: j.text + again.text + logs.join('\n'), stderr: '' });
       assert.deepEqual(logs.filter((l) => l.startsWith('add-project')), ['add-project r ADDED', 'add-project r ADDED']);
     });
@@ -433,7 +451,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function until(fn, ms = 30000) { const end = Date.now() + ms; for (;;) { if (fn()) return; if (Date.now() > end) throw new Error('until: timed out'); await sleep(50); } }
 const boxRefs = (e, remote) => git(e, remote, 'for-each-ref', '--format=%(refname)', 'refs/heads/box').split('\n').filter(Boolean);
 
-test('write proof: an old check branch is no proof; a denied delete (permission) fails the check, so the token route falls back and the key route ends in NEED_WRITE', { skip }, () => {
+test('write proof: an old check branch is no proof; once the probe was created the write is proven, and ANY refused delete is only CLEANUP_FAIL (ADDED_WARN) naming the branch', { skip }, () => {
   const e = world('true');
   try {
     const remote = bare(e, 'o/r'); e.map('r');
@@ -441,15 +459,15 @@ test('write proof: an old check branch is no proof; a denied delete (permission)
     // a branch may be created, but its deletion is refused for permission
     fs.writeFileSync(path.join(remote, 'hooks', 'pre-receive'), hook(`  [ "$n" = ${ZERO} ] && { echo "remote: Permission to o/r.git denied to box." >&2; exit 1; }`), { mode: 0o755 });
     const r = run(e, 'o/r', 'r');
-    assert.equal(r.code, 41, r.stdout + r.stderr);
-    assert.deepEqual(r.codes, ['TOKEN_OK', 'READ_OK', 'CLONED', 'HOOK_OK', 'TOKEN_FALLBACK', 'KEY_NEW', 'ALIAS_ADDED', 'READ_OK', 'CLONED', 'HOOK_OK', 'SSH_DETAIL', 'PUBKEY', 'NEED_WRITE']);
-    assert.ok(!r.codes.includes('WRITE_OK') && !r.codes.includes('CFG_ADDED'));
-    assert.equal(projects(e).r, undefined);
-    assert.equal(fs.existsSync(path.join(e.ws, 'r')), false);
-    // the old branch was never touched; each run left only its own probe (named by the job), never the fixed old name
+    assert.equal(r.code, 30, r.stdout + r.stderr); // the create worked: the token can write; the refused delete is a warning
+    assert.deepEqual(r.codes.slice(0, 7), ['TOKEN_OK', 'READ_OK', 'CLONED', 'HOOK_OK', 'CLEANUP_FAIL', 'WRITE_OK', 'CFG_ADDED']);
+    assert.ok(!r.codes.includes('TOKEN_FALLBACK'));
+    assert.equal(projects(e).r, path.join(e.ws, 'r'));
+    // the old branch was never touched; the one probe this run made is named, and is the only new branch on the remote
     const refs = boxRefs(e, remote);
     assert.ok(refs.includes('refs/heads/box/fcode-add-check'));
-    assert.equal(refs.filter((x) => /^refs\/heads\/box\/fcode-add-check-r-\d+-\d+-\d+$/.test(x)).length, 2);
+    const probes = refs.filter((x) => /^refs\/heads\/box\/fcode-add-check-r-\d+-\d+-\d+$/.test(x));
+    assert.deepEqual(probes, [r.detail('CLEANUP_FAIL')]);
     tmpClean(e);
   } finally { done(e); }
   // a key that can only read: creating the probe is refused for permission, an old check branch changes nothing
@@ -503,7 +521,7 @@ test('hook: git uses the clone\'s own hooks even when a global core.hooksPath po
   } finally { done(e); }
 });
 
-test('hook: an install failure fails the add before the project is registered; a fresh clone is removed, an existing folder is kept', { skip }, () => {
+test('hook: an install failure fails the add before the project is registered, and the clone this run made is removed', { skip }, () => {
   const e = world('true');
   try {
     const remote = bare(e, 'o/r');
@@ -515,14 +533,6 @@ test('hook: an install failure fails the add before the project is registered; a
     assert.equal(fs.existsSync(path.join(e.ws, 'r')), false);
     assert.equal(projects(e).r, undefined);
     tmpClean(e);
-    // a folder that was there before is never removed
-    const dir = path.join(e.ws, 'r');
-    sh('git', ['clone', '-q', remote, dir], { ...e, extra });
-    sh('git', ['-C', dir, 'remote', 'set-url', 'origin', 'https://github.com/o/r.git'], e);
-    r = run(e, 'o/r', 'r', extra);
-    assert.deepEqual([r.code, r.codes.at(-1)], [24, 'HOOK_FAIL'], r.stdout + r.stderr);
-    assert.ok(fs.existsSync(path.join(dir, '.git')));
-    assert.equal(projects(e).r, undefined);
   } finally { done(e); }
 });
 
@@ -540,7 +550,7 @@ test('paths: a symlinked target, a .git that is a link, or a git dir outside the
     // 1. the workspace entry is a link to the outside clone
     fs.symlinkSync(clone, target);
     let r = run(e, 'o/r', 'r');
-    assert.deepEqual([r.code, r.codes], [11, ['DIR_UNSAFE']], r.stdout + r.stderr);
+    assert.deepEqual([r.code, r.codes, r.detail('DIR_UNSAFE')], [11, ['DIR_UNSAFE'], 'unsafe'], r.stdout + r.stderr);
     assert.equal(snap(), before);
     fs.unlinkSync(target);
     // 2. a real folder whose .git is a link to the outside git dir
@@ -552,7 +562,7 @@ test('paths: a symlinked target, a .git that is a link, or a git dir outside the
     // 3. .git is a file that points at the outside git dir
     fs.mkdirSync(target); fs.writeFileSync(path.join(target, '.git'), `gitdir: ${path.join(clone, '.git')}\n`);
     r = run(e, 'o/r', 'r');
-    assert.deepEqual([r.code, r.codes], [11, ['DIR_NOTGIT']]);
+    assert.deepEqual([r.code, r.codes], [11, ['DIR_EXISTS']]);
     assert.equal(snap(), before);
     fs.rmSync(target, { recursive: true });
     assert.equal(projects(e).r, undefined);
@@ -581,18 +591,19 @@ test('cleanup: a name whose key or alias belongs to another repo is NAME_USED be
 });
 
 test('cleanup: a failed add removes the clone this run made, never a folder that was already there (also across the token fallback)', { skip }, () => {
-  // a folder that existed before: a refused write (token, then key) leaves it, drops only the credential helper
+  // a folder that existed before is refused before anything happens: it stays exactly as it was, gh is not even asked
   const e = world('true');
   try {
     const remote = bare(e, 'o/r', 'ro'); e.map('r');
     const dir = path.join(e.ws, 'r');
     sh('git', ['clone', '-q', remote, dir], e);
     sh('git', ['-C', dir, 'remote', 'set-url', 'origin', 'https://github.com/o/r.git'], e);
+    const before = fs.readFileSync(path.join(dir, '.git', 'config'), 'utf8');
     const r = run(e, 'o/r', 'r');
-    assert.equal(r.code, 41, r.stdout + r.stderr);
-    assert.ok(r.codes.includes('TOKEN_FALLBACK') && r.codes.includes('NEED_WRITE'));
+    assert.deepEqual([r.code, r.codes], [11, ['DIR_EXISTS']], r.stdout + r.stderr);
     assert.ok(fs.existsSync(path.join(dir, '.git')), 'the folder that was there stays');
-    assert.equal(gitOr(e, dir, 'config', '--local', '--get-regexp', 'credential'), '');
+    assert.equal(fs.readFileSync(path.join(dir, '.git', 'config'), 'utf8'), before);
+    assert.ok(!fs.existsSync(e.ghlog));
     assert.equal(projects(e).r, undefined);
     tmpClean(e);
   } finally { done(e); }
@@ -656,5 +667,204 @@ os.fsync = fsync; os.replace = replace
     assert.match(rows[2], new RegExp(`^replace ${e.cfgDir}/\\.config\\.json\\..*\\.tmp ${e.cfg.replace(/\./g, '\\.')}$`));
     assert.equal(rows[3], `fsync ${e.cfgDir}`); // then the folder
     assert.equal(projects(e).r, path.join(e.ws, 'r'));
+  } finally { done(e); }
+});
+// ======================= round 3: no adoption of existing folders; credentials, push destination, hooks dir, registration vs cleanup =======================
+const FAKE_GLOBAL_HELPER = '#!/bin/sh\necho "$1" >>"$GLOBAL_HELPER_LOG"\n[ "$1" = get ] && printf "username=glob\\npassword=FROM-GLOBAL\\n"\nexit 0\n';
+const globalHelper = (e) => { // a helper in the GLOBAL git config that must never be asked, nor told about a credential
+  const sh1 = path.join(e.root, 'global-helper.sh'); fs.writeFileSync(sh1, FAKE_GLOBAL_HELPER, { mode: 0o755 });
+  e.helperLog = path.join(e.root, 'global-helper.log');
+  fs.writeFileSync(path.join(e.home, '.gitconfig'), `[credential]\n\thelper = ${sh1}\n`);
+  return { GLOBAL_HELPER_LOG: e.helperLog };
+};
+const helperCalls = (e) => (fs.existsSync(e.helperLog) ? fs.readFileSync(e.helperLog, 'utf8').trim().split('\n').filter(Boolean) : []);
+
+test('credentials: the token route resets inherited helpers for the clone: a global helper is never asked, gh alone answers', { skip }, async () => {
+  const e = world('true');
+  const seen = [];
+  const srv = http.createServer((req, res) => { seen.push(req.headers.authorization ?? ''); res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="x"' }); res.end(); }); // always "log in first"
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  try {
+    const extra = globalHelper(e);
+    bare(e, 'o/r');
+    e.rewrites[0] = ['https://github.com/', `http://127.0.0.1:${srv.address().port}/`];
+    e.rewrites.push(['git@github-r:', `${e.gh}/missing/`]); // the fallback key route has nothing to read either (no network here)
+    const r = await runAsync(e, 'o/r', 'r', extra); // the clone is refused (401) and the run falls back; only the credentials it used matter here
+    assert.ok(r.codes.includes('TOKEN_OK'), r.stdout + r.stderr);
+    const auths = seen.filter(Boolean).map((h) => Buffer.from(h.replace(/^Basic /, ''), 'base64').toString());
+    assert.ok(auths.length >= 1, 'git asked for credentials');
+    assert.ok(auths.every((a) => a === `ghuser:${TOKEN}`), 'only the gh helper gave a credential');
+    assert.deepEqual(helperCalls(e), [], 'the global helper was never run (no get, no store, no erase)');
+    noToken(e, r);
+  } finally { srv.close(); done(e); }
+});
+
+test('credentials: the clone\'s own helper chain is "empty, then gh": git asks gh alone, and a credential is stored nowhere else', { skip }, () => {
+  const e = world('true');
+  try {
+    const extra = globalHelper(e);
+    bare(e, 'o/r');
+    assert.equal(run(e, 'o/r', 'r', extra).code, 0);
+    const dir = path.join(e.ws, 'r');
+    const env = { PATH: `${e.bin}:${process.env.PATH}`, HOME: e.home, GIT_CONFIG_NOSYSTEM: '1', GH_TOKEN: TOKEN, FAKE_GH_LOG: e.ghlog, GIT_TERMINAL_PROMPT: '0', ...extra };
+    const fill = spawnSync('git', ['-C', dir, 'credential', 'fill'], { input: 'protocol=https\nhost=github.com\n\n', encoding: 'utf8', env });
+    assert.match(fill.stdout, /username=ghuser/);
+    assert.ok(!fill.stdout.includes('FROM-GLOBAL'));
+    spawnSync('git', ['-C', dir, 'credential', 'approve'], { input: 'protocol=https\nhost=github.com\nusername=ghuser\npassword=x\n\n', encoding: 'utf8', env });
+    spawnSync('git', ['-C', dir, 'credential', 'reject'], { input: 'protocol=https\nhost=github.com\nusername=ghuser\npassword=x\n\n', encoding: 'utf8', env });
+    assert.deepEqual(helperCalls(e), [], 'the global helper heard nothing');
+    assert.ok(fs.readFileSync(e.ghlog, 'utf8').includes('auth git-credential get'));
+  } finally { done(e); }
+});
+
+test('push destination: a global url.*.pushInsteadOf that would send the probe elsewhere is refused before anything is cloned', { skip }, () => {
+  const e = world('true');
+  try {
+    bare(e, 'o/r', 'ro'); // "GitHub" refuses every box/* push
+    const writable = path.join(e.root, 'wr'); bare({ ...e, gh: writable }, 'o/r'); // ...but this one takes them
+    fs.writeFileSync(path.join(e.home, '.gitconfig'), `[url "${writable}/"]\n\tpushInsteadOf = https://github.com/\n`);
+    const r = run(e, 'o/r', 'r');
+    assert.deepEqual([r.code, r.codes, r.detail('URL_REWRITE')], [26, ['URL_REWRITE'], 'rewrite'], r.stdout + r.stderr);
+    assert.deepEqual(fs.readdirSync(e.ws), []);
+    assert.deepEqual(git(e, path.join(writable, 'o/r.git'), 'for-each-ref', 'refs/heads/box'), '');
+    assert.equal(projects(e).r, undefined);
+    // the same for the key route, and for a plain insteadOf that moves the fetch
+    fs.writeFileSync(path.join(e.home, '.gitconfig'), `[url "${writable}/"]\n\tinsteadOf = git@github-r:\n`);
+    const k = run(e, 'o/r', 'r', { FCODE_NO_TOKEN: '1' });
+    assert.deepEqual([k.code, k.codes], [26, ['URL_REWRITE']], k.stdout + k.stderr);
+    assert.deepEqual(fs.readdirSync(e.ws), []);
+  } finally { done(e); }
+  // an unrelated rewrite is fine
+  const e2 = world('true');
+  try {
+    bare(e2, 'o/r');
+    fs.writeFileSync(path.join(e2.home, '.gitconfig'), `[url "${path.join(e2.root, 'elsewhere')}/"]\n\tinsteadOf = https://gitlab.com/\n\tpushInsteadOf = git@gitlab.com:\n`);
+    assert.equal(run(e2, 'o/r', 'r').code, 0);
+  } finally { done(e2); }
+});
+
+test('hooks dir: a clone whose hooks folder is a link (or leads outside the clone) is refused before anything is written there', { skip }, () => {
+  const e = world('true');
+  try {
+    bare(e, 'o/r');
+    const out = path.join(e.root, 'outside-hooks'); fs.mkdirSync(out);
+    const tpl = path.join(e.root, 'tpl'); fs.mkdirSync(tpl); fs.symlinkSync(out, path.join(tpl, 'hooks'));
+    const r = run(e, 'o/r', 'r', { GIT_TEMPLATE_DIR: tpl });
+    assert.deepEqual([r.code, r.codes, r.detail('HOOK_FAIL')], [24, ['TOKEN_OK', 'READ_OK', 'CLONED', 'HOOK_FAIL'], 'install'], r.stdout + r.stderr);
+    assert.deepEqual(fs.readdirSync(out), [], 'nothing was written through the link');
+    assert.equal(fs.existsSync(path.join(e.ws, 'r')), false);
+    assert.equal(projects(e).r, undefined);
+    // a link at pre-push itself
+    const tpl2 = path.join(e.root, 'tpl2'); fs.mkdirSync(path.join(tpl2, 'hooks'), { recursive: true }); fs.symlinkSync(path.join(out, 'pre-push'), path.join(tpl2, 'hooks', 'pre-push'));
+    const r2 = run(e, 'o/r', 'r', { GIT_TEMPLATE_DIR: tpl2 });
+    assert.deepEqual([r2.code, r2.detail('HOOK_FAIL')], [24, 'install'], r2.stdout + r2.stderr);
+    assert.deepEqual(fs.readdirSync(out), []);
+    tmpClean(e);
+  } finally { done(e); }
+});
+
+// the registration step under fault injection: Python's os.fsync / os.replace are wrapped through sitecustomize (PYTHONPATH)
+function faulty(e, mode) {
+  const py = path.join(e.root, `py-${mode}`); fs.mkdirSync(py, { recursive: true });
+  fs.writeFileSync(path.join(py, 'sitecustomize.py'), `import os, time
+mode = os.environ['SC_MODE']; cfgdir = os.environ['SC_CFGDIR']; mark = os.environ['SC_MARK']
+_fsync, _replace = os.fsync, os.replace
+def fsync(fd):
+    try: p = os.readlink('/proc/self/fd/%d' % fd)
+    except OSError: p = '?'
+    if p == cfgdir and mode == 'fsyncfail': raise OSError(5, 'injected EIO')
+    if p == cfgdir and mode == 'exit77': os._exit(77)
+    return _fsync(fd)
+def replace(a, b, *x, **k):
+    r = _replace(a, b, *x, **k)
+    if mode == 'hang':
+        open(mark, 'w').close(); time.sleep(5)
+    return r
+os.fsync = fsync; os.replace = replace
+`);
+  return { PYTHONPATH: py, SC_MODE: mode, SC_CFGDIR: e.cfgDir, SC_MARK: path.join(e.root, `mark-${mode}`) };
+}
+
+test('registration vs cleanup: once config.json was replaced the folder stays whatever happens next (late fsync error, exit, closed output, TERM)', { skip }, async () => {
+  // the directory fsync fails after the commit: registered, a warning (exit 30), folder kept
+  let e = world('true');
+  try {
+    bare(e, 'o/r');
+    const r = run(e, 'o/r', 'r', faulty(e, 'fsyncfail'));
+    assert.equal(r.code, 30, r.stdout + r.stderr);
+    assert.ok(r.codes.includes('CFG_ADDED') && r.codes.includes('CFG_WARN'));
+    assert.equal(projects(e).r, path.join(e.ws, 'r'));
+    assert.ok(fs.existsSync(path.join(e.ws, 'r', '.git')));
+  } finally { done(e); }
+  // the writer dies after the commit (any non-zero exit): the cleanup sees the config maps the name to this folder and does not remove it
+  e = world('true');
+  try {
+    bare(e, 'o/r');
+    const r = run(e, 'o/r', 'r', faulty(e, 'exit77'));
+    assert.equal(r.code, 77, r.stdout + r.stderr);
+    assert.equal(projects(e).r, path.join(e.ws, 'r'));
+    assert.ok(fs.existsSync(path.join(e.ws, 'r', '.git')), 'a registered folder is never removed');
+  } finally { done(e); }
+  // the reader of the output is gone (closed pipe) before the commit: nothing fails because of it
+  e = world('true');
+  try {
+    bare(e, 'o/r');
+    const p = spawn('bash', [SCRIPT, 'o/r', 'r'], { env: scriptEnv(e), stdio: ['ignore', 'pipe', 'pipe'] });
+    p.stdout.destroy();
+    const code = await new Promise((resolve) => p.on('close', resolve));
+    assert.equal(code, 0);
+    assert.equal(projects(e).r, path.join(e.ws, 'r'));
+    assert.ok(fs.existsSync(path.join(e.ws, 'r', '.git')));
+  } finally { done(e); }
+  // TERM right after the commit: ignored during the registration step, the run goes on to the end; the folder stays
+  e = world('true');
+  try {
+    bare(e, 'o/r');
+    const env = { ...scriptEnv(e), ...faulty(e, 'hang') };
+    const p = spawn('bash', [SCRIPT, 'o/r', 'r'], { env, stdio: 'ignore', detached: true });
+    const exited = new Promise((resolve) => p.on('close', (code, sig) => resolve([code, sig])));
+    await until(() => fs.existsSync(env.SC_MARK));
+    process.kill(-p.pid, 'SIGTERM');
+    const [code] = await exited;
+    assert.ok(code === 0 || code === 30, `the run was not cut short (exit ${code})`);
+    assert.equal(projects(e).r, path.join(e.ws, 'r'));
+    assert.ok(fs.existsSync(path.join(e.ws, 'r', '.git')));
+    tmpClean(e);
+  } finally { done(e); }
+});
+
+test('registration: a name already registered for this folder but whose folder is gone is cloned again; a failure then removes that clone', { skip }, () => {
+  const e = world('false');
+  try {
+    bare(e, 'o/r', 'ro'); e.map('r');
+    fs.writeFileSync(e.cfg, JSON.stringify({ cookieSecret: Buffer.alloc(32, 7).toString('base64'), projects: { r: path.join(e.ws, 'r') } }), { mode: 0o600 });
+    const r = run(e, 'o/r', 'r');
+    assert.equal(r.code, 41, r.stdout + r.stderr);
+    assert.ok(r.codes.includes('CLONED'));
+    assert.equal(fs.existsSync(path.join(e.ws, 'r')), false); // the stale entry is not a reason to keep a clone that failed its checks
+  } finally { done(e); }
+  // a registered folder with ANOTHER origin is not "already added": it is refused
+  const e2 = world('true');
+  try {
+    bare(e2, 'a/b');
+    const dir = path.join(e2.ws, 'r');
+    sh('git', ['clone', '-q', path.join(e2.gh, 'a/b.git'), dir], e2);
+    sh('git', ['-C', dir, 'remote', 'set-url', 'origin', 'https://github.com/a/b.git'], e2);
+    fs.writeFileSync(e2.cfg, JSON.stringify({ cookieSecret: Buffer.alloc(32, 7).toString('base64'), projects: { r: dir } }), { mode: 0o600 });
+    const r = run(e2, 'o/r', 'r');
+    assert.deepEqual([r.code, r.codes], [11, ['DIR_EXISTS']], r.stdout + r.stderr);
+  } finally { done(e2); }
+});
+test('credentials: a failed write of the repo\'s helper chain fails the add and removes the clone', { skip }, () => {
+  const e = world('true');
+  try {
+    bare(e, 'o/r');
+    const real = spawnSync('bash', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
+    fs.writeFileSync(path.join(e.bin, 'git'), `#!/bin/bash\ncase "$*" in *"config --local --add credential.helper"*) exit 1;; esac\nexec ${real} "$@"\n`, { mode: 0o755 });
+    const r = run(e, 'o/r', 'r');
+    assert.deepEqual([r.code, r.codes, r.detail('CRED_FAIL')], [25, ['TOKEN_OK', 'READ_OK', 'CLONED', 'CRED_FAIL'], 'config'], r.stdout + r.stderr);
+    assert.equal(fs.existsSync(path.join(e.ws, 'r')), false);
+    assert.equal(projects(e).r, undefined);
+    tmpClean(e);
   } finally { done(e); }
 });

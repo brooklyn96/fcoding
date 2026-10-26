@@ -76,15 +76,16 @@ export function parseAddRequest(b) {
 // script exit code -> job code; anything else (or a signal) is FAILED. The script's "R <CODE> [detail]" lines add the public key and the detail.
 const ADD_CODES = { 0: 'ADDED', 30: 'ADDED_WARN', 40: 'NEED_KEY', 41: 'NEED_WRITE', 42: 'WRITE_BLOCKED', 43: 'NET_FAIL', 44: 'REPO_ARCHIVED',
   11: 'DIR_CONFLICT', 21: 'CFG_CONFLICT', 22: 'CFG_BROKEN', 23: 'NAME_USED', 2: 'BAD_ARGS', 12: 'CLONE_FAIL',
-  124: 'TIMEOUT', 137: 'TIMEOUT' }; // timeout(1): 124 = the deadline, 137 = it had to kill (the job's own deadline, kept when the server is gone)
-const ADD_DETAIL = ['SSH_DETAIL', 'CLONE_FAIL', 'DIR_OTHER', 'DIR_NOTGIT', 'CFG_CONFLICT', 'CFG_BROKEN', 'CLEANUP_FAIL']; // first one with text wins
+  124: 'TIMEOUT' }; // timeout(1): 124 = the deadline (its --kill-after kill ends it as a signal, not a code; the job's own deadline, kept when the server is gone)
+// the detail words the app matches: DIR_EXISTS 'exists', DIR_UNSAFE 'unsafe', HOOK_FAIL 'install' | 'verify'; first line with text wins
+const ADD_DETAIL = ['SSH_DETAIL', 'CLONE_FAIL', 'DIR_EXISTS', 'DIR_UNSAFE', 'HOOK_FAIL', 'URL_REWRITE', 'CRED_FAIL', 'CFG_CONFLICT', 'CFG_BROKEN', 'CLEANUP_FAIL'];
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ADD_SCRIPT = path.join(SERVER_DIR, 'fcode-add.sh'), ADD_SCRIPT_DEV = path.join(SERVER_DIR, 'box', 'fcode-add.sh'); // installed next to server.mjs, or in a checkout
 const GH_LIST_MS = 60e3, GH_PAGES = 3, GH_PAGE_SIZE = 100, GH_LIST_MAX = GH_PAGES * GH_PAGE_SIZE; // GET /api/github/repos: cache time, pages read, most repos listed
 // pages 1..3 of the newest-updated repos, one JSON object per line ("@json"); no --paginate (an account with thousands of repos would run out of time)
 const ghReposArgs = (page) => ['api', `/user/repos?affiliation=owner,collaborator,organization_member&sort=updated&per_page=${GH_PAGE_SIZE}&page=${page}`, '--jq',
   '.[] | {repo: .full_name, private: .private, archived: .archived, canPush: (.permissions.push // false), updatedAt: .updated_at} | @json'];
-const ADD_TIMEOUT_MS = 10 * 60e3, ADD_KEEP_MS = 30 * 60e3, ADD_MAX_JOBS = 50, ADD_KILL_GRACE_MS = 3000, ADD_OUT_MAX = 256 * 1024;
+const ADD_TIMEOUT_MS = 10 * 60e3, ADD_KEEP_MS = 30 * 60e3, ADD_MAX_JOBS = 50, ADD_KILL_GRACE_MS = 15000, ADD_OUT_MAX = 256 * 1024;
 // a detail is one clean line of at most 200 characters; tokens and URL credentials never pass
 const jobText = (s) => Array.from(cleanLine(s).replace(/(gh[a-z]_|github_pat_)[A-Za-z0-9_]+/gi, '<token>').replace(/\/\/[^/\s@]*@/g, '//<cred>@')).slice(0, 200).join('');
 export function addOutcome(code, stdout) {
@@ -1472,7 +1473,7 @@ export function createApp(opts = {}) {
     child.on('close', (code) => finish(addOutcome(code, out)));
     timer = setTimeout(() => {
       finish({ state: 'failed', code: 'TIMEOUT' });
-      killGroup('SIGTERM'); // git removes a half clone on TERM; whatever is left is killed after a short grace
+      killGroup('SIGTERM'); // the script cleans up its clone on TERM; on Linux timeout(1) kills what is left at +10 s, this backstop only at +15 s
       grace = setTimeout(() => killGroup('SIGKILL'), ADD_KILL_GRACE_MS);
       grace.unref();
     }, addTimeout);

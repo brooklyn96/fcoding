@@ -3912,8 +3912,12 @@ test('add project: every exit code of the script ends the job in its state and c
     [42, R('R SSH_DETAIL ! [remote rejected] (protected branch hook declined)', 'R WRITE_BLOCKED'), 'failed', 'WRITE_BLOCKED', '! [remote rejected] (protected branch hook declined)'],
     [43, R('R SSH_DETAIL ssh: connect to host github.com port 22: Connection timed out', 'R NET_FAIL'), 'failed', 'NET_FAIL', 'ssh: connect to host github.com port 22: Connection timed out'],
     [44, R('R SSH_DETAIL archived', 'R REPO_ARCHIVED'), 'failed', 'REPO_ARCHIVED', 'archived'],
-    [11, R('R DIR_OTHER other/repo'), 'failed', 'DIR_CONFLICT', 'other/repo'],
-    [11, R('R DIR_NOTGIT /data/workspace/r'), 'failed', 'DIR_CONFLICT', '/data/workspace/r'],
+    [11, R('R DIR_EXISTS exists'), 'failed', 'DIR_CONFLICT', 'exists'], // the words the app matches: exists / unsafe / install / verify
+    [11, R('R DIR_UNSAFE unsafe'), 'failed', 'DIR_CONFLICT', 'unsafe'],
+    [24, R('R HOOK_FAIL install'), 'failed', 'FAILED', 'install'], [24, R('R HOOK_FAIL verify'), 'failed', 'FAILED', 'verify'],
+    [25, R('R CRED_FAIL config'), 'failed', 'FAILED', 'config'], [26, R('R URL_REWRITE rewrite'), 'failed', 'FAILED', 'rewrite'],
+    [124, R('R KEY_NEW'), 'failed', 'TIMEOUT', null], // timeout(1) ends the job at its deadline
+    [0, R('R CFG_EXISTS'), 'done', 'ADDED', null], // a rerun of a registered project: nothing but CFG_EXISTS
     [21, R('R CFG_CONFLICT /data/workspace/else'), 'failed', 'CFG_CONFLICT', '/data/workspace/else'],
     [21, R('R ALIAS_FAIL'), 'failed', 'FAILED', null], // 21 is also "cannot write the ssh config": not a name clash
     [23, R('R NAME_USED'), 'failed', 'NAME_USED', null],
@@ -3921,7 +3925,7 @@ test('add project: every exit code of the script ends the job in its state and c
     [2, R('R BAD_ARGS'), 'failed', 'BAD_ARGS', null],
     [12, R('R CLONE_FAIL fatal: repository not found'), 'failed', 'CLONE_FAIL', 'fatal: repository not found'],
     [20, R('R KEY_FAIL'), 'failed', 'FAILED', null],
-    [1, [], 'failed', 'FAILED', null], [3, [], 'failed', 'FAILED', null], [10, [], 'failed', 'FAILED', null], [31, [], 'failed', 'FAILED', null], [45, [], 'failed', 'FAILED', null],
+    [1, [], 'failed', 'FAILED', null], [3, [], 'failed', 'FAILED', null], [10, [], 'failed', 'FAILED', null], [31, [], 'failed', 'FAILED', null], [45, [], 'failed', 'FAILED', null], [137, [], 'failed', 'FAILED', null], // 137 never comes back as a code (timeout(1) --kill-after kills the group, node sees a signal)
     [127, [], 'failed', 'FAILED', null], [255, [], 'failed', 'FAILED', null],
   ];
   for (const [exit, lines, state, code, detail, key] of cases) {

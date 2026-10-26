@@ -1,17 +1,22 @@
 #!/bin/bash
 # fcode add (chay tren box): them 1 project GitHub vao /data/workspace va vao cau hinh FCode.
 # Tham so $1=<owner/repo>, $2=<ten> do fcode.ps1 dat bang "set --" ngay truoc script nay (khong qua dong lenh).
+# Thu muc /data/workspace/<ten> da ton tai (thu muc, file, lien ket, git hay khong) KHONG BAO GIO duoc nhan lai: tu choi truoc moi thay doi
+# (R DIR_EXISTS exists / R DIR_UNSAFE unsafe, thoat 11). Ngoai le duy nhat: project da ghi trong cau hinh voi dung thu muc nay va dung origin
+# -> in "R CFG_EXISTS" va thoat 0, khong dung gi them (khong ghi thu, khong doi cau hinh). Moi buoc con lai chay tren ban clone CUA lan chay nay.
 # Duong 1 (token): neu gh cua box (GH_TOKEN) thay repo va API bao quyen push (chi la goi y: do la vai tro cua nguoi dung, khong phai pham vi
-#   cua token) thi clone qua HTTPS, gh la credential helper (chi dat trong cau hinh rieng cua repo; token khong bao gio duoc in, luu hay ghi
-#   vao URL). In "R TOKEN_OK". Viec GHI THAT (buoc 6) moi quyet dinh: bi tu choi (403...) thi in "R TOKEN_FALLBACK" va chay lai bang duong 2.
+#   cua token) thi clone qua HTTPS, gh la credential helper (chuoi helper duoc dat lai, chi dat trong cau hinh rieng cua repo; token khong bao gio
+#   duoc in, luu hay ghi vao URL). In "R TOKEN_OK". Viec GHI THAT (buoc 6) moi quyet dinh: bi tu choi (403...) thi in "R TOKEN_FALLBACK", xoa ban
+#   clone cua minh va chay lai bang duong 2.
 # Duong 2 (du phong): moi repo co 1 deploy key SSH rieng (cung kieu 3 project san co): ~/.ssh/id_ed25519_<ten> + alias "github-<ten>".
 #   Dung khi token khong thay repo, khong co quyen push, clone/ghi bang token bi tu choi, hoac thieu gh. FCODE_NO_TOKEN=1: bo qua duong 1.
-# Chay lai nhieu lan van an toan. Chi in ASCII: dong "R <MA> [chi tiet]" de fcode.ps1 dich ra tieng Viet.
+# Chi in ASCII: dong "R <MA> [chi tiet]" de fcode.ps1 dich ra tieng Viet.
 # Khong bao gio in khoa rieng; chi in khoa cong khai (PUBKEY). Khong dung token/API de them khoa.
-# Ban clone do CHINH lan chay nay tao ra bi xoa neu co loi truoc khi project duoc ghi vao cau hinh (thu muc co san thi khong bao gio xoa).
+# Ban clone do CHINH lan chay nay tao ra bi xoa neu co loi truoc khi project duoc ghi vao cau hinh (va chua co ten nay -> thu muc nay trong cau hinh).
 # Ma thoat: 0 xong, 30 xong nhung co canh bao, 40 can dan khoa vao GitHub, 41 khoa chua co quyen ghi,
-# 42 GitHub chan tao nhanh box/*, 43 mang loi, 44 repo da luu tru, 24 khong cai/kiem chung duoc hook, 2 tham so sai,
-# 11/21/22/23 ten da dung, thu muc la lien ket/ngoai workspace hoac cau hinh hong, 1x/2x loi khac.
+# 42 GitHub chan tao nhanh box/*, 43 mang loi, 44 repo da luu tru, 24 khong cai/kiem chung duoc hook, 25 khong dat duoc credential helper,
+# 26 cau hinh git (url.*.insteadOf / pushurl) doi huong URL, 2 tham so sai, 11 thu muc da co / khong an toan, 21/22 cau hinh xung dot / hong,
+# 23 ten khoa/alias da dung cho repo khac, 20 khong tao duoc khoa, 12 clone loi.
 set -u
 arg1="${1:-}"; arg2="${2:-}"
 repo="${1:-}"; name="${2:-}"
@@ -29,27 +34,44 @@ alias_="github-$name"
 url="git@$alias_:$repo.git"
 export GIT_SSH_COMMAND="ssh -F $sshdir/config -o BatchMode=yes -o ConnectTimeout=15"
 export GIT_TERMINAL_PROMPT=0 GH_PROMPT_DISABLED=1   # khong bao gio hoi mat khau
-GHELPER='!gh auth git-credential'; HKEY='credential.https://github.com.helper'
+GHELPER='!gh auth git-credential'
 via=key
 GH_ED25519='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl'   # khoa may chu github.com (chinh thuc)
-fail=0; cloned=0; registered=0
+fail=0; cloned=0; registered=0; prereg=0
 # 1 dong ket qua; neu nguoi doc (server) da dong ong thi lan chay van tiep tuc (SIGPIPE chi bi bo qua trong dong nay)
 say() { ( trap '' PIPE; echo "R $*" ) 2>/dev/null; return 0; }
 clean() { sed -E 's/(gh[a-z]_|github_pat_)[A-Za-z0-9_]+/<token>/g' | head -n 1 | cut -c1-200; }
+# cau hinh co ghi <ten> -> <thu muc nay> khong? (0 = co)
+cfg_maps() {
+  python3 - "$cfg" "$name" "$dir" <<'PY'
+import json, sys
+try:
+    p = json.load(open(sys.argv[1], encoding='utf-8')).get('projects') or {}
+except Exception:
+    sys.exit(1)
+sys.exit(0 if isinstance(p, dict) and p.get(sys.argv[2]) == sys.argv[3] else 1)
+PY
+}
 err="$(mktemp)"
-# don dep khi thoat (ca khi bi tat bang TERM/INT/HUP): file tam, va ban clone do lan chay nay tao ra neu chua ghi vao cau hinh
-cleanup() { [ "$cloned" = 1 ] && [ "$registered" != 1 ] && rm -rf -- "$dir"; rm -f "$err"; return 0; }
+# don dep khi thoat (ca khi bi tat bang TERM/INT/HUP): file tam, va ban clone do lan chay nay tao ra neu project CHUA duoc ghi vao cau hinh.
+# Truoc khi xoa con xem lai cau hinh: neu da ghi <ten> -> thu muc nay (vd. python da doi file roi moi bi loi/bi tat) thi KHONG xoa.
+cleanup() {
+  if [ "$cloned" = 1 ] && [ "$registered" != 1 ]; then
+    if [ "$prereg" = 1 ] || ! cfg_maps; then rm -rf -- "$dir"; fi
+  fi
+  rm -f "$err"; return 0
+}
 trap cleanup EXIT
 trap 'cleanup; exit 143' TERM INT HUP
 
 # 0a. thu muc dich khong duoc la lien ket, va thu muc that + git dir that phai nam trong workspace that (kiem tra truoc moi thay doi)
-if [ -L "$dir" ]; then say DIR_UNSAFE "$dir"; exit 11; fi
+if [ -L "$dir" ]; then say DIR_UNSAFE unsafe; exit 11; fi
 if [ -e "$dir" ]; then
   rws="$(readlink -f "$ws")"; rdir="$(readlink -f "$dir")"
-  if [ -z "$rws" ] || [ "$rdir" != "$rws/$name" ] || [ -L "$dir/.git" ]; then say DIR_UNSAFE "$dir"; exit 11; fi
+  if [ -z "$rws" ] || [ "$rdir" != "$rws/$name" ] || [ -L "$dir/.git" ]; then say DIR_UNSAFE unsafe; exit 11; fi
   if [ -d "$dir/.git" ]; then
     gdir="$(git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null)"
-    if [ -z "$gdir" ] || [ "$(readlink -f "$gdir")" != "$rdir/.git" ]; then say DIR_UNSAFE "$dir"; exit 11; fi
+    if [ -z "$gdir" ] || [ "$(readlink -f "$gdir")" != "$rdir/.git" ]; then say DIR_UNSAFE unsafe; exit 11; fi
   fi
 fi
 
@@ -82,6 +104,25 @@ classify_fail() { # dat $kind: net | archived | ro | other
   else kind=other; fi
 }
 
+# git cho moi lenh MANG: duong token dat lai chuoi credential helper (gia tri rong xoa helper ke thua tu system/global) roi chi dung gh
+gt() { if [ "$via" = token ]; then git -c credential.helper= -c "credential.helper=$GHELPER" "$@"; else git "$@"; fi; }
+
+# cau hinh git (system/global/repo, khong tinh -c / bien moi truong cua chinh lan chay nay) khong duoc doi huong "$url": url.*.insteadOf /
+# pushInsteadOf co tien to khop "$url", hay remote.origin.pushurl. $1 = thu muc clone (bo trong: chi system/global). 0 = khong bi doi huong.
+url_rewrite_check() {
+  local g=(git) scope kv key val bad=0
+  [ -n "${1:-}" ] && g+=(-C "$1")
+  while IFS=$'\t' read -r scope kv; do
+    [ "$scope" = command ] && continue
+    key="${kv%% *}"; val="${kv#* }"
+    case "$key" in
+      url.*.insteadof|url.*.pushinsteadof) [ -n "$val" ] && case "$url" in "$val"*) bad=1;; esac;;
+      remote.origin.pushurl) bad=1;;
+    esac
+  done < <("${g[@]}" config --show-scope --get-regexp '^(url\..*\.(insteadof|pushinsteadof)|remote\.origin\.pushurl)$' 2>/dev/null)
+  [ "$bad" -eq 0 ]
+}
+
 # 1 commit rong (cay rong) do lan chay nay tao ra; in sha. Dung cho ca buoc ghi thu va buoc kiem chung hook.
 empty_commit() { # $1 = thu muc clone, $2 = thong diep
   local tree; tree="$(git -C "$1" hash-object -t tree -w /dev/null)" || return 1
@@ -101,41 +142,34 @@ hook_verify() {
   [ "$a" -ne 0 ] && [ "$b" -eq 0 ] && printf '%s' "$o" | grep -q 'blocked on this box'
 }
 
-# ghi duoc repo: CHINH lan chay nay day THAT 1 nhanh thu duy nhat (box/fcode-add-check-<ten>-<epoch>-<pid>-<so ngau nhien>) tu commit cay rong cua no,
-# roi xoa dung commit do (--force-with-lease). Khong nhanh co san nao, va khong lan xoa that bai nao, la bang chung ghi duoc.
-# Xoa that bai: quyen / mang / luu tru -> chua chung minh duoc (1); loi khac -> da ghi duoc (nhanh duoc tao), bao CLEANUP_FAIL.
-write_check() { # $1 = thu muc clone; 0 = ghi duoc; 1 = loi (noi dung loi o $err)
+# ghi duoc repo: CHINH lan chay nay day THAT 1 nhanh thu duy nhat (box/fcode-add-check-<ten>-<epoch>-<pid>-<so ngau nhien>) tu commit cay rong cua no
+# TOI DUNG "$url" (khong qua 'origin': khong remote.origin.pushurl nao co the doi cho den), roi xoa dung commit do (--force-with-lease).
+# Khong nhanh co san nao la bang chung. Tao that bai -> chua chung minh duoc (1, noi dung loi o $err). Tao duoc roi thi DA ghi duoc: xoa that bai
+# (bat ky ly do nao) chi la CLEANUP_FAIL <nhanh> (ADDED_WARN); mot TERM giua luc tao va xoa cung de lai nhanh (ten duy nhat, chap nhan).
+write_check() { # $1 = thu muc clone; 0 = ghi duoc; 1 = loi
   local c ref e2 safe; safe="$(printf '%s' "$name" | tr -c 'a-z0-9-' '-')"
   # ten nhanh khong bao gio trung: ten-epoch-pid-ngau nhien (lan chay du phong exec giu nguyen pid), va chi tao khi nhanh CHUA co (lease rong)
   ref="refs/heads/box/fcode-add-check-$safe-$(date +%s)-$$-$RANDOM"
   c="$(empty_commit "$1" 'fcode add write check' 2>"$err")" || return 1
-  git -C "$1" push -q --force-with-lease="$ref:" origin "$c:$ref" >/dev/null 2>"$err" </dev/null || return 1
+  gt -C "$1" push -q --force-with-lease="$ref:" "$url" "$c:$ref" >/dev/null 2>"$err" </dev/null || return 1
   e2="$(mktemp)"
-  if ! git -C "$1" push -q --force-with-lease="$ref:$c" origin ":$ref" >/dev/null 2>"$e2" </dev/null; then
-    cp "$e2" "$err"; classify_fail
-    case "$kind" in ro|archived) rm -f "$e2"; return 1;; esac
+  if ! gt -C "$1" push -q --force-with-lease="$ref:$c" "$url" ":$ref" >/dev/null 2>"$e2" </dev/null; then
     sleep 2
-    if ! git -C "$1" push -q --force-with-lease="$ref:$c" origin ":$ref" >/dev/null 2>"$e2" </dev/null; then
-      cp "$e2" "$err"; classify_fail
-      case "$kind" in net|ro|archived) rm -f "$e2"; return 1;; esac
-      say CLEANUP_FAIL "$ref"; fail=1
-    fi
+    gt -C "$1" push -q --force-with-lease="$ref:$c" "$url" ":$ref" >/dev/null 2>"$e2" </dev/null || { say CLEANUP_FAIL "$ref"; fail=1; }
   fi
   rm -f "$e2"; return 0
 }
 # 0. hai lan fcode add cung ten khong chay song song
 mkdir -p "$sshdir"; chmod 700 "$sshdir"; exec 8>>"$sshdir/.fcode-add-$name.lock"; flock 8
 
-# 1. kiem tra truoc (chua tao gi): thu muc, cau hinh, khoa/alias co phai cua repo khac khong
+# 1. kiem tra truoc (chua tao gi): cau hinh, thu muc, khoa/alias co phai cua repo khac khong
 want="$(printf '%s' "$repo" | tr 'A-Z' 'a-z')"
-if [ -e "$dir" ]; then
-  if [ ! -d "$dir/.git" ]; then say DIR_NOTGIT "$dir"; exit 11; fi
-  have="$(git -C "$dir" config --get remote.origin.url 2>/dev/null | tr 'A-Z' 'a-z' | sed -E 's#^(https://github\.com/|git@[^:]*:)##; s#\.git$##')"
-  if [ "$have" != "$want" ]; then say DIR_OTHER "$have"; exit 11; fi
-fi
 python3 - "$cfg" "$name" "$dir" <<'PY'
-import json, sys
+import json, os, sys
 cfg, name, d = sys.argv[1:4]
+def out(s):
+    try: os.write(1, (s + '\n').encode())
+    except OSError: pass
 try:
     c = json.load(open(cfg, encoding='utf-8'))
     if not isinstance(c, dict): raise ValueError('config is not an object')
@@ -143,24 +177,32 @@ try:
     if p is None: p = {}
     if not isinstance(p, dict): raise ValueError('projects is not an object')
 except (OSError, ValueError) as e:
-    print('R CFG_BROKEN ' + type(e).__name__); sys.exit(22)
+    out('R CFG_BROKEN ' + type(e).__name__); sys.exit(22)
 if name in p and p[name] != d:
-    print('R CFG_CONFLICT ' + str(p[name])[:100]); sys.exit(21)
+    out('R CFG_CONFLICT ' + str(p[name])[:100]); sys.exit(21)
 PY
 rc=$?; [ "$rc" -eq 0 ] || exit "$rc"
+if cfg_maps; then prereg=1; fi
+if [ -e "$dir" ]; then
+  # chi 1 ngoai le: project da ghi (dung thu muc nay) voi dung origin -> chay lai la thanh cong, khong dung gi them
+  have="$(git -C "$dir" config --get remote.origin.url 2>/dev/null | tr 'A-Z' 'a-z' | sed -E 's#^(https://github\.com/|git@[^:]*:)##; s#\.git$##')"
+  if [ "$prereg" = 1 ] && [ -d "$dir/.git" ] && [ "$have" = "$want" ]; then say CFG_EXISTS; exit 0; fi
+  say DIR_EXISTS exists; exit 11
+fi
 # khoa/alias cua ten nay co phai cua repo khac khong (chi doc; truoc ca duong token, de mot lan chay du phong khong de lai ban clone mo coi)
 alias_owner; ao=$?
 if [ "$ao" -eq 2 ]; then say NAME_USED; exit 23; fi
 if [ "$ao" -eq 1 ] && [ -e "$key" ] && [ "$(awk '{print tolower($3)}' "$key.pub" 2>/dev/null)" != "fcode-$want" ]; then say NAME_USED; exit 23; fi
-# 1b. duong token: gh cua box co quyen push vao repo nay? (khong -> duong khoa SSH ben duoi). Project da co dung remote SSH thi giu khoa cua no.
+# 1b. duong token: gh cua box co quyen push vao repo nay? (khong -> duong khoa SSH ben duoi).
 # Chi doc "true"/"false" tu API; stderr bo di; token khong di qua dong lenh, URL hay file nao.
 if [ -z "${FCODE_NO_TOKEN:-}" ] && command -v gh >/dev/null 2>&1 \
-   && [ "$(timeout 20 gh api "repos/$repo" --jq .permissions.push </dev/null 2>/dev/null)" = true ] \
-   && ! [[ "$(git -C "$dir" config --get remote.origin.url 2>/dev/null)" == git@* ]]; then
-  via=token
+   && [ "$(timeout 20 gh api "repos/$repo" --jq .permissions.push </dev/null 2>/dev/null)" = true ]; then
+  via=token; url="https://github.com/$repo.git"
 fi
+# cau hinh git chung khong duoc doi huong URL nay (truoc moi lenh mang, truoc ca khi tao khoa)
+if ! url_rewrite_check; then say URL_REWRITE rewrite; exit 26; fi
 if [ "$via" = token ]; then
-  url="https://github.com/$repo.git"; say TOKEN_OK; say READ_OK
+  say TOKEN_OK; say READ_OK
 else   # ---- duong khoa SSH (cho den het buoc 3) ----
 
 # 2. khoa SSH rieng + alias + ghim khoa may chu github.com (khoa thu muc ~/.ssh: cac lan chay khac ten cung ghi config nay)
@@ -198,37 +240,40 @@ say READ_OK
 fi   # ---- het duong khoa SSH ----
 
 # duong token khong qua duoc (clone/ghi bi tu choi: vd. token thieu quyen Contents): lam lai tu dau bang duong khoa SSH.
-# Ban clone do lan chay nay tao ra bi xoa (lan chay khoa se clone lai); thu muc co san thi giu, chi go credential helper.
+# Ban clone la cua lan chay nay (thu muc co san da bi tu choi o tren): xoa no, lan chay khoa se clone lai.
 # Nha khoa thu muc truoc (cung file khoa, mo moi se doi mai) va xoa file tam (trap EXIT khong chay khi exec).
 fallback() {
   say TOKEN_FALLBACK
-  if [ "$cloned" = 1 ]; then rm -rf -- "$dir"; cloned=0
-  elif [ -d "$dir/.git" ]; then git -C "$dir" config --unset-all "$HKEY" 2>/dev/null; fi
+  if [ "$cloned" = 1 ]; then rm -rf -- "$dir"; cloned=0; fi
   rm -f "$err"; exec 8>&-; FCODE_NO_TOKEN=1 exec bash "$0" "$arg1" "$arg2"
 }
 
-# 4. clone (da co thi giu nguyen, dat lai remote). Duong token: gh la credential helper, dat trong cau hinh rieng cua repo.
-if [ -e "$dir" ]; then
-  git -C "$dir" remote set-url origin "$url"
-  say CLONE_EXISTS
-else
-  mkdir -p "$ws" 2>/dev/null
-  if [ "$via" = token ]; then git -c "$HKEY=$GHELPER" clone -q "$url" "$dir" >/dev/null 2>"$err" </dev/null; else git clone -q "$url" "$dir" >/dev/null 2>"$err" </dev/null; fi || {
-    classify_fail; if [ "$kind" = net ]; then say SSH_DETAIL "$(clean <"$err")"; say NET_FAIL; exit 43; fi
-    [ "$via" = token ] && fallback
-    say CLONE_FAIL "$(clean <"$err")"; exit 12
-  }
-  cloned=1
-  say CLONED
+# 4. clone (thu muc chua ton tai: da kiem tra o tren). Duong token: gh la credential helper duy nhat (gt), roi ghi vao cau hinh rieng cua repo.
+mkdir -p "$ws" 2>/dev/null
+gt clone -q "$url" "$dir" >/dev/null 2>"$err" </dev/null || {
+  classify_fail; if [ "$kind" = net ]; then say SSH_DETAIL "$(clean <"$err")"; say NET_FAIL; exit 43; fi
+  [ "$via" = token ] && fallback
+  say CLONE_FAIL "$(clean <"$err")"; exit 12
+}
+cloned=1
+say CLONED
+# ban clone phai khong doi huong URL (pushurl / insteadOf trong cau hinh cua no) va khong lech khoi workspace
+if ! url_rewrite_check "$dir"; then say URL_REWRITE rewrite; exit 26; fi
+if [ "$via" = token ]; then
+  # chuoi helper cua repo: truoc het 1 gia tri rong (xoa helper system/global), roi gh; ghi loi thi that bai
+  git -C "$dir" config --local --unset-all credential.helper 2>/dev/null
+  git -C "$dir" config --local --add credential.helper '' && git -C "$dir" config --local --add credential.helper "$GHELPER" || { say CRED_FAIL config; exit 25; }
 fi
-[ "$via" = token ] && git -C "$dir" config "$HKEY" "$GHELPER"
 
 # 5. hook chan push len main/master. Git phai THAT SU dung hook nay: core.hooksPath (chi cua repo nay) tro vao thu muc hooks cua chinh no, nen
-# core.hooksPath ke thua tu global/system khong vo hieu hoa duoc; roi kiem chung bang push that (hook_verify). Loi o day thi KHONG them project.
-gdir="$(git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null)"; hooks="$gdir/hooks"
+# core.hooksPath ke thua tu global/system khong vo hieu hoa duoc (hook global cua box khong chay trong ban clone nay); roi kiem chung bang push
+# that (hook_verify). Thu muc hooks (hay pre-push) la lien ket / nam ngoai ban clone thi tu choi TRUOC khi tao/ghi/chmod. Loi o day: KHONG them project.
+rdir="$(readlink -f "$dir")"; gdir="$(git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null)"; hooks="$gdir/hooks"
+if [ -z "$gdir" ] || [ "$(readlink -f "$gdir")" != "$rdir/.git" ] || [ -L "$dir/.git" ] || [ -L "$hooks" ] || [ -L "$hooks/pre-push" ]; then say HOOK_FAIL install; exit 24; fi
+if [ -e "$hooks" ]; then case "$(readlink -f "$hooks")" in "$rdir"/*) ;; *) say HOOK_FAIL install; exit 24;; esac; fi
 htmp="$(mktemp)"; hook_text >"$htmp"
 hk=1
-if [ -n "$gdir" ] && mkdir -p "$hooks"; then
+if mkdir -p "$hooks"; then
   if cmp -s "$htmp" "$hooks/pre-push" 2>/dev/null; then hk=0; say HOOK_EXISTS
   elif install -m 755 "$htmp" "$hooks/pre-push"; then hk=0; say HOOK_OK; fi
 fi
@@ -251,13 +296,19 @@ if ! write_check "$dir"; then
 fi
 say WRITE_OK
 
-# 7. them vao config FCode (chi them 1 khoa trong "projects"; khoa thu muc; sao luu truoc; ghi roi fsync file, doi ten, fsync thu muc; 0600)
+# 7. them vao config FCode (chi them 1 khoa trong "projects"; khoa thu muc; sao luu truoc; ghi roi fsync file, doi ten, fsync thu muc; 0600).
+# Buoc nay KHONG bi TERM/INT/HUP cat ngang (se mat tin hieu): xong roi moi dat lai trap. Python ghi qua os.write va bo qua ong da dong; tu luc
+# os.replace xong thi project da duoc ghi: moi loi sau do (fsync thu muc...) chi la canh bao (thoat 3), khong bao gio la that bai.
+trap '' TERM INT HUP
 python3 - "$cfg" "$name" "$dir" <<'PY'
 import fcntl, json, os, sys, tempfile, time
 cfg, name, d = sys.argv[1:4]
 cdir = os.path.dirname(cfg)
+def out(s):
+    try: os.write(1, (s + '\n').encode())
+    except OSError: pass
 def broken(why):
-    print('R CFG_BROKEN ' + str(why)[:80]); sys.exit(22)
+    out('R CFG_BROKEN ' + str(why)[:80]); sys.exit(22)
 try:
     lock = os.open(cdir, os.O_RDONLY)
     fcntl.flock(lock, fcntl.LOCK_EX)      # hai lan fcode add cung luc phai doi nhau
@@ -272,8 +323,8 @@ except (OSError, ValueError) as e:
     broken(type(e).__name__)
 if name in p:
     if p[name] == d:
-        print('R CFG_EXISTS'); sys.exit(0)
-    print('R CFG_CONFLICT ' + str(p[name])[:100]); sys.exit(21)
+        out('R CFG_EXISTS'); sys.exit(0)
+    out('R CFG_CONFLICT ' + str(p[name])[:100]); sys.exit(21)
 tmp = None
 try:
     bak = '%s.bak-%s-%d' % (cfg, time.strftime('%Y%m%d-%H%M%S'), os.getpid())
@@ -287,17 +338,24 @@ try:
         if raw.endswith('\n'): f.write('\n')
         f.flush(); os.fsync(f.fileno())                            # file moi xuong dia truoc khi rename
     os.replace(tmp, cfg); tmp = None
-    os.fsync(lock)                                                 # roi fsync thu muc (rename va ban sao luu)
 except OSError as e:
     if tmp:
         try: os.unlink(tmp)
         except OSError: pass
     broken(type(e).__name__)
-print('R CFG_ADDED')
+out('R CFG_ADDED')                                                  # tu day project DA duoc ghi
+try:
+    os.fsync(lock)                                                  # roi fsync thu muc (rename va ban sao luu)
+except OSError:
+    out('R CFG_WARN fsync'); sys.exit(3)
 PY
 rc=$?
-[ "$rc" -eq 0 ] || exit "$rc"
-registered=1
+trap 'cleanup; exit 143' TERM INT HUP
+case "$rc" in
+  0) registered=1;;
+  3) registered=1; fail=1;;   # da ghi, nhung fsync thu muc loi: canh bao (xong, thoat 30)
+  *) exit "$rc";;
+esac
 
 # 8. kiem tra
 branch="$(git -C "$dir" symbolic-ref --short HEAD 2>/dev/null)"
