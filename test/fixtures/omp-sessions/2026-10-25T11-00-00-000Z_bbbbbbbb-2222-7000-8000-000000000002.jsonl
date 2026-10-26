@@ -1,0 +1,3 @@
+{"type":"title","v":1,"title":"","updatedAt":"2026-10-25T10:00:00.000Z","pad":"  "}
+{"type":"session","version":3,"id":"bbbbbbbb-2222-7000-8000-000000000002","timestamp":"2026-10-25T10:00:00.000Z","cwd":"/data/workspace/demo","title":"Title from the header"}
+{"type":"message","id":"m1","parentId":null,"message":{"role":"user","content":"SECRET-BODY-DO-NOT-READ"}}

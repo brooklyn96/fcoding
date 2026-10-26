@@ -1,0 +1,2 @@
+{"type":"session","version":3,"id":"eeeeeeee-5555-7000-8000-000000000005","timestamp":"2026-10-25T10:00:00.000Z","cwd":"/data/workspace/demo","title":"Header first, no title line"}
+{"type":"message","id":"m1","parentId":null,"message":{"role":"user","content":"SECRET-BODY-DO-NOT-READ"}}
