@@ -1441,7 +1441,7 @@ enum HomeLogic {
         let dirOther = addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"DIR_CONFLICT\",\"detail\":\"/data/workspace/web\"}")))
         eq("dir unknown detail kept", dirOther.detail, "/data/workspace/web")
         eq("dir unknown detail message", dirOther.message, "Thư mục web đã có trên box. Chọn tên khác.")
-        eq("failed other detail kept",addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"FAILED\",\"detail\":\"boom\"}"))).detail, "boom")
+        eq("failed other detail kept", addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"FAILED\",\"detail\":\"boom\"}"))).detail, "boom")
         eq("resubmit after failure", addReduce(arch, .submit(repo: "Me/Web", name: "web2")).phase, .posting)
         let done = addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED\",\"name\":\"web\"}")))
         eq("done", done.phase, .done)
