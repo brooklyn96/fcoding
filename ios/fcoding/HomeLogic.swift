@@ -809,21 +809,27 @@ enum HomeLogic {
 
     /// The server's detail keywords that addCodeMessage turns into text (and so need no detail line).
     private static let dirConflictDetails = ["exists", "unsafe"]
-    private static let hookFailDetails = ["install", "verify"]
+    private static let pushGuardText = "Box không cài được chốt chặn push lên main. Thử lại sau."
+    private static let failDetailTexts = [
+        "install": pushGuardText, "verify": pushGuardText,
+        "rewrite": "Cấu hình git trên box đang đổi hướng địa chỉ GitHub. Nhờ người quản lý box gỡ cấu hình đó rồi thử lại.",
+        "config": "Box không ghi được cấu hình đăng nhập GitHub cho repo này. Thử lại sau.",
+    ]
 
     /// True when the message already says everything this detail says: DIR_CONFLICT with no detail,
-    /// "exists" or "unsafe"; FAILED with "install" or "verify". Any other detail (a path, owner/repo) stays.
+    /// "exists" or "unsafe"; FAILED with "install", "verify", "rewrite" or "config". Any other detail
+    /// (a path, owner/repo) stays.
     static func addDetailIsKeyword(_ code: String?, _ detail: String?) -> Bool {
         let d = detail ?? ""
         switch code {
         case "DIR_CONFLICT": return d.isEmpty || dirConflictDetails.contains(d)
-        case "FAILED": return hookFailDetails.contains(d)
+        case "FAILED": return failDetailTexts[d] != nil
         default: return false
         }
     }
 
     /// One short line per failed job code. `detail` and `name` (the job's project name) refine
-    /// DIR_CONFLICT ("exists" / "unsafe") and FAILED ("install" / "verify").
+    /// DIR_CONFLICT ("exists" / "unsafe") and FAILED ("install" / "verify" / "rewrite" / "config").
     static func addCodeMessage(_ code: String?, detail: String? = nil, name: String = "") -> String {
         switch code {
         case "NET_FAIL": return "Box không kết nối được GitHub, thử lại sau."
@@ -833,7 +839,7 @@ enum HomeLogic {
             return detail == "unsafe" ? "Thư mục \(dir) trên box không an toàn. Chọn tên khác."
                                       : "Thư mục \(dir) đã có trên box. Chọn tên khác."
         case "FAILED" where addDetailIsKeyword(code, detail):
-            return "Box không cài được chốt chặn push lên main. Thử lại sau."
+            return failDetailTexts[detail ?? ""] ?? pushGuardText
         case "REPO_ARCHIVED": return "Repo đã lưu trữ (archived), không ghi được."
         case "WRITE_BLOCKED": return "GitHub chặn tạo nhánh box/*, xem lại luật bảo vệ nhánh."
         case "CFG_BROKEN": return "Cấu hình FCode trên box bị hỏng, nhờ người quản lý box kiểm tra."
@@ -1441,7 +1447,13 @@ enum HomeLogic {
         let dirOther = addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"DIR_CONFLICT\",\"detail\":\"/data/workspace/web\"}")))
         eq("dir unknown detail kept", dirOther.detail, "/data/workspace/web")
         eq("dir unknown detail message", dirOther.message, "Thư mục web đã có trên box. Chọn tên khác.")
-        eq("failed other detail kept", addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"FAILED\",\"detail\":\"boom\"}"))).detail, "boom")
+        let rewrite = addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"FAILED\",\"detail\":\"rewrite\"}")))
+        eq("rewrite message", rewrite.message, "Cấu hình git trên box đang đổi hướng địa chỉ GitHub. Nhờ người quản lý box gỡ cấu hình đó rồi thử lại.")
+        eq("rewrite no bare detail", rewrite.detail == nil, true)
+        let cred = addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"FAILED\",\"detail\":\"config\"}")))
+        eq("config message", cred.message, "Box không ghi được cấu hình đăng nhập GitHub cho repo này. Thử lại sau.")
+        eq("config no bare detail", cred.detail == nil, true)
+        eq("failed other detail kept",addReduce(a, .polled(job("{\"state\":\"failed\",\"code\":\"FAILED\",\"detail\":\"boom\"}"))).detail, "boom")
         eq("resubmit after failure", addReduce(arch, .submit(repo: "Me/Web", name: "web2")).phase, .posting)
         let done = addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED\",\"name\":\"web\"}")))
         eq("done", done.phase, .done)
