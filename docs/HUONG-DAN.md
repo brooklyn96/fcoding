@@ -16,9 +16,11 @@
    - [Xem và gỡ thiết bị](#xem-và-gỡ-thiết-bị)
 7. [Dùng hằng ngày](#7-dùng-hằng-ngày)
    - [Thêm dự án từ app](#thêm-dự-án-từ-app)
+   - [Gửi ảnh trong chat](#gửi-ảnh-trong-chat)
 8. [Dùng từ laptop](#8-dùng-từ-laptop)
    - [Lệnh `fcode` (tùy chọn)](#lệnh-fcode-tùy-chọn)
    - [Đồng bộ phiên chat omp giữa laptop và box (`fcode phien`)](#đồng-bộ-phiên-chat-omp-giữa-laptop-và-box-fcode-phien)
+   - [Tự đồng bộ khi mở agent (`fcode moc`)](#tự-đồng-bộ-khi-mở-agent-fcode-moc)
    - [Cài lệnh fcode trên máy Windows khác](#cài-lệnh-fcode-trên-máy-windows-khác)
 9. [Bảo mật](#9-bảo-mật)
 10. [Phát triển](#10-phát-triển)
@@ -38,6 +40,9 @@ Tính năng chính:
 - Ghép máy bằng **mã 6 số**, không có mật khẩu; iPhone mới ghép thêm được bằng **mã QR** (`fcode-pair --qr`, hoặc `fcode pair` trên laptop).
 - Lệnh **`fcode`** trên laptop Windows: vào phiên, `fcode add` (thêm dự án GitHub vào box), `fcode pair`, cài bằng một dòng lệnh.
 - Box **tự cập nhật** omp, Claude Code và Codex mỗi 6 giờ, không làm hỏng phiên đang mở.
+- **Gửi ảnh trong chat** (v1.3.3): chụp ảnh hoặc chọn ảnh từ thư viện rồi gửi cho trợ lý ([xem mục 7](#gửi-ảnh-trong-chat)).
+- **Laptop tự đồng bộ khi mở agent** (v1.3.3): bật một lần bằng `fcode moc bat` ([xem mục 8](#tự-đồng-bộ-khi-mở-agent-fcode-moc)).
+- Chưa có: hội thoại **Claude Code** và **Codex** chưa được mang qua lại giữa laptop và box (hiện chỉ phiên omp và ghi chú dự án đi theo).
 
 ## 2. Cách hoạt động
 
@@ -300,6 +305,10 @@ Hướng dẫn đầy đủ cho app nằm ở [ios/README.md, mục 4](../ios/RE
 | "iPhone này đã bị gỡ khỏi box, hãy ghép lại." | Chạy `fcode-pair` trên box và ghép lại. |
 | "Phiên đã đóng." | Chương trình trong phiên đã thoát; bấm **Quay lại** rồi mở lại dự án. |
 | "Box đang bận, thử lại sau." | Đợi vài giây. |
+| "Ảnh quá lớn" | Ảnh còn lớn hơn 10 MB dù đã thu nhỏ; chọn ảnh khác. |
+| "Ảnh không đọc được" | Chọn lại một ảnh khác. |
+| "Phiên đã đóng" (khi gửi ảnh) | Phiên đã thoát; mở lại phiên rồi gửi lại. |
+| "Không gửi được ảnh, thử lại" | Kiểm tra mạng rồi gửi lại. |
 | "Không kết nối được máy chủ." | Kiểm tra mạng, địa chỉ máy chủ và dịch vụ `fcoding` trên box. |
 
 ### Thêm dự án từ app
@@ -333,6 +342,22 @@ Từ v1.3.2, bạn thêm dự án GitHub vào box ngay trên iPhone, không cầ
 Thêm lại một dự án đã có (cùng tên, cùng repo) không làm gì và báo thành công (`ADDED`, thoát 0).
 
 **Làm tay trên box**: `timeout --kill-after=30 600 bash /data/home/fcoding/fcode-add.sh <chủ/repo> <tên>` (script do `install.sh` cài; tự nó không có giới hạn thời gian, nên lệnh làm tay cần `timeout` như trên). Giới hạn 10 phút tự động chỉ áp dụng khi thêm từ app và bằng `fcode add`; thêm lỗi chỉ xóa thư mục do chính lần đó tạo ra, thư mục có sẵn từ trước không bao giờ bị xóa; thêm lại cùng một repo là an toàn. Cách làm tương đương trên laptop: `fcode add <chủ/repo> [tên]`.
+
+### Gửi ảnh trong chat
+
+Từ v1.3.3, bạn gửi ảnh cho trợ lý ngay trong phiên, ví dụ chụp một màn hình lỗi:
+
+1. Trong phiên, bấm **nút ảnh** cạnh ô nhập.
+2. Chọn **Chụp ảnh** (mở camera; không hiện nếu máy không có camera) hoặc **Chọn ảnh** (chọn một ảnh trong thư viện). Lần đầu chụp, iPhone hỏi quyền camera: bấm **OK**.
+3. App hiện `Đang gửi ảnh…`. Khi xong, app báo `Đã gắn ảnh — gõ lời nhắn rồi gửi`: đường dẫn ảnh đã nằm sẵn trong ô nhập của trợ lý, nhưng **chưa gửi** (app không tự bấm Enter).
+4. Gõ lời nhắn của bạn (ví dụ "sửa lỗi trong ảnh này") rồi gửi như bình thường.
+
+Chi tiết cần biết:
+
+- App tự thu nhỏ ảnh (cạnh dài tối đa 2048 điểm ảnh) và đổi mọi định dạng (kể cả HEIC) sang JPEG trước khi gửi. Ảnh vẫn lớn hơn 10 MB sau khi thu nhỏ thì bị từ chối (`Ảnh quá lớn`).
+- Ảnh được lưu trên box ở thư mục `.fcode/uploads` trong dự án. FCode tự thêm `/.fcode/` vào danh sách bỏ qua riêng của git (`.git/info/exclude`, không sửa `.gitignore`), nên ảnh không hiện thành thay đổi và không bị đưa lên GitHub.
+- Ảnh cũ hơn 7 ngày tự bị xoá mỗi lần bạn gửi ảnh mới.
+- Nếu app báo `Đã lưu ảnh nhưng chưa gắn được vào phiên` thì ảnh đã được lưu nhưng đường dẫn chưa vào được ô nhập (thường vì đường dẫn dự án có dấu cách). Bạn vẫn dùng được ảnh, chỉ cần nhờ trợ lý đọc ảnh mới nhất trong `.fcode/uploads`.
 
 ## 8. Dùng từ laptop
 
@@ -420,6 +445,36 @@ Tự động và box nghỉ: box gói miễn phí tự nghỉ sau 30 phút khôn
 Dọn rác: mỗi lần chạy thật, trước tiên fcode xóa các file tạm do chính nó để lại quá 1 giờ (laptop: `%TEMP%\fcode-phien-*` và `*.fcode-part-*`; box: `/tmp/fcode-phien-*` và `*.fcode-part-*`). Không xóa gì khác.
 
 Khi omp đổi định dạng phiên (sau khi omp cập nhật): phiên có dòng đầu không đọc được hoặc `version` lạ (hiện chỉ hiểu version 3) **không được chép** và lần chạy báo `omp đổi định dạng phiên (version X) — chưa đồng bộ, báo Claude`; phiên cũ vẫn đồng bộ bình thường. Mỗi lần chạy ghi `%LOCALAPPDATA%\fcode\phien-status.json` (giờ chạy, kết quả, số file chép, phiên lạ, phiên bản omp hai máy, ghi chú đã chép và xung đột). Menu `fcode` hiện một dòng cảnh báo vàng ở đầu khi có phiên định dạng lạ hoặc lần tự động gần nhất bị lỗi. Hai máy khác phiên bản omp thì vẫn đồng bộ phiên đúng định dạng và thêm dòng `omp laptop <a> khác box <b>`.
+
+### Tự đồng bộ khi mở agent (`fcode moc`)
+
+Từ v1.3.3, bạn không cần nhớ gõ `fcode phien` nữa. Bật một lần:
+
+```sh
+fcode moc bat          # bật
+fcode moc trang-thai   # xem đang bật hay tắt
+fcode moc tat          # tắt
+```
+
+Sau khi bật, mỗi lần bạn gõ `omp`, `claude` hoặc `codex` trong thư mục của một dự án có trong `syncRepos` (hoặc trong thư mục con của nó), FCode làm theo thứ tự:
+
+1. Đồng bộ dự án đó trước (như `fcode phien <dự án> --nhanh`), rồi mở agent như bình thường với đúng các tham số bạn gõ.
+2. Khi bạn đóng agent, FCode đồng bộ thêm một lần nữa ở chế độ ngầm: không hiện cửa sổ, không làm bạn phải chờ.
+
+Cần biết:
+
+- **Không đánh thức box.** Box đang ngủ thì hiện `phien: box đang ngủ, bỏ qua` và agent mở ngay. Cách 10 phút tự động ở trên vẫn là phương án dự phòng.
+- **Tối đa khoảng 20 giây** mỗi lần. Hết giờ thì dừng gọn, hiện `phien: hết 20 giây, phần còn lại chạy lần sau`, phần còn lại để lần sau làm tiếp.
+- Đang có một lần đồng bộ khác chạy thì hiện `phien: đang có lần đồng bộ khác, bỏ qua` và mở agent luôn.
+- **Đồng bộ lỗi không chặn agent**: agent vẫn mở, chỉ có tối đa một dòng báo lỗi ngắn.
+- Mở agent ở thư mục không thuộc dự án nào thì không đồng bộ gì, agent chạy như thường.
+- **Bỏ qua một lần**: gõ `$env:FCODE_MOC = '0'` trước lệnh (hoặc đặt biến này cho cả cửa sổ PowerShell); đặt lại `Remove-Item Env:FCODE_MOC` để dùng tiếp.
+- `fcode moc bat` thêm một khối giữa hai dòng `# >>> fcode moc >>>` và `# <<< fcode moc <<<` vào file profile của cả Windows PowerShell 5.1 và PowerShell 7 (`WindowsPowerShell\profile.ps1` và `PowerShell\profile.ps1` trong thư mục Documents của bạn, có thể nằm trong OneDrive). Nếu file đã có, FCode chép một bản dự phòng `profile.ps1.bak-fcode` trước lần sửa đầu tiên. `fcode moc tat` chỉ xoá đúng khối đó, các dòng khác của bạn giữ nguyên.
+- Cần mở lại cửa sổ PowerShell sau khi bật hoặc tắt.
+
+**Nếu không thấy tác dụng**: chạy `fcode moc trang-thai`. Lệnh cho biết từng file profile đã có khối hay chưa và chế độ chạy script (execution policy) hiện tại. Nếu chế độ là `Restricted` hoặc `AllSigned`, PowerShell sẽ không nạp profile nên khối này không chạy; lệnh sẽ chỉ cách cho phép. FCode không bao giờ tự đổi chế độ này của bạn.
+
+**Chưa có**: hội thoại Claude Code và Codex chưa được mang qua lại giữa laptop và box. Hiện chỉ phiên omp và ghi chú dự án được đồng bộ (như mô tả ở mục `fcode phien` phía trên); mở `claude` hoặc `codex` với `fcode moc` bật vẫn chỉ đồng bộ hai thứ đó.
 
 ### Cài lệnh fcode trên máy Windows khác
 

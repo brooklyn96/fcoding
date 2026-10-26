@@ -30,6 +30,9 @@ FCode là một app iPhone kèm một máy chủ nhỏ. Máy chủ chạy trên 
 - **Phiên omp gần đây** (v1.3.2): bấm **Tiếp tục** để mở lại một phiên omp của dự án, kể cả phiên làm từ laptop.
 - **Máy staging** (v1.3.2): thẻ dự án có nút **Bật** để đánh thức máy instabox cùng tên (cần khóa instabox trên box).
 - **Đồng bộ phiên omp laptop và box** (v1.3.2): `fcode phien` chép phiên qua lại; `fcode phien tu-dong bat` bật tự động (mỗi 10 phút, không giữ box thức). Ghi chú dự án không nằm trong git (`CLAUDE.md`, `TASK.md`...) đi theo. Phiên lớn chép dần theo từng phần; chưa xong thì chạy lại `fcode phien` khi mạng tốt.
+- **Gửi ảnh trong chat** (v1.3.3): trong phiên, bấm nút ảnh, chọn **Chụp ảnh** hoặc **Chọn ảnh**, đợi app báo `Đã gắn ảnh — gõ lời nhắn rồi gửi`, rồi gõ lời nhắn và gửi như bình thường. Ảnh nằm ở thư mục `.fcode/uploads` của dự án trên box, không vào git và tự xoá sau 7 ngày.
+- **Laptop tự đồng bộ khi mở agent** (v1.3.3): chạy `fcode moc bat` một lần; từ đó mỗi lần bạn mở `omp`, `claude` hoặc `codex` trong thư mục một dự án đã đồng bộ, FCode đồng bộ dự án đó trước khi mở và sau khi đóng. Box đang ngủ thì bỏ qua (không đánh thức box), mỗi lần tối đa khoảng 20 giây. Tắt bằng `fcode moc tat`; bỏ qua một lần bằng `FCODE_MOC=0`; nếu PowerShell chặn thì `fcode moc trang-thai` chỉ cách.
+- **Chưa có**: hội thoại Claude Code và Codex chưa được mang qua lại giữa laptop và box; hiện chỉ phiên omp và ghi chú dự án đi theo.
 - **Box tự cập nhật code** (v1.3.2): box tự kéo code mới về khi dự án đang rảnh và sạch.
 - **`fcode sync`** (v1.3.2): kéo code mới về laptop, và với project có trên box mà chưa có trên laptop thì tìm bản clone sẵn có (hoặc clone mới), thêm vào `syncRepos` rồi đồng bộ ngay.
 - **`fcode add <chủ/repo>`** (v1.3.2): thêm dự án vào box; có token GitHub ghi được thì xong ngay, không thì lệnh chỉ cách dán khóa.
