@@ -301,7 +301,7 @@ function Show-Help {
   Write-Host 'fcode - điều khiển box coding từ máy này. Các lệnh:'
   Write-Host ''
   Write-Host '  fcode'
-  Write-Host '      Xem danh sách phiên đang chạy trên box, gõ số để vào.'
+  Write-Host '      Xem danh sách phiên đang chạy trên box, gõ số để vào (gõ 0 để mở phiên mới).'
   Write-Host '      Ví dụ: fcode'
   Write-Host '  fcode <số hoặc tên phiên>'
   Write-Host '      Vào thẳng một phiên (tên có thể gõ phần đầu). Thoát mà không tắt phiên: Ctrl+B rồi D.'
@@ -309,6 +309,10 @@ function Show-Help {
   Write-Host '  fcode --list'
   Write-Host '      Chỉ in danh sách phiên, không vào (viết tắt: fcode -l).'
   Write-Host '      Ví dụ: fcode -l'
+  Write-Host '  fcode new'
+  Write-Host '      Mở một phiên MỚI trên box (như nút "+" trong app): chọn project, chọn omp / claude / codex, rồi vào luôn phiên đó.'
+  Write-Host '      Gõ fcode rồi chọn 0 cũng được. Bấm Enter ở bất kỳ câu hỏi nào để quay lại.'
+  Write-Host '      Ví dụ: fcode new'
   Write-Host '  fcode sync'
   Write-Host '      Cập nhật các project trên máy này từ GitHub, báo nhánh box chờ merge và PR đang mở.'
   Write-Host '      Ví dụ: fcode sync'
@@ -510,10 +514,6 @@ while IFS= read -r l; do
   [ -n "$l" ] && rows+=("$l") && names+=("${l%%|*}")
 done < <(tmux list-sessions -F '#{session_name}|#{session_attached}|#{@pc_project}|#{@pc_harness}' 2>/dev/null)
 n=${#rows[@]}
-if [ "$n" -eq 0 ]; then
-  echo "Chưa có phiên nào trên box. Mở phiên mới từ app FCode."
-  exit 0
-fi
 
 show() { # in 1 dong cho phien thu $1 (chi so tu 0)
   local name att proj har out
@@ -524,7 +524,11 @@ show() { # in 1 dong cho phien thu $1 (chi so tu 0)
   [ "${att:-0}" != "0" ] && out+="  -  đang có người xem"
   echo "$out"
 }
-show_all() { local i; echo "Các phiên trên box:"; for ((i = 0; i < n; i++)); do show "$i"; done; }
+show_all() {
+  local i
+  if [ "$n" -eq 0 ]; then echo "Chưa có phiên nào trên box."; return; fi
+  echo "Các phiên trên box:"; for ((i = 0; i < n; i++)); do show "$i"; done
+}
 
 resolve() { # $1 = so hoac ten (hoac dau ten) -> dat $sel
   local q="$1" ql="${1,,}" i matches=()
@@ -553,15 +557,69 @@ attach() {
   exec tmux -u attach -t "=$1"
 }
 
+# --- mo phien moi: dung fcode-new tren box (hop dong: --projects / --harnesses / <project> <harness>) ---
+# Moi ten di qua mang bash co dau nhay kep, khong bao gio qua eval hay dong lenh.
+export PATH="$HOME/.local/bin:$PATH"
+
+fnew() { # chay fcode-new "$@": stdout vao $out; thong bao loi (stderr, tieng Viet) cua box hien thang tren man hinh
+  out="$(fcode-new "$@" </dev/null)"
+}
+
+pick() { # $1 = tieu de, con lai = lua chon -> dat $picked. 0 = da chon, 1 = Enter (quay lai)
+  local title="$1" i c; shift
+  local opts=("$@")
+  echo; echo "$title"
+  for i in "${!opts[@]}"; do printf '%3d) %s\n' $((i + 1)) "${opts[$i]}"; done
+  while true; do
+    read -r -p "Chọn số (Enter để quay lại): " c || return 1
+    [ -z "$c" ] && return 1
+    if [[ "$c" =~ ^[0-9]{1,6}$ ]] && [ "$((10#$c))" -ge 1 ] && [ "$((10#$c))" -le "${#opts[@]}" ]; then
+      picked="${opts[$((10#$c - 1))]}"; return 0
+    fi
+    echo "Số không hợp lệ, gõ lại."
+  done
+}
+
+newflow() { # chon project, harness, tao phien -> dat $sel. 0 = xong, 1 = quay lai (Enter), 2 = loi
+  local projs harns proj har
+  if ! command -v fcode-new >/dev/null 2>&1; then
+    echo "Box chưa có lệnh fcode-new nên chưa mở được phiên mới từ máy này. Hãy cập nhật box (trong thư mục fcoding chạy git pull rồi bash install.sh) rồi thử lại."
+    return 2
+  fi
+  fnew --projects || return 2
+  mapfile -t projs < <(grep -v '^$' <<<"$out")
+  [ "${#projs[@]}" -gt 0 ] || { echo "Box chưa có project nào. Thêm project bằng: fcode add <chủ/repo>"; return 2; }
+  pick "Chọn project:" "${projs[@]}" || return 1; proj="$picked"
+  fnew --harnesses || return 2
+  mapfile -t harns < <(grep -v '^$' <<<"$out")
+  [ "${#harns[@]}" -gt 0 ] || { echo "Lỗi: box không trả về danh sách harness."; return 2; }
+  pick "Chọn harness:" "${harns[@]}" || return 1; har="$picked"
+  echo "Đang mở phiên mới ($proj, $har)..."
+  fnew "$proj" "$har" || return 2
+  sel="$(printf '%s\n' "$out" | head -n 1)"
+  if ! [[ "$sel" =~ ^[A-Za-z0-9._-]+$ ]]; then echo "Lỗi: box trả về tên phiên không hợp lệ."; return 2; fi
+  return 0
+}
+
 if [ "$arg" = "--list" ]; then show_all; exit 0; fi
+if [ "$arg" = "--new" ]; then
+  newflow; rc=$?
+  [ "$rc" -eq 0 ] && attach "$sel"
+  [ "$rc" -eq 2 ] && exit 1
+  exit 0
+fi
 if [ -n "$arg" ]; then resolve "$arg" || exit 1; attach "$sel"; fi
 
 show_all
-[ -t 0 ] || exit 0
+[ -t 0 ] || { [ "$n" -eq 0 ] && echo "Mở phiên mới bằng lệnh: fcode new"; exit 0; }
+echo "  0) Mở phiên mới"
+ask="Chọn số phiên, 0 để mở phiên mới (Enter để thoát): "
+[ "$n" -eq 0 ] && ask="Gõ 0 để mở phiên mới (Enter để thoát): "
 while true; do
   echo
-  read -r -p "Chọn số phiên (Enter để thoát): " c || exit 0
+  read -r -p "$ask" c || exit 0
   [ -z "$c" ] && exit 0
+  if [ "$c" = 0 ]; then newflow && attach "$sel"; echo; show_all; echo "  0) Mở phiên mới"; continue; fi
   resolve "$c" && attach "$sel"
 done
 '@) -replace "`r`n", "`n"
@@ -830,8 +888,9 @@ if ($arg -eq 'ipa') { exit (Invoke-Ipa) }
 if ($arg -eq 'add') { exit (Invoke-Add) }
 if ($arg -eq 'pair') { exit (Invoke-Pair) }
 if ($arg -eq '-l') { $arg = '--list' }
+if ($arg -eq 'new') { $arg = '--new' }
 # ten phien: chi chu, so, . _ - (\z, khong dung $: $ chap nhan them 1 ky tu xuong dong o cuoi)
-if ($arg -and $arg -ne '--list' -and $arg -notmatch '\A[A-Za-z0-9._-]+\z') {
+if ($arg -and $arg -ne '--list' -and $arg -ne '--new' -and $arg -notmatch '\A[A-Za-z0-9._-]+\z') {
   Write-Host "Không hiểu lệnh '$($arg -replace '[\x00-\x1f\x7f]', '?')'. Gõ fcode help để xem các lệnh."
   exit 1
 }
@@ -844,5 +903,5 @@ $remote = "bash <(echo $b64 | base64 -d)"
 if ($arg -eq '--list') { & $ib ssh $box -- $remote } else { & $ib ssh $box -- -q -tt $remote }
 $rc = $LASTEXITCODE
 # tham so khong khop phien nao (hoac loi) thi nhac lenh help
-if ($rc -ne 0 -and $arg -and $arg -ne '--list') { Write-Host "Nếu '$arg' không phải tên phiên, gõ fcode help để xem các lệnh." }
+if ($rc -ne 0 -and $arg -and $arg -ne '--list' -and $arg -ne '--new') { Write-Host "Nếu '$arg' không phải tên phiên, gõ fcode help để xem các lệnh." }
 exit $rc
