@@ -1,6 +1,6 @@
 # FCode cho iPhone
 
-Ứng dụng FCode giúp bạn trò chuyện với các chương trình (omp, claude, codex, shell) đang chạy trên box, ngay trên iPhone. Gõ tiếng Việt (Telex) bình thường bằng bàn phím của iPhone.
+Ứng dụng FCode giúp bạn trò chuyện với các chương trình (omp, claude, codex) đang chạy trên box, ngay trên iPhone. Gõ tiếng Việt (Telex) bình thường bằng bàn phím của iPhone.
 
 Ứng dụng không có trên App Store. Bạn cài nó bằng **Sideloadly** trên máy tính (Windows hoặc Mac).
 
@@ -35,7 +35,7 @@ Không có mật khẩu. Chỉ người có quyền vào dòng lệnh của box 
 
 Mẹo: iPhone chỉ báo tên chung là "iPhone", nên mọi máy trong danh sách thiết bị của box đều mang tên đó. Muốn đặt tên riêng, trên box gõ kèm tên khi lấy mã, ví dụ `fcode-pair "iPhone X của tôi"`; box sẽ dùng tên này.
 
-Sau khi ghép, iPhone nhớ box trong Keychain; mở ứng dụng là vào thẳng danh sách dự án. Box khởi động lại thì không phải ghép lại.
+Sau khi ghép, iPhone nhớ box trong Keychain; mở ứng dụng là vào thẳng màn hình chính. Box khởi động lại thì không phải ghép lại.
 
 **Thêm một iPhone mới bằng mã QR** (khi đã có một iPhone ghép rồi):
 
@@ -46,16 +46,19 @@ Các bước chi tiết có trong app: bấm nút **?** (Hướng dẫn) ở gó
 
 ## 4. Cách dùng
 
-- **Màn hình chính** gom mọi phiên trên box, việc cần bạn lên đầu. Danh sách tự cập nhật mỗi 5 giây; kéo xuống để cập nhật ngay.
-  - Dòng chữ cam dưới **FCode** cho biết bao nhiêu phiên đang chờ bạn.
-  - **Hàng dự án** (trượt ngang): chạm **Tất cả** hoặc một dự án để chỉ xem phiên của dự án đó. Số cam = số phiên đang chờ bạn; số xám = số phiên.
-  - **Cần bạn**: phiên đang hỏi bạn, luôn mở sẵn, hiện đầy đủ câu hỏi. Câu hỏi có/không có nút **y · Đồng ý** và **n · Từ chối** (gửi y hoặc n kèm Enter); câu khác có nút **Trả lời** (mở phiên, con trỏ ở ô nhập). Nút **Mở** mở phiên.
-  - **Đang chạy** và **Đang nghỉ**: mặc định thu gọn thành một dòng; chạm để mở hoặc thu gọn. Ứng dụng nhớ lựa chọn này.
+- **Màn hình chính** (thanh trên cùng cuộn theo danh sách; chỉ có nút **?** Hướng dẫn và **⚙** Cài đặt). Phiên tự cập nhật mỗi 5 giây, hạn mức và dự án mỗi phút; kéo xuống để cập nhật ngay.
+  - **Vòng giờ box** (bên trái thẻ trên cùng): **Sleeps in** = box còn chạy bao lâu rồi tự nghỉ (tối đa 8 giờ, hoặc sớm hơn nếu rảnh 30 phút). Vòng chuyển vàng khi còn dưới 10 phút. **Wakes in** = box đang nghỉ 10 phút rồi tự dậy. Chạm vào vòng để xem giờ chính xác.
+  - **Ô hạn mức** (bên phải): mỗi lần một tài khoản, tự chuyển sang tài khoản kế mỗi 4 giây (giữ ngón tay trên ô để dừng). Chạm để mở màn hình **Hạn mức**.
+  - Dòng **đang chạy · chờ bạn**: chạm để nhảy tới phiên tương ứng.
+  - **Dự án** (trượt ngang): mỗi thẻ cho biết số PR đang mở, kết quả checks và lần deploy gần nhất. Chạm thẻ để chỉ xem phiên của dự án đó; giữ lâu hoặc bấm **…** để mở phiên mới trong dự án đó.
+  - **Cần bạn**: phiên đang hỏi bạn, luôn mở sẵn. Câu hỏi có/không có nút **y · Đồng ý** và **n · Từ chối**; câu khác có nút **Trả lời**. Nút **Mở** mở phiên.
+  - **Đang chạy** và **Đang nghỉ**: chạm tiêu đề để mở hoặc thu gọn. Ứng dụng nhớ lựa chọn này.
   - Chấm xanh dương cạnh tên = có thay đổi bạn chưa xem. Mở phiên là tính đã đọc.
-  - Vuốt trái một phiên: **Đã đọc / Chưa đọc**, hoặc **Xoá** (có hỏi xác nhận; chương trình trong phiên bị tắt).
-  - **Thanh dưới cùng** (Tất cả / omp / claude / codex / shell): chỉ xem phiên của một chương trình.
-- **Phiên mới** (nút **+** góc phải): luôn tạo một phiên MỚI, không mở lại phiên cũ (phiên cũ mở từ danh sách). Chọn chương trình rồi chọn dự án; nếu thanh dưới đang chọn một chương trình thì bỏ qua bước chọn chương trình.
-- **Cài đặt**: nút bánh răng góc trái.
+  - Vuốt trái một phiên: **Đổi tên** hoặc **Đóng** (có hỏi xác nhận; chương trình trong phiên bị tắt). Đổi tên cần máy chủ bản mới.
+- **Phiên mới** (nút tròn **+** góc dưới bên phải): luôn tạo một phiên MỚI. Chọn dự án rồi chọn chương trình (omp, claude hoặc codex).
+- **Hạn mức** (chạm ô hạn mức): tổng chi phí 30 ngày, rồi từng tài khoản: thanh dùng của từng khung giờ (xanh = ổn, vàng = sắp hết trước giờ reset, đỏ = sẽ chạm giới hạn), xu hướng 30 ngày, chi phí "Hôm nay / Hôm qua / 30 ngày / Ước tính tuần". Chạm số % để đổi "Còn" / "Đã dùng", chạm giờ reset để đổi đếm ngược / giờ chính xác. **Reset**: Codex dùng lượt reset ngay trong app (có hỏi xác nhận); Claude chỉ mở trang chính thức claude.ai để bạn bấm **Reset for free** ở đó.
+- **Hướng dẫn**: nút **?** ở góc trên màn hình chính; các bước chi tiết theo từng phần.
+- **Cài đặt**: nút bánh răng góc trên bên phải.
 - **Trong phiên**:
   - Thanh trên cùng: nhãn tên phiên có màu theo chương trình (cam = claude, tím = omp, xanh = codex). Tên dài thì bị cắt ở giữa.
   - Chữ trên màn hình có màu như trên laptop; các biểu tượng nhỏ (nhánh git, thư mục, …) hiện đúng nhờ font biểu tượng đi kèm ứng dụng.
@@ -93,3 +96,33 @@ Các bước chi tiết có trong app: bấm nút **?** (Hướng dẫn) ở gó
 - *"Phiên đã đóng."*: chương trình trong phiên đã thoát; bấm **Quay lại** rồi mở lại dự án.
 - *"Box đang bận, thử lại sau."*: đợi vài giây rồi thử lại.
 - *"Không kết nối được máy chủ."* / *"Không tìm thấy máy chủ."*: kiểm tra mạng và địa chỉ máy chủ.
+
+## Giấy phép bên thứ ba
+
+Màn hình **Hạn mức** làm theo cách hiển thị của Pane (quy tắc màu theo tốc độ dùng, biểu đồ xu hướng, biểu đồ chi phí). Pane dùng giấy phép MIT:
+
+```
+MIT License
+
+Copyright (c) 2026 Jazii (Pane for Windows)
+Copyright (c) 2025 Robin Ebers (OpenUsage for macOS — provider research and original concept, https://github.com/robinebers/openusage)
+Copyright (c) 2025 Peter Steinberger (CodexBar for macOS — provider research for Codebuff/Kilo/Kiro/Amp/Vertex AI/Bedrock/Poe/Chutes/Warp/Crof, https://github.com/steipete/CodexBar)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```

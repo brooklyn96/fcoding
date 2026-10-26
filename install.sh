@@ -63,6 +63,20 @@ fi
 # KillMode=process: the tmux server (and every harness session) is started by this service;
 # restarting or crashing the service must not take it down. StartLimitIntervalSec=0: always restart.
 # PATH for the harnesses is set by server.mjs itself (~/.local/bin, ~/.bun/bin, system dirs).
+# The home screen's project list runs gh, which needs GH_TOKEN. A login shell gets it from the instabox vault file
+# (/etc/profile.d/zz-instabox-secrets.sh sources /run/instabox/secrets/env, which lives in RAM); the service takes
+# GH_TOKEN alone from the same file at each start. Nothing is copied to disk and no other variable is kept.
+cat > "$APP/start.sh" <<'START'
+#!/bin/sh
+f=${FCODE_SECRETS_ENV:-/run/instabox/secrets/env}
+if [ -z "${GH_TOKEN:-}" ] && [ -r "$f" ]; then
+  t=$(. "$f" >/dev/null 2>&1; printf '%s' "${GH_TOKEN:-}")
+  if [ -n "$t" ]; then GH_TOKEN=$t; export GH_TOKEN; fi
+  unset t
+fi
+exec "$@"
+START
+chmod 755 "$APP/start.sh"
 mkdir -p "$UNIT_DIR"
 cat > "$UNIT_DIR/fcoding.service" <<UNIT
 [Unit]
@@ -73,7 +87,7 @@ StartLimitIntervalSec=0
 [Service]
 Environment=LANG=C.UTF-8
 Environment=PC_CONFIG_DIR=$CFG
-ExecStart=$(command -v node) $APP/server.mjs
+ExecStart=/bin/sh $APP/start.sh $(command -v node) $APP/server.mjs
 KillMode=process
 Restart=always
 RestartSec=2

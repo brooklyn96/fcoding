@@ -29,14 +29,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The app has no test target: build Links.swift + PairLink.swift for macOS with a tiny main, run their selfTests and the shared origin vectors.
-      - name: Links + PairLink self-test
+      # The app has no test target: build Links.swift + PairLink.swift + HomeLogic.swift for macOS with a tiny main, run their selfTests and the shared origin vectors.
+      - name: Links + PairLink + HomeLogic self-test
         run: |
           T=$(mktemp -d)
-          cp ios/fcoding/Links.swift ios/fcoding/PairLink.swift "$T/"
+          cp ios/fcoding/Links.swift ios/fcoding/PairLink.swift ios/fcoding/HomeLogic.swift "$T/"
           cat > "$T/main.swift" <<'EOF'
           import Foundation
           var failures = Links.selfTest() + PairLink.selfTest().map { "PairLink " + $0 }
+            + HomeLogic.selfTest().map { "HomeLogic " + $0 }
           // The shared origin table (same file as the server tests), path as the first argument.
           if CommandLine.arguments.count > 1, let data = FileManager.default.contents(atPath: CommandLine.arguments[1]) {
               failures += PairLink.checkVectors(data).map { "vector " + $0 }
@@ -48,7 +49,7 @@ jobs:
           exit(failures.isEmpty ? 0 : 1)
           EOF
           cd "$T"
-          xcrun -sdk macosx swiftc -o linktest Links.swift PairLink.swift main.swift
+          xcrun -sdk macosx swiftc -o linktest Links.swift PairLink.swift HomeLogic.swift main.swift
           ./linktest "$GITHUB_WORKSPACE/test/origin-vectors.json"
 
       - name: Install XcodeGen

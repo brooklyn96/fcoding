@@ -109,6 +109,7 @@ struct SessionView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbarBackground(Color(white: 0.086), for: .navigationBar)
         .toolbarBackground(.visible, for: .navigationBar)
+        .toolbar(.visible, for: .navigationBar)
         .toolbar {
             ToolbarItem(placement: .principal) { titleChip }
             ToolbarItemGroup(placement: .navigationBarTrailing) {

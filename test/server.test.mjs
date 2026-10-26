@@ -8,7 +8,10 @@ import { spawnSync, execFile, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
-import { createApp, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, strictOrigin, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock } from '../server.mjs';
+import { createApp, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, strictOrigin, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock,
+  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, prsOf, runOf, parseUpdates, resetReply, RESET_MSG, BOX, memo, codexChildMeta } from '../server.mjs';
+
+process.env.TZ = 'America/Los_Angeles'; // spend days follow config.json timeZone, never the process zone: a third zone proves it
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const FAKE = path.join(here, 'fake-tmux.mjs');
@@ -21,14 +24,17 @@ const LAUNCH = `env LANG=C.UTF-8 LC_ALL=C.UTF-8 'PATH=${HOME}/.local/bin:${HOME}
 async function boot(opts = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-test-'));
   const fakeDir = path.join(root, 'fake'); fs.mkdirSync(fakeDir);
-  const configDir = path.join(root, 'cfg'); fs.mkdirSync(configDir);
-  fs.writeFileSync(path.join(configDir, 'config.json'), JSON.stringify({
+  const configDir = opts.configDir ?? path.join(root, 'cfg'); // opts.configDir: a restart on the same config dir
+  if (!opts.configDir) fs.mkdirSync(configDir);
+  if (!opts.configDir) fs.writeFileSync(path.join(configDir, 'config.json'), JSON.stringify({
     cookieSecret: Buffer.alloc(32, 7).toString('base64'),
-    projects: { alpha: ABS, 'my.proj': ABS }, port: 7681,
+    projects: { alpha: ABS, 'my.proj': ABS }, port: 7681, ...opts.config,
   }));
   process.env.FAKE_TMUX_DIR = fakeDir;
   const logs = [];
-  const app = createApp({ configDir, tmux: [process.execPath, FAKE], log: (l) => logs.push(l), pollMs: 40, pasteEnterDelayMs: 0, ...opts });
+  // home v2 sources default to nothing real: no scan of this machine's logs, no omp/gh on PATH
+  const app = createApp({ configDir, tmux: [process.execPath, FAKE], log: (l) => logs.push(l), pollMs: 40, pasteEnterDelayMs: 0,
+    spendRoots: {}, updatesFile: path.join(root, 'no-status.json'), omp: [process.execPath, '-e', 'process.exit(1)'], gh: [process.execPath, '-e', 'process.exit(1)'], ...opts });
   const port = await app.listen(0, '127.0.0.1');
   const ctx = { app, port, logs, root, configDir };
   ctx.req = (method, p, o = {}) => request(port, method, p, o);
@@ -833,6 +839,24 @@ test('empty projects: meta, overview and the + flow work with no projects; a fre
   setProjects(c, { beta: ABS }); // adding one by editing config.json: picked up without a restart
   assert.deepEqual((await c.req('GET', '/api/meta', { cookie })).json.projects, ['beta']);
 }));
+
+test('install.sh start.sh: the service takes GH_TOKEN alone from the instabox secrets file, nothing else', { skip: process.platform === 'win32' && 'POSIX sh' }, () => {
+  const install = fs.readFileSync(path.join(here, '..', 'install.sh'), 'utf8');
+  const m = /cat > "\$APP\/start\.sh" <<'START'\r?\n([\s\S]*?)\r?\nSTART\r?\n/.exec(install);
+  assert.ok(m, 'start.sh not found in install.sh');
+  assert.match(install, /ExecStart=\/bin\/sh \$APP\/start\.sh \$\(command -v node\) \$APP\/server\.mjs/);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-start-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'start.sh'), `${m[1]}\n`);
+    fs.writeFileSync(path.join(dir, 'env'), 'export GH_TOKEN=tok-test\nexport OTHER_SECRET=zz\necho noise\n');
+    const probe = [process.execPath, '-e', 'console.log(JSON.stringify([process.env.GH_TOKEN ?? null, process.env.OTHER_SECRET ?? null]))'];
+    const env = { PATH: process.env.PATH, FCODE_SECRETS_ENV: path.join(dir, 'env') };
+    const out = (e) => spawnSync('/bin/sh', [path.join(dir, 'start.sh'), ...probe], { encoding: 'utf8', env: e }).stdout.trim();
+    assert.equal(out(env), '["tok-test",null]');
+    assert.equal(out({ ...env, FCODE_SECRETS_ENV: path.join(dir, 'missing') }), '[null,null]'); // no file: starts without it
+    assert.equal(out({ ...env, GH_TOKEN: 'mine' }), '["mine",null]'); // one already set wins
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
 
 test('install.sh first-install seed: the config it writes parses and has no projects', () => {
   // run the real `node -e '...'` snippet from install.sh into a temp file (no bash needed)
@@ -2498,3 +2522,806 @@ test('tmux targets: panes are =name:, session-only commands are =name; a bare =n
   }
   assert.equal(fake('has-session', '-t', '=work').status, 0);
 }));
+
+// ---------- home screen v2 (A8): GET /api/home, POST /api/codex-reset ----------
+const FIXDIR = path.join(here, 'fixtures', 'home');
+const FIX = (f) => path.join(FIXDIR, f);
+const fixJson = (f) => JSON.parse(fs.readFileSync(FIX(f), 'utf8'));
+const GH = fixJson('gh.json');
+const T0 = 1792956700000; // 2026-10-25T19:31:40Z, two minutes after the recorded omp fetch
+// one fake for omp, gh and git: logs its argv, answers by the first rule whose key is a substring of the joined argv
+const FAKE_TOOL_SRC = `import fs from 'node:fs'; import path from 'node:path';
+const [dir, ...args] = process.argv.slice(2);
+const line = args.join(' ');
+fs.appendFileSync(path.join(dir, 'calls.jsonl'), JSON.stringify(args) + '\\n');
+const rules = JSON.parse(fs.readFileSync(path.join(dir, 'rules.json'), 'utf8'));
+const r = rules.find(([k]) => line.includes(k))?.[1] ?? { code: 1, stderr: 'no rule' };
+setTimeout(() => {
+  if (r.file) process.stdout.write(fs.readFileSync(r.file)); else if (r.stdout) process.stdout.write(r.stdout);
+  if (r.stderr) process.stderr.write(r.stderr);
+  process.exitCode = r.code ?? 0;
+}, r.delay ?? 0);
+`;
+const RESET_OK = 'Reset applied for user2@example.com · personal (Codex) — the covered rate-limit windows have been refreshed.\n';
+const baseRules = () => [
+  ['usage reset openai-codex/', { stdout: RESET_OK }],
+  ['usage reset --json', { file: FIX('omp-reset-list.json') }],
+  ['usage --json', { file: FIX('omp-usage.json') }],
+  ['remote get-url origin', { stdout: 'git@github-work:owner/repo.git\n' }],
+  ['rev-parse --abbrev-ref HEAD', { stdout: 'main\n' }],
+  ['pr list', { stdout: JSON.stringify(GH.prs) }],
+  ['run list', { stdout: JSON.stringify(GH.runs) }],
+];
+function spendDirs(root) {
+  const d = { omp: path.join(root, 'omp'), claude: path.join(root, 'claude'), codex: path.join(root, 'codex'), archived: path.join(root, 'codex-archived') };
+  for (const x of Object.values(d)) fs.mkdirSync(path.join(x, 'p'), { recursive: true });
+  fs.copyFileSync(FIX('omp-session.jsonl'), path.join(d.omp, 'p', 's1.jsonl'));
+  fs.copyFileSync(FIX('claude.jsonl'), path.join(d.claude, 'p', 'c1.jsonl'));
+  fs.copyFileSync(FIX('codex.jsonl'), path.join(d.codex, 'p', 'rollout-11111111-2222-3333-4444-555555555555.jsonl'));
+  // the same Codex session also archived: it counts once
+  fs.copyFileSync(FIX('codex.jsonl'), path.join(d.archived, 'p', 'rollout-11111111-2222-3333-4444-555555555555.jsonl'));
+  // make the file times recent so the 31-day scan window keeps them
+  for (const x of Object.values(d)) for (const f of fs.readdirSync(path.join(x, 'p'))) fs.utimesSync(path.join(x, 'p', f), T0 / 1000, T0 / 1000);
+  return { omp: [d.omp], claude: [d.claude], codex: [d.codex, d.archived], dirs: d };
+}
+// polls fn (every 20 ms, 10 s at most) until it returns something truthy
+async function waitFor(fn, ms = 10000) {
+  const end = Date.now() + ms;
+  for (;;) {
+    const v = await fn();
+    if (v) return v;
+    if (Date.now() > end) throw new Error('waitFor: timed out');
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+async function homeApp(fn, extra = {}) {
+  const toolDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-tool-'));
+  fs.writeFileSync(path.join(toolDir, 'fake-tool.mjs'), FAKE_TOOL_SRC);
+  fs.writeFileSync(path.join(toolDir, 'rules.json'), JSON.stringify(baseRules()));
+  fs.writeFileSync(path.join(toolDir, 'status.json'), JSON.stringify(GH.status));
+  const tool = [process.execPath, path.join(toolDir, 'fake-tool.mjs'), toolDir];
+  const clock = { t: T0 };
+  const roots = spendDirs(toolDir);
+  const c = await boot({ omp: tool, gh: tool, git: tool, now: () => clock.t, spendRoots: roots, updatesFile: path.join(toolDir, 'status.json'),
+    config: { timeZone: 'UTC' }, ...extra }); // the fixtures' days are UTC days
+  c.clock = clock; c.roots = roots;
+  c.setRules = (r) => fs.writeFileSync(path.join(toolDir, 'rules.json'), JSON.stringify(r));
+  c.toolCalls = (sub = '') => {
+    try { return fs.readFileSync(path.join(toolDir, 'calls.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l).join(' ')).filter((l) => l.includes(sub)); } catch { return []; }
+  };
+  c.cookie = (await c.login()).cookie;
+  c.home = async () => { const r = await c.req('GET', '/api/home', { cookie: c.cookie }); assert.equal(r.status, 200, r.text); return r.json; };
+  c.reset = (body, o = {}) => c.req('POST', '/api/codex-reset', { cookie: c.cookie, body, ...o });
+  c.homeUntil = (ok) => waitFor(async () => { const h = await c.home(); return ok(h) && h; }); // a background refresh landed
+  // warm: the first listing has landed and the quota is built from it. A cold spawn can be slower than homeWait / 2, and the
+  // quota built without it is cached 60 s on the frozen clock, so each miss lets the listing land and moves past QUOTA_TTL (with a
+  // regular box tick, so the box run goes on). `ok` can also wait for the other parts; the reply that passed it is returned.
+  c.warm = async (ok = (h) => h.accounts[3]?.resets.target) => {
+    let h;
+    await waitFor(async () => {
+      if (ok(h = await c.home())) return true;
+      await c.app.homeIdle(); c.clock.t += 61e3; c.app.tickBox(); await c.home(); await c.app.homeIdle(); // the next read is built from the listing
+      return false;
+    });
+    await c.app.homeIdle();
+    return h;
+  };
+  try { await fn(c); } finally { await c.app.homeIdle(); await c.close(); fs.rmSync(toolDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+}
+
+test('quota: omp reports -> accounts by credential id; unreported windows hidden; labels, plan, resets, stale', () => {
+  const { accounts, byAccountId } = parseQuota(fixJson('omp-usage.json'), fixJson('omp-reset-list.json'), T0);
+  assert.deepEqual(accounts.map((a) => [a.id, a.harness, a.email, a.org, a.plan]), [
+    ['anthropic/1', 'claude', 'user1@example.com', 'Beyondk', null],
+    ['anthropic/2', 'claude', 'user2@example.com', 'Beyondk', null], // same login in two orgs: told apart by orgId
+    ['anthropic/3', 'claude', 'user2@example.com', 'user2 Organization', null],
+    ['openai-codex/4', 'codex', 'user2@example.com', 'personal', 'Plus'],
+  ]);
+  const [a1, a2, a3, cx] = accounts;
+  assert.deepEqual(a1.windows.map((w) => w.key), ['5h', '7d_fable']); // the team account reports no plain 7d: hidden
+  assert.deepEqual(a3.windows.map((w) => [w.key, w.label, w.usedPercent]), [['5h', '5 giờ', 5], ['7d', '7 ngày', 67], ['7d_fable', '7 ngày Fable', 2]]);
+  assert.deepEqual(a1.windows[0], { key: '5h', label: '5 giờ', usedPercent: 7, resetsAt: '2026-10-25T21:09:59.553Z', periodSeconds: 18000 });
+  assert.equal(a2.windows[0].resetsAt, null); // a window that has not started has no reset time
+  assert.deepEqual(cx.windows.map((w) => [w.key, w.label, w.usedPercent, w.periodSeconds]), [['5h', '5 giờ', 19, 18000], ['7d', '7 ngày', 5, 604800]]);
+  assert.deepEqual(cx.resets, { available: 1, target: 'openai-codex/4' });
+  assert.deepEqual(a1.resets, { available: 0, target: 'anthropic/1' });
+  assert.ok(accounts.every((a) => a.stale === false && a.rateLimited === false && a.fetchedAt.startsWith('2026-10-25T')));
+  assert.equal(byAccountId.get('codex:acct-cdx'), 'openai-codex/4');
+  // 11 minutes later every report is stale
+  assert.ok(parseQuota(fixJson('omp-usage.json'), fixJson('omp-reset-list.json'), T0 + 11 * 60e3).accounts.every((a) => a.stale));
+  // no reset listing: hash ids, no target
+  const bare = parseQuota(fixJson('omp-usage.json'), null, T0).accounts;
+  assert.ok(bare.every((a) => /^(anthropic|openai-codex)\/~[0-9a-f]{8}$/.test(a.id) && a.resets.target === null));
+  assert.notEqual(bare[1].id, bare[2].id);
+  // plans: raw -> label, never branched on
+  const plan = (p) => parseQuota({ reports: [{ provider: 'openai-codex', metadata: { planType: p, accountId: 'x' }, limits: [] }] }, null, T0).accounts[0].plan;
+  assert.deepEqual(['pro', 'max', 'team', 'enterprise', 'plus', 'weird', undefined].map(plan), ['Pro', 'Max', 'Team', 'Enterprise', 'Plus', 'Weird', null]);
+  // an account omp could not fetch: shown without windows, stale; a 429 marks it rate limited
+  const wo = parseQuota({ reports: [], accountsWithoutUsage: [{ provider: 'anthropic', email: 'z@example.com', accountId: 'z', error: 'rate_limited (429)' }] }, null, T0).accounts[0];
+  assert.deepEqual([wo.windows, wo.stale, wo.rateLimited], [[], true, true]);
+  // other providers are not accounts of this screen; a limit without a number is hidden
+  assert.equal(parseQuota({ reports: [{ provider: 'github-copilot', metadata: {}, limits: [] }] }, null, T0).accounts.length, 0);
+  assert.deepEqual(windowsOf([{ scope: { windowId: '7d' }, amount: { unit: 'percent' } }, { window: { id: '1d' }, amount: { used: 3, limit: 4 } }]),
+    [{ key: '1d', label: '1 ngày', usedPercent: 75, resetsAt: null, periodSeconds: null }]);
+});
+
+test('spend parsers: omp cost and credential, Claude dedupe and prices, Codex deltas and re-emitted snapshots', () => {
+  const lines = (f) => fs.readFileSync(FIX(f), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const omp = lines('omp-session.jsonl').map((v) => ompLine(v, 's1.jsonl')).filter(Boolean);
+  assert.deepEqual(omp.map((e) => [e.who, e.harness, e.usd, e.tokens]), [
+    ['anthropic/1', 'claude', 0.0031854000000000006, 15206],
+    ['anthropic/3', 'claude', 0.064, 103000],
+    ['openai-codex/4', 'codex', 0.08, 11000], // no cost in the log: priced from the table (gpt-5.5: $5 in, $30 out)
+    [null, 'claude', 0.000015, 110], // model_usage (title): no credential -> the harness total only
+  ]); // the unknown provider line is skipped
+  assert.equal(omp[0].key, 'o:msg_test_0001');
+  const cl = lines('claude.jsonl').map(claudeLine).filter(Boolean);
+  assert.equal(cl.filter((e) => e.key === 'c:msg_c1').length, 3); // three lines of one message; spendView keeps one
+  assert.ok(Math.abs(cl[0].usd - 0.021) < 1e-12); // sonnet-4-5 (date suffix dropped): 1000x3 + 500x15 + 10000x0.3 + 2000x3.75
+  assert.equal(cl[0].tokens, 13500);
+  assert.deepEqual(cl.slice(3).map((e) => [e.key, e.usd, e.tokens]), [['c:msg_c2', 0.5, 30], ['c:msg_c3', null, 200]]); // costUSD wins; unknown model: tokens only
+  const st = { file: 'f' };
+  const cx = lines('codex.jsonl').map((v) => codexLine(v, st)).filter(Boolean);
+  assert.deepEqual(cx.map((e) => [e.who, e.tokens]), [['codex:acct-cdx', 21000], ['codex:acct-cdx', 11000]]); // the repeated snapshot is not counted
+  assert.ok(Math.abs(cx[0].usd - 0.085) < 1e-12 && Math.abs(cx[1].usd - 0.0575) < 1e-12); // cached input at the cache-read rate; 2nd from the delta
+  assert.deepEqual([priceOf('claude-opus-4-8-20260101'), priceOf('gpt-5.1-codex-max'), priceOf('anthropic/claude-haiku-5-5'), priceOf('nope')],
+    [[5, 25, 0.5, 6.25, 10], [1.25, 10, 0.125], [0.1, 0.5, 0.01, 0.125, 0.2], null]);
+  // variants priced on their own (LiteLLM 2026-10-26), never at the base model's rate
+  assert.deepEqual(['gpt-5.4-nano', 'gpt-5.5-pro', 'gpt-5-pro', 'gpt-5.2-pro', 'gpt-5.4-pro', 'gpt-5.5-cyber', 'gpt-5.6-cyber'].map(priceOf),
+    [[0.2, 1.25, 0.02], [30, 180], [15, 120], [21, 168], [30, 180], [12.5, 75, 1.25], [12.5, 75, 1.25, 15.625]]);
+  // an unknown variant of a known model gets no price (tokens only), only same-price suffixes fall back to the base
+  assert.deepEqual(['gpt-5.4-nano-high', 'gpt-5.5-ultra', 'claude-opus-5-5-fast', 'gpt-5.2-codex', 'gpt-5.2-chat-latest'].map(priceOf),
+    [null, null, null, [1.75, 14, 0.175], [1.75, 14, 0.175]]);
+  const unpriced = ompLine({ type: 'message', id: 'u', message: { role: 'assistant', provider: 'openai-codex', model: 'gpt-5.5-ultra', credentialId: 4, timestamp: T0, usage: { input: 10, output: 5 } } }, 'f');
+  assert.deepEqual([unpriced.usd, unpriced.tokens], [null, 15]);
+});
+
+// Pane spend.rs codex_child_meta_rules + codex_replay_gate_skips_child_history (@442bdd7), ported line for line
+test('codex replay gate (Pane CodexReplayGate): child markers; replayed parent history and task_started never counted', () => {
+  assert.equal(codexChildMeta({ forked_from_id: null, parent_thread_id: null }), false);
+  assert.equal(codexChildMeta({ forked_from_id: '  ' }), false);
+  assert.equal(codexChildMeta({ session_id: 'root' }), false);
+  assert.equal(codexChildMeta({ forked_from_id: 'abc' }), true);
+  assert.equal(codexChildMeta({ parent_thread_id: 'abc' }), true);
+  assert.equal(codexChildMeta({ thread_source: 'subagent' }), true);
+  assert.equal(codexChildMeta({ source: { subagent: { thread_spawn: {} } } }), true);
+  assert.equal(codexChildMeta({ source: { subagent: null } }), false);
+  const tcl = (ts, last, total) => {
+    const info = { total_token_usage: { input_tokens: total[0], output_tokens: total[1], total_tokens: total[0] + total[1] } };
+    if (last) info.last_token_usage = { input_tokens: last[0], output_tokens: last[1], total_tokens: last[0] + last[1] };
+    return { timestamp: ts, type: 'event_msg', payload: { type: 'token_count', info } };
+  };
+  const spawn = Date.parse('2026-07-10T10:00:00Z') / 1000;
+  const run = (lines) => { const st = { file: 'f' }; return lines.map((v) => codexLine(v, st)).filter(Boolean); };
+  const tokens = (ev) => ev.reduce((a, e) => a + e.tokens, 0);
+  const child = (meta, metaTs = '2026-07-10T10:00:00Z') => [
+    { timestamp: metaTs, type: 'session_meta', payload: meta },
+    { timestamp: '2026-07-10T10:00:00Z', type: 'turn_context', payload: { model: 'gpt-5.6-terra' } },
+    tcl('2026-07-10T10:00:01Z', [50000, 5000], [50000, 5000]),
+    { timestamp: '2026-07-10T10:00:02Z', type: 'event_msg', payload: { type: 'task_started', started_at: spawn - 3600 } }, // replayed: parent's older start
+    tcl('2026-07-10T10:00:03Z', [30000, 3000], [80000, 8000]),
+    { timestamp: '2026-07-10T10:00:05Z', type: 'event_msg', payload: { type: 'task_started', started_at: spawn + 5 } }, // first live turn
+    tcl('2026-07-10T10:00:09Z', [1000, 100], [81000, 8100]),
+  ];
+  assert.equal(tokens(run(child({ parent_thread_id: 'abc', thread_source: 'subagent' }))), 1100); // Pane's test: subagent spawn
+  assert.equal(tokens(run(child({ forked_from_id: 'abc' }))), 1100); // the same history in a fork
+  assert.equal(tokens(run(child({ source: { subagent: { thread_spawn: {} } } }))), 1100);
+  const self = run(child({ forked_from_id: 'abc' }, 'not a time')); // no session_meta time: self-timed (started_at >= the line's own second)
+  assert.equal(tokens(self), 1100);
+  const live = run(child({ forked_from_id: 'abc' })); // without last_token_usage the first live delta is from the replayed totals
+  assert.deepEqual(live.map((e) => e.usd !== null), [true]); // gpt-5.6-terra priced
+  const noLast = child({ forked_from_id: 'abc' }).map((v) => (v.payload.type === 'token_count' ? { ...v, payload: { ...v.payload, info: { total_token_usage: v.payload.info.total_token_usage } } } : v));
+  assert.equal(tokens(run(noLast)), 1100);
+  // a root session with null parents counts normally (Pane codex_root_session_with_null_parent_counts_normally)
+  assert.equal(tokens(run([{ timestamp: '2026-07-10T10:00:00Z', type: 'session_meta', payload: { forked_from_id: null, parent_thread_id: null } },
+    tcl('2026-07-10T10:00:01Z', [1000, 100], [1000, 100])])), 1100);
+  // only the file's first session_meta counts, even one with no id: the replayed parent meta sets neither account nor gate
+  const first = run([{ timestamp: '2026-07-10T10:00:00Z', type: 'session_meta', payload: { creator_account_id: 'acct-cdx' } },
+    { timestamp: '2026-07-10T10:00:00Z', type: 'session_meta', payload: { id: 'parent', forked_from_id: 'x', creator_account_id: 'acct-other' } },
+    tcl('2026-07-10T10:00:01Z', [1000, 100], [1000, 100])]);
+  assert.deepEqual(first.map((e) => [e.who, e.tokens, e.key.startsWith('x:f:')]), [['codex:acct-cdx', 1100, true]]);
+});
+
+test('spend summary: today / yesterday / last 30 days, 30 daily rows, weekly estimate, per account and per harness', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-spend-'));
+  try {
+    const events = await spendScanner(spendDirs(root), () => T0)();
+    const { accounts, byAccountId } = parseQuota(fixJson('omp-usage.json'), fixJson('omp-reset-list.json'), T0);
+    const { perAccount, totals } = spendView(events, accounts, byAccountId, T0, 'UTC');
+    const cx = perAccount.get('openai-codex/4');
+    assert.deepEqual(cx.today, { usd: 0.2225, tokens: 43000 }); // omp 0.08 + Codex log 0.085 + 0.0575 (archived copy counted once)
+    // weekly: only spend inside the 7d window (from resetsAt - 7 days) counts: 0.08 at 5 % used -> 1.6
+    assert.deepEqual(cx.weeklyEstimate, { usd: 1.6, tokens: 220000 });
+    assert.deepEqual(perAccount.get('anthropic/3').weeklyEstimate, { usd: 0.0955, tokens: 153731 }); // 0.064 / 0.67
+    assert.equal(perAccount.get('anthropic/1').weeklyEstimate, null); // no plain 7d window reported
+    assert.deepEqual(perAccount.get('anthropic/2').last30, { usd: 0, tokens: 0 });
+    assert.deepEqual(totals.spend.today, { usd: 0.3107, tokens: 175016 });
+    assert.deepEqual(totals.spend.yesterday, { usd: 0.5, tokens: 30 });
+    assert.deepEqual(totals.spend.last30, { usd: 0.8107, tokens: 175046 });
+    assert.equal(totals.spend.weeklyEstimate, null);
+    assert.equal(totals.spend.daily30.length, 30);
+    assert.deepEqual([totals.spend.daily30[0].date, totals.spend.daily30[28].date, totals.spend.daily30[29].date], ['2026-09-26', '2026-10-24', '2026-10-25']);
+    assert.deepEqual(totals.byHarness, [{ harness: 'claude', usd: 0.5882 }, { harness: 'codex', usd: 0.2225 }]);
+    // weekly estimate needs >= 5 % used; at >= 100 % it is the spend itself
+    const ev = [{ ts: T0 - 1000, usd: 2, tokens: 10 }];
+    const win = (usedPercent) => ({ key: '7d', usedPercent, resetsAt: new Date(T0 + 3600e3).toISOString(), periodSeconds: 604800 });
+    assert.equal(spendOf(ev, T0, win(4.9)).weeklyEstimate, null);
+    assert.equal(spendOf([], T0, win(10)).weeklyEstimate, null); // used 10 % but nothing logged in the window (other machine): no estimate
+    assert.deepEqual(spendOf(ev, T0, win(120)).weeklyEstimate, { usd: 2, tokens: 10 });
+    // no reset listing yet ("~hash" ids): spend unknown (null), not $0; the totals still count everything
+    const bare = parseQuota(fixJson('omp-usage.json'), null, T0);
+    const bv = spendView(events, bare.accounts, bare.byAccountId, T0, 'UTC');
+    assert.ok([...bv.perAccount.values()].every((x) => x === null));
+    assert.deepEqual(bv.totals.spend.last30, totals.spend.last30);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('spend days: calendar days of config timeZone (default Asia/Ho_Chi_Minh), not of the process TZ', () => {
+  const ev = [{ ts: Date.parse('2026-10-25T18:30:00Z'), usd: 1, tokens: 1 }]; // 01:30 on 26/10 in Vietnam
+  const now = Date.parse('2026-10-25T20:00:00Z'); // 03:00 on 26/10 in Vietnam, still 25/10 in UTC and in Los Angeles
+  const vn = spendOf(ev, now);
+  assert.deepEqual([vn.daily30[29].date, vn.today, vn.yesterday], ['2026-10-26', { usd: 1, tokens: 1 }, { usd: 0, tokens: 0 }]);
+  assert.deepEqual(spendOf(ev, now, null, 'Asia/Ho_Chi_Minh'), vn);
+  const utc = spendOf(ev, now, null, 'UTC');
+  assert.deepEqual([utc.daily30[29].date, utc.today.usd], ['2026-10-25', 1]);
+  const ny = spendOf([{ ts: Date.parse('2026-03-08T12:00:00Z'), usd: 1, tokens: 1 }], Date.parse('2026-03-09T12:00:00Z'), null, 'America/New_York'); // across a DST change
+  assert.deepEqual([ny.daily30[28].date, ny.daily30[29].date, ny.yesterday.usd, new Set(ny.daily30.map((d) => d.date)).size], ['2026-03-08', '2026-03-09', 1, 30]);
+  const secret = Buffer.alloc(32, 7).toString('base64');
+  assert.equal(parseConfig(JSON.stringify({ cookieSecret: secret })).timeZone, 'Asia/Ho_Chi_Minh');
+  assert.equal(parseConfig(JSON.stringify({ cookieSecret: secret, timeZone: 'UTC' })).timeZone, 'UTC');
+  for (const timeZone of ['Mars/Base', 7, '']) assert.throws(() => parseConfig(JSON.stringify({ cookieSecret: secret, timeZone })), /timeZone invalid/);
+});
+
+test('memo: stale-while-revalidate, bounded first wait, backoff after a failure, clear() drops an older refresh', async () => {
+  let t = 0, n = 0, gate;
+  const get = async (mm, w) => { const { value, fresh } = await mm.get(w); return { value, fresh }; }; // at: checked below
+  const calls = [];
+  const m = memo(100, () => { calls.push(++n); return new Promise((r, j) => { gate = { r, j }; }); }, () => t);
+  // the first value: waited for at most `wait`, then the refresh carries on
+  await assert.rejects(get(m, 30), /timeout/);
+  gate.r('v1');
+  assert.deepEqual(await get(m, 30), { value: 'v1', fresh: true });
+  // past the TTL: the old value at once, one refresh in the background
+  t = 150;
+  assert.deepEqual(await get(m, 30), { value: 'v1', fresh: true });
+  assert.deepEqual(await get(m, 30), { value: 'v1', fresh: true });
+  assert.equal(calls.length, 2);
+  gate.j(new Error('down'));
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(await get(m, 30), { value: 'v1', fresh: false }); // the refresh failed: stale, and no new refresh before a TTL
+  assert.equal(calls.length, 2);
+  t = 260;
+  await get(m, 30); // a TTL after the failure: retried
+  await new Promise((r) => setImmediate(r));
+  assert.equal(calls.length, 3);
+  const old = gate;
+  m.clear(); // e.g. a reset finished while this refresh ran: its (pre-reset) result must not be kept
+  const next = get(m, 1000);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(calls.length, 4);
+  old.r('pre-reset');
+  gate.r('post-reset');
+  assert.deepEqual(await next, { value: 'post-reset', fresh: true }); // after clear(): waited for, not the old value
+  assert.deepEqual(await get(m, 30), { value: 'post-reset', fresh: true });
+  // after clear(), a refresh slower than the wait: the old value, marked not fresh
+  m.clear();
+  assert.deepEqual(await get(m, 20), { value: 'post-reset', fresh: false });
+  gate.r('later');
+  // a refresh dropped by clear() is not fresh for whoever waited on it, and every answer says when its refresh started
+  const d = memo(100, () => new Promise((r) => { gate = r; }), () => t);
+  t = 1000;
+  const waiting = d.get(1000);
+  await new Promise((r) => setImmediate(r));
+  d.clear();
+  gate('pre-clear');
+  assert.deepEqual(await waiting, { value: 'pre-clear', fresh: false, at: -Infinity }); // of no age: never counts as after a reset
+  assert.equal(d.at(), -Infinity); // not stored
+  t = 1010;
+  const next2 = d.get(1000);
+  await new Promise((r) => setImmediate(r));
+  gate('post-clear');
+  assert.deepEqual(await next2, { value: 'post-clear', fresh: true, at: 1010 });
+  assert.deepEqual(await d.get(10), { value: 'post-clear', fresh: true, at: 1010 });
+  // a first refresh that failed: no new run for a TTL, the part is empty
+  let k = 0;
+  const f = memo(100, () => { k++; throw new Error('no'); }, () => t);
+  await assert.rejects(get(f, 30), /no/);
+  await assert.rejects(get(f, 30), /failed recently/);
+  assert.equal(k, 1);
+});
+
+test('spend scan is incremental: only new whole lines are read; a shrunk file is re-read; a removed file is dropped', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-scan-'));
+  try {
+    const file = path.join(root, 's.jsonl');
+    const all = fs.readFileSync(FIX('omp-session.jsonl'), 'utf8').split('\n');
+    fs.writeFileSync(file, `${all.slice(0, 5).join('\n')}\n`); // up to the first assistant message
+    const scan = spendScanner({ omp: [root] }, () => Date.now());
+    const keys = async () => (await scan()).map((e) => e.key);
+    assert.deepEqual(await keys(), ['o:msg_test_0001']);
+    // overwrite the bytes already read (same length): they are not read again
+    fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace('msg_test_0001', 'msg_test_XXXX'));
+    fs.appendFileSync(file, `${all[6]}\n${all[7].slice(0, 40)}`); // a whole line, then half a line
+    assert.deepEqual(await keys(), ['o:msg_test_0001', 'o:msg_test_0002']); // the half line waits
+    fs.appendFileSync(file, `${all[7].slice(40)}\n`);
+    assert.deepEqual(await keys(), ['o:msg_test_0001', 'o:msg_test_0002', 'o:resp_test_0003']);
+    fs.writeFileSync(file, `${all[4]}\n`); // shorter than what was read: replaced, read from the start
+    assert.deepEqual(await keys(), ['o:msg_test_0001']);
+    const old = path.join(root, 'old.jsonl');
+    fs.writeFileSync(old, `${all[6]}\n`);
+    const past = (Date.now() - 32 * 86400e3) / 1000;
+    fs.utimesSync(old, past, past); // not touched in 31 days: skipped
+    assert.deepEqual(await keys(), ['o:msg_test_0001']);
+    fs.rmSync(file);
+    assert.deepEqual(await keys(), []);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('projects and updates parsers: remotes, checks, mergeable, last run, status.json', () => {
+  assert.deepEqual(['git@github-work:owner/repo.git', 'https://x:secret@github.com/owner/repo.git', 'ssh://git@github.com/owner/re.po', 'https://gitlab.com/o/r.git', null].map(repoOf),
+    ['owner/repo', 'owner/repo', 'owner/re.po', null, null]);
+  assert.deepEqual(prsOf(GH.prs), [
+    { number: 6, title: 'T6', checks: 'pending', mergeable: true },
+    { number: 5, title: 'T5', checks: 'failure', mergeable: false },
+    { number: 4, title: 'T4', checks: 'none', mergeable: null },
+  ]);
+  assert.equal(checksOf([{ __typename: 'CheckRun', status: 'COMPLETED', conclusion: 'SUCCESS' }, { state: 'SUCCESS' }]), 'success');
+  assert.equal(checksOf(undefined), null); // gh could not read checks
+  assert.deepEqual(runOf(GH.runs), { workflow: 'Deal Sync Mobile v2 Gate', status: 'failure', at: '2026-10-25T19:25:12Z', url: 'https://github.com/owner/repo/actions/runs/1' });
+  assert.deepEqual([runOf([{ status: 'in_progress' }]).status, runOf([{ status: 'completed', conclusion: 'skipped' }]).status, runOf([])], ['in_progress', 'success', null]);
+  assert.deepEqual(parseUpdates(JSON.stringify(GH.status)).codex, { from: '0.164.0', to: '0.164.1', at: '2026-10-25T19:21:18Z', result: 'updated' });
+  assert.deepEqual([parseUpdates('not json'), parseUpdates('[]')], [{}, {}]);
+  // only the three harness tools; an unknown result is null
+  const extra = parseUpdates(JSON.stringify({ ...GH.status, other: { from: '1', to: '2', result: 'updated' }, omp: { ...GH.status.omp, result: 'weird' } }));
+  assert.deepEqual([Object.keys(extra), extra.omp.result], [['omp', 'claude', 'codex'], null]);
+});
+
+test('codex reset: every omp answer maps to a result and a Vietnamese message', () => {
+  const cases = [
+    [RESET_OK, 'reset'],
+    ['user2@example.com (Codex): that reset was already redeemed.', 'already'],
+    ['x (Codex): another omp process spent a saved reset on this account 2m ago, so this one was not spent.', 'already'],
+    ['x (Codex): nothing to reset right now — your covered limits are not constrained, so no credit was spent.', 'nothing_to_reset'],
+    ['\x1b[31mx (Codex): no saved resets available to spend.\x1b[39m', 'no_credit'],
+    ['x (Codex): could not authenticate this account — try /login.', 'error', RESET_MSG.login],
+    ['x (Codex): a reset is already in progress.', 'error', RESET_MSG.busy],
+    ['x (Codex): couldn’t load this account’s saved resets (network/auth) — nothing was spent, try again.', 'error', RESET_MSG.list],
+    ['x (Codex): couldn\x27t load this account\x27s saved resets (network/auth) — nothing was spent, try again.', 'error', RESET_MSG.list],
+    ['x (Codex): the reset offer changed — nothing was spent; reopen /usage reset.', 'error', RESET_MSG.changed],
+    ['x (Codex): couldn\x27t confirm whether the reset applied — check /usage before trying again.', 'error', RESET_MSG.error],
+    ['', 'error', RESET_MSG.error],
+  ];
+  for (const [text, result, message = RESET_MSG[result]] of cases) assert.deepEqual(resetReply(text), { result, message }, text);
+});
+
+test('GET /api/home: the whole shape from omp, logs, gh and status.json; box timer estimate', () => homeApp(async (c) => {
+  const h = await c.warm((x) => x.accounts[3]?.resets.target && x.totals.spend && !x.projects[0].loading); // every part has landed
+  assert.deepEqual(Object.keys(h), ['generatedAt', 'box', 'accounts', 'totals', 'projects', 'updates']);
+  assert.equal(h.generatedAt, new Date(c.clock.t).toISOString());
+  assert.deepEqual(h.box, { state: 'running', sleepsAt: new Date(T0 + 480 * 60e3).toISOString(), ...BOX, source: 'estimate' });
+  assert.deepEqual(h.accounts.map((a) => a.id), ['anthropic/1', 'anthropic/2', 'anthropic/3', 'openai-codex/4']);
+  const cx = h.accounts[3];
+  assert.deepEqual(Object.keys(cx), ['id', 'harness', 'email', 'org', 'plan', 'fetchedAt', 'stale', 'rateLimited', 'windows', 'resets', 'spend']);
+  assert.deepEqual(Object.keys(cx.spend), ['today', 'yesterday', 'last30', 'weeklyEstimate', 'daily30']);
+  assert.deepEqual(cx.spend.today, { usd: 0.2225, tokens: 43000 });
+  assert.deepEqual(h.totals.spend.last30, { usd: 0.8107, tokens: 175046 });
+  assert.deepEqual(h.totals.byHarness.map((x) => x.harness), ['claude', 'codex']);
+  assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: 'owner/repo', branch: 'main', prs: prsOf(GH.prs), lastRun: runOf(GH.runs) })));
+  assert.deepEqual(Object.keys(h.updates), ['omp', 'claude', 'codex']);
+  assert.ok(!JSON.stringify(h).includes('github-work')); // the remote URL never leaves the server
+  // box: a tick more than 90 s late is a resume; regular ticks are not
+  c.clock.t += 30e3; c.app.tickBox();
+  assert.equal((await c.home()).box.sleepsAt, new Date(T0 + 480 * 60e3).toISOString());
+  c.clock.t += 120e3; c.app.tickBox();
+  assert.equal((await c.home()).box.sleepsAt, new Date(c.clock.t + 480 * 60e3).toISOString());
+  for (let i = 0; i < 962; i++) { c.clock.t += 30e3; c.app.tickBox(); } // ran 481 minutes without a gap: past the estimate
+  assert.equal((await c.home()).box.sleepsAt, null);
+}));
+
+test('GET /api/home caches: quota 60 s, projects 2 min, spend 5 min; one refresh shared by concurrent requests', () => homeApp(async (c) => {
+  await Promise.all([c.home(), c.home(), c.home()]);
+  await c.app.homeIdle(); // a part slower than homeWait has landed (the spend scan must end before the log line below is added)
+  assert.equal(c.toolCalls('usage --json').length, 1);
+  assert.equal(c.toolCalls('pr list').length, 2); // two projects, once each
+  fs.appendFileSync(path.join(c.roots.dirs.omp, 'p', 's1.jsonl'), `${JSON.stringify({ type: 'message', id: 'n1', timestamp: new Date(T0).toISOString(),
+    message: { role: 'assistant', provider: 'anthropic', model: 'claude-haiku-5-5', credentialId: 2, responseId: 'msg_new', timestamp: T0, usage: { totalTokens: 5, cost: { total: 1 } } } })}\n`);
+  c.clock.t += 61e3;
+  let h = await c.home(); // past the quota TTL: answered from the cache, refreshed in the background
+  await waitFor(() => c.toolCalls('usage --json').length === 2);
+  assert.equal(c.toolCalls('pr list').length, 2);
+  assert.deepEqual(h.accounts[1].spend.today, { usd: 0, tokens: 0 }); // spend still cached
+  c.clock.t += 60e3;
+  await c.home();
+  await waitFor(() => c.toolCalls('pr list').length === 4);
+  c.clock.t += 180e3;
+  h = await c.home();
+  assert.deepEqual(h.accounts[1].spend.today, { usd: 0, tokens: 0 }); // the old spend at once ...
+  await c.homeUntil((x) => x.accounts[1].spend.today.usd === 1); // ... the rescan lands in the background
+}));
+
+test('GET /api/home partial failure: omp, gh or the logs down -> that part empty or stale, the rest still answers', () => homeApp(async (c) => {
+  const rules = baseRules();
+  c.setRules([['usage', { code: 1, stderr: 'boom' }], ['pr list', { code: 1, stderr: 'HTTP 502' }], ['run list', { stdout: 'not json' }], ...rules]);
+  fs.rmSync(c.roots.dirs.claude, { recursive: true }); // one log source gone
+  let h = await c.homeUntil((x) => x.totals.spend && !x.projects[0].loading); // the spend scan and gh have answered
+  assert.deepEqual(h.accounts, []);
+  assert.deepEqual(h.projects[0], { name: 'alpha', repo: 'owner/repo', branch: 'main', prs: null, lastRun: null });
+  assert.equal(h.totals.spend.last30.usd, 0.2897); // omp + Codex logs; Claude Code logs gone
+  assert.ok(h.box.sleepsAt && h.updates.omp);
+  // omp back: fresh; omp down again after the TTL: the last accounts, marked stale
+  c.setRules(rules);
+  c.clock.t += 61e3;
+  h = await c.homeUntil((x) => x.accounts.length === 4); // omp may answer after homeWait: not cached until then
+  assert.equal(h.accounts.length, 4);
+  assert.ok(h.accounts.every((a) => !a.stale));
+  c.setRules([['usage', { code: 1 }], ...rules]);
+  c.clock.t += 61e3;
+  h = await c.home(); // the cached accounts at once; the background refresh fails ...
+  assert.equal(h.accounts.length, 4);
+  h = await c.homeUntil((x) => x.accounts.every((a) => a.stale)); // ... then they are marked stale
+  assert.equal(h.accounts.length, 4);
+  const before = c.toolCalls('usage --json').length;
+  for (let i = 0; i < 3; i++) await c.home(); // within a TTL of the failure: no new omp run on every poll
+  assert.equal(c.toolCalls('usage --json').length, before);
+  await c.app.homeIdle(); // the projects refresh started above has ended before the rules change
+  // a token that cannot read checks fails the statusCheckRollup query: the list comes without checks
+  c.setRules([['statusCheckRollup', { code: 1, stderr: 'GraphQL: Resource not accessible by personal access token' }],
+    ['--json number,title,mergeable', { stdout: JSON.stringify(GH.prs.map(({ statusCheckRollup, ...p }) => p)) }], ...rules]);
+  c.clock.t += 121e3;
+  h = await c.homeUntil((x) => x.projects[0].prs?.[0]?.checks === null);
+  assert.deepEqual(h.projects[0].prs.map((p) => [p.number, p.checks, p.mergeable]), [[6, null, true], [5, null, false], [4, null, null]]);
+  // any other gh failure (a timeout, HTTP 502) is not retried without checks
+  const fallbacks = () => c.toolCalls().filter((l) => l.endsWith('--json number,title,mergeable')).length, fb = fallbacks();
+  await c.app.homeIdle();
+  c.setRules([['statusCheckRollup', { code: 1, stderr: 'HTTP 502: Bad Gateway' }], ['--json number,title,mergeable', { stdout: '[]' }], ...rules]);
+  c.clock.t += 121e3;
+  h = await c.homeUntil((x) => x.projects[0].prs === null);
+  assert.equal(fallbacks(), fb);
+}));
+
+test('GET /api/home never waits long: a slow part is empty the first time, then served from the cache while it refreshes', () => homeApp(async (c) => {
+  c.setRules([['usage --json', { file: FIX('omp-usage.json'), delay: 1500 }], ['pr list', { stdout: '[]', delay: 1500 }], ...baseRules()]);
+  let t0 = Date.now();
+  let h = await c.home();
+  assert.ok(Date.now() - t0 < 1200, `took ${Date.now() - t0} ms`); // homeWaitMs 300 per part, in parallel
+  assert.deepEqual(h.accounts, []); // not ready yet: empty, the rest answers (box, updates; spend if its scan was quick)
+  assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: null, branch: null, prs: null, lastRun: null, loading: true })));
+  assert.ok('spend' in h.totals && Array.isArray(h.totals.byHarness) && h.box && h.updates.omp);
+  h = await c.homeUntil((x) => x.accounts.length === 4 && x.projects[0].repo && x.totals.spend);
+  c.clock.t += 121e3; // both TTLs over, both tools still slow: the cached parts at once
+  t0 = Date.now();
+  h = await c.home();
+  assert.ok(Date.now() - t0 < 1000);
+  assert.deepEqual([h.accounts.length, h.projects.length], [4, 2]);
+}, { homeWaitMs: 300 }));
+
+test('home routes: auth on both, CSRF on the reset; nothing runs for a refused request', () => homeApp(async (c) => {
+  const body = { accountId: 'openai-codex/4', requestId: '0f8f7a6e-1111-4222-8333-944455556666' };
+  assert.equal((await c.req('GET', '/api/home')).status, 401);
+  assert.equal((await c.req('GET', '/api/home', { cookie: 'pc_sid=forged' })).status, 401);
+  assert.equal((await c.req('POST', '/api/codex-reset', { body })).status, 401);
+  assert.equal((await c.reset(body, { pc: false })).status, 403);
+  assert.equal((await c.reset(body, { headers: { Origin: 'https://evil.example' } })).status, 403);
+  assert.equal((await c.req('POST', '/api/home', { cookie: c.cookie, body: {} })).status, 405);
+  assert.equal((await c.req('GET', '/api/codex-reset', { cookie: c.cookie })).status, 405);
+  assert.equal(c.toolCalls().length, 0);
+}));
+
+test('POST /api/codex-reset: Codex only, validated, lock per account, the same requestId never runs twice', () => homeApp(async (c) => {
+  const id = (n) => `0f8f7a6e-1111-4222-8333-${String(n).padStart(12, '0')}`;
+  await c.warm(); // the account ids come from the listing
+  assert.equal((await c.reset({ accountId: 'openai-codex/4' })).status, 400);
+  assert.equal((await c.reset({ accountId: 'openai-codex/4', requestId: 'x' })).status, 400);
+  const claude = await c.reset({ accountId: 'anthropic/1', requestId: id(1) });
+  assert.deepEqual([claude.status, claude.json], [400, { error: 'not_allowed' }]);
+  const unknown = await c.reset({ accountId: 'openai-codex/99', requestId: id(2) });
+  assert.deepEqual([unknown.status, unknown.json], [404, { error: 'unknown_account' }]); // not not_found (an older server's unknown route)
+  assert.equal(c.toolCalls('usage reset openai').length, 0);
+  // two confirms at once for one account: one runs, the other is refused
+  c.setRules([['usage reset openai-codex/4', { stdout: RESET_OK, delay: 400 }], ...baseRules()]);
+  const [a, b] = await Promise.all([c.reset({ accountId: 'openai-codex/4', requestId: id(3) }), c.reset({ accountId: 'openai-codex/4', requestId: id(4) })]);
+  assert.deepEqual([a.status, a.json], [200, { result: 'reset', message: RESET_MSG.reset }]);
+  assert.deepEqual([b.status, b.json], [409, { error: 'in_progress' }]);
+  // a retry of the same request (the app lost the answer): the same answer, omp is not run again
+  const again = await c.reset({ accountId: 'openai-codex/4', requestId: id(3) });
+  assert.deepEqual([again.status, again.json], [200, a.json]);
+  assert.equal(c.toolCalls('usage reset openai-codex/4').length, 1);
+  // the same requestId twice at once: one run, both get its answer
+  const [x, y] = await Promise.all([c.reset({ accountId: 'openai-codex/4', requestId: id(5) }), c.reset({ accountId: 'openai-codex/4', requestId: id(5) })]);
+  assert.deepEqual([x.status, y.status, x.json], [200, 200, y.json]);
+  assert.equal(c.toolCalls('usage reset openai-codex/4').length, 2);
+  // omp says no (exit 1, stderr): mapped, never a 500; the log has the account id and the result only
+  c.setRules([['usage reset openai-codex/4', { code: 1, stderr: 'user2@example.com (Codex): no saved resets available to spend.\n' }], ...baseRules()]);
+  const none = await c.reset({ accountId: 'openai-codex/4', requestId: id(6) });
+  assert.deepEqual([none.status, none.json], [200, { result: 'no_credit', message: RESET_MSG.no_credit }]);
+  assert.ok(c.logs.includes('codex-reset openai-codex/4 no_credit'));
+  assert.ok(!c.logs.some((l) => l.includes('@')));
+  // a final answer is kept for its requestId: omp is not run again
+  assert.deepEqual((await c.reset({ accountId: 'openai-codex/4', requestId: id(6) })).json, none.json);
+  assert.equal(c.toolCalls('usage reset openai-codex/4').length, 3);
+}));
+
+test('POST /api/codex-reset: errors are not kept (a retry runs omp again); a kill is unconfirmed; every run clears the quota cache', () => homeApp(async (c) => {
+  const id = '0f8f7a6e-1111-4222-8333-000000000077', body = { accountId: 'openai-codex/4', requestId: id };
+  const runs = () => c.toolCalls('usage reset openai-codex/4').length;
+  await c.warm();
+  const q0 = c.toolCalls('usage --json').length;
+  c.setRules([['usage reset openai-codex/4', { code: 1, stderr: 'x (Codex): couldn\u2019t load this account\u2019s saved resets (network/auth) \u2014 nothing was spent, try again.\n' }], ...baseRules()]);
+  const e1 = await c.reset(body);
+  assert.deepEqual([e1.status, e1.json], [200, { result: 'error', message: RESET_MSG.list }]);
+  await c.home(); // the reset cleared the quota cache: read again
+  assert.equal(c.toolCalls('usage --json').length, q0 + 1);
+  c.setRules(baseRules()); // omp recovered: the same requestId really runs again
+  const ok = await c.reset(body);
+  assert.deepEqual([ok.json.result, runs()], ['reset', 2]);
+  assert.deepEqual([(await c.reset(body)).json.result, runs()], ['reset', 2]); // kept now
+  // killed at the timeout: the redeem may have gone out, "not confirmed", and the quota is read again
+  c.setRules([['usage reset openai-codex/4', { stdout: RESET_OK, delay: 3000 }], ...baseRules()]);
+  const k = await c.reset({ ...body, requestId: `${id}-k` });
+  assert.deepEqual([k.status, k.json], [200, { result: 'error', message: RESET_MSG.error }]);
+  const before = c.toolCalls('usage --json').length;
+  await c.home();
+  assert.equal(c.toolCalls('usage --json').length, before + 1);
+}, { resetTimeoutMs: 500 }));
+
+test('after a reset the quota waits for the new listing; a listing that is late or fails marks the accounts stale, briefly cached', () => homeApp(async (c) => {
+  const body = { accountId: 'openai-codex/4', requestId: '0f8f7a6e-1111-4222-8333-000000000099' };
+  await c.warm();
+  assert.equal((await c.home()).accounts[3].resets.available, 1);
+  const spent = JSON.parse(fs.readFileSync(FIX('omp-reset-list.json'), 'utf8'));
+  for (const a of spent.accounts) if (a.provider === 'openai-codex') { a.redeemableCount = 0; a.availableCount = 0; }
+  // the listing after the reset is slower than homeWait / 2 (and than homeWait) but within the post-reset wait
+  c.setRules([['usage reset --json', { stdout: JSON.stringify(spent), delay: 1500 }], ...baseRules()]);
+  assert.equal((await c.reset(body)).json.result, 'reset');
+  let cx = (await c.home()).accounts[3];
+  assert.deepEqual([cx.resets.available, cx.stale], [1, true]); // not ready within homeWait: the old count, marked stale
+  cx = (await c.homeUntil((h) => !h.accounts[3].stale)).accounts[3];
+  assert.equal(cx.resets.available, 0); // the refresh waited for the new listing: its count, not the old one
+  // the listing fails after a reset: the old count is shown marked stale and read again within 15 s, not kept 60 s
+  c.setRules([['usage reset --json', { code: 1, stderr: 'down' }], ['usage reset openai-codex/4', { stdout: RESET_OK }], ...baseRules()]);
+  assert.equal((await c.reset({ ...body, requestId: `${body.requestId}-2` })).json.result, 'reset');
+  cx = (await c.home()).accounts[3];
+  assert.equal(cx.stale, true);
+  const reads = c.toolCalls('usage --json').length;
+  c.clock.t += 16e3;
+  c.setRules([['usage reset --json', { stdout: JSON.stringify(spent) }], ...baseRules()]);
+  await c.home(); // the short-lived stale value has expired: served once more while the refresh runs
+  await waitFor(() => c.toolCalls('usage --json').length > reads);
+  c.clock.t += 61e3; // the listing's retry delay after its failure is over
+  cx = (await c.homeUntil((h) => !h.accounts[3].stale && h.accounts[3].resets.available === 0)).accounts[3];
+  assert.deepEqual([cx.resets.available, cx.stale], [0, false]);
+}, { homeWaitMs: 600, listAfterResetMs: 8000 }));
+
+test('two resets close together: a listing fetched before the second reset never gives its count as fresh', () => homeApp(async (c) => {
+  const id = (n) => `0f8f7a6e-1111-4222-8333-0000000001${n}0`;
+  await c.warm();
+  const spent = JSON.parse(fs.readFileSync(FIX('omp-reset-list.json'), 'utf8'));
+  for (const a of spent.accounts) if (a.provider === 'openai-codex') { a.redeemableCount = 0; a.availableCount = 0; }
+  // reset A; the refresh after it waits for listing L1, which is slow and still says 1 (it predates reset B)
+  c.setRules([['usage reset --json', { file: FIX('omp-reset-list.json'), delay: 3000 }], ...baseRules()]); // lands well after reset B
+  assert.equal((await c.reset({ accountId: 'openai-codex/4', requestId: id(1) })).json.result, 'reset');
+  c.clock.t += 1000;
+  const h1 = await c.home(); // Q1 starts and waits for L1
+  assert.equal(h1.accounts[3].stale, true);
+  c.clock.t += 1000;
+  // reset B ends while L1 is still running; after it the listing says 0, slowly (longer than homeWait)
+  c.setRules([['usage reset --json', { stdout: JSON.stringify(spent), delay: 1500 }], ...baseRules()]);
+  assert.equal((await c.reset({ accountId: 'openai-codex/4', requestId: id(2) })).json.result, 'reset');
+  await new Promise((res) => setTimeout(res, 4000)); // L1 lands (its refresh was dropped by reset B) before the next poll
+  // until the new listing lands every reply is stale or says 0; the old count 1 is never given as current
+  const seen = [];
+  const h = await waitFor(async () => { const x = await c.home(); const a = x.accounts[3]; seen.push([a.resets.available, a.stale]); return !a.stale && x; });
+  assert.equal(h.accounts[3].resets.available, 0);
+  assert.ok(!seen.some(([n, stale]) => n === 1 && !stale), JSON.stringify(seen));
+  await c.app.homeIdle();
+  c.clock.t += 20e3; // also later: the fresh 0 stays (no old count stored for 60 s)
+  assert.deepEqual([(await c.home()).accounts[3].resets.available], [0]);
+}, { homeWaitMs: 600, listAfterResetMs: 8000 }));
+
+test('after a reset and a good listing, a later listing failure is handled as without a reset: not stale, 60 s TTL', () => homeApp(async (c) => {
+  await c.warm();
+  assert.equal((await c.reset({ accountId: 'openai-codex/4', requestId: '0f8f7a6e-1111-4222-8333-000000000201' })).json.result, 'reset');
+  await c.homeUntil((h) => h.accounts.every((a) => !a.stale)); // the listing fetched after the reset has landed
+  await c.app.homeIdle();
+  c.setRules([['usage reset --json', { code: 1, stderr: 'down' }], ...baseRules()]);
+  const fails = c.toolCalls('usage reset --json').length;
+  for (const step of [305e3, 61e3]) { // the listing expires and fails; then its retry delay is over and it fails again
+    c.clock.t += step;
+    await c.home(); // served while the quota refresh runs
+    await c.app.homeIdle(); await c.app.homeIdle();
+    const h = await c.home();
+    assert.ok(h.accounts.every((a) => !a.stale), JSON.stringify(h.accounts.map((a) => [a.id, a.stale])));
+  }
+  assert.equal(c.toolCalls('usage reset --json').length, fails + 2); // both listing refreshes ran and failed
+  const reads = c.toolCalls('usage --json').length;
+  c.clock.t += 20e3; // past the 15 s stale TTL, within the normal 60 s
+  await c.home();
+  await c.app.homeIdle();
+  assert.equal(c.toolCalls('usage --json').length, reads);
+}, { homeWaitMs: 600, listAfterResetMs: 8000 }));
+
+test('cold start: a quota built before a slow first listing is dropped when the listing lands; without one it is kept 15 s only', () => homeApp(async (c) => {
+  const ids = (h) => h.accounts.map((a) => a.id).join(' ');
+  c.setRules([['usage reset --json', { file: FIX('omp-reset-list.json'), delay: 1500 }], ...baseRules()]); // slower than homeWait / 2
+  let h = await c.home();
+  assert.match(ids(h), /^anthropic\/~[0-9a-f]{8} /); // no listing yet: ~ ids, no reset target
+  assert.equal(h.accounts[3].resets.target, null);
+  await c.app.homeIdle(); await c.app.homeIdle(); // the listing has landed (the clock does not move)
+  h = await c.home();
+  assert.equal(ids(h), 'anthropic/1 anthropic/2 anthropic/3 openai-codex/4');
+  assert.equal(h.accounts[3].resets.target, 'openai-codex/4');
+  assert.ok(h.accounts.every((a) => !a.stale));
+  await c.app.homeIdle();
+  const reads = c.toolCalls('usage --json').length;
+  c.clock.t += 20e3; // built from the listing: the normal 60 s TTL
+  await c.home(); await c.app.homeIdle();
+  assert.equal(c.toolCalls('usage --json').length, reads);
+}, { homeWaitMs: 600 }));
+
+test('cold start: a first listing that lands after its wait but before usage --json ends still drops the quota', () => homeApp(async (c) => {
+  // listing wait 300 ms (homeWait / 2), listing 700 ms, usage --json 1.5 s
+  c.setRules([['usage reset --json', { file: FIX('omp-reset-list.json'), delay: 700 }], ['usage --json', { file: FIX('omp-usage.json'), delay: 1500 }], ...baseRules()]);
+  await c.home();
+  await c.app.homeIdle(); await c.app.homeIdle(); // the listing landed first, then usage --json ended
+  c.setRules(baseRules()); // omp quick again; the clock does not move (no 15 s wait)
+  const h = await c.home();
+  assert.equal(h.accounts.map((a) => a.id).join(' '), 'anthropic/1 anthropic/2 anthropic/3 openai-codex/4');
+  assert.equal(h.accounts[3].resets.target, 'openai-codex/4');
+}, { homeWaitMs: 600 }));
+
+test('cold start: the first listing fails: the quota with ~ ids is read again after 15 s, not 60 s', () => homeApp(async (c) => {
+  c.setRules([['usage reset --json', { code: 1, stderr: 'down' }], ...baseRules()]);
+  assert.equal((await c.home()).accounts[3].resets.target, null);
+  await c.app.homeIdle();
+  const reads = c.toolCalls('usage --json').length;
+  c.clock.t += 16e3;
+  await c.home(); await c.app.homeIdle();
+  assert.equal(c.toolCalls('usage --json').length, reads + 1);
+  c.setRules(baseRules()); // omp's listing is back after its 60 s retry delay
+  c.clock.t += 61e3;
+  await c.home(); await c.app.homeIdle(); await c.app.homeIdle();
+  assert.equal((await c.home()).accounts[3].resets.target, 'openai-codex/4'); // dropped when the listing landed
+}, { homeWaitMs: 600 }));
+
+test('box timer: kept across a server restart within 90 s of the last tick on the same boot (box-timer.json); a longer gap or a reboot is a new run', async () => {
+  const clock = { t: T0 };
+  const bootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-boot-'));
+  const bootIdFile = path.join(bootDir, 'boot_id');
+  fs.writeFileSync(bootIdFile, 'boot-aaaa\n');
+  const start = (o = {}) => boot({ bootIdFile, ...o });
+  const a = await start({ now: () => clock.t });
+  const sleeps = async (c) => { const { cookie } = await c.login(); return (await c.req('GET', '/api/home', { cookie })).json.box.sleepsAt; };
+  try {
+    clock.t += 30e3; a.app.tickBox();
+    clock.t += 30e3; a.app.tickBox(); // an hour into the run, ticking regularly
+    const before = await sleeps(a);
+    assert.equal(before, new Date(T0 + 480 * 60e3).toISOString());
+    const stored = JSON.parse(fs.readFileSync(path.join(a.configDir, 'box-timer.json'), 'utf8'));
+    assert.deepEqual(stored, { resume: T0, tick: T0 + 60e3, boot: 'boot-aaaa' });
+    if (process.platform !== 'win32') assert.equal(fs.statSync(path.join(a.configDir, 'box-timer.json')).mode & 0o777, 0o600);
+    await a.app.close(); // the config dir (and box-timer.json) stays
+    clock.t += 45e3; // restarted 45 s after the last tick (reinstall, crash, systemctl restart)
+    const b = await start({ now: () => clock.t, configDir: a.configDir });
+    try { assert.equal(await sleeps(b), before); } finally { await b.close(); }
+    clock.t += 91e3; // stopped longer than 90 s (b ticked once at its start): the box slept, a new run
+    const c = await start({ now: () => clock.t, configDir: a.configDir });
+    try { assert.equal(await sleeps(c), new Date(clock.t + 480 * 60e3).toISOString()); } finally { await c.close(); }
+    fs.writeFileSync(path.join(a.configDir, 'box-timer.json'), 'not json');
+    clock.t += 1e3;
+    const d = await start({ now: () => clock.t, configDir: a.configDir });
+    try { assert.equal(await sleeps(d), new Date(clock.t + 480 * 60e3).toISOString()); } finally { await d.close(); }
+    // d left a fresh run in the file; a restart 10 s later on another boot (the box rebooted): a new run, not d's resume
+    const dRun = JSON.parse(fs.readFileSync(path.join(a.configDir, 'box-timer.json'), 'utf8')).resume;
+    clock.t += 10e3;
+    fs.writeFileSync(bootIdFile, 'boot-bbbb\n');
+    const e = await start({ now: () => clock.t, configDir: a.configDir });
+    try {
+      assert.equal(await sleeps(e), new Date(clock.t + 480 * 60e3).toISOString());
+      assert.notEqual(clock.t, dRun);
+    } finally { await e.close(); }
+    // no boot_id at all (not Linux): null on both sides still matches
+    clock.t += 10e3;
+    const noBoot = path.join(bootDir, 'missing');
+    const f = await start({ now: () => clock.t, configDir: a.configDir, bootIdFile: noBoot });
+    const fRun = clock.t;
+    await f.app.close();
+    assert.equal(JSON.parse(fs.readFileSync(path.join(a.configDir, 'box-timer.json'), 'utf8')).boot, null);
+    clock.t += 20e3;
+    const g = await start({ now: () => clock.t, configDir: a.configDir, bootIdFile: noBoot });
+    try { assert.equal(await sleeps(g), new Date(fRun + 480 * 60e3).toISOString()); } finally { await g.close(); }
+    await f.close();
+  } finally { await a.close(); fs.rmSync(bootDir, { recursive: true, force: true }); }
+});
+
+test('POST /api/codex-reset: a slow reset is answered 202 pending; it finishes in the background and clears the quota cache', () => homeApp(async (c) => {
+  const body = { accountId: 'openai-codex/4', requestId: '0f8f7a6e-1111-4222-8333-000000000088' };
+  await c.warm();
+  c.setRules([['usage reset openai-codex/4', { stdout: RESET_OK, delay: 800 }], ...baseRules()]);
+  const p = await c.reset(body);
+  assert.deepEqual([p.status, p.json], [202, { result: 'pending', message: RESET_MSG.pending }]);
+  const other = await c.reset({ ...body, requestId: '0f8f7a6e-1111-4222-8333-000000000089' }); // the lock is still held
+  assert.deepEqual([other.status, other.json], [409, { error: 'in_progress' }]);
+  await waitFor(() => c.logs.includes('codex-reset openai-codex/4 reset'));
+  const quotaReads = c.toolCalls('usage --json').length;
+  await c.home(); // the finished reset cleared the cache: this GET reads omp again
+  assert.equal(c.toolCalls('usage --json').length, quotaReads + 1);
+  const done = await c.reset(body); // the same requestId later: the kept final answer
+  assert.deepEqual([done.status, done.json.result, c.toolCalls('usage reset openai-codex/4').length], [200, 'reset', 1]);
+}, { resetReplyMs: 200 }));
+
+// ---------- A8: PATCH /api/sessions/<name> renames a session ----------
+const rename = (c, cookie, from, body, o = {}) => c.req('PATCH', `/api/sessions/${from}`, { cookie, body, ...o });
+const readFake = (c) => JSON.parse(fs.readFileSync(fakeState(c), 'utf8'));
+
+test('rename: exact-match target, project and harness kept, errors 400 bad_name / 404 not_found / 409 name_taken, auth and CSRF', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  assert.equal((await mkSession(c, cookie, 'work')).status, 201);
+  assert.equal((await mkSession(c, cookie, 'other')).status, 201);
+  assert.equal((await rename(c, undefined, 'work', { name: 'x1' })).status, 401);
+  assert.equal((await rename(c, cookie, 'work', { name: 'x1' }, { pc: false })).status, 403);
+  assert.equal((await rename(c, cookie, 'work', { name: 'x1' }, { headers: { Origin: 'https://evil.example' } })).status, 403);
+  for (const name of ['Bad', '-x', 'a'.repeat(33), 'a b', 'a;b', '', 7, undefined]) {
+    const r = await rename(c, cookie, 'work', { name });
+    assert.deepEqual([r.status, r.json], [400, { error: 'bad_name' }], String(name));
+  }
+  assert.equal((await rename(c, cookie, 'NOPE', { name: 'x1' })).status, 400); // the old name follows the same rule
+  const missing = await rename(c, cookie, 'wor', { name: 'x1' }); // a prefix of "work" is not "work"
+  assert.deepEqual([missing.status, missing.json], [404, { error: 'not_found' }]);
+  const taken = await rename(c, cookie, 'work', { name: 'other' });
+  assert.deepEqual([taken.status, taken.json], [409, { error: 'name_taken' }]);
+  const ok = await rename(c, cookie, 'work', { name: 'renamed-1' });
+  assert.deepEqual([ok.status, ok.json], [200, { name: 'renamed-1' }]);
+  assert.ok(c.calls().some(({ argv }) => argv.join(' ') === 'rename-session -t =work renamed-1'));
+  const list = (await c.req('GET', '/api/sessions', { cookie })).json.sessions;
+  assert.deepEqual(list.map((s) => [s.name, s.project, s.harness]).sort(), [['other', 'alpha', 'shell'], ['renamed-1', 'alpha', 'shell']]);
+  assert.equal((await rename(c, cookie, 'renamed-1', { name: 'renamed-1' })).status, 200); // the same name: nothing changes
+  assert.equal((await c.req('PUT', '/api/sessions/renamed-1', { cookie, body: { name: 'y' } })).status, 405);
+  // "<project>-<harness>" is the name /api/open reuses: refused for a session of another project or harness
+  for (const name of ['alpha-claude', 'my-proj-shell', 'alpha-omp']) {
+    const r = await rename(c, cookie, 'renamed-1', { name });
+    assert.deepEqual([r.status, r.json], [409, { error: 'reserved_name' }], name);
+  }
+  assert.deepEqual((await rename(c, cookie, 'nope-x', { name: 'alpha-claude' })).json, { error: 'not_found' });
+  const own = await rename(c, cookie, 'renamed-1', { name: 'alpha-shell' }); // its own project and harness: allowed
+  assert.deepEqual([own.status, own.json], [200, { name: 'alpha-shell' }]);
+  const open = await c.req('POST', '/api/open', { cookie, body: { project: 'alpha', harness: 'shell' } });
+  assert.deepEqual(open.json, { name: 'alpha-shell', created: false }); // /api/open finds it
+}));
+
+test('rename: race-safe against a create of the same name (server jobs in one queue; one made outside -> name_taken)', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  for (let i = 0; i < 6; i++) {
+    assert.equal((await mkSession(c, cookie, `src${i}`)).status, 201);
+    const mk = () => mkSession(c, cookie, `t${i}`), rn = () => rename(c, cookie, `src${i}`, { name: `t${i}` });
+    const [created, renamed] = i % 2 ? await Promise.all([mk(), rn()]) : (await Promise.all([rn(), mk()])).reverse(); // both send orders
+    assert.deepEqual([created.status === 201, renamed.status === 200].filter(Boolean).length, 1, `${created.status} ${renamed.status}`); // exactly one gets the name
+    assert.ok(created.status === 409 || renamed.json?.error === 'name_taken');
+    assert.equal(Object.keys(readFake(c).sessions).filter((n) => n === `t${i}`).length, 1);
+  }
+  // a session made outside the server under the wanted name (plain tmux): tmux refuses, the server answers name_taken
+  const st = readFake(c);
+  st.sessions.outside = { created: 1700000000, opts: {} };
+  fs.writeFileSync(fakeState(c), JSON.stringify(st));
+  assert.equal((await mkSession(c, cookie, 'src-x')).status, 201);
+  const r = await rename(c, cookie, 'src-x', { name: 'outside' });
+  assert.deepEqual([r.status, r.json], [409, { error: 'name_taken' }]);
+}));
+
+const REAL_TMUX = spawnSync('tmux', ['-V'], { encoding: 'utf8' }).status === 0 && process.platform !== 'win32';
+test('rename with real tmux: exact target, options move, duplicate and missing names', { skip: !REAL_TMUX && 'tmux not installed' }, async () => {
+  const sock = `pc-test-${process.pid}`;
+  const tmux = (...a) => spawnSync('tmux', ['-L', sock, '-f', '/dev/null', ...a], { encoding: 'utf8' });
+  const c = await boot({ tmux: ['tmux', '-L', sock, '-f', '/dev/null'] });
+  try {
+    const { cookie } = await c.login();
+    for (const n of ['work', 'workbench']) assert.equal((await mkSession(c, cookie, n)).status, 201);
+    assert.deepEqual((await rename(c, cookie, 'wor', { name: 'x' })).status, 404); // "=wor" is exact: no prefix match
+    assert.deepEqual((await rename(c, cookie, 'work', { name: 'workbench' })).json, { error: 'name_taken' });
+    const r = await rename(c, cookie, 'work', { name: 'done-1' });
+    assert.deepEqual([r.status, r.json], [200, { name: 'done-1' }]);
+    const out = tmux('list-sessions', '-F', '#{session_name} #{@pc_project} #{@pc_harness}').stdout.trim().split('\n').sort();
+    assert.deepEqual(out, ['done-1 alpha shell', 'workbench alpha shell']);
+    assert.equal((await c.req('GET', '/api/screen/done-1', { cookie })).status, 200);
+    assert.equal((await c.req('GET', '/api/screen/work', { cookie })).status, 404);
+  } finally { tmux('kill-server'); await c.close(); }
+});

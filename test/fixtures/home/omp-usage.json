@@ -1,0 +1,66 @@
+{
+  "generatedAt": 1792956687714,
+  "reports": [
+    {
+      "provider": "anthropic", "fetchedAt": 1792956564566,
+      "limits": [
+        { "id": "anthropic:5h", "label": "Claude 5 Hour", "scope": { "provider": "anthropic", "windowId": "5h", "shared": true },
+          "window": { "id": "5h", "label": "5 Hour", "durationMs": 18000000, "resetsAt": 1792962599553 },
+          "amount": { "used": 7, "limit": 100, "remaining": 93, "usedFraction": 0.07, "remainingFraction": 0.9299999999999999, "unit": "percent" }, "status": "ok" },
+        { "id": "anthropic:7d:fable", "label": "Claude 7 Day (Fable)", "scope": { "provider": "anthropic", "windowId": "7d", "tier": "fable" },
+          "window": { "id": "7d", "label": "7 Day", "durationMs": 604800000, "resetsAt": 1793498400000 },
+          "amount": { "used": 0, "limit": 100, "remaining": 100, "usedFraction": 0, "remainingFraction": 1, "unit": "percent" }, "status": "ok" }
+      ],
+      "metadata": { "endpoint": "https://api.anthropic.com/api/oauth/usage", "accountId": "acct-1111", "email": "user1@example.com", "orgId": "org-team", "orgName": "Beyondk" },
+      "resetCredits": { "availableCount": 0, "redeemableCount": 0, "eligible": false, "reason": "no_grant", "credits": [] }
+    },
+    {
+      "provider": "anthropic", "fetchedAt": 1792956564555,
+      "limits": [
+        { "id": "anthropic:5h", "label": "Claude 5 Hour", "scope": { "provider": "anthropic", "windowId": "5h", "shared": true },
+          "window": { "id": "5h", "label": "5 Hour", "durationMs": 18000000 },
+          "amount": { "used": 0, "limit": 100, "remaining": 100, "usedFraction": 0, "remainingFraction": 1, "unit": "percent" }, "status": "ok" },
+        { "id": "anthropic:7d:fable", "label": "Claude 7 Day (Fable)", "scope": { "provider": "anthropic", "windowId": "7d", "tier": "fable" },
+          "window": { "id": "7d", "label": "7 Day", "durationMs": 604800000, "resetsAt": 1793127600000 },
+          "amount": { "used": 0, "limit": 100, "remaining": 100, "usedFraction": 0, "remainingFraction": 1, "unit": "percent" }, "status": "ok" }
+      ],
+      "metadata": { "endpoint": "https://api.anthropic.com/api/oauth/usage", "accountId": "acct-2222", "email": "user2@example.com", "orgId": "org-team", "orgName": "Beyondk" },
+      "resetCredits": { "availableCount": 0, "redeemableCount": 0, "eligible": false, "reason": "no_grant", "credits": [] }
+    },
+    {
+      "provider": "anthropic", "fetchedAt": 1792956564452,
+      "limits": [
+        { "id": "anthropic:5h", "label": "Claude 5 Hour", "scope": { "provider": "anthropic", "windowId": "5h", "shared": true },
+          "window": { "id": "5h", "label": "5 Hour", "durationMs": 18000000, "resetsAt": 1792973400459 },
+          "amount": { "used": 5, "limit": 100, "remaining": 95, "usedFraction": 0.05, "remainingFraction": 0.95, "unit": "percent" }, "status": "ok" },
+        { "id": "anthropic:7d", "label": "Claude 7 Day", "scope": { "provider": "anthropic", "windowId": "7d", "shared": true },
+          "window": { "id": "7d", "label": "7 Day", "durationMs": 604800000, "resetsAt": 1793156400459 },
+          "amount": { "used": 67, "limit": 100, "remaining": 33, "usedFraction": 0.67, "remainingFraction": 0.32999999999999996, "unit": "percent" }, "status": "ok" },
+        { "id": "anthropic:7d:fable", "label": "Claude 7 Day (Fable)", "scope": { "provider": "anthropic", "windowId": "7d", "tier": "fable" },
+          "window": { "id": "7d", "label": "7 Day", "durationMs": 604800000, "resetsAt": 1793156400460 },
+          "amount": { "used": 2, "limit": 100, "remaining": 98, "usedFraction": 0.02, "remainingFraction": 0.98, "unit": "percent" }, "status": "ok" }
+      ],
+      "metadata": { "endpoint": "https://api.anthropic.com/api/oauth/usage", "accountId": "acct-2222", "email": "user2@example.com", "orgId": "org-personal", "orgName": "user2 Organization" },
+      "resetCredits": { "availableCount": 0, "redeemableCount": 0, "eligible": false, "reason": "not_at_wall", "credits": [] }
+    },
+    {
+      "provider": "openai-codex", "fetchedAt": 1792956564243,
+      "limits": [
+        { "id": "openai-codex:primary", "label": "5 hours", "scope": { "provider": "openai-codex", "windowId": "5h", "shared": true },
+          "window": { "id": "5h", "label": "5 hours", "durationMs": 18000000, "resetsAt": 1792973168000 },
+          "amount": { "used": 19, "limit": 100, "remaining": 81, "usedFraction": 0.19, "remainingFraction": 0.81, "unit": "percent" }, "status": "ok" },
+        { "id": "openai-codex:secondary", "label": "7 days", "scope": { "provider": "openai-codex", "windowId": "7d", "shared": true },
+          "window": { "id": "7d", "label": "7 days", "durationMs": 604800000, "resetsAt": 1793530986000 },
+          "amount": { "used": 5, "limit": 100, "remaining": 95, "usedFraction": 0.05, "remainingFraction": 0.95, "unit": "percent" }, "status": "ok" }
+      ],
+      "resetCredits": { "availableCount": 0 },
+      "metadata": { "planType": "plus", "allowed": true, "limitReached": false, "email": "user2@example.com", "accountId": "acct-cdx", "meterStates": { "chat": { "allowed": true, "limitReached": false } }, "orgId": "acct-cdx", "orgName": "personal" }
+    }
+  ],
+  "accountsWithoutUsage": [],
+  "disabledCredentials": [],
+  "capacity": {
+    "anthropic": [ { "window": "5h", "durationMs": 18000000, "accounts": 3, "usedAccounts": 0.12000000000000001, "remainingAccounts": 2.88 } ],
+    "openai-codex": [ { "window": "5h", "durationMs": 18000000, "meter": "chat", "accounts": 1, "usedAccounts": 0.19, "remainingAccounts": 0.81 } ]
+  }
+}

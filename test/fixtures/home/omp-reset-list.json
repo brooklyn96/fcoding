@@ -1,0 +1,9 @@
+{
+  "generatedAt": 1792956700519,
+  "accounts": [
+    { "provider": "openai-codex", "credentialId": 4, "email": "user2@example.com", "accountId": "acct-cdx", "orgId": "acct-cdx", "orgName": "personal", "availableCount": 1, "redeemableCount": 1, "credits": [] },
+    { "provider": "anthropic", "credentialId": 1, "email": "user1@example.com", "accountId": "acct-1111", "orgId": "org-team", "orgName": "Beyondk", "availableCount": 0, "redeemableCount": 0, "unavailableReason": "no_grant", "credits": [] },
+    { "provider": "anthropic", "credentialId": 2, "email": "user2@example.com", "accountId": "acct-2222", "orgId": "org-team", "orgName": "Beyondk", "availableCount": 0, "redeemableCount": 0, "unavailableReason": "no_grant", "credits": [] },
+    { "provider": "anthropic", "credentialId": 3, "email": "user2@example.com", "accountId": "acct-2222", "orgId": "org-personal", "orgName": "user2 Organization", "availableCount": 0, "redeemableCount": 0, "unavailableReason": "not_at_wall", "credits": [] }
+  ]
+}

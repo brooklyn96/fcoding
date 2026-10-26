@@ -17,6 +17,12 @@ struct DeviceSettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
+                // The header scrolls with the content (only harness session screens freeze theirs).
+                FormHeader(title: "Cài đặt") {
+                    HeaderIconButton(symbol: "questionmark.circle", label: "Hướng dẫn") { showGuide = true }
+                } trailing: {
+                    HeaderTextButton(title: "Đóng", bold: true) { dismiss() }
+                }
                 Section("Máy chủ") {
                     Text(PairLink.label(app.serverURL)).textSelection(.enabled)
                 }
@@ -26,6 +32,11 @@ struct DeviceSettingsView: View {
                     }
                 }
                 .disabled(running != nil)
+                Section {
+                    NavigationLink { AboutView() } label: {
+                        Label("Giới thiệu · Giấy phép", systemImage: "info.circle")
+                    }
+                }
                 Section {
                     Button { run(.here) } label: { row("Gỡ iPhone này", .here) }
                     Button(role: .destructive) { confirmAll = true } label: { row("Gỡ mọi thiết bị", .all) }
@@ -40,14 +51,9 @@ struct DeviceSettingsView: View {
                 }
             }
             .navigationTitle("Cài đặt")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button { showGuide = true } label: { Image(systemName: "questionmark.circle") }
-                        .accessibilityLabel("Hướng dẫn")
-                }
-                ToolbarItem(placement: .confirmationAction) { Button("Đóng") { dismiss() } }
-            }
+            .toolbar(.hidden, for: .navigationBar)
+            .scrollIndicators(.hidden)
+            .background(SwipeBackEnabler().frame(width: 0, height: 0))
             .sheet(isPresented: $showGuide) { PairGuideView() }
             .confirmationDialog("Gỡ mọi thiết bị khỏi box?", isPresented: $confirmAll, titleVisibility: .visible) {
                 Button("Gỡ mọi thiết bị", role: .destructive) { run(.all) }
@@ -83,6 +89,7 @@ struct DeviceSettingsView: View {
 /// type on the new iPhone. Live countdown on this phone's clock; a share link with the server.
 struct AddDeviceView: View {
     @EnvironmentObject private var app: AppState
+    @Environment(\.dismiss) private var dismiss
     @State private var reply: PairCodeResponse?
     /// Expiry on this phone's clock (see API.pairCode).
     @State private var expires = Date()
@@ -98,6 +105,11 @@ struct AddDeviceView: View {
 
     var body: some View {
         Form {
+            FormHeader(title: "Thêm thiết bị") {
+                HeaderTextButton(title: "Cài đặt", back: true) { dismiss() }
+            } trailing: {
+                HeaderIconButton(symbol: "questionmark.circle", label: "Hướng dẫn") { showGuide = true }
+            }
             if let reply = reply {
                 let left = Int(expires.timeIntervalSince(now).rounded(.up))
                 Section {
@@ -125,13 +137,8 @@ struct AddDeviceView: View {
             }
         }
         .navigationTitle("Thêm thiết bị")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .navigationBarTrailing) {
-                Button { showGuide = true } label: { Image(systemName: "questionmark.circle") }
-                    .accessibilityLabel("Hướng dẫn")
-            }
-        }
+        .toolbar(.hidden, for: .navigationBar)
+        .scrollIndicators(.hidden)
         .sheet(isPresented: $showGuide) { PairGuideView() }
         .onReceive(tick) { now = $0 }
     }
@@ -230,5 +237,144 @@ struct AddDeviceView: View {
         guard let output = filter.outputImage,
               let cg = CIContext().createCGImage(output, from: output.extent) else { return nil }
         return UIImage(cgImage: cg)
+    }
+}
+
+/// "Giới thiệu": app name and version, then the third-party notices (Pane, MIT) that ship with
+/// the quota screen's pace, trend and donut rules.
+struct AboutView: View {
+    @Environment(\.dismiss) private var dismiss
+
+    private var version: String {
+        let info = Bundle.main.infoDictionary
+        let v = info?["CFBundleShortVersionString"] as? String ?? "?"
+        return (info?["CFBundleVersion"] as? String).map { "\(v) (\($0))" } ?? v
+    }
+
+    var body: some View {
+        Form {
+            FormHeader(title: "Giới thiệu") {
+                HeaderTextButton(title: "Cài đặt", back: true) { dismiss() }
+            } trailing: {
+                EmptyView()
+            }
+            Section {
+                HStack {
+                    Text("FCode - EZ Vibecoding")
+                    Spacer()
+                    Text("Phiên bản \(version)").foregroundColor(.secondary)
+                }
+            }
+            Section {
+                Text("Màn hình Hạn mức làm theo cách hiển thị của Pane (màu theo tốc độ dùng, biểu đồ xu hướng, biểu đồ chi phí).")
+                    .font(.subheadline)
+                Text("Pane").font(.subheadline.weight(.semibold))
+                Text(AboutView.paneLicense)
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+            } header: {
+                Text("Giấy phép bên thứ ba")
+            }
+        }
+        .navigationTitle("Giới thiệu")
+        .toolbar(.hidden, for: .navigationBar)
+        .scrollIndicators(.hidden)
+    }
+
+    static let paneLicense = """
+    MIT License
+
+    Copyright (c) 2026 Jazii (Pane for Windows)
+    Copyright (c) 2025 Robin Ebers (OpenUsage for macOS — provider research and original concept, https://github.com/robinebers/openusage)
+    Copyright (c) 2025 Peter Steinberger (CodexBar for macOS — provider research for Codebuff/Kilo/Kiro/Amp/Vertex AI/Bedrock/Poe/Chutes/Warp/Crof, https://github.com/steipete/CodexBar)
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy \
+    of this software and associated documentation files (the "Software"), to deal \
+    in the Software without restriction, including without limitation the rights \
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell \
+    copies of the Software, and to permit persons to whom the Software is \
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all \
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR \
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, \
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE \
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER \
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, \
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE \
+    SOFTWARE.
+    """
+}
+
+// MARK: - Scrolling header row (non-session screens)
+
+/// A Form's first row used as the screen header: centred title, one control on each side. It
+/// scrolls away with the content; the navigation bar stays hidden.
+struct FormHeader<Leading: View, Trailing: View>: View {
+    let title: String
+    @ViewBuilder let leading: Leading
+    @ViewBuilder let trailing: Trailing
+
+    var body: some View {
+        Section {
+            // Equal fixed sides keep the title centred; it shrinks before it would reach them.
+            HStack(spacing: 4) {
+                leading.frame(width: 112, alignment: .leading)
+                Text(title)
+                    .scaledFont(17, weight: .semibold)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                    .frame(maxWidth: .infinity)
+                    .accessibilityAddTraits(.isHeader)
+                trailing.frame(width: 112, alignment: .trailing)
+            }
+            .frame(minHeight: 44)
+            .dynamicTypeSize(...DynamicTypeSize.xxLarge)
+            .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
+            .listRowBackground(Color.clear)
+        }
+    }
+}
+
+struct HeaderTextButton: View {
+    let title: String
+    var bold = false
+    /// Shows "‹" before the title (back to the previous screen).
+    var back = false
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 2) {
+                if back { Image(systemName: "chevron.left").font(.system(size: 20, weight: .semibold)) }
+                Text(title).scaledFont(17, weight: bold ? .semibold : .regular).lineLimit(1).minimumScaleFactor(0.7)
+            }
+            .foregroundColor(.accentBlue)
+            .padding(.horizontal, 6)
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .accessibilityLabel(back ? "Quay lại \(title)" : title)
+    }
+}
+
+struct HeaderIconButton: View {
+    let symbol: String
+    let label: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 20))
+                .foregroundColor(.accentBlue)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .accessibilityLabel(label)
     }
 }
