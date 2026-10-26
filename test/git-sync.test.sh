@@ -12,6 +12,7 @@ T=$(mktemp -d) || exit 1
 trap 'rm -rf "$T"' EXIT
 export HOME="$T/home"
 export GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
+export FCODE_SECRETS_ENV="$T/no-vault" # a path that does not exist: no run in this suite reads the real /run/instabox/secrets/env (tokrun sets its own fake vault)
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 mkdir -p "$HOME" "$T/bin"
 
@@ -384,7 +385,7 @@ SHIM
   # tokrun [VAR=value ...]: one timer run with no GH_TOKEN / INSTABOX_API_KEY in the environment (unless given); prints what the fetch saw
   tokrun() { : >"$T/envseen"; env -u GH_TOKEN -u INSTABOX_API_KEY "$@" bash "$SYNC" >"$T/run.out" 2>&1; tr '\n' ' ' <"$T/envseen" | sed 's/ $//'; }
   V="$T/vault-env"
-  printf 'echo noise\nexport INSTABOX_API_KEY=ikey-secret-9\nexport GH_TOKEN_X=nope\nexport GH_TOKEN="tok-vault-1"\nexport OTHER=zz\n' >"$V"
+  printf 'echo noise\nexport INSTABOX_API_KEY=ikey-secret-9\nexport GH_TOKEN_X=nope\nexport OLD_GH_TOKEN=bad\n#GH_TOKEN=bad\nexport GH_TOKEN="tok-vault-1"\nexport OTHER=zz\n' >"$V"
   eq "vault: GH_TOKEN reaches the fetch, INSTABOX_API_KEY does not" "$(tokrun FCODE_SECRETS_ENV="$V")" "tok-vault-1|unset"
   eq "vault: fetched fine, quiet, token in neither git-sync.json nor stderr, key not either" "$(q projects.tk.error)/$(wc -c <"$T/run.out" | tr -d ' ')/$(grep -rlE 'tok-vault-1|ikey-secret-9' "$HOME/.local/state" "$T/run.out" | wc -l | tr -d ' ')" "null/0/0"
   printf 'GH_TOKEN=tok_bare.2\r\nINSTABOX_API_KEY=ikey-2\r\n' >"$V"

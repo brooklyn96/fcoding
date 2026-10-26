@@ -143,8 +143,9 @@ exec 9>"$DIR/git-sync.lock"
 
 # The timer unit has no GH_TOKEN (a systemd user unit gets no login environment), so the fetch of a project added by the token route
 # (https origin + the repo's `!gh auth git-credential` helper) would fail on every run. Take GH_TOKEN alone from the instabox vault
-# file, the way start.sh does (install.sh): the one line `[export ]GH_TOKEN=...` is read as text (the file is never sourced), the
-# value must look like a token, and nothing else (INSTABOX_API_KEY included) is taken. An already set GH_TOKEN wins. It only lives in
+# file. Unlike start.sh, which sources the file in a subshell (install.sh:85), this reader takes only the first literal
+# `[export ]GH_TOKEN=` line, as text: the file is never sourced here. The value must look like a token, and nothing else
+# (INSTABOX_API_KEY included) is taken. An already set GH_TOKEN wins. It only lives in
 # this process's environment for git's children: never written to the state file, never printed.
 vf=${FCODE_SECRETS_ENV:-/run/instabox/secrets/env}
 if [ -z "${GH_TOKEN:-}" ] && [ -r "$vf" ]; then
