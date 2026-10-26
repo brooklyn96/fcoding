@@ -168,6 +168,7 @@ struct ProjectsView: View {
                             loadError: model.errorText,
                             sessions: allSessions,
                             initialProject: project,
+                            clockOffset: home.offset,
                             onOpened: { openAfterSheet = $0 })
         case .rename(let name):
             RenameSheet(name: name, taken: Set(allSessions.map(\.name))) { newName in
@@ -334,7 +335,16 @@ struct ProjectsView: View {
                            waiting: waiting > 0, lines: lines, selected: project == id,
                            onTap: { withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) { project = id } },
                            onMore: { sheet = .new(project: id == "all" ? nil : id) },
-                           showMore: id != "all")
+                           showMore: id != "all",
+                           staging: id == "all" ? nil
+                               : HomeLogic.stagingChip(info?.staging, startedAt: home.stagingStarted[id], now: Date()),
+                           onStartStaging: { startStaging(id) })
+    }
+
+    private func startStaging(_ project: String) {
+        Task {
+            if let failure = await home.startStaging(project, app: app) { toast = failure }
+        }
     }
 
     // MARK: - Sessions
@@ -576,6 +586,8 @@ struct ProjectCard: View {
     let onTap: () -> Void
     let onMore: () -> Void
     let showMore: Bool
+    var staging: HomeLogic.StagingChip? = nil
+    var onStartStaging: () -> Void = {}
     @State private var pressing = false
 
     var body: some View {
@@ -598,6 +610,7 @@ struct ProjectCard: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.85)
             }
+            if let s = staging { stagingRow(s) }
         }
         .padding(.top, 11).padding(.horizontal, 12).padding(.bottom, 10)
         .frame(width: 182, alignment: .topLeading)
@@ -632,6 +645,38 @@ struct ProjectCard: View {
         // A double tap filters (the combined "…" button would otherwise take it).
         .accessibilityAction(.default, onTap)
         .accessibilityAction(named: "Mở phiên mới", onMore)
+        .accessibilityActions {
+            if staging?.canStart == true { Button("Bật staging", action: onStartStaging) }
+        }
+    }
+
+    /// Bottom line: the staging box state, with "Bật" while it is paused or off.
+    private func stagingRow(_ s: HomeLogic.StagingChip) -> some View {
+        HStack(spacing: 6) {
+            StatusDot(state: s.dot)
+            Text(s.text)
+                .scaledFont(12.5)
+                .foregroundColor(.l2)
+                .lineLimit(1)
+                .minimumScaleFactor(0.85)
+            Spacer(minLength: 0)
+            if s.canStart {
+                Button(action: onStartStaging) {
+                    Text("Bật")
+                        .scaledFont(12.5, weight: .semibold)
+                        .foregroundColor(.accentBlue)
+                        .padding(.horizontal, 10)
+                        .frame(minHeight: 24)
+                        .background(Color.fill3, in: Capsule())
+                        .padding(.vertical, 4)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Bật staging")
+            }
+        }
+        .frame(minHeight: 24)
+        .padding(.top, 3)
     }
 }
 

@@ -77,4 +77,39 @@ final class HomeModel: ObservableObject {
         }
         return outcome
     }
+
+    /// When "Bật" was tapped per project (this phone's clock); the chip shows "đang bật…" meanwhile.
+    @Published private(set) var stagingStarted: [String: Date] = [:]
+
+    /// POST staging/start; returns the error text, nil on success. The server caches the box
+    /// state for 30 s, so the home reply is fetched a few times until it can say "running".
+    func startStaging(_ project: String, app: AppState) async -> String? {
+        guard let api = app.api else { return unpairedNotice }
+        stagingStarted[project] = Date()
+        var failure: String?
+        do {
+            let reply = try await api.startStaging(project: project)
+            if reply.ok == false {
+                failure = HomeLogic.stagingFailure(status: 200, code: reply.error) ?? "Không bật được staging."
+            }
+        } catch {
+            let e = error as? APIError
+            failure = HomeLogic.stagingFailure(status: e?.status ?? 0, code: e?.code)
+                ?? "Không bật được staging: " + (app.report(error) ?? "lỗi mạng").lowercased(with: Locale(identifier: "vi"))
+        }
+        if failure != nil {
+            stagingStarted[project] = nil
+            return failure
+        }
+        Task {
+            var waited = 0.0
+            for at in [20.0, 45, 90, 150] {
+                try? await Task.sleep(nanoseconds: UInt64((at - waited) * 1_000_000_000))
+                waited = at
+                await self.load(app)
+                if self.home?.projects.first(where: { $0.name == project })?.staging?.state == "running" { break }
+            }
+        }
+        return nil
+    }
 }

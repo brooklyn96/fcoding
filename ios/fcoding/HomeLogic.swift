@@ -263,8 +263,10 @@ struct HomeProject: Decodable {
     var git: HomeGit?
     /// Placeholder before the server's first gh read (not a failure).
     var loading = false
+    /// The project's instabox staging box; nil = no such box (or an older server): no chip.
+    var staging: HomeStaging?
 
-    private enum K: String, CodingKey { case name, branch, prs, lastRun, git, loading }
+    private enum K: String, CodingKey { case name, branch, prs, lastRun, git, loading, staging }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: K.self)
         name = c.value(.name) ?? ""
@@ -274,6 +276,49 @@ struct HomeProject: Decodable {
         lastRun = c.value(.lastRun)
         git = c.value(.git)
         loading = c.value(.loading) ?? false
+        staging = c.value(.staging)
+    }
+}
+
+/// `projects[].staging`: state running | suspended | stopped | starting | unknown.
+struct HomeStaging: Decodable {
+    var state: String
+    var updatedAt: Date?
+
+    private enum K: String, CodingKey { case state, updatedAt }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        state = ((c.value(.state) as String?) ?? "unknown").lowercased()
+        updatedAt = c.date(.updatedAt)
+    }
+}
+
+/// GET /api/projects/<name>/omp-sessions: newest first, at most 10.
+struct OmpSessionsReply: Decodable {
+    var sessions: [OmpSession] = []
+
+    private enum K: String, CodingKey { case sessions }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        let all: [OmpSession] = c.list(.sessions)
+        sessions = Array(all.filter { !$0.id.isEmpty }.prefix(10))
+    }
+}
+
+struct OmpSession: Decodable, Identifiable {
+    var id: String
+    var title: String
+    var updatedAt: Date?
+    /// "box" | "laptop" (anything else is shown as box).
+    var origin: String
+
+    private enum K: String, CodingKey { case id, title, updatedAt, origin }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        id = c.value(.id) ?? ""
+        title = c.value(.title) ?? ""
+        updatedAt = c.date(.updatedAt)
+        origin = c.value(.origin) ?? "box"
     }
 }
 
@@ -702,6 +747,71 @@ enum HomeLogic {
         s.range(of: "^[a-z0-9][a-z0-9-]{0,31}$", options: .regularExpression) != nil
     }
 
+    // MARK: Staging box
+
+    struct StagingChip: Equatable {
+        var text: String
+        /// StatusDot state: "running" green, "waiting" orange (starting), "idle" grey.
+        var dot: String
+        /// "Bật" is offered.
+        var canStart: Bool
+    }
+
+    /// A tapped "Bật" shows "đang bật…" until the server reports running, for at most this long
+    /// (then the server's state, and the button, come back).
+    static let stagingStartWindow: TimeInterval = 180
+
+    /// nil = no staging box: the chip is hidden. `startedAt` = when "Bật" was tapped on this phone.
+    static func stagingChip(_ s: HomeStaging?, startedAt: Date?, now: Date) -> StagingChip? {
+        guard let s = s else { return nil }
+        var state = s.state
+        if state != "running", let t = startedAt, now.timeIntervalSince(t) < stagingStartWindow { state = "starting" }
+        switch state {
+        case "running": return StagingChip(text: "Staging: đang chạy", dot: "running", canStart: false)
+        case "starting": return StagingChip(text: "Staging: đang bật…", dot: "waiting", canStart: false)
+        case "suspended": return StagingChip(text: "Staging: đang nghỉ", dot: "idle", canStart: true)
+        case "stopped": return StagingChip(text: "Staging: đã tắt", dot: "idle", canStart: true)
+        default: return StagingChip(text: "Staging: chưa rõ", dot: "idle", canStart: false)
+        }
+    }
+
+    /// Known failures of POST staging/start (an error status, or a 200 with ok:false); nil = an
+    /// ordinary error, worded by the caller.
+    static func stagingFailure(status: Int, code: String?) -> String? {
+        if code == "no_instabox_key" { return "Box chưa có API key instabox" }
+        if code == "unknown_project" { return "Dự án này không có trên box." }
+        if [404, 405, 501].contains(status) { return "Máy chủ chưa hỗ trợ, cập nhật máy chủ trước." }
+        return nil
+    }
+
+    // MARK: Recent omp sessions
+
+    static func ompTitle(_ title: String) -> String {
+        let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty ? "(không tên)" : t
+    }
+
+    static func ompOrigin(_ origin: String) -> String { origin == "laptop" ? "laptop" : "box" }
+
+    /// "3 giờ trước"; "" without a time.
+    static func ompWhen(_ s: OmpSession, now: Date) -> String {
+        s.updatedAt.map { ago(now.timeIntervalSince($0)) } ?? ""
+    }
+
+    /// GET omp-sessions failed on a server without the route: the section is hidden.
+    static func ompListHidden(status: Int, code: String?) -> Bool {
+        code != "unknown_project" && [404, 405, 501].contains(status)
+    }
+
+    /// Known failures of POST resume; nil = an ordinary error, worded by the caller.
+    static func ompResumeFailure(status: Int, code: String?) -> String? {
+        if code == "unknown_session" { return "Phiên này không còn trên box." }
+        if status == 500 && code == "harness_exited" { return "Không mở được omp trên box (chương trình thoát ngay)." }
+        if code == "unknown_project" { return "Dự án này không có trên box." }
+        if [404, 405, 501].contains(status) { return "Máy chủ chưa hỗ trợ, cập nhật máy chủ trước." }
+        return nil
+    }
+
     // MARK: - Self-test
 
     /// Fixed cases; one line per failure (empty = all pass). Run by the CI self-test step.
@@ -954,6 +1064,66 @@ enum HomeLogic {
         eq("name ok", validSessionName("deal-sync-omp-2"), true)
         eq("name upper", validSessionName("Deal"), false)
         eq("name dash first", validSessionName("-a"), false)
+
+        // Staging chip
+        let stg = projects("""
+        {"name":"a","staging":{"state":"suspended","updatedAt":"2027-01-15T07:59:00Z"}},{"name":"b","staging":null},\
+        {"name":"c"},{"name":"d","staging":{"state":"Running"}},{"name":"e","staging":{"state":"stopped"}},\
+        {"name":"f","staging":{"state":"weird"}},{"name":"g","staging":"broken"}
+        """)
+        eq("staging count", stg.count, 7)
+        eq("staging decoded", stg.first?.staging?.state, "suspended")
+        eq("staging updatedAt", stg.first?.staging?.updatedAt, now.addingTimeInterval(-60))
+        eq("staging null hides", stagingChip(stg[1].staging, startedAt: nil, now: now) == nil, true)
+        eq("staging missing hides", stagingChip(stg[2].staging, startedAt: nil, now: now) == nil, true)
+        eq("staging broken hides", stagingChip(stg[6].staging, startedAt: nil, now: now) == nil, true)
+        eq("staging suspended", stagingChip(stg[0].staging, startedAt: nil, now: now),
+           StagingChip(text: "Staging: đang nghỉ", dot: "idle", canStart: true))
+        eq("staging running", stagingChip(stg[3].staging, startedAt: nil, now: now),
+           StagingChip(text: "Staging: đang chạy", dot: "running", canStart: false))
+        eq("staging stopped", stagingChip(stg[4].staging, startedAt: nil, now: now),
+           StagingChip(text: "Staging: đã tắt", dot: "idle", canStart: true))
+        eq("staging unknown", stagingChip(stg[5].staging, startedAt: nil, now: now),
+           StagingChip(text: "Staging: chưa rõ", dot: "idle", canStart: false))
+        eq("staging tapped", stagingChip(stg[0].staging, startedAt: now.addingTimeInterval(-30), now: now),
+           StagingChip(text: "Staging: đang bật…", dot: "waiting", canStart: false))
+        eq("staging tapped then running", stagingChip(stg[3].staging, startedAt: now.addingTimeInterval(-30), now: now)?.text,
+           "Staging: đang chạy")
+        eq("staging tap expires", stagingChip(stg[0].staging, startedAt: now.addingTimeInterval(-200), now: now)?.canStart, true)
+        eq("staging no key", stagingFailure(status: 200, code: "no_instabox_key"), "Box chưa có API key instabox")
+        eq("staging no key 4xx", stagingFailure(status: 400, code: "no_instabox_key"), "Box chưa có API key instabox")
+        eq("staging old server", stagingFailure(status: 404, code: "not_found"), "Máy chủ chưa hỗ trợ, cập nhật máy chủ trước.")
+        eq("staging other", stagingFailure(status: 500, code: "error") == nil, true)
+
+        // Recent omp sessions
+        let ompJSON = """
+        {"ok":true,"sessions":[{"id":"0a1b2c3d-1111","title":"Sửa lỗi đăng nhập","updatedAt":"2027-01-15T05:00:00.000Z","origin":"laptop"},
+         {"id":"0a1b2c3d-2222","title":"  ","updatedAt":"2027-01-15T07:59:30Z","origin":"box"},{"title":"no id"},
+         {"id":"0a1b2c3d-3333","updatedAt":null,"origin":"other"},{"id":5}]}
+        """
+        if let o = try? JSONDecoder().decode(OmpSessionsReply.self, from: Data(ompJSON.utf8)) {
+            eq("omp count", o.sessions.count, 3)
+            eq("omp title", ompTitle(o.sessions[0].title), "Sửa lỗi đăng nhập")
+            eq("omp blank title", ompTitle(o.sessions[1].title), "(không tên)")
+            eq("omp missing title", ompTitle(o.sessions[2].title), "(không tên)")
+            eq("omp laptop", ompOrigin(o.sessions[0].origin), "laptop")
+            eq("omp box", ompOrigin(o.sessions[1].origin), "box")
+            eq("omp other origin", ompOrigin(o.sessions[2].origin), "box")
+            eq("omp when", ompWhen(o.sessions[0], now: now), "3 giờ trước")
+            eq("omp just now", ompWhen(o.sessions[1], now: now), "vừa xong")
+            eq("omp no time", ompWhen(o.sessions[2], now: now), "")
+        } else {
+            failures.append("omp: decode failed")
+        }
+        let ompMany = (0..<12).map { "{\"id\":\"0000000\($0)\"}" }.joined(separator: ",")
+        eq("omp max 10", (try? JSONDecoder().decode(OmpSessionsReply.self, from: Data("{\"sessions\":[\(ompMany)]}".utf8)))?.sessions.count, 10)
+        eq("omp list old server", ompListHidden(status: 404, code: "not_found"), true)
+        eq("omp list unknown project", ompListHidden(status: 404, code: "unknown_project"), false)
+        eq("omp list 500", ompListHidden(status: 500, code: "error"), false)
+        eq("omp resume gone", ompResumeFailure(status: 404, code: "unknown_session"), "Phiên này không còn trên box.")
+        eq("omp resume exited", ompResumeFailure(status: 500, code: "harness_exited"),
+           "Không mở được omp trên box (chương trình thoát ngay).")
+        eq("omp resume other", ompResumeFailure(status: 503, code: "busy") == nil, true)
         return failures
     }
 }
