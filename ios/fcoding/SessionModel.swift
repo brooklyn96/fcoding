@@ -240,30 +240,49 @@ final class SessionModel: ObservableObject {
 
     // MARK: - Image attach
 
-    /// An image is being converted or sent (one at a time).
+    /// On from the moment an image is selected (before it is loaded or converted) until its upload
+    /// ends; one image at a time. While on, the composer disables Send and the image button, so no
+    /// message can overtake the image path and a second pick is never dropped silently.
     @Published private(set) var imageBusy = false
-    /// Neutral status line for the image: sending, attached, saved but not attached.
+    /// Status line for the image: sending, attached, saved but not attached, or an image error
+    /// (`imageFailed`). Image results never go to `errorText`, so a later Send cannot wipe them.
     @Published var imageNote: String?
+    /// `imageNote` is an error (or the camera is off): shown as a warning and kept on Send.
+    @Published private(set) var imageFailed = false
 
-    /// Converts the image to JPEG, finds the session's project, uploads it (queued in the input
-    /// chain, so a send tapped meanwhile lands after the path). Errors go to `errorText`.
-    /// `image == nil`: the picked file could not be read.
-    func attachImage(_ image: UIImage?) {
+    /// Photo library, called at selection: `load` reads the picked file (seconds for an iCloud
+    /// original), then ImageIO downsamples it without decoding the full bitmap.
+    func attachPhoto(_ load: @escaping () async -> Data?) {
+        attach {
+            guard let data = await load() else { throw APIError(status: 0, code: "bad_type") }
+            return try await Task.detached(priority: .userInitiated) { try ImageAttach.jpeg(data: data) }.value
+        }
+    }
+
+    /// Camera shot.
+    func attachImage(_ image: UIImage) {
+        attach { try await Task.detached(priority: .userInitiated) { try ImageAttach.jpeg(image) }.value }
+    }
+
+    /// Camera access is denied or restricted for FCode: say where to turn it on; nothing is opened.
+    func cameraDenied() {
+        guard !imageBusy else { return }
+        let text = "Camera đang bị tắt cho FCode: vào Cài đặt → FCode → bật Camera"
+        imageFailed = true
+        imageNote = text
+        UIAccessibility.post(notification: .announcement, argument: text)
+    }
+
+    /// Makes the JPEG, then finds the session's project and uploads it in the input chain.
+    private func attach(_ makeJPEG: @escaping @MainActor () async throws -> Data) {
         guard !imageBusy else { return }
         imageBusy = true
-        errorText = nil
+        imageFailed = false
         imageNote = "Đang gửi ảnh…"
         Task { [weak self] in
-            var jpeg: Data?
-            var failure: Error?
-            if let image = image {
-                do { jpeg = try await Task.detached(priority: .userInitiated) { try ImageAttach.jpeg(image) }.value }
-                catch { failure = error }
-            } else {
-                failure = APIError(status: 0, code: "bad_type")
-            }
+            let jpeg: Data
+            do { jpeg = try await makeJPEG() } catch { self?.finishImage(nil, error); return }
             guard let self = self else { return }
-            guard let jpeg = jpeg else { self.finishImage(nil, failure); return }
             _ = self.enqueue { [weak self] in
                 guard let self = self else { return false }
                 guard let api = self.app?.api else { self.finishImage(nil, nil); return false }
@@ -286,21 +305,17 @@ final class SessionModel: ObservableObject {
 
     private func finishImage(_ reply: UploadReply?, _ error: Error?) {
         imageBusy = false
-        imageNote = nil
-        let said: String?
+        imageFailed = reply == nil
         if let reply = reply {
             imageNote = reply.attached ? "Đã gắn ảnh — gõ lời nhắn rồi gửi" : "Đã lưu ảnh nhưng chưa gắn được vào phiên"
-            said = imageNote
         } else if error is CancellationError {
-            said = nil
+            imageNote = nil
         } else if let e = error as? APIError, e.status == 401 {
-            errorText = app?.report(e)
-            said = errorText
+            imageNote = app?.report(e)
         } else {
-            errorText = error.map(ImageAttach.message) ?? "Không gửi được ảnh, thử lại"
-            said = errorText
+            imageNote = error.map(ImageAttach.message) ?? "Không gửi được ảnh, thử lại"
         }
-        if let said = said { UIAccessibility.post(notification: .announcement, argument: said) }
+        if let said = imageNote { UIAccessibility.post(notification: .announcement, argument: said) }
     }
 
     /// Tells tmux how many columns/rows fit in `size` at this font size (debounced, skipped if unchanged).

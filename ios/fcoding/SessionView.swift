@@ -1,3 +1,4 @@
+import AVFoundation
 import PhotosUI
 import SwiftUI
 
@@ -80,7 +81,7 @@ struct SessionView: View {
                         if model.imageBusy {
                             ProgressView().tint(.white).scaleEffect(0.8)
                         } else {
-                            Image(systemName: "photo")
+                            Image(systemName: model.imageFailed ? "exclamationmark.triangle.fill" : "photo")
                         }
                         Text(note)
                     }
@@ -89,7 +90,7 @@ struct SessionView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
-                    .background(Color(white: 0.2))
+                    .background(model.imageFailed ? Color.red.opacity(0.85) : Color(white: 0.2))
                 }
                 .accessibilityHint(model.imageBusy ? "" : "Chạm để ẩn")
             }
@@ -99,7 +100,8 @@ struct SessionView: View {
                     draftKey: "draft.\(name)",
                     onSend: { text, enter in
                         bottomRequest += 1
-                        if !model.imageBusy { model.imageNote = nil }
+                        // An image error stays until tapped away; "attached" is done once the message goes.
+                        if !model.imageBusy, !model.imageFailed { model.imageNote = nil }
                         return model.send(text, enter: enter)
                     },
                     onKey: { key in model.key(key) },
@@ -109,7 +111,9 @@ struct SessionView: View {
                     onHide: hideComposer,
                     onSent: { if !composerPinned { hideComposer() } },
                     imageBusy: model.imageBusy,
-                    onImage: { image in model.attachImage(image) }
+                    onPhoto: { load in model.attachPhoto(load) },
+                    onCamera: { image in model.attachImage(image) },
+                    onCameraDenied: { model.cameraDenied() }
                 )
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
@@ -539,10 +543,15 @@ struct ComposerView: View {
     let onHide: () -> Void
     /// After a successful send that emptied the draft.
     let onSent: () -> Void
-    /// An image is being converted or uploaded: the image button shows a spinner.
+    /// An image is selected and not yet uploaded: the image button shows a spinner, and both it and
+    /// Send are disabled (typing stays allowed), so a message never overtakes the image.
     var imageBusy = false
-    /// A picked or shot image (nil: the picked file could not be read).
-    let onImage: (UIImage?) -> Void
+    /// A photo was selected; the closure loads its bytes (the model calls it).
+    let onPhoto: (@escaping () async -> Data?) -> Void
+    /// A camera shot.
+    let onCamera: (UIImage) -> Void
+    /// Camera access is denied or restricted: the camera is not opened.
+    let onCameraDenied: () -> Void
     @State private var showPhotos = false
     @State private var showCamera = false
     @State private var photoItem: PhotosPickerItem?
@@ -613,15 +622,17 @@ struct ComposerView: View {
         .onChange(of: photoItem) { item in
             guard let item = item else { return }
             photoItem = nil
-            Task {
-                let data = try? await item.loadTransferable(type: Data.self)
-                pickedImage(data.flatMap { UIImage(data: $0) })
-            }
+            // Busy starts now, at selection; the model loads the bytes.
+            onPhoto { try? await item.loadTransferable(type: Data.self) }
+            refocus()
         }
         .fullScreenCover(isPresented: $showCamera) {
             CameraPicker { image in
                 showCamera = false
-                if let image = image { pickedImage(image) }
+                if let image = image {
+                    onCamera(image)
+                    refocus()
+                }
             }
             .ignoresSafeArea()
         }
@@ -681,9 +692,9 @@ struct ComposerView: View {
         } primaryAction: {
             submit(enter: true)
         }
-        .disabled(sending)
+        .disabled(sending || imageBusy)
         .accessibilityLabel("Gửi")
-        .accessibilityHint("Gửi rồi nhấn Enter. Giữ lâu để chọn Gửi không Enter.")
+        .accessibilityHint(imageBusy ? "Chờ gửi ảnh xong" : "Gửi rồi nhấn Enter. Giữ lâu để chọn Gửi không Enter.")
         .accessibilityAction(named: "Gửi không Enter") { submit(enter: false) }
     }
 
@@ -715,7 +726,7 @@ struct ComposerView: View {
     private var imageButton: some View {
         Menu {
             if hasCamera {
-                Button { showCamera = true } label: { Label("Chụp ảnh", systemImage: "camera") }
+                Button { openCamera() } label: { Label("Chụp ảnh", systemImage: "camera") }
             }
             Button { showPhotos = true } label: { Label("Chọn ảnh", systemImage: "photo.on.rectangle") }
         } label: {
@@ -735,9 +746,16 @@ struct ComposerView: View {
         .accessibilityHint("Chụp ảnh hoặc chọn ảnh để gắn vào phiên")
     }
 
-    /// Hands the image up, then puts the cursor back in the field for the message.
-    private func pickedImage(_ image: UIImage?) {
-        onImage(image)
+    /// Denied / restricted: say so instead of opening a black camera. Not asked yet: open, iOS asks.
+    private func openCamera() {
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .denied, .restricted: onCameraDenied()
+        default: showCamera = true
+        }
+    }
+
+    /// After an image is handed up, puts the cursor back in the field for the message.
+    private func refocus() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { focused.wrappedValue = true }
     }
 
@@ -793,7 +811,7 @@ struct ComposerView: View {
     /// settle, then clear and rebuild the field.
     private func submit(enter: Bool) {
         let snapshot = draft
-        guard !sending, enter || !snapshot.isEmpty else { return }
+        guard !sending, !imageBusy, enter || !snapshot.isEmpty else { return }
         sending = true
         let job = onSend(snapshot, enter) // queued now, in tap order with the quick keys
         Task {

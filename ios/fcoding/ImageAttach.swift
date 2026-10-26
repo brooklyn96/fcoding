@@ -1,3 +1,4 @@
+import ImageIO
 import SwiftUI
 import UIKit
 
@@ -38,6 +39,21 @@ enum ImageAttach {
         throw APIError(status: 0, code: "too_big")
     }
 
+    /// Photo-library bytes: downsampled by ImageIO straight to at most `maxSide` (upright, EXIF
+    /// orientation applied), so the full-size bitmap is never decoded; then encoded as above.
+    static func jpeg(data: Data) throws -> Data {
+        guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary)
+        else { throw APIError(status: 0, code: "bad_type") }
+        let options: [CFString: Any] = [
+            kCGImageSourceThumbnailMaxPixelSize: Int(maxSide),
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+        ]
+        guard let thumb = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+        else { throw APIError(status: 0, code: "bad_type") }
+        return try jpeg(UIImage(cgImage: thumb))
+    }
+
     /// Short Vietnamese line for an upload or conversion failure (401 is handled by the caller).
     static func message(_ error: Error) -> String {
         if let e = error as? APIError {
@@ -45,9 +61,11 @@ enum ImageAttach {
             case "too_big": return "Ảnh quá lớn"
             case "bad_type", "empty": return "Ảnh không đọc được"
             case "no_session", "no_project": return "Phiên đã đóng"
+            case "busy": return "Đang gửi ảnh khác, thử lại sau"
             default: break
             }
             if e.status == 413 { return "Ảnh quá lớn" }
+            if e.status == 429 { return "Đang gửi ảnh khác, thử lại sau" }
             if e.status == 415 { return "Ảnh không đọc được" }
         }
         return "Không gửi được ảnh, thử lại"
