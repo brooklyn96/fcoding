@@ -2593,6 +2593,19 @@ async function homeApp(fn, extra = {}) {
   c.home = async () => { const r = await c.req('GET', '/api/home', { cookie: c.cookie }); assert.equal(r.status, 200, r.text); return r.json; };
   c.reset = (body, o = {}) => c.req('POST', '/api/codex-reset', { cookie: c.cookie, body, ...o });
   c.homeUntil = (ok) => waitFor(async () => { const h = await c.home(); return ok(h) && h; }); // a background refresh landed
+  // warm: the first listing has landed and the quota is built from it. A cold spawn can be slower than homeWait / 2, and the
+  // quota built without it is cached 60 s on the frozen clock, so each miss lets the listing land and moves past QUOTA_TTL (with a
+  // regular box tick, so the box run goes on). `ok` can also wait for the other parts; the reply that passed it is returned.
+  c.warm = async (ok = (h) => h.accounts[3]?.resets.target) => {
+    let h;
+    await waitFor(async () => {
+      if (ok(h = await c.home())) return true;
+      await c.app.homeIdle(); c.clock.t += 61e3; c.app.tickBox(); await c.home(); await c.app.homeIdle(); // the next read is built from the listing
+      return false;
+    });
+    await c.app.homeIdle();
+    return h;
+  };
   try { await fn(c); } finally { await c.app.homeIdle(); await c.close(); fs.rmSync(toolDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 }
 
@@ -2882,9 +2895,9 @@ test('codex reset: every omp answer maps to a result and a Vietnamese message', 
 });
 
 test('GET /api/home: the whole shape from omp, logs, gh and status.json; box timer estimate', () => homeApp(async (c) => {
-  const h = await c.home();
+  const h = await c.warm((x) => x.accounts[3]?.resets.target && x.totals.spend && !x.projects[0].loading); // every part has landed
   assert.deepEqual(Object.keys(h), ['generatedAt', 'box', 'accounts', 'totals', 'projects', 'updates']);
-  assert.equal(h.generatedAt, new Date(T0).toISOString());
+  assert.equal(h.generatedAt, new Date(c.clock.t).toISOString());
   assert.deepEqual(h.box, { state: 'running', sleepsAt: new Date(T0 + 480 * 60e3).toISOString(), ...BOX, source: 'estimate' });
   assert.deepEqual(h.accounts.map((a) => a.id), ['anthropic/1', 'anthropic/2', 'anthropic/3', 'openai-codex/4']);
   const cx = h.accounts[3];
@@ -2907,6 +2920,7 @@ test('GET /api/home: the whole shape from omp, logs, gh and status.json; box tim
 
 test('GET /api/home caches: quota 60 s, projects 2 min, spend 5 min; one refresh shared by concurrent requests', () => homeApp(async (c) => {
   await Promise.all([c.home(), c.home(), c.home()]);
+  await c.app.homeIdle(); // a part slower than homeWait has landed (the spend scan must end before the log line below is added)
   assert.equal(c.toolCalls('usage --json').length, 1);
   assert.equal(c.toolCalls('pr list').length, 2); // two projects, once each
   fs.appendFileSync(path.join(c.roots.dirs.omp, 'p', 's1.jsonl'), `${JSON.stringify({ type: 'message', id: 'n1', timestamp: new Date(T0).toISOString(),
@@ -2929,7 +2943,7 @@ test('GET /api/home partial failure: omp, gh or the logs down -> that part empty
   const rules = baseRules();
   c.setRules([['usage', { code: 1, stderr: 'boom' }], ['pr list', { code: 1, stderr: 'HTTP 502' }], ['run list', { stdout: 'not json' }], ...rules]);
   fs.rmSync(c.roots.dirs.claude, { recursive: true }); // one log source gone
-  let h = await c.home();
+  let h = await c.homeUntil((x) => x.totals.spend && !x.projects[0].loading); // the spend scan and gh have answered
   assert.deepEqual(h.accounts, []);
   assert.deepEqual(h.projects[0], { name: 'alpha', repo: 'owner/repo', branch: 'main', prs: null, lastRun: null });
   assert.equal(h.totals.spend.last30.usd, 0.2897); // omp + Codex logs; Claude Code logs gone
@@ -2937,7 +2951,7 @@ test('GET /api/home partial failure: omp, gh or the logs down -> that part empty
   // omp back: fresh; omp down again after the TTL: the last accounts, marked stale
   c.setRules(rules);
   c.clock.t += 61e3;
-  h = await c.home();
+  h = await c.homeUntil((x) => x.accounts.length === 4); // omp may answer after homeWait: not cached until then
   assert.equal(h.accounts.length, 4);
   assert.ok(h.accounts.every((a) => !a.stale));
   c.setRules([['usage', { code: 1 }], ...rules]);
@@ -2970,10 +2984,10 @@ test('GET /api/home never waits long: a slow part is empty the first time, then 
   let t0 = Date.now();
   let h = await c.home();
   assert.ok(Date.now() - t0 < 1200, `took ${Date.now() - t0} ms`); // homeWaitMs 300 per part, in parallel
-  assert.deepEqual(h.accounts, []); // not ready yet: empty, the rest answers (spend, box, updates)
+  assert.deepEqual(h.accounts, []); // not ready yet: empty, the rest answers (box, updates; spend if its scan was quick)
   assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: null, branch: null, prs: null, lastRun: null, loading: true })));
-  assert.ok(h.totals.spend && h.box && h.updates.omp);
-  h = await c.homeUntil((x) => x.accounts.length === 4 && x.projects[0].repo);
+  assert.ok('spend' in h.totals && Array.isArray(h.totals.byHarness) && h.box && h.updates.omp);
+  h = await c.homeUntil((x) => x.accounts.length === 4 && x.projects[0].repo && x.totals.spend);
   c.clock.t += 121e3; // both TTLs over, both tools still slow: the cached parts at once
   t0 = Date.now();
   h = await c.home();
@@ -2995,6 +3009,7 @@ test('home routes: auth on both, CSRF on the reset; nothing runs for a refused r
 
 test('POST /api/codex-reset: Codex only, validated, lock per account, the same requestId never runs twice', () => homeApp(async (c) => {
   const id = (n) => `0f8f7a6e-1111-4222-8333-${String(n).padStart(12, '0')}`;
+  await c.warm(); // the account ids come from the listing
   assert.equal((await c.reset({ accountId: 'openai-codex/4' })).status, 400);
   assert.equal((await c.reset({ accountId: 'openai-codex/4', requestId: 'x' })).status, 400);
   const claude = await c.reset({ accountId: 'anthropic/1', requestId: id(1) });
@@ -3029,13 +3044,13 @@ test('POST /api/codex-reset: Codex only, validated, lock per account, the same r
 test('POST /api/codex-reset: errors are not kept (a retry runs omp again); a kill is unconfirmed; every run clears the quota cache', () => homeApp(async (c) => {
   const id = '0f8f7a6e-1111-4222-8333-000000000077', body = { accountId: 'openai-codex/4', requestId: id };
   const runs = () => c.toolCalls('usage reset openai-codex/4').length;
-  await c.home();
-  assert.equal(c.toolCalls('usage --json').length, 1);
+  await c.warm();
+  const q0 = c.toolCalls('usage --json').length;
   c.setRules([['usage reset openai-codex/4', { code: 1, stderr: 'x (Codex): couldn\u2019t load this account\u2019s saved resets (network/auth) \u2014 nothing was spent, try again.\n' }], ...baseRules()]);
   const e1 = await c.reset(body);
   assert.deepEqual([e1.status, e1.json], [200, { result: 'error', message: RESET_MSG.list }]);
   await c.home(); // the reset cleared the quota cache: read again
-  assert.equal(c.toolCalls('usage --json').length, 2);
+  assert.equal(c.toolCalls('usage --json').length, q0 + 1);
   c.setRules(baseRules()); // omp recovered: the same requestId really runs again
   const ok = await c.reset(body);
   assert.deepEqual([ok.json.result, runs()], ['reset', 2]);
@@ -3051,8 +3066,7 @@ test('POST /api/codex-reset: errors are not kept (a retry runs omp again); a kil
 
 test('after a reset the quota waits for the new listing; a listing that is late or fails marks the accounts stale, briefly cached', () => homeApp(async (c) => {
   const body = { accountId: 'openai-codex/4', requestId: '0f8f7a6e-1111-4222-8333-000000000099' };
-  await c.homeUntil((h) => h.accounts[3]?.resets.target); // warm: the first listing has landed (a cold spawn can take longer than homeWait)
-  await c.app.homeIdle();
+  await c.warm();
   assert.equal((await c.home()).accounts[3].resets.available, 1);
   const spent = JSON.parse(fs.readFileSync(FIX('omp-reset-list.json'), 'utf8'));
   for (const a of spent.accounts) if (a.provider === 'openai-codex') { a.redeemableCount = 0; a.availableCount = 0; }
@@ -3080,8 +3094,7 @@ test('after a reset the quota waits for the new listing; a listing that is late 
 
 test('two resets close together: a listing fetched before the second reset never gives its count as fresh', () => homeApp(async (c) => {
   const id = (n) => `0f8f7a6e-1111-4222-8333-0000000001${n}0`;
-  await c.homeUntil((h) => h.accounts[3]?.resets.target);
-  await c.app.homeIdle();
+  await c.warm();
   const spent = JSON.parse(fs.readFileSync(FIX('omp-reset-list.json'), 'utf8'));
   for (const a of spent.accounts) if (a.provider === 'openai-codex') { a.redeemableCount = 0; a.availableCount = 0; }
   // reset A; the refresh after it waits for listing L1, which is slow and still says 1 (it predates reset B)
@@ -3106,8 +3119,7 @@ test('two resets close together: a listing fetched before the second reset never
 }, { homeWaitMs: 600, listAfterResetMs: 8000 }));
 
 test('after a reset and a good listing, a later listing failure is handled as without a reset: not stale, 60 s TTL', () => homeApp(async (c) => {
-  await c.homeUntil((h) => h.accounts[3]?.resets.target);
-  await c.app.homeIdle();
+  await c.warm();
   assert.equal((await c.reset({ accountId: 'openai-codex/4', requestId: '0f8f7a6e-1111-4222-8333-000000000201' })).json.result, 'reset');
   await c.homeUntil((h) => h.accounts.every((a) => !a.stale)); // the listing fetched after the reset has landed
   await c.app.homeIdle();
@@ -3180,7 +3192,7 @@ test('box timer: kept across a server restart within 90 s of the last tick on th
 
 test('POST /api/codex-reset: a slow reset is answered 202 pending; it finishes in the background and clears the quota cache', () => homeApp(async (c) => {
   const body = { accountId: 'openai-codex/4', requestId: '0f8f7a6e-1111-4222-8333-000000000088' };
-  await c.home();
+  await c.warm();
   c.setRules([['usage reset openai-codex/4', { stdout: RESET_OK, delay: 800 }], ...baseRules()]);
   const p = await c.reset(body);
   assert.deepEqual([p.status, p.json], [202, { result: 'pending', message: RESET_MSG.pending }]);
