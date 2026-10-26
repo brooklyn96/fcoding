@@ -3,14 +3,18 @@
   "projects": {
     "alpha": {
       "branch": "main", "default": "main", "dirty": true, "behindDefault": 3, "aheadOfOrigin": 0,
-      "lastFetchAt": "2026-10-25T19:29:00Z", "error": null
+      "lastFetchAt": "2026-10-25T19:29:00Z", "error": null, "autoUpdated": false, "autoSkip": "dirty"
     },
     "my.proj": {
       "branch": "feature/x", "default": "main", "dirty": false, "behindDefault": 0, "aheadOfOrigin": 2,
-      "lastFetchAt": "2026-10-25T19:00:00Z", "error": "fetch failed: could not resolve host"
+      "lastFetchAt": "2026-10-25T19:00:00Z", "error": "fetch failed: could not resolve host", "autoUpdated": true, "autoSkip": null
     },
     "odd": {
-      "branch": 7, "dirty": "yes", "behindDefault": "3", "aheadOfOrigin": -1, "lastFetchAt": "garbage", "error": ""
+      "branch": 7, "dirty": "yes", "behindDefault": "3", "aheadOfOrigin": -1, "lastFetchAt": "garbage", "error": "", "autoUpdated": "yes", "autoSkip": "bogus"
+    },
+    "old-script": {
+      "branch": "main", "default": "main", "dirty": false, "behindDefault": 1, "aheadOfOrigin": 0,
+      "lastFetchAt": "2026-10-25T19:10:00Z", "error": null
     }
   }
 }

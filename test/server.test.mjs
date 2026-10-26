@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import { createApp, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, strictOrigin, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock,
-  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, parseUpdates, resetReply, RESET_MSG, BOX, memo, codexChildMeta, parseGitSync } from '../server.mjs';
+  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, parseUpdates, resetReply, RESET_MSG, BOX, memo, codexChildMeta, parseGitSync, ompDirName, ompHead, parseStaging, KNOWN_VERSIONS } from '../server.mjs';
 
 process.env.TZ = 'America/Los_Angeles'; // spend days follow config.json timeZone, never the process zone: a third zone proves it
 
@@ -34,7 +34,8 @@ async function boot(opts = {}) {
   const logs = [];
   // home v2 sources default to nothing real: no scan of this machine's logs, no omp/gh on PATH
   const app = createApp({ configDir, tmux: [process.execPath, FAKE], log: (l) => logs.push(l), pollMs: 40, pasteEnterDelayMs: 0,
-    spendRoots: {}, updatesFile: path.join(root, 'no-status.json'), gitSync: null, gitSyncFile: path.join(root, 'no-git-sync.json'), omp: [process.execPath, '-e', 'process.exit(1)'], gh: [process.execPath, '-e', 'process.exit(1)'], ...opts });
+    spendRoots: {}, updatesFile: path.join(root, 'no-status.json'), gitSync: null, gitSyncFile: path.join(root, 'no-git-sync.json'), omp: [process.execPath, '-e', 'process.exit(1)'], gh: [process.execPath, '-e', 'process.exit(1)'],
+    ompSessionsRoot: path.join(root, 'omp-sessions'), instabox: [process.execPath, '-e', 'process.exit(1)'], instaboxKey: null, ...opts });
   const port = await app.listen(0, '127.0.0.1');
   const ctx = { app, port, logs, root, configDir };
   ctx.req = (method, p, o = {}) => request(port, method, p, o);
@@ -2528,7 +2529,7 @@ const FIXDIR = path.join(here, 'fixtures', 'home');
 const FIX = (f) => path.join(FIXDIR, f);
 const fixJson = (f) => JSON.parse(fs.readFileSync(FIX(f), 'utf8'));
 const GH = fixJson('gh.json');
-const GIT_NULL = { behind: null, ahead: null, dirty: null, branch: null, syncedAt: null, error: null }; // projects[].git with no git-sync.json entry
+const GIT_NULL = { behind: null, ahead: null, dirty: null, branch: null, syncedAt: null, error: null, autoUpdated: false, autoSkip: null }; // projects[].git with no git-sync.json entry
 const T0 = 1792956700000; // 2026-10-25T19:31:40Z, two minutes after the recorded omp fetch
 // one fake for omp, gh and git: logs its argv, answers by the first rule whose key is a substring of the joined argv
 const FAKE_TOOL_SRC = `import fs from 'node:fs'; import path from 'node:path';
@@ -2915,7 +2916,7 @@ test('codex reset: every omp answer maps to a result and a Vietnamese message', 
 
 test('GET /api/home: the whole shape from omp, logs, gh and status.json; box timer estimate', () => homeApp(async (c) => {
   const h = await c.warm((x) => x.accounts[3]?.resets.target && x.totals.spend && !x.projects[0].loading); // every part has landed
-  assert.deepEqual(Object.keys(h), ['generatedAt', 'box', 'accounts', 'totals', 'projects', 'updates']);
+  assert.deepEqual(Object.keys(h), ['generatedAt', 'box', 'accounts', 'totals', 'projects', 'updates', 'omp']);
   assert.equal(h.generatedAt, new Date(c.clock.t).toISOString());
   assert.deepEqual(h.box, { state: 'running', sleepsAt: new Date(T0 + 480 * 60e3).toISOString(), ...BOX, source: 'estimate' });
   assert.deepEqual(h.accounts.map((a) => a.id), ['anthropic/1', 'anthropic/2', 'anthropic/3', 'openai-codex/4']);
@@ -2927,7 +2928,7 @@ test('GET /api/home: the whole shape from omp, logs, gh and status.json; box tim
   assert.deepEqual(h.totals.byHarness.map((x) => x.harness), ['claude', 'codex']);
   // the newest run is a failed PR gate: the deploy line is the newest run of the workflow whose FILE is deploy.yml ("Ship it")
   const ship = { workflow: 'Ship it', status: 'success', at: '2026-10-25T19:10:00Z', url: 'https://github.com/owner/repo/actions/runs/7' };
-  assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: 'owner/repo', branch: 'main', prs: prsOf(GH.prs), lastRun: ship, git: GIT_NULL })));
+  assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: 'owner/repo', branch: 'main', prs: prsOf(GH.prs), lastRun: ship, git: GIT_NULL, staging: null })));
   assert.deepEqual(Object.keys(h.updates), ['omp', 'claude', 'codex']);
   assert.ok(!JSON.stringify(h).includes('github-work')); // the remote URL never leaves the server
   // box: a tick more than 90 s late is a resume; regular ticks are not
@@ -2969,7 +2970,7 @@ test('GET /api/home partial failure: omp, gh or the logs down -> that part empty
   fs.rmSync(c.roots.dirs.claude, { recursive: true }); // one log source gone
   let h = await c.homeUntil((x) => x.totals.spend && !x.projects[0].loading); // the spend scan and gh have answered
   assert.deepEqual(h.accounts, []);
-  assert.deepEqual(h.projects[0], { name: 'alpha', repo: 'owner/repo', branch: 'main', prs: null, lastRun: null, git: GIT_NULL });
+  assert.deepEqual(h.projects[0], { name: 'alpha', repo: 'owner/repo', branch: 'main', prs: null, lastRun: null, git: GIT_NULL, staging: null });
   assert.equal(h.totals.spend.last30.usd, 0.2897); // omp + Codex logs; Claude Code logs gone
   assert.ok(h.box.sleepsAt && h.updates.omp);
   // omp back: fresh; omp down again after the TTL: the last accounts, marked stale
@@ -3057,7 +3058,7 @@ test('GET /api/home never waits long: a slow part is empty the first time, then 
   let h = await c.home();
   assert.ok(Date.now() - t0 < 1200, `took ${Date.now() - t0} ms`); // homeWaitMs 300 per part, in parallel
   assert.deepEqual(h.accounts, []); // not ready yet: empty, the rest answers (box, updates; spend if its scan was quick)
-  assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: null, branch: null, prs: null, lastRun: null, loading: true, git: GIT_NULL })));
+  assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: null, branch: null, prs: null, lastRun: null, loading: true, git: GIT_NULL, staging: null })));
   assert.ok('spend' in h.totals && Array.isArray(h.totals.byHarness) && h.box && h.updates.omp);
   h = await c.homeUntil((x) => x.accounts.length === 4 && x.projects[0].repo && x.totals.spend);
   c.clock.t += 121e3; // both TTLs over, both tools still slow: the cached parts at once
@@ -3543,9 +3544,13 @@ const gitFile = () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-gs
 
 test('parseGitSync: field mapping; wrong types, a broken file or a non-object are null on their own, never a throw', () => {
   const m = parseGitSync(fs.readFileSync(FIX('git-sync.json'), 'utf8'));
-  assert.deepEqual([...m.keys()], ['alpha', 'my.proj', 'odd']);
-  assert.deepEqual(m.get('alpha'), { behind: 3, ahead: 0, dirty: true, branch: 'main', syncedAt: '2026-10-25T19:29:00.000Z', error: null });
-  assert.deepEqual(m.get('my.proj'), { behind: 0, ahead: 2, dirty: false, branch: 'feature/x', syncedAt: '2026-10-25T19:00:00.000Z', error: 'fetch failed: could not resolve host' }); // behind 0 stays 0
+  assert.deepEqual([...m.keys()], ['alpha', 'my.proj', 'odd', 'old-script']);
+  assert.deepEqual(m.get('alpha'), { behind: 3, ahead: 0, dirty: true, branch: 'main', syncedAt: '2026-10-25T19:29:00.000Z', error: null, autoUpdated: false, autoSkip: 'dirty' });
+  assert.deepEqual(m.get('my.proj'), { behind: 0, ahead: 2, dirty: false, branch: 'feature/x', syncedAt: '2026-10-25T19:00:00.000Z', error: 'fetch failed: could not resolve host', autoUpdated: true, autoSkip: null }); // behind 0 stays 0
+  // an entry of an older script has neither field: false / null
+  assert.deepEqual(m.get('old-script'), { behind: 1, ahead: 0, dirty: false, branch: 'main', syncedAt: '2026-10-25T19:10:00.000Z', error: null, autoUpdated: false, autoSkip: null });
+  for (const s of ['in_progress', 'on_branch', 'dirty', 'ahead', 'filters', 'busy', 'late', 'ff_failed']) assert.equal(parseGitSync(JSON.stringify({ projects: { a: { autoSkip: s } } })).get('a').autoSkip, s);
+  assert.deepEqual(parseGitSync('{"projects":{"a":{"autoUpdated":1,"autoSkip":["dirty"]}}}').get('a'), { ...GIT_NULL });
   // 'odd': every field of the wrong type, one by one
   assert.deepEqual(m.get('odd'), GIT_NULL);
   for (const bad of ['', '{', 'null', '[]', '"x"', '{"projects":null}', '{"projects":[]}', '{"projects":"x"}', '{"updatedAt":"x"}']) assert.equal(parseGitSync(bad).size, 0, bad);
@@ -3565,7 +3570,7 @@ test('GET /api/home projects[].git: from git-sync.json; no file, a broken file o
       fs.writeFileSync(g.file, '{"projects": {broken');
       assert.deepEqual(await gits(), [GIT_NULL, GIT_NULL]);
       fs.writeFileSync(g.file, JSON.stringify({ updatedAt: 'x', projects: { alpha: { branch: 'main', dirty: true, behindDefault: 4, aheadOfOrigin: 1, lastFetchAt: '2026-10-25T19:29:00Z', error: null } } }));
-      assert.deepEqual(await gits(), [{ behind: 4, ahead: 1, dirty: true, branch: 'main', syncedAt: '2026-10-25T19:29:00.000Z', error: null }, GIT_NULL]); // my.proj is not in the file
+      assert.deepEqual(await gits(), [{ behind: 4, ahead: 1, dirty: true, branch: 'main', syncedAt: '2026-10-25T19:29:00.000Z', error: null, autoUpdated: false, autoSkip: null }, GIT_NULL]); // my.proj is not in the file
       const h = await c.warm((x) => !x.projects[0].loading); // the cached projects part carries the file's values as well, never stale ones
       assert.equal(h.projects[0].repo, 'owner/repo');
       assert.deepEqual(h.projects[0].git.behind, 4);
@@ -3774,5 +3779,471 @@ test('open fresh: an open while a sync still runs (even past an earlier open\'s 
       assert.ok(s.alive(pid));
       assert.equal(logsOf(c).length, 1); // the warning is once per sync
     }, { gitSync: s.spec, gitSyncMs: 2500 });
+  } finally { s.cleanup(); }
+});
+
+// ======================= v1.3.2: omp sessions of a project, format guard, staging box =======================
+const OMPFIX = path.join(here, 'fixtures', 'omp-sessions');
+const ID = { a: 'aaaaaaaa-1111-7000-8000-000000000001', b: 'bbbbbbbb-2222-7000-8000-000000000002', c: 'cccccccc-3333-7000-8000-000000000003', d: 'dddddddd-4444-7000-8000-000000000004', e: 'eeeeeeee-5555-7000-8000-000000000005' };
+const ompDirOf = (c, dir = ABS) => path.join(c.root, 'omp-sessions', ompDirName(dir));
+// the fixture tree in the project's encoded dir; mtimes follow the fixture names (a oldest ... e newest)
+function ompTree(c, dir = ABS) {
+  const d = ompDirOf(c, dir);
+  fs.mkdirSync(d, { recursive: true });
+  let t = 1_700_000_000;
+  for (const f of fs.readdirSync(OMPFIX).sort()) {
+    fs.copyFileSync(path.join(OMPFIX, f), path.join(d, f));
+    if (f.endsWith('.jsonl')) fs.utimesSync(path.join(d, f), t += 1000, t);
+  }
+  return d;
+}
+const ompGet = (c, cookie, project = 'alpha') => c.req('GET', `/api/projects/${encodeURIComponent(project)}/omp-sessions`, { cookie });
+const resumeReq = (c, cookie, id, project = 'alpha') => c.req('POST', `/api/projects/${encodeURIComponent(project)}/omp-sessions/${id}/resume`, { cookie });
+const newSessions = (c) => c.calls().filter((x) => x.argv[0] === 'new-session');
+
+test('ompDirName: omp\'s encoding of a project dir (abs, under home, home itself, under tmp)', { skip: process.platform === 'win32' && 'POSIX paths' }, () => {
+  assert.equal(ompDirName('/data/workspace/deal-sync', '/data/home', '/tmp'), '--data-workspace-deal-sync--');
+  assert.equal(ompDirName('/data/home/Desktop/Project BD/deal-sync', '/data/home', '/tmp'), '-Desktop-Project BD-deal-sync');
+  assert.equal(ompDirName('/data/home', '/data/home', '/tmp'), '-');
+  assert.equal(ompDirName('/tmp/pc-it-run-1', '/data/home', '/tmp'), '-tmp-pc-it-run-1');
+  assert.equal(ompDirName('/tmp', '/data/home', '/tmp'), '-tmp');
+  assert.equal(ompDirName('/data/homework/x', '/data/home', '/tmp'), '--data-homework-x--'); // a sibling is not "under home"
+});
+
+test('ompHead: title line, header title, header first, empty, unknown version, garbage; only the first bytes matter', () => {
+  const rd = (f) => { const b = fs.readFileSync(path.join(OMPFIX, f)); return ompHead(b.subarray(0, 4096), b.length); };
+  const name = (id) => fs.readdirSync(OMPFIX).find((f) => f.endsWith(`${id}.jsonl`));
+  assert.deepEqual(rd(name(ID.a)), { title: 'Fix the login bug', version: 3, cwd: '/data/workspace/demo', empty: false });
+  assert.equal(rd(name(ID.b)).title, 'Title from the header');
+  assert.equal(rd(name(ID.c)).empty, true);
+  assert.equal(rd(name(ID.d)).version, 4);
+  assert.equal(rd(name(ID.e)).title, 'Header first, no title line');
+  assert.deepEqual(KNOWN_VERSIONS, [3]);
+  const g = ompHead(Buffer.from('not json\n{"type":"session"}\nmore\n'), 33);
+  assert.equal(g.version, null); // unknown format
+  assert.equal(ompHead(Buffer.from(''), 0).empty, true);
+  // a header without a newline after it: the file ends there = empty
+  const nl = Buffer.from('{"type":"title","title":"t"}\n{"type":"session","version":3,"cwd":"/x"}');
+  assert.deepEqual(ompHead(nl, nl.length), { title: 't', version: 3, cwd: '/x', empty: true });
+});
+
+test('GET omp-sessions: newest first, empty and unknown-format sessions skipped, origin from the sidecar, no message body', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  assert.deepEqual((await ompGet(c, cookie)).json, { ok: true, sessions: [] }); // no dir yet
+  ompTree(c);
+  const r = await ompGet(c, cookie);
+  assert.equal(r.status, 200, r.text);
+  assert.deepEqual(r.json.sessions.map((s) => [s.id, s.title, s.origin]), [
+    [ID.e, 'Header first, no title line', 'box'],
+    [ID.b, 'Title from the header', 'laptop'],
+    [ID.a, 'Fix the login bug', 'box'],
+  ]);
+  assert.deepEqual(r.json.sessions.map((s) => s.updatedAt), [1_700_005_000, 1_700_002_000, 1_700_001_000].map((s) => new Date(s * 1000).toISOString())); // the file's mtime, ISO UTC
+  assert.ok(!r.text.includes('SECRET-BODY'));
+  assert.deepEqual(Object.keys(r.json.sessions[0]), ['id', 'title', 'updatedAt', 'origin']);
+}));
+
+test('GET omp-sessions: at most 10; a long title is cut at 60 characters and cleaned; nested session files are not listed', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  const d = ompDirOf(c); fs.mkdirSync(d, { recursive: true });
+  const head = (title) => `{"type":"title","v":1,"title":${JSON.stringify(title)},"pad":""}\n{"type":"session","version":3,"cwd":"/x"}\n{"type":"message"}\n`;
+  for (let i = 0; i < 12; i++) {
+    const f = path.join(d, `2026-10-25T10-00-${String(i).padStart(2, '0')}-000Z_${String(i).padStart(8, '0')}-0000-7000-8000-000000000000.jsonl`);
+    fs.writeFileSync(f, head(i === 11 ? `\u001b[1m${'x'.repeat(100)}\nsecond line` : `t${i}`)); fs.utimesSync(f, 1_700_000_000 + i, 1_700_000_000 + i);
+  }
+  fs.mkdirSync(path.join(d, 'nested'));
+  fs.writeFileSync(path.join(d, 'nested', '2026-10-25T10-00-00-000Z_99999999-0000-7000-8000-000000000000.jsonl'), head('nested'));
+  const s = (await ompGet(c, cookie)).json.sessions;
+  assert.equal(s.length, 10);
+  assert.equal(s[0].title, `${'x'.repeat(60)}`);
+  assert.equal(s[1].title, 't10');
+  assert.ok(!s.some((x) => x.title === 'nested'));
+}));
+
+test('omp-sessions: unknown project 404, auth, methods, X-PC', () => withApp(async (c) => {
+  assert.equal((await c.req('GET', '/api/projects/alpha/omp-sessions')).status, 401);
+  const { cookie } = await c.login();
+  const r = await ompGet(c, cookie, 'nope');
+  assert.deepEqual([r.status, r.json], [404, { ok: false, error: 'unknown_project' }]);
+  for (const p of ['__proto__', '..', '%E0%A4%A', 'alpha/../nope']) assert.equal((await c.req('GET', `/api/projects/${p}/omp-sessions`, { cookie })).status === 404, true, p);
+  assert.equal((await c.req('POST', '/api/projects/alpha/omp-sessions', { cookie, body: {} })).status, 405);
+  assert.equal((await c.req('GET', `/api/projects/alpha/omp-sessions/${ID.a}/resume`, { cookie })).status, 405);
+  assert.equal((await c.req('POST', `/api/projects/alpha/omp-sessions/${ID.a}/resume`, { cookie, pc: false })).status, 403);
+  assert.equal((await c.req('POST', `/api/projects/nope/omp-sessions/${ID.a}/resume`, { cookie })).json.error, 'unknown_project');
+  assert.equal(newSessions(c).length, 0);
+}));
+
+test('POST resume: omp -r <id> in the project dir with the harness env, tmux name <project>-omp-r-<id8>, reused the second time', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  ompTree(c);
+  const r = await resumeReq(c, cookie, ID.a);
+  assert.deepEqual([r.status, r.json], [200, { ok: true, session: 'alpha-omp-r-00000001' }]);
+  const [n] = newSessions(c);
+  assert.deepEqual(n.argv, ['new-session', '-d', '-s', 'alpha-omp-r-00000001', '-c', ABS, `${LAUNCH}omp -r '${ID.a}'`]);
+  const st = JSON.parse(fs.readFileSync(fakeState(c), 'utf8')).sessions['alpha-omp-r-00000001'];
+  assert.deepEqual([st.opts['@pc_project'], st.opts['@pc_harness']], ['alpha', 'omp']);
+  const again = await resumeReq(c, cookie, ID.a);
+  assert.deepEqual(again.json, { ok: true, session: 'alpha-omp-r-00000001' });
+  assert.equal(newSessions(c).length, 1); // reused, nothing new
+  assert.equal((await resumeReq(c, cookie, ID.b, 'my.proj')).json.session, 'my-proj-omp-r-00000002');
+  // the session list shows it as an omp session of the project
+  const l = (await c.req('GET', '/api/sessions', { cookie })).json.sessions.find((x) => x.name === 'alpha-omp-r-00000001');
+  assert.deepEqual([l.project, l.harness], ['alpha', 'omp']);
+  const two = await Promise.all([resumeReq(c, cookie, ID.e), resumeReq(c, cookie, ID.e)]); // concurrent: one session
+  assert.deepEqual(two.map((x) => x.json.session), ['alpha-omp-r-00000005', 'alpha-omp-r-00000005']);
+  assert.equal(newSessions(c).filter((x) => x.argv[3] === 'alpha-omp-r-00000005').length, 1);
+}));
+
+test('POST resume: a long project name is shortened, the id part never; the name stays <= 32 characters', () => {
+  const long = 'a-very-long-project-name-of-forty-chars-x';
+  return withApp(async (c) => {
+    const { cookie } = await c.login();
+    ompTree(c);
+    const r = await resumeReq(c, cookie, ID.a, long);
+    assert.equal(r.status, 200, r.text);
+    assert.ok(r.json.session.length <= 32 && r.json.session.endsWith('-omp-r-00000001'), r.json.session);
+  }, { config: { projects: { [long]: ABS } } });
+});
+
+test('POST resume: unknown or malformed ids and traversal attempts -> 404 unknown_session, nothing is started', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  const d = ompTree(c);
+  fs.mkdirSync(path.join(d, 'sub'), { recursive: true });
+  const bad = ['00000000-0000-7000-8000-000000000000', 'abc', 'AAAAAAAA-1111-7000-8000-000000000001', `${ID.a}x`, '..%2f..%2fetc%2fpasswd', '%2e%2e%2f%2e%2e%2fx',
+    'aaaaaaaa%2f..', 'sub', ID.a.slice(0, 8), 'a'.repeat(65), '%00', ID.a + '%00', '%zz', 'aaaaaaaa-1111;touch%20x', `${ID.a}%5c..`, `2026-10-25T10-00-00-000Z_${ID.a}`];
+  for (const id of bad) {
+    const r = await c.req('POST', `/api/projects/alpha/omp-sessions/${id}/resume`, { cookie });
+    assert.deepEqual([id, r.status, r.json], [id, 404, { ok: false, error: 'unknown_session' }]);
+  }
+  for (const id of ['..', '%2e%2e', '.', '../..']) { // dot segments never reach the route (the URL is normalised): still a 404, still nothing started
+    assert.equal((await c.req('POST', `/api/projects/alpha/omp-sessions/${id}/resume`, { cookie })).status, 404, id);
+  }
+  // an id that exists only in another project's dir (a different encoded dir) is not found either
+  const other = path.join(c.root, 'project-two'); fs.mkdirSync(other);
+  const od = ompDirOf(c, other); fs.mkdirSync(od, { recursive: true });
+  fs.copyFileSync(path.join(OMPFIX, fs.readdirSync(OMPFIX).find((f) => f.endsWith(`${ID.a}.jsonl`))), path.join(od, `2026-10-25T10-00-00-000Z_${ID.a}.jsonl`));
+  fs.rmSync(path.join(d, fs.readdirSync(d).find((f) => f.endsWith(`${ID.a}.jsonl`))));
+  assert.equal(newSessions(c).length, 0);
+  assert.equal((await resumeReq(c, cookie, ID.a)).status, 404);
+}));
+
+test('POST resume: omp that cannot start the session -> 500 harness_exited (nothing is left behind)', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  ompTree(c);
+  process.env.FAKE_TMUX_EXIT = '1';
+  try { assert.equal((await resumeReq(c, cookie, ID.a)).status, 500); } finally { delete process.env.FAKE_TMUX_EXIT; }
+  assert.equal((await resumeReq(c, cookie, ID.a)).status, 200);
+}));
+
+// the omp format guard: GET /api/home omp: {version, formatOk, reason}
+const stubDir = () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-stub-'));
+  fs.writeFileSync(path.join(dir, 'omp.mjs'), `import fs from 'node:fs'; fs.appendFileSync(${JSON.stringify(path.join(dir, 'omp.log'))}, process.argv.slice(2).join(' ') + '\\n');
+if (process.argv[2] === '--version') console.log('omp/18.12.6'); else process.exit(1);\n`);
+  fs.writeFileSync(path.join(dir, 'instabox.mjs'), `import fs from 'node:fs';
+const d = ${JSON.stringify(dir)}, a = process.argv.slice(2);
+fs.appendFileSync(d + '/instabox.log', JSON.stringify({ argv: a, key: process.env.INSTABOX_API_KEY ?? null }) + '\\n');
+if (a[0] === 'ls') { if (fs.existsSync(d + '/ls-fail')) process.exit(2); process.stdout.write(fs.readFileSync(d + '/ls.json', 'utf8')); }
+else if (a[0] === 'start') setTimeout(() => process.exit(fs.existsSync(d + '/start-fail') ? 3 : 0), 400); // a start takes a moment\n`);
+  fs.writeFileSync(path.join(dir, 'ls.json'), '[]');
+  return {
+    dir, omp: [process.execPath, path.join(dir, 'omp.mjs')], instabox: [process.execPath, path.join(dir, 'instabox.mjs')],
+    ls: (boxes) => fs.writeFileSync(path.join(dir, 'ls.json'), JSON.stringify(boxes)),
+    calls: () => { try { return fs.readFileSync(path.join(dir, 'instabox.log'), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } },
+    ompCalls: () => { try { return fs.readFileSync(path.join(dir, 'omp.log'), 'utf8').trim().split('\n').filter(Boolean); } catch { return []; } },
+    cleanup: () => fs.rmSync(dir, { recursive: true, force: true }),
+  };
+};
+const homeOmp = async (c, cookie) => { await c.app.homeIdle(); return (await c.req('GET', '/api/home', { cookie })).json.omp; };
+
+test('omp format guard: known versions -> formatOk true with the omp version; a version 4 header -> false, unknown_version:4; the sessions list skips it', async () => {
+  const s = stubDir();
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      assert.deepEqual(await homeOmp(c, cookie), { version: '18.12.6', formatOk: true, reason: null }); // no sessions at all
+      assert.deepEqual(Object.keys((await c.req('GET', '/api/home', { cookie })).json).slice(-2), ['updates', 'omp']);
+    }, { omp: s.omp });
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      ompTree(c);
+      const g = await homeOmp(c, cookie);
+      assert.deepEqual(g, { version: '18.12.6', formatOk: false, reason: 'unknown_version:4' });
+      assert.ok(!(await ompGet(c, cookie)).json.sessions.some((x) => x.id === ID.d));
+      assert.deepEqual(s.ompCalls().filter((x) => x === '--version').length >= 1, true);
+    }, { omp: s.omp });
+  } finally { s.cleanup(); }
+});
+
+test('omp format guard: an unreadable header, and a project session sitting outside the encoded dir (omp renamed its dirs), are alarms; known formats are not', async () => {
+  const s = stubDir();
+  try {
+    await withApp(async (c) => { // only the newest 20 headers are looked at, whatever else lies below
+      const { cookie } = await c.login();
+      const d = ompDirOf(c); fs.mkdirSync(d, { recursive: true });
+      fs.writeFileSync(path.join(d, `2026-10-25T10-00-00-000Z_${ID.a}.jsonl`), `{"type":"title","title":"x"}\n{"type":"session","version":3,"cwd":${JSON.stringify(ABS)}}\n{"type":"message"}\n`);
+      assert.equal((await homeOmp(c, cookie)).formatOk, true);
+    }, { omp: s.omp });
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      const d = ompDirOf(c); fs.mkdirSync(d, { recursive: true });
+      const bad = path.join(d, `2026-10-25T10-00-00-000Z_${ID.a}.jsonl`);
+      fs.writeFileSync(bad, 'this is not json\n{"type":"session"}\n{"type":"message"}\n'); fs.utimesSync(bad, 1_700_000_000, 1_700_000_000);
+      assert.deepEqual(await homeOmp(c, cookie), { version: '18.12.6', formatOk: false, reason: 'no_header' });
+    }, { omp: s.omp });
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      const d = path.join(c.root, 'omp-sessions', 'some-other-name'); fs.mkdirSync(d, { recursive: true }); // not what ompDirName gives for ABS
+      fs.writeFileSync(path.join(d, `2026-10-25T10-00-00-000Z_${ID.a}.jsonl`), `{"type":"title","title":"x"}\n{"type":"session","version":3,"cwd":${JSON.stringify(ABS)}}\n{"type":"message"}\n`);
+      assert.deepEqual(await homeOmp(c, cookie), { version: '18.12.6', formatOk: false, reason: 'dir_rule' });
+    }, { omp: s.omp });
+    await withApp(async (c) => { // omp missing: version null, and no alarm by itself
+      const { cookie } = await c.login();
+      assert.deepEqual(await homeOmp(c, cookie), { version: null, formatOk: true, reason: null });
+    }, { omp: [path.join(s.dir, 'no-such-omp')] });
+  } finally { s.cleanup(); }
+});
+
+test('omp format guard: checked at most every 10 min (one omp --version per window), again after it', async () => {
+  const s = stubDir();
+  const clock = { t: 1_700_000_000_000 };
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      await homeOmp(c, cookie); await homeOmp(c, cookie);
+      assert.equal(s.ompCalls().filter((x) => x === '--version').length, 1);
+      clock.t += 9 * 60e3; await homeOmp(c, cookie);
+      assert.equal(s.ompCalls().filter((x) => x === '--version').length, 1);
+      clock.t += 2 * 60e3; await homeOmp(c, cookie); await c.app.homeIdle(); await homeOmp(c, cookie);
+      assert.equal(s.ompCalls().filter((x) => x === '--version').length, 2);
+    }, { omp: s.omp, now: () => clock.t });
+  } finally { s.cleanup(); }
+});
+
+// staging box: projects[].staging and POST /api/projects/<name>/staging/start
+const BOXES = [
+  { name: 'alpha', desiredState: 'suspended', state: 'suspended', updatedAt: '2026-10-26T07:40:41.143075Z', extra: { token: 'x' } },
+  { name: 'my.proj', desiredState: 'running', state: 'suspended', updatedAt: '2026-10-26T07:41:00Z' },
+  { name: 'other', desiredState: 'running', state: 'running', updatedAt: '2026-10-26T03:18:19.3925Z' },
+];
+const stagingOf = async (c, cookie) => { await c.app.homeIdle(); return (await c.req('GET', '/api/home', { cookie })).json.projects.map((p) => p.staging); };
+
+test('parseStaging: states from instabox ls --json; unknown values, a box asked to run but not running, bad rows', () => {
+  const m = parseStaging([
+    { name: 'a', state: 'running', desiredState: 'running', updatedAt: '2026-10-26T03:18:19.3925Z' }, { name: 'b', state: 'suspended', desiredState: 'suspended' },
+    { name: 'c', state: 'stopped', desiredState: 'stopped' }, { name: 'd', state: 'suspended', desiredState: 'running' }, { name: 'e', state: 'weird', desiredState: 'weird' },
+    { name: 'f', state: 'starting' }, { state: 'running' }, null, 'x', { name: 'g' },
+  ]);
+  assert.deepEqual([...m], [
+    ['a', { state: 'running', updatedAt: '2026-10-26T03:18:19.392Z' }], ['b', { state: 'suspended', updatedAt: null }], ['c', { state: 'stopped', updatedAt: null }],
+    ['d', { state: 'starting', updatedAt: null }], ['e', { state: 'unknown', updatedAt: null }], ['f', { state: 'starting', updatedAt: null }], ['g', { state: 'unknown', updatedAt: null }],
+  ]);
+  assert.equal(parseStaging('nope').size, 0);
+});
+
+test('GET /api/home projects[].staging: {state, updatedAt} from instabox ls --json (30 s cache); a missing box is null; nothing else of the box leaks', async () => {
+  const s = stubDir();
+  const clock = { t: 1_700_000_000_000 };
+  try {
+    s.ls(BOXES);
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      const st = await stagingOf(c, cookie);
+      assert.deepEqual(st, [{ state: 'suspended', updatedAt: '2026-10-26T07:40:41.143Z' }, { state: 'starting', updatedAt: '2026-10-26T07:41:00.000Z' }]);
+      assert.ok(!JSON.stringify((await c.req('GET', '/api/home', { cookie })).json).includes('"extra"'));
+      assert.deepEqual(s.calls().map((x) => [x.argv.join(' '), x.key]), [['ls --json', 'ibk_test']]);
+      await stagingOf(c, cookie);
+      assert.equal(s.calls().length, 1); // cached
+      s.ls([{ name: 'alpha', desiredState: 'running', state: 'running', updatedAt: '2026-10-26T08:00:00Z' }]);
+      clock.t += 31e3; await c.req('GET', '/api/home', { cookie }); // a stale value is served at once and refreshed behind
+      await c.app.homeIdle();
+      assert.equal(s.calls().length, 2);
+      assert.deepEqual(await stagingOf(c, cookie), [{ state: 'running', updatedAt: '2026-10-26T08:00:00.000Z' }, null]);
+      fs.writeFileSync(path.join(s.dir, 'ls-fail'), '');
+      clock.t += 31e3; await c.req('GET', '/api/home', { cookie }); await c.app.homeIdle();
+      assert.equal(s.calls().length, 3);
+      assert.deepEqual((await stagingOf(c, cookie))[0].state, 'running'); // ls failing: the last good answer stays
+    }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t });
+    fs.rmSync(path.join(s.dir, 'ls-fail'), { force: true });
+    await withApp(async (c) => { // ls fails from the start: every staging is null, no error
+      const { cookie } = await c.login();
+      fs.writeFileSync(path.join(s.dir, 'ls-fail'), '');
+      assert.deepEqual(await stagingOf(c, cookie), [null, null]);
+    }, { instabox: s.instabox, instaboxKey: 'ibk_test' });
+  } finally { s.cleanup(); }
+});
+
+test('staging without a key: every staging is null and instabox is never run; start answers 409 no_instabox_key', async () => {
+  const s = stubDir();
+  try {
+    s.ls(BOXES);
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      assert.deepEqual(await stagingOf(c, cookie), [null, null]);
+      const r = await c.req('POST', '/api/projects/alpha/staging/start', { cookie });
+      assert.deepEqual([r.status, r.json], [409, { ok: false, error: 'no_instabox_key' }]);
+      assert.equal((await c.req('POST', '/api/projects/nope/staging/start', { cookie })).json.error, 'unknown_project');
+      assert.equal(s.calls().length, 0);
+    }, { instabox: s.instabox, instaboxKey: null });
+  } finally { s.cleanup(); }
+});
+
+test('POST staging/start: instabox start <box> --no-wait, detached, answered at once; a running or missing box is not started; never stop/rm/create/snapshot/fork', async () => {
+  const s = stubDir();
+  try {
+    s.ls(BOXES);
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      assert.equal((await c.req('POST', '/api/projects/alpha/staging/start', { pc: false, cookie })).status, 403);
+      assert.equal((await c.req('GET', '/api/projects/alpha/staging/start', { cookie })).status, 405);
+      const r = await c.req('POST', '/api/projects/alpha/staging/start', { cookie });
+      assert.deepEqual([r.status, r.json], [200, { ok: true, state: 'starting' }]);
+      assert.ok(await until(() => s.calls().some((x) => x.argv[0] === 'start')));
+      const start = s.calls().find((x) => x.argv[0] === 'start');
+      assert.deepEqual(start, { argv: ['start', 'alpha', '--no-wait'], key: 'ibk_test' });
+      // already starting (desired state running): left alone
+      const before = s.calls().filter((x) => x.argv[0] === 'start').length;
+      assert.deepEqual((await c.req('POST', '/api/projects/my.proj/staging/start', { cookie })).json, { ok: true, state: 'starting' });
+      s.ls([{ name: 'alpha', desiredState: 'running', state: 'running', updatedAt: '2026-10-26T08:00:00Z' }]);
+      assert.deepEqual((await c.req('POST', '/api/projects/alpha/staging/start', { cookie })).json, { ok: true, state: 'running' });
+      assert.equal(s.calls().filter((x) => x.argv[0] === 'start').length, before);
+      const none = await c.req('POST', '/api/projects/my.proj/staging/start', { cookie }); // not in the listing any more
+      assert.deepEqual([none.status, none.json], [404, { ok: false, error: 'no_staging_box' }]);
+      assert.ok(s.calls().every((x) => ['ls', 'start'].includes(x.argv[0])));
+      assert.ok(!c.logs.join('\n').includes('ibk_test'));
+    }, { instabox: s.instabox, instaboxKey: 'ibk_test' });
+  } finally { s.cleanup(); }
+});
+
+test('POST staging/start: a failing start logs one line (no key); ls down with nothing known -> 503 staging_unavailable; two taps at once start once', async () => {
+  const s = stubDir();
+  try {
+    s.ls(BOXES);
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      fs.writeFileSync(path.join(s.dir, 'start-fail'), '');
+      const two = await Promise.all([1, 2].map(() => c.req('POST', '/api/projects/alpha/staging/start', { cookie })));
+      assert.deepEqual(two.map((r) => [r.status, r.json.state]), [[200, 'starting'], [200, 'starting']]);
+      assert.ok(await until(() => c.logs.includes('staging-start alpha: exit 3')));
+      assert.equal(s.calls().filter((x) => x.argv[0] === 'start').length, 1);
+      assert.deepEqual(c.logs.filter((l) => l.startsWith('staging-start')), ['staging-start alpha: exit 3']);
+      assert.ok(!c.logs.join('\n').includes('ibk_test'));
+    }, { instabox: s.instabox, instaboxKey: 'ibk_test' });
+    fs.writeFileSync(path.join(s.dir, 'ls-fail'), '');
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      const r = await c.req('POST', '/api/projects/alpha/staging/start', { cookie });
+      assert.deepEqual([r.status, r.json], [503, { ok: false, error: 'staging_unavailable' }]);
+      assert.equal(s.calls().filter((x) => x.argv[0] === 'start').length, 1); // only the first app's
+    }, { instabox: s.instabox, instaboxKey: 'ibk_test' });
+  } finally { s.cleanup(); }
+});
+
+test('the instabox key is taken out of the server\'s environment (tmux and the harnesses never inherit it) and still works for instabox', async () => {
+  const s = stubDir();
+  try {
+    s.ls(BOXES);
+    await withEnv({ INSTABOX_API_KEY: 'ibk_env' }, async () => {
+      await withApp(async (c) => {
+        assert.equal(process.env.INSTABOX_API_KEY, undefined);
+        const { cookie } = await c.login();
+        assert.deepEqual((await stagingOf(c, cookie))[0].state, 'suspended');
+        assert.equal(s.calls()[0].key, 'ibk_env');
+        await c.req('POST', '/api/projects/alpha/staging/start', { cookie });
+        assert.ok(await until(() => s.calls().some((x) => x.argv[0] === 'start')));
+        assert.equal(s.calls().find((x) => x.argv[0] === 'start').key, 'ibk_env');
+      }, { instabox: s.instabox, instaboxKey: undefined });
+    });
+  } finally { s.cleanup(); }
+});
+
+test('install.sh start.sh: INSTABOX_API_KEY alone is read, as text, from instabox.env; nothing is sourced', { skip: process.platform === 'win32' && 'POSIX sh' }, () => {
+  const install = fs.readFileSync(path.join(here, '..', 'install.sh'), 'utf8');
+  const m = /cat > "\$APP\/start\.sh" <<'START'\r?\n([\s\S]*?)\r?\nSTART\r?\n/.exec(install);
+  assert.ok(m, 'start.sh not found in install.sh');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-start-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'start.sh'), `${m[1]}\n`);
+    const probe = [process.execPath, '-e', 'console.log(JSON.stringify([process.env.INSTABOX_API_KEY ?? null, process.env.OTHER_SECRET ?? null, process.env.GH_TOKEN ?? null]))'];
+    const env = { PATH: process.env.PATH, FCODE_SECRETS_ENV: path.join(dir, 'none'), FCODE_INSTABOX_ENV: path.join(dir, 'instabox.env') };
+    const run = (file, e = env) => { if (file !== null) fs.writeFileSync(path.join(dir, 'instabox.env'), file); return spawnSync('/bin/sh', [path.join(dir, 'start.sh'), ...probe], { encoding: 'utf8', env: e }).stdout.trim(); };
+    assert.equal(run('export INSTABOX_API_KEY=ibk_abc-123.x_y\n'), '["ibk_abc-123.x_y",null,null]');
+    assert.equal(run('export OTHER_SECRET=zz\nexport INSTABOX_API_KEY=ibk_abc\necho noise\n'), '["ibk_abc",null,null]'); // only that variable
+    assert.equal(run('export INSTABOX_API_KEY="ibk_q"\r\n'), '["ibk_q",null,null]');
+    assert.equal(run("export INSTABOX_API_KEY='ibk_s'\n"), '["ibk_s",null,null]');
+    assert.equal(run('# no key here\nexport OTHER_SECRET=zz\n'), '[null,null,null]');
+    assert.equal(run(`export INSTABOX_API_KEY=$(touch ${path.join(dir, 'pwned')})\n`), '[null,null,null]'); // not a key: dropped, and never run
+    assert.equal(run('export INSTABOX_API_KEY=ibk_a;touch pwned2\n'), '[null,null,null]');
+    assert.equal(run('export INSTABOX_API_KEY=`touch x`\n'), '[null,null,null]');
+    assert.equal(run('export INSTABOX_API_KEY=\n'), '[null,null,null]');
+    assert.ok(!fs.existsSync(path.join(dir, 'pwned')) && !fs.existsSync(path.join(dir, 'pwned2')) && !fs.existsSync(path.join(dir, 'x')));
+    assert.equal(run(null, { ...env, FCODE_INSTABOX_ENV: path.join(dir, 'missing') }), '[null,null,null]'); // no file: starts without it
+    assert.equal(run('export INSTABOX_API_KEY=ibk_file\n', { ...env, INSTABOX_API_KEY: 'mine' }), '["mine",null,null]'); // one already set wins
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+// ---- review round 1 ----
+test('POST resume: ids that share their first 8 digits (UUIDv7 timestamp) get different tmux names; the name ends in the last 8', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  const d = ompDirOf(c); fs.mkdirSync(d, { recursive: true });
+  const A = '01a15f0d-afec-767f-8000-aaaaaaaa1111', B = '01a15f0d-1111-7000-8000-bbbbbbbb2222';
+  for (const id of [A, B]) fs.writeFileSync(path.join(d, `2026-10-21T15-20-49-000Z_${id}.jsonl`), '{"type":"title","title":"t"}\n{"type":"session","version":3,"cwd":"/x"}\n{"type":"message"}\n');
+  const ra = await resumeReq(c, cookie, A), rb = await resumeReq(c, cookie, B);
+  assert.deepEqual([ra.json.session, rb.json.session], ['alpha-omp-r-aaaa1111', 'alpha-omp-r-bbbb2222']);
+  assert.deepEqual(newSessions(c).map((x) => x.argv.at(-1)), [`${LAUNCH}omp -r '${A}'`, `${LAUNCH}omp -r '${B}'`]); // each opens its own conversation
+  assert.equal((await resumeReq(c, cookie, A)).json.session, 'alpha-omp-r-aaaa1111'); // and each is reused for itself
+  assert.equal(newSessions(c).length, 2);
+}));
+
+test('POST resume: a session of an unknown format (header version 4, no header) -> 409 unknown_format, nothing started; known formats still resume', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  const d = ompTree(c);
+  const r = await resumeReq(c, cookie, ID.d);
+  assert.deepEqual([r.status, r.json], [409, { ok: false, error: 'unknown_format' }]);
+  const g = path.join(d, `2026-10-25T15-00-00-000Z_${'f'.repeat(8)}-6666-7000-8000-000000000006.jsonl`);
+  fs.writeFileSync(g, 'garbage\n');
+  assert.equal((await resumeReq(c, cookie, `${'f'.repeat(8)}-6666-7000-8000-000000000006`)).json.error, 'unknown_format');
+  assert.equal(newSessions(c).length, 0);
+  assert.equal((await resumeReq(c, cookie, ID.a)).status, 200); // v3
+  assert.equal((await resumeReq(c, cookie, ID.c)).status, 200); // empty but a known header: it exists, omp decides
+}));
+
+test('POST staging/start decides on a FRESH ls: ls failing after a good cached answer -> 503 staging_unavailable, no start', async () => {
+  const s = stubDir();
+  try {
+    s.ls(BOXES);
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      assert.equal((await stagingOf(c, cookie))[0].state, 'suspended'); // cached
+      fs.writeFileSync(path.join(s.dir, 'ls-fail'), '');
+      const r = await c.req('POST', '/api/projects/alpha/staging/start', { cookie });
+      assert.deepEqual([r.status, r.json], [503, { ok: false, error: 'staging_unavailable' }]);
+      assert.equal(s.calls().filter((x) => x.argv[0] === 'start').length, 0);
+      assert.equal((await stagingOf(c, cookie))[0].state, 'suspended'); // the card keeps its last good value
+      fs.rmSync(path.join(s.dir, 'ls-fail'));
+      assert.equal((await c.req('POST', '/api/projects/alpha/staging/start', { cookie })).status, 200);
+    }, { instabox: s.instabox, instaboxKey: 'ibk_test' });
+  } finally { s.cleanup(); }
+});
+
+test('omp format guard: an empty or title-only file, and a header-less file younger than 30 s, are being created (no alarm); a complete old one with a bad header is', async () => {
+  const s = stubDir();
+  const clock = { t: Date.now() };
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      const d = ompDirOf(c); fs.mkdirSync(d, { recursive: true });
+      const mk = (id, text, age) => { const p = path.join(d, `2026-10-25T10-00-00-000Z_${id}.jsonl`); fs.writeFileSync(p, text); const t = (clock.t - age) / 1000; fs.utimesSync(p, t, t); };
+      mk(ID.a, '', 3600e3); // 0 bytes, old
+      mk(ID.b, '{"type":"title","title":"x"}\n', 3600e3); // title line only, old
+      mk(ID.c, '{"type":"title","title":"x"}\n{"type":"sess', 3600e3); // header cut in the middle, old
+      mk(ID.d, 'garbage line\nmore garbage\n', 5e3); // complete-looking but young: being written
+      assert.deepEqual(await homeOmp(c, cookie), { version: '18.12.6', formatOk: true, reason: null });
+    }, { omp: s.omp, now: () => clock.t });
+    await withApp(async (c) => { // a v4 header counts even in a young or empty file: it is the new format
+      const { cookie } = await c.login();
+      const d = ompDirOf(c); fs.mkdirSync(d, { recursive: true });
+      fs.writeFileSync(path.join(d, `2026-10-25T10-00-00-000Z_${ID.a}.jsonl`), '{"type":"title","title":"x"}\n{"type":"session","version":4,"cwd":"/x"}\n');
+      assert.deepEqual(await homeOmp(c, cookie), { version: '18.12.6', formatOk: false, reason: 'unknown_version:4' });
+    }, { omp: s.omp });
   } finally { s.cleanup(); }
 });
