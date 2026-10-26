@@ -26,7 +26,7 @@ if ($errs.Count) { throw "fcode.ps1 does not parse: $($errs[0].Message)" }
 $wanted = 'Test-WinPath', 'Resolve-OmpPath', 'Get-OmpUnder', 'Join-OmpName', 'Get-OmpEncodedDir', 'ConvertTo-Epoch', 'Convert-OmpCwd', 'ConvertTo-JsonStr',
   'Get-OmpHeaderSpan', 'Open-ShareRead', 'Read-Head', 'Get-OmpBodyOff', 'Test-OmpNonEmpty', 'Get-RangeSha', 'Get-PhienOff', 'Test-PhienPrefix', 'Get-PhienKnownVersions', 'Test-PhienKnownVersion', 'Get-OmpHeaderVersion', 'Get-OmpHeaderInfo', 'Get-PhienVersionNote', 'Get-PhienUnknownNote', 'Get-PhienNoteRx', 'Get-PhienNoteSpecs', 'Invoke-GitQuiet', 'Get-PhienLocalNotes', 'Get-PhienNotePlan', 'Get-PhienNoteStatePath', 'Read-PhienNoteState', 'Write-PhienNoteState', 'Add-PhienNoteExclude', 'Install-PhienNote',
   'Copy-OmpSession', 'Get-OmpBlobRefs', 'Get-OmpBlobIndex', 'Get-PhienLocalScan', 'Compare-PhienFile', 'Get-PhienPlan', 'Install-PhienFile',
-  'Install-PhienTask', 'Remove-PhienTask'
+  'Install-PhienTask', 'Remove-PhienTask', 'New-PhienPartName', 'Get-PhienBoxBlobSet'
 foreach ($fn in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in $wanted }, $true)) { . ([scriptblock]::Create($fn.Extent.Text)) }
 $pyAssign = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$PhienPy' }, $true)
 Invoke-Expression $pyAssign.Extent.Text
@@ -327,7 +327,7 @@ T 'notes: install refuses when the target changed, is busy or is tracked' {
   Eq (Install-PhienNote $src $d 'HANDOFF-i.md' $sha $n) 'busy'
   Put-File "$d\CLAUDE.md" 'tracked'; Git-Commit $d @('CLAUDE.md')
   Eq (Install-PhienNote $src $d 'CLAUDE.md' '' $n) 'tracked'
-  Ok (-not (Get-ChildItem $d -Filter '*.fcode-part' -Force)) 'no part files'
+  Ok (-not (Get-ChildItem $d -Filter '*.fcode-part*' -Force)) 'no part files'
 }
 # ============================== install (place) rules ==============================
 T 'install: new / same / replaced (only when target is a prefix) / skip / busy; no overwrite of diverged' {
@@ -350,7 +350,7 @@ T 'install: new / same / replaced (only when target is a prefix) / skip / busy; 
   $x = New-Sess $S 'inn00002' '/d/p' @('a'); $dx = Join-Path $D (Split-Path $x -Leaf)
   [void](Install-PhienFile $x $dx '/d/p' 'C:\q' $Now); Add-Msgs $x @('b'); [IO.File]::SetLastWriteTimeUtc($dx, [DateTime]::UtcNow)
   Eq (Install-PhienFile $x $dx '/d/p' 'C:\q' $Now) 'busy'
-  Ok (-not (Get-ChildItem $D -Recurse -Filter '*.fcode-part')) 'no part files left'
+  Ok (-not (Get-ChildItem $D -Recurse -Filter '*.fcode-part*')) 'no part files left'
 }
 
 # ============================== end to end through the real fcode.ps1 + fake instabox ==============================
@@ -379,6 +379,11 @@ function Invoke-Fcode($World, [string[]]$FArgs, [hashtable]$ExtraEnv = @{}) {
     [pscustomobject]@{ Code = $LASTEXITCODE; Out = $out }
   } finally { foreach ($k in $save.Keys) { [Environment]::SetEnvironmentVariable($k, $(if ($null -eq $save[$k]) { [NullString]::Value } else { $save[$k] })) } }
 }
+function Set-AutoState($w, [bool]$running, [double]$ageMin) {
+  $p = Join-Path $w.U 'AppData\Local\fcode\phien-auto.json'; [void](New-Item -ItemType Directory -Path (Split-Path $p) -Force)
+  [IO.File]::WriteAllText($p, (@{ boxRunning = $running; lastSshAt = ((ConvertTo-Epoch (Get-Date)) - $ageMin * 60) } | ConvertTo-Json -Compress))
+}
+function Get-AutoState($w) { Get-Content (Join-Path $w.U 'AppData\Local\fcode\phien-auto.json') -Raw | ConvertFrom-Json }
 function SshCount($World) { if (Test-Path $World.Log) { @(Get-Content $World.Log).Count } else { 0 } }
 function Tree([string]$d) { if (Test-Path $d) { @(Get-ChildItem $d -Recurse -File | ForEach-Object { $_.FullName.Substring($d.Length + 1) } | Sort-Object) } else { @() } }
 
@@ -447,7 +452,7 @@ T 'e2e: continued session is copied over the shorter one; diverged is left alone
 }
 T 'e2e: nothing is ever deleted; only the session files and blobs are written' {
   $w = $script:E2E
-  Ok (-not (Get-ChildItem $w.W -Recurse -Filter '*.fcode-part')) 'no part files'
+  Ok (-not (Get-ChildItem $w.W -Recurse -Filter '*.fcode-part*')) 'no part files'
   Ok (-not (Get-ChildItem $w.W -Recurse -Filter '*.bak*')) 'no backups'
   $agentL = Join-Path $w.U '.omp\agent'; $agentB = Join-Path $w.BH '.omp\agent'
   foreach ($a in $agentL, $agentB) { foreach ($c in (Get-ChildItem $a -Directory)) { Ok ($c.Name -in 'sessions', 'blobs') "unexpected dir $($c.Name) in $a" }; Ok (-not (Get-ChildItem $a -File)) "unexpected files in $a" }
@@ -561,7 +566,7 @@ T 'e2e: format guard in a real run: unknown session skipped and reported, status
   $s = Get-Content $sp -Raw | ConvertFrom-Json; Eq @($s.unknownFormat).Count 0 'cleared'
   $m = Invoke-Fcode $w @(); Ok ($m.Out -notmatch 'Cảnh báo') ("no warning any more; out: " + $m.Out)
   # a failed AUTO run warns too; a failed manual run does not
-  [void](New-Sess $w.LS 'aaaa1111-chg1' $w.LP @('a'))   # something changed on the laptop, so the auto run does try ssh
+  Set-AutoState $w $true 41   # the last ssh is long enough ago, so the auto run does try ssh
   $r = Invoke-Fcode $w @('phien', '--tu-dong') @{ FAKE_SSH_FAIL = '1' }
   $s = Get-Content $sp -Raw | ConvertFrom-Json; Eq $s.ok $false 'auto run failed'
   $m = Invoke-Fcode $w @(); Ok ($m.Out.TrimStart() -like 'Cảnh báo: lần tự động đồng bộ phiên omp gần nhất bị lỗi*') ("auto-failure warning; out: " + $m.Out)
@@ -700,53 +705,135 @@ T 'e2e: equal-length sessions with other content are reported and left alone' {
   Eq ([Convert]::ToBase64String((Read-Bytes $l))) ([Convert]::ToBase64String($lb)) 'laptop copy untouched'
   Eq ([Convert]::ToBase64String((Read-Bytes $b))) ([Convert]::ToBase64String($bb)) 'box copy untouched'
 }
-T 'e2e: auto run opens ssh only with a reason (laptop changed / box just started / last run took data from the box / last run failed), manual always runs' {
+T 'e2e: auto run v2: no ssh while the box is down; one sync when it just started; then only when the last ssh is 40+ min old; failures wait for the next slot; manual always runs' {
   $w = New-World 'e2e9'
   [void](New-Item -ItemType Directory -Path (Join-Path $w.U 'Desktop\other'), (Join-Path $w.U 'Desktop\notonbox') -Force)
-  $auto = { param($env_ = @{}) Invoke-Fcode $w @('phien', '--tu-dong') $env_ }
+  $auto = { param($e = @{}) Invoke-Fcode $w @('phien', '--tu-dong') $e }
   $log = Join-Path $w.U '.fcode\phien.log'
   $logText = { if (Test-Path $log) { (Get-Content $log -Raw) } else { '' } }
+  $onBox = { param($n) Test-Path (Join-Path $w.BS (Split-Path (Get-ChildItem $w.LS -Filter "*$n.jsonl").FullName -Leaf)) }
   [void](New-Sess $w.LS '11111111-aut1' $w.LP @('a'))
   # box not running: no ssh at all
-  $r = & $auto @{ FAKE_BOX_STATE = 'suspended' }; Eq $r.Code 0; Eq (SshCount $w) 0 'suspended: no ssh'
-  # (b) box just started (and the laptop has something new): ssh
-  $n0 = SshCount $w; $r = & $auto; Eq $r.Code 0 $r.Out
-  Ok ((SshCount $w) -gt $n0) 'box just started: ssh'
-  Ok ((& $logText) -match 'đồng bộ vì: box vừa chạy') 'reason logged (b)'
-  Ok (Test-Path (Join-Path $w.BS (Split-Path (Get-ChildItem $w.LS -Filter '*aut1.jsonl').FullName -Leaf))) 'it copied the session'
-  # running, nothing changed, last run took nothing from the box: NO ssh
-  $n1 = SshCount $w; $r = & $auto; Eq $r.Code 0 $r.Out
-  Eq (SshCount $w) $n1 'running + nothing changed + nothing taken from the box last time: no ssh'
-  Ok ((& $logText) -match 'không có gì mới: bỏ qua, không mở ssh') 'reason logged (skip)'
-  $r = & $auto; Eq (SshCount $w) $n1 'still none the next time'
-  # (a) laptop session changed
+  $r = & $auto @{ FAKE_BOX_STATE = 'suspended' }; Eq $r.Code 0; Eq (SshCount $w) 0 'suspended: no ssh'; Eq (Get-AutoState $w).boxRunning $false
+  # box just started: one sync now
+  $r = & $auto; Eq $r.Code 0 $r.Out
+  $n1 = SshCount $w; Ok ($n1 -gt 0) 'just started: ssh'
+  Ok ((& $logText) -match 'đồng bộ vì: box vừa chạy') 'reason logged'; Ok (& $onBox 'aut1') 'it synced'
+  Ok (((ConvertTo-Epoch (Get-Date)) - (Get-AutoState $w).lastSshAt) -lt 180) 'last ssh time recorded'
+  # running, last ssh a few minutes ago: no ssh, even with a laptop change
   [void](New-Sess $w.LS '22222222-aut2' $w.LP @('a'))
-  $r = & $auto; Ok ((SshCount $w) -gt $n1) 'laptop changed: ssh'
-  Ok ((& $logText) -match 'đồng bộ vì: laptop có thay đổi') 'reason logged (a)'
-  $n2 = SshCount $w; $r = & $auto; Eq (SshCount $w) $n2 'quiet again after that run'
-  # (a) a root note changed
-  [IO.File]::WriteAllText("$($w.LP)\HANDOFF-z.md", 'x'); Set-Age "$($w.LP)\HANDOFF-z.md" 600
-  $r = & $auto; Ok ((SshCount $w) -gt $n2) 'laptop note changed: ssh'
-  $n3 = SshCount $w; $r = & $auto; Eq (SshCount $w) $n3 'quiet again'
-  # (b) box went away and came back
-  $r = & $auto @{ FAKE_BOX_STATE = 'suspended' }; Eq (SshCount $w) $n3 'suspended again: no ssh'
-  Ok ((& $logText) -match 'box không chạy nữa') 'stop logged'
-  $r = & $auto; Ok ((SshCount $w) -gt $n3) 'box running again: ssh'
-  $n4 = SshCount $w; $r = & $auto; Eq (SshCount $w) $n4 'quiet again'
-  # (c) the user worked on the box: a manual run takes something from it, so the next auto run goes
-  [void](New-Sess $w.BS '33333333-box1' $w.BP @('b'))
-  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out; Ok (Test-Path (Join-Path $w.LS (Split-Path (Get-ChildItem $w.BS -Filter '*box1.jsonl').FullName -Leaf))) 'manual run took the box session'
-  $n5 = SshCount $w; $r = & $auto; Ok ((SshCount $w) -gt $n5) 'last run copied from the box: ssh'
-  Ok ((& $logText) -match 'lần trước có lấy dữ liệu từ box về') 'reason logged (c)'
-  $n6 = SshCount $w; $r = & $auto; Eq (SshCount $w) $n6 'and quiet after the run that took nothing'
-  # (d) a failed run is retried although nothing changed since
-  [void](New-Sess $w.LS '44444444-aut4' $w.LP @('a'))
-  $r = & $auto @{ FAKE_SSH_FAIL = '1' }; Eq $r.Code 1
-  $n7 = SshCount $w; $r = & $auto; Eq $r.Code 0 $r.Out; Ok ((SshCount $w) -gt $n7) 'retry after a failed run'
-  Ok ((& $logText) -match 'lần chạy trước bị lỗi') 'reason logged (d)'
-  Ok (Test-Path (Join-Path $w.BS (Split-Path (Get-ChildItem $w.LS -Filter '*aut4.jsonl').FullName -Leaf))) 'the retry copied the session'
+  $r = & $auto; Eq (SshCount $w) $n1 'right after: no ssh'
+  Ok ((& $logText) -match 'dưới 40') 'skip reason logged'
+  Set-AutoState $w $true 39; $r = & $auto; Eq (SshCount $w) $n1 '39 min: no ssh'
+  Ok (-not (& $onBox 'aut2')) 'a laptop change alone does not open ssh before the slot'
+  # 41 min: ssh, and it carries the change
+  Set-AutoState $w $true 41; $r = & $auto; Eq $r.Code 0 $r.Out
+  $n2 = SshCount $w; Ok ($n2 -gt $n1) '41 min: ssh'; Ok (& $onBox 'aut2') 'the change went with it'
+  Ok ((& $logText) -match 'đồng bộ vì: lần mở ssh trước đã cách 41 phút') 'slot reason logged'
+  $r = & $auto; Eq (SshCount $w) $n2 'quiet again right after'
+  # a session that was being written (busy) is picked up at the next slot, a box session is pulled at the next slot
+  $busy = New-Sess $w.LS '33333333-busy' $w.LP @('a'); [IO.File]::SetLastWriteTimeUtc($busy, [DateTime]::UtcNow)
+  [void](New-Sess $w.BS '44444444-box1' $w.BP @('b'))
+  Set-AutoState $w $true 41; $r = & $auto; Ok ((SshCount $w) -gt $n2) 'slot: ssh'
+  Ok (-not (& $onBox 'busy')) 'busy session skipped this time'
+  Ok (Test-Path (Join-Path $w.LS (Split-Path (Get-ChildItem $w.BS -Filter '*box1.jsonl').FullName -Leaf))) 'the box session was pulled in the slot'
+  Set-Age $busy 600; Set-AutoState $w $true 41; $r = & $auto
+  Ok (& $onBox 'busy') 'the session that was busy is synced at the next slot'
+  # a failure waits for the next slot (no fast retry)
+  [void](New-Sess $w.LS '55555555-aut5' $w.LP @('a'))
+  Set-AutoState $w $true 41; $r = & $auto @{ FAKE_SSH_FAIL = '1' }; Eq $r.Code 1
+  Ok (((ConvertTo-Epoch (Get-Date)) - (Get-AutoState $w).lastSshAt) -lt 180) 'a failed attempt counts as the last ssh'
+  Eq ((Get-Content (Join-Path $w.U 'AppData\Local\fcode\phien-status.json') -Raw | ConvertFrom-Json).ok) $false 'failure recorded'
+  $n3 = SshCount $w; $r = & $auto; Eq (SshCount $w) $n3 'after a failure: no fast retry'
+  Set-AutoState $w $true 41; $r = & $auto; Eq $r.Code 0 $r.Out; Ok (& $onBox 'aut5') 'the next slot retried and copied'
+  # box went away and came back: sync once at once, whatever the last ssh time
+  $n4 = SshCount $w; $r = & $auto @{ FAKE_BOX_STATE = 'suspended' }; Eq (SshCount $w) $n4 'suspended: no ssh'
+  $r = & $auto; Ok ((SshCount $w) -gt $n4) 'box running again: ssh at once'
   # manual runs always run
-  $n8 = SshCount $w; $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0; Ok ((SshCount $w) -gt $n8) 'manual run: ssh even with nothing new'
+  $n5 = SshCount $w; $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0; Ok ((SshCount $w) -gt $n5) 'manual run: ssh'
+  Ok ((Get-AutoState $w).PSObject.Properties.Name.Count -eq 2) 'state holds only boxRunning + lastSshAt'
+  Ok (-not (Test-Path (Join-Path $w.U 'AppData\Local\fcode\phien-auto.json.part'))) 'no leftovers'
+}
+T 'e2e: a manual run waits for the auto-run lock; an auto run that finds the lock busy opens no ssh' {
+  $w = New-World 'e2e10'
+  [void](New-Item -ItemType Directory -Path (Join-Path $w.U 'Desktop\other'), (Join-Path $w.U 'Desktop\notonbox') -Force)
+  $ls = New-Sess $w.LS '66666666-lock' $w.LP @('a')
+  $mx = New-Object Threading.Mutex($false, 'Local\fcode-phien'); Ok ($mx.WaitOne(0)) 'the test holds the lock'
+  try {
+    Set-AutoState $w $true 41
+    $n0 = SshCount $w; $r = Invoke-Fcode $w @('phien', '--tu-dong'); Eq $r.Code 0; Eq (SshCount $w) $n0 'lock busy: the auto run opens no ssh'
+    # manual run in a background job while the lock is held
+    $set = @{ USERPROFILE = $w.U; LOCALAPPDATA = (Join-Path $w.U 'AppData\Local'); FCODE_PHIEN_BOXENV = ('HOME=' + ($w.BH -replace '\\', '/') + ' FCODE_CFG=' + ($w.Cfg -replace '\\', '/')); FAKE_SSH_LOG = $w.Log; TEMP = (Join-Path $w.U 'AppData\Local\Temp'); TMP = (Join-Path $w.U 'AppData\Local\Temp') }
+    $save = @{}; foreach ($k in $set.Keys) { $save[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k, $set[$k]) }
+    try { $job = Start-Job -ScriptBlock { param($fc) & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $fc phien 2>&1 | Out-String } -ArgumentList $Fcode }
+    finally { foreach ($k in $save.Keys) { [Environment]::SetEnvironmentVariable($k, $(if ($null -eq $save[$k]) { [NullString]::Value } else { $save[$k] })) } }
+    Start-Sleep -Seconds 7
+    Eq $job.State 'Running' 'the manual run is waiting for the lock'
+    Eq (SshCount $w) $n0 'and has opened no ssh yet'
+    $mx.ReleaseMutex()
+    [void](Receive-Job $job -Wait -AutoRemoveJob)
+    Ok ((SshCount $w) -gt $n0) 'after the lock was released the manual run went on'
+    Ok (Test-Path (Join-Path $w.BS (Split-Path $ls -Leaf))) 'and synced'
+  } finally { try { $mx.ReleaseMutex() } catch { }; $mx.Dispose() }
+}
+T 'P3: box blob names are indexed by hex (a blob with an extension is not re-sent)' {
+  $h1 = 'a1' * 32; $h2 = 'b2' * 32
+  $b = Get-PhienBoxBlobSet @($h1, "$h2.png", 'junk', "$h1.webp")
+  Eq $b.Count 2; Ok ($b.ContainsKey($h1) -and $b.ContainsKey($h2)) 'by hex'; Ok (-not $b.ContainsKey("$h2.png")) 'not by file name'
+}
+T 'P3: Copy-OmpSession copies exactly the planned size, never what was written after the scan' {
+  $d = Join-Path $Root 'sz'; $f = New-Sess $d 'sz000001' 'C:\p' @('a', 'b', 'c', 'd')
+  $all = Read-Bytes $f; $planned = $all.Length - 45
+  $o = Join-Path $d 'out1.bin'; [void](Copy-OmpSession $f $o '' '' $planned)
+  $got = Read-Bytes $o; Eq $got.Length $planned; Ok ([Linq.Enumerable]::SequenceEqual([byte[]]$got, [byte[]]($all[0..($planned - 1)]))) 'exact prefix'
+  $o2 = Join-Path $d 'out2.bin'; [void](Copy-OmpSession $f $o2 'C:\p' '/data/workspace/p' $planned)   # with the cwd rewrite: planned + delta
+  Eq (Read-Bytes $o2).Length ($planned + '/data/workspace/p'.Length - 'C:\\p'.Length)
+  $o3 = Join-Path $d 'out3.bin'; [void](Copy-OmpSession $f $o3 '' '' ($all.Length + 1000)); Eq (Read-Bytes $o3).Length $all.Length 'a larger plan never invents bytes'
+  # bigger than the 256 KB head buffer
+  $big = Join-Path $d 'big.jsonl'; [IO.File]::WriteAllBytes($big, [byte[]](,[byte]65 * 700000))
+  $o4 = Join-Path $d 'out4.bin'; [void](Copy-OmpSession $big $o4 '' '' 300000); Eq (Read-Bytes $o4).Length 300000
+  $o5 = Join-Path $d 'out5.bin'; [void](Copy-OmpSession $big $o5 '' '' 100); Eq (Read-Bytes $o5).Length 100
+}
+T 'P3: box program `get` cuts each file at the planned size and skips a file that shrank' {
+  $h = Join-Path $Root 'pg\home'; $enc = 'E-test'; $sd = "$h\.omp\agent\sessions\$enc"
+  $f = New-Sess $sd 'gg000001' '/x' @('a', 'b', 'c'); $name = Split-Path $f -Leaf; $size = (Read-Bytes $f).Length
+  $save = @{}; foreach ($k in 'HOME', 'FCODE_CFG', 'PI_CODING_AGENT_DIR') { $save[$k] = [Environment]::GetEnvironmentVariable($k) }
+  [Environment]::SetEnvironmentVariable('HOME', $h); [Environment]::SetEnvironmentVariable('FCODE_CFG', "$Root\nocfg.json"); [Environment]::SetEnvironmentVariable('PI_CODING_AGENT_DIR', [NullString]::Value)
+  try {
+    foreach ($case in @(@{ n = 'cut'; planned = $size - 30; want = $size - 30 }, @{ n = 'whole'; planned = $size; want = $size }, @{ n = 'shrunk'; planned = $size + 50; want = -1 })) {
+      $req = Join-Path $Root "pg-$($case.n).json"; $out = Join-Path $Root "pg-$($case.n).bin"
+      [IO.File]::WriteAllText($req, (@{ items = @(@{ enc = $enc; top = $name; files = @(); sizes = @{ $name = $case.planned } }); have = @() } | ConvertTo-Json -Compress -Depth 5), $utf8)
+      cmd /c "python -I `"$PyFile`" get < `"$req`" > `"$out`""
+      $bytes = Read-Bytes $out; $mk = $utf8.GetBytes("FCODE-TAR`n"); $pos = -1
+      for ($i = 0; $i -lt 200 -and $pos -lt 0; $i++) { if ($bytes[$i] -eq $mk[0] -and [Linq.Enumerable]::SequenceEqual([byte[]]$bytes[$i..($i + $mk.Length - 1)], [byte[]]$mk)) { $pos = $i + $mk.Length } }
+      Ok ($pos -ge 0) "tar marker ($($case.n))"
+      $tar = Join-Path $Root "pg-$($case.n).tar"; [IO.File]::WriteAllBytes($tar, [byte[]]$bytes[$pos..($bytes.Length - 1)])
+      $x = Join-Path $Root "pg-$($case.n)-x"; [void](New-Item -ItemType Directory -Path $x -Force); & tar -xf $tar -C $x
+      $got = Join-Path $x "sessions\$enc\$name"
+      if ($case.want -lt 0) { Ok (-not (Test-Path $got)) 'a shrunk file is left out' } else { Eq (Read-Bytes $got).Length $case.want "size ($($case.n))" }
+    }
+  } finally { foreach ($k in $save.Keys) { [Environment]::SetEnvironmentVariable($k, $(if ($null -eq $save[$k]) { [NullString]::Value } else { $save[$k] })) } }
+}
+T 'P3: prefix check uses native SHA-256 ranges: right answers and fast on big files' {
+  $d = Join-Path $Root 'pf'; [void](New-Item -ItemType Directory -Path $d -Force)
+  $hdr = $utf8.GetBytes('{"type":"title","v":1}' + "`n" + '{"type":"session","version":3,"id":"i","cwd":"/x"}' + "`n")
+  $rnd = New-Object Random 7; $chunk = New-Object byte[] 1048576
+  $mk = { param($path, $mb, $flip) $fs = [IO.File]::Create($path); try { $fs.Write($hdr, 0, $hdr.Length); $r = New-Object Random 7; for ($i = 0; $i -lt $mb; $i++) { $c = New-Object byte[] 1048576; $r.NextBytes($c); if ($flip -ge 0 -and $i -eq $flip) { $c[5] = ($c[5] + 1) % 256 }; $fs.Write($c, 0, $c.Length) } } finally { $fs.Dispose() } }
+  $s30 = Join-Path $d 's30.jsonl'; $l40 = Join-Path $d 'l40.jsonl'; $bad = Join-Path $d 'bad.jsonl'
+  & $mk $s30 30 -1; & $mk $l40 40 -1; & $mk $bad 40 29
+  $t0 = Get-Date; $ok = Test-PhienPrefix $s30 $l40; $sec = ((Get-Date) - $t0).TotalSeconds
+  Ok $ok 'a real prefix'; Ok ($sec -lt 6) "30 MB compared in $([Math]::Round($sec, 1)) s"
+  Ok (-not (Test-PhienPrefix $s30 $bad)) 'a changed byte inside the compared range'
+  Ok (Test-PhienPrefix $l40 $l40) 'a file is a prefix of itself'
+}
+T 'P3: temp names are unique per run and no part file is left behind' {
+  $a = New-PhienPartName 'C:\x\f.jsonl'; $b = New-PhienPartName 'C:\x\f.jsonl'
+  Ok ($a -ne $b) 'two names differ'; Ok ($a -match '\.fcode-part-\d+-[0-9a-f]{6}$') "pattern: $a"
+  $S = Join-Path $Root 'pn\S'; $D = Join-Path $Root 'pn\D'
+  $f = New-Sess $S 'pn000001' '/d/p' @('a'); $dst = Join-Path $D (Split-Path $f -Leaf)
+  [void](New-Item -ItemType Directory -Path $D -Force); [IO.File]::WriteAllText("$dst.fcode-part", 'stale part of an older version, locked')
+  $lock = [IO.File]::Open("$dst.fcode-part", 'Open', 'ReadWrite', 'None')
+  try { Eq (Install-PhienFile $f $dst '/d/p' 'C:\q' (ConvertTo-Epoch (Get-Date))) 'new' 'a stale/locked old-style part name no longer gets in the way' } finally { $lock.Dispose() }
 }
 # ============================== scheduled task (hidden) ==============================
 T 'task scheduler: registers a headless every-10-minutes task and the action shows no window' {
