@@ -63,6 +63,14 @@ switch (cmd) {
     break;
   }
   case 'kill-session': needSession(); delete st.sessions[target()]; save(st); break;
+  case 'rename-session': { // like tmux 3.x: the same name is a no-op, a taken one is "duplicate session"
+    needSession();
+    const to = argv[argv.length - 1];
+    if (to === target()) break;
+    if (st.sessions[to]) fail(`duplicate session: ${to}`);
+    st.sessions[to] = st.sessions[target()]; delete st.sessions[target()]; save(st);
+    break;
+  }
   case 'list-sessions': {
     const names = Object.keys(st.sessions);
     if (!names.length) fail('no server running on /tmp/tmux-1000/default');

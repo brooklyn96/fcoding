@@ -1,6 +1,6 @@
 # FCode
 
-Điều khiển các trợ lý lập trình (omp, Claude Code, Codex, shell) đang chạy trên một máy Linux đám mây, ngay từ iPhone.
+Điều khiển các trợ lý lập trình (omp, Claude Code, Codex) đang chạy trên một máy Linux đám mây, ngay từ iPhone.
 
 ## Mục lục
 
@@ -21,7 +21,7 @@ FCode là một ứng dụng iPhone kèm một máy chủ nhỏ. Máy chủ ch�
 
 Tính năng chính:
 
-- Trò chuyện với **omp**, **Claude Code**, **Codex** hoặc **shell** (bash) chạy trong tmux trên box.
+- Trò chuyện với **omp**, **Claude Code** hoặc **Codex** chạy trong tmux trên box. (Máy chủ vẫn chạy được **shell** (bash), nhưng app không còn liệt kê shell.)
 - **Hộp thư tổng quan**: mọi phiên được chia thành **Cần bạn**, **Đang chạy** và **Đang nghỉ**. Việc cần bạn trả lời luôn nằm trên cùng.
 - **Trả lời y/n ngay trên danh sách**, không cần mở phiên.
 - **Hàng phím nhanh**: Esc, Ctrl+C, mũi tên, Tab, Shift+Tab, Enter, y, n, **Agents** và **^O** (chỉ trong phiên omp), cùng nút `/` cho các lệnh hay dùng.
@@ -43,11 +43,11 @@ Link công khai của instabox  (https://7681-<id>.instabox.tech)
 server.mjs trên box  (cổng 7681)
    │  tmux
    ▼
-Các phiên tmux: omp / claude / codex / shell
+Các phiên tmux: omp / claude / codex (shell: chỉ từ máy chủ)
 ```
 
 - `server.mjs` là một file Node.js duy nhất, chỉ dùng thư viện có sẵn của Node 22. Không có gói ngoài, không có cơ sở dữ liệu.
-- Máy chủ chỉ gọi lệnh `tmux` (và `git` ở chế độ chỉ đọc để hiện nhánh và số dòng thay đổi). Nó không tự kết nối ra internet.
+- Máy chủ gọi lệnh `tmux` (và `git` ở chế độ chỉ đọc để hiện nhánh và số dòng thay đổi). Cho màn hình chính nó còn gọi `omp usage` (hạn mức) và `gh` (pull request, lần chạy CI); chính hai lệnh này kết nối ra internet, máy chủ thì không. Nó không bao giờ đọc file đăng nhập của omp, Claude hay Codex.
 - Dữ liệu chỉ đi giữa box và điện thoại của bạn, qua đường HTTPS của instabox. FCode không có máy chủ riêng, không gửi thống kê đi đâu.
 - Lưu ý: bản thân omp, Claude Code, Codex vẫn nói chuyện với dịch vụ AI của chúng như khi bạn chạy chúng ở bất kỳ nơi nào khác. FCode không can thiệp vào việc đó.
 
@@ -107,6 +107,27 @@ Các dự án hiện trong app nằm trong `config.json`, mục `projects`. Sau 
 - Tên dự án nên gồm chữ thường, số và dấu gạch ngang (tên này được dùng để đặt tên phiên, ví dụ `web-claude`).
 - Máy chủ tự đọc lại file sau khi bạn lưu, không cần khởi động lại (riêng `port` chỉ có tác dụng sau khi khởi động lại dịch vụ). Nếu file bị lỗi cú pháp, máy chủ giữ cấu hình cũ cho tới khi bạn sửa đúng.
 - Mỗi phiên mới chạy trong thư mục của dự án đã chọn.
+
+### Màn hình chính: hạn mức, chi phí, dự án
+
+Màn hình chính của app lấy mọi thứ từ một địa chỉ của máy chủ (`GET /api/home`). Máy chủ gom dữ liệu như sau:
+
+| Phần | Lấy từ đâu | Làm mới |
+|---|---|---|
+| Hạn mức Claude / Codex | `omp usage --json` (omp đã đăng nhập các tài khoản) | mỗi 60 giây |
+| Chi phí và số token | file nhật ký trên box: `~/.omp/agent/sessions`, `~/.claude/projects`, `~/.codex/sessions` | mỗi 5 phút, chỉ đọc phần mới thêm |
+| Pull request, CI | `gh` theo kho GitHub của từng dự án trong `config.json` | mỗi 2 phút |
+| Phiên bản công cụ | `~/.local/state/fcode-update/status.json` (omp, claude, codex) | mỗi lần mở |
+| Giờ box ngủ | ước tính: lần box thức dậy gần nhất + 8 giờ (vẫn giữ đúng khi máy chủ khởi động lại, nhờ file `~/.fcoding/box-timer.json`; box khởi động lại thì tính lại từ đầu) | luôn |
+
+- Một phần bị lỗi (ví dụ `gh` chưa đăng nhập) thì phần đó trống, các phần khác vẫn hiện. Hạn mức cũ được đánh dấu "cũ" nếu không làm mới được.
+- Màn hình chính luôn trả lời nhanh: phần nào đã có thì hiện ngay và được làm mới ở nền. Lần mở đầu tiên sau khi máy chủ khởi động, phần nào chưa đọc xong trong 8 giây thì tạm trống và hiện ở lần tải sau.
+- Chi phí là giá API niêm yết (bảng giá kèm trong `server.mjs`), không phải số tiền bạn trả theo gói. Chi phí của omp và của Codex được tính vào đúng tài khoản; chi phí từ Claude Code chạy riêng chỉ cộng vào tổng. Mẫu máy (model) không có trong bảng giá thì chỉ đếm token, không đoán tiền.
+- "Ước tính cả tuần" của một tài khoản chỉ tính phần chi phí đã biết là của tài khoản đó. Claude Code chạy riêng (và vài lệnh nhỏ của omp như đặt tên phiên) cũng dùng hạn mức tuần nhưng không biết thuộc tài khoản nào, nên khi có chúng con số ước tính sẽ thấp hơn thực tế.
+- Ngày (Hôm nay, Hôm qua, 30 ngày) tính theo giờ Việt Nam, bất kể box dùng múi giờ nào. Muốn đổi, thêm `"timeZone": "<múi giờ>"` (ví dụ `"Asia/Tokyo"`) vào `~/.fcoding/config.json`; máy chủ tự đọc lại, không cần khởi động lại.
+- `gh` cần `GH_TOKEN` để đọc kho. Trên box instabox, dịch vụ tự lấy `GH_TOKEN` từ kho bí mật của instabox (giống như cửa sổ dòng lệnh), không ghi ra ổ đĩa. Nếu bạn vừa thêm token vào kho bí mật, khởi động lại dịch vụ: `systemctl --user restart fcoding`. Không có token thì phần dự án hiện "chưa đọc được GitHub". Nếu token không được đọc trạng thái kiểm tra (checks) thì app chỉ không hiện phần đó.
+- Nút Reset của Codex trong app chạy `omp usage reset <tài khoản>` trên box, mỗi tài khoản một lần một. Nếu reset chạy lâu hơn 15 giây, app báo "đang chạy" và bạn xem lại Hạn mức sau ít phút. Reset của Claude chỉ mở trang claude.ai.
+- Đổi tên phiên (vuốt trên một phiên, "Đổi tên") dùng `tmux rename-session`; tên mới theo cùng luật như tên phiên. Tên dạng `<dự án>-<chương trình>` (ví dụ `deal-sync-claude`) dành cho phiên mở từ dự án đó, nên phiên khác không đổi sang tên này được.
 
 ## 4. Mở link công khai
 
@@ -222,20 +243,22 @@ Muốn dùng lại sau khi bị gỡ thì chạy `fcode-pair` trên box và ghé
 
 ## 7. Dùng hằng ngày
 
-**Màn hình chính** gom mọi phiên trên box, tự cập nhật mỗi 5 giây (kéo xuống để cập nhật ngay).
+Hướng dẫn đầy đủ cho app nằm ở [ios/README.md, mục 4](ios/README.md#4-cách-dùng). Tóm tắt:
 
-- **Cần bạn**: phiên đang hỏi bạn điều gì đó (ví dụ `(y/n)`, "Do you want…", "Proceed?"). Luôn mở sẵn và hiện đủ câu hỏi.
-  - Câu hỏi có/không có hai nút **y · Đồng ý** và **n · Từ chối**.
-  - Câu hỏi khác có nút **Trả lời** (mở phiên, con trỏ nằm sẵn ở ô nhập).
-  - Nút **Mở** vào phiên để xem toàn bộ.
-- **Đang chạy**: phiên có màn hình vừa thay đổi trong 8 giây gần nhất. Hiện dự án, nhánh git, số dòng thêm/bớt và một dòng xem trước.
-- **Đang nghỉ**: phiên đang yên, hiện mờ. Hai mục này mặc định thu gọn; chạm vào tiêu đề để mở, app nhớ lựa chọn của bạn.
-- **Hàng dự án** (trượt ngang): chạm **Tất cả** hoặc một dự án để lọc. Số cam là số phiên đang chờ bạn, số xám là số phiên.
-- **Thanh chương trình ở dưới** (Tất cả / omp / claude / codex / shell): lọc theo chương trình.
+**Màn hình chính** (thanh trên cùng chỉ có nút **?** Hướng dẫn và **⚙** Cài đặt). Phiên tự cập nhật mỗi 5 giây, hạn mức và dự án mỗi phút; kéo xuống để cập nhật ngay.
+
+- **Vòng giờ box** (bên trái thẻ trên cùng): **Sleeps in** là thời gian box còn chạy trước khi tự nghỉ (tối đa 8 giờ, hoặc sớm hơn nếu rảnh 30 phút; đây là ước tính của máy chủ). Vòng chuyển vàng khi còn dưới 10 phút. **Wakes in** là lúc box đang nghỉ 10 phút rồi tự dậy. Chạm vào vòng để xem giờ chính xác.
+- **Ô hạn mức** (bên phải): mỗi lần một tài khoản, tự chuyển sang tài khoản kế mỗi 4 giây (giữ ngón tay trên ô để dừng). Chạm để mở màn hình **Hạn mức**.
+- Dòng **đang chạy · chờ bạn**: chạm để nhảy tới phiên tương ứng.
+- **Dự án** (trượt ngang): mỗi thẻ cho biết số PR đang mở, kết quả checks và lần deploy gần nhất ("đang đọc…" khi máy chủ vừa khởi động, "chưa đọc được GitHub" khi `gh` lỗi). Chạm thẻ để chỉ xem phiên của dự án đó; giữ lâu hoặc bấm **…** để mở phiên mới trong dự án đó.
+- **Cần bạn**: phiên đang hỏi bạn, luôn mở sẵn. Câu hỏi có/không có nút **y · Đồng ý** và **n · Từ chối**; câu khác có nút **Trả lời**. Nút **Mở** mở phiên.
+- **Đang chạy** và **Đang nghỉ**: chạm tiêu đề để mở hoặc thu gọn. App nhớ lựa chọn này.
 - Chấm xanh dương cạnh tên phiên: có thay đổi bạn chưa xem. Mở phiên là tính đã đọc.
-- Vuốt trái một phiên: **Đã đọc / Chưa đọc**, hoặc **Xoá** (có hỏi xác nhận; chương trình trong phiên sẽ bị tắt).
+- Vuốt trái một phiên: **Đổi tên** hoặc **Đóng** (có hỏi xác nhận; chương trình trong phiên bị tắt).
 
-**Tạo phiên mới**: bấm **+** ở góc phải. Chọn chương trình, rồi chọn dự án. Nút này luôn tạo phiên **mới** (tên như `web-claude`, `web-claude-2`, …) và không bao giờ mở lại phiên cũ; muốn vào phiên cũ thì mở từ danh sách. Nếu thanh dưới đang lọc một chương trình thì bước chọn chương trình được bỏ qua.
+**Tạo phiên mới**: bấm nút tròn **+** ở góc dưới bên phải. Chọn dự án, rồi chọn chương trình (omp, claude hoặc codex). Nút này luôn tạo phiên **mới** (tên như `web-claude`, `web-claude-2`, …) và không bao giờ mở lại phiên cũ; muốn vào phiên cũ thì mở từ danh sách. App không còn liệt kê shell, dù máy chủ vẫn chạy được shell.
+
+**Hạn mức** (chạm ô hạn mức): tổng chi phí 30 ngày, rồi từng tài khoản: thanh dùng của từng khung giờ, xu hướng 30 ngày, chi phí "Hôm nay / Hôm qua / 30 ngày / Ước tính tuần". **Reset**: Codex dùng lượt reset ngay trong app (có hỏi xác nhận); Claude chỉ mở trang claude.ai. Xem thêm "Màn hình chính: hạn mức, chi phí, dự án" ở mục 3.
 
 **Trong một phiên**:
 
