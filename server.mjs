@@ -1102,7 +1102,14 @@ export function createApp(opts = {}) {
   const listAfterReset = opts.listAfterResetMs ?? LIST_AFTER_RESET_MS;
   const homeWait = opts.homeWaitMs ?? HOME_WAIT_MS, resetReplyMs = opts.resetReplyMs ?? RESET_REPLY_MS, resetTimeout = opts.resetTimeoutMs ?? RESET_TIMEOUT;
   // `omp usage reset --json` (credential ids, reset counts) on its own longer TTL; the last good listing is kept on a failure
-  const listing = memo(LISTING_TTL, async () => JSON.parse(await execTool(ompSpec, ['usage', 'reset', '--json'], 30e3)), now, QUOTA_TTL);
+  // A quota built with no listing at all (slow or failed first listing: `~` ids, no reset target) is kept STALE_QUOTA_TTL only,
+  // and the listing that then succeeds drops it, so the next GET is built from that listing at once.
+  let quotaBare = false;
+  const listing = memo(LISTING_TTL, async () => {
+    const v = JSON.parse(await execTool(ompSpec, ['usage', 'reset', '--json'], 30e3));
+    if (quotaBare) { quotaBare = false; quota.clear(); }
+    return v;
+  }, now, QUOTA_TTL);
   // After a reset the reset counts must come from a listing fetched after it: a kept listing whose refresh started at or after
   // lastResetAt. While the stored listing is older than the last reset, a quota refresh waits up to LIST_AFTER_RESET_MS (omp's own
   // listing timeout) for one, not homeWait / 2. Without one (slow, failed, or a refresh dropped by a later reset) the accounts are
@@ -1117,6 +1124,8 @@ export function createApp(opts = {}) {
     const q = parseQuota(JSON.parse(u.value), r.status === 'fulfilled' ? r.value.value : null, now());
     // by the listing's age only: a later listing failure is the same with or without a past reset
     if (resetAt > -Infinity && !(r.status === 'fulfilled' && r.value.at >= resetAt)) { for (const a of q.accounts) a.stale = true; q.ttl = STALE_QUOTA_TTL; }
+    quotaBare = r.status !== 'fulfilled';
+    if (quotaBare) q.ttl = STALE_QUOTA_TTL;
     return q;
   }, now, QUOTA_TTL, (q) => q.ttl);
   const scan = spendScanner(spendRoots, now);

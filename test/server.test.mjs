@@ -3140,6 +3140,38 @@ test('after a reset and a good listing, a later listing failure is handled as wi
   assert.equal(c.toolCalls('usage --json').length, reads);
 }, { homeWaitMs: 600, listAfterResetMs: 8000 }));
 
+test('cold start: a quota built before a slow first listing is dropped when the listing lands; without one it is kept 15 s only', () => homeApp(async (c) => {
+  const ids = (h) => h.accounts.map((a) => a.id).join(' ');
+  c.setRules([['usage reset --json', { file: FIX('omp-reset-list.json'), delay: 1500 }], ...baseRules()]); // slower than homeWait / 2
+  let h = await c.home();
+  assert.match(ids(h), /^anthropic\/~[0-9a-f]{8} /); // no listing yet: ~ ids, no reset target
+  assert.equal(h.accounts[3].resets.target, null);
+  await c.app.homeIdle(); await c.app.homeIdle(); // the listing has landed (the clock does not move)
+  h = await c.home();
+  assert.equal(ids(h), 'anthropic/1 anthropic/2 anthropic/3 openai-codex/4');
+  assert.equal(h.accounts[3].resets.target, 'openai-codex/4');
+  assert.ok(h.accounts.every((a) => !a.stale));
+  await c.app.homeIdle();
+  const reads = c.toolCalls('usage --json').length;
+  c.clock.t += 20e3; // built from the listing: the normal 60 s TTL
+  await c.home(); await c.app.homeIdle();
+  assert.equal(c.toolCalls('usage --json').length, reads);
+}, { homeWaitMs: 600 }));
+
+test('cold start: the first listing fails: the quota with ~ ids is read again after 15 s, not 60 s', () => homeApp(async (c) => {
+  c.setRules([['usage reset --json', { code: 1, stderr: 'down' }], ...baseRules()]);
+  assert.equal((await c.home()).accounts[3].resets.target, null);
+  await c.app.homeIdle();
+  const reads = c.toolCalls('usage --json').length;
+  c.clock.t += 16e3;
+  await c.home(); await c.app.homeIdle();
+  assert.equal(c.toolCalls('usage --json').length, reads + 1);
+  c.setRules(baseRules()); // omp's listing is back after its 60 s retry delay
+  c.clock.t += 61e3;
+  await c.home(); await c.app.homeIdle(); await c.app.homeIdle();
+  assert.equal((await c.home()).accounts[3].resets.target, 'openai-codex/4'); // dropped when the listing landed
+}, { homeWaitMs: 600 }));
+
 test('box timer: kept across a server restart within 90 s of the last tick on the same boot (box-timer.json); a longer gap or a reboot is a new run', async () => {
   const clock = { t: T0 };
   const bootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-boot-'));
