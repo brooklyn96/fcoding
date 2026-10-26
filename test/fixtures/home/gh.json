@@ -1,10 +1,24 @@
 {
-  "_note": "gh pr list / gh run list --json output recorded on the box 2026-10-25 (titles, names and URLs replaced)",
+  "_note": "gh pr list / gh run list / gh workflow list --json output recorded on the box 2026-10-25 (titles, names, URLs and SHAs replaced); runs and workflows extended for 1.3.1 (deploy line, checks from Actions runs)",
   "prs": [
-    {"mergeable":"MERGEABLE","number":6,"statusCheckRollup":[{"__typename":"CheckRun","completedAt":"2026-10-25T19:30:00Z","conclusion":"SUCCESS","detailsUrl":"https://github.com/o/r/x","name":"check","startedAt":"2026-10-25T19:25:00Z","status":"COMPLETED","workflowName":"wf"},{"__typename":"StatusContext","context":"ctx","startedAt":"2026-10-25T19:25:00Z","state":"PENDING","targetUrl":"u"}],"title":"T6"},
-    {"mergeable":"CONFLICTING","number":5,"statusCheckRollup":[{"__typename":"CheckRun","conclusion":"FAILURE","name":"check","status":"COMPLETED"}],"title":"T5"},
-    {"mergeable":"UNKNOWN","number":4,"statusCheckRollup":[],"title":"T4"}
+    {"headRefOid":"sha6","mergeable":"MERGEABLE","number":6,"statusCheckRollup":[{"__typename":"CheckRun","completedAt":"2026-10-25T19:30:00Z","conclusion":"SUCCESS","detailsUrl":"https://github.com/o/r/x","name":"check","startedAt":"2026-10-25T19:25:00Z","status":"COMPLETED","workflowName":"wf"},{"__typename":"StatusContext","context":"ctx","startedAt":"2026-10-25T19:25:00Z","state":"PENDING","targetUrl":"u"}],"title":"T6"},
+    {"headRefOid":"sha5","mergeable":"CONFLICTING","number":5,"statusCheckRollup":[{"__typename":"CheckRun","conclusion":"FAILURE","name":"check","status":"COMPLETED"}],"title":"T5"},
+    {"headRefOid":"sha4","mergeable":"UNKNOWN","number":4,"statusCheckRollup":[],"title":"T4"}
   ],
-  "runs": [{"conclusion":"failure","createdAt":"2026-10-25T19:25:12Z","name":"Deal Sync Mobile v2 Gate","status":"completed","url":"https://github.com/owner/repo/actions/runs/1","workflowName":"Deal Sync Mobile v2 Gate"}],
+  "runs": [
+    {"conclusion":"failure","createdAt":"2026-10-25T19:25:12Z","headSha":"g1","name":"Deal Sync Mobile v2 Gate","status":"completed","url":"https://github.com/owner/repo/actions/runs/1","workflowName":"Deal Sync Mobile v2 Gate","workflowDatabaseId":11},
+    {"conclusion":"","createdAt":"2026-10-25T19:24:00Z","headSha":"sha6","name":"CI","status":"in_progress","url":"https://github.com/owner/repo/actions/runs/2","workflowName":"CI","workflowDatabaseId":12},
+    {"conclusion":"failure","createdAt":"2026-10-25T19:22:00Z","headSha":"sha5","name":"CI","status":"completed","url":"https://github.com/owner/repo/actions/runs/3","workflowName":"CI","workflowDatabaseId":12},
+    {"conclusion":"success","createdAt":"2026-10-25T19:21:00Z","headSha":"sha4","name":"CI","status":"completed","url":"https://github.com/owner/repo/actions/runs/4","workflowName":"CI","workflowDatabaseId":12},
+    {"conclusion":"success","createdAt":"2026-10-25T19:20:00Z","headSha":"sha6","name":"Deal Sync Mobile v2 Gate","status":"completed","url":"https://github.com/owner/repo/actions/runs/5","workflowName":"Deal Sync Mobile v2 Gate","workflowDatabaseId":11},
+    {"conclusion":"success","createdAt":"2026-10-25T19:15:00Z","headSha":"sha5","name":"CI","status":"completed","url":"https://github.com/owner/repo/actions/runs/6","workflowName":"CI","workflowDatabaseId":12},
+    {"conclusion":"success","createdAt":"2026-10-25T19:10:00Z","headSha":"g0","name":"Ship it","status":"completed","url":"https://github.com/owner/repo/actions/runs/7","workflowName":"Ship it","workflowDatabaseId":13},
+    {"conclusion":"failure","createdAt":"2026-10-25T19:05:00Z","headSha":"sha4","name":"CI","status":"completed","url":"https://github.com/owner/repo/actions/runs/8","workflowName":"CI","workflowDatabaseId":12}
+  ],
+  "workflows": [
+    {"id":11,"name":"Deal Sync Mobile v2 Gate","path":".github/workflows/gate.yml"},
+    {"id":13,"name":"Ship it","path":".github/workflows/deploy.yml"},
+    {"id":12,"name":"CI","path":".github/workflows/ci.yml"}
+  ],
   "status": {"omp":{"from":"18.12.6","to":"18.12.6","at":"2026-10-25T19:21:17Z","result":"current","error":null},"claude":{"from":"2.1.310","to":"2.1.310","at":"2026-10-25T19:21:17Z","result":"current","error":null},"codex":{"from":"0.164.0","to":"0.164.1","at":"2026-10-25T19:21:18Z","result":"updated","error":null}}
 }

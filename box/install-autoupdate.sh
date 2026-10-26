@@ -5,6 +5,7 @@
 #   2. fcode-update.service + .timer -> ~/.config/systemd/user, timer enabled
 #   3. turns off claude's built-in self-updater unless the box already does (tools are replaced only
 #      through the versioned layout, never by themselves)
+#   4. fcode-git-sync.sh -> ~/.local/bin/fcode-git-sync, its service + timer (every 5 minutes), timer enabled
 set -euo pipefail
 
 D=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -12,6 +13,7 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 UNITS="$HOME/.config/systemd/user"
 
 command -v jq >/dev/null || sudo -n apt-get install -y jq >/dev/null
+command -v node >/dev/null || { echo "install-autoupdate: node is missing" >&2; exit 1; }
 command -v flock >/dev/null || { echo "install-autoupdate: flock is missing (util-linux)" >&2; exit 1; }
 sudo -n true 2>/dev/null || { echo "install-autoupdate: passwordless sudo is needed (links in /usr/local/bin, /opt/fcode-tools)" >&2; exit 1; }
 sudo -n install -d -o "$(id -un)" -g "$(id -gn)" /opt/fcode-tools
@@ -39,6 +41,9 @@ json_set() {
 put "$D/fcode-update.sh" "$HOME/.local/bin/fcode-update" 755
 put "$D/fcode-update.service" "$UNITS/fcode-update.service" 644
 put "$D/fcode-update.timer" "$UNITS/fcode-update.timer" 644
+put "$D/fcode-git-sync.sh" "$HOME/.local/bin/fcode-git-sync" 755
+put "$D/fcode-git-sync.service" "$UNITS/fcode-git-sync.service" 644
+put "$D/fcode-git-sync.timer" "$UNITS/fcode-git-sync.timer" 644
 mkdir -p "$HOME/.local/state/fcode-update"
 
 # claude's built-in self-updater off (our timer does the updating)
@@ -54,6 +59,6 @@ CLEAN="$HOME/.local/state/fcode-update/.npm-cache-cleaned"
 [ "$(loginctl show-user "$(id -u)" -p Linger --value 2>/dev/null)" = yes ] || sudo -n loginctl enable-linger "$USER"
 
 systemctl --user daemon-reload
-systemctl --user enable --now fcode-update.timer
-[ "$CHANGED" = 0 ] || systemctl --user restart fcode-update.timer
-systemctl --user list-timers fcode-update.timer --no-pager
+systemctl --user enable --now fcode-update.timer fcode-git-sync.timer
+[ "$CHANGED" = 0 ] || systemctl --user restart fcode-update.timer fcode-git-sync.timer
+systemctl --user list-timers fcode-update.timer fcode-git-sync.timer --no-pager

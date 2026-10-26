@@ -1,0 +1,9 @@
+[Unit]
+Description=Fetch FCode projects from GitHub and record how far each is behind or ahead
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/fcode-git-sync
+# a few projects at 60 s fetch each; a hung run must not pile up behind the 5-minute timer
+TimeoutStartSec=15min
+Nice=10

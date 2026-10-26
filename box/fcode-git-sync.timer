@@ -1,0 +1,14 @@
+[Unit]
+Description=Fetch FCode projects from GitHub every 5 minutes
+
+[Timer]
+# realtime: also fires after the paused box wakes up and its clock jumps past a boundary
+OnCalendar=*:0/5
+# 1 minute after boot
+OnBootSec=1min
+# a run missed while the box was off is made up at the next start
+Persistent=true
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

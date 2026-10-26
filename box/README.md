@@ -66,3 +66,19 @@ fcode-update --resume claude                  # cho phép cập nhật tiếp
 ### Cài cùng `install.sh`
 
 `install.sh` tự chạy `box/install-autoupdate.sh` sau khi cài `fcode-pair` (nếu có thư mục `box/` cạnh nó). Nếu bước này lỗi (ví dụ thiếu sudo không mật khẩu) thì chỉ cảnh báo, việc cài fcoding vẫn tiếp tục.
+
+## Theo dõi độ lệch git so với GitHub
+
+Một timer thứ hai (`fcode-git-sync.timer`, cài cùng `install-autoupdate.sh`) chạy mỗi 5 phút và 1 phút sau khi box khởi động. Script `~/.local/bin/fcode-git-sync` **chỉ xem, không bao giờ sửa repo**: không merge, không checkout, không reset, không push; thư mục làm việc, index, mọi nhánh và tag cục bộ giữ nguyên. Với từng project trong `~/.fcoding/config.json` (`projects`; tên hoặc đường dẫn có ký tự điều khiển bị bỏ qua):
+
+1. `git fetch` về `refs/remotes/origin/*` (timeout 60 giây, không hỏi gì; dùng khoá deploy riêng của repo). Lệnh fetch ghi rõ URL và refspec, nên refspec / prune / tagopt cấu hình sẵn trong repo không làm nó đụng vào nhánh hay tag cục bộ. URL là URL **đầu tiên** của `origin` (như `git fetch origin`), và không ghi `.git/FETCH_HEAD`;
+2. đếm, chỉ đọc: `behindDefault` = số commit trên `origin/<nhánh mặc định>` (theo `origin/HEAD`, mặc định `main`) mà HEAD chưa có; `aheadOfOrigin` = số commit của HEAD không nằm trên nhánh `origin/*` nào (tức là chỉ có trên box; `null` nếu không tính được); `dirty` = có thay đổi chưa commit (kể cả file chưa theo dõi);
+3. ghi `~/.local/state/fcode/git-sync.json` (ghi nguyên tử, chế độ 600): mỗi project có `branch`, `default`, `dirty`, `behindDefault`, `aheadOfOrigin`, `lastFetchAt`, `error`, cùng `updatedAt` ở ngoài cùng. `error` chỉ là một lý do ngắn (`fetch failed: ...`, `fetch timed out after Ns`, ...), kèm tối đa dòng đầu của git với mật khẩu trong URL và token (`ghp_`, `github_pat_`, `x-access-token`...) đã bị che.
+
+Ứng dụng đọc file này và hiện "chậm N commit" (`behindDefault` > 0), "N commit chưa đẩy" (`aheadOfOrigin` > 0) hoặc "có sửa chưa lưu" (`dirty`). **Cập nhật code là việc của agent**, theo luật "Sync first" trong `box/agents-git.md`: đầu mỗi task và trước `gh pr create` chạy `git fetch origin` rồi cập nhật nhánh từ `origin/main` (rebase nếu nhánh chưa đẩy, merge nếu đã đẩy). **Box không bao giờ tự đẩy (push) hộ**: nếu thấy "chưa đẩy" / "chưa lưu", hãy nhờ agent commit và push nhánh của nó.
+
+Một project lỗi không làm dừng các project khác; chỉ một lượt chạy tại một thời điểm (`flock`); không in gì ra màn hình. Chạy tay: `fcode-git-sync` hoặc `systemctl --user start fcode-git-sync.service`. Chạy riêng một project: `fcode-git-sync <tên project>` (server gọi lệnh này ngay trước khi tạo phiên mới): chỉ project đó được fetch, chỉ mục của nó trong `git-sync.json` được cập nhật (các mục khác giữ nguyên), toàn bộ lượt chạy xong trong khoảng 55 giây (chờ khoá tối đa 15 giây + fetch 30 giây + 5 giây chờ tắt + đếm) và luôn thoát với mã 0; lỗi chỉ nằm trong mục của project. Tên không có trong cấu hình: in một dòng ra stderr, không đổi state. Khi nhận TERM/INT/HUP script dọn file tạm rồi thoát; file state luôn ghi bằng file tạm rồi đổi tên.
+
+`install-autoupdate.sh` chỉ cài script và hai unit rồi bật timer; nó **không** sửa file hướng dẫn của agent. Nội dung luật Git cho agent nằm ở `box/agents-git.md` (nguồn duy nhất); người quản trị tự đưa mục đó vào `~/.omp/agent/AGENTS.md`, `~/.claude/CLAUDE.md` và `~/AGENTS.md`.
+
+Kiểm thử (thư mục tạm, không đụng box thật): `bash test/git-sync.test.sh`.

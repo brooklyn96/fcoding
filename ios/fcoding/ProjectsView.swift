@@ -286,10 +286,12 @@ struct ProjectsView: View {
 
     private var rail: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 10) {
+            // Equal-height cards: the tallest (git line) sets the row, the others stretch.
+            HStack(alignment: .top, spacing: 10) {
                 projectCard("all")
                 ForEach(projectNames, id: \.self) { projectCard($0) }
             }
+            .fixedSize(horizontal: false, vertical: true)
             .padding(.horizontal, 16)
             .padding(.top, 2)
             .padding(.bottom, 6)
@@ -316,9 +318,14 @@ struct ProjectsView: View {
             let checks = HomeLogic.checksLine(prs, branch: branch)
             let deploy = HomeLogic.deployLine(info?.lastRun, now: home.serverNow())
             let reading = info?.loading == true
+            let git = HomeLogic.gitLine(info?.git)
             lines = [
                 ProjectLine(text: Text(LocalizedStringKey(HomeLogic.prLine(info)))),
                 ProjectLine(text: Text(checks.text.isEmpty ? " " : checks.text), color: checks.tone.color),
+            ] + (git.map { g -> [ProjectLine] in
+                let t = Text(g.text)
+                return [ProjectLine(text: g.label.map { t.accessibilityLabel($0) } ?? t, color: g.tone.color)]
+            } ?? []) + [
                 // Before the first gh read there is no deploy to report yet.
                 ProjectLine(text: Text(reading ? " " : deploy.text), color: deploy.tone.color),
             ]
@@ -498,7 +505,7 @@ extension HomeLogic.Tone {
         switch self {
         case .ok: return .greenTone
         case .fail: return .redTone
-        case .pending: return .orangeTone
+        case .pending, .warn: return .orangeTone
         case .none: return .l3
         }
     }
@@ -558,7 +565,7 @@ struct ProjectLine {
     var color: Color = .l2
 }
 
-/// 182 pt card: name + count, three status lines, "…" for a new session; tap filters the
+/// 182 pt card: name + count, three or four status lines, "…" for a new session; tap filters the
 /// sessions, a long press opens a new session in that project.
 struct ProjectCard: View {
     let title: String
@@ -594,7 +601,7 @@ struct ProjectCard: View {
         }
         .padding(.top, 11).padding(.horizontal, 12).padding(.bottom, 10)
         .frame(width: 182, alignment: .topLeading)
-        .frame(minHeight: 108, alignment: .topLeading)
+        .frame(minHeight: 108, maxHeight: .infinity, alignment: .topLeading)
         .background(selected ? Color(hex: 0x2A2A2E) : Color.grp, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(selected ? Color.white : .clear, lineWidth: 1.5))
         .overlay(alignment: .topTrailing) {
@@ -746,7 +753,7 @@ struct SessionRow: View {
             }
             meta.padding(.top, 3)
             if let preview = session.preview, !preview.isEmpty {
-                Text(preview)
+                PreviewText(text: preview)
                     .scaledFont(12.5, design: .monospaced)
                     .foregroundColor(idle ? .l2 : Color(hex: 0xD1D1D6))
                     .lineLimit(waiting ? 3 : 1)
@@ -808,6 +815,47 @@ struct SessionRow: View {
         .buttonStyle(.plain)
         .disabled(off)
         .opacity(off ? 0.5 : 1)
+    }
+}
+
+/// The card's last line with omp's Nerd icons drawn in the bundled Symbols Nerd Font, as
+/// SessionView does: SF Mono has no glyph for them and the system fallback never searches app
+/// fonts, so they showed as boxes. Text keeps the inherited font and colour; an icon the Nerd
+/// font lacks too is dropped. Its own view, so the size reads the row's clamped Dynamic Type.
+private struct PreviewText: View {
+    let text: String
+    @ScaledMetric(relativeTo: .caption) private var size: CGFloat = 12.5
+
+    var body: some View { Text(attributed) }
+
+    private var attributed: AttributedString {
+        typealias A = AttributeScopes.SwiftUIAttributes
+        let nerd = UIFont(name: ANSI.nerdFontName, size: ANSI.iconFontSize(forBase: size))
+        var icon = AttributeContainer()
+        if let nerd = nerd {
+            let base = UIFont.monospacedSystemFont(ofSize: size, weight: .regular)
+            icon[A.FontAttribute.self] = Font(nerd as CTFont)
+            icon[A.BaselineOffsetAttribute.self] = (base.ascender + base.descender) / 2 - (nerd.ascender + nerd.descender) / 2
+        }
+        var out = AttributedString()
+        var piece = String.UnicodeScalarView()
+        var pieceIsIcon = false
+        func emit() {
+            guard !piece.isEmpty else { return }
+            out.append(AttributedString(String(piece), attributes: pieceIsIcon ? icon : AttributeContainer()))
+            piece = String.UnicodeScalarView()
+        }
+        for scalar in text.unicodeScalars {
+            let isIcon = ANSI.isIcon(scalar)
+            if isIcon, !(nerd.map { ANSI.hasGlyph($0 as CTFont, scalar) } ?? false) { continue }
+            if isIcon != pieceIsIcon {
+                emit()
+                pieceIsIcon = isIcon
+            }
+            piece.append(scalar)
+        }
+        emit()
+        return out
     }
 }
 

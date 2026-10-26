@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import { createApp, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, strictOrigin, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock,
-  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, prsOf, runOf, parseUpdates, resetReply, RESET_MSG, BOX, memo, codexChildMeta } from '../server.mjs';
+  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, parseUpdates, resetReply, RESET_MSG, BOX, memo, codexChildMeta, parseGitSync } from '../server.mjs';
 
 process.env.TZ = 'America/Los_Angeles'; // spend days follow config.json timeZone, never the process zone: a third zone proves it
 
@@ -34,7 +34,7 @@ async function boot(opts = {}) {
   const logs = [];
   // home v2 sources default to nothing real: no scan of this machine's logs, no omp/gh on PATH
   const app = createApp({ configDir, tmux: [process.execPath, FAKE], log: (l) => logs.push(l), pollMs: 40, pasteEnterDelayMs: 0,
-    spendRoots: {}, updatesFile: path.join(root, 'no-status.json'), omp: [process.execPath, '-e', 'process.exit(1)'], gh: [process.execPath, '-e', 'process.exit(1)'], ...opts });
+    spendRoots: {}, updatesFile: path.join(root, 'no-status.json'), gitSync: null, gitSyncFile: path.join(root, 'no-git-sync.json'), omp: [process.execPath, '-e', 'process.exit(1)'], gh: [process.execPath, '-e', 'process.exit(1)'], ...opts });
   const port = await app.listen(0, '127.0.0.1');
   const ctx = { app, port, logs, root, configDir };
   ctx.req = (method, p, o = {}) => request(port, method, p, o);
@@ -2528,6 +2528,7 @@ const FIXDIR = path.join(here, 'fixtures', 'home');
 const FIX = (f) => path.join(FIXDIR, f);
 const fixJson = (f) => JSON.parse(fs.readFileSync(FIX(f), 'utf8'));
 const GH = fixJson('gh.json');
+const GIT_NULL = { behind: null, ahead: null, dirty: null, branch: null, syncedAt: null, error: null }; // projects[].git with no git-sync.json entry
 const T0 = 1792956700000; // 2026-10-25T19:31:40Z, two minutes after the recorded omp fetch
 // one fake for omp, gh and git: logs its argv, answers by the first rule whose key is a substring of the joined argv
 const FAKE_TOOL_SRC = `import fs from 'node:fs'; import path from 'node:path';
@@ -2551,6 +2552,7 @@ const baseRules = () => [
   ['rev-parse --abbrev-ref HEAD', { stdout: 'main\n' }],
   ['pr list', { stdout: JSON.stringify(GH.prs) }],
   ['run list', { stdout: JSON.stringify(GH.runs) }],
+  ['workflow list', { stdout: JSON.stringify(GH.workflows) }],
 ];
 function spendDirs(root) {
   const d = { omp: path.join(root, 'omp'), claude: path.join(root, 'claude'), codex: path.join(root, 'codex'), archived: path.join(root, 'codex-archived') };
@@ -2869,6 +2871,23 @@ test('projects and updates parsers: remotes, checks, mergeable, last run, status
   assert.equal(checksOf(undefined), null); // gh could not read checks
   assert.deepEqual(runOf(GH.runs), { workflow: 'Deal Sync Mobile v2 Gate', status: 'failure', at: '2026-10-25T19:25:12Z', url: 'https://github.com/owner/repo/actions/runs/1' });
   assert.deepEqual([runOf([{ status: 'in_progress' }]).status, runOf([{ status: 'completed', conclusion: 'skipped' }]).status, runOf([])], ['in_progress', 'success', null]);
+  // deploy line: workflow NAME or FILE PATH contains "deploy" (any case); a PR gate or CI run is never it, however new
+  assert.equal(deployRunOf(GH.runs, GH.workflows).workflow, 'Ship it'); // the file deploy.yml, the name says nothing
+  assert.equal(deployRunOf(GH.runs, null), null); // no workflow list (gh failed) and no "deploy" in any name: none
+  assert.equal(deployRunOf([{ workflowName: 'CI', status: 'completed', conclusion: 'success' }, { workflowName: 'Deploy Prod', status: 'in_progress' }], null).status, 'in_progress');
+  assert.deepEqual([deployRunOf([], GH.workflows), deployRunOf(null, GH.workflows), deployRunOf([{ name: 'RE-DEPLOY', status: 'completed', conclusion: 'failure' }], undefined).status], [null, null, 'failure']);
+  // checks from Actions runs of one head SHA: the latest run per workflow (newest first), same rules as the rollup
+  assert.deepEqual(['sha6', 'sha5', 'sha4', 'nobody'].map((sha) => checksOfRuns(GH.runs, sha)), ['pending', 'failure', 'success', 'none']);
+  assert.deepEqual([checksOfRuns(null, 'sha6'), checksOfRuns(GH.runs, undefined)], [null, 'none']);
+  // two workflow files with ONE name are told apart by id: the newer success of one "CI" does not hide the failure of the other,
+  // and a deploy.yml named "CI" is the deploy line, not the newest run of any "CI"
+  const ci = (id, conclusion, headSha = 'a') => ({ workflowDatabaseId: id, workflowName: 'CI', name: 'CI', status: 'completed', conclusion, headSha });
+  assert.equal(checksOfRuns([ci(2, 'success'), ci(1, 'failure')], 'a'), 'failure');
+  assert.equal(deployRunOf([ci(1, 'failure'), ci(2, 'success')], [{ id: 1, name: 'CI', path: '.github/workflows/ci.yml' }, { id: 2, name: 'CI', path: '.github/workflows/deploy.yml' }]).status, 'success');
+  assert.equal(deployRunOf([ci(1, 'failure')], [{ id: 1, name: 'CI', path: '.github/workflows/ci.yml' }, { id: 2, name: 'CI', path: '.github/workflows/deploy.yml' }]), null);
+  assert.deepEqual(prsOf(GH.prs.map(({ statusCheckRollup, ...p }) => p), GH.runs).map((p) => p.checks), ['pending', 'failure', 'success']);
+  assert.deepEqual(prsOf(GH.prs.map(({ statusCheckRollup, ...p }) => p)).map((p) => p.checks), [null, null, null]); // runs unreadable: null as before
+  assert.deepEqual(prsOf(GH.prs, GH.runs).map((p) => p.checks), ['pending', 'failure', 'none']); // a readable rollup wins, even an empty one
   assert.deepEqual(parseUpdates(JSON.stringify(GH.status)).codex, { from: '0.164.0', to: '0.164.1', at: '2026-10-25T19:21:18Z', result: 'updated' });
   assert.deepEqual([parseUpdates('not json'), parseUpdates('[]')], [{}, {}]);
   // only the three harness tools; an unknown result is null
@@ -2906,7 +2925,9 @@ test('GET /api/home: the whole shape from omp, logs, gh and status.json; box tim
   assert.deepEqual(cx.spend.today, { usd: 0.2225, tokens: 43000 });
   assert.deepEqual(h.totals.spend.last30, { usd: 0.8107, tokens: 175046 });
   assert.deepEqual(h.totals.byHarness.map((x) => x.harness), ['claude', 'codex']);
-  assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: 'owner/repo', branch: 'main', prs: prsOf(GH.prs), lastRun: runOf(GH.runs) })));
+  // the newest run is a failed PR gate: the deploy line is the newest run of the workflow whose FILE is deploy.yml ("Ship it")
+  const ship = { workflow: 'Ship it', status: 'success', at: '2026-10-25T19:10:00Z', url: 'https://github.com/owner/repo/actions/runs/7' };
+  assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: 'owner/repo', branch: 'main', prs: prsOf(GH.prs), lastRun: ship, git: GIT_NULL })));
   assert.deepEqual(Object.keys(h.updates), ['omp', 'claude', 'codex']);
   assert.ok(!JSON.stringify(h).includes('github-work')); // the remote URL never leaves the server
   // box: a tick more than 90 s late is a resume; regular ticks are not
@@ -2923,6 +2944,9 @@ test('GET /api/home caches: quota 60 s, projects 2 min, spend 5 min; one refresh
   await c.app.homeIdle(); // a part slower than homeWait has landed (the spend scan must end before the log line below is added)
   assert.equal(c.toolCalls('usage --json').length, 1);
   assert.equal(c.toolCalls('pr list').length, 2); // two projects, once each
+  assert.deepEqual([c.toolCalls('run list').length, c.toolCalls('workflow list').length], [2, 2]); // the deploy line and the PR checks share one run list
+  assert.ok(c.toolCalls('workflow list').every((l) => l.includes('--all --json id,name,path'))); // a disabled deploy workflow too, by id
+  assert.ok(c.toolCalls('run list').every((l) => l.includes('--json workflowDatabaseId,')));
   fs.appendFileSync(path.join(c.roots.dirs.omp, 'p', 's1.jsonl'), `${JSON.stringify({ type: 'message', id: 'n1', timestamp: new Date(T0).toISOString(),
     message: { role: 'assistant', provider: 'anthropic', model: 'claude-haiku-5-5', credentialId: 2, responseId: 'msg_new', timestamp: T0, usage: { totalTokens: 5, cost: { total: 1 } } } })}\n`);
   c.clock.t += 61e3;
@@ -2945,7 +2969,7 @@ test('GET /api/home partial failure: omp, gh or the logs down -> that part empty
   fs.rmSync(c.roots.dirs.claude, { recursive: true }); // one log source gone
   let h = await c.homeUntil((x) => x.totals.spend && !x.projects[0].loading); // the spend scan and gh have answered
   assert.deepEqual(h.accounts, []);
-  assert.deepEqual(h.projects[0], { name: 'alpha', repo: 'owner/repo', branch: 'main', prs: null, lastRun: null });
+  assert.deepEqual(h.projects[0], { name: 'alpha', repo: 'owner/repo', branch: 'main', prs: null, lastRun: null, git: GIT_NULL });
   assert.equal(h.totals.spend.last30.usd, 0.2897); // omp + Codex logs; Claude Code logs gone
   assert.ok(h.box.sleepsAt && h.updates.omp);
   // omp back: fresh; omp down again after the TTL: the last accounts, marked stale
@@ -2964,19 +2988,67 @@ test('GET /api/home partial failure: omp, gh or the logs down -> that part empty
   for (let i = 0; i < 3; i++) await c.home(); // within a TTL of the failure: no new omp run on every poll
   assert.equal(c.toolCalls('usage --json').length, before);
   await c.app.homeIdle(); // the projects refresh started above has ended before the rules change
-  // a token that cannot read checks fails the statusCheckRollup query: the list comes without checks
+  // a token that cannot read checks fails the statusCheckRollup query (GraphQL "not accessible", or an HTTP 403): the list comes
+  // without it and the checks come from the Actions runs of each head SHA, from ONE run list per project (not one call per PR)
+  const noRollup = JSON.stringify(GH.prs.map(({ statusCheckRollup, ...p }) => p));
+  const runCalls = () => c.toolCalls('run list').length, fallbacks = () => c.toolCalls().filter((l) => l.endsWith('--json number,title,mergeable,headRefOid')).length;
+  let r0 = runCalls(), fb = fallbacks();
   c.setRules([['statusCheckRollup', { code: 1, stderr: 'GraphQL: Resource not accessible by personal access token' }],
-    ['--json number,title,mergeable', { stdout: JSON.stringify(GH.prs.map(({ statusCheckRollup, ...p }) => p)) }], ...rules]);
+    ['--json number,title,mergeable,headRefOid', { stdout: noRollup }], ...rules]);
+  c.clock.t += 121e3;
+  h = await c.homeUntil((x) => x.projects[0].prs?.[2]?.checks === 'success');
+  assert.deepEqual(h.projects[0].prs.map((p) => [p.number, p.checks, p.mergeable]), [[6, 'pending', true], [5, 'failure', false], [4, 'success', null]]);
+  assert.deepEqual(h.projects[0].lastRun.workflow, 'Ship it'); // the same run list feeds the deploy line
+  await c.app.homeIdle();
+  assert.deepEqual([fallbacks() - fb, runCalls() - r0], [2, 2]); // two projects: one fallback list and one run list each, however many PRs
+  // HTTP 403 alone is a permission error too
+  r0 = runCalls(); fb = fallbacks();
+  c.setRules([['statusCheckRollup', { code: 1, stderr: 'gh: HTTP 403' }], ['--json number,title,mergeable,headRefOid', { stdout: noRollup }], ...rules]);
+  c.clock.t += 121e3;
+  await c.home(); // stale at once, the refresh runs in the background
+  await c.app.homeIdle();
+  assert.deepEqual([fallbacks() - fb, runCalls() - r0], [2, 2]);
+  // the runs unreadable too: checks null, as before 1.3.1 (the PR list itself is still shown)
+  c.setRules([['statusCheckRollup', { code: 1, stderr: 'GraphQL: Resource not accessible by personal access token' }], ['run list', { code: 1, stderr: 'HTTP 403' }],
+    ['--json number,title,mergeable,headRefOid', { stdout: noRollup }], ...rules]);
   c.clock.t += 121e3;
   h = await c.homeUntil((x) => x.projects[0].prs?.[0]?.checks === null);
-  assert.deepEqual(h.projects[0].prs.map((p) => [p.number, p.checks, p.mergeable]), [[6, null, true], [5, null, false], [4, null, null]]);
+  assert.deepEqual([h.projects[0].prs.map((p) => p.checks), h.projects[0].lastRun], [[null, null, null], null]);
   // any other gh failure (a timeout, HTTP 502) is not retried without checks
-  const fallbacks = () => c.toolCalls().filter((l) => l.endsWith('--json number,title,mergeable')).length, fb = fallbacks();
+  fb = fallbacks();
   await c.app.homeIdle();
-  c.setRules([['statusCheckRollup', { code: 1, stderr: 'HTTP 502: Bad Gateway' }], ['--json number,title,mergeable', { stdout: '[]' }], ...rules]);
+  c.setRules([['statusCheckRollup', { code: 1, stderr: 'HTTP 502: Bad Gateway' }], ['--json number,title,mergeable,headRefOid', { stdout: '[]' }], ...rules]);
   c.clock.t += 121e3;
   h = await c.homeUntil((x) => x.projects[0].prs === null);
   assert.equal(fallbacks(), fb);
+  // a rate limit is a 403 too, but a retry cannot succeed: not retried
+  await c.app.homeIdle();
+  c.setRules([['statusCheckRollup', { code: 1, stderr: 'gh: HTTP 403: API rate limit exceeded for user ID 1.' }], ['--json number,title,mergeable,headRefOid', { stdout: noRollup }], ...rules]);
+  c.clock.t += 121e3;
+  await c.home();
+  await c.app.homeIdle();
+  assert.equal(fallbacks(), fb);
+}));
+
+test('GET /api/home: a full 100-run window without a deploy run reads the deploy workflow\'s newest run, one call per deploy workflow', () => homeApp(async (c) => {
+  const full = Array.from({ length: 100 }, (_, i) => ({ conclusion: 'success', createdAt: `2026-10-25T18:${String(i % 60).padStart(2, '0')}:00Z`, headSha: `x${i}`, name: 'CI', status: 'completed',
+    url: 'https://github.com/owner/repo/actions/runs/9', workflowName: 'CI', workflowDatabaseId: 12 }));
+  const old = [GH.runs.find((r) => r.workflowDatabaseId === 13)];
+  const ci = GH.workflows.filter((w) => w.id === 12);
+  const wfCalls = () => c.toolCalls('--workflow').length;
+  c.setRules([['--workflow 13', { stdout: JSON.stringify(old) }], ['run list', { stdout: JSON.stringify(full) }], ...baseRules()]);
+  let h = await c.homeUntil((x) => x.projects[0].lastRun && x.projects[1].lastRun);
+  assert.deepEqual(h.projects.map((p) => p.lastRun.workflow), ['Ship it', 'Ship it']);
+  await c.app.homeIdle();
+  assert.equal(wfCalls(), 2); // two projects, the one deploy workflow each
+  assert.ok(c.toolCalls('--workflow 13').every((l) => l.includes('--limit 1 ')));
+  // the window full and no deploy workflow at all: no extra call, none
+  c.setRules([['workflow list', { stdout: JSON.stringify(ci) }], ['run list', { stdout: JSON.stringify(full) }], ...baseRules()]);
+  c.clock.t += 121e3;
+  await c.home();
+  await c.app.homeIdle();
+  h = await c.home();
+  assert.deepEqual([h.projects[0].lastRun, wfCalls()], [null, 2]);
 }));
 
 test('GET /api/home never waits long: a slow part is empty the first time, then served from the cache while it refreshes', () => homeApp(async (c) => {
@@ -2985,7 +3057,7 @@ test('GET /api/home never waits long: a slow part is empty the first time, then 
   let h = await c.home();
   assert.ok(Date.now() - t0 < 1200, `took ${Date.now() - t0} ms`); // homeWaitMs 300 per part, in parallel
   assert.deepEqual(h.accounts, []); // not ready yet: empty, the rest answers (box, updates; spend if its scan was quick)
-  assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: null, branch: null, prs: null, lastRun: null, loading: true })));
+  assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: null, branch: null, prs: null, lastRun: null, loading: true, git: GIT_NULL })));
   assert.ok('spend' in h.totals && Array.isArray(h.totals.byHarness) && h.box && h.updates.omp);
   h = await c.homeUntil((x) => x.accounts.length === 4 && x.projects[0].repo && x.totals.spend);
   c.clock.t += 121e3; // both TTLs over, both tools still slow: the cached parts at once
@@ -3324,4 +3396,383 @@ test('rename with real tmux: exact target, options move, duplicate and missing n
     assert.equal((await c.req('GET', '/api/screen/done-1', { cookie })).status, 200);
     assert.equal((await c.req('GET', '/api/screen/work', { cookie })).status, 404);
   } finally { tmux('kill-server'); await c.close(); }
+});
+
+// ======================= v1.3.1: fcode-new (server.mjs --new, install.sh's wrapper ~/.local/bin/fcode-new) =======================
+const newCli = (c, ...args) => cli(c.configDir, ['--new', ...args]);
+
+test('fcode-new --projects and --harnesses: one name per line, config order, exit 0, nothing on stderr', () => withApp(async (c) => {
+  const p = await newCli(c, '--projects');
+  assert.deepEqual([p.status, p.stdout, p.stderr], [0, 'alpha\nmy.proj\n', '']);
+  const h = await newCli(c, '--harnesses');
+  assert.deepEqual([h.status, h.stdout, h.stderr], [0, 'omp\nclaude\ncodex\n', '']); // not the plain shell
+  assert.equal(c.calls().length, 0); // the lists never touch tmux
+}));
+
+test('fcode-new <project> <harness>: the same session as the app, only its name on stdout; a taken name gets -2, -3', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  const a = await newCli(c, 'alpha', 'omp');
+  assert.deepEqual([a.status, a.stdout, a.stderr], [0, 'alpha-omp\n', '']);
+  const b = await newCli(c, 'alpha', 'omp');
+  assert.deepEqual([b.status, b.stdout, b.stderr], [0, 'alpha-omp-2\n', '']);
+  assert.equal((await newCli(c, 'my.proj', 'claude')).stdout, 'my-proj-claude\n'); // openName: lowercased, [^a-z0-9-] -> -
+  // an app "+" in between takes the next free name, in the same queue
+  const app = await c.req('POST', '/api/open', { cookie, body: { project: 'alpha', harness: 'omp', fresh: true } });
+  assert.equal(app.json.name, 'alpha-omp-3');
+  assert.equal((await newCli(c, 'alpha', 'omp')).stdout, 'alpha-omp-4\n');
+  // identical to the app's session: the same tmux command and the same project / harness options, and it shows in the app's list
+  const ns = c.calls().filter((x) => x.argv[0] === 'new-session' && x.argv[3] === 'alpha-omp');
+  assert.deepEqual(ns[0].argv, ['new-session', '-d', '-s', 'alpha-omp', '-c', ABS, `${LAUNCH}omp`]);
+  const list = (await c.req('GET', '/api/sessions', { cookie })).json.sessions;
+  assert.deepEqual(list.filter((s) => s.name.startsWith('alpha-omp')).map((s) => [s.name, s.project, s.harness]).sort(),
+    ['alpha-omp', 'alpha-omp-2', 'alpha-omp-3', 'alpha-omp-4'].map((n) => [n, 'alpha', 'omp']));
+  const mine = list.find((s) => s.name === 'my-proj-claude');
+  assert.deepEqual([mine.project, mine.harness], ['my.proj', 'claude']);
+}));
+
+test('fcode-new: names never exceed 32 chars, suffix kept; concurrent calls get different names', () => withApp(async (c) => {
+  const long = 'a-very-long-project-name-for-tests-x';
+  setProjects(c, { [long]: ABS, alpha: ABS });
+  const names = [];
+  for (let i = 0; i < 10; i++) names.push((await newCli(c, long, 'claude')).stdout.trim());
+  assert.ok(names.every((n) => n.length <= 32), names.join(' '));
+  assert.equal(new Set(names).size, 10);
+  assert.deepEqual([names[0], names[1], names[2], names[9]], ['a-very-long-project-name-for-tes', 'a-very-long-project-name-for-t-2', 'a-very-long-project-name-for-t-3', 'a-very-long-project-name-for-10']);
+  const par = await Promise.all([1, 2, 3, 4].map(() => newCli(c, 'alpha', 'codex')));
+  assert.ok(par.every((r) => r.status === 0));
+  assert.deepEqual(par.map((r) => r.stdout.trim()).sort(), ['alpha-codex', 'alpha-codex-2', 'alpha-codex-3', 'alpha-codex-4']);
+}));
+
+test('fcode-new errors: Vietnamese on stderr, empty stdout, exit 1; no session is made', () => withApp(async (c) => {
+  const cases = [
+    [['nope', 'omp'], /Không có dự án/],
+    [['alpha', 'nope'], /Không có harness/],
+    [['alpha', 'shell'], /Không có harness/], // the plain shell is not offered
+    [['alpha', 'constructor'], /Không có harness/],
+    [['alpha'], /Cách dùng/],
+    [[], /Cách dùng/],
+    [['--projects', 'x'], /Không có dự án/], // two words: a project and a harness, and no such project
+    [['a', 'b', 'c'], /Cách dùng/],
+  ];
+  for (const [args, msg] of cases) {
+    const r = await newCli(c, ...args);
+    assert.deepEqual([r.status, r.stdout], [1, ''], args.join(' '));
+    assert.match(r.stderr, msg, args.join(' '));
+  }
+  assert.ok(!c.calls().some((x) => x.argv[0] === 'new-session'));
+  // a harness that exits at once
+  await withEnv({ FAKE_TMUX_EXIT: '1' }, async () => {
+    const r = await newCli(c, 'alpha', 'omp');
+    assert.deepEqual([r.status, r.stdout], [1, '']);
+    assert.match(r.stderr, /Harness thoát/);
+  });
+}));
+
+test('fcode-new with no server running: Vietnamese message, empty stdout, exit 1', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-cli-'));
+  try {
+    for (const args of [['--projects'], ['--harnesses'], ['alpha', 'omp']]) {
+      const r = await cli(dir, ['--new', ...args]);
+      assert.deepEqual([r.status, r.stdout], [1, ''], args.join(' '));
+      assert.match(r.stderr, /Server FCode chưa chạy/);
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('admin socket: new and meta over adminRequest; no paired device needed', () => withApp(async (c) => {
+  assert.deepEqual(await adminRequest(c.configDir, { cmd: 'meta' }), { ok: true, projects: ['alpha', 'my.proj'], harnesses: ['omp', 'claude', 'codex'] });
+  assert.deepEqual(await adminRequest(c.configDir, { cmd: 'new', project: 'alpha', harness: 'omp' }), { ok: true, name: 'alpha-omp' });
+  assert.deepEqual(await adminRequest(c.configDir, { cmd: 'new', project: 'x', harness: 'omp' }), { ok: false, error: 'unknown_project' });
+  assert.deepEqual(await adminRequest(c.configDir, { cmd: 'new', project: 'alpha', harness: 'shell' }), { ok: false, error: 'unknown_harness' });
+  assert.deepEqual(await adminRequest(c.configDir, { cmd: 'new', project: {}, harness: [] }), { ok: false, error: 'unknown_project' });
+  assert.deepEqual(await adminRequest(c.configDir, { cmd: 'devices' }), { ok: true, devices: [] }); // the other commands are unchanged
+}));
+
+test('admin socket: a client that goes away drops its queued new session (as an HTTP request that closes does)', () => withApp(async (c) => {
+  await withEnv({ FAKE_TMUX_DELAY_MS: '300' }, async () => {
+    const first = adminRequest(c.configDir, { cmd: 'new', project: 'alpha', harness: 'omp' });
+    assert.ok(await until(() => c.app.stats().running === 1, 3000));
+    const sock = net.connect(adminPath(c.configDir));
+    sock.on('error', () => {});
+    sock.write(`${JSON.stringify({ cmd: 'new', project: 'my.proj', harness: 'omp' })}\n`);
+    assert.ok(await until(() => c.app.stats().waiting === 1, 3000)); // queued behind the first
+    sock.destroy(); // fcode-new timed out, or Ctrl+C
+    assert.ok(await until(() => c.app.stats().waiting === 0, 3000)); // dropped from the queue at once
+    assert.deepEqual(await first, { ok: true, name: 'alpha-omp' });
+    await sleep(800);
+    assert.ok(!c.calls().some((x) => x.argv[0] === 'new-session' && x.argv[3] === 'my-proj-omp'), JSON.stringify(c.calls().map((x) => x.argv.slice(0, 4))));
+  });
+}));
+
+test('fcode-new against an old server or a dead socket: plain Vietnamese, no English detail', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-cli-'));
+  const old = (reply) => net.createServer((s) => { s.on('error', () => {}); s.once('data', () => (reply ? s.end(reply) : s.destroy())); });
+  try {
+    for (const [reply, msg] of [['{"ok":false,"error":"unknown command"}\n', /bản cũ.*install\.sh/], ['', /Không nói chuyện được.*install\.sh/], ['{"ok":false,"error":"internal"}\n', /Không tạo được phiên/]]) {
+      const srv = old(reply);
+      await new Promise((r) => srv.listen(adminPath(dir), r));
+      try {
+        for (const args of [['--projects'], ['alpha', 'omp']]) {
+          const r = await cli(dir, ['--new', ...args]);
+          assert.deepEqual([r.status, r.stdout], [1, ''], `${reply} ${args}`);
+          assert.match(r.stderr, msg);
+          assert.ok(!/[Uu]nknown|timeout|internal|admin|\bsocket\b/.test(r.stderr), r.stderr);
+        }
+      } finally { await new Promise((r) => srv.close(r)); }
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('fcode-pair "--new": a pairing name is not the fcode-new switch (only argv[2] is)', () => withApp(async (c) => {
+  const r = await cli(c.configDir, ['--pair', '--new', '--qr']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /MÃ GHÉP/);
+  assert.ok(!/Cách dùng/.test(r.stderr + r.stdout));
+  assert.equal((await adminRequest(c.configDir, { cmd: 'devices' })).ok, true);
+}));
+
+test('fcode-new: the install.sh wrapper passes its arguments through to server.mjs --new', () => {
+  const sh = fs.readFileSync(path.join(here, '..', 'install.sh'), 'utf8').replaceAll('\r\n', '\n');
+  assert.match(sh, /cat > "\$HOME\/\.local\/bin\/fcode-new" <<WRAP\n#!\/bin\/sh\nexec env PC_CONFIG_DIR="\$CFG" "\$\(command -v node\)" "\$APP\/server\.mjs" --new "\\\$@"\nWRAP\nchmod 755 "\$HOME\/\.local\/bin\/fcode-new"/);
+});
+
+// ======================= v1.3.1 phase 2: git sync state in GET /api/home, fcode-git-sync before a fresh session =======================
+// projects[].git from git-sync.json (the box timer fcode-git-sync); openFresh first runs `fcode-git-sync <project>` (8 s cap)
+const logsOf = (c) => c.logs.filter((l) => !/^(GET|POST|PATCH|DELETE|PUT|HEAD) /.test(l)); // the log without the access lines
+const gitFile = () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-gsync-')); return { dir, file: path.join(dir, 'git-sync.json') }; };
+
+test('parseGitSync: field mapping; wrong types, a broken file or a non-object are null on their own, never a throw', () => {
+  const m = parseGitSync(fs.readFileSync(FIX('git-sync.json'), 'utf8'));
+  assert.deepEqual([...m.keys()], ['alpha', 'my.proj', 'odd']);
+  assert.deepEqual(m.get('alpha'), { behind: 3, ahead: 0, dirty: true, branch: 'main', syncedAt: '2026-10-25T19:29:00.000Z', error: null });
+  assert.deepEqual(m.get('my.proj'), { behind: 0, ahead: 2, dirty: false, branch: 'feature/x', syncedAt: '2026-10-25T19:00:00.000Z', error: 'fetch failed: could not resolve host' }); // behind 0 stays 0
+  // 'odd': every field of the wrong type, one by one
+  assert.deepEqual(m.get('odd'), GIT_NULL);
+  for (const bad of ['', '{', 'null', '[]', '"x"', '{"projects":null}', '{"projects":[]}', '{"projects":"x"}', '{"updatedAt":"x"}']) assert.equal(parseGitSync(bad).size, 0, bad);
+  assert.equal(parseGitSync('{"projects":{"a":null,"b":3,"c":[]}}').size, 1); // an array is an object: all null; null and numbers are skipped
+  // text fields: control and escape characters dropped, one line, at most 160 characters
+  const e = parseGitSync(JSON.stringify({ projects: { a: { error: `\u001b[31mfetch\tfailed\u001b[0m\n${'x'.repeat(300)}`, branch: '  ' } } })).get('a');
+  assert.equal(e.branch, null);
+  assert.ok(Array.from(e.error).length <= 160 && !/[\u001b\t\n]/.test(e.error) && e.error.startsWith('fetch'), e.error);
+});
+
+test('GET /api/home projects[].git: from git-sync.json; no file, a broken file or an unlisted project -> all null, no error, nothing logged', async () => {
+  const g = gitFile();
+  try {
+    await homeApp(async (c) => {
+      const gits = async () => (await c.home()).projects.map((p) => p.git);
+      assert.deepEqual(await gits(), [GIT_NULL, GIT_NULL]); // no file (the first reply: loading placeholders carry it too)
+      fs.writeFileSync(g.file, '{"projects": {broken');
+      assert.deepEqual(await gits(), [GIT_NULL, GIT_NULL]);
+      fs.writeFileSync(g.file, JSON.stringify({ updatedAt: 'x', projects: { alpha: { branch: 'main', dirty: true, behindDefault: 4, aheadOfOrigin: 1, lastFetchAt: '2026-10-25T19:29:00Z', error: null } } }));
+      assert.deepEqual(await gits(), [{ behind: 4, ahead: 1, dirty: true, branch: 'main', syncedAt: '2026-10-25T19:29:00.000Z', error: null }, GIT_NULL]); // my.proj is not in the file
+      const h = await c.warm((x) => !x.projects[0].loading); // the cached projects part carries the file's values as well, never stale ones
+      assert.equal(h.projects[0].repo, 'owner/repo');
+      assert.deepEqual(h.projects[0].git.behind, 4);
+      fs.copyFileSync(FIX('git-sync.json'), g.file); // the file changes between two replies: the next reply has it (the file is not cached)
+      assert.deepEqual((await c.home()).projects.map((p) => p.git.behind), [3, 0]);
+      fs.rmSync(g.file);
+      assert.deepEqual(await gits(), [GIT_NULL, GIT_NULL]);
+      assert.deepEqual(logsOf(c), []); // no log line for any of it
+    }, { gitSyncFile: g.file });
+  } finally { fs.rmSync(g.dir, { recursive: true, force: true }); }
+});
+
+// a fake fcode-git-sync: logs its start (and end) with the argv project, then ok (ends after 150 ms, exit 0), fail (exit 3) or hang
+function syncTool(mode) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-fsync-'));
+  const script = path.join(dir, 'sync.mjs');
+  fs.writeFileSync(script, `import fs from 'node:fs';
+const [file, mode, project] = process.argv.slice(2);
+const w = (what) => fs.appendFileSync(file, JSON.stringify({ what, project, pid: process.pid, at: Date.now() }) + '\\n');
+w('start');
+if (mode === 'fail') process.exit(3);
+if (mode === 'hang') setInterval(() => {}, 1000);
+else setTimeout(() => { w('end'); process.exit(0); }, mode === 'slow' ? 1200 : 150);
+`);
+  const log = path.join(dir, 'sync.jsonl');
+  const lines = () => { try { return fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } };
+  const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const cleanup = () => { for (const l of lines()) try { process.kill(l.pid, 'SIGKILL'); } catch {} fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); };
+  return { dir, spec: [process.execPath, script, log, mode], lines, alive, cleanup };
+}
+const sessionCalls = (c, name) => c.calls().filter((x) => x.argv[0] === 'new-session' && x.argv[3] === name);
+
+test('open fresh (app "+" and fcode-new) runs fcode-git-sync <project> first, then creates the session; a reuse open does not sync', async () => {
+  const s = syncTool('ok');
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      const r = await c.req('POST', '/api/open', { cookie, body: { project: 'my.proj', harness: 'omp', fresh: true } });
+      assert.deepEqual([r.status, r.json], [200, { name: 'my-proj-omp', created: true }]);
+      let l = s.lines();
+      assert.deepEqual(l.map((x) => [x.what, x.project]), [['start', 'my.proj'], ['end', 'my.proj']]); // the project name is the only argument
+      const made = sessionCalls(c, 'my-proj-omp');
+      assert.equal(made.length, 1);
+      assert.ok(made[0].t0 >= l[1].at, `sync ended ${l[1].at}, session created ${made[0].t0}`); // sync first, then new-session
+      // the admin command (fcode-new) too
+      assert.deepEqual(await adminRequest(c.configDir, { cmd: 'new', project: 'alpha', harness: 'claude' }), { ok: true, name: 'alpha-claude' });
+      l = s.lines();
+      assert.deepEqual(l.slice(2).map((x) => [x.what, x.project]), [['start', 'alpha'], ['end', 'alpha']]);
+      assert.ok(sessionCalls(c, 'alpha-claude')[0].t0 >= l[3].at);
+      // an open that reuses a session is not a fresh open: no sync
+      assert.equal((await c.req('POST', '/api/open', { cookie, body: { project: 'alpha', harness: 'codex' } })).json.created, true);
+      assert.equal(s.lines().length, 4);
+      // rejected before anything runs: no sync
+      assert.equal((await c.req('POST', '/api/open', { cookie, body: { project: 'nope', harness: 'omp', fresh: true } })).status, 400);
+      assert.equal((await adminRequest(c.configDir, { cmd: 'new', project: 'nope', harness: 'omp' })).ok, false);
+      assert.equal(s.lines().length, 4);
+      assert.deepEqual(logsOf(c), []); // a good sync logs nothing
+    }, { gitSync: s.spec });
+  } finally { s.cleanup(); }
+});
+
+test('open fresh: a failing or missing fcode-git-sync never blocks the open; one log line, the session is created', async () => {
+  const s = syncTool('fail');
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      const r = await c.req('POST', '/api/open', { cookie, body: { project: 'alpha', harness: 'omp', fresh: true } });
+      assert.deepEqual([r.status, r.json.name], [200, 'alpha-omp']);
+      assert.deepEqual(logsOf(c), ['git-sync alpha: exit 3']);
+      assert.equal(sessionCalls(c, 'alpha-omp').length, 1);
+    }, { gitSync: s.spec });
+  } finally { s.cleanup(); }
+  await withApp(async (c) => { // the command does not exist (not installed, not on PATH)
+    const { cookie } = await c.login();
+    const r = await c.req('POST', '/api/open', { cookie, body: { project: 'alpha', harness: 'omp', fresh: true } });
+    assert.deepEqual([r.status, r.json.name], [200, 'alpha-omp']);
+    assert.deepEqual(logsOf(c), ['git-sync alpha: command not found']);
+    assert.equal((await newCli(c, 'alpha', 'omp')).stdout, 'alpha-omp-2\n'); // fcode-new has the same path (the CLI runs the same server code)
+  }, { gitSync: [path.join(os.tmpdir(), 'pc-no-such-dir', 'fcode-git-sync')] });
+});
+
+test('open fresh: a sync that hangs does not hold the open past the cap; the session is created and the sync is left running', async () => {
+  const s = syncTool('hang');
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      const t0 = Date.now();
+      const r = await c.req('POST', '/api/open', { cookie, body: { project: 'alpha', harness: 'omp', fresh: true } });
+      const took = Date.now() - t0;
+      assert.deepEqual([r.status, r.json.name], [200, 'alpha-omp']);
+      assert.ok(took >= 380 && took < 4000, `took ${took} ms`); // the cap is 400 ms here
+      assert.deepEqual(logsOf(c), ['git-sync alpha: not finished after 0.4 s, opening anyway']);
+      await sleep(500);
+      assert.ok(s.alive(s.lines()[0].pid), 'the server killed the sync'); // never killed: it ends by its own limits
+    }, { gitSync: s.spec, gitSyncMs: 400 });
+  } finally { s.cleanup(); }
+});
+
+test('open fresh: the default cap is 8 s', async () => {
+  const s = syncTool('hang');
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      const t0 = Date.now();
+      const r = await c.req('POST', '/api/open', { cookie, body: { project: 'alpha', harness: 'omp', fresh: true } });
+      const took = Date.now() - t0;
+      assert.deepEqual([r.status, r.json.name], [200, 'alpha-omp']);
+      assert.ok(took >= 7500 && took < 12000, `took ${took} ms`);
+      assert.deepEqual(logsOf(c), ['git-sync alpha: not finished after 8 s, opening anyway']);
+      assert.ok(s.alive(s.lines()[0].pid));
+    }, { gitSync: s.spec });
+  } finally { s.cleanup(); }
+});
+
+test('open fresh: fcode-new (the real CLI, 20 s budget) still gets its session name when the sync never exits: the cap is 8 s', async () => {
+  const s = syncTool('hang');
+  try {
+    await withApp(async (c) => {
+      const t0 = Date.now();
+      const r = await newCli(c, 'alpha', 'omp');
+      const took = Date.now() - t0;
+      assert.deepEqual([r.status, r.stdout, r.stderr], [0, 'alpha-omp\n', '']);
+      assert.ok(took >= 7500 && took < 14000, `took ${took} ms`); // the default cap, then the create: far inside 20 s
+      assert.deepEqual(logsOf(c), ['git-sync alpha: not finished after 8 s, opening anyway']);
+      assert.ok(s.alive(s.lines()[0].pid));
+    }, { gitSync: s.spec });
+  } finally { s.cleanup(); }
+});
+
+// an /api/open fresh request that can be abandoned; done = its reply
+const abandonable = (c, cookie, project, harness) => {
+  const rq = http.request({ host: '127.0.0.1', port: c.port, method: 'POST', path: '/api/open', headers: { 'X-PC': '1', Cookie: cookie, 'Content-Type': 'application/json' } });
+  const done = new Promise((resolve) => {
+    rq.on('error', () => resolve(null));
+    rq.on('response', (res) => { let t = ''; res.on('data', (d) => { t += d; }); res.on('end', () => resolve({ status: res.statusCode, json: JSON.parse(t) })); });
+  });
+  rq.end(JSON.stringify({ project, harness, fresh: true }));
+  return { rq, done };
+};
+
+test('open fresh: the client going away during the sync makes no session and leaves the sync running (HTTP and admin socket)', async () => {
+  const s = syncTool('hang');
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      // HTTP: the app gives up
+      const a = abandonable(c, cookie, 'alpha', 'omp');
+      assert.ok(await until(() => s.lines().length === 1, 5000));
+      const first = s.lines()[0].pid;
+      a.rq.destroy();
+      await sleep(500);
+      assert.ok(s.alive(first), 'the sync of a closed request was killed');
+      // admin socket: fcode-new gives up (timeout, Ctrl+C)
+      const sock = net.connect(adminPath(c.configDir));
+      sock.on('error', () => {});
+      sock.write(`${JSON.stringify({ cmd: 'new', project: 'my.proj', harness: 'claude' })}\n`);
+      assert.ok(await until(() => s.lines().length === 2, 5000));
+      const second = s.lines()[1].pid;
+      sock.destroy();
+      await sleep(500);
+      assert.ok(s.alive(second), 'the sync of a closed admin socket was killed');
+      assert.equal(c.calls().filter((x) => x.argv[0] === 'new-session').length, 0, JSON.stringify(c.calls().map((x) => x.argv.slice(0, 4))));
+      assert.deepEqual(logsOf(c), []); // a cancel is not a failure to report
+      assert.equal(c.app.stats().running + c.app.stats().waiting, 0);
+    }, { gitSync: s.spec, gitSyncMs: 10000 });
+  } finally { s.cleanup(); }
+});
+
+test('open fresh: concurrent opens of one project share one sync (a later open syncs again)', async () => {
+  const s = syncTool('slow');
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      const o = (project, harness) => c.req('POST', '/api/open', { cookie, body: { project, harness, fresh: true } });
+      const rs = await Promise.all([o('alpha', 'omp'), o('alpha', 'claude'), o('alpha', 'codex'), o('my.proj', 'omp')]);
+      assert.deepEqual(rs.map((r) => [r.status, r.json.name]), [[200, 'alpha-omp'], [200, 'alpha-claude'], [200, 'alpha-codex'], [200, 'my-proj-omp']]);
+      assert.deepEqual(s.lines().map((x) => [x.what, x.project]).sort(), [['end', 'alpha'], ['end', 'my.proj'], ['start', 'alpha'], ['start', 'my.proj']]); // one per project
+      assert.equal((await o('alpha', 'omp')).json.name, 'alpha-omp-2');
+      assert.equal(s.lines().filter((x) => x.what === 'start').length, 3); // the sync had ended: a new one
+    }, { gitSync: s.spec });
+  } finally { s.cleanup(); }
+});
+
+test('open fresh: an open while a sync still runs (even past an earlier open\'s cap) joins it: no second spawn, no kill', async () => {
+  const s = syncTool('hang');
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      const a = abandonable(c, cookie, 'alpha', 'omp'), b = abandonable(c, cookie, 'alpha', 'claude');
+      assert.ok(await until(() => s.lines().length === 1, 5000));
+      await sleep(300); // both wait on the one sync
+      assert.equal(s.lines().length, 1);
+      const pid = s.lines()[0].pid;
+      b.rq.destroy(); // one waiting open goes away: the other is not affected
+      await sleep(300);
+      assert.ok(s.alive(pid));
+      const ra = await a.done; // the cap (2.5 s) ends a's wait: its session is made, b's is not
+      assert.deepEqual([ra.status, ra.json.name], [200, 'alpha-omp']);
+      assert.equal(sessionCalls(c, 'alpha-claude').length, 0);
+      assert.deepEqual(logsOf(c), ['git-sync alpha: not finished after 2.5 s, opening anyway']);
+      assert.ok(s.alive(pid)); // still running after the cap
+      // a new open: the sync is still running, so it joins (waits its own cap) instead of spawning another
+      const r = await c.req('POST', '/api/open', { cookie, body: { project: 'alpha', harness: 'codex', fresh: true } });
+      assert.deepEqual([r.status, r.json.name], [200, 'alpha-codex']);
+      assert.equal(s.lines().length, 1);
+      assert.ok(s.alive(pid));
+      assert.equal(logsOf(c).length, 1); // the warning is once per sync
+    }, { gitSync: s.spec, gitSyncMs: 2500 });
+  } finally { s.cleanup(); }
 });
