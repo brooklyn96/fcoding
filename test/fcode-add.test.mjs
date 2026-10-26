@@ -1016,6 +1016,24 @@ test('reservation: a TERM at the instant mkdir finishes (to the script and to mk
   } finally { done(e); }
 });
 
+test('reservation: a group TERM held while the reservation mkdir FAILS (a folder made by someone else) ends 143, never DIR_EXISTS, and touches nothing', { skip }, async () => {
+  const e = world('true');
+  try {
+    bare(e, 'o/r');
+    // the wrapper makes the target with a file inside, TERMs the whole group, then the real mkdir runs and fails (the folder exists)
+    onTarget(e, 'r', `/bin/mkdir "\${@: -1}"; echo foreign >"\${@: -1}/keep.txt"; kill -TERM -- -$PPID`);
+    const p = spawn('bash', [SCRIPT, 'o/r', 'r'], { env: scriptEnv(e), stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    let out = ''; p.stdout.on('data', (d) => { out += d; });
+    const [code] = await new Promise((resolve) => p.on('close', (c, sig) => resolve([c, sig])));
+    assert.equal(code, 143, out);
+    assert.ok(!out.includes('DIR_EXISTS'), out);
+    assert.equal(fs.readFileSync(path.join(e.ws, 'r', 'keep.txt'), 'utf8'), 'foreign\n', 'the foreign folder and file are left intact');
+    assert.deepEqual(fs.readdirSync(path.join(e.ws, 'r')), ['keep.txt']);
+    assert.equal(projects(e).r, undefined);
+    tmpClean(e);
+  } finally { done(e); }
+});
+
 test('reservation: a dangling symlink put at the target in the same instant is DIR_EXISTS and is left alone', { skip }, () => {
   const e = world('true');
   try {
