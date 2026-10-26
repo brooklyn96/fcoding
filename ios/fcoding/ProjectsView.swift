@@ -646,7 +646,8 @@ struct CleanupNotice: View {
                 .padding(.top, 12)
                 .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
                 .transition(reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity))
-                .accessibilityElement(children: .contain)            }
+                .accessibilityElement(children: .contain)
+            }
         }
         .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: added)
     }
