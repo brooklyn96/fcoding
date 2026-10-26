@@ -10,8 +10,8 @@
 #      are on no origin/* branch; dirty = tracked or untracked changes.
 #   3. `git merge --ff-only origin/<default>` ONLY when ALL hold: behind > 0 and ahead == 0; HEAD is on the default branch;
 #      no tracked change (untracked files do not count); no merge / rebase / cherry-pick / revert / bisect / index.lock in
-#      progress; no smudge / process filter is both configured and used (Git LFS and the like: a checkout would run slow
-#      external code; see filters()); the run is younger than 10 min; and no process of this user (omp, claude, codex, a
+#      progress; no smudge / process filter driver is configured in any scope (Git LFS and the like: a checkout would run
+#      slow external code; a global `git lfs install` thus turns this step off on the box); the run is younger than 10 min; and no process of this user (omp, claude, codex, a
 #      shell, a tmux pane) has its cwd inside the work tree (/proc/<pid>/cwd; without /proc the project counts as busy).
 #      Hooks, fsmonitor, submodule recursion, auto gc and overwriting of ignored files are off for that merge, so an
 #      untracked OR ignored file in the way makes it fail. The merge is never time-limited or killed (a half-written work
@@ -35,6 +35,7 @@ ONLY="${1:-}"
 if [ -n "$ONLY" ]; then FETCH_T="${FCODE_GIT_FETCH_TIMEOUT:-30}" LOCK_W=15
 else FETCH_T="${FCODE_GIT_FETCH_TIMEOUT:-60}" LOCK_W=0; fi
 LATE_S="${FCODE_GIT_LATE_AFTER:-600}" # no merge is started once the run is this many seconds old (the unit's TimeoutStartSec is 15 min)
+case $LATE_S in ''|*[!0-9]*) LATE_S=600 ;; esac
 
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # first line only, control characters dropped, URL credentials / tokens masked, at most 200 characters:
@@ -56,27 +57,10 @@ in_progress() {
   done
   return 1
 }
-# filters <default branch>: the checkout would run external code. True only when a filter driver is configured
-# (filter.<name>.smudge or .process, in any config) AND that same <name> is used as `filter=<name>` by an attributes source:
-# a tracked .gitattributes in HEAD or in origin/<default> (the incoming side counts), info/attributes, core.attributesFile, or the XDG file.
-# A global `git lfs install` alone, or `filter=` without a driver, runs nothing and does not skip.
-filters() {
-  local names f txt
-  names=$(g config --get-regexp '^filter\..*\.(smudge|process)$' 2>/dev/null | sed -E 's/^filter\.(.*)\.(smudge|process)( .*)?$/\1/; t; d')
-  [ -n "$names" ] || return 1
-  txt=$({
-    for f in HEAD "refs/remotes/origin/$1"; do g grep -h -I -e 'filter=' "$f" -- ':(glob).gitattributes' ':(glob)**/.gitattributes'; done
-    for f in "$(g rev-parse --git-path info/attributes)" "$(g config --type=path --get core.attributesFile)" "${XDG_CONFIG_HOME:-$HOME/.config}/git/attributes"; do
-      [ -n "$f" ] || continue
-      case $f in /*) ;; *) f="$P/$f" ;; esac
-      [ -f "$f" ] && cat "$f"
-    done
-  } 2>/dev/null | tr -s ' \t' '\n\n')
-  while IFS= read -r f; do
-    printf '%s\n' "$txt" | grep -qxF "filter=$f" && return 0
-  done <<<"$names"
-  return 1
-}
+# filters: any smudge / process filter driver is configured in any scope (repo, global, system): a checkout could run slow external
+# code (Git LFS and the like). No attributes parsing: a global `git lfs install` therefore turns the auto fast-forward off on this
+# box, which is accepted (safe; agents still sync first).
+filters() { [ -n "$(g config --get-regexp '^filter\..*\.(smudge|process)$' 2>/dev/null)" ]; }
 # busy: a process of this user has its cwd inside the work tree the merge moves (the repo's top level, not the configured dir,
 # which can be a subdirectory), or we cannot tell (no /proc). omp, claude, codex, a shell and a tmux pane all show up here.
 # The scan runs in a subshell with cwd / so neither it nor its children can match; this script's own pid is skipped.
@@ -139,7 +123,7 @@ sync_one() {
       elif [ "$branch" != "$def" ]; then skip=on_branch
       elif ! out=$(g status --porcelain --untracked-files=no 2>/dev/null) || [ -n "$out" ]; then skip=dirty
       elif [ "${ahead:-1}" -ne 0 ]; then skip=ahead
-      elif filters "$def"; then skip=filters
+      elif filters; then skip=filters
       elif busy; then skip=busy
       elif g -c gc.auto=0 -c maintenance.auto=false -c core.hooksPath=/dev/null -c core.fsmonitor=false -c submodule.recurse=false -c merge.autoStash=false \
           merge --ff-only --quiet --no-edit --no-overwrite-ignore "refs/remotes/origin/$def" >/dev/null 2>&1; then

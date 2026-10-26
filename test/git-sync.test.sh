@@ -320,38 +320,34 @@ if [ $LINUX = 1 ]; then
   H=$(hd ign); cfg ign; run
   eq "ignored file in the way: ff_failed, file and HEAD unchanged" "$(q projects.ign.autoSkip)/$(q projects.ign.autoUpdated)/$(cat "$T/ws/ign/TASK.md")/$(hd ign)/$(q projects.ign.behindDefault)" "ff_failed/false/box-only notes/$H/1"
 
-  # filters: the merge is skipped only when a filter driver is configured AND the same name is used as filter=<name> by an
-  # attributes source that applies (HEAD's or the incoming origin/<default>'s .gitattributes, info/attributes)
-  push_attrs() { # <name>: a tracked .gitattributes with filter=lfs, pushed (so ahead stays 0), seed up to date
-    ( cd "$T/ws/$1" && echo '*.bin filter=lfs -text' >.gitattributes && git add . && git commit -qm attrs && git push -q origin main )
-    ( cd "$T/seed/$1" && git pull -q origin main )
-  }
-  FSKIP="fhead fincoming finfo"; FGO="fdrv fattr finfoa fother"
-  for n in $FSKIP $FGO; do mkproj $n; done
-  push_attrs fhead; push_attrs fattr; push_attrs fother                        # attributes in HEAD (and origin/main); fother's driver has another name
-  for n in $FSKIP $FGO; do adv $n a.txt "r-$n"; done
-  ( cd "$T/seed/fincoming" && echo '*.bin filter=lfs -text' >.gitattributes && git add . && git commit -qm attrs && git push -q origin main ) # attributes only in the incoming commit
-  echo '*.bin filter=lfs' >"$T/ws/finfo/.git/info/attributes"; echo '*.bin filter=lfs' >"$T/ws/finfoa/.git/info/attributes"
-  for n in fhead fincoming finfo fdrv; do c $n config filter.lfs.process 'git-lfs filter-process'; done  # driver + attributes -> skip; driver alone (fdrv) -> ff
-  c fother config filter.other.smudge cat
-  c finfoa config filter.lfs.smudge-typo x                                     # not a smudge/process key: no driver
-  for n in $FSKIP $FGO; do eval "H_$n=$(hd $n)"; done
-  cfg $FSKIP $FGO; run
-  for n in $FSKIP; do v=H_$n; eq "filters ($n): driver + attributes in use -> autoSkip filters, HEAD unchanged, behind 1" "$(q projects.$n.autoSkip)/$(q projects.$n.autoUpdated)/$(hd $n)/$(q projects.$n.behindDefault)" "filters/false/${!v}/$([ $n = fincoming ] && echo 2 || echo 1)"; done
-  for n in $FGO; do eq "no filter in use ($n): fast-forwarded" "$(q projects.$n.autoSkip)/$(q projects.$n.autoUpdated)/$(q projects.$n.behindDefault)/$(hd $n)" "null/true/0/$(git -C "$T/remotes/$n.git" rev-parse main)"; done
-  # a global `git lfs install` (filter.lfs.process in ~/.gitconfig) alone must not stop a repo without LFS attributes
-  for n in glfs gsk; do mkproj $n; done
-  push_attrs gsk; for n in glfs gsk; do adv $n a.txt "r-$n"; done; H_gsk=$(hd gsk)
+  # filters: any smudge / process filter driver configured in any scope (repo or global) turns the ff off; attributes are not read
+  for n in fsm fpr fnone gplain; do mkproj $n; done
+  ( cd "$T/ws/fnone" && echo '*.bin filter=lfs -text' >.gitattributes && git add . && git commit -qm attrs && git push -q origin main )  # attributes without any driver
+  ( cd "$T/seed/fnone" && git pull -q origin main )
+  for n in fsm fpr fnone gplain; do adv $n a.txt "r-$n"; done
+  echo '*.bin filter=lfs' >"$T/ws/fnone/.git/info/attributes"
+  c fsm config filter.lfs.smudge 'git-lfs smudge -- %f'
+  c fpr config filter.lfs.process 'git-lfs filter-process'
+  c fnone config filter.x.clean cat                                            # a clean-only driver runs nothing on checkout
+  for n in fsm fpr fnone gplain; do eval "H_$n=$(hd $n)"; done
   printf '[filter "lfs"]\n\tprocess = git-lfs filter-process\n\tsmudge = git-lfs smudge -- %%f\n\trequired = true\n' >"$HOME/.gitconfig"
-  cfg glfs gsk; run; rm -f "$HOME/.gitconfig"
-  eq "global lfs config + plain repo: fast-forwarded" "$(q projects.glfs.autoSkip)/$(q projects.glfs.autoUpdated)/$(hd glfs)" "null/true/$(git -C "$T/remotes/glfs.git" rev-parse main)"
-  eq "global lfs config + repo with filter=lfs attributes: filters" "$(q projects.gsk.autoSkip)/$(hd gsk)" "filters/$H_gsk"
+  cfg gplain; run; rm -f "$HOME/.gitconfig"
+  eq "global lfs config (git lfs install): even a plain repo is skipped (accepted, safe)" "$(q projects.gplain.autoSkip)/$(q projects.gplain.autoUpdated)/$(hd gplain)" "filters/false/$H_gplain"
+  cfg fsm fpr fnone gplain; run
+  eq "repo config filter.*.smudge: autoSkip filters, HEAD unchanged" "$(q projects.fsm.autoSkip)/$(q projects.fsm.autoUpdated)/$(hd fsm)/$(q projects.fsm.behindDefault)" "filters/false/$H_fsm/1"
+  eq "repo config filter.*.process: autoSkip filters, HEAD unchanged" "$(q projects.fpr.autoSkip)/$(q projects.fpr.autoUpdated)/$(hd fpr)/$(q projects.fpr.behindDefault)" "filters/false/$H_fpr/1"
+  eq "filter= attributes (HEAD, info) and a clean-only driver, no smudge/process: fast-forwarded" "$(q projects.fnone.autoSkip)/$(q projects.fnone.autoUpdated)/$(hd fnone)" "null/true/$(git -C "$T/remotes/fnone.git" rev-parse main)"
+  eq "no driver left (global config removed): the plain repo fast-forwards" "$(q projects.gplain.autoSkip)/$(q projects.gplain.autoUpdated)" "null/true"
 
-  # late: a run older than FCODE_GIT_LATE_AFTER seconds (600 by default) starts no merge
+  # late: a run older than FCODE_GIT_LATE_AFTER seconds (600 by default) starts no merge; a bad value means 600
   mkproj lat; adv lat a.txt r-lat; H=$(hd lat); cfg lat
   FCODE_GIT_LATE_AFTER=0 bash "$SYNC" >/dev/null 2>&1
   eq "late: no merge, autoSkip late, HEAD unchanged, behind 1" "$(q projects.lat.autoSkip)/$(q projects.lat.autoUpdated)/$(hd lat)/$(q projects.lat.behindDefault)" "late/false/$H/1"
-  run; eq "not late: the next run fast-forwards" "$(q projects.lat.autoUpdated)/$(q projects.lat.autoSkip)" "true/null"
+  FCODE_GIT_LATE_AFTER=abc bash "$SYNC" >/dev/null 2>&1
+  eq "late: a non-numeric FCODE_GIT_LATE_AFTER falls back to 600 (not late, fast-forwards, no shell error)" "$(q projects.lat.autoUpdated)/$(q projects.lat.autoSkip)" "true/null"
+  mkproj lat2; adv lat2 a.txt r-lat2; cfg lat2
+  FCODE_GIT_LATE_AFTER= bash "$SYNC" >"$T/late.out" 2>&1
+  eq "late: an empty FCODE_GIT_LATE_AFTER falls back to 600, quiet" "$(q projects.lat2.autoUpdated)/$(wc -c <"$T/late.out" | tr -d ' ')" "true/0"
 
   # busy root is the work tree: a project configured as a subdirectory of a checkout is busy while a process sits in a sibling dir
   mkproj mono; ( cd "$T/ws/mono" && mkdir web api && echo w >web/w.txt && echo a >api/a.txt && git add . && git commit -qm dirs && git push -q origin main )
