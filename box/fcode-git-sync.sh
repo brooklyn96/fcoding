@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# fcode-git-sync: tell how far every FCode project is from GitHub, and fast-forward the ones that are idle and clean.
+# fcode-git-sync: tell how far every FCode project is from GitHub, and (timer run only) fast-forward the ones that are idle and clean.
 # The only change it ever makes to a repository is one fast-forward of the default branch (step 3): it never creates a commit and
 # never checks out, resets, stashes, rebases, deletes or pushes; every other local branch and tag stays as it is.
+# `fcode-git-sync <project>` (the server runs it right before it opens a session) is look-only: steps 1, 2 and 4, never step 3.
 # For each project in ~/.fcoding/config.json ("projects": name -> dir):
 #   1. fetch from origin into refs/remotes/origin/* only (timeout, no prompts). The fetch names the URL and an explicit
 #      refspec, so a configured refspec, prune or tag option of the repo cannot make it touch local branches or tags.
@@ -9,14 +10,17 @@
 #      are on no origin/* branch; dirty = tracked or untracked changes.
 #   3. `git merge --ff-only origin/<default>` ONLY when ALL hold: behind > 0 and ahead == 0; HEAD is on the default branch;
 #      no tracked change (untracked files do not count); no merge / rebase / cherry-pick / revert / bisect / index.lock in
-#      progress; and no process of this user (omp, claude, codex, a shell, a tmux pane) has its cwd inside the project
-#      (/proc/<pid>/cwd; without /proc the project counts as busy). Hooks and submodule recursion are off for that merge.
-#      A failure leaves the checkout as it was. Why a project was not updated is recorded as autoSkip in the state file.
+#      progress; the repo uses no smudge / process filter (Git LFS and the like: a checkout would run slow external code);
+#      and no process of this user (omp, claude, codex, a shell, a tmux pane) has its cwd inside the work tree
+#      (/proc/<pid>/cwd; without /proc the project counts as busy). Hooks, submodule recursion, auto gc and overwriting of
+#      ignored files are off for that merge, so an untracked OR ignored file in the way makes it fail. The merge is never
+#      time-limited or killed (a half-written work tree is worse than a slow merge). A failure leaves the checkout as it was.
+#      Why a project was not updated is recorded as autoSkip in the state file.
 #   4. write ~/.local/state/fcode/git-sync.json (atomic, mode 600).
 # Agents still sync first at the start of a task (see agents-git.md, "Sync first"): this timer only catches up an idle main.
 # One run at a time (flock). Quiet: problems go in the state file; stderr only when the script itself cannot run.
 # One project failing never stops the others. Exit 0 unless the script itself is broken.
-# `fcode-git-sync <project>`: the same for that one project only (shorter timeouts; at most 15 s lock wait + 30 s fetch + 5 s kill + counts + a fast-forward, which has its own 60 s cap); the
+# `fcode-git-sync <project>`: the same for that one project only (shorter timeouts, the whole run within about 55 s: 15 s lock wait + 30 s fetch + 5 s kill + counts); the
 # other entries of the state file stay as they are. An unknown name: a message on stderr, exit 0, state unchanged.
 set -u
 export PATH="$HOME/.local/bin:$HOME/.bun/bin:/usr/local/bin:$PATH"
@@ -49,13 +53,27 @@ in_progress() {
   done
   return 1
 }
-# busy: a process of this user has its cwd inside $P (omp, claude, codex, a shell, a tmux pane), or we cannot tell (no /proc).
+# filters: the repo runs external code on checkout (a smudge / process filter in any config, or `filter=` in any attributes file)
+filters() {
+  local f
+  [ -n "$(g config --get-regexp '^filter\..*\.(smudge|process)$' 2>/dev/null)" ] && return 0
+  g grep -q -e 'filter=' -- ':(glob).gitattributes' ':(glob)**/.gitattributes' 2>/dev/null && return 0
+  for f in "$(g rev-parse --git-path info/attributes 2>/dev/null)" "$(g config --type=path --get core.attributesFile 2>/dev/null)" "${XDG_CONFIG_HOME:-$HOME/.config}/git/attributes"; do
+    [ -n "$f" ] || continue
+    case $f in /*) ;; *) f="$P/$f" ;; esac
+    [ -f "$f" ] && grep -q 'filter=' "$f" 2>/dev/null && return 0
+  done
+  return 1
+}
+# busy: a process of this user has its cwd inside the work tree the merge moves (the repo's top level, not the configured dir,
+# which can be a subdirectory), or we cannot tell (no /proc). omp, claude, codex, a shell and a tmux pane all show up here.
 # The scan runs in a subshell with cwd / so neither it nor its children can match; this script's own pid is skipped.
 # The trailing slash keeps /ws/app from matching /ws/app-two.
 busy() {
   local rp
   [ -d /proc/self ] || return 0
-  rp=$(realpath -e -- "$P" 2>/dev/null) || return 0
+  rp=$(g rev-parse --show-toplevel 2>/dev/null) && rp=$(realpath -e -- "$rp" 2>/dev/null) || return 0
+  ! command -v cygpath >/dev/null || rp=$(cygpath -u "$rp") # Git Bash prints C:/... from git; /proc shows /c/...
   rp=${rp%/}
   (
     cd / || exit 0
@@ -102,15 +120,16 @@ sync_one() {
     fi
     ahead=$(g rev-list --count HEAD --not --remotes=origin 2>/dev/null) || ahead=
 
-    # fast-forward the default branch, only when nothing can be in the way (see the header); the first failing check is the reason
-    if [ "${behind:-0}" -gt 0 ]; then
+    # fast-forward the default branch (timer run only), only when nothing can be in the way (see the header); the first failing check is the reason
+    if [ -z "$ONLY" ] && [ "${behind:-0}" -gt 0 ]; then
       if in_progress "$gd"; then skip=in_progress
       elif [ "$branch" != "$def" ]; then skip=on_branch
       elif ! out=$(g status --porcelain --untracked-files=no 2>/dev/null) || [ -n "$out" ]; then skip=dirty
       elif [ "${ahead:-1}" -ne 0 ]; then skip=ahead
+      elif filters; then skip=filters
       elif busy; then skip=busy
-      elif x 60 git -C "$P" -c core.hooksPath=/dev/null -c submodule.recurse=false -c merge.autoStash=false \
-          merge --ff-only --quiet --no-edit "refs/remotes/origin/$def" >/dev/null 2>&1; then
+      elif g -c gc.auto=0 -c maintenance.auto=false -c core.hooksPath=/dev/null -c submodule.recurse=false -c merge.autoStash=false \
+          merge --ff-only --quiet --no-edit --no-overwrite-ignore "refs/remotes/origin/$def" >/dev/null 2>&1; then
         updated=true
         behind=$(g rev-list --count "HEAD..origin/$def" 2>/dev/null) || behind=
       else skip=ff_failed; fi

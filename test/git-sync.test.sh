@@ -229,13 +229,10 @@ echo "# single project"
 for n in sa sb; do mkproj $n; adv $n a.txt "remote-$n"; done
 cfg sa sb; bash "$SYNC" >/dev/null 2>&1
 adv sa a.txt remote-sa2; adv sb a.txt remote-sb2
-SB_BEFORE=$(qj projects.sb); SB_HEAD=$(hd sb); SB_ORIGIN=$(c sb rev-parse origin/main)
+SB_BEFORE=$(qj projects.sb); SB_HEAD=$(hd sb); SB_ORIGIN=$(c sb rev-parse origin/main); SA_HEAD=$(hd sa)
 bash "$SYNC" sa >"$T/one.out" 2>&1; eq "single: exit 0, quiet" "$?/$(wc -c <"$T/one.out" | tr -d ' ')" "0/0"
-if [ $LINUX = 1 ]; then
-  eq "single: sa fetched and fast-forwarded to the new commit" "$(q projects.sa.behindDefault)/$(q projects.sa.autoUpdated)/$(hd sa)" "0/true/$(git -C "$T/remotes/sa.git" rev-parse main)"
-else
-  eq "single (no /proc): sa fetched, not moved, busy" "$(q projects.sa.behindDefault)/$(q projects.sa.autoSkip)" "2/busy"
-fi
+# the single-project run is look-only: sa is fetched (origin/main moved) and counted, but never fast-forwarded
+eq "single: sa fetched, never fast-forwarded (HEAD unchanged, autoUpdated false, autoSkip null)" "$(q projects.sa.behindDefault)/$(q projects.sa.autoUpdated)/$(q projects.sa.autoSkip)/$(hd sa)/$(c sa rev-parse origin/main)" "$([ $LINUX = 1 ] && echo 1 || echo 2)/false/null/$SA_HEAD/$(git -C "$T/remotes/sa.git" rev-parse main)"
 eq "single: sb untouched (entry kept, not fetched, not fast-forwarded)" "$(qj projects.sb)/$(c sb rev-parse origin/main)/$(hd sb)" "$SB_BEFORE/$SB_ORIGIN/$SB_HEAD"
 eq "single: both entries still in the state" "$(keys)" "sa,sb"
 SUM=$(cksum <"$STATEF")
@@ -316,6 +313,40 @@ if [ $LINUX = 1 ]; then
   mkproj hk; adv hk a.txt hk1; printf '#!/bin/sh\ntouch "%s/hook-control"\n' "$T" >"$T/ws/hk/.git/hooks/post-merge"; chmod +x "$T/ws/hk/.git/hooks/post-merge"
   c hk fetch -q origin; c hk merge -q --ff-only origin/main
   eq "control: the post-merge hook runs under a plain git merge" "$([ -e "$T/hook-control" ] && echo ran || echo none)" ran
+
+  # ignored file in the way (the laptop handoff puts TASK.md & co. in .git/info/exclude): the merge must not replace it
+  mkproj ign; echo TASK.md >>"$T/ws/ign/.git/info/exclude"; echo "box-only notes" >"$T/ws/ign/TASK.md"
+  ( cd "$T/seed/ign" && echo "remote task" >TASK.md && git add . && git commit -qm task && git push -q origin main )
+  H=$(hd ign); cfg ign; run
+  eq "ignored file in the way: ff_failed, file and HEAD unchanged" "$(q projects.ign.autoSkip)/$(q projects.ign.autoUpdated)/$(cat "$T/ws/ign/TASK.md")/$(hd ign)/$(q projects.ign.behindDefault)" "ff_failed/false/box-only notes/$H/1"
+
+  # filters: Git LFS and the like run external code on checkout, so the merge is never started (config smudge / process, attributes)
+  for n in fltc fltp fltg fltl; do mkproj $n; done
+  ( cd "$T/ws/fltg" && echo '*.bin filter=lfs -text' >.gitattributes && git add . && git commit -qm attrs && git push -q origin main ) # tracked, on origin/main: ahead 0
+  ( cd "$T/seed/fltg" && git pull -q origin main )
+  for n in fltc fltp fltg fltl; do adv $n a.txt "r-$n"; done
+  c fltc config filter.lfs.smudge 'git-lfs smudge -- %f'
+  c fltp config filter.lfs.process 'git-lfs filter-process'
+  echo '*.bin filter=lfs' >"$T/ws/fltl/.git/info/attributes"
+  for n in fltc fltp fltg fltl; do eval "H_$n=$(hd $n)"; done
+  cfg fltc fltp fltg fltl; run
+  for n in fltc fltp fltg fltl; do v=H_$n; eq "filters ($n): autoSkip filters, HEAD unchanged, behind 1" "$(q projects.$n.autoSkip)/$(q projects.$n.autoUpdated)/$(hd $n)/$(q projects.$n.behindDefault)" "filters/false/${!v}/1"; done
+
+  # busy root is the work tree: a project configured as a subdirectory of a checkout is busy while a process sits in a sibling dir
+  mkproj mono; ( cd "$T/ws/mono" && mkdir web api && echo w >web/w.txt && echo a >api/a.txt && git add . && git commit -qm dirs && git push -q origin main )
+  ( cd "$T/seed/mono" && git pull -q origin main && echo m >b.txt && git add . && git commit -qm m && git push -q origin main )
+  printf '{"projects":{"monoweb":"%s"}}\n' "$T/ws/mono/web" >"$HOME/.fcoding/config.json"
+  H=$(hd mono); ( cd "$T/ws/mono/api" && exec sleep 60 ) & BUSY3=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [ "$(readlink /proc/$BUSY3/cwd 2>/dev/null)" = "$T/ws/mono/api" ] && break; sleep 0.3; done
+  run; eq "busy root: a process in a sibling dir of the configured subdir blocks the ff" "$(q projects.monoweb.autoSkip)/$(hd mono)/$(cat "$T/ws/mono/b.txt")" "busy/$H/one"
+  kill $BUSY3 2>/dev/null; wait $BUSY3 2>/dev/null
+  run; eq "busy root: once it is gone the ff happens" "$(q projects.monoweb.autoUpdated)/$(cat "$T/ws/mono/b.txt")" "true/m"
+
+  # a single-project run (the server runs it right before opening a session) never fast-forwards
+  mkproj sing; adv sing a.txt r-sing; cfg sing; H=$(hd sing)
+  bash "$SYNC" sing >"$T/one.out" 2>&1
+  eq "single-project run: fetched, behind 1, but no ff (autoUpdated false, autoSkip null, HEAD unchanged)" "$(q projects.sing.behindDefault)/$(q projects.sing.autoUpdated)/$(q projects.sing.autoSkip)/$(hd sing)/$(c sing rev-parse origin/main)" "1/false/null/$H/$(git -C "$T/remotes/sing.git" rev-parse main)"
+  run; eq "the timer run then fast-forwards it" "$(q projects.sing.autoUpdated)/$(hd sing)" "true/$(git -C "$T/remotes/sing.git" rev-parse main)"
 else
   echo "note: no Linux /proc here, the auto fast-forward and busy tests are skipped"
 fi
@@ -323,7 +354,7 @@ fi
 # ---- the script has no git command that writes to a repository except the one fast-forward ----
 CODE=$(sed 's/[[:space:]]#[[:space:]].*//; /^[[:space:]]*#/d' "$SYNC" | grep -v 'for f in MERGE_HEAD' | sed 's/\^{commit}//g') # (the marker names rebase-merge/-apply and the rev-parse peel are not git commands)
 eq "no checkout/reset/push/switch/rebase/update-ref/stash/pull/clean/commit/branch/tag in the code (comments aside)" "$(printf '%s\n' "$CODE" | grep -cE '\b(checkout|reset|push|switch|rebase|update-ref|stash|pull|clean|commit|branch -[dDmM]|tag -d)\b')" 0
-eq "the only merge is one --ff-only on origin/<default>, hooks off" "$(printf '%s\n' "$CODE" | grep -cE '\bmerge\b' | tr -d ' ')/$(printf '%s\n' "$CODE" | grep -c 'merge --ff-only --quiet --no-edit "refs/remotes/origin/\$def"')/$(printf '%s\n' "$CODE" | grep -c 'core.hooksPath=/dev/null')" "2/1/1"
+eq "the only merge is one --ff-only --no-overwrite-ignore on origin/<default>, hooks/gc/maintenance off, never under timeout" "$(printf '%s\n' "$CODE" | grep -cE '\bmerge\b' | tr -d ' ')/$(printf '%s\n' "$CODE" | grep -c 'merge --ff-only --quiet --no-edit --no-overwrite-ignore "refs/remotes/origin/\$def"')/$(printf '%s\n' "$CODE" | grep -c 'core.hooksPath=/dev/null')/$(printf '%s\n' "$CODE" | grep -c 'gc.auto=0 -c maintenance.auto=false -c core.hooksPath')/$(printf '%s\n' "$CODE" | grep -cE '\bx [0-9]')" "2/1/1/1/0"
 eq "the one fetch names the url and the explicit refspec, no prune, no tags, no FETCH_HEAD" "$(grep -c "fetch --no-write-fetch-head --no-tags --no-prune --no-recurse-submodules" "$SYNC")/$(grep -c "'+refs/heads/\*:refs/remotes/origin/\*'" "$SYNC")" 1/1
 
 echo
