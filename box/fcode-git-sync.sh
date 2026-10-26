@@ -1,13 +1,25 @@
 #!/usr/bin/env bash
-# fcode-git-sync: tell how far every FCode project is from GitHub. It only LOOKS: it never changes a repository
-# (no merge, no checkout, no reset, no push; the working tree, the index and every local branch and tag stay as they are).
+# fcode-git-sync: tell how far every FCode project is from GitHub, and (timer run only) fast-forward the ones that are idle and clean.
+# The only change it ever makes to a repository is one fast-forward of the default branch (step 3): it never creates a commit and
+# never checks out, resets, stashes, rebases, deletes or pushes; every other local branch and tag stays as it is.
+# `fcode-git-sync <project>` (the server runs it right before it opens a session) is look-only: steps 1, 2 and 4, never step 3.
 # For each project in ~/.fcoding/config.json ("projects": name -> dir):
 #   1. fetch from origin into refs/remotes/origin/* only (timeout, no prompts). The fetch names the URL and an explicit
 #      refspec, so a configured refspec, prune or tag option of the repo cannot make it touch local branches or tags.
 #   2. count, read-only: behindDefault = commits on origin/<default> that HEAD lacks; aheadOfOrigin = HEAD commits that
 #      are on no origin/* branch; dirty = tracked or untracked changes.
-#   3. write ~/.local/state/fcode/git-sync.json (atomic, mode 600).
-# Bringing a checkout up to date is the agent's job (see agents-git.md, "Sync first").
+#   3. `git merge --ff-only origin/<default>` ONLY when ALL hold: behind > 0 and ahead == 0; HEAD is on the default branch;
+#      no tracked change (untracked files do not count); no merge / rebase / cherry-pick / revert / bisect / index.lock in
+#      progress; no filter.* config key exists in any scope (Git LFS and the like: a checkout would run
+#      slow external code; a global `git lfs install` thus turns this step off on the box); the run is younger than 10 min; and no process of this user (omp, claude, codex, a
+#      shell, a tmux pane) has its cwd inside the work tree (/proc/<pid>/cwd; without /proc the project counts as busy).
+#      Hooks, fsmonitor, submodule recursion, auto gc and overwriting of ignored files are off for that merge, so an
+#      untracked OR ignored file in the way makes it fail. The merge is never time-limited or killed (a half-written work
+#      tree is worse than a slow merge; the 10 min rule keeps systemd's 15 min unit timeout from ever hitting one).
+#      A failure leaves the checkout as it was.
+#      Why a project was not updated is recorded as autoSkip in the state file.
+#   4. write ~/.local/state/fcode/git-sync.json (atomic, mode 600).
+# Agents still sync first at the start of a task (see agents-git.md, "Sync first"): this timer only catches up an idle main.
 # One run at a time (flock). Quiet: problems go in the state file; stderr only when the script itself cannot run.
 # One project failing never stops the others. Exit 0 unless the script itself is broken.
 # `fcode-git-sync <project>`: the same for that one project only (shorter timeouts, the whole run within about 55 s: 15 s lock wait + 30 s fetch + 5 s kill + counts); the
@@ -22,6 +34,8 @@ STATE="$DIR/git-sync.json"
 ONLY="${1:-}"
 if [ -n "$ONLY" ]; then FETCH_T="${FCODE_GIT_FETCH_TIMEOUT:-30}" LOCK_W=15
 else FETCH_T="${FCODE_GIT_FETCH_TIMEOUT:-60}" LOCK_W=0; fi
+LATE_S="${FCODE_GIT_LATE_AFTER:-600}" # no merge is started once the run is this many seconds old (the unit's TimeoutStartSec is 15 min)
+case $LATE_S in ''|*[!0-9]*) LATE_S=600 ;; esac
 
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # first line only, control characters dropped, URL credentials / tokens masked, at most 200 characters:
@@ -35,10 +49,42 @@ redact() {
 x() { local t=$1; shift; timeout -k 5 "$t" "$@" 9>&- </dev/null; }
 g() { git --no-optional-locks -C "$P" "$@" 9>&- </dev/null; }
 add_err() { err="${err:+$err; }$1"; }
+# in_progress <git dir>: a merge, rebase, cherry-pick, revert or bisect is under way, or a stale index.lock is there
+in_progress() {
+  local f
+  for f in MERGE_HEAD REBASE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG index.lock rebase-merge rebase-apply sequencer; do
+    [ -e "$1/$f" ] && return 0
+  done
+  return 1
+}
+# filters: any filter.* key is configured in any scope (repo, global, system): a checkout could run slow external code, or die
+# mid-way (a `required` driver that cannot smudge), e.g. Git LFS. No attributes parsing: a global `git lfs install` therefore
+# turns the auto fast-forward off on this box, which is accepted (safe; agents still sync first).
+filters() { [ -n "$(g config --get-regexp '^filter\.' 2>/dev/null)" ]; }
+# busy: a process of this user has its cwd inside the work tree the merge moves (the repo's top level, not the configured dir,
+# which can be a subdirectory), or we cannot tell (no /proc). omp, claude, codex, a shell and a tmux pane all show up here.
+# The scan runs in a subshell with cwd / so neither it nor its children can match; this script's own pid is skipped.
+# The trailing slash keeps /ws/app from matching /ws/app-two.
+busy() {
+  local rp
+  [ -d /proc/self ] || return 0
+  rp=$(g rev-parse --show-toplevel 2>/dev/null) && rp=$(realpath -e -- "$rp" 2>/dev/null) || return 0
+  ! command -v cygpath >/dev/null || rp=$(cygpath -u "$rp") # Git Bash prints C:/... from git; /proc shows /c/...
+  rp=${rp%/}
+  (
+    cd / || exit 0
+    for d in /proc/[0-9]*; do
+      [ "${d#/proc/}" = "$$" ] && continue
+      c=$(readlink "$d/cwd" 2>/dev/null) || continue
+      case "$c/" in "$rp"/*) exit 0 ;; esac
+    done
+    exit 1
+  )
+}
 
-# sync_one <name> <dir>: appends one TSV row (name branch default dirty behind ahead fetchedAt error)
+# sync_one <name> <dir>: appends one TSV row (name branch default dirty behind ahead fetchedAt autoUpdated autoSkip error)
 sync_one() {
-  local name=$1 gd out rc ssh url dirty=false fetched= err= branch= def= behind= ahead=
+  local name=$1 gd out rc ssh url dirty=false fetched= err= branch= def= behind= ahead= updated=false skip=
   P=$2
   if ! gd=$(g rev-parse --absolute-git-dir 2>/dev/null); then
     add_err "not a git repository"
@@ -69,8 +115,24 @@ sync_one() {
       add_err "no origin/$def"
     fi
     ahead=$(g rev-list --count HEAD --not --remotes=origin 2>/dev/null) || ahead=
+
+    # fast-forward the default branch (timer run only), only when nothing can be in the way (see the header); the first failing check is the reason
+    if [ -z "$ONLY" ] && [ "${behind:-0}" -gt 0 ]; then
+      if [ "$SECONDS" -ge "$LATE_S" ]; then skip=late # the run is old: systemd's TimeoutStartSec must never find a merge in flight
+      elif in_progress "$gd"; then skip=in_progress
+      elif [ "$branch" != "$def" ]; then skip=on_branch
+      elif ! out=$(g status --porcelain --untracked-files=no 2>/dev/null) || [ -n "$out" ]; then skip=dirty
+      elif [ "${ahead:-1}" -ne 0 ]; then skip=ahead
+      elif filters; then skip=filters
+      elif busy; then skip=busy
+      elif g -c gc.auto=0 -c maintenance.auto=false -c core.hooksPath=/dev/null -c core.fsmonitor=false -c submodule.recurse=false -c merge.autoStash=false \
+          merge --ff-only --quiet --no-edit --no-overwrite-ignore "refs/remotes/origin/$def" >/dev/null 2>&1; then
+        updated=true
+        behind=$(g rev-list --count "HEAD..origin/$def" 2>/dev/null) || behind=
+      else skip=ff_failed; fi
+    fi
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$branch" "$def" "$dirty" "$behind" "$ahead" "$fetched" "$err" >>"$ROWS"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$branch" "$def" "$dirty" "$behind" "$ahead" "$fetched" "$updated" "$skip" "$err" >>"$ROWS"
 }
 
 command -v node >/dev/null || { echo "fcode-git-sync: node is missing" >&2; exit 1; }
@@ -105,9 +167,10 @@ const projects = Object.create(null); // single-project run: the other entries s
 if (only) for (const k in old) projects[k] = old[k];
 for (const l of fs.readFileSync(rows, "utf8").split("\n")) {
   if (!l) continue;
-  const [n, b, d, di, be, ah, lf, er] = l.split("\t");
+  const [n, b, d, di, be, ah, lf, au, sk, er] = l.split("\t");
   projects[n] = { branch: b || null, default: d || null, dirty: di === "true", behindDefault: be ? +be : null,
-    aheadOfOrigin: ah ? +ah : null, lastFetchAt: lf || (old[n] && old[n].lastFetchAt) || null, error: er || null };
+    aheadOfOrigin: ah ? +ah : null, lastFetchAt: lf || (old[n] && old[n].lastFetchAt) || null, error: er || null,
+    autoUpdated: au === "true", autoSkip: sk || null };
 }
 const tmp = out + "." + process.pid + ".tmp";
 fs.writeFileSync(tmp, JSON.stringify({ updatedAt: at, projects }, null, 2) + "\n", { mode: 0o600 });
