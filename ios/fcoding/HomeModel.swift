@@ -17,14 +17,28 @@ final class HomeModel: ObservableObject {
     func serverNow(_ date: Date = Date()) -> Date { date.addingTimeInterval(offset) }
 
     private var current: Task<Void, Never>?
+    /// Requests started so far, and the number of the one in flight.
+    private var starts = 0
+    private var currentIndex = 0
 
-    /// One request at a time; a call during one waits for it.
-    func load(_ app: AppState) async {
-        if let running = current { await running.value; return }
-        let task = Task { await self.fetch(app) }
+    /// One request at a time; a call during one waits for it. `fresh`: the reply must come from
+    /// a request started after this call (one already in flight may carry older server state).
+    func load(_ app: AppState, fresh: Bool = false) async {
+        let needed = starts + 1
+        while let running = current {
+            if !fresh || currentIndex >= needed { await running.value; return }
+            await running.value
+        }
+        starts += 1
+        let index = starts
+        currentIndex = index
+        // Cleared inside the task, so a waiter never sees a finished task as still running.
+        let task = Task {
+            await self.fetch(app)
+            if self.currentIndex == index { self.current = nil }
+        }
         current = task
         await task.value
-        current = nil
     }
 
     private func fetch(_ app: AppState) async {
@@ -90,15 +104,12 @@ final class HomeModel: ObservableObject {
         guard let api = app.api else { return unpairedNotice }
         stagingStarted[project] = Date()
         var failure: String?
+        var replyState: String?
         do {
             let reply = try await api.startStaging(project: project)
+            replyState = reply.state
             if reply.ok == false {
                 failure = HomeLogic.stagingFailure(status: 200, code: reply.error) ?? "Không bật được staging."
-            } else if reply.state == "running" {
-                // Already running: no "đang bật…", just fetch the fresh state.
-                stagingStarted[project] = nil
-                await load(app)
-                return nil
             }
         } catch {
             let e = error as? APIError
@@ -109,15 +120,21 @@ final class HomeModel: ObservableObject {
             stagingStarted[project] = nil
             return failure
         }
+        // The "đang bật…" override stays until a load started after this reply shows running (or
+        // its 180 s window ends): a load already in flight may still carry the cached old state.
+        let reloads = HomeLogic.stagingReloads(replyState: replyState)
         Task {
             var waited = 0.0
-            for at in [20.0, 45, 90, 150] {
+            for at in reloads {
                 try? await Task.sleep(nanoseconds: UInt64((at - waited) * 1_000_000_000))
                 waited = at
                 // Off screen: ProjectsView loads home again as soon as the list is back.
                 guard self.visible else { break }
-                await self.load(app)
-                if self.home?.projects.first(where: { $0.name == project })?.staging?.state == "running" { break }
+                await self.load(app, fresh: true)
+                if self.home?.projects.first(where: { $0.name == project })?.staging?.state == "running" {
+                    self.stagingStarted[project] = nil
+                    break
+                }
             }
         }
         return nil

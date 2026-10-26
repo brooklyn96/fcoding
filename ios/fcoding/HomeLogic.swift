@@ -788,6 +788,14 @@ enum HomeLogic {
         }
     }
 
+    /// Seconds after a successful POST staging/start at which GET /api/home is fetched again
+    /// (each a request started after the reply). "running" (already up): at once, then twice more
+    /// in case the server's 30 s cache still says otherwise; "starting": while the box boots.
+    /// The "đang bật…" override is kept until one of these shows running.
+    static func stagingReloads(replyState: String?) -> [Double] {
+        replyState == "running" ? [0, 20, 45] : [20, 45, 90, 150]
+    }
+
     /// Known failures of POST staging/start (an error status, or a 200 with ok:false); nil = an
     /// ordinary error, worded by the caller.
     static func stagingFailure(status: Int, code: String?) -> String? {
@@ -1114,7 +1122,12 @@ enum HomeLogic {
         eq("staging no key 4xx", stagingFailure(status: 400, code: "no_instabox_key"), "Box chưa có API key instabox")
         eq("staging old server", stagingFailure(status: 404, code: "not_found"), "Máy chủ chưa hỗ trợ, cập nhật máy chủ trước.")
         eq("staging other", stagingFailure(status: 500, code: "error") == nil, true)
-        eq("staging no box", stagingFailure(status: 404, code: "no_staging_box"), "Dự án này chưa có máy staging")
+        eq("staging reloads running", stagingReloads(replyState: "running"), [0, 20, 45])
+        eq("staging reloads starting", stagingReloads(replyState: "starting"), [20, 45, 90, 150])
+        eq("staging reloads no state", stagingReloads(replyState: nil), [20, 45, 90, 150])
+        // Reply "running" but a stale home (cached "suspended") lands: the override still holds.
+        eq("staging stale after running reply", stagingChip(stg[0].staging, startedAt: now.addingTimeInterval(-1), now: now)?.canStart, false)
+        eq("staging no box",stagingFailure(status: 404, code: "no_staging_box"), "Dự án này chưa có máy staging")
 
         // omp format banner
         func banner(_ json: String) -> String? {
