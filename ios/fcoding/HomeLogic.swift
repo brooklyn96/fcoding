@@ -238,12 +238,17 @@ struct HomeRun: Decodable {
 /// Box copy vs GitHub (git-sync state); every field nil when the box has no entry.
 struct HomeGit: Decodable {
     var behind: Int?
+    /// Commits only on the box, not pushed.
+    var ahead: Int?
+    var dirty: Bool?
     var error: String?
 
-    private enum K: String, CodingKey { case behind, error }
+    private enum K: String, CodingKey { case behind, ahead, dirty, error }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: K.self)
         behind = c.value(.behind)
+        ahead = c.value(.ahead)
+        dirty = c.value(.dirty)
         error = c.value(.error)
     }
 }
@@ -522,6 +527,8 @@ enum HomeLogic {
     static func gitLine(_ git: HomeGit?) -> (text: String, tone: Tone, label: String?)? {
         if let n = git?.behind, n > 0 { return ("⚠ chậm \(n) commit", .warn, "chậm \(n) commit so với GitHub") }
         if git?.error != nil { return ("⚠ không đồng bộ được", .warn, nil) }
+        if let n = git?.ahead, n > 0 { return ("↑ \(n) commit chưa đẩy", .warn, "\(n) commit chỉ có trên box, chưa đẩy lên GitHub") }
+        if git?.dirty == true { return ("✎ có sửa chưa lưu", .warn, "có thay đổi chưa commit trên box") }
         return nil
     }
 
@@ -880,6 +887,22 @@ enum HomeLogic {
         eq("git error", gitErr?.text, "⚠ không đồng bộ được")
         eq("git error tone", gitErr?.tone, Tone.warn)
         eq("git error no label", gitErr.map { $0.label == nil }, true)
+        func gl(_ git: String) -> (text: String, tone: Tone, label: String?)? {
+            gitLine(projects("{\"name\":\"e\",\"git\":\(git)}").first?.git)
+        }
+        let ahead2 = gl("{\"behind\":0,\"ahead\":2,\"dirty\":false,\"error\":null}")
+        eq("git ahead", ahead2?.text, "↑ 2 commit chưa đẩy")
+        eq("git ahead tone", ahead2?.tone, Tone.warn)
+        eq("git ahead label", ahead2?.label, "2 commit chỉ có trên box, chưa đẩy lên GitHub")
+        let dirty = gl("{\"behind\":0,\"ahead\":0,\"dirty\":true,\"error\":null}")
+        eq("git dirty", dirty?.text, "✎ có sửa chưa lưu")
+        eq("git dirty tone", dirty?.tone, Tone.warn)
+        eq("git dirty label", dirty?.label, "có thay đổi chưa commit trên box")
+        eq("git behind wins", gl("{\"behind\":3,\"ahead\":2,\"dirty\":true}")?.text, "⚠ chậm 3 commit")
+        eq("git error over ahead", gl("{\"ahead\":2,\"dirty\":true,\"error\":\"x\"}")?.text, "⚠ không đồng bộ được")
+        eq("git ahead over dirty", gl("{\"ahead\":2,\"dirty\":true}")?.text, "↑ 2 commit chưa đẩy")
+        eq("git clean", gl("{\"behind\":0,\"ahead\":0,\"dirty\":false,\"error\":null}") == nil, true)
+        eq("git lenient types", gl("{\"ahead\":\"2\",\"dirty\":\"yes\"}") == nil, true)
         eq("decode empty", (try? JSONDecoder().decode(HomeData.self, from: Data("{}".utf8)))?.accounts.count, 0)
 
         // Codex reset replies
