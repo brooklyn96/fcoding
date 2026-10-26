@@ -17,6 +17,12 @@ final class OverviewModel: ObservableObject {
     /// The one load in flight; a load() call during it asks for exactly one more (`reloadAfter`).
     private var current: Task<Void, Never>?
     private var reloadAfter = false
+    /// Renames in flight: every overview reply that arrives meanwhile is dropped, because it may
+    /// hold the old name or the new one, and syncSeen would mark the renamed session read.
+    private var renaming = 0
+    /// Bumped when a rename ends: a reply to a fetch that started before that is dropped too, and
+    /// the fetch is repeated.
+    private var generation = 0
     private static let seenKey = "inbox.seen"
 
     init() {
@@ -47,8 +53,14 @@ final class OverviewModel: ObservableObject {
     /// Keeps the last data on failure; a 401 goes back to pairing through `app.report`.
     private func fetchOnce(_ app: AppState) async {
         guard let api = app.api else { return }
+        let started = generation
         do {
             let fresh = try await api.overview()
+            if renaming > 0 { return }   // the rename fetches once its PATCH has answered
+            guard started == generation else {
+                reloadAfter = true
+                return
+            }
             overview = fresh
             errorText = nil
             syncSeen(fresh)
@@ -128,12 +140,55 @@ final class OverviewModel: ObservableObject {
         if sent { markRead(s.name) }
     }
 
-    /// Kills the tmux session; its draft goes with it (as before).
-    func delete(_ name: String, app: AppState) async {
-        _ = await perform(name, app) { api in
+    /// "Đóng": kills the tmux session; its draft goes with it (as before). True when it closed.
+    @discardableResult
+    func delete(_ name: String, app: AppState) async -> Bool {
+        await perform(name, app) { api in
             try await api.call("DELETE", "api/sessions/\(name)")
             UserDefaults.standard.removeObject(forKey: "draft.\(name)")
         }
+    }
+
+    /// "Đổi tên": PATCH /api/sessions/<name> {name}. Returns the error text, nil when renamed.
+    /// The draft and the read mark move with the session.
+    func rename(_ name: String, to newName: String, app: AppState) async -> String? {
+        guard let api = app.api else { return unpairedNotice }
+        guard !busy.contains(name) else { return "Phiên đang bận, thử lại." }
+        busy.insert(name)
+        defer { busy.remove(name) }
+        let mark = seen[name]
+        renaming += 1
+        do {
+            defer {
+                renaming -= 1
+                generation += 1
+            }
+            try await api.call("PATCH", "api/sessions/\(name)", body: ["name": newName])
+        } catch let e as APIError where e.status == 404 && e.code == "not_found" {
+            await load(app)
+            return "Phiên này không còn nữa."
+        } catch let e as APIError where [404, 405, 501].contains(e.status) {
+            return "Máy chủ chưa hỗ trợ đổi tên, cập nhật máy chủ trước."
+        } catch let e as APIError where e.status == 409 && e.code == "reserved_name" {
+            return HomeLogic.reservedNameMessage(newName, projects: overview?.projects.map(\.name) ?? [])
+        } catch let e as APIError where e.status == 409 {
+            return "Tên này đã có phiên khác."
+        } catch let e as APIError where e.status == 400 {
+            return "Tên không hợp lệ."
+        } catch {
+            return app.report(error) ?? "Chưa đổi được tên, thử lại."
+        }
+        let defaults = UserDefaults.standard
+        if let draft = defaults.string(forKey: "draft.\(name)") {
+            defaults.set(draft, forKey: "draft.\(newName)")
+            defaults.removeObject(forKey: "draft.\(name)")
+        }
+        // The mark read before the PATCH: no reply since then has been applied to `seen`.
+        if let mark = mark { seen[newName] = mark }
+        seen[name] = nil
+        saveSeen()
+        await load(app)
+        return nil
     }
 
     /// Runs one action for `name`; `busy` stays set until the post-action data is in, so the
