@@ -1119,13 +1119,14 @@ export function createApp(opts = {}) {
   const quota = memo(QUOTA_TTL, async () => {
     const resetAt = lastResetAt;
     const needNew = listing.at() < resetAt;
-    const [u, r] = await Promise.allSettled([execTool(ompSpec, ['usage', '--json'], 30e3), listing.get(needNew ? listAfterReset : homeWait / 2)]);
+    quotaBare = false; // this refresh replaces the stored value; it sets the flag again if its own listing wait fails
+    const [u, r] = await Promise.allSettled([execTool(ompSpec, ['usage', '--json'], 30e3), listing.get(needNew ? listAfterReset : homeWait / 2)
+      .catch((e) => { quotaBare = true; throw e; })]); // set now: a listing landing before usage --json ends must drop this quota
     if (u.status === 'rejected') throw u.reason;
     const q = parseQuota(JSON.parse(u.value), r.status === 'fulfilled' ? r.value.value : null, now());
     // by the listing's age only: a later listing failure is the same with or without a past reset
     if (resetAt > -Infinity && !(r.status === 'fulfilled' && r.value.at >= resetAt)) { for (const a of q.accounts) a.stale = true; q.ttl = STALE_QUOTA_TTL; }
-    quotaBare = r.status !== 'fulfilled';
-    if (quotaBare) q.ttl = STALE_QUOTA_TTL;
+    if (r.status === 'fulfilled') quotaBare = false; else q.ttl = STALE_QUOTA_TTL;
     return q;
   }, now, QUOTA_TTL, (q) => q.ttl);
   const scan = spendScanner(spendRoots, now);
