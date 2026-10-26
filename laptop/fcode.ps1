@@ -564,8 +564,10 @@ function Invoke-Add {
   for ($try = 1; $try -le $max; $try++) {
     $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     try {
-      # chi de thu: FCODE_ADD_SCRIPT doi duong dan script tren box
-      $run = $(if ("$env:FCODE_ADD_SCRIPT" -match '\A/[A-Za-z0-9_./-]{1,200}\z') { "FCODE_ADD_SCRIPT='$env:FCODE_ADD_SCRIPT'`n" } else { '' }) + $FcodeAddRun
+      # chi de thu: FCODE_ADD_SCRIPT doi duong dan script tren box; FCODE_ADD_TIMEOUT_S / FCODE_ADD_KILL_AFTER_S (chi chu so) doi han
+      $run = $(if ("$env:FCODE_ADD_SCRIPT" -match '\A/[A-Za-z0-9_./-]{1,200}\z') { "FCODE_ADD_SCRIPT='$env:FCODE_ADD_SCRIPT'`n" } else { '' })
+      foreach ($tv in 'FCODE_ADD_TIMEOUT_S', 'FCODE_ADD_KILL_AFTER_S') { $tx = [Environment]::GetEnvironmentVariable($tv); if ("$tx" -match '\A[0-9]{1,5}\z') { $run += "$tv=$tx`n" } }
+      $run += $FcodeAddRun
       $lines = @(Invoke-BoxScript $run @($repo, $name) 2>&1 | ForEach-Object { "$_" })
       $code = $LASTEXITCODE
     } catch { $lines = @("$($_.Exception.Message)"); $code = 255 }
@@ -621,6 +623,8 @@ function Invoke-Add {
         'BAD_ARGS'      { Write-Host 'lỗi: tên repo hoặc tên project không hợp lệ.' }
       }
     }
+    # timeout tren box: 124 = qua han, da dung (TERM); 137 = khong dung theo TERM nen bi KILL
+    if ($code -in 124, 137) { Write-Host "lỗi: thêm dự án trên box chạy quá 10 phút nên đã bị dừng (mã $code). Chạy lại là an toàn: fcode add $repo $name"; return 1 }
     if ($code -eq 11) { Write-Host "Thư mục $name đã có trên box (hoặc không an toàn) — chọn tên khác: fcode add $repo <tên-khác>"; return 1 }
     if ($code -eq 25) { Write-Host 'lỗi: box không ghi được cấu hình đăng nhập GitHub cho repo này, nên chưa thêm project.'; return 1 }
     if ($code -eq 26) { Write-Host 'lỗi: cấu hình git trên box đang chuyển hướng địa chỉ GitHub (insteadOf / pushInsteadOf / pushurl) — cần gỡ trên box rồi chạy lại.'; return 1 }
@@ -839,10 +843,11 @@ done
 
 # fcode add chay script DA CAI tren box (box/fcode-add.sh, install.sh dat o /data/home/fcoding/fcode-add.sh): mot nguon duy nhat cho ca app va laptop.
 # Dong ket qua dang "R <MA> [chi tiet]" do Invoke-Add dich ra tieng Viet. Thieu script -> "R NO_SCRIPT" (box chua cap nhat).
+# Cung han voi server (server.mjs): toi da 600 giay, roi TERM, 30 giay sau KILL (124 / 137), de khoa theo ten tren box khong bi giu mai.
 $FcodeAddRun = (@'
 s="${FCODE_ADD_SCRIPT:-/data/home/fcoding/fcode-add.sh}"
 [ -f "$s" ] || { echo "R NO_SCRIPT"; exit 3; }
-exec bash "$s" "$@"
+exec timeout --kill-after="${FCODE_ADD_KILL_AFTER_S:-30}" "${FCODE_ADD_TIMEOUT_S:-600}" bash "$s" "$@"
 '@) -replace "`r`n", "`n"
 
 # fcode-pair tren box (server worker them --qr). $1 = ten thiet bi (co the rong).

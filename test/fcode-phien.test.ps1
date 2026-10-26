@@ -761,6 +761,24 @@ if ($env:FCODE_TEST_BOX) {
       Eq (Invoke-RealBox "grep -c '`"id`":`"b`"' $sd/$an") '1' 'updated once nothing holds it'
     } finally { [void](Invoke-RealBox "kill `$(cat $bt/pid 2>/dev/null) 2>/dev/null; rm -rf $bt; echo ok") }
   }
+  T 'real box: fcode add runs the box script under timeout: a stalled script is stopped (124, or 137 when it ignores TERM) and leaves no process' {
+    $bt = Invoke-RealBox 'mktemp -d /tmp/fcode-phien-test-XXXXXXXX'; Ok ($bt -match '\A/tmp/fcode-phien-test-[A-Za-z0-9]{8}\z') "throwaway dir: $bt"
+    $w = New-World 'real3'
+    [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ instabox = $RealIb; box = 'coder'; syncRepos = @() } | ConvertTo-Json -Compress))
+    try {
+      $n1 = Get-Random -Minimum 100000 -Maximum 199999; $n2 = $n1 + 1   # sleep lengths unique to this run: the process check sees only ours
+      [void](Invoke-RealBox "cat > $bt/stall.sh" $utf8.GetBytes("echo 'R TOKEN_OK'`nsleep $n1`n"))
+      [void](Invoke-RealBox "cat > $bt/stallterm.sh" $utf8.GetBytes("trap '' TERM`necho 'R TOKEN_OK'`nsleep $n2`n"))
+      foreach ($c in @(@{ S = 'stall.sh'; Code = 124 }, @{ S = 'stallterm.sh'; Code = 137 })) {
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $r = Invoke-Fcode $w @('add', 'owner/repo') @{ FCODE_ADD_SCRIPT = "$bt/$($c.S)"; FCODE_ADD_TIMEOUT_S = '2'; FCODE_ADD_KILL_AFTER_S = '2' }
+        Ok ($sw.Elapsed.TotalSeconds -lt 90) "returned in $([int]$sw.Elapsed.TotalSeconds) s"
+        Eq $r.Code 1 $r.Out; Ok ($r.Out -match "chạy quá 10 phút nên đã bị dừng \(mã $($c.Code)\)") ("$($c.S): told; out: " + $r.Out)
+      }
+      $bp = '[' + $bt.Substring(0, 1) + ']' + $bt.Substring(1)   # [/]tmp/...: the grep never matches its own command line
+      Eq (Invoke-RealBox "ps -eo args | grep -c '$bp/stall\|[s]leep $n1\|[s]leep $n2'") '0' 'no process left on the box'
+    } finally { [void](Invoke-RealBox "rm -rf $bt; echo ok") }
+  }
 }
 T 'e2e: equal-length sessions with other content are reported and left alone' {
   $w = New-World 'e2e8'
@@ -1401,6 +1419,19 @@ T 'add r6: re-add (only CFG_EXISTS) is success; CFG_WARN is a warning; exits 25 
     Eq $r.Code $c.Code $r.Out; Ok ($r.Out -match $c.Rx) ("message; out: " + $r.Out)
     Eq (@(Get-Content $w.Log | Where-Object { $_ -eq 'ssh script' }).Count) 1 'no retry'
     Ok ($r.Out -notmatch 'chạy lại là an toàn' -or $c.B -match 'CFG_WARN') ("no false retry promise; out: " + $r.Out)
+  }
+}
+T 'add r7: the box script runs under the same timeout as the server (600 s, KILL 30 s later); a stalled script is stopped and told as a safe retry' {
+  $runAst = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$FcodeAddRun' }, $true)
+  $FcodeAddRun = $null; Invoke-Expression $runAst.Extent.Text
+  Ok ($FcodeAddRun -match '(?m)^exec timeout --kill-after="\$\{FCODE_ADD_KILL_AFTER_S:-30\}" "\$\{FCODE_ADD_TIMEOUT_S:-600\}" bash "\$s" "\$@"$') ("wrapper: " + $FcodeAddRun)
+  $w = New-World 'add6'; $fa = Join-Path $w.W 'fake-add.sh'
+  foreach ($c in @(@{ B = "echo 'R TOKEN_OK'`nsleep 297"; Code = 124 }, @{ B = "trap '' TERM`necho 'R TOKEN_OK'`nsleep 297"; Code = 137 })) {
+    New-FakeAdd $fa $c.B
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $r = Invoke-Fcode $w @('add', 'owner/repo') @{ FCODE_ADD_SCRIPT = (ConvertTo-Posix $fa); FCODE_ADD_TIMEOUT_S = '2'; FCODE_ADD_KILL_AFTER_S = '2' }
+    Ok ($sw.Elapsed.TotalSeconds -lt 60) "returned in $([int]$sw.Elapsed.TotalSeconds) s"
+    Eq $r.Code 1 $r.Out; Ok ($r.Out -match "chạy quá 10 phút nên đã bị dừng \(mã $($c.Code)\)\. Chạy lại là an toàn: fcode add owner/repo repo") ("told; out: " + $r.Out)
   }
 }
 T 'sync r6: the 60 s `projects` deadline starts after the box is awake (a slow wake does not eat it)' {

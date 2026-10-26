@@ -47,7 +47,8 @@ if a and a[0] == 'ssh':
         with os.fdopen(fd, 'wb') as f:
             f.write(data)
         try:
-            rc = subprocess.call([bash, sp], stdin=subprocess.DEVNULL)
+            # like the real remote command (bash -l $f; rc=$?): an outer bash turns a death by signal into 128+n (e.g. 137)
+            rc = subprocess.call([bash, '-c', 'bash "$1"; exit $?', 'x', sp], stdin=subprocess.DEVNULL)
         finally:
             os.unlink(sp)
         sys.exit(rc)
