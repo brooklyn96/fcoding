@@ -690,7 +690,7 @@ function execTool(spec, args, timeout, env = toolEnv()) {
 // git-sync.json of the box timer (fcode-git-sync) -> Map project name -> the `git` object of GET /api/home. A missing, unreadable or
 // broken file, or a project it does not list, is NO_GIT (every field null; autoUpdated false); a field of the wrong type is null on its own.
 // autoUpdated / autoSkip: what the timer's fast-forward did (an entry of an older script has neither: false / null).
-const AUTO_SKIPS = ['on_branch', 'dirty', 'in_progress', 'busy', 'ahead', 'ff_failed'];
+const AUTO_SKIPS = ['in_progress', 'on_branch', 'dirty', 'ahead', 'filters', 'busy', 'late', 'ff_failed'];
 const NO_GIT = Object.freeze({ behind: null, ahead: null, dirty: null, branch: null, syncedAt: null, error: null, autoUpdated: false, autoSkip: null });
 const textOf = (v) => { const t = str(v); return t ? clip(cleanLine(t)) || null : null; };
 const count = (v) => (Number.isInteger(v) && v >= 0 ? v : null);
@@ -779,7 +779,7 @@ function takeInstaboxKey() {
   delete process.env.INSTABOX_API_KEY;
   return typeof k === 'string' && k.trim() ? k.trim() : null;
 }
-const STAGING_TTL = 30e3, STAGING_START_MS = 60e3, GUARD_TTL = 10 * 60e3, GUARD_SCAN = 20;
+const STAGING_TTL = 30e3, STAGING_START_MS = 60e3, GUARD_TTL = 10 * 60e3, GUARD_SCAN = 20, GUARD_YOUNG_MS = 30e3;
 const GIT_SYNC_MS = 8e3; // openFresh: how long fcode-git-sync may take before the new session is made anyway (fcode-new and the app wait 20 s in all)
 // Stale-while-revalidate, one refresh at a time. get(wait): a value younger than ttl as is; an older one at once while a refresh
 // runs in the background. With no value yet, or after clear(), the refresh is waited for at most `wait` ms; then the old value
@@ -1220,8 +1220,8 @@ export function createApp(opts = {}) {
     return base.slice(0, 32 - suffix.length).replace(/-+$/, '') + suffix;
   };
 
-  // `fcode-git-sync <project>` before a new session: it fetches and refreshes the behind / ahead / dirty counts of the card, and may fast-forward an idle,
-  // clean default branch (the script's own rules: no other branch, no stash or reset, no push). This server never changes a checkout. Never blocks the open and is never killed: an open waits for it at most gitSyncMs, or
+  // `fcode-git-sync <project>` before a new session: it only fetches and refreshes the behind / ahead / dirty counts of the card (a single-project run never
+  // fast-forwards; only the box's 5-minute timer may). This server never changes a checkout. Never blocks the open and is never killed: an open waits for it at most gitSyncMs, or
   // until the open is cancelled, then goes on; the child keeps running, detached and unref'd with its output ignored, and ends by its
   // own limits. One sync per project at a time: an open that arrives meanwhile joins it instead of starting another. A missing
   // command or a failure only log one line. ctx.onCancel is free until mutate takes it.
@@ -1309,8 +1309,8 @@ export function createApp(opts = {}) {
     return out;
   }
   // omp format guard: `omp --version` and the headers of the newest GUARD_SCAN sessions of every project dir under the sessions root.
-  // formatOk = false when a header is missing or has a version outside KNOWN_VERSIONS (reason "unknown_version:<v>", "no_header" when
-  // the header is unreadable), or when a session whose header cwd is a configured project sits outside the project's encoded dir
+  // formatOk = false when a header has a version outside KNOWN_VERSIONS (reason "unknown_version:<v>"), or is missing / unreadable in a
+  // complete file (not empty, not modified in the last 30 s: reason "no_header"), or when a session whose header cwd is a configured project sits outside the project's encoded dir
   // (reason "dir_rule": omp changed how it names the dir). Checked at most every 10 min (the first one at start); a failed scan is
   // not an alarm (formatOk stays true, reason null).
   async function ompGuardScan() {
@@ -1332,6 +1332,8 @@ export function createApp(opts = {}) {
       const buf = await readStart(f.file, Math.min(f.size, OMP_HEAD_BYTES));
       const head = buf && ompHead(buf, f.size);
       if (!head) continue;
+      // no usable header in a file that is empty or younger than 30 s is one being created (or a crash leftover): not an alarm
+      if (head.version === null && (head.empty || now() - f.mtime < GUARD_YOUNG_MS)) continue;
       if (head.version === null) reason ??= 'no_header';
       else if (!KNOWN_VERSIONS.includes(head.version)) reason ??= `unknown_version:${head.version}`;
       else if (head.cwd && wanted.has(path.resolve(head.cwd)) && ompDirName(head.cwd) !== f.dir) reason ??= 'dir_rule';
@@ -1340,9 +1342,10 @@ export function createApp(opts = {}) {
   }
   const ompGuard = memo(GUARD_TTL, ompGuardScan, now);
   ompGuard.get().catch(() => {}); // at start, in the background
-  // "<project>-omp-r-<first 8 of the id>": the project part is shortened, never the id, so the name stays within 32 characters
+  // "<project>-omp-r-<last 8 of the id>": omp ids are UUIDv7, whose first 8 digits are a timestamp (65 s steps), the last 8 are random.
+  // The project part is shortened, never the id part, so the name stays within 32 characters
   const resumeName = (project, id) => {
-    const tail = `omp-r-${id.slice(0, 8)}`.replace(/[^a-z0-9-]+/g, '-');
+    const tail = `omp-r-${id.slice(-8)}`.replace(/[^a-z0-9-]+/g, '-');
     const base = project.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+/, '').slice(0, 32 - tail.length - 1).replace(/-+$/, '');
     return base ? `${base}-${tail}` : tail;
   };
@@ -1360,7 +1363,8 @@ export function createApp(opts = {}) {
   }
 
   // --- staging box: `instabox ls --json` (30 s) and `instabox start <box> --no-wait`, box name = project name ---
-  const staging = memo(STAGING_TTL, async () => parseStaging(JSON.parse(await execTool(instaboxSpec, ['ls', '--json'], 15e3, { ...toolEnv(), INSTABOX_API_KEY: instaboxKey }))), now);
+  const lsBoxes = async () => parseStaging(JSON.parse(await execTool(instaboxSpec, ['ls', '--json'], 15e3, { ...toolEnv(), INSTABOX_API_KEY: instaboxKey })));
+  const staging = memo(STAGING_TTL, lsBoxes, now);
   const startingBoxes = new Set(); // projects whose `instabox start` runs now
   // detached and unref'd with its output ignored; a failure only logs one line (never the key)
   function startBox(project) {
@@ -1761,13 +1765,18 @@ export function createApp(opts = {}) {
       if (pm[2]) return json(res, 200, { ok: true, sessions: await ompSessions(project) });
       if (pm[4]) { // resume
         const id = unescape(pm[3]);
-        if (!OMP_ID_RE.test(id) || !(await ompFiles(path.join(ompRoot, ompDirName(cfg.projects[project])))).some((f) => f.id === id)) return refuse(404, 'unknown_session');
+        const dir = path.join(ompRoot, ompDirName(cfg.projects[project]));
+        const file = OMP_ID_RE.test(id) ? (await ompFiles(dir)).find((f) => f.id === id) : null;
+        const st = file && await fs.promises.stat(path.join(dir, file.name)).catch(() => null);
+        if (!st) return refuse(404, 'unknown_session');
+        const buf = await readStart(path.join(dir, file.name), Math.min(st.size, OMP_HEAD_BYTES));
+        if (!buf || !KNOWN_VERSIONS.includes(ompHead(buf, st.size).version)) return refuse(409, 'unknown_format'); // the list never offers it either
         return json(res, 200, { ok: true, session: await mutate(ctx, () => resumeOmp(project, id, ctx)) });
       }
       // staging/start: only a box that `instabox ls` lists under the project's name; a running or starting one is left alone
       if (!instaboxKey) return refuse(409, 'no_instabox_key');
       let box;
-      try { staging.clear(); box = (await staging.get(homeWait)).value.get(project); } catch { return refuse(503, 'staging_unavailable'); } // the state now, not a cached one
+      try { box = (await lsBoxes()).get(project); } catch { return refuse(503, 'staging_unavailable'); } // the state now (a fresh ls), never a cached one
       if (!box) return refuse(404, 'no_staging_box');
       if (box.state === 'running' || box.state === 'starting' || startingBoxes.has(project)) return json(res, 200, { ok: true, state: box.state === 'running' ? 'running' : 'starting' });
       startBox(project);

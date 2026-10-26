@@ -3549,7 +3549,7 @@ test('parseGitSync: field mapping; wrong types, a broken file or a non-object ar
   assert.deepEqual(m.get('my.proj'), { behind: 0, ahead: 2, dirty: false, branch: 'feature/x', syncedAt: '2026-10-25T19:00:00.000Z', error: 'fetch failed: could not resolve host', autoUpdated: true, autoSkip: null }); // behind 0 stays 0
   // an entry of an older script has neither field: false / null
   assert.deepEqual(m.get('old-script'), { behind: 1, ahead: 0, dirty: false, branch: 'main', syncedAt: '2026-10-25T19:10:00.000Z', error: null, autoUpdated: false, autoSkip: null });
-  for (const s of ['on_branch', 'dirty', 'in_progress', 'busy', 'ahead', 'ff_failed']) assert.equal(parseGitSync(JSON.stringify({ projects: { a: { autoSkip: s } } })).get('a').autoSkip, s);
+  for (const s of ['in_progress', 'on_branch', 'dirty', 'ahead', 'filters', 'busy', 'late', 'ff_failed']) assert.equal(parseGitSync(JSON.stringify({ projects: { a: { autoSkip: s } } })).get('a').autoSkip, s);
   assert.deepEqual(parseGitSync('{"projects":{"a":{"autoUpdated":1,"autoSkip":["dirty"]}}}').get('a'), { ...GIT_NULL });
   // 'odd': every field of the wrong type, one by one
   assert.deepEqual(m.get('odd'), GIT_NULL);
@@ -3877,21 +3877,21 @@ test('POST resume: omp -r <id> in the project dir with the harness env, tmux nam
   const { cookie } = await c.login();
   ompTree(c);
   const r = await resumeReq(c, cookie, ID.a);
-  assert.deepEqual([r.status, r.json], [200, { ok: true, session: 'alpha-omp-r-aaaaaaaa' }]);
+  assert.deepEqual([r.status, r.json], [200, { ok: true, session: 'alpha-omp-r-00000001' }]);
   const [n] = newSessions(c);
-  assert.deepEqual(n.argv, ['new-session', '-d', '-s', 'alpha-omp-r-aaaaaaaa', '-c', ABS, `${LAUNCH}omp -r '${ID.a}'`]);
-  const st = JSON.parse(fs.readFileSync(fakeState(c), 'utf8')).sessions['alpha-omp-r-aaaaaaaa'];
+  assert.deepEqual(n.argv, ['new-session', '-d', '-s', 'alpha-omp-r-00000001', '-c', ABS, `${LAUNCH}omp -r '${ID.a}'`]);
+  const st = JSON.parse(fs.readFileSync(fakeState(c), 'utf8')).sessions['alpha-omp-r-00000001'];
   assert.deepEqual([st.opts['@pc_project'], st.opts['@pc_harness']], ['alpha', 'omp']);
   const again = await resumeReq(c, cookie, ID.a);
-  assert.deepEqual(again.json, { ok: true, session: 'alpha-omp-r-aaaaaaaa' });
+  assert.deepEqual(again.json, { ok: true, session: 'alpha-omp-r-00000001' });
   assert.equal(newSessions(c).length, 1); // reused, nothing new
-  assert.equal((await resumeReq(c, cookie, ID.b, 'my.proj')).json.session, 'my-proj-omp-r-bbbbbbbb');
+  assert.equal((await resumeReq(c, cookie, ID.b, 'my.proj')).json.session, 'my-proj-omp-r-00000002');
   // the session list shows it as an omp session of the project
-  const l = (await c.req('GET', '/api/sessions', { cookie })).json.sessions.find((x) => x.name === 'alpha-omp-r-aaaaaaaa');
+  const l = (await c.req('GET', '/api/sessions', { cookie })).json.sessions.find((x) => x.name === 'alpha-omp-r-00000001');
   assert.deepEqual([l.project, l.harness], ['alpha', 'omp']);
   const two = await Promise.all([resumeReq(c, cookie, ID.e), resumeReq(c, cookie, ID.e)]); // concurrent: one session
-  assert.deepEqual(two.map((x) => x.json.session), ['alpha-omp-r-eeeeeeee', 'alpha-omp-r-eeeeeeee']);
-  assert.equal(newSessions(c).filter((x) => x.argv[3] === 'alpha-omp-r-eeeeeeee').length, 1);
+  assert.deepEqual(two.map((x) => x.json.session), ['alpha-omp-r-00000005', 'alpha-omp-r-00000005']);
+  assert.equal(newSessions(c).filter((x) => x.argv[3] === 'alpha-omp-r-00000005').length, 1);
 }));
 
 test('POST resume: a long project name is shortened, the id part never; the name stays <= 32 characters', () => {
@@ -3901,7 +3901,7 @@ test('POST resume: a long project name is shortened, the id part never; the name
     ompTree(c);
     const r = await resumeReq(c, cookie, ID.a, long);
     assert.equal(r.status, 200, r.text);
-    assert.ok(r.json.session.length <= 32 && r.json.session.endsWith('-omp-r-aaaaaaaa'), r.json.session);
+    assert.ok(r.json.session.length <= 32 && r.json.session.endsWith('-omp-r-00000001'), r.json.session);
   }, { config: { projects: { [long]: ABS } } });
 });
 
@@ -3987,7 +3987,8 @@ test('omp format guard: an unreadable header, and a project session sitting outs
     await withApp(async (c) => {
       const { cookie } = await c.login();
       const d = ompDirOf(c); fs.mkdirSync(d, { recursive: true });
-      fs.writeFileSync(path.join(d, `2026-10-25T10-00-00-000Z_${ID.a}.jsonl`), 'this is not json\n{"type":"session"}\n{"type":"message"}\n');
+      const bad = path.join(d, `2026-10-25T10-00-00-000Z_${ID.a}.jsonl`);
+      fs.writeFileSync(bad, 'this is not json\n{"type":"session"}\n{"type":"message"}\n'); fs.utimesSync(bad, 1_700_000_000, 1_700_000_000);
       assert.deepEqual(await homeOmp(c, cookie), { version: '18.12.6', formatOk: false, reason: 'no_header' });
     }, { omp: s.omp });
     await withApp(async (c) => {
@@ -4179,4 +4180,70 @@ test('install.sh start.sh: INSTABOX_API_KEY alone is read, as text, from instabo
     assert.equal(run(null, { ...env, FCODE_INSTABOX_ENV: path.join(dir, 'missing') }), '[null,null,null]'); // no file: starts without it
     assert.equal(run('export INSTABOX_API_KEY=ibk_file\n', { ...env, INSTABOX_API_KEY: 'mine' }), '["mine",null,null]'); // one already set wins
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+// ---- review round 1 ----
+test('POST resume: ids that share their first 8 digits (UUIDv7 timestamp) get different tmux names; the name ends in the last 8', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  const d = ompDirOf(c); fs.mkdirSync(d, { recursive: true });
+  const A = '01a15f0d-afec-767f-8000-aaaaaaaa1111', B = '01a15f0d-1111-7000-8000-bbbbbbbb2222';
+  for (const id of [A, B]) fs.writeFileSync(path.join(d, `2026-10-21T15-20-49-000Z_${id}.jsonl`), '{"type":"title","title":"t"}\n{"type":"session","version":3,"cwd":"/x"}\n{"type":"message"}\n');
+  const ra = await resumeReq(c, cookie, A), rb = await resumeReq(c, cookie, B);
+  assert.deepEqual([ra.json.session, rb.json.session], ['alpha-omp-r-aaaa1111', 'alpha-omp-r-bbbb2222']);
+  assert.deepEqual(newSessions(c).map((x) => x.argv.at(-1)), [`${LAUNCH}omp -r '${A}'`, `${LAUNCH}omp -r '${B}'`]); // each opens its own conversation
+  assert.equal((await resumeReq(c, cookie, A)).json.session, 'alpha-omp-r-aaaa1111'); // and each is reused for itself
+  assert.equal(newSessions(c).length, 2);
+}));
+
+test('POST resume: a session of an unknown format (header version 4, no header) -> 409 unknown_format, nothing started; known formats still resume', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  const d = ompTree(c);
+  const r = await resumeReq(c, cookie, ID.d);
+  assert.deepEqual([r.status, r.json], [409, { ok: false, error: 'unknown_format' }]);
+  const g = path.join(d, `2026-10-25T15-00-00-000Z_${'f'.repeat(8)}-6666-7000-8000-000000000006.jsonl`);
+  fs.writeFileSync(g, 'garbage\n');
+  assert.equal((await resumeReq(c, cookie, `${'f'.repeat(8)}-6666-7000-8000-000000000006`)).json.error, 'unknown_format');
+  assert.equal(newSessions(c).length, 0);
+  assert.equal((await resumeReq(c, cookie, ID.a)).status, 200); // v3
+  assert.equal((await resumeReq(c, cookie, ID.c)).status, 200); // empty but a known header: it exists, omp decides
+}));
+
+test('POST staging/start decides on a FRESH ls: ls failing after a good cached answer -> 503 staging_unavailable, no start', async () => {
+  const s = stubDir();
+  try {
+    s.ls(BOXES);
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      assert.equal((await stagingOf(c, cookie))[0].state, 'suspended'); // cached
+      fs.writeFileSync(path.join(s.dir, 'ls-fail'), '');
+      const r = await c.req('POST', '/api/projects/alpha/staging/start', { cookie });
+      assert.deepEqual([r.status, r.json], [503, { ok: false, error: 'staging_unavailable' }]);
+      assert.equal(s.calls().filter((x) => x.argv[0] === 'start').length, 0);
+      assert.equal((await stagingOf(c, cookie))[0].state, 'suspended'); // the card keeps its last good value
+      fs.rmSync(path.join(s.dir, 'ls-fail'));
+      assert.equal((await c.req('POST', '/api/projects/alpha/staging/start', { cookie })).status, 200);
+    }, { instabox: s.instabox, instaboxKey: 'ibk_test' });
+  } finally { s.cleanup(); }
+});
+
+test('omp format guard: an empty or title-only file, and a header-less file younger than 30 s, are being created (no alarm); a complete old one with a bad header is', async () => {
+  const s = stubDir();
+  const clock = { t: Date.now() };
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      const d = ompDirOf(c); fs.mkdirSync(d, { recursive: true });
+      const mk = (id, text, age) => { const p = path.join(d, `2026-10-25T10-00-00-000Z_${id}.jsonl`); fs.writeFileSync(p, text); const t = (clock.t - age) / 1000; fs.utimesSync(p, t, t); };
+      mk(ID.a, '', 3600e3); // 0 bytes, old
+      mk(ID.b, '{"type":"title","title":"x"}\n', 3600e3); // title line only, old
+      mk(ID.c, '{"type":"title","title":"x"}\n{"type":"sess', 3600e3); // header cut in the middle, old
+      mk(ID.d, 'garbage line\nmore garbage\n', 5e3); // complete-looking but young: being written
+      assert.deepEqual(await homeOmp(c, cookie), { version: '18.12.6', formatOk: true, reason: null });
+    }, { omp: s.omp, now: () => clock.t });
+    await withApp(async (c) => { // a v4 header counts even in a young or empty file: it is the new format
+      const { cookie } = await c.login();
+      const d = ompDirOf(c); fs.mkdirSync(d, { recursive: true });
+      fs.writeFileSync(path.join(d, `2026-10-25T10-00-00-000Z_${ID.a}.jsonl`), '{"type":"title","title":"x"}\n{"type":"session","version":4,"cwd":"/x"}\n');
+      assert.deepEqual(await homeOmp(c, cookie), { version: '18.12.6', formatOk: false, reason: 'unknown_version:4' });
+    }, { omp: s.omp });
+  } finally { s.cleanup(); }
 });
