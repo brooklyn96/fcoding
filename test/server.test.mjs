@@ -3158,6 +3158,17 @@ test('cold start: a quota built before a slow first listing is dropped when the 
   assert.equal(c.toolCalls('usage --json').length, reads);
 }, { homeWaitMs: 600 }));
 
+test('cold start: a first listing that lands after its wait but before usage --json ends still drops the quota', () => homeApp(async (c) => {
+  // listing wait 300 ms (homeWait / 2), listing 700 ms, usage --json 1.5 s
+  c.setRules([['usage reset --json', { file: FIX('omp-reset-list.json'), delay: 700 }], ['usage --json', { file: FIX('omp-usage.json'), delay: 1500 }], ...baseRules()]);
+  await c.home();
+  await c.app.homeIdle(); await c.app.homeIdle(); // the listing landed first, then usage --json ended
+  c.setRules(baseRules()); // omp quick again; the clock does not move (no 15 s wait)
+  const h = await c.home();
+  assert.equal(h.accounts.map((a) => a.id).join(' '), 'anthropic/1 anthropic/2 anthropic/3 openai-codex/4');
+  assert.equal(h.accounts[3].resets.target, 'openai-codex/4');
+}, { homeWaitMs: 600 }));
+
 test('cold start: the first listing fails: the quota with ~ ids is read again after 15 s, not 60 s', () => homeApp(async (c) => {
   c.setRules([['usage reset --json', { code: 1, stderr: 'down' }], ...baseRules()]);
   assert.equal((await c.home()).accounts[3].resets.target, null);
