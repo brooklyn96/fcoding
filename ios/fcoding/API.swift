@@ -104,7 +104,7 @@ extension API {
         return try JSONDecoder().decode(ResumeResponse.self, from: data).session
     }
 
-    /// POST staging/start: `{ok:true, state:"starting"}`, or a 200 `{ok:false, error}`.
+    /// POST staging/start: `{ok:true, state:"starting"|"running"}`, or `{ok:false, error}`.
     func startStaging(project: String) async throws -> StagingStartResponse {
         let data = try await call("POST", "api/projects/\(project)/staging/start", body: [:])
         return try JSONDecoder().decode(StagingStartResponse.self, from: data)
@@ -112,7 +112,7 @@ extension API {
 }
 
 struct ResumeResponse: Decodable { let session: String }
-struct StagingStartResponse: Decodable { let ok: Bool?; let error: String? }
+struct StagingStartResponse: Decodable { let ok: Bool?; let error: String?; let state: String? }
 
 struct SessionInfo: Decodable, Identifiable, Hashable {
     let name: String

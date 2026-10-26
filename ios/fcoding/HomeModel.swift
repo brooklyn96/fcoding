@@ -80,6 +80,9 @@ final class HomeModel: ObservableObject {
 
     /// When "Bật" was tapped per project (this phone's clock); the chip shows "đang bật…" meanwhile.
     @Published private(set) var stagingStarted: [String: Date] = [:]
+    /// The project list is on screen and the app in the foreground (ProjectsView's `polling`);
+    /// the follow-up loads after "Bật" stop when it is not.
+    var visible = false
 
     /// POST staging/start; returns the error text, nil on success. The server caches the box
     /// state for 30 s, so the home reply is fetched a few times until it can say "running".
@@ -91,6 +94,11 @@ final class HomeModel: ObservableObject {
             let reply = try await api.startStaging(project: project)
             if reply.ok == false {
                 failure = HomeLogic.stagingFailure(status: 200, code: reply.error) ?? "Không bật được staging."
+            } else if reply.state == "running" {
+                // Already running: no "đang bật…", just fetch the fresh state.
+                stagingStarted[project] = nil
+                await load(app)
+                return nil
             }
         } catch {
             let e = error as? APIError
@@ -106,6 +114,8 @@ final class HomeModel: ObservableObject {
             for at in [20.0, 45, 90, 150] {
                 try? await Task.sleep(nanoseconds: UInt64((at - waited) * 1_000_000_000))
                 waited = at
+                // Off screen: ProjectsView loads home again as soon as the list is back.
+                guard self.visible else { break }
                 await self.load(app)
                 if self.home?.projects.first(where: { $0.name == project })?.staging?.state == "running" { break }
             }

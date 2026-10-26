@@ -329,8 +329,15 @@ struct NewSessionSheet: View {
         SheetScaffold {
             if let p = picked ?? initialProject {
                 let back: (String, () -> Void) = initialProject != nil ? ("Huỷ", { dismiss() })
-                                                                         : ("‹ Dự án", { picked = nil; errorText = nil })
-                SheetHeader(title: initialProject ?? "Phiên mới", left: back)
+                                                                         : ("‹ Dự án", {
+                                                                             picked = nil
+                                                                             errorText = nil
+                                                                             // The next project must not show this one's rows.
+                                                                             omp = nil
+                                                                             ompError = nil
+                                                                         })
+                // Off while a session opens: a late reply would open it after the sheet is gone.
+                SheetHeader(title: initialProject ?? "Phiên mới", left: back).disabled(opening != nil)
                 (Text(initialProject != nil ? "" : "Bước 2/2 · ") + Text("Chọn chương trình cho ") + Text(p).bold())
                     .stepCaption()
                 options(Self.harnesses) { h in

@@ -10,10 +10,12 @@ struct HomeData: Decodable {
     var accounts: [QuotaAccount] = []
     var totals: HomeTotals?
     var projects: [HomeProject] = []
+    /// The box's omp format check; nil on an older server.
+    var omp: HomeOmp?
 
     init() {}
 
-    private enum K: String, CodingKey { case generatedAt, box, accounts, totals, projects }
+    private enum K: String, CodingKey { case generatedAt, box, accounts, totals, projects, omp }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: K.self)
         generatedAt = c.date(.generatedAt)
@@ -22,6 +24,17 @@ struct HomeData: Decodable {
         accounts = all.filter { !$0.harness.isEmpty }
         totals = c.value(.totals)
         projects = c.list(.projects)
+        omp = c.value(.omp)
+    }
+}
+
+/// `omp: {version, formatOk, reason}`; formatOk nil = not reported.
+struct HomeOmp: Decodable {
+    var formatOk: Bool?
+
+    private enum K: String, CodingKey { case formatOk }
+    init(from decoder: Decoder) throws {
+        formatOk = try decoder.container(keyedBy: K.self).value(.formatOk)
     }
 }
 
@@ -779,12 +792,19 @@ enum HomeLogic {
     /// ordinary error, worded by the caller.
     static func stagingFailure(status: Int, code: String?) -> String? {
         if code == "no_instabox_key" { return "Box chưa có API key instabox" }
+        if code == "no_staging_box" { return "Dự án này chưa có máy staging" }
         if code == "unknown_project" { return "Dự án này không có trên box." }
         if [404, 405, 501].contains(status) { return "Máy chủ chưa hỗ trợ, cập nhật máy chủ trước." }
         return nil
     }
 
     // MARK: Recent omp sessions
+
+    /// Home banner when the box found an omp session format it does not know; nil otherwise
+    /// (missing or malformed `omp` = no banner).
+    static func ompFormatBanner(_ home: HomeData?) -> String? {
+        home?.omp?.formatOk == false ? "omp vừa đổi định dạng phiên — nhắn Claude để cập nhật FCode" : nil
+    }
 
     static func ompTitle(_ title: String) -> String {
         let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1094,6 +1114,22 @@ enum HomeLogic {
         eq("staging no key 4xx", stagingFailure(status: 400, code: "no_instabox_key"), "Box chưa có API key instabox")
         eq("staging old server", stagingFailure(status: 404, code: "not_found"), "Máy chủ chưa hỗ trợ, cập nhật máy chủ trước.")
         eq("staging other", stagingFailure(status: 500, code: "error") == nil, true)
+        eq("staging no box", stagingFailure(status: 404, code: "no_staging_box"), "Dự án này chưa có máy staging")
+
+        // omp format banner
+        func banner(_ json: String) -> String? {
+            ompFormatBanner(try? JSONDecoder().decode(HomeData.self, from: Data(json.utf8)))
+        }
+        let ompBanner = "omp vừa đổi định dạng phiên — nhắn Claude để cập nhật FCode"
+        eq("omp banner off", banner("{\"omp\":{\"version\":\"13.1\",\"formatOk\":false,\"reason\":\"version 4\"}}"), ompBanner)
+        eq("omp banner ok", banner("{\"omp\":{\"version\":\"13.1\",\"formatOk\":true}}") == nil, true)
+        eq("omp banner missing", banner("{}") == nil, true)
+        eq("omp banner null", banner("{\"omp\":null}") == nil, true)
+        eq("omp banner no field", banner("{\"omp\":{\"version\":\"13.1\"}}") == nil, true)
+        eq("omp banner bad type", banner("{\"omp\":{\"formatOk\":\"no\"}}") == nil, true)
+        eq("omp banner broken", banner("{\"omp\":\"x\",\"projects\":[{\"name\":\"a\"}]}") == nil, true)
+        eq("omp banner keeps rest", (try? JSONDecoder().decode(HomeData.self, from: Data("{\"omp\":\"x\",\"projects\":[{\"name\":\"a\"}]}".utf8)))?.projects.count, 1)
+        eq("omp banner no data", ompFormatBanner(nil) == nil, true)
 
         // Recent omp sessions
         let ompJSON = """

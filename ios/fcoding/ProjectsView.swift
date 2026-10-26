@@ -61,6 +61,18 @@ struct ProjectsView: View {
                         .accessibilityHint("Chạm để ẩn")
                         .homeRow(top: 0, bottom: 8)
                     }
+                    if let banner = HomeLogic.ompFormatBanner(home.home) {
+                        Label(banner, systemImage: "exclamationmark.triangle")
+                            .scaledFont(14)
+                            .foregroundColor(.orangeTone)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 10)
+                            .background(Color.orangeTone.opacity(0.14), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .accessibilityElement(children: .combine)
+                            .homeRow(top: 0, bottom: 8)
+                    }
                     if let errorText = model.errorText {
                         Label(errorText, systemImage: "exclamationmark.triangle")
                             .font(.footnote)
@@ -102,7 +114,9 @@ struct ProjectsView: View {
                 }
             }
             .task(id: polling) {
-                guard polling else { return }
+                let on = polling
+                await MainActor.run { home.visible = on }
+                guard on else { return }
                 while !Task.isCancelled {
                     await home.load(app)
                     try? await Task.sleep(nanoseconds: 60_000_000_000)
