@@ -720,11 +720,14 @@ test('credentials: the clone\'s own helper chain is "empty, then gh": git asks g
 test('push destination: a global url.*.pushInsteadOf that would send the probe elsewhere is refused before anything is cloned', { skip }, () => {
   const e = world('true');
   try {
-    bare(e, 'o/r', 'ro'); // "GitHub" refuses every box/* push
+    bare(e, 'o/r', 'ro'); e.map('r'); // "GitHub" refuses every box/* push; the key alias is a local fixture too (never real GitHub SSH)
     const writable = path.join(e.root, 'wr'); bare({ ...e, gh: writable }, 'o/r'); // ...but this one takes them
     fs.writeFileSync(path.join(e.home, '.gitconfig'), `[url "${writable}/"]\n\tpushInsteadOf = https://github.com/\n`);
     const r = run(e, 'o/r', 'r');
-    assert.deepEqual([r.code, r.codes, r.detail('URL_REWRITE')], [26, ['URL_REWRITE'], 'rewrite'], r.stdout + r.stderr);
+    // the https URL is rewritten: the run is a deploy-key run from the start (no TOKEN_OK, no TOKEN_FALLBACK, no re-exec, no URL_REWRITE);
+    // what happens then is the key route's own: this remote refuses the probe push, the writable repo is never reached
+    assert.deepEqual([r.code, r.codes], [41, ['KEY_NEW', 'ALIAS_ADDED', 'READ_OK', 'CLONED', 'HOOK_OK', 'SSH_DETAIL', 'PUBKEY', 'NEED_WRITE']], r.stdout + r.stderr);
+    assert.ok(!r.codes.some((c) => ['TOKEN_OK', 'TOKEN_FALLBACK', 'URL_REWRITE', 'WRITE_OK', 'CFG_ADDED'].includes(c)));
     assert.deepEqual(fs.readdirSync(e.ws), []);
     assert.deepEqual(git(e, path.join(writable, 'o/r.git'), 'for-each-ref', 'refs/heads/box'), '');
     assert.equal(projects(e).r, undefined);
@@ -778,7 +781,7 @@ def fsync(fd):
 def replace(a, b, *x, **k):
     r = _replace(a, b, *x, **k)
     if mode == 'hang':
-        open(mark, 'w').close(); time.sleep(5)
+        open(mark, 'w').write(str(os.getpid())); time.sleep(float(os.environ.get('SC_HANG', '5')))
     return r
 os.fsync = fsync; os.replace = replace
 `);
@@ -866,5 +869,119 @@ test('credentials: a failed write of the repo\'s helper chain fails the add and 
     assert.equal(fs.existsSync(path.join(e.ws, 'r')), false);
     assert.equal(projects(e).r, undefined);
     tmpClean(e);
+  } finally { done(e); }
+});
+
+// ======================= round 4: atomic reservation of the target, escalation to KILL =======================
+const realTool = (cmd) => spawnSync('bash', ['-c', `command -v ${cmd}`], { encoding: 'utf8' }).stdout.trim();
+const wrapper = (e, cmd, body) => fs.writeFileSync(path.join(e.bin, cmd), `#!/bin/bash\n${body}\nexec ${realTool(cmd)} "$@"\n`, { mode: 0o755 });
+// the wrapper acts only when the LAST argument is the target folder (<FCODE_WORKSPACE>/<name>); every other mkdir (ws, sshdir, hooks) is untouched
+const onTarget = (e, name, body) => wrapper(e, 'mkdir', `if [ "\${@: -1}" = "\${FCODE_WORKSPACE}/${name}" ]; then\n${body}\nfi`);
+// terminated = gone, or a zombie (state Z in /proc/<pid>/stat): a killed process whose parent is gone may stay a zombie when the box has no reaping init
+const terminated = (pid) => {
+  try {
+    const st = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return st.slice(st.lastIndexOf(')') + 2, st.lastIndexOf(')') + 3) === 'Z';
+  } catch { return true; }
+};
+
+test('reservation: a failed clone leaves nothing (key route, and token route after its fallback)', { skip }, () => {
+  for (const push of ['false', 'true']) {
+    const e = world(push);
+    try {
+      bare(e, 'o/r'); e.map('r');
+      // a clone that dies half way: it leaves a .git and a file in the target, exit 128
+      wrapper(e, 'git', 'for a in "$@"; do if [ "$a" = clone ]; then t="${@: -1}"; mkdir -p "$t/.git"; echo x > "$t/file"; echo "fatal: injected clone failure" >&2; exit 128; fi; done');
+      const r = run(e, 'o/r', 'r');
+      const want = push === 'false' ? ['KEY_NEW', 'ALIAS_ADDED', 'READ_OK', 'CLONE_FAIL'] : ['TOKEN_OK', 'READ_OK', 'TOKEN_FALLBACK', 'KEY_NEW', 'ALIAS_ADDED', 'READ_OK', 'CLONE_FAIL'];
+      assert.deepEqual([r.code, r.codes], [12, want], r.stdout + r.stderr);
+      assert.match(r.detail('CLONE_FAIL'), /injected clone failure/);
+      assert.deepEqual(fs.readdirSync(e.ws), [], 'the half clone is gone');
+      assert.equal(projects(e).r, undefined);
+      tmpClean(e);
+    } finally { done(e); }
+  }
+});
+
+test('reservation: a TERM during the clone removes the folder (exit 143)', { skip }, async () => {
+  const e = world('false');
+  try {
+    bare(e, 'o/r'); e.map('r');
+    const marker = path.join(e.root, 'in-clone');
+    wrapper(e, 'git', `for a in "$@"; do if [ "$a" = clone ]; then mkdir -p "\${@: -1}/.git"; touch ${marker}; exec sleep 60; fi; done`);
+    const p = spawn('bash', [SCRIPT, 'o/r', 'r'], { env: scriptEnv(e), stdio: 'ignore', detached: true });
+    const exited = new Promise((resolve) => p.on('close', (code, sig) => resolve([code, sig])));
+    await until(() => fs.existsSync(marker));
+    assert.ok(fs.existsSync(path.join(e.ws, 'r')));
+    process.kill(-p.pid, 'SIGTERM');
+    const [code] = await exited;
+    assert.equal(code, 143);
+    assert.deepEqual(fs.readdirSync(e.ws), []);
+    assert.equal(projects(e).r, undefined);
+    tmpClean(e);
+  } finally { done(e); }
+});
+
+test('reservation: a workspace that cannot be written is CLONE_FAIL with the mkdir error, nothing left', { skip: skip || process.getuid?.() === 0 }, () => {
+  const e = world('false');
+  try {
+    bare(e, 'o/r'); e.map('r');
+    fs.chmodSync(e.ws, 0o500);
+    const r = run(e, 'o/r', 'r');
+    assert.deepEqual([r.code, r.codes], [12, ['CLONE_FAIL']], r.stdout + r.stderr);
+    assert.match(r.detail('CLONE_FAIL'), /Permission denied/);
+    fs.chmodSync(e.ws, 0o700);
+    assert.deepEqual(fs.readdirSync(e.ws), []);
+    assert.equal(projects(e).r, undefined);
+    tmpClean(e);
+  } finally { try { fs.chmodSync(e.ws, 0o700); } catch {} done(e); }
+});
+
+test('reservation: someone else creating the target in the same instant is DIR_EXISTS, and their files are never touched', { skip }, () => {
+  const e = world('true');
+  try {
+    bare(e, 'o/r');
+    // the other one wins the race between the existence check and our mkdir
+    onTarget(e, 'r', `/bin/mkdir -p "\${@: -1}"; echo keep > "\${@: -1}/other"`);
+    const r = run(e, 'o/r', 'r');
+    assert.deepEqual([r.code, r.codes], [11, ['DIR_EXISTS']], r.stdout + r.stderr);
+    assert.equal(fs.readFileSync(path.join(e.ws, 'r', 'other'), 'utf8'), 'keep\n');
+    assert.equal(projects(e).r, undefined);
+    tmpClean(e);
+  } finally { done(e); }
+});
+
+test('reservation: a TERM that lands between mkdir and "owned" is held, then honoured: folder removed, exit 143', { skip }, () => {
+  const e = world('true');
+  try {
+    bare(e, 'o/r');
+    // mkdir succeeds, the TERM hits the script before mkdir returns to it
+    onTarget(e, 'r', `/bin/mkdir "\${@: -1}"; st=$?; kill -TERM $PPID; exit $st`);
+    const r = run(e, 'o/r', 'r');
+    assert.equal(r.code, 143, r.stdout + r.stderr);
+    assert.deepEqual(fs.readdirSync(e.ws), [], 'the reserved folder is not left behind');
+    assert.equal(projects(e).r, undefined);
+    tmpClean(e);
+  } finally { done(e); }
+});
+
+test('escalation (script): under timeout --kill-after a TERM ignored during the registration step ends in KILL for the whole group; the project stays registered', { skip }, async () => {
+  const e = world('true');
+  try {
+    bare(e, 'o/r');
+    const env = { ...scriptEnv(e), ...faulty(e, 'hang'), SC_HANG: '10' };
+    const p = spawn('timeout', ['--kill-after=2', '60', 'bash', SCRIPT, 'o/r', 'r'], { env, stdio: 'ignore', detached: true });
+    const exited = new Promise((resolve) => p.on('close', (code, sig) => resolve([code, sig])));
+    await until(() => fs.existsSync(env.SC_MARK) && fs.readFileSync(env.SC_MARK, 'utf8').length > 0);
+    const pyPid = Number(fs.readFileSync(env.SC_MARK, 'utf8'));
+    const t0 = Date.now();
+    process.kill(-p.pid, 'SIGTERM'); // bash and python both ignore it (registration step); timeout arms its KILL
+    const [code, sig] = await exited;
+    const took = Date.now() - t0;
+    assert.ok(code === 137 || sig === 'SIGKILL', `ended by KILL (code ${code}, signal ${sig})`);
+    assert.ok(took < 4500, `within kill-after + slack (${took} ms)`);
+    await until(() => terminated(pyPid), 3000);
+    assert.equal(projects(e).r, path.join(e.ws, 'r'));
+    assert.ok(fs.existsSync(path.join(e.ws, 'r', '.git')));
   } finally { done(e); }
 });

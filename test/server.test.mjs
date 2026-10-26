@@ -3790,6 +3790,12 @@ if (plan.addProject) {
   c.projects[argv[1]] = plan.addProject; fs.writeFileSync(f + '.tmp', JSON.stringify(c), { mode: 0o600 }); fs.renameSync(f + '.tmp', f);
 }
 if (plan.child) { const k = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }); fs.writeFileSync(path.join(dir, 'child.pid'), String(k.pid)); }
+if (plan.ignoreTerm) {
+  process.on('SIGTERM', () => {});
+  const gsrc = "process.on('SIGTERM',()=>{});require('fs').writeFileSync(" + JSON.stringify(path.join(dir, 'ready-grand')) + ",String(process.pid));setInterval(()=>{},1000)";
+  spawn(process.execPath, ['-e', gsrc], { stdio: 'ignore' });
+  fs.writeFileSync(path.join(dir, 'ready-fake'), String(process.pid)); // after the handler above
+}
 setTimeout(() => process.exit(plan.exit ?? 0), plan.sleep ?? 0);
 `;
 const ADD_PUB = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl fcode-o/r';
@@ -4298,17 +4304,18 @@ test('add project: ended jobs are pruned on every submit, and at most 50 are kep
   assert.ok(c.app.stats().addJobs <= 2, `kept ${c.app.stats().addJobs}`); // only the new one (and, maybe, a job still ending)
 }));
 // the job's deadline and the server's stop, on a real server process (POSIX: process groups and timeout(1))
-async function addServerProc(fn, { timeoutMs = 2500 } = {}) {
+async function addServerProc(fn, { timeoutMs = 2500, plan = { sleep: 120e3, child: true }, killAfter } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-addp-'));
   fs.writeFileSync(path.join(dir, 'fake-add.mjs'), ADD_FAKE_SRC);
-  fs.writeFileSync(path.join(dir, 'plan.json'), JSON.stringify({ sleep: 120e3, child: true }));
+  fs.writeFileSync(path.join(dir, 'plan.json'), JSON.stringify(plan));
   const c0 = await freshDir();
   const port = await freePort();
   const child = spawn(process.execPath, [SERVER], { stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, PC_CONFIG_DIR: c0.configDir, PC_PORT: String(port), PC_ADD_TIMEOUT_MS: String(timeoutMs), PC_ADD_SCRIPT: JSON.stringify([process.execPath, path.join(dir, 'fake-add.mjs'), dir]) } });
+    env: { ...process.env, PC_CONFIG_DIR: c0.configDir, PC_PORT: String(port), PC_ADD_TIMEOUT_MS: String(timeoutMs), ...(killAfter && { PC_ADD_KILL_AFTER_S: String(killAfter) }), PC_ADD_SCRIPT: JSON.stringify([process.execPath, path.join(dir, 'fake-add.mjs'), dir]) } });
   const listening = new Promise((resolve) => child.stdout.on('data', (d) => { if (String(d).includes('fcoding listening')) resolve(); }));
   const exited = new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })));
   const pids = () => { try { return Number(fs.readFileSync(path.join(dir, 'child.pid'), 'utf8')); } catch { return 0; } };
+  const pidOf = (f) => { try { return Number(fs.readFileSync(path.join(dir, f), 'utf8')) || 0; } catch { return 0; } };
   try {
     await listening;
     const p = await adminRequest(c0.configDir, { cmd: 'pair', name: 't' });
@@ -4316,11 +4323,14 @@ async function addServerProc(fn, { timeoutMs = 2500 } = {}) {
     const cookie = login.headers['set-cookie'][0].split(';')[0];
     const post = await request(port, 'POST', '/api/projects', { cookie, body: { repo: 'o/r' } });
     assert.equal(post.status, 202, post.text);
-    const grand = await waitFor(() => pids());
+    let grand, fake;
+    if (plan.ignoreTerm) { // each process says it is ready only after its own SIGTERM handler is in place; no signal before both did
+      fake = await waitFor(() => pidOf('ready-fake')); grand = await waitFor(() => pidOf('ready-grand'));
+    } else grand = await waitFor(() => pids());
     assert.ok(alive(grand));
-    await fn({ child, exited, grand, pid: child.pid, cookie, port });
+    await fn({ child, exited, grand, fake, pid: child.pid, cookie, port });
   } finally {
-    try { process.kill(pids(), 'SIGKILL'); } catch {}
+    for (const pid of [pids(), pidOf('ready-fake'), pidOf('ready-grand')]) if (pid) { try { process.kill(pid, 'SIGKILL'); } catch {} }
     try { child.kill('SIGKILL'); } catch {}
     await exited;
     fs.rmSync(c0.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
@@ -4346,3 +4356,29 @@ test('add project: a stop of the service (SIGTERM, SIGINT) ends the running job 
     }, { timeoutMs: 600e3 });
   }
 });
+
+// timeout(1) --kill-after is load-bearing: a job that ignores TERM (and a grandchild that does too) must still die within the bound.
+// "dead" = gone or a zombie (a killed process may stay a zombie when the box has no reaping init)
+const terminatedPid = (pid) => {
+  try {
+    const st = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return st.slice(st.lastIndexOf(')') + 2, st.lastIndexOf(')') + 3) === 'Z';
+  } catch { return true; }
+};
+const addPosix = { skip: process.platform !== 'linux' && 'needs Linux (timeout(1), /proc)' };
+
+test('escalation (server): a job and a grandchild that ignore TERM are killed by timeout --kill-after after a server crash', addPosix, () => addServerProc(async ({ child, exited, fake, grand }) => {
+  const t0 = Date.now();
+  child.kill('SIGKILL'); // a crash: only timeout(1) is left to enforce the deadline
+  await exited;
+  await waitFor(() => terminatedPid(fake) && terminatedPid(grand), 2500 + 2000 + 2000 + 1500); // deadline 2.5 s + kill-after 2 s + 2 s
+  assert.ok(Date.now() - t0 >= 2000, 'not before the deadline'); // they ignored TERM: it took the deadline's TERM and then the KILL
+}, { timeoutMs: 2500, killAfter: 2, plan: { sleep: 120e3, ignoreTerm: true } }));
+
+test('escalation (server): a stop of the service forwards TERM through timeout(1) and its kill-after kills a job that ignores it, the server exits 0', addPosix, () => addServerProc(async ({ child, exited, fake, grand }) => {
+  child.kill('SIGTERM');
+  const r = await Promise.race([exited, new Promise((x) => setTimeout(x, 8000, 'hung'))]);
+  assert.notEqual(r, 'hung', 'the server did not exit');
+  assert.equal(r.code, 0);
+  await waitFor(() => terminatedPid(fake) && terminatedPid(grand), 2000 + 2000 + 1000); // kill-after 2 s + 2 s
+}, { timeoutMs: 600e3, killAfter: 2, plan: { sleep: 120e3, ignoreTerm: true } }));
