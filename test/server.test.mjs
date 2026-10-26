@@ -4382,3 +4382,15 @@ test('escalation (server): a stop of the service forwards TERM through timeout(1
   assert.equal(r.code, 0);
   await waitFor(() => terminatedPid(fake) && terminatedPid(grand), 2000 + 2000 + 1000); // kill-after 2 s + 2 s
 }, { timeoutMs: 600e3, killAfter: 2, plan: { sleep: 120e3, ignoreTerm: true } }));
+
+test('add project: after a normal TIMEOUT close no late SIGKILL is sent (the kill-grace timer is cleared when the job is gone)', () => addApp(async (c) => {
+  const kills = []; const orig = process.kill;
+  process.kill = (pid, sig) => { if (sig === 'SIGKILL') kills.push(pid); return orig.call(process, pid, sig); };
+  try {
+    c.plan({ sleep: 60e3 });
+    const j = await c.jobEnd((await c.add({ repo: 'o/r' })).json.job);
+    assert.equal(j.code, 'TIMEOUT');
+    await new Promise((r) => setTimeout(r, 2000)); // far past the 600 ms grace
+    assert.deepEqual(kills, [], 'a SIGKILL went to a group that was already gone');
+  } finally { process.kill = orig; }
+}, { addTimeoutMs: 300, addKillGraceMs: 600 }));

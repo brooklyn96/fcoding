@@ -197,13 +197,15 @@ fi
 # 1a. DAT CHO thu muc dich bang 1 lenh mkdir nguyen tu (khong -p: that bai neu da co): tu luc mkdir thanh cong thu muc la CUA lan chay nay (owned=1),
 # va cleanup / fallback xoa no o moi duong thoat truoc khi project duoc ghi (clone hong, bi tat giua chung, loi hook...). Tin hieu TERM/INT/HUP
 # bi hoan lai qua mkdir -> owned=1 (bash chi chay trap sau khi lenh dang chay xong) roi xu ly ngay sau do: khong bao gio de mot thu muc moi tao
-# ma khong ai so huu. Thu muc cha: mkdir -p "$ws" rieng (khong thuoc ten nay).
+# ma khong ai so huu. Tien trinh con mkdir chay voi TERM/INT/HUP bi BO QUA (SIG_IGN song sot qua exec; chi trong tien trinh con): mot tin hieu
+# gui cho ca nhom khong giet duoc mkdir giua luc mkdir(2) da xong va luc ta biet ket qua. Thu muc cha: mkdir -p "$ws" rieng (khong thuoc ten nay).
 sig=
 trap 'sig=1' TERM INT HUP
 mkdir -p "$ws" 2>/dev/null
-if ! mkdir "$dir" 2>"$err"; then
+if ! ( trap '' TERM INT HUP; exec mkdir "$dir" ) 2>"$err"; then
   trap 'cleanup; exit 143' TERM INT HUP
-  if [ -e "$dir" ]; then say DIR_EXISTS exists; exit 11; fi    # ai do vua tao ra cung luc: khong dung vao
+  [ -z "$sig" ] || exit 143                                    # co tin hieu trong luc do: dung, khong dung vao thu muc (owned=0)
+  if [ -e "$dir" ] || [ -L "$dir" ]; then say DIR_EXISTS exists; exit 11; fi    # ai do vua tao ra (ca lien ket treo) cung luc: khong dung vao
   say CLONE_FAIL "$(clean <"$err")"; exit 12
 fi
 owned=1

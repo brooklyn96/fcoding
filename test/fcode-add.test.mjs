@@ -985,3 +985,63 @@ test('escalation (script): under timeout --kill-after a TERM ignored during the 
     assert.ok(fs.existsSync(path.join(e.ws, 'r', '.git')));
   } finally { done(e); }
 });
+
+// ======================= round 5: the reservation mkdir cannot be killed by a group signal =======================
+test('reservation: a TERM at the instant mkdir finishes (to the script and to mkdir itself, or to the whole group) cannot kill the mkdir: folder removed, exit 143, never DIR_EXISTS', { skip }, async () => {
+  // 1. TERM to the script and to the mkdir process itself (the mkdir child runs with TERM ignored, so it still finishes)
+  let e = world('true');
+  try {
+    bare(e, 'o/r');
+    onTarget(e, 'r', `/bin/mkdir "\${@: -1}"; st=$?; kill -TERM $PPID; kill -TERM $$; exit $st`);
+    const r = run(e, 'o/r', 'r');
+    assert.equal(r.code, 143, r.stdout + r.stderr);
+    assert.ok(!r.codes.includes('DIR_EXISTS'));
+    assert.deepEqual(fs.readdirSync(e.ws), [], 'the reserved folder is not left behind');
+    assert.equal(projects(e).r, undefined);
+    tmpClean(e);
+  } finally { done(e); }
+  // 2. TERM to the whole process group (what timeout(1) and the server's close() send)
+  e = world('true');
+  try {
+    bare(e, 'o/r');
+    onTarget(e, 'r', `/bin/mkdir "\${@: -1}"; st=$?; kill -TERM -- -$PPID; exit $st`); // the script leads its own group (spawned detached)
+    const p = spawn('bash', [SCRIPT, 'o/r', 'r'], { env: scriptEnv(e), stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    let out = ''; p.stdout.on('data', (d) => { out += d; });
+    const [code] = await new Promise((resolve) => p.on('close', (c, sig) => resolve([c, sig])));
+    assert.equal(code, 143, out);
+    assert.ok(!out.includes('DIR_EXISTS'));
+    assert.deepEqual(fs.readdirSync(e.ws), []);
+    assert.equal(projects(e).r, undefined);
+    tmpClean(e);
+  } finally { done(e); }
+});
+
+test('reservation: a dangling symlink put at the target in the same instant is DIR_EXISTS and is left alone', { skip }, () => {
+  const e = world('true');
+  try {
+    bare(e, 'o/r');
+    const missing = path.join(e.root, 'no-such-place'); // a path that really is not there (/nonexistent exists on some boxes)
+    onTarget(e, 'r', `ln -s ${missing} "\${@: -1}"`);
+    const r = run(e, 'o/r', 'r');
+    assert.deepEqual([r.code, r.codes], [11, ['DIR_EXISTS']], r.stdout + r.stderr);
+    assert.equal(fs.readlinkSync(path.join(e.ws, 'r')), missing);
+    assert.deepEqual(fs.readdirSync(e.ws), ['r']);
+    assert.equal(projects(e).r, undefined);
+    tmpClean(e);
+  } finally { done(e); }
+});
+
+test('push destination: when BOTH the https URL and the key alias are rewritten the switch to the key route ends in URL_REWRITE (26), before any key is made', { skip }, () => {
+  const e = world('true');
+  try {
+    bare(e, 'o/r'); e.map('r');
+    const other = path.join(e.root, 'elsewhere');
+    fs.writeFileSync(path.join(e.home, '.gitconfig'), `[url "${other}/a/"]\n\tpushInsteadOf = https://github.com/\n[url "${other}/b/"]\n\tinsteadOf = git@github-r:\n`);
+    const r = run(e, 'o/r', 'r');
+    assert.deepEqual([r.code, r.codes, r.detail('URL_REWRITE')], [26, ['URL_REWRITE'], 'rewrite'], r.stdout + r.stderr);
+    assert.deepEqual(fs.readdirSync(e.ws), []);
+    assert.equal(fs.existsSync(path.join(e.ssh, 'id_ed25519_r')), false, 'no key was made');
+    assert.equal(projects(e).r, undefined);
+    tmpClean(e);
+  } finally { done(e); }
+});

@@ -1433,7 +1433,7 @@ export function createApp(opts = {}) {
   const addSpec = specOf(opts.addScript ?? process.env.PC_ADD_SCRIPT ?? ['bash', [ADD_SCRIPT, ADD_SCRIPT_DEV].find((f) => fs.existsSync(f)) ?? ADD_SCRIPT]);
   const addTimeout = opts.addTimeoutMs ?? (Number(process.env.PC_ADD_TIMEOUT_MS) || ADD_TIMEOUT_MS);
   // on Linux the script runs under timeout(1): the deadline then holds on its own even when this server is gone (a crash, or a restart that
-  // leaves the job alone: install.sh uses KillMode=process); a graceful stop ends the jobs through close(). 124 / 137 map to TIMEOUT.
+  // leaves the job alone: install.sh uses KillMode=process); a graceful stop ends the jobs through close(). 124 maps to TIMEOUT; a kill-after kill ends as a signal.
   const addKillAfter = Number(process.env.PC_ADD_KILL_AFTER_S) || ADD_KILL_AFTER_S; // test-only override, like PC_ADD_TIMEOUT_MS
   const addWrap = process.platform === 'win32' ? [] : ['timeout', `--kill-after=${addKillAfter}`, String(addTimeout / 1000)];
   const addJobs = new Map(); // id -> job
@@ -1471,11 +1471,11 @@ export function createApp(opts = {}) {
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (c) => { if (out.length < ADD_OUT_MAX) out += c; });
     child.on('error', () => finish({ state: 'failed', code: 'FAILED' }));
-    child.on('close', (code) => finish(addOutcome(code, out)));
+    child.on('close', (code) => { clearTimeout(grace); finish(addOutcome(code, out)); }); // the job is gone: no late SIGKILL to a group id that may be reused
     timer = setTimeout(() => {
       finish({ state: 'failed', code: 'TIMEOUT' });
       killGroup('SIGTERM'); // the script cleans up its clone on TERM; on Linux timeout(1) kills what is left at +30 s, this backstop only at +45 s
-      grace = setTimeout(() => killGroup('SIGKILL'), ADD_KILL_GRACE_MS);
+      grace = setTimeout(() => killGroup('SIGKILL'), opts.addKillGraceMs ?? ADD_KILL_GRACE_MS); // opts.addKillGraceMs: tests
       grace.unref();
     }, addTimeout);
     addStops.add(abort);
