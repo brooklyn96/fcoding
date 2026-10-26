@@ -18,6 +18,14 @@ const COOKIE_MAX_AGE = 30 * 24 * 3600;
 const BODY_LIMIT = 64 * 1024;
 const TEXT_LIMIT = 32 * 1024;
 const LONG_TEXT = 500; // bytes; longer single lines are pasted, not typed
+// v1.3.3 image upload (CONTRACT A12): POST /api/projects/<name>/upload. Content-Type -> file extension and the magic bytes the body must start with
+const UPLOAD_LIMIT = 10 * 1024 * 1024;
+const UPLOAD_KEEP_MS = 7 * 24 * 3600e3; // a file in .fcode/uploads older than this is deleted by the next upload
+const UPLOAD_NAME_RE = /^\d{8}-\d{6}-[0-9a-f]{6}\.(?:jpg|png)$/;
+const UPLOAD_TYPES = new Map([
+  ['image/jpeg', { ext: 'jpg', magic: Buffer.from([0xff, 0xd8, 0xff]) }],
+  ['image/png', { ext: 'png', magic: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) }],
+]);
 const PAIR_TTL = 120 * 1000, PAIR_ATTEMPTS = 5, PAIR_PENDING = 3;
 const PAIR_PER_MINUTE = 10, PAIR_MINUTE = 60 * 1000, PAIR_PER_HOUR = 30, PAIR_HOUR = 3600 * 1000;
 const MAX_STREAMS = 50;
@@ -1437,13 +1445,17 @@ export function createApp(opts = {}) {
     } catch { end('cannot start'); }
   }
 
+  // bracketed paste into the session's input (tmux buffer "pc"); runs inside a mutation job
+  async function pasteText(name, text, ctx) {
+    await run(ctx, ['load-buffer', '-b', 'pc', '-'], text);
+    try { await run(ctx, ['paste-buffer', '-p', '-d', '-b', 'pc', '-t', pane(name)]); }
+    catch (e) { await run(ctx, ['delete-buffer', '-b', 'pc']).catch(() => {}); throw e; }
+  }
   // runs inside a mutation job; every step re-checks through run(ctx)
   async function sendText(name, text, enter, ctx) {
     text = text.replace(/\r\n?/g, '\n');
     if (text && (text.includes('\n') || Buffer.byteLength(text) > LONG_TEXT)) {
-      await run(ctx, ['load-buffer', '-b', 'pc', '-'], text);
-      try { await run(ctx, ['paste-buffer', '-p', '-d', '-b', 'pc', '-t', pane(name)]); }
-      catch (e) { await run(ctx, ['delete-buffer', '-b', 'pc']).catch(() => {}); throw e; }
+      await pasteText(name, text, ctx);
       if (enter && pasteEnterDelay) await sleep(pasteEnterDelay);
     } else if (text) {
       // tmux's argv parser treats a trailing ";" as a command separator and "\;" as a literal ";":
@@ -1740,6 +1752,101 @@ export function createApp(opts = {}) {
   }
   const validName = (n) => typeof n === 'string' && NAME_RE.test(n);
 
+  // --- POST /api/projects/<name>/upload?session=<name> (CONTRACT A12) ---
+  // the raw body, at most UPLOAD_LIMIT bytes: past it the 413 is answered at once and the rest is read and thrown away (never kept; destroyed at 16x)
+  function readUpload(req) {
+    return new Promise((resolve, reject) => {
+      const declared = req.headers['content-length'];
+      if (declared !== undefined && Number(declared) > UPLOAD_LIMIT) return reject(new HttpErr(413, 'too_big'));
+      const chunks = []; let size = 0, over = false;
+      req.on('data', (c) => {
+        size += c.length;
+        if (over) { if (size > 16 * UPLOAD_LIMIT) req.destroy(); return; }
+        if (size > UPLOAD_LIMIT) { over = true; chunks.length = 0; reject(new HttpErr(413, 'too_big')); return; }
+        chunks.push(c);
+      });
+      req.on('end', () => resolve(Buffer.concat(chunks)));
+      req.on('error', () => reject(new HttpErr(400, 'invalid')));
+      req.on('close', () => reject(new HttpErr(499, 'cancelled'))); // no-op once settled
+    });
+  }
+  // best effort: `/.fcode/` once in the work tree's own info/exclude (never .gitignore); one at a time so two uploads cannot both add it
+  let excludeChain = Promise.resolve();
+  const hideFromGit = (dir) => (excludeChain = excludeChain.then(async () => {
+    try {
+      const out = await execTool(gitSpec, ['-C', dir, '-c', 'core.fsmonitor=false', 'rev-parse', '--is-inside-work-tree', '--git-path', 'info/exclude'], 5000);
+      const [inside, rel] = out.split('\n');
+      if (inside.trim() !== 'true' || !rel) return;
+      const file = path.resolve(dir, rel.trim());
+      let text = '';
+      try { text = await fs.promises.readFile(file, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') return; }
+      if (text.split(/\r?\n/).some((l) => l.trim() === '/.fcode/')) return;
+      await fs.promises.mkdir(path.dirname(file), { recursive: true });
+      await fs.promises.appendFile(file, `${text && !text.endsWith('\n') ? '\n' : ''}/.fcode/\n`);
+    } catch {} // not a git work tree, or no git: nothing to hide
+  }));
+  // regular files named like our uploads and older than UPLOAD_KEEP_MS; anything else in the folder is left alone
+  async function sweepUploads(up) {
+    try {
+      for (const e of await fs.promises.readdir(up, { withFileTypes: true })) {
+        if (!e.isFile() || !UPLOAD_NAME_RE.test(e.name)) continue;
+        const f = path.join(up, e.name);
+        if (now() - (await fs.promises.lstat(f)).mtimeMs > UPLOAD_KEEP_MS) await fs.promises.unlink(f);
+      }
+    } catch {}
+  }
+  // the absolute path ALONE into the session's input, never Enter. claude, omp and unknown: bracketed paste; codex: one send-keys -l (a paste stays text there).
+  // A path with whitespace or a quote is not attached. true only after tmux answered 0.
+  async function attachPath(session, agent, file, ctx) {
+    if (/[\s'"]/.test(file)) return false;
+    try {
+      await mutate(ctx, () => (agent === 'codex' ? run(ctx, ['send-keys', '-t', pane(session), '-l', '--', file]) : pasteText(session, file, ctx)));
+      return true;
+    } catch (e) {
+      if (gateStop(e)) throw e;
+      return false;
+    }
+  }
+  async function upload(req, res, url, ctx, rawName) {
+    if (req.method !== 'POST') throw new HttpErr(405, 'method');
+    let project = '';
+    try { project = decodeURIComponent(rawName); } catch {}
+    const dir = validProject(project) ? cfg.projects[project] : null;
+    if (!dir || !(await fs.promises.stat(dir).then((s) => s.isDirectory(), () => false))) throw new HttpErr(404, 'no_project');
+    const type = UPLOAD_TYPES.get((req.headers['content-type'] || '').split(';')[0].trim().toLowerCase());
+    if (!type) throw new HttpErr(415, 'bad_type');
+    const session = url.searchParams.get('session'); // checked before anything is written
+    let agent = null;
+    if (session !== null) {
+      const s = (await listSessions(ctx)).find((x) => x.name === session && x.project === project);
+      if (!s) throw new HttpErr(404, 'no_session');
+      agent = s.harness;
+    }
+    const buf = await readUpload(req);
+    if (!valid(ctx)) throw gateErr(ctx);
+    if (!buf.length) throw new HttpErr(400, 'empty');
+    if (!buf.subarray(0, type.magic.length).equals(type.magic)) throw new HttpErr(415, 'bad_type');
+    await hideFromGit(dir);
+    const up = path.join(dir, '.fcode', 'uploads');
+    const stamp = new Date(now()).toISOString().replace(/[-:]/g, '').slice(0, 15).replace('T', '-'); // UTC: YYYYMMDD-HHMMSS
+    let file;
+    try {
+      for (const d of [path.dirname(up), up]) { // one level at a time: a symlink in place of either is refused before anything is made through it
+        await fs.promises.mkdir(d, { recursive: true, mode: 0o700 });
+        if (!(await fs.promises.lstat(d)).isDirectory()) throw new Error('not a directory');
+      }
+      let fh;
+      for (let i = 0; !fh; i++) {
+        file = path.join(up, `${stamp}-${crypto.randomBytes(3).toString('hex')}.${type.ext}`);
+        try { fh = await fs.promises.open(file, 'wx', 0o600); } catch (e) { if (e.code !== 'EEXIST' || i >= 4) throw e; }
+      }
+      try { await fh.writeFile(buf); } catch (e) { await fh.close(); await fs.promises.unlink(file).catch(() => {}); throw e; }
+      await fh.close();
+    } catch { throw new HttpErr(500, 'storage'); }
+    await sweepUploads(up);
+    return json(res, 200, { path: file, attached: session === null ? false : await attachPath(session, agent, file, ctx) });
+  }
+
   // --- SSE ---
   let streams = 0;
   async function stream(req, res, name, lines, ctx, ansi) {
@@ -1830,6 +1937,8 @@ export function createApp(opts = {}) {
       if (!valid(ctx)) throw new HttpErr(401, 'unauthorized');
     }
     if (!isApi) throw new HttpErr(404, 'not_found');
+    const um = /^\/api\/projects\/([^/]+)\/upload$/.exec(pathname); // v1.3.3: reads its own raw body, so it must come before the 64 KB JSON readBody below
+    if (um) return upload(req, res, url, ctx, um[1]);
     if (isPair) { // counted before the body: oversized, slow and invalid bodies use up the quota too
       if (method !== 'POST') throw new HttpErr(405, 'method');
       const wait = pairLimited(now());
