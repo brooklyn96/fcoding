@@ -32,7 +32,7 @@ $wanted = 'Test-WinPath', 'Resolve-OmpPath', 'Get-OmpUnder', 'Join-OmpName', 'Ge
   'Copy-OmpSession', 'Get-OmpBlobRefs', 'Get-OmpBlobIndex', 'Get-PhienLocalScan', 'Compare-PhienFile', 'Get-PhienPlan', 'Install-PhienFile',
   'Install-PhienTask', 'Remove-PhienTask', 'New-PhienPartName', 'Get-PhienBoxBlobSet', 'New-PhienBatch', 'Get-PhienBatch', 'Remove-PhienNoteExclude',
   'Get-PhienDirFiles', 'Get-PhienIdOf', 'Test-PhienDeps', 'Get-PhienUnitBytes', 'Get-PhienUpstreamNotes',
-  'Add-SyncRepoConfig', 'Test-SyncFolder', 'Get-RepoKey', 'Get-GitDirOrigin', 'Find-LocalClones', 'Get-SyncDesktop'
+  'Add-SyncRepoConfig', 'Test-SyncFolder', 'Get-RepoKey', 'Get-GitDirOrigin', 'Find-LocalClones', 'Get-SyncDesktop', 'Get-FcodeAddLimitVars'
 foreach ($fn in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in $wanted }, $true)) { . ([scriptblock]::Create($fn.Extent.Text)) }
 $pyAssign = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$PhienPy' }, $true)
 Invoke-Expression $pyAssign.Extent.Text
@@ -1433,6 +1433,15 @@ T 'add r7: the box script runs under the same timeout as the server (600 s, KILL
     Ok ($sw.Elapsed.TotalSeconds -lt 60) "returned in $([int]$sw.Elapsed.TotalSeconds) s"
     Eq $r.Code 1 $r.Out; Ok ($r.Out -match "chạy quá 10 phút nên đã bị dừng \(mã $($c.Code)\)\. Chạy lại là an toàn: fcode add owner/repo repo") ("told; out: " + $r.Out)
   }
+}
+T 'add r7: the test-only limit overrides take positive integers only (0 would mean no limit for timeout)' {
+  $save = @{}; foreach ($k in 'FCODE_ADD_TIMEOUT_S', 'FCODE_ADD_KILL_AFTER_S') { $save[$k] = [Environment]::GetEnvironmentVariable($k) }
+  try {
+    foreach ($c in @(@('2', '3', "FCODE_ADD_TIMEOUT_S=2`nFCODE_ADD_KILL_AFTER_S=3`n"), @('0', '0', ''), @('00', '05', ''), @('1x', '-1', ''), @('123456', ' 2', ''), @('99999', $null, "FCODE_ADD_TIMEOUT_S=99999`n"))) {
+      [Environment]::SetEnvironmentVariable('FCODE_ADD_TIMEOUT_S', $c[0]); [Environment]::SetEnvironmentVariable('FCODE_ADD_KILL_AFTER_S', $c[1])
+      Eq (Get-FcodeAddLimitVars) $c[2] "timeout [$($c[0])] kill-after [$($c[1])]"
+    }
+  } finally { foreach ($k in $save.Keys) { [Environment]::SetEnvironmentVariable($k, $(if ($null -eq $save[$k]) { [NullString]::Value } else { $save[$k] })) } }
 }
 T 'sync r6: the 60 s `projects` deadline starts after the box is awake (a slow wake does not eat it)' {
   $w = New-World 'syn4'

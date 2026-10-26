@@ -542,6 +542,13 @@ function Invoke-BoxScript([string]$Script, [string[]]$ScriptArgs) {
 # ky tu dieu khien (ke ca xuong dong) khong bao gio duoc di vao tham so
 function Test-HasControlChar([string]$s) { $s -match '[\x00-\x1f\x7f]' }
 
+# chi de thu: FCODE_ADD_TIMEOUT_S / FCODE_ADD_KILL_AFTER_S (so nguyen duong, khong co 0: timeout 0 = khong co han) thanh bien cho $FcodeAddRun
+function Get-FcodeAddLimitVars {
+  $o = ''
+  foreach ($tv in 'FCODE_ADD_TIMEOUT_S', 'FCODE_ADD_KILL_AFTER_S') { $tx = [Environment]::GetEnvironmentVariable($tv); if ("$tx" -match '\A[1-9][0-9]{0,4}\z') { $o += "$tv=$tx`n" } }
+  $o
+}
+
 # fcode add <owner/repo> [name]: them project vao box bang script da cai tren box (token GitHub cua box, khong thi khoa SSH rieng); xem $FcodeAddRun
 # Neu GitHub chua co khoa cua box: in khoa cong khai + cac buoc, doi Enter, thu lai (toi da 3 lan).
 function Invoke-Add {
@@ -566,7 +573,7 @@ function Invoke-Add {
     try {
       # chi de thu: FCODE_ADD_SCRIPT doi duong dan script tren box; FCODE_ADD_TIMEOUT_S / FCODE_ADD_KILL_AFTER_S (chi chu so) doi han
       $run = $(if ("$env:FCODE_ADD_SCRIPT" -match '\A/[A-Za-z0-9_./-]{1,200}\z') { "FCODE_ADD_SCRIPT='$env:FCODE_ADD_SCRIPT'`n" } else { '' })
-      foreach ($tv in 'FCODE_ADD_TIMEOUT_S', 'FCODE_ADD_KILL_AFTER_S') { $tx = [Environment]::GetEnvironmentVariable($tv); if ("$tx" -match '\A[0-9]{1,5}\z') { $run += "$tv=$tx`n" } }
+      $run += Get-FcodeAddLimitVars
       $run += $FcodeAddRun
       $lines = @(Invoke-BoxScript $run @($repo, $name) 2>&1 | ForEach-Object { "$_" })
       $code = $LASTEXITCODE
@@ -668,8 +675,8 @@ function Invoke-Add {
   # chi bao "Xong" khi script thoat 0 va that su qua: doc duoc + ghi duoc repo, va da vao cau hinh
   if ($code -eq 0 -and $seen.ContainsKey('READ_OK') -and $seen.ContainsKey('WRITE_OK') -and ($seen.ContainsKey('CFG_ADDED') -or $seen.ContainsKey('CFG_EXISTS'))) { }
   elseif ($code -ne 0 -and $code -ne 30) {
-    # chi noi "chay lai la an toan" khi chay lai co the giup (mang / box bi dung giua chung / het gio); ma la: chi bao ma
-    if ($code -in 1, 12, 124, 143, 255) { Write-Host "Chưa xong (mã $code). Xem thông báo ở trên rồi chạy lại cùng lệnh, chạy lại là an toàn." } else { Write-Host "Chưa xong (mã $code). Xem thông báo ở trên." }
+    # chi noi "chay lai la an toan" khi chay lai co the giup (mang / box bi dung giua chung); 124 / 137 (qua han) da bao rieng o tren; ma la: chi bao ma
+    if ($code -in 1, 12, 143, 255) { Write-Host "Chưa xong (mã $code). Xem thông báo ở trên rồi chạy lại cùng lệnh, chạy lại là an toàn." } else { Write-Host "Chưa xong (mã $code). Xem thông báo ở trên." }
     return 1
   }
   elseif ($code -eq 0) { Write-Host "Chưa xong (mã $code). Xem thông báo ở trên rồi chạy lại cùng lệnh, chạy lại là an toàn."; return 1 }
