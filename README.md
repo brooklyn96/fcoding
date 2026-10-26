@@ -333,6 +333,37 @@ fcode new       # mở phiên mới: chọn dự án và harness (hoặc gõ 0 t
 
 Thoát bằng **Ctrl+B** rồi **D**, phiên vẫn chạy tiếp.
 
+### Đồng bộ phiên chat omp giữa laptop và box (`fcode phien`)
+
+Chat omp ở laptop và chat omp ở box nằm ở hai nơi riêng. `fcode phien` chép phiên qua lại giữa hai máy để bên nào cũng thấy phiên của bên kia ngay trong omp: danh sách `/resume`, `omp -c` (phiên mới nhất của thư mục) và `omp -r <mã>`. Phiên chép sang là phiên omp bình thường của máy nhận (omp không biết nó từ máy khác tới), nên không cần lệnh riêng để mở lại.
+
+Điều kiện: project có trong `syncRepos` của laptop (file `%USERPROFILE%\.fcode\config.json`) **và** trong danh sách project của FCode trên box (`fcode add`). Project chỉ có ở một bên thì bỏ qua. Mọi lần chép đều do laptop bắt đầu (box không với tới laptop được).
+
+```sh
+fcode phien                # đồng bộ mọi project
+fcode phien deal-sync      # chỉ một project
+fcode phien --thu          # chạy thử: chỉ liệt kê sẽ chép gì đi đâu, không chép, không ghi gì
+fcode phien tu-dong bat    # bật tự động (mỗi 10 phút, chạy ngầm, không hiện cửa sổ)
+fcode phien tu-dong tat    # tắt tự động (trangthai để xem đang bật hay tắt)
+```
+
+Gõ `fcode` rồi bấm `p` trong danh sách cũng mở menu này (đồng bộ ngay, bật hoặc tắt tự động).
+
+Luật đồng bộ (một phiên = một mã = một file `.jsonl` chỉ được nối thêm):
+
+- Phiên chỉ có ở một máy: chép sang máy kia, kèm thư mục đi kèm (nhật ký lệnh, phiên con) và các file đính kèm (blob) phiên đó dùng. Chỉ đổi đúng dòng đầu của file (thư mục làm việc `cwd` thành đường dẫn project của máy nhận); mọi byte khác giữ nguyên, giờ sửa file giữ nguyên.
+- Phiên có ở cả hai máy và một bên là phần đầu của bên kia (cùng cuộc trò chuyện, một bên đi tiếp): chép bản dài đè lên bản ngắn. Hai bản cùng độ dài thì so sha256; khác nội dung thì coi là khác nhau.
+- Hai bản đã khác nhau (không bản nào là phần đầu của bản kia): không đụng vào cả hai, chỉ báo `phiên <mã> đã khác nhau ở hai máy, giữ nguyên cả hai`.
+- Phiên vừa được ghi trong 30 giây gần nhất (đang chat) thì bỏ qua, lần sau đồng bộ tiếp. Phiên trống (chưa có tin nhắn) không chép.
+- Không bao giờ xóa gì ở cả hai máy, không đụng `agent.db` và các file dữ liệu khác của omp. Chạy lại ngay thì không chép gì thêm.
+- Trên box, phiên chép từ laptop có thêm một file nhỏ `<tên phiên>.fcode-origin` (nội dung `laptop`) để app ghi nhãn "laptop"; không ghi gì vào chính file phiên.
+- Nhớ đẩy code lên GitHub (`git push`) trước khi sang máy kia làm tiếp: phiên chỉ mang cuộc trò chuyện, không mang code.
+
+Ghi chú ở thư mục gốc project: cùng lượt đồng bộ này chép hai chiều các file `HANDOFF*.md`, `CLAUDE.md`, `AGENTS.md`, `WORKFLOW.md`, `agent_state.md`, `TASK.md`, `CLAUDE.local.md`, **chỉ khi git không theo dõi file đó ở cả hai máy** (file git đã theo dõi đi qua git, không đi qua đây). Máy nhận tự thêm tên file vào `.git/info/exclude` (không sửa `.gitignore`) để file không hiện thành thay đổi và không làm vướng việc tự cập nhật code trên box. File nào chỉ một bên sửa từ lần đồng bộ trước thì chép sang bên kia; cả hai bên cùng sửa thì giữ nguyên và báo `handoff <file> khác nhau ở hai máy, giữ nguyên cả hai`. Trạng thái nằm ở `%LOCALAPPDATA%\fcode\handoff-state.json`. File bị xóa ở một bên thì không bị xóa ở bên kia (lần sau nó được chép lại).
+
+Tự động và box nghỉ: box gói miễn phí tự nghỉ sau 30 phút không dùng, nên tự động **không** mở kết nối mỗi 10 phút. Mỗi lần nó chỉ hỏi `instabox ls` xem box có đang chạy không (không bao giờ đánh thức box), rồi chỉ đồng bộ khi có lý do: laptop có phiên hoặc ghi chú đổi từ lần chạy thành công trước, box vừa bật, lần trước có lấy dữ liệu từ box về (bạn đang làm việc bên đó), hoặc lần trước bị lỗi. Không có lý do nào thì thôi. Lý do và kết quả ghi ở `%USERPROFILE%\.fcode\phien.log`.
+
+Khi omp đổi định dạng phiên (sau khi omp cập nhật): phiên có dòng đầu không đọc được hoặc `version` lạ (hiện chỉ hiểu version 3) **không được chép** và lần chạy báo `omp đổi định dạng phiên (version X) — chưa đồng bộ, báo Claude`; phiên cũ vẫn đồng bộ bình thường. Mỗi lần chạy ghi `%LOCALAPPDATA%\fcode\phien-status.json` (giờ chạy, kết quả, số file chép, phiên lạ, phiên bản omp hai máy, ghi chú đã chép và xung đột). Menu `fcode` hiện một dòng cảnh báo vàng ở đầu khi có phiên định dạng lạ hoặc lần tự động gần nhất bị lỗi. Hai máy khác phiên bản omp thì vẫn đồng bộ phiên đúng định dạng và thêm dòng `omp laptop <a> khác box <b>`.
 ### Cài lệnh fcode trên máy Windows khác
 
 Mở **Windows PowerShell**: bấm nút **Start**, gõ `PowerShell`, bấm Enter (không cần chạy bằng quyền admin). Rồi dán đúng một dòng này và bấm Enter:

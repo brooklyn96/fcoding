@@ -36,7 +36,8 @@ $PyFile = Join-Path $Root 'phien.py'
 # --- fixtures ---
 $utf8 = New-Object Text.UTF8Encoding($false)
 $Now = ConvertTo-Epoch (Get-Date)
-function Set-Age([string]$Path, [int]$Sec) { [IO.File]::SetLastWriteTimeUtc($Path, (Get-Date).ToUniversalTime().AddSeconds(-$Sec)) }
+$AgeBase = [DateTime]::UtcNow
+function Set-Age([string]$Path, [int]$Sec) { [IO.File]::SetLastWriteTimeUtc($Path, $AgeBase.AddSeconds(-$Sec)) }   # same age = same instant (the equal-length rule compares mtimes)
 function Msg([string]$Id, [string]$Text = 'hi') { '{"type":"message","id":"' + $Id + '","parentId":null,"timestamp":"2026-10-25T16:18:29.000Z","message":{"role":"user","content":"' + $Text + '"}}' }
 # session file: line1 title, line2 header, then message lines (no model_change: omp would try to restore a model that an empty throwaway profile lacks). $Nl = line ending. keys of the header like omp (laptop order)
 function New-Sess([string]$Dir, [string]$Id, [string]$Cwd, [string[]]$Msgs, [string]$Title = 'T', [string]$Nl = "`n", [string]$Ts = '2026-10-25T16-18-25-246Z') {
@@ -193,6 +194,19 @@ T 'planner: second run with equal sides copies nothing' {
   Eq $p.Put.Count 0; Eq $p.Get.Count 0; Eq $p.Need.Count 0; Eq $p.Same 1
 }
 
+T 'equal-length bodies: sha256 decides (other content = diverged, same content = same); same length + same mtime is not hashed' {
+  $L = Join-Path $Root 'eq\L'; $B = Join-Path $Root 'eq\B'
+  [void](New-Sess $L 'eq000001' 'C:\p' @('aaa')); $b1 = New-Sess $B 'eq000001' '/d/p' @('bbb'); Set-Age $b1 601      # same length, other content, other mtime
+  [void](New-Sess $L 'eq000002' 'C:\p' @('ccc')); $b2 = New-Sess $B 'eq000002' '/d/p' @('ccc'); Set-Age $b2 700      # same content, other mtime
+  [void](New-Sess $L 'eq000003' 'C:\p' @('xxx')); [void](New-Sess $B 'eq000003' '/d/p' @('yyy'))                    # same length, same mtime: shortcut
+  $n = ConvertTo-Epoch (Get-Date)
+  $p1 = Get-PhienPlan (Get-PhienLocalScan $L) (Get-PhienLocalScan $B) 'E' @{} $L $n $n 30
+  Eq $p1.Need.Count 2 'only the two pairs with different mtimes are hashed'
+  $p2 = Get-PhienPlan (Get-PhienLocalScan $L) (Get-PhienLocalScan $B) 'E' (Get-Hashes $p1 $B 'E') $L $n $n 30
+  Eq $p2.Diverged 1; Ok (@($p2.Notes | Where-Object { $_ -like '*eq000001*khác nhau*' }).Count -eq 1) 'diverged is reported'
+  Eq ($p2.Put.Count + $p2.Get.Count) 0 'nothing is copied either way'
+  Eq $p2.Same 2 'eq000002 (same hash) and eq000003 (shortcut)'
+}
 # ============================== omp format guard ==============================
 function New-RawSess([string]$Dir, [string]$Name, [string[]]$Lines) {
   [void](New-Item -ItemType Directory -Path $Dir -Force)
@@ -547,6 +561,7 @@ T 'e2e: format guard in a real run: unknown session skipped and reported, status
   $s = Get-Content $sp -Raw | ConvertFrom-Json; Eq @($s.unknownFormat).Count 0 'cleared'
   $m = Invoke-Fcode $w @(); Ok ($m.Out -notmatch 'Cảnh báo') ("no warning any more; out: " + $m.Out)
   # a failed AUTO run warns too; a failed manual run does not
+  [void](New-Sess $w.LS 'aaaa1111-chg1' $w.LP @('a'))   # something changed on the laptop, so the auto run does try ssh
   $r = Invoke-Fcode $w @('phien', '--tu-dong') @{ FAKE_SSH_FAIL = '1' }
   $s = Get-Content $sp -Raw | ConvertFrom-Json; Eq $s.ok $false 'auto run failed'
   $m = Invoke-Fcode $w @(); Ok ($m.Out.TrimStart() -like 'Cảnh báo: lần tự động đồng bộ phiên omp gần nhất bị lỗi*') ("auto-failure warning; out: " + $m.Out)
@@ -675,6 +690,64 @@ if ($env:FCODE_TEST_BOX) {
     } finally { [void](Invoke-RealBox "rm -rf $bt") }
   }
 }
+T 'e2e: equal-length sessions with other content are reported and left alone' {
+  $w = New-World 'e2e8'
+  [void](New-Item -ItemType Directory -Path (Join-Path $w.U 'Desktop\other'), (Join-Path $w.U 'Desktop\notonbox') -Force)
+  $l = New-Sess $w.LS '77777777-eqln' $w.LP @('aaa'); $b = New-Sess $w.BS '77777777-eqln' $w.BP @('bbb'); Set-Age $b 650
+  $lb = Read-Bytes $l; $bb = Read-Bytes $b
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
+  Ok ($r.Out -match 'phiên 77777777 đã khác nhau ở hai máy, giữ nguyên cả hai') ("reported; out: " + $r.Out)
+  Eq ([Convert]::ToBase64String((Read-Bytes $l))) ([Convert]::ToBase64String($lb)) 'laptop copy untouched'
+  Eq ([Convert]::ToBase64String((Read-Bytes $b))) ([Convert]::ToBase64String($bb)) 'box copy untouched'
+}
+T 'e2e: auto run opens ssh only with a reason (laptop changed / box just started / last run took data from the box / last run failed), manual always runs' {
+  $w = New-World 'e2e9'
+  [void](New-Item -ItemType Directory -Path (Join-Path $w.U 'Desktop\other'), (Join-Path $w.U 'Desktop\notonbox') -Force)
+  $auto = { param($env_ = @{}) Invoke-Fcode $w @('phien', '--tu-dong') $env_ }
+  $log = Join-Path $w.U '.fcode\phien.log'
+  $logText = { if (Test-Path $log) { (Get-Content $log -Raw) } else { '' } }
+  [void](New-Sess $w.LS '11111111-aut1' $w.LP @('a'))
+  # box not running: no ssh at all
+  $r = & $auto @{ FAKE_BOX_STATE = 'suspended' }; Eq $r.Code 0; Eq (SshCount $w) 0 'suspended: no ssh'
+  # (b) box just started (and the laptop has something new): ssh
+  $n0 = SshCount $w; $r = & $auto; Eq $r.Code 0 $r.Out
+  Ok ((SshCount $w) -gt $n0) 'box just started: ssh'
+  Ok ((& $logText) -match 'đồng bộ vì: box vừa chạy') 'reason logged (b)'
+  Ok (Test-Path (Join-Path $w.BS (Split-Path (Get-ChildItem $w.LS -Filter '*aut1.jsonl').FullName -Leaf))) 'it copied the session'
+  # running, nothing changed, last run took nothing from the box: NO ssh
+  $n1 = SshCount $w; $r = & $auto; Eq $r.Code 0 $r.Out
+  Eq (SshCount $w) $n1 'running + nothing changed + nothing taken from the box last time: no ssh'
+  Ok ((& $logText) -match 'không có gì mới: bỏ qua, không mở ssh') 'reason logged (skip)'
+  $r = & $auto; Eq (SshCount $w) $n1 'still none the next time'
+  # (a) laptop session changed
+  [void](New-Sess $w.LS '22222222-aut2' $w.LP @('a'))
+  $r = & $auto; Ok ((SshCount $w) -gt $n1) 'laptop changed: ssh'
+  Ok ((& $logText) -match 'đồng bộ vì: laptop có thay đổi') 'reason logged (a)'
+  $n2 = SshCount $w; $r = & $auto; Eq (SshCount $w) $n2 'quiet again after that run'
+  # (a) a root note changed
+  [IO.File]::WriteAllText("$($w.LP)\HANDOFF-z.md", 'x'); Set-Age "$($w.LP)\HANDOFF-z.md" 600
+  $r = & $auto; Ok ((SshCount $w) -gt $n2) 'laptop note changed: ssh'
+  $n3 = SshCount $w; $r = & $auto; Eq (SshCount $w) $n3 'quiet again'
+  # (b) box went away and came back
+  $r = & $auto @{ FAKE_BOX_STATE = 'suspended' }; Eq (SshCount $w) $n3 'suspended again: no ssh'
+  Ok ((& $logText) -match 'box không chạy nữa') 'stop logged'
+  $r = & $auto; Ok ((SshCount $w) -gt $n3) 'box running again: ssh'
+  $n4 = SshCount $w; $r = & $auto; Eq (SshCount $w) $n4 'quiet again'
+  # (c) the user worked on the box: a manual run takes something from it, so the next auto run goes
+  [void](New-Sess $w.BS '33333333-box1' $w.BP @('b'))
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out; Ok (Test-Path (Join-Path $w.LS (Split-Path (Get-ChildItem $w.BS -Filter '*box1.jsonl').FullName -Leaf))) 'manual run took the box session'
+  $n5 = SshCount $w; $r = & $auto; Ok ((SshCount $w) -gt $n5) 'last run copied from the box: ssh'
+  Ok ((& $logText) -match 'lần trước có lấy dữ liệu từ box về') 'reason logged (c)'
+  $n6 = SshCount $w; $r = & $auto; Eq (SshCount $w) $n6 'and quiet after the run that took nothing'
+  # (d) a failed run is retried although nothing changed since
+  [void](New-Sess $w.LS '44444444-aut4' $w.LP @('a'))
+  $r = & $auto @{ FAKE_SSH_FAIL = '1' }; Eq $r.Code 1
+  $n7 = SshCount $w; $r = & $auto; Eq $r.Code 0 $r.Out; Ok ((SshCount $w) -gt $n7) 'retry after a failed run'
+  Ok ((& $logText) -match 'lần chạy trước bị lỗi') 'reason logged (d)'
+  Ok (Test-Path (Join-Path $w.BS (Split-Path (Get-ChildItem $w.LS -Filter '*aut4.jsonl').FullName -Leaf))) 'the retry copied the session'
+  # manual runs always run
+  $n8 = SshCount $w; $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0; Ok ((SshCount $w) -gt $n8) 'manual run: ssh even with nothing new'
+}
 # ============================== scheduled task (hidden) ==============================
 T 'task scheduler: registers a headless every-10-minutes task and the action shows no window' {
   $tp = '\FCode-test\'; $tn = 'phien-test-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
@@ -698,7 +771,7 @@ T 'task scheduler: registers a headless every-10-minutes task and the action sho
   Ok (-not (Remove-PhienTask $tn $tp)) 'removing twice is harmless'
 }
 
-if ($env:FCODE_TEST_KEEP) { Write-Host "kept: $Root" } else { Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue }
+if ($env:FCODE_TEST_KEEP) { Write-Host "kept: $Root" } else { for ($i = 0; $i -lt 4 -and (Test-Path -LiteralPath $Root); $i++) { Set-Location -LiteralPath $env:TEMP; Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue; if (Test-Path -LiteralPath $Root) { Start-Sleep -Seconds 3 } } }   # omp may still hold its native addon for a moment
 Write-Host ''
 Write-Host "passed $script:pass, failed $script:fail"
 exit $(if ($script:fail) { 1 } else { 0 })

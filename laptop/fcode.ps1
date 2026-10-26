@@ -334,7 +334,7 @@ function Show-Help {
   Write-Host '      Chạy thử: chỉ liệt kê những phiên sẽ được chép đi đâu, không chép và không ghi gì.'
   Write-Host '      Ví dụ: fcode phien --thu'
   Write-Host '  fcode phien tu-dong bat   |   fcode phien tu-dong tat'
-  Write-Host '      Bật / tắt tự động đồng bộ phiên mỗi 10 phút, chạy ngầm (không hiện cửa sổ), chỉ khi box đang chạy.'
+  Write-Host '      Bật / tắt tự động đồng bộ phiên mỗi 10 phút, chạy ngầm (không hiện cửa sổ), chỉ khi box đang chạy và có gì mới (laptop đổi, box vừa bật, hoặc bạn vừa làm việc trên box).'
   Write-Host '      Ví dụ: fcode phien tu-dong bat'
   Write-Host '  fcode help'
   Write-Host '      In bảng này (cũng là fcode -h, fcode --help, fcode /?).'
@@ -1705,7 +1705,9 @@ function Get-PhienLocalScan([string]$Dir) {
 # so sanh mot file co mat o hai ben: 'same' | 'put' (laptop dai hon) | 'get' (box dai hon) | 'diverged' | 'need' (can hash cua box)
 function Compare-PhienFile($L, $R, [string]$Enc, [string]$Rel, [hashtable]$BoxHash, [string]$LDir, $Need) {
   $a = [long]$L.size - [long]$L.off; $b = [long]$R.size - [long]$R.off
-  if ($a -eq $b) { return 'same' }
+  # cung do dai: file do chinh fcode chep giu nguyen gio sua (den giay), va moi lan ghi sau do deu doi gio sua
+  # -> cung do dai + cung gio sua = giong nhau, khong can bam; khac gio sua thi so sha256 (khac noi dung = diverged)
+  if ($a -eq $b -and [Math]::Floor([double]$L.mtime) -eq [Math]::Floor([double]$R.mtime)) { return 'same' }
   $len = [Math]::Min($a, $b)
   $key = "$Enc|$Rel|$len"
   if (-not $BoxHash.ContainsKey($key)) {
@@ -1714,7 +1716,7 @@ function Compare-PhienFile($L, $R, [string]$Enc, [string]$Rel, [hashtable]$BoxHa
   }
   $bh = $BoxHash[$key]
   $lh = Get-RangeSha (Join-Path $LDir ($Rel -replace '/', '\')) ([long]$L.off) $len
-  if ($bh -and $lh -and $bh -eq $lh) { if ($a -lt $b) { 'get' } else { 'put' } } else { 'diverged' }
+  if ($bh -and $lh -and $bh -eq $lh) { if ($a -eq $b) { 'same' } elseif ($a -lt $b) { 'get' } else { 'put' } } else { 'diverged' }
 }
 
 # ke hoach cho mot project: Put/Get = danh sach {Id; Name; Top; Files}; Need = cac hash can hoi box; Notes = loi cho nguoi dung
@@ -1917,10 +1919,11 @@ function Get-PhienWarning {
 }
 
 # dong bo mot hay moi project. Tra ve 0 xong, 1 loi.
-function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false) {
+function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [bool]$BoxKnownRunning = $false) {
   $script:PhienQuiet = $Auto; $script:PhienLines = New-Object System.Collections.Generic.List[string]
   $code = 0
-  $stat = @{ ran = $false; ok = $true; copied = 0; skipped = 0; diverged = 0; unknown = @(); ompL = ''; ompB = ''; noteCopied = 0; noteConf = @() }
+  $stat = @{ ran = $false; ok = $true; copied = 0; skipped = 0; diverged = 0; unknown = @(); ompL = ''; ompB = ''; noteCopied = 0; noteConf = @(); fromBox = 0 }
+  $noteFromBox = 0
   try {
     $projs = Get-PhienProjects
     if ($projs.Count -eq 0) { Write-PhienOut "Chưa có project nào trong syncRepos ($ConfigFile)."; return 0 }
@@ -1930,7 +1933,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false) {
       if (-not $projs.Contains($o)) { Write-PhienOut "Không thấy project '$Only' trong syncRepos. Có: $($names -join ', ')"; return 1 }
       $names = @($o)
     }
-    if ($Auto) { if (-not (Test-BoxRunning)) { return 0 } }
+    if ($Auto) { if (-not $BoxKnownRunning -and -not (Test-BoxRunning)) { return 0 } }
     else { & (Get-InstaboxExe) wake $box *> $null }
     $stat.ran = $true; $stat.ompL = Get-OmpVersion
     $agent = Get-OmpAgentDir
@@ -2084,7 +2087,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false) {
             $key = "$($n.project)/$($n.name)"; $info = $noteGetInfo[$key]
             if (-not (Test-Path -LiteralPath $src)) { $noteSkipped++; continue }
             $ldirN = ($ctx | Where-Object { $_.Name -eq $n.project } | Select-Object -First 1).LDir
-            if ((Install-PhienNote $src $ldirN $n.name $info.Expect $gnow $PhienBusySec) -eq 'ok') { $noteRec[$key] = [string]$info.Sha; $stat.noteCopied++ } else { $noteSkipped++ }
+            if ((Install-PhienNote $src $ldirN $n.name $info.Expect $gnow $PhienBusySec) -eq 'ok') { $noteRec[$key] = [string]$info.Sha; $stat.noteCopied++; $noteFromBox++ } else { $noteSkipped++ }
           }
           $gb = Join-Path $gt 'blobs'
           if (Test-Path -LiteralPath $gb) {
@@ -2103,6 +2106,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false) {
       # --- bao cao ---
       $up = if ($putRes) { [int]$putRes.new + [int]$putRes.replaced } else { 0 }
       $down = [int]$getRes.new + [int]$getRes.replaced
+      $stat.fromBox = $down + $noteFromBox
       foreach ($c in $ctx) { $pl = $plans[$c.Name]; Write-PhienOut ("== $($c.Name): gửi $(@($pl.Put | Where-Object { $_.Top }).Count) phiên lên box, lấy $(@($pl.Get | Where-Object { $_.Top }).Count) phiên về, $($pl.Same) đã giống nhau") }
       if ($missingBlobs) { Write-PhienOut "cảnh báo: $missingBlobs file đính kèm (blob) không thấy trên laptop nên chưa gửi" }
       $skipped = [int]$getRes.skip + [int]$getRes.busy + $(if ($putRes) { [int]$putRes.skip + [int]$putRes.busy } else { 0 })
@@ -2121,7 +2125,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false) {
     Write-PhienOut ('lỗi: ' + $_.Exception.Message)
     return 1
   } finally {
-    if ($stat.ran -and -not $DryRun) { Write-PhienStatus $stat $Auto }
+    if ($stat.ran -and -not $DryRun) { Write-PhienStatus $stat $Auto; Update-PhienAutoState $stat (-not $Only) }
     if ($Auto -and $script:PhienLines.Count -gt 0) { Add-PhienLog $script:PhienLines }
   }
 }
@@ -2235,6 +2239,83 @@ function Install-PhienNote([string]$Src, [string]$Dir, [string]$Name, [string]$E
   Add-PhienNoteExclude $Dir $Name
   'ok'
 }
+# trang thai che do tu dong (%LOCALAPPDATA%\fcode\phien-auto.json): box dang chay o lan kiem tra truoc, lan chay truoc co loi khong,
+# lan truoc co lay gi tu box ve khong, va "chu ky" cua phan phien + ghi chu tren laptop sau lan chay thanh cong gan nhat
+function Get-PhienAutoStatePath { Join-Path $env:LOCALAPPDATA 'fcode\phien-auto.json' }
+function Read-PhienAutoState {
+  try {
+    $o = [IO.File]::ReadAllText((Get-PhienAutoStatePath)) | ConvertFrom-Json
+    @{ boxRunning = [bool]$o.boxRunning; ok = [bool]$o.ok; fromBox = [int]$o.fromBox; sig = [string]$o.sig }
+  } catch { $null }
+}
+function Write-PhienAutoState([hashtable]$S) {
+  try {
+    $p = Get-PhienAutoStatePath
+    $d = Split-Path -Parent $p
+    if (-not (Test-Path -LiteralPath $d)) { [void](New-Item -ItemType Directory -Path $d -Force) }
+    [IO.File]::WriteAllText($p, ([ordered]@{ boxRunning = [bool]$S.boxRunning; ok = [bool]$S.ok; fromBox = [int]$S.fromBox; sig = [string]$S.sig } | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
+  } catch { }
+}
+
+# chu ky re (khong ssh, khong doc noi dung): ten + kich thuoc + gio sua cua moi file trong thu muc phien cua tung project
+# va cua cac file ghi chu o goc project
+function Get-PhienLocalSig {
+  $sessRoot = Join-Path (Get-OmpAgentDir) 'sessions'
+  $rx = Get-PhienNoteRx
+  $projs = Get-PhienProjects
+  $lines = New-Object System.Collections.Generic.List[string]
+  foreach ($n in @($projs.Keys)) {
+    $ldir = $projs[$n]
+    $sd = Join-Path $sessRoot (Get-LaptopEncodedDir $ldir)
+    if (Test-Path -LiteralPath $sd -PathType Container) {
+      foreach ($fi in (New-Object IO.DirectoryInfo($sd)).EnumerateFiles('*', [IO.SearchOption]::AllDirectories)) {
+        if (-not $fi.Name.EndsWith('.fcode-part')) { $lines.Add("S|$n|$($fi.FullName.Substring($sd.Length))|$($fi.Length)|$($fi.LastWriteTimeUtc.Ticks)") }
+      }
+    }
+    if (Test-Path -LiteralPath $ldir -PathType Container) {
+      foreach ($fi in (New-Object IO.DirectoryInfo($ldir)).EnumerateFiles()) {
+        if ($fi.Name -cmatch $rx) { $lines.Add("N|$n|$($fi.Name)|$($fi.Length)|$($fi.LastWriteTimeUtc.Ticks)") }
+      }
+    }
+  }
+  $lines.Sort([StringComparer]::Ordinal)
+  $sha = [Security.Cryptography.SHA256]::Create()
+  try { ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($lines -join "`n")))) -replace '-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+}
+
+# sau mot lan chay that (tay hay tu dong): ghi lai de lan tu dong sau biet co can mo ssh khong
+function Update-PhienAutoState($Stat, [bool]$FullRun) {
+  $old = Read-PhienAutoState
+  $sig = if ($old) { $old.sig } else { '' }
+  if ($Stat.ok -and $FullRun) { $sig = Get-PhienLocalSig }
+  Write-PhienAutoState @{ boxRunning = $true; ok = [bool]$Stat.ok; fromBox = [int]$Stat.fromBox; sig = $sig }
+}
+
+# che do tu dong: chi doc `instabox ls --json`; chi mo ssh khi co ly do (ghi vao phien.log):
+#  (a) laptop co phien / ghi chu doi tu lan chay thanh cong truoc, (b) box vua tu khong chay thanh dang chay,
+#  (c) lan tu dong/chay truoc co lay gi tu box ve (ban dang lam viec o do), (d) lan truoc bi loi (thu lai)
+function Invoke-PhienAutoRun {
+  $as = Read-PhienAutoState
+  if (-not (Test-BoxRunning)) {
+    if ($as -and $as.boxRunning) { Add-PhienLog @('box không chạy nữa, tạm nghỉ') }
+    $keep = if ($as) { $as } else { @{ ok = $true; fromBox = 0; sig = '' } }
+    Write-PhienAutoState @{ boxRunning = $false; ok = $keep.ok; fromBox = $keep.fromBox; sig = $keep.sig }
+    return 0
+  }
+  $why = New-Object System.Collections.Generic.List[string]
+  if (-not $as -or -not $as.boxRunning) { $why.Add('box vừa chạy (lần đầu trong đợt chạy này)') }
+  if ($as -and -not $as.ok) { $why.Add('lần chạy trước bị lỗi, thử lại') }
+  if ($as -and $as.fromBox -gt 0) { $why.Add('lần trước có lấy dữ liệu từ box về (bạn đang làm việc bên đó)') }
+  if (-not $as -or (Get-PhienLocalSig) -ne $as.sig) { $why.Add('laptop có thay đổi (phiên hoặc ghi chú)') }
+  if ($why.Count -eq 0) {
+    Add-PhienLog @('box đang chạy nhưng không có gì mới: bỏ qua, không mở ssh')
+    Write-PhienAutoState @{ boxRunning = $true; ok = $as.ok; fromBox = $as.fromBox; sig = $as.sig }
+    return 0
+  }
+  Add-PhienLog @('đồng bộ vì: ' + ($why -join '; '))
+  Invoke-PhienSync '' $true $false $true
+}
+
 # nhat ky cho che do tu dong: chi dong tom tat, khong bao gio noi dung phien. Cat con ~100 KB.
 function Add-PhienLog($Lines) {
   try {
@@ -2267,7 +2348,7 @@ function Invoke-PhienAuto([string]$Mode) {
   switch ($Mode) {
     'bat' {
       try { Install-PhienTask $FcodeScript } catch { Write-IpaError 'không bật được chế độ tự động (Task Scheduler báo lỗi).' $_.Exception.Message; return 1 }
-      Write-Host 'Đã bật tự động: cứ 10 phút, nếu box đang chạy, fcode tự đồng bộ phiên chat omp hai chiều (chạy ngầm, không hiện cửa sổ).'
+      Write-Host 'Đã bật tự động: cứ 10 phút, nếu box đang chạy, fcode xem có gì mới thì tự đồng bộ phiên chat omp hai chiều (chạy ngầm, không hiện cửa sổ). Không có gì mới thì không mở kết nối nào, để box vẫn tự nghỉ được.'
       Write-Host "Nhật ký: $PhienLog    Tắt: fcode phien tu-dong tat"
       return 0
     }
@@ -2278,7 +2359,7 @@ function Invoke-PhienAuto([string]$Mode) {
     }
     { $_ -in '', 'trangthai' } {
       $t = Get-ScheduledTask -TaskPath '\FCode\' -TaskName 'phien-sync' -ErrorAction SilentlyContinue
-      if ($t) { Write-Host 'Tự động đồng bộ: ĐANG BẬT (mỗi 10 phút, chỉ khi box đang chạy).' } else { Write-Host 'Tự động đồng bộ: đang tắt. Bật: fcode phien tu-dong bat' }
+      if ($t) { Write-Host 'Tự động đồng bộ: ĐANG BẬT (mỗi 10 phút, chỉ khi box đang chạy và có gì mới).' } else { Write-Host 'Tự động đồng bộ: đang tắt. Bật: fcode phien tu-dong bat' }
       return 0
     }
     default { Write-Host 'Cách dùng: fcode phien tu-dong bat   hoặc   fcode phien tu-dong tat   hoặc   fcode phien tu-dong trangthai'; return 1 }
@@ -2313,7 +2394,7 @@ function Invoke-Phien {
       $mx = New-Object Threading.Mutex($false, 'Local\fcode-phien')
       try { $held = $mx.WaitOne(0) } catch [Threading.AbandonedMutexException] { $held = $true }
       if (-not $held) { return 0 }
-      return (Invoke-PhienSync '' $true)
+      return (Invoke-PhienAutoRun)
     } finally { if ($mx) { if ($held) { try { $mx.ReleaseMutex() } catch { } }; $mx.Dispose() } }
   }
   if ($sub -eq 'tu-dong') { return (Invoke-PhienAuto $(if ($pa.Count -gt 1) { $pa[1] } else { '' })) }
