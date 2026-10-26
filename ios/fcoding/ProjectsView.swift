@@ -286,11 +286,12 @@ struct ProjectsView: View {
 
     private var rail: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            // Top-aligned: a card with the git line is one line taller.
+            // Equal-height cards: the tallest (git line) sets the row, the others stretch.
             HStack(alignment: .top, spacing: 10) {
                 projectCard("all")
                 ForEach(projectNames, id: \.self) { projectCard($0) }
             }
+            .fixedSize(horizontal: false, vertical: true)
             .padding(.horizontal, 16)
             .padding(.top, 2)
             .padding(.bottom, 6)
@@ -564,7 +565,7 @@ struct ProjectLine {
     var color: Color = .l2
 }
 
-/// 182 pt card: name + count, three status lines, "…" for a new session; tap filters the
+/// 182 pt card: name + count, three or four status lines, "…" for a new session; tap filters the
 /// sessions, a long press opens a new session in that project.
 struct ProjectCard: View {
     let title: String
@@ -600,7 +601,7 @@ struct ProjectCard: View {
         }
         .padding(.top, 11).padding(.horizontal, 12).padding(.bottom, 10)
         .frame(width: 182, alignment: .topLeading)
-        .frame(minHeight: 108, alignment: .topLeading)
+        .frame(minHeight: 108, maxHeight: .infinity, alignment: .topLeading)
         .background(selected ? Color(hex: 0x2A2A2E) : Color.grp, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(selected ? Color.white : .clear, lineWidth: 1.5))
         .overlay(alignment: .topTrailing) {
