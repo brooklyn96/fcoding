@@ -1868,7 +1868,7 @@ export function createApp(opts = {}) {
       const { repo, name } = parseAddRequest(parseJson(req, body));
       return json(res, 202, { job: startAdd(repo, name).id });
     }
-    if (seg.length === 5 && seg[0] === '' && seg[1] === 'api' && seg[2] === 'projects' && seg[3] === 'jobs') {
+    if (seg.length === 5 && seg[0] === '' && seg[1] === 'api' && seg[2] === 'projects' && seg[3] === 'jobs' && seg[4] !== 'omp-sessions') { // a project named "jobs" keeps its omp-sessions list (CONTRACT A9); a job id is hex, never that word
       want('GET');
       const j = addJob(seg[4]);
       if (!j) throw new HttpErr(404, 'no_job');

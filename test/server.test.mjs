@@ -3905,6 +3905,20 @@ test('POST resume: a long project name is shortened, the id part never; the name
   }, { config: { projects: { [long]: ABS } } });
 });
 
+test('a project named "jobs": its omp-sessions list, resume and staging routes are not taken by GET /api/projects/jobs/<id>; the job route still answers', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  ompTree(c);
+  const r = await ompGet(c, cookie, 'jobs');
+  assert.equal(r.status, 200, r.text);
+  assert.deepEqual(r.json.sessions.map((s) => s.id), [ID.e, ID.b, ID.a]);
+  assert.equal((await c.req('POST', '/api/projects/jobs/omp-sessions', { cookie, body: {} })).status, 405);
+  const rs = await resumeReq(c, cookie, ID.a, 'jobs');
+  assert.equal(rs.status, 200, rs.text);
+  assert.equal((await c.req('POST', '/api/projects/jobs/staging/start', { cookie })).json.error, 'no_instabox_key');
+  const j = await c.req('GET', `/api/projects/jobs/${'0'.repeat(32)}`, { cookie });
+  assert.deepEqual([j.status, j.json], [404, { error: 'no_job' }]);
+}, { config: { projects: { jobs: ABS } } }));
+
 test('POST resume: unknown or malformed ids and traversal attempts -> 404 unknown_session, nothing is started', () => withApp(async (c) => {
   const { cookie } = await c.login();
   const d = ompTree(c);
