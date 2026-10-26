@@ -928,16 +928,30 @@ enum HomeLogic {
         case let .polled(job):
             guard case .polling = s.phase else { return s }
             s.pollErrors = 0
+            // The server reuses a running job for the same name: a job for another repo (or name) is
+            // not ours, so neither its key nor its success is shown.
+            guard job.name == s.name, job.repo?.lowercased() == s.repo.lowercased() else {
+                s.phase = .failed
+                s.message = "Tên này đang được dùng để thêm repo khác, đặt tên khác."
+                return s
+            }
             let detail = job.detail?.trimmingCharacters(in: .whitespacesAndNewlines)
             switch job.state {
             case "done":
                 let name = job.name ?? s.name
                 s.phase = .done
-                // ADDED_WARN detail = the test branch GitHub kept (CLEANUP_FAIL), as refs/heads/<branch>.
-                let branch = (detail ?? "").replacingOccurrences(of: "^refs/heads/", with: "", options: .regularExpression)
-                s.message = job.code == "ADDED_WARN"
-                    ? "Đã thêm \(name). GitHub không cho box xoá nhánh thử" + (branch.isEmpty ? "" : " \(branch)") + ", hãy xoá bằng tay."
-                    : "Đã thêm dự án \(name)"
+                if job.code == "ADDED_WARN" {
+                    // Exit 30 covers every failed check; only CLEANUP_FAIL's detail is the check branch.
+                    let d = detail ?? ""
+                    if d.range(of: "^(refs/heads/)?box/fcode-add-check$", options: .regularExpression) != nil {
+                        let branch = d.replacingOccurrences(of: "^refs/heads/", with: "", options: .regularExpression)
+                        s.message = "Đã thêm \(name). GitHub không cho box xoá nhánh thử \(branch), hãy xoá bằng tay."
+                    } else {
+                        s.message = "Đã thêm dự án, nhưng box kiểm tra lại chưa đạt hết, xem lại trên box."
+                    }
+                } else {
+                    s.message = "Đã thêm dự án \(name)"
+                }
             case "failed":
                 let key = job.pubkey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 if ["NEED_KEY", "NEED_WRITE"].contains(job.code ?? ""), !key.isEmpty {
@@ -1316,7 +1330,13 @@ enum HomeLogic {
         eq("key page nil", keyPage(nil) == nil, true)
 
         // Add project: the poll state machine
-        func job(_ json: String) -> ProjectJob { try! JSONDecoder().decode(ProjectJob.self, from: Data(json.utf8)) }
+        /// A job reply; name "web" and repo "Me/Web" (what `a` submits) unless the JSON sets them.
+        func job(_ json: String) -> ProjectJob {
+            var j = json
+            if !j.contains("\"name\"") { j = "{\"name\":\"web\"," + j.dropFirst() }
+            if !j.contains("\"repo\"") { j = "{\"repo\":\"Me/Web\"," + j.dropFirst() }
+            return try! JSONDecoder().decode(ProjectJob.self, from: Data(j.utf8))
+        }
         var a = addReduce(AddState(), .submit(repo: "me/x", name: "home"))
         eq("submit bad name", a.phase, .form)
         eq("submit bad name text", a.message, badNameText)
@@ -1371,13 +1391,31 @@ enum HomeLogic {
         let done = addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED\",\"name\":\"web\"}")))
         eq("done", done.phase, .done)
         eq("done toast", done.message, "Đã thêm dự án web")
-        let addedWarn = addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\"refs/heads/box/x\"}")))
+        let addedWarn = addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\"refs/heads/box/fcode-add-check\"}")))
         eq("done warn", addedWarn.phase, .done)
-        eq("done warn toast", addedWarn.message, "Đã thêm web. GitHub không cho box xoá nhánh thử box/x, hãy xoá bằng tay.")
-        eq("done warn no detail", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\"}"))).message,
-           "Đã thêm web. GitHub không cho box xoá nhánh thử, hãy xoá bằng tay.")
-        eq("done warn bare branch", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\" box/y \"}"))).message,
-           "Đã thêm web. GitHub không cho box xoá nhánh thử box/y, hãy xoá bằng tay.")
+        eq("done warn cleanup toast", addedWarn.message,
+           "Đã thêm web. GitHub không cho box xoá nhánh thử box/fcode-add-check, hãy xoá bằng tay.")
+        let generic = "Đã thêm dự án, nhưng box kiểm tra lại chưa đạt hết, xem lại trên box."
+        eq("done warn no detail", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\"}"))).message, generic)
+        eq("done warn other detail", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\"refs/heads/box/x\"}"))).message,
+           generic)
+        eq("done warn cfg detail", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\"pr list failed\"}"))).message,
+           generic)
+        eq("done warn bare branch", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED_WARN\",\"detail\":\" box/fcode-add-check \"}"))).message,
+           "Đã thêm web. GitHub không cho box xoá nhánh thử box/fcode-add-check, hãy xoá bằng tay.")
+        // Another sheet's job (the server dedupes by name): never its key or its success.
+        let conflict = "Tên này đang được dùng để thêm repo khác, đặt tên khác."
+        let alice = addReduce(a, .polled(job("""
+        {"state":"failed","code":"NEED_KEY","name":"web","repo":"alice/web","pubkey":"ssh-ed25519 ALICE","keyUrl":"https://github.com/alice/web/settings/keys/new"}
+        """)))
+        eq("other repo job fails", alice.phase, .failed)
+        eq("other repo job message", alice.message, conflict)
+        eq("other repo job no key", alice.pubkey == nil, true)
+        eq("other repo done not ours", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED\",\"repo\":\"alice/web\"}"))).phase, .failed)
+        eq("other repo running stops", addReduce(a, .polled(job("{\"state\":\"running\",\"repo\":\"alice/web\"}"))).phase, .failed)
+        eq("other name job", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED\",\"name\":\"web2\"}"))).message, conflict)
+        eq("job without repo not ours", addReduce(a, .polled(job("{\"state\":\"done\",\"repo\":null}"))).phase, .failed)
+        eq("repo case ignored", addReduce(a, .polled(job("{\"state\":\"done\",\"code\":\"ADDED\",\"repo\":\"ME/WEB\"}"))).phase, .done)
         // A picked repo leaves the name empty: the default follows the link sent, never an older one.
         let picked = addReduce(AddState(), .submit(repo: "https://github.com/me/old-app", name: ""))
         eq("picked default name", picked.name, "old-app")
