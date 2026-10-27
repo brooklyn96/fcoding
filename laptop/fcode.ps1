@@ -1109,9 +1109,19 @@ def tracked_names(d):
 
 
 def scan_notes(d):
+    # fx = the exclude file has fcode's pair for that name (Rule O); no exclude path, or a file that cannot be read: gitok False
+    # (no note work for this project this run, never "no line of ours"); no file = no pair
+    no = {'gitok': False, 'tracked': [], 'upstream': [], 'files': []}
     t = index_names(d) if os.path.isdir(d) else None
     if t is None:
-        return {'gitok': False, 'tracked': [], 'upstream': [], 'files': []}
+        return no
+    p = exclude_path(d)
+    if p is None:
+        return no
+    try:
+        ext = read_exclude(p)
+    except OSError:
+        return no
     files = []
     for n in sorted(os.listdir(d)):
         p = os.path.join(d, n)
@@ -1119,11 +1129,8 @@ def scan_notes(d):
             st = os.stat(p)
             ig = git(d, 'check-ignore', '-q', '--', n)
             files.append({'name': n, 'size': st.st_size, 'mtime': st.st_mtime, 'sha': file_sha(p),
-                          'ign': bool(ig and ig.returncode == 0)})
+                          'ign': bool(ig and ig.returncode == 0), 'fx': bool(mark_rx(n).search(ext))})
     return {'gitok': True, 'tracked': sorted(t), 'upstream': sorted(upstream_names(d)), 'files': files}
-
-
-LAST_EXCL = [False]
 
 
 def exclude_path(d):
@@ -1134,10 +1141,78 @@ def exclude_path(d):
     return p if os.path.isabs(p) else os.path.join(d, p)
 
 
+# Rule O: a line of .git/info/exclude is fcode's when it is the pair "# fcode" + "/<ten>" (one atomic write). The file is handled as bytes,
+# so every other byte and its newline (CRLF or LF) stay as they were
+MARK = b'# fcode'
+
+
+def mark_rx(name):
+    return re.compile(rb'(?m)^' + re.escape(MARK) + rb'\r?\n/' + re.escape(name.encode('utf-8')) + rb'\r?(?:\n|\Z)')
+
+
+def bare_rx(name):
+    return re.compile(rb'(?m)^/' + re.escape(name.encode('utf-8')) + rb'\r?(?:\n|\Z)')
+
+
+def read_exclude(p):
+    try:
+        with open(p, 'rb') as f:
+            return f.read()
+    except FileNotFoundError:
+        return b''
+
+
+def pid_gone(pid):
+    # the PID of a part file no longer runs. The box is Linux; on Windows (the tests run this program there) os.kill(pid, 0) would END that process
+    if os.name == 'nt':
+        import ctypes
+        k = ctypes.WinDLL('kernel32', use_last_error=True)
+        h = k.OpenProcess(0x1000, False, pid)
+        if not h:
+            return ctypes.get_last_error() == 87
+        c = ctypes.c_ulong()
+        ok = k.GetExitCodeProcess(h, ctypes.byref(c))
+        k.CloseHandle(h)
+        return bool(ok) and c.value != 259
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def write_exclude(p, data):
+    # the one way the box rewrites .git/info/exclude: a part file beside it, then os.replace (a kill leaves the old file or the new one).
+    # First its own leftovers there go: exactly <leaf>.fcode-part-<PID>-<6hex>, over 1 h old or of a PID that no longer runs
+    d, leaf = os.path.split(p)
+    rx = re.compile(re.escape(leaf) + r'\.fcode-part-([0-9]+)-[0-9a-f]{6}')
+    try:
+        names = os.listdir(d)
+    except OSError:
+        names = []
+    for n in names:
+        m = rx.fullmatch(n)
+        q = os.path.join(d, n)
+        try:
+            if m and not os.path.islink(q) and (os.lstat(q).st_mtime < NOW - 3600 or pid_gone(int(m.group(1)))):
+                os.unlink(q)
+        except OSError:
+            pass
+    part = part_name(p)
+    try:
+        with open(part, 'wb') as f:
+            f.write(data)
+        os.replace(part, p)
+    finally:
+        if os.path.exists(part):
+            os.unlink(part)
+
+
 def ensure_excluded(d, name):
-    # dong "/<ten>" trong .git/info/exclude (khong dung .gitignore) neu git chua bo qua file nay.
-    # LAST_EXCL[0] = True chi khi LAN GOI NAY them dong (laptop ghi lai, de sau nay chi go dung dong do)
-    LAST_EXCL[0] = False
+    # the pair "# fcode" + "/<ten>" in .git/info/exclude (never .gitignore) when git does not ignore the file yet; an exact "/<ten>"
+    # already there is the user's: nothing added, nothing claimed
     ig = git(d, 'check-ignore', '-q', '--', name)
     if ig is None or ig.returncode == 0:
         return
@@ -1145,30 +1220,30 @@ def ensure_excluded(d, name):
     if not p:
         return
     os.makedirs(os.path.dirname(p), exist_ok=True)
-    cur = ''
-    if os.path.exists(p):
-        with open(p, encoding='utf-8', errors='replace') as f:
-            cur = f.read()
-    if ('/' + name) in cur.splitlines():
+    cur = read_exclude(p)
+    line = b'/' + name.encode('utf-8')
+    if line in cur.splitlines():
         return
-    with open(p, 'a', encoding='utf-8') as f:
-        f.write(('' if not cur or cur.endswith('\n') else '\n') + '/' + name + '\n')
-    LAST_EXCL[0] = True
+    nl = b'\r\n' if b'\r\n' in cur else b'\n'
+    write_exclude(p, cur + (b'' if not cur or cur.endswith(b'\n') else nl) + MARK + nl + line + nl)
 
 
-def unexclude(d, name):
-    # go DUNG dong "/<ten>" (dong ensure_excluded da them); moi dong khac giu nguyen
+def unexclude(d, name, legacy):
+    # give fcode's line back: the pair, or the bare "/<ten>" only when legacy (a line 1.3.2/1.3.3 added; the laptop kept its record).
+    # True = no line of fcode's is there now (removed, or not there); False = git could not say where the file is
     p = exclude_path(d)
-    if not p or not os.path.exists(p):
+    if not p:
         return False
-    with open(p, encoding='utf-8', errors='replace', newline='') as f:
-        cur = f.read()
-    new = re.sub(r'(?m)^/' + re.escape(name) + r'\r?(?:\n|\Z)', '', cur)
-    if new == cur:
-        return False
-    with open(p, 'w', encoding='utf-8', newline='') as f:
-        f.write(new)
+    if not os.path.exists(p):
+        return True
+    cur = read_exclude(p)
+    new = mark_rx(name).sub(b'', cur)
+    if new == cur and legacy:
+        new = bare_rx(name).sub(b'', cur)
+    if new != cur:
+        write_exclude(p, new)
     return True
+
 
 def part_name(p):
     # ten tam rieng cho tung lan chay (hai lan chay cung luc khong dam len nhau)
@@ -1319,7 +1394,8 @@ def box_projects():
 
 
 def clean_old(dirs):
-    # do lai cua lan chay bi cat ngang (ssh rot, box nghi): chi ten tam cua fcode, cu hon 1 gio; khong dung toi gi khac
+    # do lai cua lan chay bi cat ngang (ssh rot, box nghi), Rule L: only fcode's complete names, over 1 h old, never a link:
+    # $TMPDIR/fcode-phien-<8 of [a-z0-9_]> (mkdtemp) owned by this user, <name>.fcode-part-<PID>-<6hex> in the session / blob dirs
     old = NOW - 3600
     tmp = tempfile.gettempdir()
     uid = os.getuid() if hasattr(os, 'getuid') else None
@@ -1331,7 +1407,7 @@ def clean_old(dirs):
         p = os.path.join(tmp, n)
         try:
             st = os.lstat(p)
-            if not n.startswith('fcode-phien-') or st.st_mtime >= old or (uid is not None and st.st_uid != uid) or os.path.islink(p):
+            if not re.fullmatch(r'fcode-phien-[a-z0-9_]{8}', n) or st.st_mtime >= old or (uid is not None and st.st_uid != uid) or os.path.islink(p):
                 continue
             if os.path.isdir(p):
                 shutil.rmtree(p, ignore_errors=True)
@@ -1344,7 +1420,7 @@ def clean_old(dirs):
             for n in fs:
                 p = os.path.join(root, n)
                 try:
-                    if '.fcode-part-' in n and os.lstat(p).st_mtime < old and not os.path.islink(p):
+                    if re.search(r'\.fcode-part-[0-9]+-[0-9a-f]{6}\Z', n) and os.lstat(p).st_mtime < old and not os.path.islink(p):
                         os.unlink(p)
                 except OSError:
                     pass
@@ -1580,34 +1656,31 @@ def cmd_put(_req):
         cnt['deferred'] = defer
         projs = cfg_projects()
         placed = []
-        excl = []
         for it in man.get('notes', []):
             pn, name = it.get('project'), it.get('name')
             d = note_dir(projs, pn)
             if not d or not isinstance(name, str) or not NOTE_RX.match(name):
                 continue
             src = os.path.join(stage, 'notes', pn, name)
-            LAST_EXCL[0] = False
             if os.path.isfile(src) and place_note(d, name, src, it.get('expect') or '', it.get('sha') or '') == 'ok':
                 placed.append(pn + '/' + name)
-                if LAST_EXCL[0]:
-                    excl.append(pn + '/' + name)
         for it in man.get('ensure', []):
             pn, name = it.get('project'), it.get('name')
             d = note_dir(projs, pn)
             t = tracked_names(d) if d else None
             if d and t is not None and isinstance(name, str) and NOTE_RX.match(name) and name not in t and os.path.isfile(os.path.join(d, name)):
                 ensure_excluded(d, name)
-                if LAST_EXCL[0]:
-                    excl.append(pn + '/' + name)
         unexcl = []
         for it in man.get('unexclude', []):
             pn, name = it.get('project'), it.get('name')
-            d = note_dir(projs, pn)   # the other side tracks the name now; the laptop only asks for it when it recorded that THIS line is fcode's
-            if d and isinstance(name, str) and NOTE_RX.match(name) and unexclude(d, name):
+            d = note_dir(projs, pn)   # the other side tracks the name now; the laptop asks only when the scan saw fcode's pair here (or a 1.3.2/1.3.3 record: legacy)
+            try:
+                gone = bool(d and isinstance(name, str) and NOTE_RX.match(name) and unexclude(d, name, bool(it.get('legacy'))))
+            except OSError:
+                gone = False
+            if gone:
                 unexcl.append(pn + '/' + name)
         cnt['notePlaced'] = placed
-        cnt['exclAdded'] = excl
         cnt['unexcluded'] = unexcl
         out_json(cnt)
     finally:
@@ -2237,35 +2310,45 @@ function Get-LocalRepoKey([string]$Dir) {
   if ($r.Code -eq 0) { Get-RepoKey ([string]@($r.Out)[0]) } else { '' }
 }
 
-# do lai cua lan chay bi cat ngang (may ngu, mat dien, tat cua so, lan nhanh bi ngat o ~30 s, Ctrl+C): chi ten tam cua fcode, cu hon 1 gio, hoac
-# cua mot lan chay da chet (PID trong ten khong con chay, hay PID do gio la tien trinh moi hon do lai) -> xoa ngay o lan chay sau.
-# %TEMP%\fcode-phien-*, *.fcode-part-* trong cac thu muc phien da cho ($Dirs, ca thu muc con) va o goc project ($Flat, chi goc); khong dung toi gi khac.
+# do lai cua lan chay bi cat ngang (may ngu, mat dien, tat cua so, lan nhanh bi ngat o ~30 s, Ctrl+C). Rule L: fcode deletes only a name that is one of
+# its own complete generated names, only where it put it, and only when it is over 1 h old or the PID in the name no longer runs (or is now a newer
+# process): %TEMP%\fcode-phien-<PID>-<32hex> (and 1.3.2's fcode-phien-<32hex>, age only, never a link); <name>.fcode-part-<PID>-<6hex> in the session
+# dirs ($Dirs, with subfolders) and the project roots ($Flat, root only); <file>.part-<PID> beside a file Write-PhienText rewrites (Clear-PhienPartFiles:
+# by Write-PhienText itself before each write, and for the three state files here). Nothing else, nowhere else.
 function Test-PhienOwnerGone($Item, [string]$Rx) {
-  if ($Item.Name -notmatch $Rx) { return $false }   # not our current name format: the 1 h rule only
+  if ($Item.Name -notmatch $Rx -or -not $Matches[1]) { return $false }   # no PID in the name: the 1 h rule only
   try { $p = Get-Process -Id ([int]$Matches[1]) -ErrorAction Stop } catch { return $true }
   try { $p.StartTime.ToUniversalTime() -gt $Item.CreationTimeUtc } catch { $false }
 }
+# the only sweep of Write-PhienText leftovers: exactly <leaf>.part-<PID>, beside the file they belonged to (the path git named, for an exclude file)
+function Clear-PhienPartFiles([string]$Path) {
+  $dir = [IO.Path]::GetDirectoryName($Path); $leaf = [IO.Path]::GetFileName($Path)
+  if (-not $dir -or -not [IO.Directory]::Exists($dir)) { return }
+  $rx = '\A' + [regex]::Escape($leaf) + '\.part-([0-9]+)\z'
+  $old = (Get-Date).ToUniversalTime().AddHours(-1)
+  foreach ($x in @(Get-ChildItem -LiteralPath $dir -File -Force -Filter ($leaf + '.part-*') -ErrorAction SilentlyContinue)) {
+    if ($x.Name -notmatch $rx) { continue }
+    if ($x.LastWriteTimeUtc -lt $old -or (Test-PhienOwnerGone $x $rx)) { Remove-Item -LiteralPath $x.FullName -Force -ErrorAction SilentlyContinue }
+  }
+}
 function Clear-PhienLeftovers([string[]]$Dirs, [string[]]$Flat = @()) {
   $old = (Get-Date).ToUniversalTime().AddHours(-1)
+  $tmpRx = '\Afcode-phien-(?:([0-9]+)-)?[0-9a-f]{32}\z'
   $partRx = '\.fcode-part-([0-9]+)-[0-9a-f]{6}\z'
   foreach ($x in @(Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Filter 'fcode-phien-*' -Force -ErrorAction SilentlyContinue)) {
     if ($x.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
-    if ($x.LastWriteTimeUtc -lt $old -or (Test-PhienOwnerGone $x '\Afcode-phien-([0-9]+)-[0-9a-f]{32}\z')) { Remove-Item -LiteralPath $x.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+    if ($x.Name -notmatch $tmpRx) { continue }
+    if ($x.LastWriteTimeUtc -lt $old -or (Test-PhienOwnerGone $x $tmpRx)) { Remove-Item -LiteralPath $x.FullName -Recurse -Force -ErrorAction SilentlyContinue }
   }
   foreach ($d in @(@($Dirs | ForEach-Object { @{ D = $_; R = $true } }) + @($Flat | ForEach-Object { @{ D = $_; R = $false } }))) {
     if (-not $d.D -or -not (Test-Path -LiteralPath $d.D)) { continue }
     foreach ($x in @(Get-ChildItem -LiteralPath $d.D -Recurse:$d.R -File -Force -Filter '*.fcode-part-*' -ErrorAction SilentlyContinue)) {
+      if ($x.Name -notmatch $partRx) { continue }
       if ($x.LastWriteTimeUtc -lt $old -or (Test-PhienOwnerGone $x $partRx)) { Remove-Item -LiteralPath $x.FullName -Force -ErrorAction SilentlyContinue }
     }
   }
-  # Write-PhienText part files (<file>.part-<PID>) beside the three state files and each project's .git/info/exclude
   $sd = Join-Path $env:LOCALAPPDATA 'fcode'
-  foreach ($f in @(@('handoff-state.json', 'phien-status.json', 'phien-auto.json' | ForEach-Object { Join-Path $sd $_ }) + @($Flat | Where-Object { $_ } | ForEach-Object { Join-Path $_ '.git\info\exclude' }))) {
-    $fd = Split-Path -Parent $f; if (-not (Test-Path -LiteralPath $fd -PathType Container)) { continue }
-    foreach ($x in @(Get-ChildItem -LiteralPath $fd -File -Force -Filter ((Split-Path -Leaf $f) + '.part-*') -ErrorAction SilentlyContinue)) {
-      if ($x.LastWriteTimeUtc -lt $old -or (Test-PhienOwnerGone $x '\.part-([0-9]+)\z')) { Remove-Item -LiteralPath $x.FullName -Force -ErrorAction SilentlyContinue }
-    }
-  }
+  foreach ($f in 'handoff-state.json', 'phien-status.json', 'phien-auto.json') { Clear-PhienPartFiles (Join-Path $sd $f) }
 }
 
 function Get-PhienProjects {
@@ -2311,12 +2394,14 @@ function Write-PhienStatus([hashtable]$Stat, [bool]$Auto) {
   } catch { }
 }
 # the one way fcode rewrites a file of its own or the user's (.git/info/exclude, the state JSONs): a part file next to it, then an atomic
-# Replace / Move, so a kill at any instant leaves the old file or the new one, never a cut one. UTF-8 without BOM.
-function Write-PhienText([string]$Path, [string]$Text) {
+# Replace / Move, so a kill at any instant leaves the old file or the new one, never a cut one. UTF-8 without BOM, or $Enc (Latin-1 for
+# .git/info/exclude: its bytes go through unchanged). A dead run's part file of this same file is swept first (Rule L).
+function Write-PhienText([string]$Path, [string]$Text, [Text.Encoding]$Enc = (New-Object Text.UTF8Encoding($false))) {
   [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Path))
+  Clear-PhienPartFiles $Path
   $part = "$Path.part-$PID"
   try {
-    [IO.File]::WriteAllText($part, $Text, (New-Object Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText($part, $Text, $Enc)
     if ([IO.File]::Exists($Path)) { [IO.File]::Replace($part, $Path, [NullString]::Value) } else { [IO.File]::Move($part, $Path) }
   } finally { if ([IO.File]::Exists($part)) { try { [IO.File]::Delete($part) } catch { } } }
 }
@@ -2477,11 +2562,12 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
           if (-not $DryRun) {
             $rk = "$($c.Name)/$($rl.Name)"
             if ($rl.OldOn -eq 'laptop') {
-              # the record goes only when the line is gone for sure (removed now, or not there): else it stays and the next run tries again
-              if ((Remove-PhienNoteExclude $c.LDir $rl.Name) -ne 'failed') { [void]$noteDel.Add("exclude:laptop:$rk"); [void]$noteDel.Add($rk) }
+              # the records go only when the line is gone for sure (removed now, or not there): else they stay and the next run tries again.
+              # The path is the one the scan resolved (no git call here)
+              if ((Remove-PhienNoteExclude $c.LN.excl $rl.Name $rl.Legacy) -ne 'failed') { [void]$noteDel.Add("exclude:laptop:$rk"); [void]$noteDel.Add($rk) }
               else { $code = 1; Write-PhienOut "  [$($c.Name)] lỗi: ghi chú $($rl.Name): chưa gỡ được dòng /$($rl.Name) của fcode trong .git/info/exclude (liên kết, hoặc git lỗi / không trả lời kịp), lần sau thử lại" }
             }
-            else { [void]$unexcl.Add(@{ project = $c.Name; name = $rl.Name }) }
+            else { [void]$unexcl.Add(@{ project = $c.Name; name = $rl.Name; legacy = $rl.Legacy }) }
           }
         }
         if ($DryRun) {
@@ -2545,8 +2631,8 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
       if (($ensure.Count -or $unexcl.Count) -and -not $nb) { $nb = New-PhienBatch (Join-Path $tmpRoot 'put\notes'); [void]$putB.Add($nb) }
       if ($nb) { foreach ($x in $ensure) { [void]$nb.Ensure.Add($x) }; foreach ($x in $unexcl) { [void]$nb.Unexclude.Add($x) } }
       $notePlanned = $putN.Count; $placedPut = 0
-      # $Strict: a failed write throws (the ownership saved before an exclude line: no saved ownership, no line, no note)
-      $saveNotes = { param([bool]$Strict = $false) if ($noteRec.Count -or $noteDel.Count) { foreach ($k in $noteRec.Keys) { $noteState[$k] = $noteRec[$k] }; foreach ($k in $noteDel) { $noteState.Remove([string]$k) }; try { Write-PhienNoteState $noteState } catch { if ($Strict) { throw "không ghi được trạng thái ghi chú (handoff-state.json): $($_.Exception.Message)" } } } }
+      # every write of handoff-state.json is strict: a failed write stops the run there with the file name and the reason
+      $saveNotes = { if ($noteRec.Count -or $noteDel.Count) { foreach ($k in $noteRec.Keys) { $noteState[$k] = $noteRec[$k] }; foreach ($k in $noteDel) { $noteState.Remove([string]$k) }; try { Write-PhienNoteState $noteState } catch { throw "không ghi được trạng thái ghi chú (handoff-state.json): $($_.Exception.Message)" } } }
       $deferredTops = New-Object System.Collections.ArrayList; $busyFiles = New-Object System.Collections.ArrayList
       # --- mot dot gui len box (chep sang thu muc tam, doi cwd, dong goi, gui, xoa): 'ok' | 'fail' | 'lost' (ssh 255: mat box) ---
       $putRes = @{ new = 0; replaced = 0; same = 0; skip = 0; busy = 0; blobs = 0; failed = 0 }
@@ -2587,8 +2673,9 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
         foreach ($x in @($res.deferred)) { if ($x) { [void]$deferredTops.Add([string]$x) } }
         foreach ($x in @($res.busyFiles)) { if ($x) { [void]$busyFiles.Add([string]$x) } }
         foreach ($k in @($res.notePlaced)) { if ($k) { $noteRec[[string]$k] = $noteShaPut[[string]$k]; $stat.noteCopied++; $placedPut++ } }
-        foreach ($k in @($res.exclAdded)) { if ($k) { $noteRec["exclude:box:$k"] = '1' } }
         foreach ($k in @($res.unexcluded)) { if ($k) { [void]$noteDel.Add("exclude:box:$k"); [void]$noteDel.Add([string]$k) } }
+        # a release the box could not do (it could not find its exclude file): a failure, nothing forgotten, the next run tries again
+        foreach ($x in @($pb.Unexclude)) { if (@($res.unexcluded) -notcontains "$($x.project)/$($x.name)") { $code = 1; Write-PhienOut "  [$($x.project)] lỗi: ghi chú $($x.name): box chưa gỡ được dòng /$($x.name) của fcode trong .git/info/exclude (git trên box lỗi), lần sau thử lại" } }
         & $saveNotes
         'ok'
       }
@@ -2653,9 +2740,8 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
           $key = "$($u.C.Name)/$($u.Name)"; $info = $noteGetInfo[$key]
           if (Test-PhienTimeUp) { $cut = $true }   # safe point: before a note
           if ($cut -or -not (Test-Path -LiteralPath $src)) { $noteSkipped++; continue }
-          # ownership is saved before fcode adds the line: a kill after the line never leaves a line fcode does not know it owns
-          $ns = Install-PhienNote $src $u.C.LDir $u.Name $info.Expect $gnow $PhienBusySec ([string]$info.Sha) { $noteRec["exclude:laptop:$key"] = '1'; & $saveNotes $true }
-          if ($ns -eq 'ok') { $noteRec[$key] = [string]$info.Sha; $stat.noteCopied++; if ($script:PhienLastExclAdded) { $noteRec["exclude:laptop:$key"] = '1' } } else { $noteSkipped++ }
+          $ns = Install-PhienNote $src $u.C.LDir $u.Name $info.Expect $gnow $PhienBusySec ([string]$info.Sha)
+          if ($ns -eq 'ok') { $noteRec[$key] = [string]$info.Sha; $stat.noteCopied++ } else { $noteSkipped++ }
           if ($ns -eq 'timeout') { $cut = $true; Write-PhienOut "  [$($u.C.Name)] ghi chú $($u.Name): git không trả lời kịp, chưa đặt (lần sau làm tiếp)" }
           if ($ns -eq 'link') { Write-PhienOut "  [$($u.C.Name)] ghi chú $($u.Name): .git/info/exclude là liên kết, fcode không ghi vào đó, chưa đặt" }
         }
@@ -2685,7 +2771,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
         if ("$st" -eq 'ok') { continue }
         if ("$st" -eq 'cap') { if ($Quick) { $capHit = $true } else { Write-PhienOut 'hết thời gian của lượt này: phần còn lại để lần sau'; $code = 1 }; break }
         $code = 1
-        $bn = & $bigName $job.B; if ($bn) { Write-PhienOut "phiên lớn: $bn chưa chép xong — chạy ``fcode phien`` khi mạng tốt"; $stat.unfinished += $bn }
+        $bn = & $bigName $job.B; if ($bn) { Write-PhienOut "phiên lớn: $bn chưa chép xong — chạy fcode phien khi mạng tốt"; $stat.unfinished += $bn }
         if ("$st" -eq 'lost') { Write-PhienOut 'lỗi: mất kết nối với box, phần còn lại để lần sau'; break }
       }
       $noteSkipped += $notePlanned - $placedPut
@@ -2764,22 +2850,29 @@ function Get-PhienUpstreamNotes([string]$Dir) {
   , @($r.Out | Where-Object { $_ -cmatch $rx } | Sort-Object)
 }
 
-# cung dang voi `scan_notes` cua box: @{gitok; tracked (index); upstream (origin/<mac dinh>); files = {name,size,mtime,sha,ign}}
+# cung dang voi `scan_notes` cua box: @{gitok; tracked (index); upstream (origin/<mac dinh>); files = {name,size,mtime,sha,ign,fx}; excl}
+# fx = the exclude file has fcode's pair for that name (Rule O); excl = the exclude file git names (the release reuses it: no git call there)
 function Get-PhienLocalNotes([string]$Dir) {
-  $nogit = [pscustomobject]@{ gitok = $false; tracked = @(); upstream = @(); files = @() }   # also when git did not answer in time: no note sync for it this run
+  $nogit = [pscustomobject]@{ gitok = $false; tracked = @(); upstream = @(); files = @(); excl = '' }   # also when git did not answer in time: no note sync for it this run
   $r = Invoke-GitQuiet $Dir (@('ls-files', '--') + (Get-PhienNoteSpecs))
   if ($r.Code -ne 0) { return $nogit }
+  # no answer for the exclude path, or a file that cannot be read: no note work for this project this run (never "no line of ours"); no file = no pair
+  $ep = Invoke-GitQuiet $Dir @('rev-parse', '--git-path', 'info/exclude')
+  $excl = [string]@($ep.Out)[0]
+  if ($ep.Code -ne 0 -or -not $excl) { return $nogit }
+  if (-not [IO.Path]::IsPathRooted($excl)) { $excl = Join-Path $Dir $excl }
+  try { $ext = Read-PhienExcludeText $excl } catch { Write-PhienOut "  [$Dir] không đọc được .git/info/exclude ($($_.Exception.Message)), bỏ qua ghi chú của dự án này lần này"; return $nogit }
   $rx = Get-PhienNoteRx
   $files = New-Object System.Collections.ArrayList
   foreach ($f in (Get-ChildItem -LiteralPath $Dir -File -Force | Sort-Object Name)) {
     if ($f.Name -cnotmatch $rx) { continue }
     $ig = Invoke-GitQuiet $Dir @('check-ignore', '-q', '--', $f.Name)
     if ($ig.Code -eq 124) { return $nogit }
-    [void]$files.Add([pscustomobject]@{ name = $f.Name; size = $f.Length; mtime = (ConvertTo-Epoch $f.LastWriteTimeUtc); sha = (Get-RangeSha $f.FullName 0 $f.Length); ign = ($ig.Code -eq 0) })
+    [void]$files.Add([pscustomobject]@{ name = $f.Name; size = $f.Length; mtime = (ConvertTo-Epoch $f.LastWriteTimeUtc); sha = (Get-RangeSha $f.FullName 0 $f.Length); ign = ($ig.Code -eq 0); fx = (Test-PhienMarkedLine $ext $f.Name) })
   }
   $up = Get-PhienUpstreamNotes $Dir
   if ($null -eq $up) { return $nogit }
-  [pscustomobject]@{ gitok = $true; tracked = @($r.Out | Where-Object { $_ -cmatch $rx } | Sort-Object); upstream = @($up); files = @($files) }
+  [pscustomobject]@{ gitok = $true; tracked = @($r.Out | Where-Object { $_ -cmatch $rx } | Sort-Object); upstream = @($up); files = @($files); excl = $excl }
 }
 
 # ke hoach cho mot project: Put/Get = {Name; Expect (sha hien co o dich, '' neu chua co); Sha (sha noi dung se chep)};
@@ -2796,9 +2889,10 @@ function Get-PhienNotePlan([string]$Proj, $LN, $RN, $State, [double]$LNow, [doub
     $lm = @{}; foreach ($f in @($LN.files)) { $lm[[string]$f.name] = $f }
     $rm = @{}; foreach ($f in @($RN.files)) { $rm[[string]$f.name] = $f }
     # git tracks a name now (other index or upstream) and fcode had placed + excluded the untracked copy on one side: stop syncing it
-    # and give that one line back
-    foreach ($n in @($lt + $up | Sort-Object -Unique)) { if (-not ($rt -ccontains $n) -and $rm[$n] -and $State["exclude:box:$Proj/$n"]) { [void]$release.Add([pscustomobject]@{ Name = $n; TrackedOn = $(if ($lt -ccontains $n) { 'laptop' } else { 'origin' }); OldOn = 'box' }) } }
-    foreach ($n in @($rt + $up | Sort-Object -Unique)) { if (-not ($lt -ccontains $n) -and $lm[$n] -and $State["exclude:laptop:$Proj/$n"]) { [void]$release.Add([pscustomobject]@{ Name = $n; TrackedOn = $(if ($rt -ccontains $n) { 'box' } else { 'origin' }); OldOn = 'laptop' }) } }
+    # and give that one line back. Ownership = the "# fcode" pair in that side's exclude file (fx); the record only for a line 1.3.2/1.3.3
+    # added (Legacy: then the bare line may go too)
+    foreach ($n in @($lt + $up | Sort-Object -Unique)) { if (-not ($rt -ccontains $n) -and $rm[$n] -and ($rm[$n].fx -or $State["exclude:box:$Proj/$n"])) { [void]$release.Add([pscustomobject]@{ Name = $n; TrackedOn = $(if ($lt -ccontains $n) { 'laptop' } else { 'origin' }); OldOn = 'box'; Legacy = [bool]$State["exclude:box:$Proj/$n"] }) } }
+    foreach ($n in @($rt + $up | Sort-Object -Unique)) { if (-not ($lt -ccontains $n) -and $lm[$n] -and ($lm[$n].fx -or $State["exclude:laptop:$Proj/$n"])) { [void]$release.Add([pscustomobject]@{ Name = $n; TrackedOn = $(if ($rt -ccontains $n) { 'box' } else { 'origin' }); OldOn = 'laptop'; Legacy = [bool]$State["exclude:laptop:$Proj/$n"] }) } }
     foreach ($n in @(@($lm.Keys) + @($rm.Keys) | Sort-Object -Unique)) {
       if ($tracked -ccontains $n) { continue }
       $l = $lm[$n]; $r = $rm[$n]; $key = "$Proj/$n"
@@ -2817,9 +2911,19 @@ function Get-PhienNotePlan([string]$Proj, $LN, $RN, $State, [double]$LNow, [doub
 }
 
 function Get-PhienNoteStatePath { Join-Path $env:LOCALAPPDATA 'fcode\handoff-state.json' }
+# strict: a missing file is an empty state; anything else that is not one JSON object (unreadable, cut, `null`, `42`, an array) stops the run
+# before any change, so the sha memory and the 1.3.2/1.3.3 ownership records are never overwritten with nothing
 function Read-PhienNoteState {
+  $sp = Get-PhienNoteStatePath
+  if (-not (Test-Path -LiteralPath $sp)) { return @{} }
   $h = @{}
-  try { foreach ($p in ([IO.File]::ReadAllText((Get-PhienNoteStatePath)) | ConvertFrom-Json).PSObject.Properties) { $h[$p.Name] = [string]$p.Value } } catch { }
+  try {
+    $raw = [IO.File]::ReadAllText($sp)
+    if ($raw -notmatch '\A\s*\{') { throw 'không phải một đối tượng JSON' }   # PowerShell 7 unwraps a one-item array into its object
+    $o = $raw | ConvertFrom-Json
+    if ($o -isnot [Management.Automation.PSCustomObject]) { throw 'không phải một đối tượng JSON' }
+    foreach ($p in $o.PSObject.Properties) { $h[$p.Name] = [string]$p.Value }
+  } catch { throw "không đọc được trạng thái ghi chú (handoff-state.json): $($_.Exception.Message)" }
   $h
 }
 function Write-PhienNoteState([hashtable]$S) {
@@ -2844,39 +2948,44 @@ function Get-PhienExcludeFile([string]$Dir, [string]$Name) {
   if (Test-PhienReparse $p) { $script:PhienExclLink = $true; return $null }   # never write through a symlink / junction
   $p
 }
-# the file half (plain .NET, no git): add "/<ten>" to that exclude file (whole-file atomic rewrite). Tra ve $true chi khi LAN NAY them dong
-# (noi goi ghi lai de sau nay chi go dung dong do)
+# .git/info/exclude is read and written as Latin-1 (one char per byte, lossless): every byte of the user's file survives a rewrite, whatever its
+# encoding; a note name is compared and written as the Latin-1 form of its UTF-8 bytes (what git reads)
+function ConvertTo-PhienLatin1([string]$Text) { [Text.Encoding]::GetEncoding(28591).GetString([Text.Encoding]::UTF8.GetBytes($Text)) }
+function Read-PhienExcludeText([string]$File) { if (-not [IO.File]::Exists($File)) { return '' }; [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($File)) }
+# Rule O: a line is fcode's when it is the pair "# fcode" (its own line) right above "/<ten>", written in one atomic write
+function Get-PhienMarkRx([string]$Name) { '(?m)^# fcode\r?\n/' + [regex]::Escape((ConvertTo-PhienLatin1 $Name)) + '\r?(?:\n|\z)' }
+function Test-PhienMarkedLine([string]$Text, [string]$Name) { [bool]($Text -and [regex]::IsMatch($Text, (Get-PhienMarkRx $Name))) }
+# the file half (plain .NET, no git): add the pair "# fcode" + "/<ten>" to that exclude file in one atomic rewrite (the pair is the ownership),
+# with the file's own newline. Tra ve $true chi khi LAN NAY them; an exact "/<ten>" already there is the user's: nothing added, nothing claimed
 function Add-PhienExcludeLine([string]$File, [string]$Name) {
   if (Test-PhienExcludeLine $File $Name) { return $false }
-  $cur = if ([IO.File]::Exists($File)) { [IO.File]::ReadAllText($File) } else { '' }
-  Write-PhienText $File ($cur + $(if ($cur -and -not $cur.EndsWith("`n")) { "`n" } else { '' }) + '/' + $Name + "`n")
+  $cur = Read-PhienExcludeText $File
+  $nl = if ($cur -match "`r`n") { "`r`n" } else { "`n" }
+  Write-PhienText $File ($cur + $(if ($cur -and -not $cur.EndsWith("`n")) { $nl } else { '' }) + '# fcode' + $nl + '/' + (ConvertTo-PhienLatin1 $Name) + $nl) ([Text.Encoding]::GetEncoding(28591))
   $true
 }
-# the exclude file already has the exact line "/<ten>" (then it is not fcode's: fcode never claims it)
-function Test-PhienExcludeLine([string]$File, [string]$Name) { [IO.File]::Exists($File) -and (@([IO.File]::ReadAllText($File) -split '\r?\n') -ccontains ('/' + $Name)) }
+# the exclude file already has the exact line "/<ten>"
+function Test-PhienExcludeLine([string]$File, [string]$Name) { [IO.File]::Exists($File) -and (@((Read-PhienExcludeText $File) -split '\r?\n') -ccontains ('/' + (ConvertTo-PhienLatin1 $Name))) }
 
-# go DUNG dong "/<ten>" (dong fcode da them); moi dong khac trong .git/info/exclude giu nguyen.
-# Tra ve: removed (da go) | absent (khong co file / khong co dong do) | failed (git loi / khong tra loi kip, hay file / thu muc la lien ket: khong ghi gi)
-function Remove-PhienNoteExclude([string]$Dir, [string]$Name) {
-  $r = Invoke-GitQuiet $Dir @('rev-parse', '--git-path', 'info/exclude')
-  $p = @($r.Out)[0]
-  if ($r.Code -ne 0 -or -not $p) { return 'failed' }
-  if (-not [IO.Path]::IsPathRooted($p)) { $p = Join-Path $Dir $p }
-  if (Test-PhienReparse $p) { return 'failed' }
-  if (-not (Test-Path -LiteralPath $p)) { return 'absent' }
-  $cur = [IO.File]::ReadAllText($p)
-  $new = [regex]::Replace($cur, '(?m)^/' + [regex]::Escape($Name) + '\r?(?:\n|\z)', '')
+# give fcode's line back: the pair "# fcode" + "/<ten>", or — only for a line 1.3.2/1.3.3 added ($Legacy: its record says so) — the bare
+# "/<ten>"; every other byte stays. No git here: $File is the path the scan resolved ('' = it could not).
+# Tra ve: removed | absent (no file / nothing of fcode's there) | failed (no path, or the file / its folder is a link: nothing written)
+function Remove-PhienNoteExclude([string]$File, [string]$Name, [bool]$Legacy) {
+  if (-not $File -or (Test-PhienReparse $File)) { return 'failed' }
+  if (-not (Test-Path -LiteralPath $File)) { return 'absent' }
+  $cur = Read-PhienExcludeText $File
+  $new = [regex]::Replace($cur, (Get-PhienMarkRx $Name), '')
+  if ($new -ceq $cur -and $Legacy) { $new = [regex]::Replace($cur, '(?m)^/' + [regex]::Escape((ConvertTo-PhienLatin1 $Name)) + '\r?(?:\n|\z)', '') }
   if ($new -ceq $cur) { return 'absent' }
-  Write-PhienText $p $new
+  Write-PhienText $File $new ([Text.Encoding]::GetEncoding(28591))
   'removed'
 }
 
 # dat mot file ghi chu da lay tu box vao goc project tren laptop.
 # Tra ve: ok | changed | busy | tracked | failed | link (.git/info/exclude la lien ket) | timeout (git did not answer in time)
-# One item, in this order: the git half, then ownership ($BeforeLine records "fcode owns the line"), then the exclude line, then the move.
-# A kill anywhere leaves at most an inert line or a recorded ownership, never a visible unexcluded note and never an unrecorded line.
-function Install-PhienNote([string]$Src, [string]$Dir, [string]$Name, [string]$Expect, [double]$Now, [int]$Busy = 30, [string]$Sha = '', [scriptblock]$BeforeLine = $null) {
-  $script:PhienLastExclAdded = $false
+# One item, in this order: the git half, then the marked pair (one atomic write, which is the ownership), then the move.
+# A kill anywhere leaves at most an inert pair, never a visible unexcluded note.
+function Install-PhienNote([string]$Src, [string]$Dir, [string]$Name, [string]$Expect, [double]$Now, [int]$Busy = 30, [string]$Sha = '') {
   if ($Sha -and (Get-RangeSha $Src 0 (Get-Item -LiteralPath $Src).Length) -ne $Sha) { return 'changed' }
   $t = Invoke-GitQuiet $Dir @('ls-files', '--', $Name)
   if ($t.Code -eq 124) { return 'timeout' }
@@ -2897,11 +3006,9 @@ function Install-PhienNote([string]$Src, [string]$Dir, [string]$Name, [string]$E
   try {
     [IO.File]::Copy($Src, $part, $true)
     [IO.File]::SetLastWriteTimeUtc($part, $mt)
-    # ownership only for a line fcode really adds now: an identical line already there is the user's
-    if ($ex) { if ($BeforeLine -and -not (Test-PhienExcludeLine $ex $Name)) { & $BeforeLine }; $added = Add-PhienExcludeLine $ex $Name } else { $added = $false }
+    if ($ex) { [void](Add-PhienExcludeLine $ex $Name) }
     if (Test-Path -LiteralPath $dst) { [IO.File]::Replace($part, $dst, [NullString]::Value) } else { [IO.File]::Move($part, $dst) }
   } finally { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }
-  $script:PhienLastExclAdded = [bool]$added
   'ok'
 }
 # trang thai che do tu dong (%LOCALAPPDATA%\fcode\phien-auto.json): box dang chay o lan kiem tra truoc, va luc (epoch giay) mo ssh
