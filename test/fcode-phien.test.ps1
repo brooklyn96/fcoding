@@ -2271,6 +2271,8 @@ T 'nhanh r5: a release whose exclude line cannot be removed (.git/info became a 
   New-InfoJunction $w.LP $tg ([IO.File]::ReadAllText("$info\exclude"))
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 1 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $FailMsg 'the failure line'
   Ok ((Read-PhienLog $w) -match 'lỗi: ghi chú HANDOFF\.md: chưa gỡ được dòng /HANDOFF\.md của fcode trong \.git/info/exclude') ('logged: ' + (Read-PhienLog $w))
+  Ok ((Read-PhienLog $w) -notmatch 'ghi chú HANDOFF\.md giờ do git theo dõi') 'a failed release prints no "xóa được" line (only the error line)'
+  Eq @((Get-Content (Join-Path $w.U 'AppData\Local\fcode\phien-status.json') -Raw | ConvertFrom-Json).notes.released).Count 0 'a failed release is not in notes.released'
   Ok ((Get-Content (Join-Path $tg 'exclude') -Raw) -match '(?m)^# fcode\r?\n/HANDOFF\.md\r?$') 'nothing written through the link: the pair is still in the target'
   Ok ($null -ne (Get-Content $sf -Raw | ConvertFrom-Json).PSObject.Properties['proj/HANDOFF.md']) 'the sha record is kept'
   # fixed: a plain folder again (same content); the pair is still there, so the next run gives the line back
@@ -2416,6 +2418,8 @@ T 'nhanh r6: the box cannot find its exclude file during a release: failure line
   Rename-Item -LiteralPath "$bpw\.git-x" -NewName '.git'
   Eq $r.Code 1 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $FailMsg 'the failure line'
   Ok ((Read-PhienLog $w) -match '\[proj\] lỗi: ghi chú HANDOFF-lap\.md: box chưa gỡ được dòng /HANDOFF-lap\.md của fcode trong \.git/info/exclude \(liên kết, git trên box lỗi, hoặc chưa tạo được \.fcode/\.gitignore\), lần sau thử lại') ('logged: ' + (Read-PhienLog $w))
+  Ok ((Read-PhienLog $w) -notmatch 'ghi chú HANDOFF-lap\.md giờ do git theo dõi') 'a failed box release prints no "xóa được" line (only the error line)'
+  Eq @((Get-Content (Join-Path $w.U 'AppData\Local\fcode\phien-status.json') -Raw | ConvertFrom-Json).notes.released).Count 0 'a failed box release is not in notes.released'
   Ok ((Get-Content $bex -Raw) -match '(?m)^# fcode\r?\n/HANDOFF-lap\.md\r?$') 'the pair is still on the box'
   Ok ($null -ne (Get-NoteState $w).PSObject.Properties['proj/HANDOFF-lap.md']) 'nothing forgotten'
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
@@ -2778,13 +2782,63 @@ g['git'] = lambda dd, *a, **k: None if (iseq(dd, B) and a[:1] == ('check-ignore'
 reset()
 print(U(), exb() == pair)
 g['git'] = realgit
-g['tracked_names'] = lambda x: None
+g['tracked_names'] = lambda x, s=False: None
 reset()
 print(U(), exb() == pair)
 g['tracked_names'] = realtn
 g['git'] = lambda dd, *a, **k: subprocess.CompletedProcess([], 128, b'', b'') if (iseq(dd, B) and a[:1] == ('check-ignore',)) else realgit(dd, *a, **k)
 reset()
 print(U(), exb() == pair)
+g['git'] = realgit
+# 6b the upstream half of the holder test: B's copy is in origin's default branch only, and git gives no answer for B's ls-tree (a timeout): False,
+# the pair stays (never kept, never released on a guess); with git answering it is released (control)
+G('remote', 'add', 'origin', O)
+G('fetch', '-q', 'origin')
+g['git'] = lambda dd, *a, **k: None if (iseq(dd, B) and a[:1] == ('ls-tree',)) else realgit(dd, *a, **k)
+reset()
+print(U(), exb() == pair)
+g['git'] = realgit
+reset()
+print(U(), exb() == b'# user\n')
+# the other two strict branches of the upstream half: symbolic-ref gives no answer; then (origin/HEAD gone) `rev-parse --verify origin/main` gives none;
+# then git answers: the origin/main fallback finds it upstream (released)
+g['git'] = lambda dd, *a, **k: None if (iseq(dd, B) and a[:1] == ('symbolic-ref',)) else realgit(dd, *a, **k)
+reset()
+print(U(), exb() == pair)
+G('symbolic-ref', '--delete', 'refs/remotes/origin/HEAD')
+g['git'] = lambda dd, *a, **k: None if (iseq(dd, B) and a[:3] == ('rev-parse', '-q', '--verify')) else realgit(dd, *a, **k)
+reset()
+print(U(), exb() == pair)
+g['git'] = realgit
+reset()
+print(U(), exb() == b'# user\n')
+G('remote', 'remove', 'origin')
+# 6c a sibling whose rev-parse fails with rc 128 but not "not a git repository" (dubious ownership): False, the pair stays; the real "not a git
+# repository" skips that folder (released)
+def rp(msg):
+    return lambda dd, *a, **k: subprocess.CompletedProcess([], 128, b'', msg) if (iseq(dd, B) and a[:1] == ('rev-parse',) and '--is-inside-work-tree' in a) else realgit(dd, *a, **k)
+g['git'] = rp(b'fatal: detected dubious ownership in repository at B\n')
+reset()
+print(U(), exb() == pair)
+g['git'] = rp(b'fatal: not a git repository (or any of the parent directories): .git\n')
+reset()
+print(U(), exb() == b'# user\n')
+# 6d a config project Z whose rev-parse fails with "dubious ownership": while it holds no copy of the note it is skipped (it never blocks a release, and a
+# holder B past it is still found); once it holds a regular copy it is a holder candidate and the failure is an error
+Z = os.path.join(par, 'r12a-Z')
+os.makedirs(Z)
+pz = {'root': d, 'b': B, 'z': Z}
+g['git'] = lambda dd, *a, **k: subprocess.CompletedProcess([], 128, b'', b'fatal: detected dubious ownership in repository at Z\n') if (iseq(dd, Z) and a[:1] == ('rev-parse',) and '--is-inside-work-tree' in a) else realgit(dd, *a, **k)
+os.unlink(fb)
+reset()
+print(U(pz), exb() == b'# user\n')
+open(fb, 'w').write('x')
+reset()
+print(U(pz), exb() == pair)
+open(os.path.join(Z, 'HANDOFF.md'), 'w').write('x')
+reset()
+print(U(pz), exb() == pair)
+os.unlink(os.path.join(Z, 'HANDOFF.md'))
 g['git'] = realgit
 # 7 the copy sits in a sub-folder project (the /HANDOFF.md line is anchored at the root)
 os.unlink(fb)
@@ -2810,7 +2864,7 @@ print(m['unexclude'](B, name, False, projs, []))
 reset()
 print(U(rel=[]))
 '@ $d
-  Eq ($out -join ',') "kept True True,True True,True True,True True True,True True,False True True,False True,False True,False True,True True,kept True,True True,True True True,True,kept,kept" '1 kept; 2 upstream-only and 2b index-tracked release; 3 independent .gitignore releases and stays hidden; 4 deleted releases; 5a False and nothing made; 5b/5c/6 a git failure on the holder test is False (an error, never kept), the pair stays; 7 sub-folder copy releases; 8 legacy kept, non-legacy untouched; 9 releasing set ends the hold'
+  Eq ($out -join ',') "kept True True,True True,True True,True True True,True True,False True True,False True,False True,False True,False True,True True,False True,False True,True True,False True,True True,True True,kept True,False True,True True,kept True,True True,True True True,True,kept,kept" '1 kept; 2 upstream-only and 2b index-tracked release; 3 independent .gitignore releases and stays hidden; 4 deleted releases; 5a False and nothing made; 5b/5c/6 a git failure on the holder test is False (an error, never kept), the pair stays; 7 sub-folder copy releases; 8 legacy kept, non-legacy untouched; 9 releasing set ends the hold'
 }
 # r12 (release 1.3.6 P3): the box reads check-ignore's "<source>:<line>:<pattern>" from the known pattern, not by colons
 T 'notes r12: b: the box reads check-ignore -v -z (never quoted; fewer than four fields is a failure: False, the pair stays); a note name holding a colon is still told apart (kept by the pair, released by a .gitignore); a negated .gitignore line releases; the exclude file is cut again right before the write' {
@@ -2889,10 +2943,18 @@ reset()
 print(U(), exb() == b'# user\n/injected\n')
 g['hide_all_uploads'] = inject(b'# user\n/other\n')
 reset()
-print(U(), exb() == b'# user\n/other\n')
+wr = []
+realwe = g['write_exclude']
+def we(q, *a):
+    if iseq(q, p):
+        wr.append(1)
+    return realwe(q, *a)
+g['write_exclude'] = we
+print(U(), exb() == b'# user\n/other\n', not wr)   # nothing left to cut: no write at all (a needless rewrite could drop a line appended meanwhile)
+g['write_exclude'] = realwe
 g['hide_all_uploads'] = realhide
 '@ $d
-  Eq ($out -join ',') 'kept True,True True,False True,True True,kept True,True True,True True,True True' '1 -z answer (the text form would be quoted): kept; .gitignore source releases; three fields: failed, pair stays; 2 negation releases; 3 colon name: pair holds, .gitignore releases; 4 a line added meanwhile survives; 5 the pair taken meanwhile: nothing written'
+  Eq ($out -join ',') 'kept True,True True,False True,True True,kept True,True True,True True,True True True' '1 -z answer (the text form would be quoted): kept; .gitignore source releases; three fields: failed, pair stays; 2 negation releases; 3 colon name: pair holds, .gitignore releases; 4 a line added meanwhile survives; 5 the pair taken meanwhile: nothing written (write_exclude not called)'
 }
 # r12 (release 1.3.6 P3): real git, folders with non-ASCII names (the exclude path and the sibling tree): the holder is told apart, kept and released
 T 'notes r12: e: a folder name with non-ASCII characters (the exclude path and the other work tree): kept while that copy is held, released when its own .gitignore hides it' {
@@ -2937,6 +2999,27 @@ T 'notes r12: c: Get-PhienRepoId answers $null only for git''s "not a git reposi
   Eq (Get-PhienRepoId $rp) 'unknown' 'asked once per folder for the run: the first answer is reused'
 }
 
+T 'notes r12: h: the laptop runs git with LC_ALL=C through the process environment (restored after the call); fcode.ps1 never touches the ProcessStartInfo environment dictionary' {
+  $rp = Join-Path $Root 'r12h'; New-GitDir $rp
+  $al = @('-c', 'alias.e=!printf %s "$LC_ALL"', 'e')   # the alias prints what the git child sees
+  $had = Test-Path Env:LC_ALL; $was = $env:LC_ALL
+  try {
+    if ($had) { Remove-Item Env:LC_ALL }
+    $r = Invoke-GitQuiet $rp $al
+    Eq $r.Code 0 ('git ran: ' + $r.Err); Eq ([string]@($r.Out)[0]) 'C' 'the child sees LC_ALL=C'; Eq (Test-Path Env:LC_ALL) $false 'unset before: unset after'
+    $env:LC_ALL = 'vi_VN.UTF-8'
+    $r = Invoke-GitQuiet $rp $al
+    Eq ([string]@($r.Out)[0]) 'C' 'C even when the user set another locale'; Eq $env:LC_ALL 'vi_VN.UTF-8' 'set before: restored after'
+  } finally { if ($had) { $env:LC_ALL = $was } else { Remove-Item Env:LC_ALL -ErrorAction SilentlyContinue } }
+  Eq @(Select-String -LiteralPath $Fcode -Pattern 'EnvironmentVariables' -SimpleMatch).Count 0 'no environment getter of ProcessStartInfo anywhere (it fails on Windows PowerShell 5.1 when two names differ only in case)'
+}
+T 'notes r12: i: the box runs git with LC_ALL=C' {
+  $d = Join-Path $Root 'r12i'; New-GitDir $d
+  $out = Invoke-BoxDriver 'r12i' @'
+print(m['git'](d, '-c', 'alias.e=!printf %s "$LC_ALL"', 'e').stdout == b'C')
+'@ $d
+  Eq ($out -join ',') 'True' 'the box git child sees LC_ALL=C'
+}
 # r12 e2e (release 1.3.6): two projects on one repository (linked work trees) share one .git/info/exclude on each side
 function Git-Seed([string]$Dir) { $ErrorActionPreference = 'Continue'; & git -C $Dir -c user.name=t -c user.email=t@t commit -q --allow-empty -m seed 2>&1 | Out-Null }
 function Add-Wt([string]$Repo, [string]$Path, [string]$Branch) { $ErrorActionPreference = 'Continue'; & git -C $Repo worktree add -q $Path -b $Branch 2>&1 | Out-Null; if ($LASTEXITCODE -ne 0) { throw "git worktree add $Path failed" } }
@@ -2964,16 +3047,16 @@ T 'nhanh r12: box side: a release the other box work tree still depends on is ke
   Git-Commit $w.LP @('HANDOFF.md'); $m = New-LogMark $w
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
   $lg = Log-Since $w $m
-  Ok ($lg -match 'ghi chú HANDOFF\.md giờ do git theo dõi \(trên laptop\): bản cũ trên box xóa được') ('run 2: the release line: ' + $lg); Ok ($lg -match (Kept-Rx 'proj' 'HANDOFF.md' 'box')) ('run 2: the kept line: ' + $lg); Ok ($lg -notmatch 'lỗi:') ('run 2: no error line: ' + $lg)
+  Ok ($lg -notmatch 'ghi chú HANDOFF\.md giờ do git theo dõi') ('run 2: a kept pair gets no release line: ' + $lg); Ok ($lg -match (Kept-Rx 'proj' 'HANDOFF.md' 'box') -and $lg -notmatch 'xóa được') ('run 2: the kept line: ' + $lg); Ok ($lg -notmatch 'lỗi:') ('run 2: no error line: ' + $lg)
   Eq (Pair-Count $bex 'HANDOFF.md') 1 'run 2: the pair stays'; Eq (Ign-Rc $w.BO 'HANDOFF.md') 0 'run 2: the other tree still hides its copy'
   $sj = Get-Content (Join-Path $w.U 'AppData\Local\fcode\phien-status.json') -Raw | ConvertFrom-Json
-  Eq (@($sj.notes.released) -join ',') 'proj/HANDOFF.md' 'run 2: the status lists the release (a kept line is still a release the user was told about)'
+  Eq @($sj.notes.released).Count 0 'run 2: the status does not list a kept pair (the menu never says "xóa được" for it)'
   Ok ($null -ne (Get-NoteState $w).PSObject.Properties['proj/HANDOFF.md']) 'run 2: nothing forgotten'
   Remove-Item -LiteralPath "$($w.BO)\HANDOFF.md"; Put-File "$($w.LO)\HANDOFF.md" 'changed'; $m = New-LogMark $w
   $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
   $lg = $r.Out
   Eq (Get-Content "$($w.BO)\HANDOFF.md" -Raw) 'changed' 'run 3: the re-sent copy is on the box'; Eq (Ign-Rc $w.BO 'HANDOFF.md') 0 'run 3: and hidden'; Eq (Pair-Count $bex 'HANDOFF.md') 1 'run 3: the pair stays'
-  Ok ($lg -match (Kept-Rx 'proj' 'HANDOFF.md' 'box')) ('run 3: the kept line again: ' + $lg); Ok ($lg -notmatch 'lỗi:') ('run 3: no error line: ' + $lg)
+  Ok ($lg -match (Kept-Rx 'proj' 'HANDOFF.md' 'box') -and $lg -notmatch 'xóa được') ('run 3: the kept line again: ' + $lg); Ok ($lg -notmatch 'lỗi:') ('run 3: no error line: ' + $lg)
   Git-Commit $w.LO @('HANDOFF.md'); $m = New-LogMark $w
   $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
   $lg = $r.Out
@@ -2989,18 +3072,19 @@ T 'nhanh r12: laptop side (project registered through a junction): a release the
   Git-Commit $w.BP @('TASK.md'); $m = New-LogMark $w
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
   $lg = Log-Since $w $m
-  Ok ($lg -match 'ghi chú TASK\.md giờ do git theo dõi \(trên box\): bản cũ trên laptop xóa được') ('run 2: the release line: ' + $lg); Ok ($lg -match (Kept-Rx 'proj' 'TASK.md' 'laptop')) ('run 2: the kept line: ' + $lg); Ok ($lg -notmatch 'lỗi:') ('run 2: no error line: ' + $lg)
+  Ok ($lg -notmatch 'ghi chú TASK\.md giờ do git theo dõi') ('run 2: a kept pair gets no release line: ' + $lg); Ok ($lg -match (Kept-Rx 'proj' 'TASK.md' 'laptop') -and $lg -notmatch 'xóa được') ('run 2: the kept line: ' + $lg); Ok ($lg -notmatch 'lỗi:') ('run 2: no error line: ' + $lg)
   Eq (Pair-Count $lex 'TASK.md') 1 'run 2: the pair stays'; Eq (Ign-Rc $w.LO 'TASK.md') 0 'run 2: the other tree still hides its copy'
+  Eq @((Get-Content (Join-Path $w.U 'AppData\Local\fcode\phien-status.json') -Raw | ConvertFrom-Json).notes.released).Count 0 'run 2: the status does not list a kept pair'
   # a corrupt index of the other work tree: git cannot say whether its copy is tracked: an error (exit 1), the pair stays, nothing is forgotten; healed, the next run keeps it
   $ErrorActionPreference = 'Continue'; $ix = (@(& git -C $w.LO rev-parse --git-path index)[0]) -replace '/', '\'; $ErrorActionPreference = 'Stop'
   if (-not [IO.Path]::IsPathRooted($ix)) { $ix = Join-Path $w.LO $ix }
   $orig = Read-Bytes $ix; $junk = New-Object byte[] 16; (New-Object Random 7).NextBytes($junk); [IO.File]::WriteAllBytes($ix, $junk); $m = New-LogMark $w
   try { $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') } finally { [IO.File]::WriteAllBytes($ix, $orig) }
   Eq $r.Code 1 $r.Out; $lg = Log-Since $w $m
-  Ok ($lg -match 'lỗi: ghi chú TASK\.md: chưa gỡ được dòng /TASK\.md') ('run 3 (corrupt index): the error line: ' + $lg); Ok ($lg -notmatch (Kept-Rx 'proj' 'TASK.md' 'laptop')) ('run 3: not a kept line: ' + $lg); Eq (Pair-Count $lex 'TASK.md') 1 'run 3: the pair stays'
+  Ok ($lg -match 'lỗi: ghi chú TASK\.md: chưa gỡ được dòng /TASK\.md') ('run 3 (corrupt index): the error line: ' + $lg); Ok ($lg -notmatch (Kept-Rx 'proj' 'TASK.md' 'laptop') -and $lg -notmatch 'xóa được') ('run 3: not a kept line, no "xóa được" line (the error line alone): ' + $lg); Eq (Pair-Count $lex 'TASK.md') 1 'run 3: the pair stays'
   Ok ($null -ne (Get-NoteState $w).PSObject.Properties['proj/TASK.md']) 'run 3: nothing forgotten'
   $m = New-LogMark $w; $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out; $lg = Log-Since $w $m
-  Ok ($lg -match (Kept-Rx 'proj' 'TASK.md' 'laptop') -and $lg -notmatch 'lỗi:') ('run 4 (index healed): the kept line again: ' + $lg)
+  Ok ($lg -match (Kept-Rx 'proj' 'TASK.md' 'laptop') -and $lg -notmatch 'xóa được' -and $lg -notmatch 'lỗi:') ('run 4 (index healed): the kept line again: ' + $lg)
 }
 T 'nhanh r12: laptop side: a copy that the other work tree hides through its own .gitignore does not keep the line (released, still hidden there)' {
   $w = New-ShareWorld 'q43' -Junction
@@ -3035,7 +3119,7 @@ T 'nhanh r12: quick run, two laptop checkouts with the same folder name: the one
   Put-File "$($w.LP)\TASK.md" 'main copy'; Git-Commit $w.BP @('TASK.md'); $m = New-LogMark $w
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
   $lg = Log-Since $w $m
-  Ok ($lg -match (Kept-Rx 'proj' 'TASK.md' 'laptop')) ('the kept line: ' + $lg); Ok ($lg -notmatch 'lỗi:') ('no error line: ' + $lg); Eq (Pair-Count $lex 'TASK.md') 1 'the pair stays'; Eq (Ign-Rc $w.LP 'TASK.md') 0 'the main checkout still hides its copy'
+  Ok ($lg -match (Kept-Rx 'proj' 'TASK.md' 'laptop') -and $lg -notmatch 'xóa được') ('the kept line: ' + $lg); Ok ($lg -notmatch 'lỗi:') ('no error line: ' + $lg); Eq (Pair-Count $lex 'TASK.md') 1 'the pair stays'; Eq (Ign-Rc $w.LP 'TASK.md') 0 'the main checkout still hides its copy'
 }
 T 'nhanh r12: a note placed in the same run on the other laptop work tree: the line is back after the release, and the next run keeps it' {
   $w = New-ShareWorld 'q46'
@@ -3046,7 +3130,7 @@ T 'nhanh r12: a note placed in the same run on the other laptop work tree: the l
   $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
   Eq (Get-Content "$($w.LO)\TASK.md" -Raw) 'for other' 'run 2: other got its note'; Eq (Pair-Count $lex 'TASK.md') 1 'run 2: the pair is there again'; Eq (Ign-Rc $w.LO 'TASK.md') 0 'run 2: other is hidden'
   $m = New-LogMark $w; $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out; $lg = $r.Out
-  Ok ($lg -match (Kept-Rx 'proj' 'TASK.md' 'laptop') -and $lg -notmatch 'lỗi:') ('run 3: the kept line: ' + $lg)
+  Ok ($lg -match (Kept-Rx 'proj' 'TASK.md' 'laptop') -and $lg -notmatch 'xóa được' -and $lg -notmatch 'lỗi:') ('run 3: the kept line: ' + $lg)
 }
 T 'notes r12: d: the laptop asks git about the other work trees only while fcode''s line is still in the exclude file; a git failure there is failed (never kept)' {
   $dd = Join-Path $Root 'r12d'; [void](New-Item -ItemType Directory -Path $dd -Force)
@@ -3057,6 +3141,21 @@ T 'notes r12: d: the laptop asks git about the other work trees only while fcode
   Eq (Rel "# user`n/TASK.md`n" $false) 'absent' 'a bare user line without the legacy flag: not fcode''s'; Eq $script:gitCalls 0 'git not asked (bare, no legacy)'
   Eq (Rel "# user`n# fcode`n/TASK.md`n" $false) 'failed' 'the pair is there and git cannot say: failed, not kept'; Ok ($script:gitCalls -gt 0) 'git asked'; Eq ([IO.File]::ReadAllText($ex)) "# user`n# fcode`n/TASK.md`n" 'nothing written'
   Eq (Rel "# user`n/TASK.md`n" $true) 'failed' 'legacy + the bare line: git asked, cannot say: failed'
+  # a link is checked before any holder is asked (the box order: is_link first): .git/info a junction + a holder = failed, never kept
+  $real = Join-Path $Root 'r12d-real'; [void](New-Item -ItemType Directory -Path $real -Force)
+  $jn = Join-Path $Root 'r12d-info'; [void](New-Item -ItemType Junction -Path $jn -Target $real)
+  $jex = Join-Path $jn 'exclude'; [IO.File]::WriteAllText($jex, "# fcode`n/TASK.md`n")
+  function Test-PhienSharedNote { $true }   # a holder exists
+  Eq (Get-PhienLaptopRelease $dd $jex 'TASK.md' $false @()) 'failed' 'the exclude file sits under a junction and a holder exists: failed, not kept'
+  Eq ([IO.File]::ReadAllText($jex)) "# fcode`n/TASK.md`n" 'nothing written'
+  [IO.File]::WriteAllText($ex, "# fcode`n/TASK.md`n")
+  Eq (Get-PhienLaptopRelease $dd $ex 'TASK.md' $false @()) 'kept' 'a plain file with a holder: kept (the control)'
+}
+T 'notes r12: g: a note file whose attributes cannot be read (a race after the file test) is unknown for that release, never an abort of the run' {
+  $rp = Join-Path $Root 'r12g'; New-GitDir $rp
+  $SyncRepos = @($rp); $script:PhienRepoIds = @{}
+  function Test-Path { param($LiteralPath, $PathType) if ($PathType -eq 'Leaf') { $true } else { Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath } }   # the file was there for the file test, gone for GetAttributes
+  Eq (Test-PhienSharedNote $rp 'TASK.md' @()) 'unknown' 'GetAttributes throws: unknown'
 }
 T 'notes r12: f: laptop, real git, folders with non-ASCII names (the exclude path and the other work tree): the holder is seen; its own .gitignore ends the hold' {
   $a = Join-Path $Root ('r12f D' + [char]0x1EF1 + ' ' + [char]0xE1 + 'n'); New-GitDir $a; Git-Seed $a
@@ -3078,7 +3177,7 @@ T 'nhanh r12: laptop side: a sibling registered through a junction to its work t
   Git-Commit $w.BP @('TASK.md'); $m = New-LogMark $w
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
   $lg = Log-Since $w $m
-  Ok ($lg -match (Kept-Rx 'proj' 'TASK.md' 'laptop')) ('the kept line: ' + $lg); Ok ($lg -notmatch 'lỗi:') ('no error line: ' + $lg)
+  Ok ($lg -match (Kept-Rx 'proj' 'TASK.md' 'laptop') -and $lg -notmatch 'xóa được') ('the kept line: ' + $lg); Ok ($lg -notmatch 'lỗi:') ('no error line: ' + $lg)
   Eq (Pair-Count $lex 'TASK.md') 1 'the pair stays'; Eq (Ign-Rc $w.LO 'TASK.md') 0 'the work tree behind the junction still hides its copy'
 }
 
