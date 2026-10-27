@@ -521,6 +521,16 @@ function Show-Help {
   Write-Host '  fcode phien tu-dong bat   |   fcode phien tu-dong tat'
   Write-Host '      Bật / tắt tự động đồng bộ phiên mỗi 10 phút, chạy ngầm (không hiện cửa sổ), chỉ khi box đang chạy, và chỉ mở kết nối khi box vừa bật hoặc cách lần mở trước từ 40 phút (để box tự nghỉ được).'
   Write-Host '      Ví dụ: fcode phien tu-dong bat'
+  Write-Host '  fcode phien <project> --nhanh'
+  Write-Host '      Bản nhanh cho hook (fcode moc): chỉ một project, không đánh thức box (box đang ngủ thì bỏ qua), tối đa 20 giây, đang có lượt đồng bộ khác thì bỏ qua. Lần chạy nhanh chưa xong sau 30 giây thì bị ngắt hẳn và báo lỗi (fcode phien chạy tay thì không bị ngắt như vậy).'
+  Write-Host '      Ví dụ: fcode phien deal-sync --nhanh'
+  Write-Host '  fcode phien <project> --nhanh --nen'
+  Write-Host '      Như --nhanh nhưng chờ 35 giây rồi mới đồng bộ (hook dùng sau khi omp / claude / codex thoát).'
+  Write-Host '      Ví dụ: fcode phien deal-sync --nhanh --nen'
+  Write-Host '  fcode moc bat   |   fcode moc tat   |   fcode moc trang-thai'
+  Write-Host '      Bật / tắt / xem hook trong profile PowerShell: gõ omp, claude hoặc codex trong thư mục một project (có trong syncRepos) thì fcode đồng bộ nhanh phiên trước và sau khi chạy (tối đa khoảng 20 giây, box ngủ thì bỏ qua). Tắt hook trong cửa sổ này: gõ $env:FCODE_MOC = ''0'' (đến khi gõ Remove-Item Env:FCODE_MOC hoặc đóng cửa sổ). Phiên Claude Code / Codex chưa được chép giữa hai máy, chỉ phiên omp và ghi chú project.'
+  Write-Host '      Hook là hàm bọc nên không chuyển đúng hoàn toàn các tham số kiểu -- và -x:giá-trị, cũng không để lại lỗi của chương trình trong $?; những lúc cần đúng tuyệt đối, chạy thẳng claude.exe / codex.exe / omp.exe.'
+  Write-Host '      Ví dụ: fcode moc bat'
   Write-Host '  fcode help'
   Write-Host '      In bảng này (cũng là fcode -h, fcode --help, fcode /?).'
   Write-Host '      Ví dụ: fcode help'
@@ -2084,9 +2094,10 @@ function Get-PhienUnitBytes([long]$Size, [string]$Rel = '', [long]$Extra = 0) {
 # 'running' | 'stopped' | 'unknown' (instabox ls loi, JSON hong, khong thay box hoac khong co trang thai): unknown khong doi gi ca
 function Test-BoxRunning {
   try {
-    $j = & (Get-InstaboxExe) ls --json 2>$null | Out-String
-    if ($LASTEXITCODE -ne 0) { return 'unknown' }
-    $list = $j | ConvertFrom-Json
+    $r = Invoke-PhienExe (Get-InstaboxExe) @('ls', '--json')
+    if ($r.Code -eq 124) { return 'timeout' }   # only while a phien deadline is set (--nhanh): `instabox ls` ran into it
+    if ($r.Code -ne 0) { return 'unknown' }
+    $list = ($r.Out -join "`n") | ConvertFrom-Json
     $b = $null; foreach ($x in $list) { foreach ($y in @($x)) { if ($y -and $y.name -eq $box) { $b = $y } } }
     if (-not $b -or -not "$($b.state)") { return 'unknown' }
     if ("$($b.state)" -eq 'running') { 'running' } else { 'stopped' }
@@ -2096,21 +2107,60 @@ function Test-BoxRunning {
 # gioi han giay: lan tu dong = MOT han cho ca lan chay (420 s, duoi 8 phut cua Task Scheduler); chay tay = 900 s moi lan goi box.
 # Chi de thu: FCODE_PHIEN_TIMEOUT=<giay>.
 function Get-PhienLimitSec([bool]$Auto) { if ("$env:FCODE_PHIEN_TIMEOUT" -match '\A[0-9]{1,5}\z') { [int]$env:FCODE_PHIEN_TIMEOUT } elseif ($Auto) { 420 } else { 900 } }
-function Test-PhienTimeUp { [bool]($script:PhienDeadline -and [DateTime]::UtcNow -ge $script:PhienDeadline) }
+# han chot cua che do nhanh (--nhanh): 20 s. Chi de thu: FCODE_PHIEN_CAP_SEC=<giay> (1-999).
+$PhienCapMsg = 'phien: hết 20 giây, phần còn lại chạy lần sau'
+function Get-PhienCapSec { if ("$env:FCODE_PHIEN_CAP_SEC" -match '\A[1-9][0-9]{0,2}\z') { [int]$env:FCODE_PHIEN_CAP_SEC } else { 20 } }
+# the phien deadline (--nhanh, auto) is checked ONLY here, at a safe point of Invoke-PhienSync: before an item (a batch, a note) starts. Nothing inside an
+# item stops for it: an item is all fallible work first, then its commit step (an atomic move), then plain file writes, so it ends whole or not at all.
+# "Time is up" already when less than 1 s is left: no item is worth starting then.
+function Test-PhienTimeUp { [bool]($script:PhienDeadline -and [DateTime]::UtcNow.AddSeconds(1) -ge $script:PhienDeadline) }
+# timeout of one child program (ms, -1 = none): the time left + 5 s grace, at least 3 s. A child that runs into it fails only its own item cleanly,
+# and the run stops at the next safe point, so a quick run ends by about cap + 5 s.
+function Get-PhienChildMs { if ($script:PhienDeadline) { [int][Math]::Max(3000, ($script:PhienDeadline - [DateTime]::UtcNow).TotalMilliseconds + 5000) } else { -1 } }
+# a safe point found the deadline passed (nothing failed before it): --nhanh -> the cap line, exit 0; auto -> the run is cut, exit 1
+function Stop-PhienAtCap([bool]$Quick, [hashtable]$Stat) {
+  if ($Quick) { Set-PhienScreen $PhienCapMsg; return 0 }
+  $Stat.ok = $false; Write-PhienOut 'hết thời gian của lượt này: phần còn lại để lần sau'; 1
+}
 # dung tien trinh va moi tien trinh con cua no (instabox -> ssh); Windows PowerShell 5.1 khong co Kill($true) nen dung taskkill
 function Stop-PhienProc($p) {
   try { $p.Kill($true) } catch { try { & taskkill.exe /PID $p.Id /T /F 2>&1 | Out-Null } catch { }; try { $p.Kill() } catch { } }
+}
+# one argument as the Windows command line wants it (.NET Framework, hence Windows PowerShell 5.1, has no ArgumentList)
+function ConvertTo-PhienArg([string]$a) {
+  if ($a -ne '' -and $a -notmatch '[\s"]') { return $a }
+  '"' + ([regex]::Replace($a, '(\\*)"', '$1$1\"') -replace '(\\+)\z', '$1$1') + '"'
+}
+# run a program with its output captured (stdin closed, so it can never wait for a key). While a phien deadline is set the program is killed with its
+# children after Get-PhienChildMs (Code 124). Out = stdout lines.
+function Invoke-PhienExe([string]$Exe, [string[]]$ExeArgs) {
+  $psi = New-Object Diagnostics.ProcessStartInfo
+  $psi.FileName = $Exe; $psi.Arguments = (@($ExeArgs | ForEach-Object { ConvertTo-PhienArg ([string]$_) }) -join ' ')
+  $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+  $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+  $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
+  try { $p = [Diagnostics.Process]::Start($psi) } catch { return [pscustomobject]@{ Code = -1; Out = [string[]]@(); Err = "$($_.Exception.Message)" } }
+  try {
+    try { $p.StandardInput.Close() } catch { }
+    $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
+    # short waits, so a kill of this process (the job ending it) is never stuck behind one long native wait; -1 = no deadline, wait as long as it runs
+    $ms = Get-PhienChildMs; $end = if ($ms -lt 0) { $null } else { [DateTime]::UtcNow.AddMilliseconds($ms) }
+    while (-not $p.WaitForExit(100)) {
+      if ($end -and [DateTime]::UtcNow -ge $end) { Stop-PhienProc $p; return [pscustomobject]@{ Code = 124; Out = [string[]]@(); Err = 'quá thời gian chờ' } }
+    }
+    try { [void][Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($o, $e), 3000) } catch { }
+    $lines = New-Object System.Collections.Generic.List[string]
+    if ($o.IsCompleted -and -not $o.IsFaulted) { $lines.AddRange([string[]]@($o.Result -split "`r?`n")) }
+    if ($lines.Count -and $lines[$lines.Count - 1] -eq '') { $lines.RemoveAt($lines.Count - 1) }
+    [pscustomobject]@{ Code = $p.ExitCode; Out = [string[]]$lines.ToArray(); Err = $(if ($e.IsCompleted -and -not $e.IsFaulted) { $e.Result } else { '' }) }
+  } finally { $p.Dispose() }
 }
 
 # chay $PhienPy tren box. Tra ve @{Code; Out = byte[]; Err}. stdin: $InBytes hoac noi dung file $InFile.
 # Han chot tinh tu truoc khi ghi byte stdin dau tien; stdin ghi bat dong bo, nen box dung doc thi den han van dung duoc.
 function Invoke-BoxPy([string]$Cmd, [byte[]]$InBytes, [string]$InFile) {
   if ($box -notmatch '\A[A-Za-z0-9._-]+\z') { throw "tên box '$box' không hợp lệ" }
-  $sec = Get-PhienLimitSec $false
-  if ($script:PhienDeadline) {
-    $sec = ($script:PhienDeadline - [DateTime]::UtcNow).TotalSeconds
-    if ($sec -lt 1) { return [pscustomobject]@{ Code = 124; Out = [byte[]]@(); Err = 'hết thời gian của lượt này' } }
-  }
+  $sec = if ($script:PhienDeadline) { (Get-PhienChildMs) / 1000 } else { Get-PhienLimitSec $false }
   $end = [DateTime]::UtcNow.AddSeconds($sec)
   # chuong trinh python (deflate + base64) la dong dau cua stdin; dong lenh chi co lenh nap ngan (khong vuong gioi han do dai)
   # chu thich va dong trong bo di truoc khi nen
@@ -2169,8 +2219,10 @@ function Get-BoxJson($r) {
 function Find-TarExe { $c = Get-Command tar.exe -ErrorAction SilentlyContinue; if ($c) { $c.Source } else { throw 'máy này không có tar.exe (Windows 10 trở lên mới có)' } }
 
 function Write-PhienOut([string]$Msg) {
-  if ($script:PhienQuiet) { $script:PhienLines.Add($Msg) } else { Write-Host $Msg }
+  if ($script:PhienQuiet -or $script:PhienQuick) { Add-PhienLog @($Msg) } else { Write-Host $Msg }   # auto and quick (--nhanh) runs: phien.log only, each line at once
 }
+# --nhanh: the one line (at most) that reaches the screen, printed by Invoke-Phien after the run; it is logged too
+function Set-PhienScreen([string]$Msg) { $script:PhienScreen = $Msg; Write-PhienOut $Msg }
 
 # owner/name (chu thuong) cua mot URL GitHub o moi dang (https, git@github.com:, alias github-<ten>:); khong phai GitHub -> '' (nhu repo_key cua box)
 function Get-RepoKey([string]$Url) {
@@ -2185,17 +2237,33 @@ function Get-LocalRepoKey([string]$Dir) {
   if ($r.Code -eq 0) { Get-RepoKey ([string]@($r.Out)[0]) } else { '' }
 }
 
-# do lai cua lan chay bi cat ngang (may ngu, mat dien, tat cua so): chi ten tam cua fcode, cu hon 1 gio.
-# %TEMP%\fcode-phien-* va *.fcode-part-* trong cac thu muc phien da cho; khong dung toi gi khac.
-function Clear-PhienLeftovers([string[]]$Dirs) {
+# do lai cua lan chay bi cat ngang (may ngu, mat dien, tat cua so, lan nhanh bi ngat o ~30 s, Ctrl+C): chi ten tam cua fcode, cu hon 1 gio, hoac
+# cua mot lan chay da chet (PID trong ten khong con chay, hay PID do gio la tien trinh moi hon do lai) -> xoa ngay o lan chay sau.
+# %TEMP%\fcode-phien-*, *.fcode-part-* trong cac thu muc phien da cho ($Dirs, ca thu muc con) va o goc project ($Flat, chi goc); khong dung toi gi khac.
+function Test-PhienOwnerGone($Item, [string]$Rx) {
+  if ($Item.Name -notmatch $Rx) { return $false }   # not our current name format: the 1 h rule only
+  try { $p = Get-Process -Id ([int]$Matches[1]) -ErrorAction Stop } catch { return $true }
+  try { $p.StartTime.ToUniversalTime() -gt $Item.CreationTimeUtc } catch { $false }
+}
+function Clear-PhienLeftovers([string[]]$Dirs, [string[]]$Flat = @()) {
   $old = (Get-Date).ToUniversalTime().AddHours(-1)
+  $partRx = '\.fcode-part-([0-9]+)-[0-9a-f]{6}\z'
   foreach ($x in @(Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Filter 'fcode-phien-*' -Force -ErrorAction SilentlyContinue)) {
-    if ($x.LastWriteTimeUtc -lt $old -and -not ($x.Attributes -band [IO.FileAttributes]::ReparsePoint)) { Remove-Item -LiteralPath $x.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+    if ($x.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+    if ($x.LastWriteTimeUtc -lt $old -or (Test-PhienOwnerGone $x '\Afcode-phien-([0-9]+)-[0-9a-f]{32}\z')) { Remove-Item -LiteralPath $x.FullName -Recurse -Force -ErrorAction SilentlyContinue }
   }
-  foreach ($d in $Dirs) {
-    if (-not $d -or -not (Test-Path -LiteralPath $d)) { continue }
-    foreach ($x in @(Get-ChildItem -LiteralPath $d -Recurse -File -Force -Filter '*.fcode-part-*' -ErrorAction SilentlyContinue)) {
-      if ($x.LastWriteTimeUtc -lt $old) { Remove-Item -LiteralPath $x.FullName -Force -ErrorAction SilentlyContinue }
+  foreach ($d in @(@($Dirs | ForEach-Object { @{ D = $_; R = $true } }) + @($Flat | ForEach-Object { @{ D = $_; R = $false } }))) {
+    if (-not $d.D -or -not (Test-Path -LiteralPath $d.D)) { continue }
+    foreach ($x in @(Get-ChildItem -LiteralPath $d.D -Recurse:$d.R -File -Force -Filter '*.fcode-part-*' -ErrorAction SilentlyContinue)) {
+      if ($x.LastWriteTimeUtc -lt $old -or (Test-PhienOwnerGone $x $partRx)) { Remove-Item -LiteralPath $x.FullName -Force -ErrorAction SilentlyContinue }
+    }
+  }
+  # Write-PhienText part files (<file>.part-<PID>) beside the three state files and each project's .git/info/exclude
+  $sd = Join-Path $env:LOCALAPPDATA 'fcode'
+  foreach ($f in @(@('handoff-state.json', 'phien-status.json', 'phien-auto.json' | ForEach-Object { Join-Path $sd $_ }) + @($Flat | Where-Object { $_ } | ForEach-Object { Join-Path $_ '.git\info\exclude' }))) {
+    $fd = Split-Path -Parent $f; if (-not (Test-Path -LiteralPath $fd -PathType Container)) { continue }
+    foreach ($x in @(Get-ChildItem -LiteralPath $fd -File -Force -Filter ((Split-Path -Leaf $f) + '.part-*') -ErrorAction SilentlyContinue)) {
+      if ($x.LastWriteTimeUtc -lt $old -or (Test-PhienOwnerGone $x '\.part-([0-9]+)\z')) { Remove-Item -LiteralPath $x.FullName -Force -ErrorAction SilentlyContinue }
     }
   }
 }
@@ -2213,10 +2281,10 @@ function Get-PhienProjects {
 # phien ban omp tren laptop ('' neu khong chay duoc)
 function Get-OmpVersion {
   try {
-    $c = Get-Command omp -ErrorAction SilentlyContinue
+    $c = Get-Command omp -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1   # the real program, never the `omp` function of the fcode moc hook
     if (-not $c) { return '' }
-    $o = (& $c.Source --version 2>&1 | Out-String)
-    if ($o -match '\d+\.\d+\.\d+\S*') { return $Matches[0] }
+    $r = Invoke-PhienExe $c.Source @('--version')
+    if ((($r.Out -join ' ') + ' ' + $r.Err) -match '\d+\.\d+\.\d+\S*') { return $Matches[0] }
   } catch { }
   ''
 }
@@ -2239,9 +2307,29 @@ function Write-PhienStatus([hashtable]$Stat, [bool]$Auto) {
       diverged = [int]$Stat.diverged; unknownFormat = @($Stat.unknown | ForEach-Object { [string]$_.Id } | Sort-Object -Unique)
       ompLaptop = [string]$Stat.ompL; ompBox = [string]$Stat.ompB; auto = $Auto
       notes = [ordered]@{ copied = [int]$Stat.noteCopied; conflicts = @($Stat.noteConf); released = @($Stat.noteReleased) }; unfinished = @($Stat.unfinished); newProjects = @($Stat.newProjects) }
-    [IO.File]::WriteAllText($p, ($o | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
+    Write-PhienText $p ($o | ConvertTo-Json -Compress)
   } catch { }
 }
+# the one way fcode rewrites a file of its own or the user's (.git/info/exclude, the state JSONs): a part file next to it, then an atomic
+# Replace / Move, so a kill at any instant leaves the old file or the new one, never a cut one. UTF-8 without BOM.
+function Write-PhienText([string]$Path, [string]$Text) {
+  [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($Path))
+  $part = "$Path.part-$PID"
+  try {
+    [IO.File]::WriteAllText($part, $Text, (New-Object Text.UTF8Encoding($false)))
+    if ([IO.File]::Exists($Path)) { [IO.File]::Replace($part, $Path, [NullString]::Value) } else { [IO.File]::Move($part, $Path) }
+  } finally { if ([IO.File]::Exists($part)) { try { [IO.File]::Delete($part) } catch { } } }
+}
+# $true when the path or its folder is a link (symlink / junction): fcode never writes through one
+function Test-PhienReparse([string]$Path) {
+  foreach ($x in @($Path, [IO.Path]::GetDirectoryName($Path))) {
+    if (-not $x) { continue }
+    try { if ([IO.File]::GetAttributes($x) -band [IO.FileAttributes]::ReparsePoint) { return $true } } catch { }
+  }
+  $false
+}
+# ten khoa dong bo (nhat ky dung ten nay + '-log'). Chi de thu: FCODE_PHIEN_LOCK doi ten khoa (bo test dung ten rieng, khong dung khoa that)
+function Get-PhienLockName { if ("$env:FCODE_PHIEN_LOCK" -match '\A[A-Za-z0-9\\._-]{1,200}\z') { $env:FCODE_PHIEN_LOCK } else { 'Local\fcode-phien' } }
 # mot dong canh bao dau menu fcode: co phien dinh dang la, hoac lan tu dong gan nhat bi loi
 function Get-PhienWarning {
   try {
@@ -2257,31 +2345,35 @@ function Get-PhienWarning {
 # dong bo mot hay moi project. Tra ve 0 xong, 1 loi.
 # Chep theo tung FILE, tung dot <= 50 MB (mot dot = mot lan ssh), ca hai chieu: dot nao xong thi nam lai ben nhan, lan sau chi chep
 # phan con thieu. Ben nhan dat blob, file di kem, .jsonl long ben trong, roi file .jsonl chinh sau cung (khi moi thu no can da co).
-function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [bool]$BoxKnownRunning = $false) {
-  $script:PhienQuiet = $Auto; $script:PhienLines = New-Object System.Collections.Generic.List[string]
-  $code = 0
+# $Quick (--nhanh, cho hook cua `fcode moc`): mot project, KHONG danh thuc box, khong cho khoa, toi da 20 s; thoat 0 khi box ngu / khoa ban / het gio.
+# Che do nhanh chi ghi phien.log; man hinh nhan toi da MOT dong (Invoke-Phien in $script:PhienScreen, hoac dong loi khi that bai); thanh cong thi im lang.
+# Han chot (--nhanh, tu dong) chi duoc xem o diem an toan, truoc moi muc (quet, hash, mot dot, mot ghi chu); mot muc da bat dau thi xong tron hoac hong tron.
+function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [bool]$BoxKnownRunning = $false, [bool]$Quick = $false) {
+  $script:PhienQuiet = $Auto; $script:PhienQuick = $Quick; $script:PhienScreen = $null
+  $capMsg = $PhienCapMsg
+  $code = 0; $capHit = $false
   # lan tu dong: MOT han chot cho ca lan chay, tinh tu luc tien trinh bat dau (nhu gioi han 8 phut cua Task Scheduler)
-  $script:PhienDeadline = if ($Auto) { [Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().AddSeconds((Get-PhienLimitSec $true)) } else { $null }
+  $script:PhienDeadline = if ($Auto) { [Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().AddSeconds((Get-PhienLimitSec $true)) } elseif ($Quick) { [Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().AddSeconds((Get-PhienCapSec)) } else { $null }
   $mx = $null; $held = $false
   if (-not $DryRun) {
     try {
-      # chi de thu: FCODE_PHIEN_LOCK doi ten khoa (bo test dung ten rieng, khong dung khoa that)
-      $lk = if ("$env:FCODE_PHIEN_LOCK" -match '\A[A-Za-z0-9\\._-]{1,200}\z') { $env:FCODE_PHIEN_LOCK } else { 'Local\fcode-phien' }
-      $mx = New-Object Threading.Mutex($false, $lk)
+      $mx = New-Object Threading.Mutex($false, (Get-PhienLockName))
       try { $held = $mx.WaitOne(0) } catch [Threading.AbandonedMutexException] { $held = $true }
-      if (-not $held -and -not $Auto) {
+      if (-not $held -and -not $Auto -and -not $Quick) {
         Write-Host 'Đang có một lượt đồng bộ khác chạy (tự động), chờ nó xong...'
         try { $held = $mx.WaitOne(540000) } catch [Threading.AbandonedMutexException] { $held = $true }
       }
     } catch { }
     if (-not $held) {
       if ($mx) { $mx.Dispose() }
+      if ($Quick) { Set-PhienScreen 'phien: đang có lần đồng bộ khác, bỏ qua'; return 0 }
       if (-not $Auto) { Write-Host 'lỗi: lượt đồng bộ khác chạy quá lâu, thử lại sau.'; return 1 }
       return 0
     }
   }
   $stat = @{ ran = $false; ok = $true; copied = 0; skipped = 0; diverged = 0; unknown = @(); ompL = ''; ompB = ''; noteCopied = 0; noteConf = @(); noteReleased = @(); unfinished = @(); newProjects = @() }
   try {
+    if (-not $DryRun) { Clear-PhienLeftovers @() }   # the lock is held: a killed run's staging goes now, even when this run stops early (box asleep)
     $projs = Get-PhienProjects
     if ($projs.Count -eq 0) { Write-PhienOut "Chưa có project nào trong syncRepos ($ConfigFile)."; return 0 }
     $names = @($projs.Keys)
@@ -2290,11 +2382,18 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
       if (-not $projs.Contains($o)) { Write-PhienOut "Không thấy project '$Only' trong syncRepos. Có: $($names -join ', ')"; return 1 }
       $names = @($o)
     }
-    if ($Auto) { if (-not $BoxKnownRunning -and (Test-BoxRunning) -ne 'running') { return 0 } }
+    if ($Quick) {   # only `instabox ls`: never wakes the box
+      $bs = Test-BoxRunning
+      if ($bs -eq 'timeout') { Set-PhienScreen $capMsg; return 0 }
+      if ($bs -eq 'unknown') { $stat.ok = $false; Write-PhienOut 'lỗi: không đọc được trạng thái box (instabox ls lỗi — đã chạy "instabox login" chưa?)'; return 1 }
+      if ($bs -ne 'running') { Set-PhienScreen 'phien: box đang ngủ, bỏ qua'; return 0 }
+    }
+    elseif ($Auto) { if (-not $BoxKnownRunning -and (Test-BoxRunning) -ne 'running') { return 0 } }
     else { & (Get-InstaboxExe) wake $box *> $null }
     $stat.ran = $true; $stat.ompL = Get-OmpVersion
     # moc cho lan tu dong sau: ghi truoc khi mo ssh (lan loi, bi dung giua chung hay chay thu cung tinh: ssh nao cung la hoat dong cua box)
-    Write-PhienAutoState @{ boxRunning = $true; lastSshAt = (ConvertTo-Epoch (Get-Date)) }
+    # a quick run (the hook) does not count: a cut or failed one must not push the next 10-minute auto run behind the 40-minute gap
+    if (-not $Quick) { Write-PhienAutoState @{ boxRunning = $true; lastSshAt = (ConvertTo-Epoch (Get-Date)) } }
     $agent = Get-OmpAgentDir
     $sessRoot = Join-Path $agent 'sessions'
     $laptopBlobDir = Join-Path $agent 'blobs'
@@ -2302,9 +2401,11 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
     # project nhan theo ten thu muc, hoac theo repo GitHub cua origin (thu muc ten khac van khop project cua box)
     $repoDir = @{}
     foreach ($n in $names) { $k = Get-LocalRepoKey $projs[$n]; if ($k -and -not $repoDir.ContainsKey($k)) { $repoDir[$k] = $projs[$n] } }
+    if (Test-PhienTimeUp) { return (Stop-PhienAtCap $Quick $stat) }   # safe point: before the scan
     $r = Invoke-BoxPy 'scan' ([Text.Encoding]::UTF8.GetBytes((@{ projects = @($names); repos = @($repoDir.Keys); clean = (-not $DryRun) } | ConvertTo-Json -Compress)))
     $scan = Get-BoxJson $r
     if (-not $scan) {
+      if ($Quick -and $r.Code -eq 124) { Set-PhienScreen $capMsg; return 0 }   # the deadline ended the call: a cap hit, not an error
       $stat.ok = $false
       Write-PhienOut 'lỗi: không nói chuyện được với box. Kiểm tra: đã chạy "instabox login" chưa, và box đang bật không.'
       $d = ("$($r.Err)" -split "`n" | Where-Object { $_.Trim() } | Select-Object -Last 1); if ($d) { Write-PhienOut "  (chi tiết: $($d.Trim()))" }
@@ -2325,6 +2426,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
       if (-not $pick.ContainsKey([string]$bp.name) -and $ld -and -not $used.ContainsKey($ld)) { $pick[[string]$bp.name] = $ld; $used[$ld] = $true }
     }
     foreach ($bp in @($scan.projects)) {
+      if (Test-PhienTimeUp) { return (Stop-PhienAtCap $Quick $stat) }   # safe point: before the local scan of a project
       $ldir = $pick[[string]$bp.name]
       if (-not $ldir -and $bp.repo -and $repoDir.ContainsKey([string]$bp.repo)) { continue }   # thu muc cua repo nay da thuoc project khac
       if (-not $ldir -or -not (Test-Path -LiteralPath $ldir)) { Write-PhienOut "== $($bp.name): bỏ qua, không thấy thư mục project trên laptop"; continue }
@@ -2336,7 +2438,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
       $stat.newProjects = @(@($scan.all) | Where-Object { $_ -and -not $projs.Contains([string]$_.name) -and -not ($_.repo -and $repoDir.ContainsKey([string]$_.repo)) } | ForEach-Object { [string]$_.name })
       if ($stat.newProjects.Count) { Write-PhienOut "project trên box chưa có trên laptop: $($stat.newProjects -join ', ') (chạy fcode sync để thêm)" }
     }
-    if (-not $DryRun) { Clear-PhienLeftovers @(@($ctx | ForEach-Object { $_.Lsd }) + @($laptopBlobDir)) }
+    if (-not $DryRun) { Clear-PhienLeftovers @(@($ctx | ForEach-Object { $_.Lsd }) + @($laptopBlobDir)) @($ctx | ForEach-Object { $_.LDir }) }
     # lan 1: tim cac cho can hash cua box; hoi mot lan; lan 2: ke hoach that
     $hashes = @{}
     $need = @()
@@ -2344,12 +2446,15 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
       $need += @((Get-PhienPlan $c.L $c.R $c.Benc @{} $c.Lsd $lnow $rnow $PhienBusySec $lblobIx $boxBlobs).Need)
     }
     if ($need.Count -gt 0) {
+      if (Test-PhienTimeUp) { return (Stop-PhienAtCap $Quick $stat) }   # safe point: before the hash call
       $q = @{ q = @($need | ForEach-Object { @{ enc = $_.enc; rel = $_.rel; len = $_.len } }) } | ConvertTo-Json -Compress -Depth 4
-      $h = Get-BoxJson (Invoke-BoxPy 'hash' ([Text.Encoding]::UTF8.GetBytes($q)))
+      $hr = Invoke-BoxPy 'hash' ([Text.Encoding]::UTF8.GetBytes($q))
+      if ($Quick -and $hr.Code -eq 124) { Set-PhienScreen $capMsg; return 0 }   # the deadline ended the call: a cap hit, not a warning
+      $h = Get-BoxJson $hr
       if ($h) { foreach ($pr in $h.h.PSObject.Properties) { $hashes[$pr.Name] = $pr.Value } }
       else { Write-PhienOut 'cảnh báo: không so sánh được các phiên đã đổi ở hai máy, bỏ qua chúng lần này' }
     }
-    $tmpRoot = Join-Path ([IO.Path]::GetTempPath()) ('fcode-phien-' + [guid]::NewGuid().ToString('N'))
+    $tmpRoot = Join-Path ([IO.Path]::GetTempPath()) ('fcode-phien-' + $PID + '-' + [guid]::NewGuid().ToString('N'))   # PID: a later run sees when its owner is gone
     try {
       $putU = New-Object System.Collections.ArrayList; $getU = New-Object System.Collections.ArrayList
       $putN = New-Object System.Collections.ArrayList; $getN = New-Object System.Collections.ArrayList
@@ -2371,7 +2476,11 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
           Write-PhienOut "  [$($c.Name)] ghi chú $($rl.Name) giờ do git theo dõi (trên $($rl.TrackedOn)): bản cũ trên $($rl.OldOn) xóa được, fcode không còn đồng bộ file này"
           if (-not $DryRun) {
             $rk = "$($c.Name)/$($rl.Name)"
-            if ($rl.OldOn -eq 'laptop') { [void](Remove-PhienNoteExclude $c.LDir $rl.Name); [void]$noteDel.Add("exclude:laptop:$rk"); [void]$noteDel.Add($rk) }
+            if ($rl.OldOn -eq 'laptop') {
+              # the record goes only when the line is gone for sure (removed now, or not there): else it stays and the next run tries again
+              if ((Remove-PhienNoteExclude $c.LDir $rl.Name) -ne 'failed') { [void]$noteDel.Add("exclude:laptop:$rk"); [void]$noteDel.Add($rk) }
+              else { $code = 1; Write-PhienOut "  [$($c.Name)] lỗi: ghi chú $($rl.Name): chưa gỡ được dòng /$($rl.Name) của fcode trong .git/info/exclude (liên kết, hoặc git lỗi / không trả lời kịp), lần sau thử lại" }
+            }
             else { [void]$unexcl.Add(@{ project = $c.Name; name = $rl.Name }) }
           }
         }
@@ -2436,7 +2545,8 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
       if (($ensure.Count -or $unexcl.Count) -and -not $nb) { $nb = New-PhienBatch (Join-Path $tmpRoot 'put\notes'); [void]$putB.Add($nb) }
       if ($nb) { foreach ($x in $ensure) { [void]$nb.Ensure.Add($x) }; foreach ($x in $unexcl) { [void]$nb.Unexclude.Add($x) } }
       $notePlanned = $putN.Count; $placedPut = 0
-      $saveNotes = { if ($noteRec.Count -or $noteDel.Count) { foreach ($k in $noteRec.Keys) { $noteState[$k] = $noteRec[$k] }; foreach ($k in $noteDel) { $noteState.Remove([string]$k) }; try { Write-PhienNoteState $noteState } catch { } } }
+      # $Strict: a failed write throws (the ownership saved before an exclude line: no saved ownership, no line, no note)
+      $saveNotes = { param([bool]$Strict = $false) if ($noteRec.Count -or $noteDel.Count) { foreach ($k in $noteRec.Keys) { $noteState[$k] = $noteRec[$k] }; foreach ($k in $noteDel) { $noteState.Remove([string]$k) }; try { Write-PhienNoteState $noteState } catch { if ($Strict) { throw "không ghi được trạng thái ghi chú (handoff-state.json): $($_.Exception.Message)" } } } }
       $deferredTops = New-Object System.Collections.ArrayList; $busyFiles = New-Object System.Collections.ArrayList
       # --- mot dot gui len box (chep sang thu muc tam, doi cwd, dong goi, gui, xoa): 'ok' | 'fail' | 'lost' (ssh 255: mat box) ---
       $putRes = @{ new = 0; replaced = 0; same = 0; skip = 0; busy = 0; blobs = 0; failed = 0 }
@@ -2465,11 +2575,13 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
         }
         [IO.File]::WriteAllText((Join-Path $pb.Dir 'manifest.json'), (@{ files = @($mf); tops = @($mt); notes = @($mn); ensure = @($pb.Ensure); unexclude = @($pb.Unexclude) } | ConvertTo-Json -Compress -Depth 6), (New-Object Text.UTF8Encoding($false)))
         $tarFile = $pb.Dir + '.tar'
-        & (Find-TarExe) -cf $tarFile -C $pb.Dir . 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw 'tar không đóng gói được' }
+        $tr = Invoke-PhienExe (Find-TarExe) @('-cf', $tarFile, '-C', $pb.Dir, '.')
+        if ($tr.Code -eq 124) { Remove-Item -LiteralPath $tarFile, $pb.Dir -Recurse -Force -ErrorAction SilentlyContinue; return 'cap' }   # tar ran into the deadline
+        if ($tr.Code -ne 0) { throw 'tar không đóng gói được' }
         $rp = Invoke-BoxPy 'put' $null $tarFile
         $res = Get-BoxJson $rp
         Remove-Item -LiteralPath $tarFile, $pb.Dir -Recurse -Force -ErrorAction SilentlyContinue   # free the disk before the next batch
+        if (-not $res -and $Quick -and $rp.Code -eq 124) { return 'cap' }   # the deadline ended the call: not an error, the next run sends it
         if (-not $res) { Write-PhienOut 'lỗi: gửi phiên lên box không thành công (đợt này để lần tới)'; if ($rp.Code -eq 255) { return 'lost' }; return 'fail' }
         foreach ($k in @($putRes.Keys)) { $putRes[$k] += [int]$res.$k }
         foreach ($x in @($res.deferred)) { if ($x) { [void]$deferredTops.Add([string]$x) } }
@@ -2502,12 +2614,13 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
         if ($pos -ge 0) {
           [void](New-Item -ItemType Directory -Path $gt -Force)
           $fsT = [IO.File]::Create($gtar); try { $fsT.Write($g.Out, $pos, $g.Out.Length - $pos) } finally { $fsT.Dispose() }
-          & (Find-TarExe) -xf $gtar -C $gt 2>&1 | Out-Null
-          $xok = ($LASTEXITCODE -eq 0)
+          $tr = Invoke-PhienExe (Find-TarExe) @('-xf', $gtar, '-C', $gt)
+          $xok = ($tr.Code -eq 0)
         }
         $g = $null
         if (-not $xok) {
           Remove-Item -LiteralPath $gtar, $gt -Recurse -Force -ErrorAction SilentlyContinue
+          if (($Quick -and $gcode -eq 124) -or ($pos -ge 0 -and $tr.Code -eq 124)) { return 'cap' }   # the deadline ended the call or tar: not an error, the next run fetches it
           Write-PhienOut 'lỗi: lấy phiên từ box về không thành công (đợt này để lần tới)'
           if ($gcode -eq 255) { return 'lost' }; return 'fail'
         }
@@ -2533,28 +2646,44 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
           try { $st = Install-PhienFile $src (Join-Path $u.C.Lsd ($u.Rel -replace '/', '\')) $u.C.BDir $u.C.LDir $gnow $PhienBusySec } catch { $st = 'failed' }
           $getRes[$st]++
         }
-        # 4. ghi chu
+        # 4. ghi chu: each note is an item of its own (it runs git), so the deadline is checked before each one
+        $cut = $false
         foreach ($u in @($gbt.Items | Where-Object { $_.K -eq 'note' })) {
           $src = Join-Path $gt ('notes\' + $u.C.Name + '\' + $u.Name)
           $key = "$($u.C.Name)/$($u.Name)"; $info = $noteGetInfo[$key]
-          if (-not (Test-Path -LiteralPath $src)) { $noteSkipped++; continue }
-          if ((Install-PhienNote $src $u.C.LDir $u.Name $info.Expect $gnow $PhienBusySec ([string]$info.Sha)) -eq 'ok') { $noteRec[$key] = [string]$info.Sha; $stat.noteCopied++; if ($script:PhienLastExclAdded) { $noteRec["exclude:laptop:$key"] = '1' } } else { $noteSkipped++ }
+          if (Test-PhienTimeUp) { $cut = $true }   # safe point: before a note
+          if ($cut -or -not (Test-Path -LiteralPath $src)) { $noteSkipped++; continue }
+          # ownership is saved before fcode adds the line: a kill after the line never leaves a line fcode does not know it owns
+          $ns = Install-PhienNote $src $u.C.LDir $u.Name $info.Expect $gnow $PhienBusySec ([string]$info.Sha) { $noteRec["exclude:laptop:$key"] = '1'; & $saveNotes $true }
+          if ($ns -eq 'ok') { $noteRec[$key] = [string]$info.Sha; $stat.noteCopied++; if ($script:PhienLastExclAdded) { $noteRec["exclude:laptop:$key"] = '1' } } else { $noteSkipped++ }
+          if ($ns -eq 'timeout') { $cut = $true; Write-PhienOut "  [$($u.C.Name)] ghi chú $($u.Name): git không trả lời kịp, chưa đặt (lần sau làm tiếp)" }
+          if ($ns -eq 'link') { Write-PhienOut "  [$($u.C.Name)] ghi chú $($u.Name): .git/info/exclude là liên kết, fcode không ghi vào đó, chưa đặt" }
         }
         Remove-Item -LiteralPath $gtar, $gt -Recurse -Force -ErrorAction SilentlyContinue
         & $saveNotes
-        'ok'
+        if ($cut) { 'cap' } else { 'ok' }
       }
       # --- thu tu: moi dot thuong (<= 50 MB) truoc, lay ve roi gui len; roi moi dot mot file qua lon, nho truoc; sau cung file chinh cua cac phien do.
       # Dot loi thi ghi lai roi lam dot sau; chi het gio cua lan chay hoac mat box (ssh 255) moi dung han.
       $jobs = New-Object System.Collections.ArrayList; $big = New-Object System.Collections.ArrayList
       foreach ($bb in $getB) { if (& $bigName $bb) { [void]$big.Add(@{ D = 'get'; B = $bb }) } else { [void]$jobs.Add(@{ D = 'get'; B = $bb }) } }
       foreach ($bb in $putB) { if (& $bigName $bb) { [void]$big.Add(@{ D = 'put'; B = $bb }) } else { [void]$jobs.Add(@{ D = 'put'; B = $bb }) } }
-      foreach ($job in @($big | Sort-Object { [long]$_.B.Bytes })) { [void]$jobs.Add($job) }
-      foreach ($bb in $getLB) { [void]$jobs.Add(@{ D = 'get'; B = $bb }) }; foreach ($bb in $putLB) { [void]$jobs.Add(@{ D = 'put'; B = $bb }) }
+      if ($Quick) {
+        # a quick run (the hook, 20 s) never starts a batch of one file over 50 MB, nor the late batch waiting for it: the auto run or `fcode phien` sends them
+        foreach ($bb in @(@($big | ForEach-Object { $_.B }) + @($getLB) + @($putLB))) {
+          if (-not $bb) { continue }
+          $bn = & $bigName $bb; if (-not $bn) { $bn = @($bb.Items | ForEach-Object { if ($_.Rel) { [string]$_.Rel } else { [string]$_.Name } }) -join ', ' }
+          Write-PhienOut "phiên lớn: $bn — lần nhanh không chép, để lần tự động hoặc fcode phien"; $fileSkipped++
+        }
+      } else {
+        foreach ($job in @($big | Sort-Object { [long]$_.B.Bytes })) { [void]$jobs.Add($job) }
+        foreach ($bb in $getLB) { [void]$jobs.Add(@{ D = 'get'; B = $bb }) }; foreach ($bb in $putLB) { [void]$jobs.Add(@{ D = 'put'; B = $bb }) }
+      }
       foreach ($job in $jobs) {
-        if (Test-PhienTimeUp) { Write-PhienOut 'hết thời gian của lượt này: phần còn lại để lần sau'; $code = 1; break }
+        if (Test-PhienTimeUp) { if ($Quick) { $capHit = $true } else { Write-PhienOut 'hết thời gian của lượt này: phần còn lại để lần sau'; $code = 1 }; break }
         $st = if ($job.D -eq 'put') { . $doPut $job.B } else { . $doGet $job.B }
         if ("$st" -eq 'ok') { continue }
+        if ("$st" -eq 'cap') { if ($Quick) { $capHit = $true } else { Write-PhienOut 'hết thời gian của lượt này: phần còn lại để lần sau'; $code = 1 }; break }
         $code = 1
         $bn = & $bigName $job.B; if ($bn) { Write-PhienOut "phiên lớn: $bn chưa chép xong — chạy ``fcode phien`` khi mạng tốt"; $stat.unfinished += $bn }
         if ("$st" -eq 'lost') { Write-PhienOut 'lỗi: mất kết nối với box, phần còn lại để lần sau'; break }
@@ -2574,9 +2703,11 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
       if ($stat.noteCopied -or $stat.noteConf.Count) { Write-PhienOut "ghi chú dự án: chép $($stat.noteCopied), xung đột $($stat.noteConf.Count)" }
       & $saveNotes
       $stat.skipped += $noteSkipped
-      $open = $planIncomplete + $deferredTops.Count + $busyFiles.Count + $failed + $fileSkipped + $code
+      $open = $planIncomplete + $deferredTops.Count + $busyFiles.Count + $failed + $fileSkipped + $code + [int]$capHit
       Write-PhienOut ("Xong: $up file gửi lên box, $down file lấy về laptop" + $(if ($up + $down -eq 0 -and $open -eq 0) { ' (hai bên đã giống nhau)' } else { '' }))
-      if (-not $Auto -and ($nPutSess + $nGetSess) -gt 0) { Write-PhienOut 'Nhớ đẩy code lên GitHub trước (git push) để hai bên cùng một bản code.' }
+      if (-not $Auto -and -not $Quick -and ($nPutSess + $nGetSess) -gt 0) { Write-PhienOut 'Nhớ đẩy code lên GitHub trước (git push) để hai bên cùng một bản code.' }
+      # the cap line only when nothing failed for real: a real error keeps its exit code and its own one line
+      if ($capHit) { if ($code -eq 0) { Set-PhienScreen $capMsg } else { Write-PhienOut $capMsg } }
     } finally { Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue }
     if ($code -ne 0) { $stat.ok = $false }
     return $code
@@ -2587,7 +2718,6 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
   } finally {
     if ($stat.ran -and -not $DryRun) { Write-PhienStatus $stat $Auto }
     if ($mx) { if ($held) { try { $mx.ReleaseMutex() } catch { } }; $mx.Dispose() }
-    if ($Auto -and $script:PhienLines.Count -gt 0) { Add-PhienLog $script:PhienLines }
   }
 }
 
@@ -2605,21 +2735,30 @@ function Get-PhienNoteRx { '\A(?:HANDOFF[^/\\]*\.md|CLAUDE\.md|AGENTS\.md|WORKFL
 function Get-PhienNoteSpecs { , @(':(glob)HANDOFF*.md', 'CLAUDE.md', 'AGENTS.md', 'WORKFLOW.md', 'agent_state.md', 'TASK.md', 'CLAUDE.local.md') }
 
 function Invoke-GitQuiet([string]$Dir, [string[]]$GitArgs) {
-  $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-  try { $o = & git --no-optional-locks -C $Dir -c core.quotepath=false @GitArgs 2>$null; $c = $LASTEXITCODE }
-  catch { $o = @(); $c = -1 }
-  finally { $ErrorActionPreference = $old }
-  [pscustomobject]@{ Code = $c; Out = @($o | ForEach-Object { "$_" }) }
+  $git = Get-Command git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+  $script:PhienLastGitCode = -1
+  if (-not $git) { return [pscustomobject]@{ Code = -1; Out = @() } }
+  $r = Invoke-PhienExe $git.Source (@('--no-optional-locks', '-C', $Dir, '-c', 'core.quotepath=false') + @($GitArgs))   # bounded like every other child
+  $script:PhienLastGitCode = $r.Code
+  [pscustomobject]@{ Code = $r.Code; Out = @($r.Out) }   # Code 124 = killed at its timeout: callers never read that as "git said no"
 }
 
 # ghi chu nam trong nhanh mac dinh cua origin (ban da fetch): git se mang file do toi, nen cung tinh la da theo doi (nhu box `upstream_names`)
+# $null = git did not answer in time (124): unknown, never "nothing upstream"
 function Get-PhienUpstreamNotes([string]$Dir) {
   $h = Invoke-GitQuiet $Dir @('symbolic-ref', '-q', 'refs/remotes/origin/HEAD')
+  if ($h.Code -eq 124) { return $null }
   $ref = if ($h.Code -eq 0 -and @($h.Out)[0]) { [string]@($h.Out)[0] } else { '' }
   # khong co origin/HEAD (remote add + fetch): origin/main, roi origin/master
-  foreach ($c in 'refs/remotes/origin/main', 'refs/remotes/origin/master') { if (-not $ref -and (Invoke-GitQuiet $Dir @('rev-parse', '-q', '--verify', $c)).Code -eq 0) { $ref = $c } }
+  foreach ($c in 'refs/remotes/origin/main', 'refs/remotes/origin/master') {
+    if ($ref) { break }
+    $v = Invoke-GitQuiet $Dir @('rev-parse', '-q', '--verify', $c)
+    if ($v.Code -eq 124) { return $null }
+    if ($v.Code -eq 0) { $ref = $c }
+  }
   if (-not $ref) { return , @() }
   $r = Invoke-GitQuiet $Dir @('ls-tree', '--name-only', $ref)
+  if ($r.Code -eq 124) { return $null }
   if ($r.Code -ne 0) { return , @() }
   $rx = Get-PhienNoteRx
   , @($r.Out | Where-Object { $_ -cmatch $rx } | Sort-Object)
@@ -2627,16 +2766,20 @@ function Get-PhienUpstreamNotes([string]$Dir) {
 
 # cung dang voi `scan_notes` cua box: @{gitok; tracked (index); upstream (origin/<mac dinh>); files = {name,size,mtime,sha,ign}}
 function Get-PhienLocalNotes([string]$Dir) {
+  $nogit = [pscustomobject]@{ gitok = $false; tracked = @(); upstream = @(); files = @() }   # also when git did not answer in time: no note sync for it this run
   $r = Invoke-GitQuiet $Dir (@('ls-files', '--') + (Get-PhienNoteSpecs))
-  if ($r.Code -ne 0) { return [pscustomobject]@{ gitok = $false; tracked = @(); upstream = @(); files = @() } }
+  if ($r.Code -ne 0) { return $nogit }
   $rx = Get-PhienNoteRx
   $files = New-Object System.Collections.ArrayList
   foreach ($f in (Get-ChildItem -LiteralPath $Dir -File -Force | Sort-Object Name)) {
     if ($f.Name -cnotmatch $rx) { continue }
     $ig = Invoke-GitQuiet $Dir @('check-ignore', '-q', '--', $f.Name)
+    if ($ig.Code -eq 124) { return $nogit }
     [void]$files.Add([pscustomobject]@{ name = $f.Name; size = $f.Length; mtime = (ConvertTo-Epoch $f.LastWriteTimeUtc); sha = (Get-RangeSha $f.FullName 0 $f.Length); ign = ($ig.Code -eq 0) })
   }
-  [pscustomobject]@{ gitok = $true; tracked = @($r.Out | Where-Object { $_ -cmatch $rx } | Sort-Object); upstream = (Get-PhienUpstreamNotes $Dir); files = @($files) }
+  $up = Get-PhienUpstreamNotes $Dir
+  if ($null -eq $up) { return $nogit }
+  [pscustomobject]@{ gitok = $true; tracked = @($r.Out | Where-Object { $_ -cmatch $rx } | Sort-Object); upstream = @($up); files = @($files) }
 }
 
 # ke hoach cho mot project: Put/Get = {Name; Expect (sha hien co o dich, '' neu chua co); Sha (sha noi dung se chep)};
@@ -2684,46 +2827,65 @@ function Write-PhienNoteState([hashtable]$S) {
   $d = Split-Path -Parent $p
   if (-not (Test-Path -LiteralPath $d)) { [void](New-Item -ItemType Directory -Path $d -Force) }
   $o = [ordered]@{}; foreach ($k in ($S.Keys | Sort-Object)) { $o[$k] = $S[$k] }
-  $tmp = $p + '.part'
-  [IO.File]::WriteAllText($tmp, ($o | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
-  if (Test-Path -LiteralPath $p) { [IO.File]::Replace($tmp, $p, [NullString]::Value) } else { [IO.File]::Move($tmp, $p) }
+  Write-PhienText $p ($o | ConvertTo-Json -Compress)
 }
 
-# them "/<ten>" vao .git/info/exclude (khong dung .gitignore) neu git chua bo qua file. Tra ve $true chi khi LAN NAY them dong
-# (noi goi ghi lai de sau nay chi go dung dong do)
-function Add-PhienNoteExclude([string]$Dir, [string]$Name) {
-  if ((Invoke-GitQuiet $Dir @('check-ignore', '-q', '--', $Name)).Code -eq 0) { return $false }
+# the git half of excluding a note (khong dung .gitignore): '' = git already ignores <ten>; else the full path of .git/info/exclude;
+# $null = git could not say (error or timeout), or the exclude file or its folder is a link ($script:PhienExclLink): the caller must not place the note
+function Get-PhienExcludeFile([string]$Dir, [string]$Name) {
+  $script:PhienExclLink = $false
+  $ig = (Invoke-GitQuiet $Dir @('check-ignore', '-q', '--', $Name)).Code
+  if ($ig -eq 0) { return '' }
+  if ($ig -ne 1) { return $null }
   $r = Invoke-GitQuiet $Dir @('rev-parse', '--git-path', 'info/exclude')
   $p = @($r.Out)[0]
-  if ($r.Code -ne 0 -or -not $p) { return $false }
+  if ($r.Code -ne 0 -or -not $p) { return $null }
   if (-not [IO.Path]::IsPathRooted($p)) { $p = Join-Path $Dir $p }
-  $pd = Split-Path -Parent $p
-  if (-not (Test-Path -LiteralPath $pd)) { [void](New-Item -ItemType Directory -Path $pd -Force) }
-  $cur = if (Test-Path -LiteralPath $p) { [IO.File]::ReadAllText($p) } else { '' }
-  if (@($cur -split '\r?\n') -ccontains ('/' + $Name)) { return $false }
-  [IO.File]::AppendAllText($p, $(if ($cur -and -not $cur.EndsWith("`n")) { "`n" } else { '' }) + '/' + $Name + "`n", (New-Object Text.UTF8Encoding($false)))
+  if (Test-PhienReparse $p) { $script:PhienExclLink = $true; return $null }   # never write through a symlink / junction
+  $p
+}
+# the file half (plain .NET, no git): add "/<ten>" to that exclude file (whole-file atomic rewrite). Tra ve $true chi khi LAN NAY them dong
+# (noi goi ghi lai de sau nay chi go dung dong do)
+function Add-PhienExcludeLine([string]$File, [string]$Name) {
+  if (Test-PhienExcludeLine $File $Name) { return $false }
+  $cur = if ([IO.File]::Exists($File)) { [IO.File]::ReadAllText($File) } else { '' }
+  Write-PhienText $File ($cur + $(if ($cur -and -not $cur.EndsWith("`n")) { "`n" } else { '' }) + '/' + $Name + "`n")
   $true
 }
+# the exclude file already has the exact line "/<ten>" (then it is not fcode's: fcode never claims it)
+function Test-PhienExcludeLine([string]$File, [string]$Name) { [IO.File]::Exists($File) -and (@([IO.File]::ReadAllText($File) -split '\r?\n') -ccontains ('/' + $Name)) }
 
-# go DUNG dong "/<ten>" (dong fcode da them); moi dong khac trong .git/info/exclude giu nguyen. Tra ve $true neu da go
+# go DUNG dong "/<ten>" (dong fcode da them); moi dong khac trong .git/info/exclude giu nguyen.
+# Tra ve: removed (da go) | absent (khong co file / khong co dong do) | failed (git loi / khong tra loi kip, hay file / thu muc la lien ket: khong ghi gi)
 function Remove-PhienNoteExclude([string]$Dir, [string]$Name) {
   $r = Invoke-GitQuiet $Dir @('rev-parse', '--git-path', 'info/exclude')
   $p = @($r.Out)[0]
-  if ($r.Code -ne 0 -or -not $p) { return $false }
+  if ($r.Code -ne 0 -or -not $p) { return 'failed' }
   if (-not [IO.Path]::IsPathRooted($p)) { $p = Join-Path $Dir $p }
-  if (-not (Test-Path -LiteralPath $p)) { return $false }
+  if (Test-PhienReparse $p) { return 'failed' }
+  if (-not (Test-Path -LiteralPath $p)) { return 'absent' }
   $cur = [IO.File]::ReadAllText($p)
   $new = [regex]::Replace($cur, '(?m)^/' + [regex]::Escape($Name) + '\r?(?:\n|\z)', '')
-  if ($new -ceq $cur) { return $false }
-  [IO.File]::WriteAllText($p, $new, (New-Object Text.UTF8Encoding($false)))
-  $true
+  if ($new -ceq $cur) { return 'absent' }
+  Write-PhienText $p $new
+  'removed'
 }
 
-# dat mot file ghi chu da lay tu box vao goc project tren laptop. Tra ve: ok | changed | busy | tracked
-function Install-PhienNote([string]$Src, [string]$Dir, [string]$Name, [string]$Expect, [double]$Now, [int]$Busy = 30, [string]$Sha = '') {
+# dat mot file ghi chu da lay tu box vao goc project tren laptop.
+# Tra ve: ok | changed | busy | tracked | failed | link (.git/info/exclude la lien ket) | timeout (git did not answer in time)
+# One item, in this order: the git half, then ownership ($BeforeLine records "fcode owns the line"), then the exclude line, then the move.
+# A kill anywhere leaves at most an inert line or a recorded ownership, never a visible unexcluded note and never an unrecorded line.
+function Install-PhienNote([string]$Src, [string]$Dir, [string]$Name, [string]$Expect, [double]$Now, [int]$Busy = 30, [string]$Sha = '', [scriptblock]$BeforeLine = $null) {
+  $script:PhienLastExclAdded = $false
   if ($Sha -and (Get-RangeSha $Src 0 (Get-Item -LiteralPath $Src).Length) -ne $Sha) { return 'changed' }
   $t = Invoke-GitQuiet $Dir @('ls-files', '--', $Name)
-  if ($t.Code -ne 0 -or $t.Out -ccontains $Name -or (Get-PhienUpstreamNotes $Dir) -ccontains $Name) { return 'tracked' }
+  if ($t.Code -eq 124) { return 'timeout' }
+  if ($t.Code -ne 0 -or $t.Out -ccontains $Name) { return 'tracked' }
+  $up = Get-PhienUpstreamNotes $Dir
+  if ($null -eq $up) { return 'timeout' }
+  if ($up -ccontains $Name) { return 'tracked' }
+  $ex = Get-PhienExcludeFile $Dir $Name
+  if ($null -eq $ex) { if ($script:PhienExclLink) { return 'link' }; if ($script:PhienLastGitCode -eq 124) { return 'timeout' }; return 'failed' }
   $dst = Join-Path $Dir $Name
   if (Test-Path -LiteralPath $dst) {
     $di = Get-Item -LiteralPath $dst
@@ -2734,10 +2896,12 @@ function Install-PhienNote([string]$Src, [string]$Dir, [string]$Name, [string]$E
   $part = New-PhienPartName $dst
   try {
     [IO.File]::Copy($Src, $part, $true)
+    [IO.File]::SetLastWriteTimeUtc($part, $mt)
+    # ownership only for a line fcode really adds now: an identical line already there is the user's
+    if ($ex) { if ($BeforeLine -and -not (Test-PhienExcludeLine $ex $Name)) { & $BeforeLine }; $added = Add-PhienExcludeLine $ex $Name } else { $added = $false }
     if (Test-Path -LiteralPath $dst) { [IO.File]::Replace($part, $dst, [NullString]::Value) } else { [IO.File]::Move($part, $dst) }
-    [IO.File]::SetLastWriteTimeUtc($dst, $mt)
   } finally { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }
-  $script:PhienLastExclAdded = [bool](Add-PhienNoteExclude $Dir $Name)
+  $script:PhienLastExclAdded = [bool]$added
   'ok'
 }
 # trang thai che do tu dong (%LOCALAPPDATA%\fcode\phien-auto.json): box dang chay o lan kiem tra truoc, va luc (epoch giay) mo ssh
@@ -2754,7 +2918,7 @@ function Write-PhienAutoState([hashtable]$S) {
     $p = Get-PhienAutoStatePath
     $d = Split-Path -Parent $p
     if (-not (Test-Path -LiteralPath $d)) { [void](New-Item -ItemType Directory -Path $d -Force) }
-    [IO.File]::WriteAllText($p, ([ordered]@{ boxRunning = [bool]$S.boxRunning; lastSshAt = [double]$S.lastSshAt } | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
+    Write-PhienText $p ([ordered]@{ boxRunning = [bool]$S.boxRunning; lastSshAt = [double]$S.lastSshAt } | ConvertTo-Json -Compress)
   } catch { }
 }
 
@@ -2787,16 +2951,23 @@ function Invoke-PhienAutoRun {
   Add-PhienLog @("đồng bộ vì: $why")
   Invoke-PhienSync '' $true $false $true
 }
-# nhat ky cho che do tu dong: chi dong tom tat, khong bao gio noi dung phien. Cat con ~100 KB.
+# nhat ky cho che do tu dong va --nhanh: chi dong tom tat, khong bao gio noi dung phien. Moi dong ghi ngay (append), nen lan chay bi ngat
+# giua chung van giu moi dong da ghi. Khoa ten <khoa>-log giu dong cua hai lan chay khong lan vao nhau; cho toi da 2 s roi van ghi (khong bao
+# gio cho lan chay khac), nhung khi do khong xoay file. Qua 200 KB: doi ten thanh phien.log.1 (nhat ky cu hon), roi ghi tiep vao phien.log moi.
 function Add-PhienLog($Lines) {
   try {
-    $d = Split-Path -Parent $PhienLog
-    if (-not (Test-Path -LiteralPath $d)) { [void](New-Item -ItemType Directory -Path $d -Force) }
-    if ((Test-Path -LiteralPath $PhienLog) -and (Get-Item -LiteralPath $PhienLog).Length -gt 200KB) {
-      $keep = Get-Content -LiteralPath $PhienLog -Tail 400; Set-Content -LiteralPath $PhienLog -Value $keep -Encoding UTF8
-    }
-    $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    Add-Content -LiteralPath $PhienLog -Value @($Lines | ForEach-Object { "$ts $_" }) -Encoding UTF8
+    [void][IO.Directory]::CreateDirectory((Split-Path -Parent $PhienLog))
+    $mx = New-Object Threading.Mutex($false, ((Get-PhienLockName) + '-log'))
+    $own = $false
+    try { $own = $mx.WaitOne(2000) } catch [Threading.AbandonedMutexException] { $own = $true }
+    try {
+      if ($own -and [IO.File]::Exists($PhienLog) -and (New-Object IO.FileInfo($PhienLog)).Length -gt 200KB) {
+        $old = $PhienLog + '.1'
+        try { if ([IO.File]::Exists($old)) { [IO.File]::Replace($PhienLog, $old, [NullString]::Value) } else { [IO.File]::Move($PhienLog, $old) } } catch { }   # in use (sharing violation): rotate next time
+      }
+      $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+      Add-Content -LiteralPath $PhienLog -Value @($Lines | ForEach-Object { "$ts $_" }) -Encoding UTF8
+    } finally { if ($own) { try { $mx.ReleaseMutex() } catch { } }; $mx.Dispose() }
   } catch { }
 }
 
@@ -2852,16 +3023,252 @@ function Invoke-PhienMenu {
   }
 }
 
-# fcode phien [project] | tu-dong bat|tat|trangthai | --tu-dong (do Task Scheduler goi)
+# --- --nhanh: a supervisor in its own kill-on-close job runs the real sync as a worker process inside that job ---
+$PhienFailMsg = 'phien: không đồng bộ được, xem phien.log'
+# --nen (the hook's run after the agent ends) waits 35 s first: a session saved a moment ago counts as "being written" for 30 s. FCODE_MOC_DELAY: tests only.
+function Get-PhienNenDelaySec { if ("$env:FCODE_MOC_DELAY" -match '\A[0-9]{1,3}\z') { [int]$env:FCODE_MOC_DELAY } else { 35 } }
+$PhienJobSrc = @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public static class FcodeJob {
+  [StructLayout(LayoutKind.Sequential)] struct Basic { public long PerProcessUserTimeLimit; public long PerJobUserTimeLimit; public uint LimitFlags; public UIntPtr MinimumWorkingSetSize; public UIntPtr MaximumWorkingSetSize; public uint ActiveProcessLimit; public UIntPtr Affinity; public uint PriorityClass; public uint SchedulingClass; }
+  [StructLayout(LayoutKind.Sequential)] struct Io { public ulong ReadOps, WriteOps, OtherOps, ReadBytes, WriteBytes, OtherBytes; }
+  [StructLayout(LayoutKind.Sequential)] struct Ext { public Basic BasicLimits; public Io IoInfo; public UIntPtr ProcessMemoryLimit; public UIntPtr JobMemoryLimit; public UIntPtr PeakProcessMemoryUsed; public UIntPtr PeakJobMemoryUsed; }
+  [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern IntPtr CreateJobObject(IntPtr attrs, string name);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetInformationJobObject(IntPtr job, int cls, ref Ext info, uint len);
+  [DllImport("kernel32.dll", SetLastError = true)] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr proc);
+  // a job whose last handle closing (this process ending, however it ends) makes Windows end every process in it
+  public static IntPtr Create() {
+    IntPtr j = CreateJobObject(IntPtr.Zero, null);
+    if (j == IntPtr.Zero) throw new Win32Exception();
+    Ext x = new Ext(); x.BasicLimits.LimitFlags = 0x2000;   // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if (!SetInformationJobObject(j, 9, ref x, (uint)Marshal.SizeOf(typeof(Ext)))) throw new Win32Exception();   // 9 = JobObjectExtendedLimitInformation
+    return j;
+  }
+  public static void Assign(IntPtr job, IntPtr proc) { if (!AssignProcessToJobObject(job, proc)) throw new Win32Exception(); }
+}
+'@
+# the job with THIS process in it (every child started later is born in it); $null when Windows refuses, the reason in $script:PhienJobError.
+# The handle is never closed: it closes when this process ends.
+function Get-PhienJob {
+  try {
+    if (-not ('FcodeJob' -as [type])) { Add-Type -TypeDefinition $PhienJobSrc }
+    $j = [FcodeJob]::Create()
+    [FcodeJob]::Assign($j, [Diagnostics.Process]::GetCurrentProcess().Handle)
+    $j
+  } catch { $script:PhienJobError = $_.Exception.Message; $null }
+}
+# the supervisor of a quick run: no job -> no sync at all (fail closed). The worker is the same program with FCODE_PHIEN_WORKER=1 and the screen of this
+# one. When it overruns cap + 10 s this process returns 1 and ends; however this process ends (also killed, or its window closed), the job ends the worker
+# and all its children (git, tar, instabox, ssh). So there is no kill call here.
+function Invoke-PhienBounded([string]$Proj, [bool]$Nen) {
+  if ($Nen) { Start-Sleep -Seconds (Get-PhienNenDelaySec) }
+  $job = Get-PhienJob
+  if ($null -eq $job) {
+    Add-PhienLog @("lỗi: không tạo được job bảo vệ cho lần chạy nhanh ($script:PhienJobError) — không đồng bộ")
+    Write-Host $PhienFailMsg
+    return 1
+  }
+  $psi = New-Object Diagnostics.ProcessStartInfo
+  $psi.FileName = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+  $psi.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $FcodeScript + '" phien ' + $Proj + ' --nhanh'
+  $psi.UseShellExecute = $false
+  $psi.EnvironmentVariables['FCODE_PHIEN_WORKER'] = '1'
+  try { $p = [Diagnostics.Process]::Start($psi) } catch { Add-PhienLog @("lỗi: không chạy được lần đồng bộ nhanh ($($_.Exception.Message))"); Write-Host $PhienFailMsg; return 1 }
+  try {
+    $lim = (Get-PhienCapSec) + 10
+    if ($p.WaitForExit($lim * 1000)) { return $p.ExitCode }
+    if ($p.HasExited) { return $p.ExitCode }
+    Add-PhienLog @("lỗi: lần chạy nhanh vượt quá $lim giây nên bị ngắt hẳn (việc đang làm dở để lần sau; các dòng ngay trên là của lần chạy đó)")
+    try { Write-Host $PhienFailMsg } catch { }
+    return 1
+  } finally { $p.Dispose() }
+}
+
+# fcode phien [project] | <project> --nhanh [--nen] | tu-dong bat|tat|trangthai | --tu-dong (do Task Scheduler goi)
 function Invoke-Phien {
   $dry = [bool]($Rest | Where-Object { $_ -eq '--thu' })
-  $pa = @($Rest | Select-Object -Skip 1 | Where-Object { $_ -ne '--thu' })
+  $quick = [bool]($Rest | Where-Object { $_ -eq '--nhanh' })
+  $nen = [bool]($Rest | Where-Object { $_ -eq '--nen' })
+  $pa = @($Rest | Select-Object -Skip 1 | Where-Object { $_ -ne '--thu' -and $_ -ne '--nhanh' -and $_ -ne '--nen' })
   $sub = if ($pa.Count -gt 0) { $pa[0] } else { '' }
   foreach ($a in $Rest) { if (Test-HasControlChar $a) { Write-Host 'lỗi: tham số có ký tự không hợp lệ.'; return 1 } }
   if ($sub -eq '--tu-dong') { return (Invoke-PhienAutoRun) }   # khoa chung (Local\fcode-phien) nam trong Invoke-PhienSync
   if ($sub -eq 'tu-dong') { return (Invoke-PhienAuto $(if ($pa.Count -gt 1) { $pa[1] } else { '' })) }
-  if ($sub -and $sub -notmatch '\A[A-Za-z0-9._-]+\z') { Write-Host 'Cách dùng: fcode phien [project]    fcode phien tu-dong bat|tat'; return 1 }
-  Invoke-PhienSync $sub $false $dry
+  if (($sub -and $sub -notmatch '\A[A-Za-z0-9._-]+\z') -or ($quick -and (-not $sub -or $dry)) -or ($nen -and -not $quick)) { Write-Host 'Cách dùng: fcode phien [project]    fcode phien <project> --nhanh    fcode phien tu-dong bat|tat'; return 1 }
+  if ($quick -and $env:FCODE_PHIEN_WORKER -ne '1') { return (Invoke-PhienBounded $sub $nen) }
+  $rc = Invoke-PhienSync $sub $false $dry $false $quick
+  # --nhanh (the hook): the screen gets at most one line, the asleep / busy / cap message, or one short line when the sync failed; success prints nothing
+  if ($quick) { if ($script:PhienScreen) { Write-Host $script:PhienScreen } elseif ($rc -ne 0) { Write-Host $PhienFailMsg } }
+  $rc
+}
+
+# --- fcode moc bat|tat|trang-thai: hook trong profile PowerShell ---
+# Khi gõ omp / claude / codex trong thu muc mot project (syncRepos), hook chay `fcode phien <project> --nhanh` truoc (cho xong, fcode tu ngat o ~30 s, hook chot 35 s),
+# chay chuong trinh that, roi chay `--nhanh --nen` an o nen (fcode tu cho 35 s). Khoi nam giua hai dong danh dau; fcode chi sua khoi nay, khong dong gi khac cua profile.
+# Khoi chi co ky tu ASCII (profile khong BOM doc theo ANSI trong Windows PowerShell 5.1); cau tieng Viet duy nhat di qua [regex]::Unescape.
+$MocBegin = '# >>> fcode moc >>>'; $MocEnd = '# <<< fcode moc <<<'
+$MocRx = '(?ms)^# >>> fcode moc >>>[ \t]*\r?\n.*?^# <<< fcode moc <<<[ \t]*(?:\r?\n|\z)'
+$MocBlock = @'
+# >>> fcode moc >>>
+# Added by "fcode moc bat"; remove with "fcode moc tat". Off in this window: $env:FCODE_MOC = '0' (on again: Remove-Item Env:FCODE_MOC)
+function Invoke-FcodeMoc([string]$Name, $Rest) {
+  $real = Get-Command $Name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $real) { Write-Host "${Name}: not found on PATH"; $global:LASTEXITCODE = 127; return }
+  $proj = $null; $fc = $null
+  if ($env:FCODE_MOC -ne '0') {
+    try {
+      $cwd = ((Get-Location).ProviderPath -replace '/', '\').TrimEnd('\')
+      $cfg = [IO.File]::ReadAllText((Join-Path $env:USERPROFILE '.fcode\config.json')) | ConvertFrom-Json
+      $repos = @(@($cfg.syncRepos) | ForEach-Object { ([string]$_ -replace '/', '\').TrimEnd('\') } | Where-Object { $_ })
+      $best = ''
+      foreach ($s in $repos) { if (($cwd -ieq $s -or $cwd.StartsWith($s + '\', [StringComparison]::OrdinalIgnoreCase)) -and $s.Length -gt $best.Length) { $best = $s } }
+      $n = if ($best) { (Split-Path $best -Leaf).ToLowerInvariant() } else { '' }
+      $first = $repos | Where-Object { (Split-Path $_ -Leaf).ToLowerInvariant() -eq $n } | Select-Object -First 1
+      if ($n -match '\A[a-z0-9][a-z0-9._-]{0,63}\z' -and $first -eq $best) { $proj = $n }
+      $fc = Get-Command fcode -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+      if ($fc) {
+        # fcode.ps1 next to fcode.cmd: start it directly (no batch file in the chain, so Ctrl+C never asks "Terminate batch job"); else fcode.cmd
+        $ps1 = Join-Path (Split-Path -Parent $fc.Source) 'fcode.ps1'
+        $psh = Get-Command powershell.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ((Test-Path -LiteralPath $ps1) -and $psh) { $exe = $psh.Source; $pre = '-NoProfile -ExecutionPolicy Bypass -File "' + $ps1 + '" ' } else { $exe = $fc.Source; $pre = '' }
+      }
+    } catch { }
+  }
+  $sync = $proj -and $fc
+  if ($sync) {
+    try {
+      # fcode bounds itself (ends by about 30 s); the 35 s wait and taskkill are only a backstop
+      $psi = New-Object Diagnostics.ProcessStartInfo
+      $psi.FileName = $exe; $psi.Arguments = $pre + "phien $proj --nhanh"; $psi.UseShellExecute = $false
+      $pr = [Diagnostics.Process]::Start($psi)
+      if (-not $pr.WaitForExit(35000)) { & taskkill.exe /PID $pr.Id /T /F 2>&1 | Out-Null }
+      $pr.Dispose()
+    } catch { Write-Host ([regex]::Unescape('fcode: kh\u00f4ng \u0111\u1ed3ng b\u1ed9 \u0111\u01b0\u1ee3c phi\u00ean, b\u1ecf qua.')) }
+  }
+  # piped input (echo hi | claude -p) goes on to the real program; with nothing piped it keeps the console, so the terminal UI works
+  if ($MyInvocation.ExpectingInput) { $input | & $real.Source @Rest } else { & $real.Source @Rest }
+  $rc = $LASTEXITCODE
+  if ($sync) {
+    try {
+      # the sync after the agent ends: started through the shell, so it inherits none of this shell's handles and its console stays hidden;
+      # fcode waits 35 s itself (--nen) and bounds itself
+      $psi = New-Object Diagnostics.ProcessStartInfo
+      $psi.FileName = $exe; $psi.Arguments = $pre + "phien $proj --nhanh --nen"
+      $psi.UseShellExecute = $true; $psi.WindowStyle = 'Hidden'
+      [void][Diagnostics.Process]::Start($psi)
+    } catch { }
+  }
+  $global:LASTEXITCODE = $rc
+}
+function omp { if ($MyInvocation.ExpectingInput) { $input | Invoke-FcodeMoc 'omp' $args } else { Invoke-FcodeMoc 'omp' $args } }
+function claude { if ($MyInvocation.ExpectingInput) { $input | Invoke-FcodeMoc 'claude' $args } else { Invoke-FcodeMoc 'claude' $args } }
+function codex { if ($MyInvocation.ExpectingInput) { $input | Invoke-FcodeMoc 'codex' $args } else { Invoke-FcodeMoc 'codex' $args } }
+# <<< fcode moc <<<
+'@
+
+# hai file profile (CurrentUserAllHosts) cua Windows PowerShell 5.1 va PowerShell 7. Chi de thu: FCODE_DOCUMENTS thay thu muc Documents that.
+function Get-MocProfiles {
+  $d = if ($env:FCODE_DOCUMENTS) { $env:FCODE_DOCUMENTS } else { [Environment]::GetFolderPath('MyDocuments') }
+  @((Join-Path $d 'WindowsPowerShell\profile.ps1'), (Join-Path $d 'PowerShell\profile.ps1'))
+}
+# 'ok' | 'same' (khong doi gi) | 'utf16' | 'half' (chi co mot dau danh dau): ghi/go khoi trong mot file profile. File doc theo byte (Latin-1 1:1),
+# nen phan ngoai khoi giu NGUYEN byte (BOM, xuong dong). Lan doi dau tien cua file co san: chep sang profile.ps1.bak-fcode (khong bao gio de len).
+function Set-MocProfile([string]$Path, [bool]$On) {
+  $latin = [Text.Encoding]::GetEncoding(28591)
+  $exists = Test-Path -LiteralPath $Path
+  if (-not $exists -and -not $On) { return 'same' }
+  $text = ''
+  if ($exists) {
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -ge 2 -and (($bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) -or ($bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF))) { return 'utf16' }
+    $text = $latin.GetString($bytes)
+  }
+  $m = [regex]::Match($text, $MocRx)
+  if (-not $m.Success -and ($text.Contains($MocBegin) -or $text.Contains($MocEnd))) { return 'half' }
+  $nl = if ($text -match "\r\n" -or $text -notmatch "\n") { "`r`n" } else { "`n" }
+  if ($On) {
+    $block = ($MocBlock -replace "`r?`n", $nl) + $nl
+    $new = if ($m.Success) { $text.Substring(0, $m.Index) + $block + $text.Substring($m.Index + $m.Length) }
+           else { $text + $(if ($text -and -not $text.EndsWith("`n")) { $nl }) + $block }
+  } else { $new = [regex]::Replace($text, $MocRx, '') }
+  if ($new -ceq $text) { return 'same' }
+  $dir = Split-Path -Parent $Path
+  if (-not (Test-Path -LiteralPath $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+  if ($exists -and -not (Test-Path -LiteralPath "$Path.bak-fcode")) { Copy-Item -LiteralPath $Path -Destination "$Path.bak-fcode" }
+  $tmp = "$Path.fcode-tmp"
+  [IO.File]::WriteAllBytes($tmp, $latin.GetBytes($new))
+  if ($exists) { [IO.File]::Replace($tmp, $Path, [NullString]::Value) } else { [IO.File]::Move($tmp, $Path) }
+  'ok'
+}
+# chinh sach chay script hieu luc, KHONG tinh pham vi Process (fcode.cmd chay voi -ExecutionPolicy Bypass nen se che mat chinh sach that)
+function Get-MocPolicy {
+  try { $l = @(Get-ExecutionPolicy -List | Where-Object { $_.Scope -ne 'Process' -and "$($_.ExecutionPolicy)" -ne 'Undefined' }); if ($l.Count) { return [pscustomobject]@{ Policy = "$($l[0].ExecutionPolicy)"; Scope = "$($l[0].Scope)" } } } catch { }
+  [pscustomobject]@{ Policy = 'Restricted'; Scope = 'mặc định' }
+}
+# chinh sach hieu luc cua PowerShell 7 (pwsh), hoi chinh pwsh; $null neu may khong co pwsh hoac khong hoi duoc. Bo moi truong -ExecutionPolicy Bypass
+# cua fcode.cmd (con thua huong qua PSExecutionPolicyPreference), khong thi pwsh luon tra Bypass.
+function Get-MocPwshPolicy {
+  $pw = Get-Command pwsh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $pw) { return $null }
+  $save = $script:PhienDeadline
+  try {
+    $script:PhienDeadline = [DateTime]::UtcNow.AddSeconds(15)
+    $r = Invoke-PhienExe $pw.Source @('-NoProfile', '-NonInteractive', '-Command', '$env:PSExecutionPolicyPreference = $null; (Get-ExecutionPolicy).ToString()')
+    $v = "$(@($r.Out)[-1])".Trim()
+    if ($r.Code -eq 0 -and $v -match '\A[A-Za-z]+\z') { return $v }
+  } catch { } finally { $script:PhienDeadline = $save }
+  $null
+}
+function Write-MocPolicy {
+  $p = Get-MocPolicy
+  Write-Host "Chính sách chạy script của Windows PowerShell 5.1: $($p.Policy) (đặt ở: $($p.Scope))"
+  if ($p.Policy -in 'Restricted', 'AllSigned') {
+    Write-Host "  Cảnh báo: với chính sách này Windows PowerShell 5.1 sẽ KHÔNG nạp file profile nên hook chưa chạy ở đó. fcode không tự đổi chính sách."
+    Write-Host '  Muốn cho phép, mở PowerShell và gõ:  Set-ExecutionPolicy -Scope CurrentUser RemoteSigned   rồi mở cửa sổ PowerShell mới.'
+    if ($p.Scope -in 'MachinePolicy', 'UserPolicy') { Write-Host '  (Chính sách này do Group Policy đặt nên lệnh trên có thể không đổi được; hỏi người quản trị máy.)' }
+  }
+  $pp = Get-MocPwshPolicy
+  if ($pp) {
+    Write-Host "Chính sách chạy script của PowerShell 7 (pwsh): $pp"
+    if ($pp -in 'Restricted', 'AllSigned') {
+      Write-Host "  Cảnh báo: với chính sách này PowerShell 7 sẽ KHÔNG nạp file profile nên hook chưa chạy ở đó. fcode không tự đổi chính sách."
+      Write-Host '  Muốn cho phép, mở PowerShell 7 và gõ:  Set-ExecutionPolicy -Scope CurrentUser RemoteSigned   rồi mở cửa sổ mới.'
+    }
+  }
+}
+# fcode moc bat|tat|trang-thai
+function Invoke-Moc {
+  foreach ($a in $Rest) { if (Test-HasControlChar $a) { Write-Host 'lỗi: tham số có ký tự không hợp lệ.'; return 1 } }
+  $sub = if ($Rest.Count -gt 1) { $Rest[1] } else { '' }
+  if ($sub -notin 'bat', 'tat', 'trang-thai') { Write-Host 'Cách dùng: fcode moc bat   |   fcode moc tat   |   fcode moc trang-thai'; return 1 }
+  $rc = 0
+  if ($sub -eq 'trang-thai') {
+    Write-Host 'Hook đồng bộ phiên khi mở omp / claude / codex (trong thư mục project):'
+    foreach ($f in (Get-MocProfiles)) {
+      $has = $false; try { $has = (Test-Path -LiteralPath $f) -and [regex]::IsMatch([IO.File]::ReadAllText($f), $MocRx) } catch { }
+      Write-Host ("  ${f}: " + $(if ($has) { 'có khối hook' } else { 'không có khối hook' }))
+    }
+    Write-MocPolicy
+    return 0
+  }
+  foreach ($f in (Get-MocProfiles)) {
+    try { $r = Set-MocProfile $f ($sub -eq 'bat') } catch { Write-Host "lỗi: không ghi được ${f}: $($_.Exception.Message)"; $rc = 1; continue }
+    switch ($r) {
+      'ok' { Write-Host ("  ${f}: " + $(if ($sub -eq 'bat') { 'đã thêm khối hook' } else { 'đã gỡ khối hook' })) }
+      'same' { Write-Host ("  ${f}: " + $(if ($sub -eq 'bat') { 'khối hook đã có sẵn' } else { 'không có khối hook' })) }
+      'utf16' { Write-Host "  ${f}: không sửa vì file lưu dạng UTF-16; hãy lưu lại dạng UTF-8 rồi chạy lại."; $rc = 1 }
+      'half' { Write-Host "  ${f}: không sửa vì chỉ còn một dòng đánh dấu '# >>> fcode moc >>>' / '# <<< fcode moc <<<'; hãy xoá tay dòng còn lại rồi chạy lại."; $rc = 1 }
+    }
+  }
+  if ($sub -eq 'bat') {
+    Write-Host 'Xong. Mở cửa sổ PowerShell mới. Từ giờ, gõ omp / claude / codex trong thư mục một project (có trong syncRepos), fcode đồng bộ nhanh phiên trước và sau (tối đa khoảng 20 giây; box đang ngủ thì bỏ qua).'
+    Write-Host "Tắt hook trong cửa sổ này: `$env:FCODE_MOC = '0'  (bật lại: Remove-Item Env:FCODE_MOC, hoặc đóng cửa sổ)    Tắt hẳn: fcode moc tat    Xem trạng thái: fcode moc trang-thai"
+    Write-Host 'Hook là hàm bọc nên không chuyển đúng hoàn toàn các tham số kiểu -- và -x:giá-trị, cũng không để lại lỗi trong $?; khi cần đúng tuyệt đối, chạy thẳng claude.exe / codex.exe / omp.exe.'
+    Write-MocPolicy
+  } else { Write-Host 'Đã tắt hook. Cửa sổ PowerShell đang mở vẫn còn hook cho tới khi đóng.' }
+  $rc
 }
 
 if ($arg -in '-h', '--help', '/?', 'help') { Show-Help; exit 0 }
@@ -2876,6 +3283,7 @@ if ($arg -eq 'ipa') { exit (Invoke-Ipa) }
 if ($arg -eq 'add') { exit (Invoke-Add) }
 if ($arg -eq 'pair') { exit (Invoke-Pair) }
 if ($arg -eq 'phien') { exit (Invoke-Phien) }
+if ($arg -eq 'moc') { exit (Invoke-Moc) }
 if ($arg -eq '-l') { $arg = '--list' }
 if ($arg -eq 'new') { $arg = '--new' }
 # ten phien: chi chu, so, . _ - (\z, khong dung $: $ chap nhan them 1 ky tu xuong dong o cuoi)

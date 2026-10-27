@@ -4,6 +4,10 @@
 # ~/.omp and the real box are never touched. Everything lives in a temp folder that is removed at the end.
 #   FCODE_TEST_BOX=1   also run one end-to-end pass on the real instabox box (throwaway HOME there; laptop side = temp USERPROFILE).
 #   FCODE_TEST_ONLY=<regex>   run only the tests whose name matches (used for the mutant runs)
+# Test-only overrides of fcode.ps1 used by the 1.3.3 tests (`phien --nhanh`, `moc`): FCODE_PHIEN_CAP_SEC (the 20 s cap of --nhanh), FCODE_DOCUMENTS
+# (stands for [Environment]::GetFolderPath('MyDocuments'), where `fcode moc` keeps the PowerShell profiles), FCODE_PHIEN_LOCK (the lock name),
+# FCODE_MOC_DELAY (read by `fcode phien <p> --nhanh --nen`, the hook's run after the agent ends: seconds it waits first; 35 by default, the tests use 4).
+# The profile hook is run in child PowerShell processes with a temp USERPROFILE and a fake bin folder (omp / claude / codex / fcode .cmd) first on PATH.
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $Repo = Split-Path -Parent $PSScriptRoot
@@ -28,14 +32,22 @@ $tokens = $null; $errs = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($Fcode, [ref]$tokens, [ref]$errs)
 if ($errs.Count) { throw "fcode.ps1 does not parse: $($errs[0].Message)" }
 $wanted = 'Test-WinPath', 'Resolve-OmpPath', 'Get-OmpUnder', 'Join-OmpName', 'Get-OmpEncodedDir', 'ConvertTo-Epoch', 'Convert-OmpCwd', 'ConvertTo-JsonStr',
-  'Get-OmpHeaderSpan', 'Open-ShareRead', 'Read-Head', 'Get-OmpBodyOff', 'Test-OmpNonEmpty', 'Get-RangeSha', 'Get-PhienOff', 'Test-PhienPrefix', 'Get-PhienKnownVersions', 'Test-PhienKnownVersion', 'Get-OmpHeaderVersion', 'Get-OmpHeaderInfo', 'Get-PhienVersionNote', 'Get-PhienUnknownNote', 'Get-PhienNoteRx', 'Get-PhienNoteSpecs', 'Invoke-GitQuiet', 'Get-PhienLocalNotes', 'Get-PhienNotePlan', 'Get-PhienNoteStatePath', 'Read-PhienNoteState', 'Write-PhienNoteState', 'Add-PhienNoteExclude', 'Install-PhienNote',
+  'Get-OmpHeaderSpan', 'Open-ShareRead', 'Read-Head', 'Get-OmpBodyOff', 'Test-OmpNonEmpty', 'Get-RangeSha', 'Get-PhienOff', 'Test-PhienPrefix', 'Get-PhienKnownVersions', 'Test-PhienKnownVersion', 'Get-OmpHeaderVersion', 'Get-OmpHeaderInfo', 'Get-PhienVersionNote', 'Get-PhienUnknownNote', 'Get-PhienNoteRx', 'Get-PhienNoteSpecs', 'Invoke-GitQuiet', 'Get-PhienLocalNotes', 'Get-PhienNotePlan', 'Get-PhienNoteStatePath', 'Read-PhienNoteState', 'Write-PhienNoteState', 'Get-PhienExcludeFile', 'Add-PhienExcludeLine', 'Test-PhienExcludeLine', 'Install-PhienNote',
   'Copy-OmpSession', 'Get-OmpBlobRefs', 'Get-OmpBlobIndex', 'Get-PhienLocalScan', 'Compare-PhienFile', 'Get-PhienPlan', 'Install-PhienFile',
   'Install-PhienTask', 'Remove-PhienTask', 'New-PhienPartName', 'Get-PhienBoxBlobSet', 'New-PhienBatch', 'Get-PhienBatch', 'Remove-PhienNoteExclude',
   'Get-PhienDirFiles', 'Get-PhienIdOf', 'Test-PhienDeps', 'Get-PhienUnitBytes', 'Get-PhienUpstreamNotes',
-  'Add-SyncRepoConfig', 'Test-SyncFolder', 'Get-RepoKey', 'Get-GitDirOrigin', 'Find-LocalClones', 'Get-SyncDesktop', 'Get-FcodeAddLimitVars'
+  'Add-SyncRepoConfig', 'Test-SyncFolder', 'Get-RepoKey', 'Get-GitDirOrigin', 'Find-LocalClones', 'Get-SyncDesktop', 'Get-FcodeAddLimitVars', 'Get-MocPolicy', 'Write-MocPolicy',
+  'Test-PhienTimeUp', 'Get-PhienChildMs', 'Stop-PhienProc', 'ConvertTo-PhienArg', 'Invoke-PhienExe',
+  'Write-PhienText', 'Test-PhienReparse', 'Get-PhienLockName', 'Add-PhienLog', 'Write-PhienOut', 'Get-PhienCapSec', 'Get-PhienNenDelaySec', 'Invoke-PhienBounded'
 foreach ($fn in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in $wanted }, $true)) { . ([scriptblock]::Create($fn.Extent.Text)) }
+# the git half and the file half that Install-PhienNote uses (git first, then the move, then the line), as one call for the exclude tests below
+function Add-PhienNoteExclude([string]$Dir, [string]$Name) { $f = Get-PhienExcludeFile $Dir $Name; [bool]($f -and (Add-PhienExcludeLine $f $Name)) }
 $pyAssign = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$PhienPy' }, $true)
 Invoke-Expression $pyAssign.Extent.Text
+foreach ($mn in '$MocBegin', '$MocEnd', '$MocRx', '$MocBlock', '$PhienFailMsg') {   # the profile hook text and its markers, exactly as `fcode moc bat` writes them; the failure line
+  Invoke-Expression ($ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq $mn }, $true).Extent.Text)
+}
+$PhienLog = Join-Path $Root 'unit-phien.log'   # in-process Add-PhienLog / Write-PhienOut write here, never to the real log
 $PyFile = Join-Path $Root 'phien.py'
 [IO.File]::WriteAllText($PyFile, $PhienPy, (New-Object Text.UTF8Encoding($false)))
 
@@ -62,6 +74,7 @@ function Add-Msgs([string]$Path, [string[]]$Msgs, [string]$Nl = "`n") {
 # mtimes are compared per second: tar keeps whole seconds
 function Mt1([string]$p) { [long][Math]::Floor([IO.File]::GetLastWriteTimeUtc($p).Ticks / 1e7) }
 function Read-Bytes([string]$p) { [IO.File]::ReadAllBytes($p) }
+function Bytes-Eq([byte[]]$A, [byte[]]$B) { $A.Length -eq $B.Length -and [Convert]::ToBase64String($A) -eq [Convert]::ToBase64String($B) }
 function Latin([string]$p) { [Text.Encoding]::GetEncoding(28591).GetString((Read-Bytes $p)) }
 
 # ============================== pure functions ==============================
@@ -335,6 +348,26 @@ T 'notes: install refuses when the target changed, is busy or is tracked' {
   Eq (Install-PhienNote $src $d 'CLAUDE.md' '' $n) 'tracked'
   Ok (-not (Get-ChildItem $d -Filter '*.fcode-part*' -Force)) 'no part files'
 }
+# r4 F3: ownership first: $BeforeLine (the caller saves "fcode owns this line") runs before the exclude line is added and before the note is placed
+T 'notes r4: Install-PhienNote runs $BeforeLine before the exclude line and the move; not at all when git already ignores the name' {
+  $d = Join-Path $Root 'nt8'; New-GitDir $d; $src = Join-Path $Root 'nt8-src.md'; Put-File $src 'from box'; Put-File "$d\.gitignore" "TASK.md`n"
+  $exf = "$d\.git\info\exclude"; $before = [IO.File]::ReadAllText($exf)
+  $script:snap = $null
+  $bl = { $script:snap = @{ Ex = [IO.File]::ReadAllText($exf); Note = (Test-Path -LiteralPath "$d\HANDOFF-o.md") } }
+  Eq (Install-PhienNote $src $d 'HANDOFF-o.md' '' (ConvertTo-Epoch (Get-Date)) 30 '' $bl) 'ok'
+  Ok ($null -ne $script:snap) '$BeforeLine was invoked'
+  Eq $script:snap.Ex $before 'at that moment the exclude file had not changed yet'
+  Eq $script:snap.Note $false 'and the note was not placed yet'
+  Ok ([IO.File]::ReadAllText($exf) -match '(?m)^/HANDOFF-o\.md\r?$') 'afterwards: the line'; Eq (Get-Content "$d\HANDOFF-o.md" -Raw) 'from box' 'and the note'
+  $script:snap = $null
+  Eq (Install-PhienNote $src $d 'TASK.md' '' (ConvertTo-Epoch (Get-Date)) 30 '' $bl) 'ok'
+  Eq $script:snap $null 'git already ignores TASK.md: no line, no ownership'
+  # r5: the same line already there but git says not ignored (a later user rule): the line is the user's, fcode claims nothing
+  [IO.File]::AppendAllText($exf, "/HANDOFF-u.md`n!/HANDOFF-u.md`n")
+  $script:snap = $null
+  Eq (Install-PhienNote $src $d 'HANDOFF-u.md' '' (ConvertTo-Epoch (Get-Date)) 30 '' $bl) 'ok'
+  Eq $script:snap $null 'an identical line already there: no ownership recorded'; Eq $script:PhienLastExclAdded $false 'and no line added'
+}
 T 'batches: <= 50 MB per tar stream, a bigger single item gets its own batch' {
   $bs = New-Object System.Collections.ArrayList
   foreach ($mb in 30, 30, 10, 60, 1, 49, 2) { $b = Get-PhienBatch $bs 'R' ([long]$mb * 1MB); [void]$b.Items.Add($mb) }
@@ -363,11 +396,81 @@ T 'notes: Add returns true only when it added the line; Remove takes out only th
   [IO.File]::WriteAllText($ex, "# my own comment`n/HANDOFF-ab.md`n/other.txt`n")
   Eq (Add-PhienNoteExclude $d 'HANDOFF-a.md') $true; Eq (Add-PhienNoteExclude $d 'HANDOFF-a.md') $false 'second time: already ignored'
   Eq (Add-PhienNoteExclude $d 'HANDOFF-ab.md') $false 'a pre-existing line is not ours'
-  Eq (Remove-PhienNoteExclude $d 'HANDOFF-a.md') $true
+  Eq (Remove-PhienNoteExclude $d 'HANDOFF-a.md') 'removed'
   $t = Get-Content $ex -Raw
   Ok ($t -notmatch '(?m)^/HANDOFF-a\.md\r?$') 'our line is gone'
   Ok ($t -match '(?m)^/HANDOFF-ab\.md\r?$' -and $t -match '(?m)^/other\.txt\r?$' -and $t -match '# my own comment') 'every other line stays (also the one with the same prefix)'
-  Eq (Remove-PhienNoteExclude $d 'HANDOFF-a.md') $false 'nothing left to remove'
+  Eq (Remove-PhienNoteExclude $d 'HANDOFF-a.md') 'absent' 'nothing left to remove: confirmed absent'
+  Ok (Bytes-Eq (Read-Bytes $ex) $utf8.GetBytes("# my own comment`n/HANDOFF-ab.md`n/other.txt`n")) 'the three user rules survive our add + remove byte for byte'
+  Eq @(Get-ChildItem "$d\.git\info" -Force -Filter '*.part-*').Count 0 'no part file left'
+}
+# r4 F2: fcode never writes .git/info/exclude through a link (junction / symlink of the file or of its folder)
+function New-InfoJunction([string]$Dir, [string]$Target, [string]$Text) {
+  [void](New-Item -ItemType Directory -Path $Target -Force); [IO.File]::WriteAllText((Join-Path $Target 'exclude'), $Text)
+  Remove-Item -LiteralPath "$Dir\.git\info" -Recurse -Force
+  [void](New-Item -ItemType Junction -Path "$Dir\.git\info" -Target $Target)
+}
+T 'notes r4: a junction .git/info: Get-PhienExcludeFile gives $null (the note is not placed), the exclude file is never written' {
+  $d = Join-Path $Root 'nt6'; New-GitDir $d; Put-File "$d\HANDOFF-x.md" 'x'
+  New-InfoJunction $d (Join-Path $Root 'nt6-elsewhere') "# user`n"
+  Eq $null (Get-PhienExcludeFile $d 'HANDOFF-x.md') 'link: no exclude file to write'
+  Eq (Get-Content (Join-Path $Root 'nt6-elsewhere\exclude') -Raw) "# user`n" 'the target is untouched'
+}
+T 'notes r4: Remove-PhienNoteExclude through a junction .git/info: failed (not absent), the target bytes unchanged, the junction intact; no git = failed; no exclude file = absent' {
+  $d = Join-Path $Root 'nt7'; New-GitDir $d; $tg = Join-Path $Root 'nt7-elsewhere'
+  $txt = "# user rules`n/HANDOFF-z.md`n*.log`n"
+  New-InfoJunction $d $tg $txt
+  Eq (Remove-PhienNoteExclude $d 'HANDOFF-z.md') 'failed' 'nothing removed through a link, and that is a failure'
+  Ok (Bytes-Eq (Read-Bytes (Join-Path $tg 'exclude')) $utf8.GetBytes($txt)) 'target bytes unchanged'
+  Ok ((Get-Item -LiteralPath "$d\.git\info" -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) 'the junction is still a junction'
+  $ng = Join-Path $Root 'nt7-nogit'; [void](New-Item -ItemType Directory -Path $ng -Force); Eq (Remove-PhienNoteExclude $ng 'HANDOFF-z.md') 'failed' 'git cannot say where the file is: failed'
+  $d2 = Join-Path $Root 'nt7b'; New-GitDir $d2; Remove-Item "$d2\.git\info\exclude"; Eq (Remove-PhienNoteExclude $d2 'HANDOFF-z.md') 'absent' 'no exclude file: absent'
+}
+# r4 F1: every rewrite of a file goes through Write-PhienText (part file + atomic Replace / Move); the log is appended
+T 'files r4: outside Write-PhienText, the config / profile writers and the staging manifest, fcode.ps1 has no WriteAllText( / AppendAllText( / Set-Content' {
+  $src = [IO.File]::ReadAllText($Fcode)
+  $ok = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in 'Write-PhienText', 'Add-SyncRepoConfig', 'Set-MocProfile' }, $true) | ForEach-Object { , @($_.Extent.StartOffset, $_.Extent.EndOffset) })
+  Eq $ok.Count 3 'the three allowed writers exist'
+  $bad = @()
+  foreach ($m in [regex]::Matches($src, 'WriteAllText\(|AppendAllText\(|Set-Content')) {
+    if (@($ok | Where-Object { $m.Index -ge $_[0] -and $m.Index -lt $_[1] }).Count) { continue }
+    $ls = $src.LastIndexOf("`n", $m.Index) + 1; $le = $src.IndexOf("`n", $m.Index); $line = $src.Substring($ls, $le - $ls)
+    if ($line -match "Join-Path \`$pb\.Dir 'manifest\.json'") { continue }   # the staging manifest: a temp file of this run only
+    $bad += $line.Trim()
+  }
+  Eq $bad.Count 0 ('in-place writes: ' + ($bad -join ' || '))
+}
+T 'files r4: Write-PhienText writes UTF-8 without BOM, replaces an existing file, leaves no part file' {
+  $p = Join-Path $Root 'wpt\sub\x.json'
+  Write-PhienText $p 'một'; Ok (Bytes-Eq (Read-Bytes $p) $utf8.GetBytes('một')) 'new file, no BOM'
+  Write-PhienText $p 'hai'; Eq ([IO.File]::ReadAllText($p)) 'hai' 'replaced'
+  Eq @(Get-ChildItem (Split-Path $p) -Force -Filter '*.part-*').Count 0 'no part file'
+}
+T 'log r4: above 200 KB phien.log is renamed to phien.log.1 (the older log) and the new line starts a new phien.log; a second rotation replaces .1' {
+  $saved = $PhienLog; $script:PhienLog = Join-Path $Root 'rot\phien.log'
+  try {
+    [void](New-Item -ItemType Directory -Path (Split-Path $PhienLog) -Force)
+    $big1 = [byte[]]($utf8.GetBytes(('a' * 99) + "`n") * 2100)   # 210 000 bytes
+    [IO.File]::WriteAllBytes($PhienLog, $big1)
+    Add-PhienLog @('dòng mới')
+    Ok (Bytes-Eq (Read-Bytes "$PhienLog.1") $big1) '.1 holds the old content, whole'
+    $t = @(Get-Content $PhienLog -Encoding UTF8); Eq $t.Count 1 'phien.log holds only the new line'; Ok ($t[0] -match 'dòng mới$') $t[0]
+    $big2 = [byte[]]($utf8.GetBytes(('b' * 99) + "`n") * 2100)
+    [IO.File]::WriteAllBytes($PhienLog, $big2)
+    Add-PhienLog @('dòng ba')
+    Ok (Bytes-Eq (Read-Bytes "$PhienLog.1") $big2) 'a second rotation replaces .1'
+    Eq @(Get-Content $PhienLog -Encoding UTF8).Count 1 'and phien.log starts again'
+    Add-PhienLog @('dòng bốn'); Eq @(Get-Content $PhienLog -Encoding UTF8).Count 2 'below 200 KB: plain append'
+  } finally { $script:PhienLog = $saved }
+}
+T 'log r4: a quick or auto run writes each line to phien.log at once (Write-PhienOut does not buffer)' {
+  $saved = $PhienLog; $script:PhienLog = Join-Path $Root 'inc\phien.log'
+  try {
+    $script:PhienQuick = $true
+    Write-PhienOut 'dòng một'
+    Ok ((Test-Path $PhienLog) -and (Get-Content $PhienLog -Raw -Encoding UTF8) -match 'dòng một') 'the line is in the file right after Write-PhienOut'
+    Write-PhienOut 'dòng hai'; Eq @(Get-Content $PhienLog -Encoding UTF8).Count 2 'and the next one'
+  } finally { $script:PhienQuick = $false; $script:PhienLog = $saved }
 }
 function Grow-Sess([string]$Path, [int]$MB) {
   $line = $utf8.GetBytes('{"type":"message","id":"pad","parentId":null,"timestamp":"2026-10-25T16:18:29.000Z","message":{"role":"user","content":"' + ('x' * 100000) + '"}}' + "`n")
@@ -413,13 +516,24 @@ function New-World([string]$Name) {
     BS = Join-Path $bh ('.omp\agent\sessions\' + (Get-OmpEncodedDir $bp ($bh -replace '\\', '/') (Join-Path $u 'AppData\Local\Temp')))
     LBlobs = Join-Path $u '.omp\agent\blobs'; BBlobs = Join-Path $bh '.omp\agent\blobs'; Log = Join-Path $w 'ssh.log' }
 }
-function Invoke-Fcode($World, [string[]]$FArgs, [hashtable]$ExtraEnv = @{}, [string]$InText = $null) {
+# -NoWait: start it hidden and return the process (for the kill test); -Async: the same with the screen output captured, returns {P; Out = task};
+# otherwise run it and return {Code; Out}
+function Invoke-Fcode($World, [string[]]$FArgs, [hashtable]$ExtraEnv = @{}, [string]$InText = $null, [switch]$NoWait, [switch]$Async) {
   $ErrorActionPreference = 'Continue'   # Windows PowerShell 5.1 turns native stderr into errors under Stop
   $save = @{}
   $set = @{ USERPROFILE = $World.U; LOCALAPPDATA = (Join-Path $World.U 'AppData\Local'); FCODE_PHIEN_BOXENV = ('HOME=' + ($World.BH -replace '\\', '/') + ' FCODE_CFG=' + ($World.Cfg -replace '\\', '/')); FAKE_SSH_LOG = $World.Log; TEMP = (Join-Path $World.U 'AppData\Local\Temp'); TMP = (Join-Path $World.U 'AppData\Local\Temp') }
   foreach ($k in $ExtraEnv.Keys) { $set[$k] = $ExtraEnv[$k] }
   foreach ($k in $set.Keys) { $save[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k, $set[$k]) }
   try {
+    if ($NoWait -or $Async) {
+      $psi = New-Object Diagnostics.ProcessStartInfo 'powershell.exe'
+      $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $Fcode + '" ' + ($FArgs -join ' ')
+      $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+      if ($Async) { $psi.RedirectStandardOutput = $true; $psi.StandardOutputEncoding = $utf8 }
+      $p = [Diagnostics.Process]::Start($psi)
+      if ($Async) { return [pscustomobject]@{ P = $p; Out = $p.StandardOutput.ReadToEndAsync() } }
+      return $p
+    }
     $out = if ($InText) { $InText | & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Fcode @FArgs 2>&1 | Out-String } else { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Fcode @FArgs 2>&1 | Out-String }
     [pscustomobject]@{ Code = $LASTEXITCODE; Out = $out }
   } finally { foreach ($k in $save.Keys) { [Environment]::SetEnvironmentVariable($k, $(if ($null -eq $save[$k]) { [NullString]::Value } else { $save[$k] })) } }
@@ -1564,6 +1678,782 @@ T 'task scheduler: registers a headless every-10-minutes task and the action sho
   } finally { if (-not (Remove-PhienTask $tn $tp)) { Write-Host 'task already gone?' }; Remove-Item -LiteralPath $marker -ErrorAction SilentlyContinue }
   Ok (-not (Get-ScheduledTask -TaskPath $tp -TaskName $tn -ErrorAction SilentlyContinue)) 'task removed'
   Ok (-not (Remove-PhienTask $tn $tp)) 'removing twice is harmless'
+}
+
+# ============================== 1.3.3: fcode phien <project> --nhanh ==============================
+# instabox wrapper that logs the first word of every call (ls / wake / ssh): the fake itself logs only ssh
+# $Stall: 'ls' = every `instabox ls` hangs for 60 s; 'put2' = the second and later `ssh ... put` hang for 60 s (the first one runs as the fake decides)
+function Use-LoggedIb($w, [string]$Stall = '') {
+  $w | Add-Member -NotePropertyName IbLog -NotePropertyValue (Join-Path $w.W 'ib-calls.log') -Force
+  $wrap = Join-Path $w.W 'ib-wrap.cmd'
+  $hang = switch ($Stall) {
+    'ls' { "if /i `"%1`"==`"ls`" ping -n 60 127.0.0.1 >nul`r`n" }
+    'put2' { "if /i not `"%1`"==`"ssh`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`nfindstr /c:`"ssh put`" `"%FAKE_SSH_LOG%`" >nul 2>&1 || goto run`r`nping -n 60 127.0.0.1 >nul`r`n:run`r`n" }
+    # 'put1late': the first `ssh ... put` waits until the epoch second in FAKE_PUT_UNTIL, then runs as the fake decides (an item still under way when the deadline passes)
+    'put1late' { "if /i not `"%1`"==`"ssh`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`nfindstr /c:`"ssh put`" `"%FAKE_SSH_LOG%`" >nul 2>&1 && goto run`r`npython -c `"import os,time;time.sleep(max(0,float(os.environ['FAKE_PUT_UNTIL'])-time.time()))`"`r`n:run`r`n" }
+    default { '' }
+  }
+  [IO.File]::WriteAllText($wrap, "@echo off`r`necho %1 >>`"$($w.IbLog)`"`r`n${hang}call `"$Cmd`" %*`r`nexit /b %errorlevel%`r`n")
+  [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ instabox = $wrap; box = 'coder'; syncRepos = @($w.LP, (Join-Path $w.U 'Desktop\other'), (Join-Path $w.U 'Desktop\notonbox')) } | ConvertTo-Json -Compress))
+}
+function IbCalls($w) { if (Test-Path $w.IbLog) { @(Get-Content $w.IbLog | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } else { @() } }
+function BoxSessions($w) { if (Test-Path $w.BH) { @(Get-ChildItem (Join-Path $w.BH '.omp\agent\sessions') -Recurse -File -Filter '*.jsonl' -ErrorAction SilentlyContinue).Count } else { 0 } }
+$CapMsg = 'phien: hết 20 giây, phần còn lại chạy lần sau'
+$FailMsg = 'phien: không đồng bộ được, xem phien.log'
+function Screen-Lines([string]$Text) { @($Text -split "`r?`n" | Where-Object { $_.Trim() }) }   # what a run printed on the screen
+function Read-PhienLog($w) { $p = Join-Path $w.U '.fcode\phien.log'; if (Test-Path $p) { Get-Content $p -Raw } else { '' } }
+
+T 'nhanh: box asleep: exit 0 and a message, only `instabox ls`, never wake or ssh' {
+  $w = New-W2 'q1'; Use-LoggedIb $w
+  [void](New-Sess $w.LS '11111111-qs01' $w.LP @('a'))
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FAKE_BOX_STATE = 'suspended' }
+  Eq $r.Code 0 $r.Out
+  Eq ((Screen-Lines $r.Out) -join '|') 'phien: box đang ngủ, bỏ qua' 'one line'
+  Eq ((IbCalls $w) -join ',') 'ls' 'only the state check: no wake, no ssh'
+  Eq (SshCount $w) 0 'no ssh'; Eq (BoxSessions $w) 0 'nothing copied'
+}
+T 'nhanh r4: box state unknown (instabox ls fails, bad answer, no state): a failure, exit 1, only `instabox ls`, never wake or ssh' {
+  $w = New-W2 'q1u'; Use-LoggedIb $w
+  [void](New-Sess $w.LS '11111111-qs1u' $w.LP @('a'))
+  foreach ($m in 'fail', 'bad', 'nostate') {
+    $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FAKE_LS = $m }
+    Eq $r.Code 1 "${m}: $($r.Out)"
+    Eq ((Screen-Lines $r.Out) -join '|') $FailMsg "${m}: the failure line only"
+  }
+  Eq @([regex]::Matches((Read-PhienLog $w), 'lỗi: không đọc được trạng thái box \(instabox ls lỗi')).Count 3 'the reason is in phien.log each time'
+  Eq ((IbCalls $w) -join ',') 'ls,ls,ls' 'only the state check: no wake, no ssh'
+  Eq (SshCount $w) 0 'no ssh'; Eq (BoxSessions $w) 0 'nothing copied'
+}
+T 'nhanh: running box: the same work as fcode phien for that one project, no wake, no git-push hint, logged' {
+  $w = New-W2 'q2'; Use-LoggedIb $w
+  $s = New-Sess $w.LS '22222222-qs02' $w.LP @('a')
+  $otherLs = Join-Path $w.U ('.omp\agent\sessions\' + (Get-OmpEncodedDir (Join-Path $w.U 'Desktop\other') $w.U (Join-Path $w.U 'AppData\Local\Temp')))
+  [void](New-Sess $otherLs '22222222-qs03' (Join-Path $w.U 'Desktop\other') @('b'))
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh')
+  Eq $r.Code 0 $r.Out
+  Eq (Screen-Lines $r.Out).Count 0 ("success prints nothing on the screen: " + $r.Out)
+  Ok ((Read-PhienLog $w) -match '== proj: gửi 1 phiên lên box') 'the details go to phien.log'
+  Ok ((Read-PhienLog $w) -notmatch 'Nhớ đẩy code') 'no push hint in the hook'
+  Ok (Test-Path (Join-Path $w.BS (Split-Path $s -Leaf))) 'the project session is on the box'
+  Eq (BoxSessions $w) 1 'the other project was not touched'
+  Ok ((IbCalls $w) -notcontains 'wake') ('never wakes: ' + ((IbCalls $w) -join ','))
+  Ok ((IbCalls $w) -contains 'ssh') 'it did sync'
+  Ok ((Get-Content (Join-Path $w.U '.fcode\phien.log') -Raw) -match 'Xong: 1 file gửi lên box') 'summary in the log (a background run has no screen)'
+  $r = Invoke-Fcode $w @('phien', 'nope', '--nhanh'); Eq $r.Code 1 'unknown project is still an error'
+  Eq ((Screen-Lines $r.Out) -join '|') $FailMsg 'a failure is one short line'; Ok ((Read-PhienLog $w) -match "Không thấy project 'nope'") 'the reason is in phien.log'
+  $r = Invoke-Fcode $w @('phien', '--nhanh'); Eq $r.Code 1 '--nhanh needs a project'
+}
+T 'nhanh: lock busy: exit 0 at once with a message, nothing else is touched' {
+  $w = New-W2 'q3'; Use-LoggedIb $w
+  [void](New-Sess $w.LS '33333333-qs04' $w.LP @('a'))
+  $mx = New-Object Threading.Mutex($false, $env:FCODE_PHIEN_LOCK); Ok ($mx.WaitOne(0)) 'the test holds the lock'
+  try {
+    $t0 = Get-Date; $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); $sec = ((Get-Date) - $t0).TotalSeconds
+    Eq $r.Code 0 $r.Out
+    Eq ((Screen-Lines $r.Out) -join '|') 'phien: đang có lần đồng bộ khác, bỏ qua' 'one line'
+    Ok ($sec -lt 25) "no waiting for the lock ($([Math]::Round($sec)) s)"
+    Eq (IbCalls $w).Count 0 'not even `instabox ls`'
+    Ok ((Read-PhienLog $w) -match 'đang có lần đồng bộ khác, bỏ qua') 'the busy line is in phien.log too'
+    # r4 F1: phien.log has its own lock (<lock>-log). $sec (above) is the run with that lock free; the busy line is the run's only log line
+    $busy = 'đang có lần đồng bộ khác, bỏ qua'; $logf = Join-Path $w.U '.fcode\phien.log'
+    $n = { @([regex]::Matches((Read-PhienLog $w), [regex]::Escape($busy))).Count }
+    $lm = New-Object Threading.Mutex($false, ($env:FCODE_PHIEN_LOCK + '-log')); Ok ($lm.WaitOne(0)) 'the test holds the log lock'
+    $held = $true
+    try {
+      # 1. held all the time: the line waits for the lock (absent 1 s after the free-lock run would have ended), then is appended anyway after 2 s
+      $c0 = & $n; $a = Invoke-Fcode $w @('phien', 'proj', '--nhanh') -Async; $t0 = Get-Date; $mid = $null
+      while (-not $a.P.HasExited -and ((Get-Date) - $t0).TotalSeconds -lt 40) { if ($null -eq $mid -and ((Get-Date) - $t0).TotalSeconds -ge $sec + 1) { $mid = & $n }; Start-Sleep -Milliseconds 50 }
+      $s1 = ((Get-Date) - $t0).TotalSeconds; [void]$a.P.WaitForExit(); $o1 = $a.Out.Result; $a.P.Dispose()
+      Eq $mid $c0 "1 s after the free-lock run time ($([Math]::Round($sec, 1)) s) the busy line is not in phien.log yet"
+      Ok ($s1 -ge $sec + 1.5 -and $s1 -lt $sec + 8) "the run waited about 2 s for the log lock, then went on ($([Math]::Round($s1, 1)) s)"
+      Eq ((Screen-Lines $o1) -join '|') "phien: $busy" 'the busy line on the screen'
+      Eq (& $n) ($c0 + 1) 'and in phien.log (appended without the lock)'
+      # 2. released 0.5 s after the free-lock run time: the waiting run takes the lock and writes at once
+      $c0 = & $n; $a = Invoke-Fcode $w @('phien', 'proj', '--nhanh') -Async; $t0 = Get-Date
+      while (((Get-Date) - $t0).TotalSeconds -lt $sec + 0.5) { Start-Sleep -Milliseconds 50 }
+      $lm.ReleaseMutex(); $held = $false; $tr = Get-Date
+      while ((& $n) -eq $c0 -and ((Get-Date) - $tr).TotalSeconds -lt 5) { Start-Sleep -Milliseconds 50 }
+      $s2 = ((Get-Date) - $tr).TotalSeconds; [void]$a.P.WaitForExit(30000); $a.P.Dispose()
+      Ok ($s2 -lt 1.5) "after the release the line is there within 1.5 s ($([Math]::Round($s2, 1)) s)"
+      # 3. phien.log over 200 KB, lock held: a run that gives up appends without rotating; the holder's next line rotates; nothing is lost
+      $pre = [byte[]]$utf8.GetBytes((@(1..2100 | ForEach-Object { 'old line ' + $_.ToString('D4') + ' ' + ('p' * 85) }) -join "`n") + "`n")   # 210 000 bytes
+      [IO.File]::WriteAllBytes($logf, $pre); Remove-Item "$logf.1" -ErrorAction SilentlyContinue
+      Ok ($lm.WaitOne(0)) 'held again'; $held = $true
+      $r3 = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r3.Code 0 $r3.Out
+      $saved = $PhienLog; $script:PhienLog = $logf
+      try { Add-PhienLog @('x') } finally { $script:PhienLog = $saved }
+      Ok ((Test-Path "$logf.1") -and (Bytes-Eq ([byte[]]@(Read-Bytes "$logf.1")[0..($pre.Length - 1)]) $pre)) 'every old line is kept, whole, in phien.log.1'
+      $all = [IO.File]::ReadAllText("$logf.1") + [IO.File]::ReadAllText($logf)
+      Ok ($all.Contains($busy)) "the line of the run that gave up is in phien.log.1 or phien.log, never lost"
+      Ok (([IO.File]::ReadAllText($logf)) -match ' x\r?\n\z') "the holder's line starts the new phien.log"
+    } finally { if ($held) { try { $lm.ReleaseMutex() } catch { } }; $lm.Dispose() }
+  } finally { try { $mx.ReleaseMutex() } catch { }; $mx.Dispose() }
+}
+T 'nhanh: the 20 s cap ends the run cleanly: exit 0, message, no later batch, nothing half-placed; the next run finishes' {
+  $w = New-W2 'q4'; Use-LoggedIb $w
+  $a = New-Sess $w.LS 'aaaa1111-cap1' $w.LP @('a'); Grow-Sess $a 30
+  $b = New-Sess $w.LS 'bbbb2222-cap2' $w.LP @('b'); Grow-Sess $b 30
+  $t0 = Get-Date
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '15'; FAKE_SSH_CUT = 'put:1:0:stall' }
+  $sec = ((Get-Date) - $t0).TotalSeconds
+  Eq $r.Code 0 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $CapMsg 'only the cap line on the screen, no false "lỗi" and no summary'
+  Ok ((Read-PhienLog $w) -notmatch 'lỗi') 'a cut by the cap is not logged as an error either'
+  Ok ($sec -lt 45) "ended at the cap ($([Math]::Round($sec)) s, the stall is 60 s)"
+  Eq (Calls $w 'put') 1 'no batch is started after the cap'
+  Ok (-not (Test-Path (Join-Path $w.BS (Split-Path $a -Leaf))) -and -not (Test-Path (Join-Path $w.BS (Split-Path $b -Leaf)))) 'nothing half-sent is placed'
+  Eq (Parts $w.LS) 0 'no part file on the laptop'
+  Ok (-not (Get-ChildItem (Join-Path $w.U 'AppData\Local\Temp') -Directory -Filter 'fcode-phien-*' -ErrorAction SilentlyContinue)) 'staging removed'
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Ok ((Test-Path (Join-Path $w.BS (Split-Path $a -Leaf))) -and (Test-Path (Join-Path $w.BS (Split-Path $b -Leaf)))) 'the next run sends both'
+}
+T 'nhanh: a cap that has already passed before the scan: exit 0 and the message, no ssh' {
+  $w = New-W2 'q5'; Use-LoggedIb $w
+  [void](New-Sess $w.LS '55555555-qs05' $w.LP @('a'))
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '1' }
+  Eq $r.Code 0 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $CapMsg 'only the cap line'
+  Eq (SshCount $w) 0 'no ssh once the time is up'
+  $r = Invoke-Fcode $w @('phien', 'proj') @{ FCODE_PHIEN_CAP_SEC = '1' }; Eq $r.Code 0 'the cap is for --nhanh only'; Eq (BoxSessions $w) 1 'a normal run ignores the cap and syncs'
+}
+T 'nhanh r2: a failing sync (box listed running, ssh fails) is ONE short line on the screen; the details are in phien.log' {
+  $w = New-W2 'q6'; Use-LoggedIb $w
+  [void](New-Sess $w.LS '66666666-qs06' $w.LP @('a'))
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FAKE_SSH_FAIL = '1' }
+  Eq $r.Code 1 $r.Out
+  Eq ((Screen-Lines $r.Out) -join '|') $FailMsg 'one line, not the 2 lines of the old output'
+  Ok ((Read-PhienLog $w) -match 'lỗi: không nói chuyện được với box') 'the reason is logged'
+}
+# L2: every child program of a quick run is bounded by the cap (the stalls below last 60 s; the cap is 8 s)
+T 'nhanh r2: `instabox ls` that hangs is killed at the cap: exit 0, only the cap line, no ssh' {
+  $w = New-W2 'q7'; Use-LoggedIb $w 'ls'
+  [void](New-Sess $w.LS '77777777-qs07' $w.LP @('a'))
+  $t0 = Get-Date; $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '8' }; $sec = ((Get-Date) - $t0).TotalSeconds
+  Eq $r.Code 0 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $CapMsg 'the cap line, not "box đang ngủ"'
+  Ok ($sec -lt 30) "ended at the cap ($([Math]::Round($sec)) s, `instabox ls` hangs 60 s)"
+  Eq (SshCount $w) 0 'no ssh'
+}
+foreach ($shim in 'omp', 'git') {
+  T "nhanh r2: a hanging `"$shim`" (found first on PATH) is killed at the cap: exit 0, only the cap line, nothing is sent" {
+    $w = New-W2 "q8$shim"; Use-LoggedIb $w
+    [void](New-Sess $w.LS '88888888-qs08' $w.LP @('a'))
+    $bin = Join-Path $w.W 'shim'; [void](New-Item -ItemType Directory -Path $bin -Force)
+    [IO.File]::WriteAllText((Join-Path $bin "$shim.cmd"), "@echo off`r`nping -n 60 127.0.0.1 >nul`r`n")
+    $t0 = Get-Date; $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '8'; PATH = ($bin + ';' + $env:PATH) }; $sec = ((Get-Date) - $t0).TotalSeconds
+    Eq $r.Code 0 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $CapMsg 'the cap line only'
+    Ok ($sec -lt 30) "ended at the cap ($([Math]::Round($sec)) s, $shim hangs 60 s)"
+    Eq (BoxSessions $w) 0 'nothing was sent'
+  }
+}
+T 'nhanh r3: Invoke-PhienExe: arguments reach the program intact, exit code and lines come back; with a deadline a child gets the time left + 5 s (at least 3 s), then it and its children are killed (124)' {
+  $py = (Get-Command python -CommandType Application | Select-Object -First 1).Source
+  $r = Invoke-PhienExe $py @('-c', 'import sys;[print(a) for a in sys.argv[1:]];sys.exit(3)', 'a b', 'say "hi"', 'end\', 'x\"y', '')
+  Eq $r.Code 3 'exit code'; Eq ($r.Out -join '|') 'a b|say "hi"|end\|x\"y|' 'arguments (spaces, quotes, trailing backslash, empty) and lines'
+  $script:PhienDeadline = [DateTime]::UtcNow.AddSeconds(2)
+  try {
+    $t0 = Get-Date; $r = Invoke-PhienExe $env:ComSpec @('/c', 'ping -n 40 127.0.0.1 >nul'); $sec = ((Get-Date) - $t0).TotalSeconds
+    Eq $r.Code 124 'killed'; Ok ($sec -ge 6 -and $sec -lt 14) "killed after the time left + 5 s grace ($([Math]::Round($sec, 1)) s, 2 s were left, the program runs 39 s)"
+    $script:PhienDeadline = [DateTime]::UtcNow.AddSeconds(-30)
+    $t0 = Get-Date; $r = Invoke-PhienExe $env:ComSpec @('/c', 'ping -n 40 127.0.0.1 >nul'); $sec = ((Get-Date) - $t0).TotalSeconds
+    Eq $r.Code 124 'killed'; Ok ($sec -ge 2.5 -and $sec -lt 9) "past the deadline a child still gets the 3 s floor ($([Math]::Round($sec, 1)) s)"
+    $mark = Join-Path $Root 'exe-started.txt'
+    $r = Invoke-PhienExe $py @('-c', "open(r'$mark', 'w').write('x')"); Eq $r.Code 0 'a short child of an item that has started still runs to its end'; Ok (Test-Path $mark) 'it ran'
+  } finally { $script:PhienDeadline = $null }
+}
+T 'nhanh r4: Invoke-PhienExe without a deadline (-1) waits as long as the program runs' {
+  $script:PhienDeadline = $null
+  $t0 = Get-Date; $r = Invoke-PhienExe $env:ComSpec @('/c', 'ping -n 3 127.0.0.1 >nul'); $sec = ((Get-Date) - $t0).TotalSeconds
+  Eq $r.Code 0 'not killed'; Ok ($sec -ge 1.5) "it ran its 2 s ($([Math]::Round($sec, 1)) s)"
+}
+T 'nhanh r4: the supervisor (Invoke-PhienBounded) has no kill call of its own: the job ends the worker' {
+  $fn = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-PhienBounded' }, $true)
+  Ok ($null -ne $fn) 'Invoke-PhienBounded exists'
+  foreach ($x in 'Stop-PhienProc', '.Kill(', 'taskkill') { Ok (-not $fn.Body.Extent.Text.Contains($x)) "no $x in it" }
+}
+T 'nhanh r4: no job = no sync (fail closed): exit 1, the failure line, the reason in phien.log, no worker started' {
+  $saved = $PhienLog, $FcodeScript; $script:PhienLog = Join-Path $Root 'fc\phien.log'
+  $mark = Join-Path $Root 'fc\worker-ran.txt'; $script:FcodeScript = Join-Path $Root 'fc\worker.ps1'   # never the real fcode.ps1: a worker here would run in this test's environment
+  [void](New-Item -ItemType Directory -Path (Split-Path $mark) -Force); [IO.File]::WriteAllText($FcodeScript, "[IO.File]::WriteAllText('$mark', 'ran')")
+  function Get-PhienJob { $script:PhienJobError = 'test: refused'; $null }
+  try {
+    $out = @(Invoke-PhienBounded 'proj' $false 6>&1)
+    Eq @($out | Where-Object { $_ -is [int] })[0] 1 'exit code 1'
+    Ok ((@($out | ForEach-Object { "$_" }) -join '|') -match [regex]::Escape($FailMsg)) ('the failure line: ' + ($out -join '|'))
+    Ok ((Get-Content $PhienLog -Raw -Encoding UTF8) -match 'không tạo được job bảo vệ cho lần chạy nhanh \(test: refused\)') 'the reason is logged'
+    Start-Sleep -Seconds 2; Ok (-not (Test-Path $mark)) 'no worker was started'
+  } finally { $script:PhienLog, $script:FcodeScript = $saved; Remove-Item Function:\Get-PhienJob -ErrorAction SilentlyContinue }
+}
+# Q2: the deadline is checked only between items; nothing inside one stops for it (no half-done item: a note placed without its exclude line, a cut scan)
+T 'nhanh r3: nothing inside an item stops for the deadline: hash, scan, notes, git and a note install run to their end after it has passed' {
+  $w = New-World 'q9'; $s = New-Sess $w.LS '99999999-qs09' $w.LP @('a', 'b'); New-GitDir $w.LP
+  $src = Join-Path $w.W 'note-src.md'; Put-File $src 'from box'
+  $script:PhienDeadline = [DateTime]::UtcNow.AddSeconds(-5)
+  try {
+    Ok ((Get-RangeSha $s 0 10) -match '\A[0-9a-f]{64}\z') 'hash'
+    Eq @(Get-PhienLocalScan $w.LS).Count 1 'scan'
+    Eq (Get-PhienLocalNotes $w.LP).gitok $true 'notes'
+    Eq (Invoke-GitQuiet $w.LP @('status')).Code 0 'git'
+    Eq (Install-PhienNote $src $w.LP 'HANDOFF-dl.md' '' (ConvertTo-Epoch (Get-Date))) 'ok' 'a note install is one whole item'
+    Eq (Get-Content "$($w.LP)\HANDOFF-dl.md" -Raw) 'from box' 'placed'
+    Ok ((Get-Content "$($w.LP)\.git\info\exclude" -Raw) -match '(?m)^/HANDOFF-dl\.md\r?$') 'and excluded'
+  } finally { $script:PhienDeadline = $null }
+}
+# L4: the cap line is for a run that stopped on the cap; a real error keeps its exit code and its own one line (a second batch that is cut by the cap does not wipe it)
+T 'nhanh r2: a real error before the cap keeps exit code 1 and the failure line; the cap does not turn it into a clean exit' {
+  $w = New-W2 'q10'; Use-LoggedIb $w 'put2'
+  $a = New-Sess $w.LS 'aaaa1010-er01' $w.LP @('a'); Grow-Sess $a 30
+  $b = New-Sess $w.LS 'bbbb1010-er02' $w.LP @('b'); Grow-Sess $b 30
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '25'; FAKE_SSH_CUT = 'put:1:0:fail' }
+  Eq $r.Code 1 $r.Out
+  Eq ((Screen-Lines $r.Out) -join '|') $FailMsg 'the failure line only (not the cap line)'
+  Eq (Calls $w 'put') 1 'only the first put (failed on the box) reached the box; the second hung and was cut by the cap'
+  Ok ((Read-PhienLog $w) -match [regex]::Escape($CapMsg)) 'the cap is in the log'
+}
+T 'nhanh r2: a run that all finished does not claim the cap: no cap line, no "phần còn lại" in the log' {
+  $w = New-W2 'q11'; Use-LoggedIb $w
+  [void](New-Sess $w.LS '11111111-fin1' $w.LP @('a'))
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '60' }
+  Eq $r.Code 0 $r.Out; Eq (Screen-Lines $r.Out).Count 0 'silent'
+  Ok ((Read-PhienLog $w) -notmatch 'phần còn lại') 'no cap line in the log'
+}
+# L3 (second half): a quick run does not move the 40-minute gap of the auto run, so what it left undone is still picked up by the next auto run
+T 'nhanh r2: a cut quick run leaves phien-auto.json alone; the next 10-minute auto run (last ssh 100 min ago) still syncs what was left' {
+  $w = New-W2 'q12'; Use-LoggedIb $w
+  $a = New-Sess $w.LS 'aaaa1212-au01' $w.LP @('a'); Grow-Sess $a 30
+  Set-AutoState $w $true 100; $before = Get-AutoState $w
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '15'; FAKE_SSH_CUT = 'put:1:0:stall' }
+  Eq $r.Code 0 $r.Out; Ok ($r.Out.Contains($CapMsg)) 'the quick run was cut'
+  $after = Get-AutoState $w
+  Eq $after.lastSshAt $before.lastSshAt 'the gap is not reset by a quick run'; Eq $after.boxRunning $before.boxRunning
+  Eq (BoxSessions $w) 0 'nothing arrived yet'
+  $r = Invoke-Fcode $w @('phien', '--tu-dong'); Eq $r.Code 0 $r.Out
+  Eq (BoxSessions $w) 1 'the auto run did not skip behind the gap'
+}
+
+# ---- r3 "safe points only": an item (a batch, a note) ends whole or not at all; the deadline only stops the run between items ----
+function Body-Sha([string]$p) { $o = Get-PhienOff $p; Get-RangeSha $p $o ((Get-Item -LiteralPath $p).Length - $o) }
+# Q1: Install-PhienNote does every git call before it places the note; a git that never answers check-ignore / --git-path is killed (3 s floor or
+# time left + 5 s) and the note waits: never placed without its exclude line
+T 'nhanh r3: a note from the box with a git that stalls (check-ignore, --git-path): never placed without its exclude line; the next run places and excludes it' {
+  $w = New-W2 'q13'; Use-LoggedIb $w
+  New-GitDir $w.LP; New-GitDir $w.BP
+  Put-File "$($w.BP)\HANDOFF.md" 'box handoff'
+  $realGit = (Get-Command git -CommandType Application | Select-Object -First 1).Source
+  $bin = Join-Path $w.W 'shim'; [void](New-Item -ItemType Directory -Path $bin -Force); $glog = Join-Path $w.W 'git-calls.log'
+  [IO.File]::WriteAllText((Join-Path $bin 'git.cmd'), "@echo off`r`n>>`"$glog`" echo %*`r`necho %* | findstr /c:`"check-ignore`" /c:`"--git-path`" >nul || goto run`r`nping -n 60 127.0.0.1 >nul`r`nexit /b 1`r`n:run`r`n`"$realGit`" %*`r`nexit /b %errorlevel%`r`n")
+  $t0 = Get-Date; $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '15'; PATH = ($bin + ';' + $env:PATH) }; $sec = ((Get-Date) - $t0).TotalSeconds
+  Ok ((Get-Content $glog -Raw) -match 'check-ignore') ('the note install reached git (the stall was hit): ' + $r.Out)
+  Eq $r.Code 0 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $CapMsg 'a git that did not answer in time is a cut, not an error'
+  Ok ($sec -lt 35) "bounded by the cap + 5 s ($([Math]::Round($sec)) s, the stall is 60 s)"
+  $exf = "$($w.LP)\.git\info\exclude"; $ex = if (Test-Path $exf) { Get-Content $exf -Raw } else { '' }
+  Ok (-not (Test-Path "$($w.LP)\HANDOFF.md") -or $ex -match '(?m)^/HANDOFF\.md\r?$') 'never placed without its exclude line'
+  Eq (@(Get-ChildItem $w.LP -Force -Filter '*.fcode-part*').Count) 0 'no part file in the project'
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Eq (Get-Content "$($w.LP)\HANDOFF.md" -Raw) 'box handoff' 'the next run places it'
+  Ok ((Get-Content $exf -Raw) -match '(?m)^/HANDOFF\.md\r?$') 'and excludes it'
+  Ok (((& git -C $w.LP status --porcelain | Out-String)) -notmatch 'HANDOFF') 'git status on the laptop does not list it'
+}
+# Q2: a batch that is under way when the deadline passes is finished whole (its child has the 5 s grace); the run then stops before the next batch
+T 'nhanh r3: a batch still under way when the deadline passes ends whole (placed, all of it); no next batch starts; the next run sends the rest' {
+  $w = New-W2 'q14'; Use-LoggedIb $w 'put1late'
+  $a = New-Sess $w.LS 'aaaa1414-it01' $w.LP @('a'); Grow-Sess $a 30
+  $b = New-Sess $w.LS 'bbbb1414-it02' $w.LP @('b'); Grow-Sess $b 30
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '15'; FAKE_PUT_UNTIL = "$((ConvertTo-Epoch (Get-Date)) + 15.5)" }
+  Eq $r.Code 0 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $CapMsg 'the cap line only'
+  Eq (Calls $w 'put') 1 'no batch is started after the deadline'
+  $on = @($a, $b | Where-Object { Test-Path (Join-Path $w.BS (Split-Path $_ -Leaf)) })
+  Eq $on.Count 1 'the batch under way at the deadline was placed, the next one was not started'
+  Eq (Body-Sha (Join-Path $w.BS (Split-Path $on[0] -Leaf))) (Body-Sha $on[0]) 'placed whole'
+  Eq (Parts $w.LS) 0 'no part file on the laptop'; Eq (Parts $w.BS) 0 'no part file on the box'
+  Ok (-not (Get-ChildItem (Join-Path $w.U 'AppData\Local\Temp') -Directory -Filter 'fcode-phien-*' -ErrorAction SilentlyContinue)) 'staging removed'
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out; Eq (Screen-Lines $r.Out).Count 0 $r.Out
+  Eq (BoxSessions $w) 2 'the next run sends the other one'
+}
+T 'nhanh r3: an earlier batch failure, then the deadline at the next safe point: exit 1 and the failure line (the cap does not erase it)' {
+  $w = New-W2 'q15'; Use-LoggedIb $w 'put1late'
+  $a = New-Sess $w.LS 'aaaa1515-ef01' $w.LP @('a'); Grow-Sess $a 30
+  $b = New-Sess $w.LS 'bbbb1515-ef02' $w.LP @('b'); Grow-Sess $b 30
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '15'; FAKE_PUT_UNTIL = "$((ConvertTo-Epoch (Get-Date)) + 15.5)"; FAKE_SSH_CUT = 'put:1:0:fail' }
+  Eq $r.Code 1 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $FailMsg 'the failure line only'
+  Eq (Calls $w 'put') 1 'the run stopped at the safe point after the failed batch'
+  $log = Read-PhienLog $w
+  Ok ($log -match 'gửi phiên lên box không thành công') 'the failure is logged'; Ok ($log -match [regex]::Escape($CapMsg)) 'and the cap'
+}
+# Q6: a run killed at any point (the hook's 25 s kill, Ctrl+C) never leaves a half-written file under a real name; what it left (its staging in
+# %TEMP%, part files) carries its PID and is removed at the start of the next run, however fresh; a live run's part file stays
+T 'nhanh r3: a run killed mid-way leaves nothing half-written; the next run removes its staging and part files at once and finishes' {
+  $w = New-W2 'q16'; Use-LoggedIb $w
+  $a = New-Sess $w.LS 'aaaa1616-kil1' $w.LP @('a'); Grow-Sess $a 5
+  $lt = Join-Path $w.U 'AppData\Local\Temp'; [void](New-Item -ItemType Directory -Force -Path $lt)
+  $p = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '60'; FAKE_SSH_CUT = 'put:1:0:stall' } -NoWait
+  $kpid = $p.Id
+  try {
+    $until = (Get-Date).AddSeconds(40)
+    while ((Calls $w 'put') -lt 1 -and (Get-Date) -lt $until -and -not $p.HasExited) { Start-Sleep -Milliseconds 200 }
+    Ok ((Calls $w 'put') -eq 1 -and -not $p.HasExited) 'the run is in the middle of sending'
+  } finally { Stop-PhienProc $p; [void]$p.WaitForExit(15000); $p.Dispose() }
+  Start-Sleep -Seconds 1
+  $left = @(Get-ChildItem $lt -Directory -Filter 'fcode-phien-*')   # named after the worker (the supervisor's child), not $kpid
+  Eq $left.Count 1 'the killed run left its staging behind (fresh, under 1 h)'
+  Eq (BoxSessions $w) 0 'nothing half-sent is placed on the box'; Eq (Parts $w.LS) 0 'no part file of a session on the laptop'
+  $dead = "$($w.LS)\x.jsonl.fcode-part-$kpid-abcdef", "$($w.LP)\HANDOFF-k.md.fcode-part-$kpid-abcdef"
+  $live = "$($w.LS)\y.jsonl.fcode-part-$PID-abcdef"   # this test process is alive and older than the file: a run that is still going
+  foreach ($f in @($dead) + @($live)) { Put-File $f 'x' }
+  # r4 F4: the staging goes as soon as the next run holds the lock, even when that run stops early (box asleep)
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FAKE_BOX_STATE = 'suspended' }; Eq $r.Code 0 $r.Out
+  Eq ((Screen-Lines $r.Out) -join '|') 'phien: box đang ngủ, bỏ qua' 'the asleep line'
+  Ok (-not (Test-Path $left[0].FullName)) 'the staging of the killed run is removed at once, before the box check'
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '60' }; Eq $r.Code 0 $r.Out
+  foreach ($f in $dead) { Ok (-not (Test-Path $f)) "part file of the killed run removed: $(Split-Path $f -Leaf)" }
+  Ok (Test-Path $live) 'the part file of a live run stays'
+  Ok (Test-Path (Join-Path $w.BS (Split-Path $a -Leaf))) 'the next run sends the session'
+}
+# Q4: quick mode keeps the script's ErrorActionPreference ('Stop'): a cmdlet error is an error as in `fcode phien`, never a silent partial run
+T 'nhanh r3: a cmdlet error (a folder that cannot be listed) is an error in quick mode too: exit 1, the failure line, the reason in phien.log' {
+  $w = New-W2 'q17'; Use-LoggedIb $w
+  $s = New-Sess $w.LS 'eeee1717-acl1' $w.LP @('a')
+  $lk = Join-Path $w.LS ([IO.Path]::GetFileNameWithoutExtension($s) + '\locked'); Put-File "$lk\x.txt" 'x'
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+  & icacls.exe $lk /deny "${me}:(OI)(CI)(RD)" | Out-Null
+  try {
+    $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh')
+    Eq $r.Code 1 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $FailMsg 'one failure line'
+    Ok ((Read-PhienLog $w) -match 'lỗi: ') 'the reason is in phien.log'
+    Eq (BoxSessions $w) 0 'no partial listing was sent as if it were complete'
+  } finally { & icacls.exe $lk /remove:d $me | Out-Null }
+}
+
+# ---- r4: the supervisor (kill-on-close job), crash-safe writes, ownership first, big items left to the other runs ----
+# F3: the exclude line is added before the note is placed: an exclude file fcode cannot write means no note (never a visible, unexcluded one)
+T 'nhanh r4: a read-only .git/info/exclude on the laptop: the note is not placed, exit 1, the failure line, the reason logged; writable again: placed and excluded' {
+  $w = New-W2 'q19'; Use-LoggedIb $w
+  New-GitDir $w.LP; New-GitDir $w.BP
+  Put-File "$($w.BP)\HANDOFF.md" 'box handoff'
+  $exf = "$($w.LP)\.git\info\exclude"; $before = Read-Bytes $exf
+  (Get-Item -LiteralPath $exf).IsReadOnly = $true
+  try {
+    $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh')
+    Eq $r.Code 1 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $FailMsg 'the failure line'
+    Ok (-not (Test-Path "$($w.LP)\HANDOFF.md")) 'the note is not placed without its line'
+    Ok (Bytes-Eq (Read-Bytes $exf) $before) 'the exclude file is unchanged'
+    Eq (@(Get-ChildItem $w.LP -Force -Filter '*.fcode-part*').Count + @(Get-ChildItem "$($w.LP)\.git\info" -Force -Filter '*.part-*').Count) 0 'no part file'
+    Ok ((Read-PhienLog $w) -match 'lỗi') 'the reason is in phien.log'
+  } finally { (Get-Item -LiteralPath $exf).IsReadOnly = $false }
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Eq (Get-Content "$($w.LP)\HANDOFF.md" -Raw) 'box handoff' 'the next run places it'
+  Ok ((Get-Content $exf -Raw) -match '(?m)^/HANDOFF\.md\r?$') 'and excludes it'
+  Eq ((& git -C $w.LP status --porcelain | Out-String).Trim()) '' 'git status on the laptop is clean'
+}
+# F2: never write through a link
+T 'nhanh r4: a note from the box when .git/info on the laptop is a junction: not placed, one log line, exit 0, the target untouched' {
+  $w = New-W2 'q20'; Use-LoggedIb $w
+  New-GitDir $w.LP; New-GitDir $w.BP
+  Put-File "$($w.BP)\HANDOFF.md" 'box handoff'
+  $tg = Join-Path $w.W 'info-elsewhere'; New-InfoJunction $w.LP $tg "# user`n"
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out; Eq (Screen-Lines $r.Out).Count 0 $r.Out
+  Ok (-not (Test-Path "$($w.LP)\HANDOFF.md")) 'not placed'
+  Ok ((Read-PhienLog $w) -match 'ghi chú HANDOFF\.md: \.git/info/exclude là liên kết, fcode không ghi vào đó, chưa đặt') ('logged: ' + (Read-PhienLog $w))
+  Eq (Get-Content (Join-Path $tg 'exclude') -Raw) "# user`n" 'the target is untouched'
+}
+# F3 end to end: the ownership saved with the placement lets fcode give its line back once git tracks the name; the user's copy is never lost
+T 'nhanh r4: a note placed from the box, then committed on the box and fetched on the laptop: the line is given back, git shows the copy, refuses to overwrite it, the text stays' {
+  $w = New-W2 'q21'; Use-LoggedIb $w
+  New-GitDir $w.LP; New-GitDir $w.BP
+  $bo = Join-Path $w.W 'origin.git'; New-Origin $bo
+  foreach ($d in $w.LP, $w.BP) { Fetch-Origin $d $bo; $ErrorActionPreference = 'Continue'; & git -C $d checkout -q -B main origin/main 2>&1 | Out-Null; $ErrorActionPreference = 'Stop' }
+  Put-File "$($w.BP)\HANDOFF.md" 'box text'
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Eq (Get-Content "$($w.LP)\HANDOFF.md" -Raw) 'box text' 'placed from the box'
+  $st = Get-Content (Join-Path $w.U 'AppData\Local\fcode\handoff-state.json') -Raw | ConvertFrom-Json
+  Eq $st.'exclude:laptop:proj/HANDOFF.md' '1' 'the state says fcode owns the laptop line'
+  Put-File "$($w.LP)\HANDOFF.md" 'laptop edit'
+  $ErrorActionPreference = 'Continue'
+  Git-Commit $w.BP @('HANDOFF.md'); & git -C $w.BP push -q $bo HEAD:main 2>&1 | Out-Null; & git -C $w.LP fetch -q origin 2>&1 | Out-Null
+  $ErrorActionPreference = 'Stop'
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Ok ((Read-PhienLog $w) -match 'ghi chú HANDOFF\.md giờ do git theo dõi \(trên (box|origin)\): bản cũ trên laptop xóa được') ('release line: ' + (Read-PhienLog $w))
+  Ok ((Get-Content "$($w.LP)\.git\info\exclude" -Raw) -notmatch '(?m)^/HANDOFF\.md\r?$') 'the line is given back'
+  Eq ((& git -C $w.LP status --porcelain | Out-String).Trim()) '?? HANDOFF.md' 'git now shows the laptop copy'
+  $ErrorActionPreference = 'Continue'; $mo = (& git -C $w.LP merge origin/main 2>&1 | Out-String); $mc = $LASTEXITCODE; $ErrorActionPreference = 'Stop'
+  Ok ($mc -ne 0 -and $mo -match 'would be overwritten') "git refuses to overwrite it: $mo"
+  Eq (Get-Content "$($w.LP)\HANDOFF.md" -Raw) 'laptop edit' 'the local text is intact'
+}
+# F6: a quick run (20 s) never starts a batch of one file over 50 MB, nor the late top waiting for it
+T 'nhanh r4: a file over 50 MB is left to the auto run / fcode phien: the small sessions sync both ways, a log line names it, exit 0, silent; fcode phien sends it' {
+  $w = New-W2 'q18'; Use-LoggedIb $w
+  $a = New-Sess $w.LS '0000000a-big8' $w.LP @('a'); Put-Big (Join-Path $a.Replace('.jsonl', '') 'huge.log') 60 58
+  $b = New-Sess $w.LS 'ffffffff-sml8' $w.LP @('b')
+  $c = New-Sess $w.BS 'cccccccc-box8' $w.BP @('c')
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '60' }
+  Eq $r.Code 0 $r.Out; Eq (Screen-Lines $r.Out).Count 0 ('silent: ' + $r.Out)
+  Ok (Test-Path (Join-Path $w.BS (Split-Path $b -Leaf))) 'the small laptop session is on the box'
+  Ok (Test-Path (Join-Path $w.LS (Split-Path $c -Leaf))) 'the box session came to the laptop'
+  Ok (-not (Test-Path (Join-Path $w.BS (Split-Path $a -Leaf)))) 'the big session waits'
+  Eq @(PutBytes $w | Where-Object { $_ -gt 50MB }).Count 0 'no put over 50 MB'
+  Ok ((Read-PhienLog $w) -match 'phiên lớn: \S*huge\.log — lần nhanh không chép, để lần tự động hoặc fcode phien') ('logged: ' + (Read-PhienLog $w))
+  $r = Invoke-Fcode $w @('phien', 'proj'); Eq $r.Code 0 $r.Out
+  Ok (Test-Path (Join-Path $w.BS (Split-Path $a -Leaf))) 'fcode phien sends it'
+}
+# F7: the hard bound. git answers check-ignore after 2 s; 12 notes make the local scan (one item) run far past the cap, so only the supervisor ends it
+T 'nhanh r4: a quick run still busy at cap + 10 s is ended for good with every child (git): exit 1, the failure line, logged; the next run syncs' {
+  $w = New-W2 'q22'; Use-LoggedIb $w
+  New-GitDir $w.LP; New-GitDir $w.BP
+  foreach ($i in 1..12) { Put-File "$($w.LP)\HANDOFF-$i.md" "n$i" }
+  $realGit = (Get-Command git -CommandType Application | Select-Object -First 1).Source
+  $bin = Join-Path $w.W 'shim'; [void](New-Item -ItemType Directory -Path $bin -Force); $glog = Join-Path $w.W 'git-slow.log'
+  [IO.File]::WriteAllText((Join-Path $bin 'git.cmd'), "@echo off`r`necho %* | findstr /c:`"check-ignore`" >nul || goto run`r`n>>`"$glog`" echo start`r`nping -n 3 127.0.0.1 >nul`r`n>>`"$glog`" echo done`r`n:run`r`n`"$realGit`" %*`r`nexit /b %errorlevel%`r`n")
+  $t0 = Get-Date; $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '5'; PATH = ($bin + ';' + $env:PATH) }; $sec = ((Get-Date) - $t0).TotalSeconds
+  Eq $r.Code 1 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $FailMsg 'the failure line'
+  Ok ($sec -lt 22) "ended at cap + 10 s ($([Math]::Round($sec, 1)) s; the scan alone needs about 26 s)"
+  Ok ((Read-PhienLog $w) -match 'lỗi: lần chạy nhanh vượt quá 15 giây nên bị ngắt hẳn') ('logged: ' + (Read-PhienLog $w))
+  Start-Sleep -Seconds 3
+  $alive = @(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($Fcode) -and $_.CommandLine.Contains('phien proj --nhanh') })
+  Eq $alive.Count 0 'no part of the run is still alive'
+  $gl = @(Get-Content $glog | ForEach-Object { $_.Trim() }); Eq $gl[-1] 'start' 'the git call under way was ended with it (its "done" never came)'
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '60' }; Eq $r.Code 0 $r.Out
+  Eq @(Get-ChildItem $w.BP -Filter 'HANDOFF-*.md').Count 12 'the next run syncs'
+}
+T 'nhanh r4: --nen waits first (35 s by default, more than the 30 s "being written" rule; FCODE_MOC_DELAY in tests), then syncs; --nen needs --nhanh' {
+  $sd = $env:FCODE_MOC_DELAY; $env:FCODE_MOC_DELAY = $null
+  try { Eq (Get-PhienNenDelaySec) 35 'the default wait'; Ok ((Get-PhienNenDelaySec) -gt 30) 'longer than the 30 s rule' } finally { $env:FCODE_MOC_DELAY = $sd }
+  $w = New-W2 'q23'; Use-LoggedIb $w
+  [void](New-Sess $w.LS '23232323-nen1' $w.LP @('a'))
+  $p = Invoke-Fcode $w @('phien', 'proj', '--nhanh', '--nen') @{ FCODE_MOC_DELAY = '4' } -NoWait
+  try {
+    Start-Sleep -Seconds 2; Eq (IbCalls $w).Count 0 'nothing in the first 2 s, not even `instabox ls`'
+    Ok ($p.WaitForExit(40000)) 'it ends'; Eq $p.ExitCode 0 'exit 0'
+  } finally { $p.Dispose() }
+  Eq (BoxSessions $w) 1 'then it synced'
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nen'); Eq $r.Code 1 '--nen without --nhanh is refused'
+}
+# F7: the supervisor's job ends the worker however the supervisor ends; k = ms after its start, -1 = in the middle of sending
+function Get-RunTree([int]$Top, [datetime]$Since) {
+  $all = @(Get-CimInstance Win32_Process | Where-Object { $_.CreationDate -ge $Since.AddSeconds(-1) })
+  $ids = @{ $Top = $true }; $found = New-Object System.Collections.ArrayList; $grew = $true
+  while ($grew) { $grew = $false; foreach ($x in $all) { if ($ids.ContainsKey([int]$x.ParentProcessId) -and -not $ids.ContainsKey([int]$x.ProcessId)) { $ids[[int]$x.ProcessId] = $true; [void]$found.Add($x); $grew = $true } } }
+  , @($found | Where-Object { $_.Name -ne 'conhost.exe' } | ForEach-Object { "$($_.Name) $($_.ProcessId)" })
+}
+T 'nhanh r4: the supervisor killed at any moment (before its job, while the worker starts, mid-send): 2 s later nothing of the run is alive, nothing is half-placed' {
+  $w = New-W2 'q24'; Use-LoggedIb $w
+  $a = New-Sess $w.LS 'aaaa2424-sup1' $w.LP @('a'); Grow-Sess $a 5
+  foreach ($k in 0, 60, 150, 400, 1500, -1) {
+    $ev = @{ FCODE_PHIEN_CAP_SEC = '60' }
+    if ($k -lt 0) { $ev['FAKE_SSH_CUT'] = 'put:1:0:stall'; Remove-Item -LiteralPath $w.Log -ErrorAction SilentlyContinue }
+    $t0 = Get-Date; $p = Invoke-Fcode $w @('phien', 'proj', '--nhanh') $ev -NoWait; $kpid = $p.Id
+    if ($k -ge 0) { while (((Get-Date) - $t0).TotalMilliseconds -lt $k) { Start-Sleep -Milliseconds 5 } }
+    else {
+      $until = (Get-Date).AddSeconds(40)
+      while ((Calls $w 'put') -lt 1 -and (Get-Date) -lt $until -and -not $p.HasExited) { Start-Sleep -Milliseconds 200 }
+      Ok ((Calls $w 'put') -eq 1 -and -not $p.HasExited) 'the run is in the middle of sending'
+    }
+    Stop-Process -Id $kpid -Force -ErrorAction SilentlyContinue; $p.Dispose()
+    Start-Sleep -Seconds 2
+    $alive = Get-RunTree $kpid $t0
+    foreach ($x in $alive) { Stop-Process -Id ([int]($x -split ' ')[-1]) -Force -ErrorAction SilentlyContinue }   # a failing run must not hang the suite
+    Eq $alive.Count 0 "k=$($k): nothing of the run is alive ($($alive -join ', '))"
+    Eq (BoxSessions $w) 0 "k=$($k): nothing placed on the box"; Eq (Parts $w.LS) 0 "k=$($k): no part file on the laptop"; Eq (Parts $w.BS) 0 "k=$($k): no part file on the box"
+  }
+}
+
+# ---- r5: ownership is saved for sure before the line; a release that could not remove the line keeps it; Write-PhienText leftovers ----
+T 'nhanh r5: handoff-state.json cannot be written: the note from the box is not placed and no exclude line is added; exit 1, the failure line, the reason logged' {
+  $w = New-W2 'q25'; Use-LoggedIb $w
+  New-GitDir $w.LP; New-GitDir $w.BP
+  Put-File "$($w.BP)\HANDOFF.md" 'box handoff'
+  $sf = Join-Path $w.U 'AppData\Local\fcode\handoff-state.json'; Put-File $sf '{}'
+  $exf = "$($w.LP)\.git\info\exclude"; $before = Read-Bytes $exf
+  (Get-Item -LiteralPath $sf).IsReadOnly = $true
+  try {
+    $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh')
+    Eq $r.Code 1 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $FailMsg 'the failure line'
+    Ok (-not (Test-Path "$($w.LP)\HANDOFF.md")) 'the note is not placed'
+    Ok (Bytes-Eq (Read-Bytes $exf) $before) 'no exclude line without saved ownership'
+    Ok ((Read-PhienLog $w) -match 'lỗi: không ghi được trạng thái ghi chú \(handoff-state\.json\)') ('logged: ' + (Read-PhienLog $w))
+  } finally { (Get-Item -LiteralPath $sf).IsReadOnly = $false }
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Eq (Get-Content "$($w.LP)\HANDOFF.md" -Raw) 'box handoff' 'writable again: placed'
+  Eq ((Get-Content $sf -Raw | ConvertFrom-Json).'exclude:laptop:proj/HANDOFF.md') '1' 'with its ownership saved'
+}
+T 'nhanh r5: a release whose exclude line cannot be removed (.git/info became a link) keeps the ownership record, says so, exit 1; once fixed the next run removes it' {
+  $w = New-W2 'q26'; Use-LoggedIb $w
+  New-GitDir $w.LP; New-GitDir $w.BP
+  $bo = Join-Path $w.W 'origin.git'; New-Origin $bo
+  foreach ($d in $w.LP, $w.BP) { Fetch-Origin $d $bo; $ErrorActionPreference = 'Continue'; & git -C $d checkout -q -B main origin/main 2>&1 | Out-Null; $ErrorActionPreference = 'Stop' }
+  Put-File "$($w.BP)\HANDOFF.md" 'box text'
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  $sf = Join-Path $w.U 'AppData\Local\fcode\handoff-state.json'; $key = 'exclude:laptop:proj/HANDOFF.md'
+  Eq (Get-Content $sf -Raw | ConvertFrom-Json).$key '1' 'fcode owns the laptop line'
+  $ErrorActionPreference = 'Continue'; Git-Commit $w.BP @('HANDOFF.md'); & git -C $w.BP push -q $bo HEAD:main 2>&1 | Out-Null; & git -C $w.LP fetch -q origin 2>&1 | Out-Null; $ErrorActionPreference = 'Stop'
+  $info = "$($w.LP)\.git\info"; $tg = Join-Path $w.W 'info-elsewhere'
+  New-InfoJunction $w.LP $tg ([IO.File]::ReadAllText("$info\exclude"))
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 1 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $FailMsg 'the failure line'
+  Ok ((Read-PhienLog $w) -match 'lỗi: ghi chú HANDOFF\.md: chưa gỡ được dòng /HANDOFF\.md của fcode trong \.git/info/exclude') ('logged: ' + (Read-PhienLog $w))
+  Eq (Get-Content $sf -Raw | ConvertFrom-Json).$key '1' 'the ownership record is kept'
+  Ok ((Get-Content (Join-Path $tg 'exclude') -Raw) -match '(?m)^/HANDOFF\.md\r?$') 'nothing written through the link'
+  # fixed: a plain folder again (same content); the kept record lets the next run give the line back
+  $txt = [IO.File]::ReadAllText((Join-Path $tg 'exclude')); [IO.Directory]::Delete($info); [void](New-Item -ItemType Directory -Path $info); [IO.File]::WriteAllText("$info\exclude", $txt)
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Ok ((Get-Content "$info\exclude" -Raw) -notmatch '(?m)^/HANDOFF\.md\r?$') 'the line is given back'
+  Eq (Get-Content $sf -Raw | ConvertFrom-Json).$key $null 'and only now the record goes'
+}
+T 'nhanh r5: Write-PhienText leftovers (<file>.part-<PID> of a dead run) beside the state files and .git/info/exclude are removed by the next run; a live run''s stay' {
+  $w = New-W2 'q27'; Use-LoggedIb $w
+  New-GitDir $w.LP; [void](New-Sess $w.LS '27272727-lft1' $w.LP @('a'))
+  $gone = Start-Process -FilePath $env:ComSpec -ArgumentList '/c', 'exit' -WindowStyle Hidden -PassThru; $gone.WaitForExit(); $dp = $gone.Id
+  $sd = Join-Path $w.U 'AppData\Local\fcode'
+  $dead = @('handoff-state.json', 'phien-status.json', 'phien-auto.json' | ForEach-Object { Join-Path $sd "$_.part-$dp" }) + @("$($w.LP)\.git\info\exclude.part-$dp")
+  $live = @((Join-Path $sd "handoff-state.json.part-$PID"), "$($w.LP)\.git\info\exclude.part-$PID")   # this test process is alive and older than the file
+  foreach ($f in $dead + $live) { Put-File $f 'x' 0 }
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  foreach ($f in $dead) { Ok (-not (Test-Path $f)) "removed: $(Split-Path $f -Leaf)" }
+  foreach ($f in $live) { Ok (Test-Path $f) "kept: $(Split-Path $f -Leaf)" }
+}
+
+# ============================== 1.3.3: fcode moc (profile hook) ==============================
+$PwshExe = Get-Command pwsh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+function Moc($w, [string]$Sub) { Invoke-Fcode $w @('moc', $Sub) @{ FCODE_DOCUMENTS = (Join-Path $w.W 'Documents') } }
+function Count-Of([string]$Text, [string]$Needle) { [regex]::Matches($Text, [regex]::Escape($Needle)).Count }
+function Moc-Block([string]$Nl = "`r`n") { ($MocBlock -replace "`r?`n", $Nl) + $Nl }
+
+T 'moc: the hook text is plain ASCII, between the two exact marker lines, defines omp / claude / codex' {
+  Ok (-not ($MocBlock.ToCharArray() | Where-Object { [int]$_ -gt 127 })) 'ASCII only (a profile without BOM is read as ANSI by Windows PowerShell 5.1)'
+  $lines = @($MocBlock -split "`r?`n" | Where-Object { $_ })
+  Eq $lines[0] '# >>> fcode moc >>>'; Eq $lines[-1] '# <<< fcode moc <<<'
+  foreach ($n in 'omp', 'claude', 'codex') { Ok ($MocBlock -match "(?m)^function $n \{") "function $n" }
+  Ok ($MocBlock -match "FCODE_MOC -ne '0'") 'FCODE_MOC=0 skips the sync'
+  Ok ($MocBlock -match '-CommandType Application') 'the real program is the Application, never the function'
+  # r4 F8: fcode.ps1 started directly (no batch file); the after-exit run through the shell, hidden, with --nen (fcode waits itself)
+  Ok ($MocBlock -match 'fcode\.ps1') 'fcode.ps1 next to fcode.cmd'
+  Ok ($MocBlock -match 'UseShellExecute = \$true' -and $MocBlock -match "WindowStyle = 'Hidden'") 'the after-exit run goes through the shell, hidden'
+  Ok ($MocBlock -match '--nhanh --nen') 'with --nen'
+  Ok ($MocBlock -notmatch 'ping -n' -and $MocBlock -notmatch 'cmd\.exe') 'no cmd.exe / ping delay in the hook'
+  Ok ($MocBlock -match 'WaitForExit\(35000\)') 'the foreground run is waited for at most 35 s (a backstop: fcode ends itself by about 30 s)'
+}
+T 'moc: bat creates both profile files with exactly one block, trang-thai reports it, tat removes it again' {
+  $w = New-World 'moc1'; $docs = Join-Path $w.W 'Documents'
+  $p5 = Join-Path $docs 'WindowsPowerShell\profile.ps1'; $p7 = Join-Path $docs 'PowerShell\profile.ps1'
+  $r = Moc $w 'trang-thai'; Eq $r.Code 0 $r.Out
+  Eq (Count-Of $r.Out ': không có khối hook') 2 $r.Out
+  Ok ($r.Out -match 'Chính sách chạy script của Windows PowerShell 5\.1: ') 'the execution policy is reported, labelled Windows PowerShell 5.1'
+  if ($PwshExe) {   # pwsh's own policy, asked from pwsh itself (the Bypass fcode.cmd gives its own process is not inherited)
+    $direct = (& $PwshExe.Source -NoProfile -NonInteractive -Command '$env:PSExecutionPolicyPreference = $null; (Get-ExecutionPolicy).ToString()' | Out-String).Trim()
+    Ok ($r.Out -match ('Chính sách chạy script của PowerShell 7 \(pwsh\): ' + [regex]::Escape($direct) + '\r?\n')) ("pwsh policy line says [$direct]: " + $r.Out)
+  }
+  Ok (-not (Test-Path $p5) -and -not (Test-Path $p7)) 'trang-thai creates nothing'
+  $r = Moc $w 'bat'; Eq $r.Code 0 $r.Out
+  Ok ($r.Out -match 'Remove-Item Env:FCODE_MOC') 'bat says how to turn the hook back on after FCODE_MOC=0'
+  Ok ($r.Out -match 'claude\.exe' -and $r.Out -match '--') 'bat says the wrappers are not exact for -- / -x:value / $?; run claude.exe directly'
+  foreach ($p in $p5, $p7) {
+    $t = Latin $p
+    Eq (Count-Of $t '# >>> fcode moc >>>') 1 $p; Eq (Count-Of $t '# <<< fcode moc <<<') 1 $p
+    Eq $t (Moc-Block) 'a new file holds just the block'
+    Ok (-not (Test-Path "$p.bak-fcode")) 'a file that did not exist needs no backup'
+  }
+  $r = Moc $w 'trang-thai'; Eq (Count-Of $r.Out ': có khối hook') 2 $r.Out
+  $r = Moc $w 'tat'; Eq $r.Code 0 $r.Out
+  foreach ($p in $p5, $p7) { Eq (Get-Item -LiteralPath $p).Length 0 'the block is gone' }
+  $r = Moc $w 'trang-thai'; Eq (Count-Of $r.Out ': không có khối hook') 2 $r.Out
+  $r = Moc $w 'xyz'; Eq $r.Code 1 'unknown subcommand'
+}
+T 'moc: an existing profile keeps every other byte (BOM, CRLF, accents); bat twice does not duplicate; the backup is made once and never overwritten' {
+  $w = New-World 'moc2'; $docs = Join-Path $w.W 'Documents'
+  $p5 = Join-Path $docs 'WindowsPowerShell\profile.ps1'; $p7 = Join-Path $docs 'PowerShell\profile.ps1'
+  [void](New-Item -ItemType Directory -Path (Split-Path $p5) -Force)
+  $orig = [byte[]](@(0xEF, 0xBB, 0xBF) + [byte[]]$utf8.GetBytes("# my profile`r`nSet-Alias ll Get-ChildItem`r`nWrite-Host 'xin chào'`r`n"))
+  [IO.File]::WriteAllBytes($p5, $orig)
+  $r = Moc $w 'bat'; Eq $r.Code 0 $r.Out
+  $now = Read-Bytes $p5
+  Ok (Bytes-Eq $now[0..($orig.Length - 1)] $orig) 'the old bytes are the same, in front'
+  Eq (Latin $p5).Substring($orig.Length) (Moc-Block) 'the block follows'
+  Ok (Bytes-Eq (Read-Bytes "$p5.bak-fcode") $orig) 'backup of the original'
+  Ok (-not (Test-Path "$p5.fcode-tmp")) 'no temp file left'
+  # twice: nothing changes (one block), and a backup that already exists is never overwritten
+  [IO.File]::WriteAllText("$p5.bak-fcode", 'KEEP')
+  $before = Sha $p5
+  $r = Moc $w 'bat'; Eq $r.Code 0 $r.Out
+  Eq (Sha $p5) $before 'second bat: same file'
+  Eq (Count-Of (Latin $p5) '# >>> fcode moc >>>') 1 'one block, not two'
+  Eq (Count-Of (Latin $p7) '# >>> fcode moc >>>') 1 'the other profile too'
+  Eq (Get-Content "$p5.bak-fcode" -Raw) 'KEEP' 'backup untouched'
+  # the user adds lines after the block; tat removes only the block and still does not overwrite the backup
+  $fs = [IO.File]::Open($p5, 'Append'); try { $b = $utf8.GetBytes("Import-Module posh-git`r`n"); $fs.Write($b, 0, $b.Length) } finally { $fs.Dispose() }
+  $r = Moc $w 'tat'; Eq $r.Code 0 $r.Out
+  Ok (Bytes-Eq (Read-Bytes $p5) ([byte[]](@($orig) + [byte[]]$utf8.GetBytes("Import-Module posh-git`r`n")))) 'everything but the block is as it was'
+  Eq (Get-Content "$p5.bak-fcode" -Raw) 'KEEP' 'backup still untouched after tat'
+  $before = Sha $p5; $r = Moc $w 'tat'; Eq $r.Code 0; Eq (Sha $p5) $before 'second tat: same file'
+  $r = Moc $w 'bat'; Eq $r.Code 0 $r.Out; Eq (Count-Of (Latin $p5) '# >>> fcode moc >>>') 1 'bat again after tat'
+}
+T 'moc: bat replaces an old block in place (lines before and after untouched); LF files get LF; no final newline gets one; lone marker and UTF-16 are refused untouched' {
+  $w = New-World 'moc3'; $docs = Join-Path $w.W 'Documents'
+  $p5 = Join-Path $docs 'WindowsPowerShell\profile.ps1'; $p7 = Join-Path $docs 'PowerShell\profile.ps1'
+  [void](New-Item -ItemType Directory -Path (Split-Path $p5), (Split-Path $p7) -Force)
+  [IO.File]::WriteAllText($p5, "A`r`n# >>> fcode moc >>>`r`nold stuff`r`n# <<< fcode moc <<<`r`nB`r`n")
+  [IO.File]::WriteAllText($p7, "A`nB")
+  $r = Moc $w 'bat'; Eq $r.Code 0 $r.Out
+  Eq (Latin $p5) ("A`r`n" + (Moc-Block) + "B`r`n") 'replaced where it was'
+  Eq (Latin $p7) ("A`nB`n" + (Moc-Block "`n")) 'LF file: LF block, newline added before it'
+  Ok ((Latin $p7) -notmatch "`r") 'no CR in the LF file'
+  # refusals leave the file alone
+  $half = "A`r`n# >>> fcode moc >>>`r`nB`r`n"; [IO.File]::WriteAllText($p5, $half); Remove-Item "$p5.bak-fcode" -ErrorAction SilentlyContinue
+  $u16 = [byte[]](@(0xFF, 0xFE) + [byte[]][Text.Encoding]::Unicode.GetBytes("x")); [IO.File]::WriteAllBytes($p7, $u16); Remove-Item "$p7.bak-fcode" -ErrorAction SilentlyContinue
+  $r = Moc $w 'bat'; Eq $r.Code 1 $r.Out
+  Eq (Latin $p5) $half 'half block: untouched'; Ok (Bytes-Eq (Read-Bytes $p7) $u16) 'UTF-16: untouched'
+  Ok (-not (Test-Path "$p5.bak-fcode") -and -not (Test-Path "$p7.bak-fcode")) 'no backup when nothing was changed'
+  $r = Moc $w 'tat'; Eq $r.Code 1 'tat refuses the same way'
+}
+T 'moc: trang-thai says in Vietnamese when the execution policy blocks profiles, ignores the Process scope, and the policy is never changed' {
+  function Set-ExecutionPolicy { throw 'fcode must never change the execution policy' }
+  function Get-ExecutionPolicy { param([switch]$List) $script:EP }
+  function EP([string]$Mu, [string]$Us, [string]$Pr, [string]$Cu, [string]$Lm) { $script:EP = @(@('MachinePolicy', $Mu), @('UserPolicy', $Us), @('Process', $Pr), @('CurrentUser', $Cu), @('LocalMachine', $Lm) | ForEach-Object { [pscustomobject]@{ Scope = $_[0]; ExecutionPolicy = $_[1] } }) }
+  function Get-MocPwshPolicy { $script:PW }   # pwsh's own answer is mocked here; the real one is checked through `fcode moc trang-thai` in the test above
+  $script:PW = $null
+  function Say-Policy { (Write-MocPolicy *>&1 | Out-String) }
+  EP 'Undefined' 'Undefined' 'Bypass' 'Restricted' 'Undefined'
+  $o = Say-Policy
+  Ok ($o -match 'Windows PowerShell 5\.1: Restricted \(đặt ở: CurrentUser\)') ("Process=Bypass must not hide Restricted; the line is labelled 5.1: $o")
+  Ok ($o -notmatch 'PowerShell 7') 'no pwsh on this machine = no pwsh line'
+  Ok ($o -match 'KHÔNG nạp file profile') 'says the hook will not load'; Ok ($o -match 'Set-ExecutionPolicy -Scope CurrentUser RemoteSigned') 'says how to allow it'
+  # a shell is warned about only when ITS policy blocks profiles: 5.1 Restricted + pwsh RemoteSigned (a default Windows client) warns about 5.1 only, and the other way round
+  $script:PW = 'RemoteSigned'; $o = Say-Policy
+  Ok ($o -match 'PowerShell 7 \(pwsh\): RemoteSigned') 'pwsh policy is printed'; Ok ($o -match 'Windows PowerShell 5\.1 sẽ KHÔNG nạp' -and $o -notmatch 'PowerShell 7 sẽ KHÔNG nạp') "5.1 only: $o"
+  EP 'Undefined' 'Undefined' 'Undefined' 'RemoteSigned' 'Undefined'; $script:PW = 'AllSigned'; $o = Say-Policy
+  Ok ($o -match 'PowerShell 7 \(pwsh\): AllSigned' -and $o -match 'PowerShell 7 sẽ KHÔNG nạp' -and $o -notmatch 'Windows PowerShell 5\.1 sẽ KHÔNG nạp') "pwsh only: $o"
+  $script:PW = 'RemoteSigned'; Ok ((Say-Policy) -notmatch 'Cảnh báo') 'both fine = no warning'
+  $script:PW = $null
+  EP 'Undefined' 'Undefined' 'Bypass' 'Restricted' 'Undefined'
+  EP 'Undefined' 'Undefined' 'Undefined' 'Undefined' 'AllSigned'; Ok ((Say-Policy) -match 'KHÔNG nạp') 'AllSigned warns'
+  EP 'Undefined' 'Undefined' 'Undefined' 'Undefined' 'Undefined'; $o = Say-Policy; Ok ($o -match 'Restricted' -and $o -match 'KHÔNG nạp') "nothing set = the Windows default, Restricted: $o"
+  EP 'Undefined' 'Undefined' 'Undefined' 'RemoteSigned' 'Restricted'; $o = Say-Policy; Ok ($o -match 'RemoteSigned' -and $o -notmatch 'Cảnh báo') ("RemoteSigned is fine: $o")
+  EP 'Undefined' 'Undefined' 'Undefined' 'Bypass' 'Restricted'; Ok ((Say-Policy) -notmatch 'Cảnh báo') 'Bypass is fine'
+  EP 'AllSigned' 'Undefined' 'Undefined' 'RemoteSigned' 'Undefined'; $o = Say-Policy; Ok ($o -match 'Cảnh báo' -and $o -match 'Group Policy') ("a policy set by the administrator: $o")
+}
+
+# the hook run for real: child PowerShell processes, a temp USERPROFILE, fake omp / claude / codex / fcode (.cmd) first on PATH
+function New-MocBin($w) {
+  $bin = Join-Path $w.W 'bin'; [void](New-Item -ItemType Directory -Path $bin -Force)
+  $log = Join-Path $w.W 'moc.log'
+  # the part before the first agent line ("omp ", "claude ", "codex ") of the log is the foreground sync, the part after it the background one; FAKE_FG / FAKE_BG = ping count (about seconds + 1); FAKE_RC = its exit code
+  [IO.File]::WriteAllText((Join-Path $bin 'fcode.cmd'), "@echo off`r`necho fcode %* [%MOC_LABEL%] >>`"%MOCLOG%`"`r`nfindstr /b /c:`"omp `" /c:`"claude `" /c:`"codex `" `"%MOCLOG%`" >nul 2>&1`r`nif errorlevel 1 (if defined FAKE_FG ping -n %FAKE_FG% 127.0.0.1 >nul) else (if defined FAKE_BG ping -n %FAKE_BG% 127.0.0.1 >nul)`r`necho fcode-end %* [%MOC_LABEL%] >>`"%MOCLOG%`"`r`nif defined FAKE_RC exit /b %FAKE_RC%`r`nexit /b 0`r`n")
+  foreach ($n in 'omp', 'claude', 'codex') { [IO.File]::WriteAllText((Join-Path $bin "$n.cmd"), "@echo off`r`necho $n %* >>`"%MOCLOG%`"`r`necho $n-out`r`nif defined FAKE_TTY python -c `"import sys;open(sys.argv[1],'w').write(str(sys.stdin.isatty())+' '+str(sys.stdout.isatty()))`" `"%FAKE_TTY%`"`r`nif defined FAKE_STDIN findstr `"^`" >`"%FAKE_STDIN%`"`r`nexit /b 7`r`n") }
+  # fcode.ps1 beside fcode.cmd (the hook starts it directly): the same log lines; FAKE_FG / FAKE_BG (the --nen run) as above; a --nen run records
+  # whether its console has a visible window (MainWindowHandle) in <log>.handle
+  # (appends retry: the test reads the log while it is written)
+  [IO.File]::WriteAllText((Join-Path $bin 'fcode.ps1'), (@(
+      'function L([string]$f, [string]$t) { for ($i = 0; $i -lt 50; $i++) { try { [IO.File]::AppendAllText($f, $t + "`r`n"); return } catch { Start-Sleep -Milliseconds 100 } } }'
+      '$a = $args -join '' ''; $nen = $args -contains ''--nen'''
+      'L $env:MOCLOG "fcode $a [$env:MOC_LABEL]"'
+      'if ($nen) { L ($env:MOCLOG + ''.handle'') (''handle='' + (Get-Process -Id $PID).MainWindowHandle) }'
+      '$n = if ($nen) { $env:FAKE_BG } else { $env:FAKE_FG }; if ($n) { Start-Sleep -Seconds ([int]$n - 1) }'
+      'L $env:MOCLOG "fcode-end $a [$env:MOC_LABEL]"'
+      'if ($env:FAKE_RC) { exit [int]$env:FAKE_RC }; exit 0') -join "`r`n"))
+  [pscustomobject]@{ Bin = $bin; Log = $log }
+}
+function Get-MocLog($b) { if (Test-Path $b.Log) { @(Get-Content $b.Log | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } else { @() } }
+function Wait-MocLog($b, [string]$Pat, [int]$Count, [int]$Sec = 40) {
+  $end = (Get-Date).AddSeconds($Sec)
+  while ((Get-Date) -lt $end -and @(Get-MocLog $b | Where-Object { $_ -match $Pat }).Count -lt $Count) { Start-Sleep -Milliseconds 300 }
+  @(Get-MocLog $b | Where-Object { $_ -match $Pat }).Count
+}
+# runs $Body (PowerShell text) in a child host after dot-sourcing the profile that `fcode moc bat` wrote; returns the child's output
+# -Headless: the child gets a real console (stdin / stdout are a terminal, as at a prompt) but no window, the way the Task Scheduler entry runs (conhost --headless); its own output is not captured
+function Invoke-MocChild($w, $b, [string]$Body, [hashtable]$ExtraEnv = @{}, [string]$HostExe = 'powershell.exe', [switch]$Headless) {
+  $prof = Join-Path $w.W $(if ($HostExe -eq 'powershell.exe') { 'Documents\WindowsPowerShell\profile.ps1' } else { 'Documents\PowerShell\profile.ps1' })
+  $script = Join-Path $w.W 'child.ps1'
+  [IO.File]::WriteAllText($script, "`$ErrorActionPreference = 'Continue'`r`n. '$prof'`r`n$Body`r`n", (New-Object Text.UTF8Encoding($true)))
+  $set = @{ USERPROFILE = $w.U; MOCLOG = $b.Log; PATH = ($b.Bin + ';' + $env:PATH); MOC_LABEL = 'x'; FAKE_FG = [NullString]::Value; FAKE_BG = [NullString]::Value; FAKE_RC = [NullString]::Value; FAKE_TTY = [NullString]::Value; FAKE_STDIN = [NullString]::Value; FCODE_MOC = [NullString]::Value; FCODE_MOC_DELAY = '1' }
+  foreach ($k in $ExtraEnv.Keys) { $set[$k] = $ExtraEnv[$k] }
+  $save = @{}; foreach ($k in $set.Keys) { $save[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k, $set[$k]) }
+  try {
+    if ($Headless) {
+      $pr = Start-Process -FilePath conhost.exe -ArgumentList @('--headless', $HostExe, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script) -WindowStyle Hidden -PassThru
+      if (-not $pr.WaitForExit(90000)) { & taskkill.exe /PID $pr.Id /T /F 2>&1 | Out-Null }
+    } else { & $HostExe -NoProfile -ExecutionPolicy Bypass -File $script 2>&1 | Out-String }
+  } finally { foreach ($k in $save.Keys) { [Environment]::SetEnvironmentVariable($k, $(if ($null -eq $save[$k]) { [NullString]::Value } else { $save[$k] })) } }
+}
+function New-MocWorld([string]$Name) { $w = New-World $Name; [void](Moc $w 'bat'); $w }
+
+foreach ($hostExe in 'powershell.exe', 'pwsh') {
+  if ($hostExe -eq 'pwsh' -and -not $PwshExe) { continue }
+  T "moc hook ($hostExe): in a project folder the sync runs first and is waited for, then the real program gets the args, then a hidden sync; output and exit code pass through" {
+    $w = New-MocWorld ($(if ($hostExe -eq 'pwsh') { 'moc4pw' } else { 'moc4ps' })); $b = New-MocBin $w
+    $deep = Join-Path $w.LP 'sub\deep'; [void](New-Item -ItemType Directory -Path $deep -Force)
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $o = Invoke-MocChild $w $b ("Set-Location -LiteralPath '$deep'`r`n`$sw = [Diagnostics.Stopwatch]::StartNew()`r`nomp a 'b c' --x`r`n'RC=' + `$LASTEXITCODE + ' T=' + [int]`$sw.Elapsed.TotalSeconds") @{ FAKE_BG = '10' } $hostExe
+    $whole = $sw.Elapsed.TotalSeconds
+    Ok ($o -match 'omp-out') "the program's own output comes through: $o"
+    Ok ($o -match 'RC=7 ') "its exit code is left in LASTEXITCODE: $o"
+    $t = [int]([regex]::Match($o, 'T=(\d+)').Groups[1].Value)
+    Ok ($t -lt 8) "the background sync (about 9 s) is not waited for ($t s)"
+    # the after-exit run holds none of the shell's handles: the shell (and a pipe reading it) ends at once, not when that run ends
+    Ok ($whole -lt 6) "the shell ends without waiting for the background run ($([Math]::Round($whole, 1)) s)"
+    Eq ((Wait-MocLog $b '^fcode-end ' 2 45)) 2 'foreground and background sync both ran'
+    Eq ((Get-MocLog $b) -join '|') 'fcode phien proj --nhanh [x]|fcode-end phien proj --nhanh [x]|omp a "b c" --x|fcode phien proj --nhanh --nen [x]|fcode-end phien proj --nhanh --nen [x]'
+    Eq ((Get-Content "$($b.Log).handle" -Raw).Trim()) 'handle=0' 'the after-exit run has no visible window'
+  }
+}
+T 'moc hook: without fcode.ps1 next to fcode.cmd the hook runs fcode.cmd (before and after, the after-exit run with --nen)' {
+  $w = New-MocWorld 'moc9'; $b = New-MocBin $w; Remove-Item -LiteralPath (Join-Path $b.Bin 'fcode.ps1')
+  [void](Invoke-MocChild $w $b "Set-Location -LiteralPath '$($w.LP)'`r`nomp z")
+  Eq ((Wait-MocLog $b '^fcode-end ' 2 45)) 2 'both runs'
+  Eq ((Get-MocLog $b) -join '|') 'fcode phien proj --nhanh [x]|fcode-end phien proj --nhanh [x]|omp z|fcode phien proj --nhanh --nen [x]|fcode-end phien proj --nhanh --nen [x]'
+}
+T 'moc hook: project is found by the folder you are in (nested, longest path, case, slashes, trailing slash); no project or FCODE_MOC=0 = only the real program' {
+  $w = New-World 'moc5'; $d = Join-Path $w.U 'Desktop'
+  foreach ($x in 'proj\a\b', 'proj\sub\z', 'proj2', 'Mixed\child', 'x\app', 'y\app', 'New folder (2)\q') { [void](New-Item -ItemType Directory -Path (Join-Path $d $x) -Force) }
+  # the nested repo is listed BEFORE its parent: a "last match wins" rule would pick the parent and fail the 'longest' case
+  $repos = @((Join-Path $w.LP 'sub'), $w.LP, (($d + '\MIXED\') -replace '\\', '/'), (Join-Path $d 'x\app'), (Join-Path $d 'y\app'), (Join-Path $d 'New folder (2)'))
+  [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ instabox = $Cmd; box = 'coder'; syncRepos = $repos } | ConvertTo-Json -Compress))
+  [void](Moc $w 'bat'); $b = New-MocBin $w
+  $cases = @(@('root', 'proj', 'proj'), @('nested', 'proj\a\b', 'proj'), @('longest', 'proj\sub\z', 'sub'), @('sibling', 'proj2', ''), @('case', 'Mixed\child', 'mixed'),
+    @('dupfirst', 'x\app', 'app'), @('dupsecond', 'y\app', ''), @('badname', 'New folder (2)\q', ''), @('outside', '', ''))
+  # after each synced case the child waits for its background run to end, so two fake fcode processes never append to the log at the same moment
+  $body = "function W([int]`$n) { `$e = (Get-Date).AddSeconds(30); while ((Get-Date) -lt `$e -and @(Get-Content `$env:MOCLOG | Where-Object { `$_ -match '^fcode-end' }).Count -lt `$n) { Start-Sleep -Milliseconds 200 } }`r`n"
+  $want = 0
+  foreach ($c in $cases) {
+    $body += "`$env:MOC_LABEL = '$($c[0])'; Set-Location -LiteralPath '$(Join-Path $d $c[1])'; omp $($c[0])`r`n"
+    if ($c[2]) { $want += 2; $body += "W $want`r`n" }
+  }
+  $body += "`$env:FCODE_MOC = '0'; `$env:MOC_LABEL = 'off'; Set-Location -LiteralPath '$($w.LP)'; omp off"
+  [void](Invoke-MocChild $w $b $body)
+  $log = Get-MocLog $b
+  Eq (@($log | Where-Object { $_ -match '^fcode-end ' }).Count) 10 ("five synced folders = ten sync runs (before and after): " + ($log -join '|'))
+  foreach ($c in $cases) {
+    $seen = @($log | Where-Object { $_ -match "^fcode phien (\S+) --nhanh(?: --nen)? \[$($c[0])\]$" } | ForEach-Object { $Matches[1] })
+    Eq ($seen -join ',') $(if ($c[2]) { "$($c[2]),$($c[2])" } else { '' }) ("sync project for '$($c[0])'")
+    Ok (@($log | Where-Object { $_ -eq "omp $($c[0])" }).Count -eq 1) "the real program ran once for '$($c[0])'"
+  }
+  Eq @($log | Where-Object { $_ -match '\[off\]$' }).Count 0 'FCODE_MOC=0: no sync'; Ok ($log -contains 'omp off') 'but the program runs'
+}
+T 'moc hook: with nothing piped the real program keeps the console (stdin and stdout stay a terminal, so its UI works); piped input reaches it' {
+  $w = New-MocWorld 'moc7'; $b = New-MocBin $w
+  $f1 = Join-Path $w.W 'tty-direct.txt'; $f2 = Join-Path $w.W 'tty-hook.txt'; $f3 = Join-Path $w.W 'stdin.txt'
+  # the first call is the control: the same program run by hand, not through the hook
+  $body = "Set-Location -LiteralPath '$($w.U)'`r`n`$env:FAKE_TTY = '$f1'; & '$(Join-Path $b.Bin 'omp.cmd')' direct`r`n`$env:FAKE_TTY = '$f2'; omp via-hook`r`n`Remove-Item Env:FAKE_TTY; `$env:FAKE_STDIN = '$f3'; 'piped line' | codex c`r`n"
+  [void](Invoke-MocChild $w $b $body @{} 'powershell.exe' -Headless)
+  Ok (Test-Path $f1) 'the control ran'
+  Eq ((Get-Content $f1 -Raw).Trim()) 'True True' 'control: a headless console is a terminal on both sides (else this test proves nothing)'
+  Ok (Test-Path $f2) 'the hook ran the program'
+  Eq ((Get-Content $f2 -Raw).Trim()) 'True True' 'through the hook function: still a terminal'
+  Ok ((Test-Path $f3) -and (Get-Content $f3 -Raw) -match 'piped line') 'piped input arrives'
+  Eq (@(Get-MocLog $b | Where-Object { $_ -match '^(omp via-hook|codex c)$' }).Count) 2 'both programs ran through the functions'
+}
+T 'moc help: fcode help names how to turn the hook off in a window and back on, and the wrapper limits' {
+  $w = New-World 'help1'; $r = Invoke-Fcode $w @('help'); Eq $r.Code 0
+  Ok ($r.Out -match "FCODE_MOC = '0'" -and $r.Out -match 'Remove-Item Env:FCODE_MOC' -and $r.Out -match 'cửa sổ này') 'turn off in this window / on again'
+  Ok ($r.Out -match 'claude\.exe / codex\.exe / omp\.exe' -and $r.Out -match 'x:giá-trị') 'wrapper limits and the bypass'
+  Ok ($r.Out -match 'fcode phien <project> --nhanh --nen' -and $r.Out -match 'chưa xong sau 30 giây thì bị ngắt hẳn và báo lỗi') 'r4: --nen and the 30 s hard end are in the help'
+}
+T 'moc hook: a failing sync does not stop the agent; a sync that hangs is killed after 35 s (the backstop: fcode itself ends by about 30 s)' {
+  $w = New-MocWorld 'moc6'; $b = New-MocBin $w
+  $o = Invoke-MocChild $w $b "Set-Location -LiteralPath '$($w.LP)'`r`ncodex hello`r`n'RC=' + `$LASTEXITCODE" @{ FAKE_RC = '1' }
+  Ok ($o -match 'codex-out' -and $o -match 'RC=7') "the agent started anyway and keeps its own exit code: $o"
+  Eq (@(Get-MocLog $b | Where-Object { $_ -eq 'codex hello' }).Count) 1
+  Eq (Wait-MocLog $b '^fcode-end ' 2 20) 2 'both syncs ran'
+  Remove-Item $b.Log -ErrorAction SilentlyContinue; $b2 = $b
+  $o = Invoke-MocChild $w $b2 "Set-Location -LiteralPath '$($w.LP)'`r`n`$sw = [Diagnostics.Stopwatch]::StartNew()`r`nclaude hi`r`n'RC=' + `$LASTEXITCODE + ' T=' + [int]`$sw.Elapsed.TotalSeconds" @{ FAKE_FG = '61' }
+  $t = [int]([regex]::Match($o, 'T=(\d+)').Groups[1].Value)
+  Ok ($o -match 'RC=7 ' -and $o -match 'claude-out') "the agent started after the kill: $o"
+  Ok ($t -ge 34 -and $t -lt 55) "waited 35 s for the sync, then killed it ($t s)"
+  Eq (Wait-MocLog $b2 '^fcode-end ' 1 20) 1 'only the background run finished; the killed one never reached its end'
+  Eq (@(Get-MocLog $b2 | Where-Object { $_ -match '^fcode phien' }).Count) 2
 }
 
 if ($env:FCODE_TEST_KEEP) { Write-Host "kept: $Root" } else { for ($i = 0; $i -lt 4 -and (Test-Path -LiteralPath $Root); $i++) { Set-Location -LiteralPath $env:TEMP; Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue; if (Test-Path -LiteralPath $Root) { Start-Sleep -Seconds 3 } } }   # omp may still hold its native addon for a moment

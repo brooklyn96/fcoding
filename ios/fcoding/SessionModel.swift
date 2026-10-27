@@ -238,6 +238,108 @@ final class SessionModel: ObservableObject {
         }
     }
 
+    // MARK: - Image attach
+
+    /// On from the moment an image is selected (before it is loaded or converted) until its upload
+    /// ends; one image at a time. While on, the composer disables Send and the image button, so no
+    /// message can overtake the image path and a second pick is never dropped silently.
+    @Published private(set) var imageBusy = false
+    /// Status line for the image: sending, attached, saved but not attached, or an image error
+    /// (`imageFailed`). Image results never go to `errorText`, so a later Send cannot wipe them.
+    @Published var imageNote: String?
+    /// `imageNote` is an error (or the camera is off): shown as a warning and kept on Send.
+    @Published private(set) var imageFailed = false
+
+    /// Photo library, called at selection: `load` reads the picked file (seconds for an iCloud
+    /// original), then ImageIO downsamples it without decoding the full bitmap.
+    func attachPhoto(_ load: @escaping () async -> Data?) {
+        attach {
+            guard let data = await load() else { throw APIError(status: 0, code: "bad_type") }
+            return try await Task.detached(priority: .userInitiated) { try ImageAttach.jpeg(data: data) }.value
+        }
+    }
+
+    /// Camera shot.
+    func attachImage(_ image: UIImage) {
+        attach { try await Task.detached(priority: .userInitiated) { try ImageAttach.jpeg(image) }.value }
+    }
+
+    /// Camera access is denied or restricted for FCode: say where to turn it on; nothing is opened.
+    func cameraDenied() {
+        guard !imageBusy else { return }
+        let text = "Camera đang bị tắt cho FCode: vào Cài đặt → FCode → bật Camera"
+        imageFailed = true
+        imageNote = text
+        UIAccessibility.post(notification: .announcement, argument: text)
+    }
+
+    /// True while the busy image can still be cancelled by a tap on its note: from selection until
+    /// its upload request starts (an upload on the wire may already be saved and pasted).
+    @Published private(set) var imageCancellable = false
+    /// The busy image's op; replaced by the next pick, so a cancelled op never touches later state.
+    private var imageOp: ImageOp?
+
+    /// Takes the image's input-chain slot at once (at selection), so every later send or key waits
+    /// behind it. Inside that slot: make the JPEG (load + conversion, bounded by 60 s), then find the
+    /// session's project and upload. A cancelled op returns quietly: `cancelImage` already reset the note.
+    private func attach(_ makeJPEG: @escaping @MainActor () async throws -> Data) {
+        guard !imageBusy else { return }
+        let op = ImageOp()
+        imageOp = op
+        imageBusy = true
+        imageCancellable = true
+        imageFailed = false
+        imageNote = "Đang gửi ảnh…"
+        _ = enqueue { [weak self] in
+            guard let self = self else { return false }
+            do {
+                let jpeg = try await op.load(makeJPEG)
+                guard !op.cancelled else { return false }
+                guard let api = self.app?.api else { self.finishImage(nil, nil); return false }
+                // The session's project, from the server (a renamed session keeps its project).
+                let sessions = try await api.get("api/sessions", as: SessionsResponse.self).sessions
+                guard !op.cancelled else { return false }
+                guard let project = sessions.first(where: { $0.name == self.name })?.project, !project.isEmpty else {
+                    throw APIError(status: 404, code: "no_session")
+                }
+                self.imageCancellable = false
+                let reply = try await api.uploadImage(project: project, session: self.name, jpeg: jpeg)
+                self.finishImage(reply, nil)
+                return true
+            } catch {
+                if !op.cancelled { self.finishImage(nil, error) }
+                return false
+            }
+        }
+    }
+
+    /// Tap on the busy note: drops the image before its upload starts. The note clears and the
+    /// composer frees at once; the op's FIFO slot still runs, in order, and ends without uploading.
+    func cancelImage() {
+        guard imageBusy, imageCancellable, let op = imageOp else { return }
+        op.cancel()
+        finishImage(nil, CancellationError())
+        UIAccessibility.post(notification: .announcement, argument: "Đã huỷ ảnh")
+    }
+
+    private func finishImage(_ reply: UploadReply?, _ error: Error?) {
+        imageOp = nil
+        imageCancellable = false
+        imageBusy = false
+        // Saved but not attached is a warning too: kept on Send like the errors.
+        imageFailed = reply?.attached != true
+        if let reply = reply {
+            imageNote = reply.attached ? "Đã gắn ảnh — gõ lời nhắn rồi gửi" : "Đã lưu ảnh nhưng chưa gắn được vào phiên"
+        } else if error is CancellationError {
+            imageNote = nil
+        } else if let e = error as? APIError, e.status == 401 {
+            imageNote = app?.report(e)
+        } else {
+            imageNote = error.map(ImageAttach.message) ?? "Không gửi được ảnh, thử lại"
+        }
+        if let said = imageNote { UIAccessibility.post(notification: .announcement, argument: said) }
+    }
+
     /// Tells tmux how many columns/rows fit in `size` at this font size (debounced, skipped if unchanged).
     func resize(to size: CGSize, fontSize: Double) {
         let font = UIFont.monospacedSystemFont(ofSize: CGFloat(fontSize), weight: .regular)
@@ -273,5 +375,48 @@ final class SessionModel: ObservableObject {
             }
             if self.inFlightGen == gen { self.inFlightGen = nil }
         }
+    }
+}
+
+/// One image attach. Its load race (`load`) owns its own continuation, resumed exactly once: by the
+/// JPEG, by its 60 s timer, or by `cancel`. Whoever ends it cancels the other tasks; a late result
+/// (a load that ignored cancellation) finds no continuation and is dropped, never uploaded.
+@MainActor
+private final class ImageOp {
+    private(set) var cancelled = false
+    private var wait: CheckedContinuation<Data, Error>?
+    private var tasks: [Task<Void, Never>] = []
+
+    /// `make()` or, after 60 s, APIError "load_timeout". An unstructured race, so a load that ignores
+    /// cancellation (a stalled iCloud original) cannot hold the input chain.
+    func load(_ make: @escaping @MainActor () async throws -> Data) async throws -> Data {
+        try await withCheckedThrowingContinuation { (c: CheckedContinuation<Data, Error>) in
+            if cancelled { c.resume(throwing: CancellationError()); return }
+            wait = c
+            // Both tasks start after this closure returns (same actor), so `tasks` is set first.
+            let work = Task { [weak self] in
+                let result: Result<Data, Error>
+                do { result = .success(try await make()) } catch { result = .failure(error) }
+                self?.end(result)
+            }
+            let timer = Task { [weak self] in
+                do { try await Task.sleep(nanoseconds: 60_000_000_000) } catch { return }
+                self?.end(.failure(APIError(status: 0, code: "load_timeout")))
+            }
+            tasks = [work, timer]
+        }
+    }
+
+    func cancel() {
+        cancelled = true
+        end(.failure(CancellationError()))
+    }
+
+    private func end(_ result: Result<Data, Error>) {
+        guard let c = wait else { return }
+        wait = nil
+        tasks.forEach { $0.cancel() }
+        tasks = []
+        c.resume(with: result)
     }
 }

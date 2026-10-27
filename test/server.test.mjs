@@ -4879,3 +4879,621 @@ test('add project: after a normal TIMEOUT close no late SIGKILL is sent (the kil
     assert.deepEqual(kills, [], 'a SIGKILL went to a group that was already gone');
   } finally { process.kill = orig; }
 }, { addTimeoutMs: 300, addKillGraceMs: 600 }));
+
+// ======================= v1.3.3: POST /api/projects/<name>/upload (CONTRACT A12) =======================
+const JPG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46, 0x49, 0x46, 1, 2, 3]);
+const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d, 1, 2, 3]);
+const UPLOAD_MAX = 10 * 1024 * 1024;
+const NAME_UP = /^\d{8}-\d{6}-[0-9a-f]{6}\.(jpg|png)$/;
+const gitIn = (cwd, ...a) => spawnSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', ...a], { cwd, encoding: 'utf8' });
+const sized = (head, n) => { const b = Buffer.alloc(n); head.copy(b); return b; };
+
+// projects: alpha / beta (plain dirs), spaced (a dir name with a space), nested (two levels down, glob characters in the parent); dirs = {alpha, beta, spaced, nested}; base = their parent
+async function withUpload(fn, opts) {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-up-'));
+  const dirs = { alpha: path.join(base, 'alpha'), beta: path.join(base, 'beta'), spaced: path.join(base, 'with space'), nested: path.join(base, 'a[1]', 'b') };
+  for (const d of Object.values(dirs)) fs.mkdirSync(d, { recursive: true });
+  const c = await boot({ ...opts, config: { projects: { ...dirs, gone: path.join(base, 'gone') } } });
+  try { await fn(c, dirs, (await c.login()).cookie, base); } finally { await c.close(); fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+}
+// an upload whose body stops after `cut` bytes (head sent, rest held back): finish() sends the rest; done = the answer ({status, json}) or {error}
+function partialUpload(c, cookie, project, body, { session, cut = 4, type = 'image/jpeg', length = body.length } = {}) {
+  const req = http.request({ host: '127.0.0.1', port: c.port, method: 'POST', path: upUrl(project, session),
+    headers: { 'X-PC': '1', Cookie: cookie, 'Content-Type': type, 'Content-Length': length } });
+  const done = new Promise((resolve) => {
+    req.on('response', (res) => {
+      const ch = [];
+      res.on('data', (d) => ch.push(d));
+      res.on('end', () => { const text = Buffer.concat(ch).toString(); let json; try { json = JSON.parse(text); } catch {} resolve({ status: res.statusCode, json, text }); });
+    });
+    req.on('error', (e) => resolve({ error: e.code || e.message }));
+    req.on('close', () => resolve({ error: 'closed' })); // no-op once answered
+  });
+  req.write(body.subarray(0, cut));
+  return { req, done, finish: () => req.end(body.subarray(cut)) };
+}
+const upUrl = (project, session) => `/api/projects/${encodeURIComponent(project)}/upload${session === undefined ? '' : `?session=${encodeURIComponent(session)}`}`;
+const upPost = (c, cookie, project, body, { session, type = 'image/jpeg', headers = {} } = {}) =>
+  c.req('POST', upUrl(project, session), { cookie, raw: body, headers: type === null ? headers : { 'Content-Type': type, ...headers } });
+const mkAgent = async (c, cookie, name, harness, project = 'alpha') => assert.equal((await c.req('POST', '/api/sessions', { cookie, body: { name, project, harness } })).status, 201);
+const tmuxCalls = (c, ...cmds) => c.calls().filter((x) => cmds.includes(x.argv[0]));
+
+test('upload: auth and CSRF are required, GET is 405; nothing is written', () => withUpload(async (c, dirs, cookie) => {
+  assert.equal((await upPost(c, undefined, 'alpha', JPG)).status, 401);
+  assert.equal((await upPost(c, 'pc_sid=forged', 'alpha', JPG)).status, 401);
+  assert.equal((await c.req('POST', upUrl('alpha'), { cookie, raw: JPG, pc: false, headers: { 'Content-Type': 'image/jpeg' } })).status, 403);
+  assert.equal((await c.req('POST', upUrl('alpha'), { cookie, raw: JPG, headers: { 'Content-Type': 'image/jpeg', Origin: 'https://evil.example' } })).status, 403);
+  assert.equal((await c.req('GET', upUrl('alpha'), { cookie })).status, 405);
+  assert.equal((await c.req('PUT', upUrl('alpha'), { cookie, raw: JPG, headers: { 'Content-Type': 'image/jpeg' } })).status, 405);
+  assert.equal(fs.existsSync(path.join(dirs.alpha, '.fcode')), false);
+  assert.equal(c.calls().length, 0);
+  // the paired device with its Bearer token works too (the app's way)
+  const { token } = await c.login();
+  const r = await c.req('POST', upUrl('alpha'), { raw: JPG, headers: { 'Content-Type': 'image/jpeg', Authorization: `Bearer ${token}` } });
+  assert.equal(r.status, 200, r.text);
+}));
+
+test('upload: an unknown project, a name that is not a project, a bad escape and a project whose folder is gone are 404 no_project', () => withUpload(async (c, dirs, cookie) => {
+  for (const p of ['nope', '__proto__', 'constructor', 'gone', 'ALPHA']) {
+    const r = await upPost(c, cookie, p, JPG);
+    assert.equal(r.status, 404, p);
+    assert.deepEqual(r.json, { error: 'no_project' }, p);
+  }
+  const bad = await c.req('POST', '/api/projects/%zz/upload', { cookie, raw: JPG, headers: { 'Content-Type': 'image/jpeg' } });
+  assert.deepEqual([bad.status, bad.json], [404, { error: 'no_project' }]);
+  assert.equal(fs.existsSync(path.join(dirs.alpha, '.fcode')), false);
+  assert.equal(fs.existsSync(path.join(dirs.alpha, '..', 'gone')), false); // the missing folder is not created
+}));
+
+test('upload: the 64 KB JSON limit does not apply; exactly 10 MiB is stored, 10 MiB + 1 is 413 too_big (Content-Length) and nothing is written', () => withUpload(async (c, dirs, cookie) => {
+  const big = await upPost(c, cookie, 'alpha', sized(JPG, UPLOAD_MAX));
+  assert.equal(big.status, 200, big.text);
+  assert.equal(fs.statSync(big.json.path).size, UPLOAD_MAX);
+  fs.rmSync(path.join(dirs.alpha, '.fcode'), { recursive: true, force: true });
+  // 10 MiB + 1 declared: refused on the Content-Length alone, so a few bytes of the body are enough (the server closes the connection after the
+  // 413; a client that is still writing megabytes may lose the answer to the reset on some systems, see the "refused upload closes" test)
+  const over = partialUpload(c, cookie, 'alpha', JPG, { length: UPLOAD_MAX + 1 });
+  const o = await over.done; over.req.destroy();
+  assert.deepEqual([o.status, o.json], [413, { error: 'too_big' }]);
+  assert.equal(fs.existsSync(path.join(dirs.alpha, '.fcode')), false);
+  // the same server still answers (the connection was not left in a bad state)
+  assert.equal((await upPost(c, cookie, 'alpha', JPG)).status, 200);
+}));
+
+test('upload: a chunked body over 10 MiB is answered 413 while it is still being sent (the stream is not read to its end), nothing is written', () => withUpload(async (c, dirs, cookie) => {
+  // the client never ends the body: only an answer sent while it is still writing, then a closed connection, can end this
+  const r = await blast(c, [...upHead(cookie, 'alpha'), 'Transfer-Encoding: chunked'], { chunked: true });
+  assert.equal(r.timedOut, false, 'the server kept reading (or waiting for) the body');
+  assertRefused(r, 413, UPLOAD_MAX + (1 << 20)); // the cap, and at most 1 MiB more that was already on its way
+  assert.equal(fs.existsSync(path.join(dirs.alpha, '.fcode')), false);
+}));
+
+test('upload: a declared Content-Length over 10 MiB is 413 at once, before any of the body is read', () => withUpload(async (c, dirs, cookie) => {
+  const r = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { req.destroy(); reject(new Error('no answer: the server waits for the body')); }, 8000);
+    const req = http.request({ host: '127.0.0.1', port: c.port, method: 'POST', path: upUrl('alpha'),
+      headers: { 'X-PC': '1', Cookie: cookie, 'Content-Type': 'image/jpeg', 'Content-Length': UPLOAD_MAX + 1 } }, (res) => {
+      const chunks = [];
+      res.on('data', (d) => chunks.push(d));
+      res.on('end', () => { clearTimeout(timer); resolve({ status: res.statusCode, json: JSON.parse(Buffer.concat(chunks).toString()) }); req.destroy(); });
+    });
+    req.on('error', (e) => { if (e.code !== 'ECONNRESET') { clearTimeout(timer); reject(e); } });
+    req.write(JPG); // a few bytes only; the rest never comes
+  });
+  assert.deepEqual([r.status, r.json], [413, { error: 'too_big' }]);
+  assert.equal(fs.existsSync(path.join(dirs.alpha, '.fcode')), false);
+}));
+
+test('upload: bad_type for a wrong or missing Content-Type, and for magic bytes that do not match it; an empty body is 400 empty', () => withUpload(async (c, dirs, cookie) => {
+  for (const type of ['text/plain', 'application/json', 'image/gif', 'image/jpg', 'image/webp', 'image/heic', 'multipart/form-data', '', null]) {
+    const r = await upPost(c, cookie, 'alpha', JPG, { type });
+    assert.deepEqual([r.status, r.json], [415, { error: 'bad_type' }], String(type));
+  }
+  const magic = [
+    ['image/jpeg', PNG], ['image/png', JPG], ['image/jpeg', Buffer.from('GIF89a......')], ['image/png', Buffer.from('<html>not an image</html>')],
+    ['image/jpeg', Buffer.from([0xff, 0xd8])], ['image/png', PNG.subarray(0, 7)], ['image/jpeg', Buffer.from([0, 0xff, 0xd8, 0xff])],
+  ];
+  for (const [type, body] of magic) {
+    const r = await upPost(c, cookie, 'alpha', body, { type });
+    assert.deepEqual([r.status, r.json], [415, { error: 'bad_type' }], `${type} ${body.subarray(0, 4).toString('hex')}`);
+  }
+  for (const type of ['image/jpeg', 'image/png']) {
+    const r = await upPost(c, cookie, 'alpha', Buffer.alloc(0), { type });
+    assert.deepEqual([r.status, r.json], [400, { error: 'empty' }], type);
+  }
+  assert.equal(fs.existsSync(path.join(dirs.alpha, '.fcode')), false); // none of them wrote anything
+  // the type is compared without case and parameters
+  assert.equal((await upPost(c, cookie, 'alpha', JPG, { type: 'IMAGE/JPEG; charset=binary' })).status, 200);
+}));
+
+test('upload: a session that is not live, not of this project or not a name is 404 no_session BEFORE any file or folder is written', () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 'other', 'claude', 'beta');
+  for (const s of ['ghost', 'other', '', 'Bad Name', '../x', 'a'.repeat(40)]) {
+    const r = await upPost(c, cookie, 'alpha', JPG, { session: s });
+    assert.deepEqual([r.status, r.json], [404, { error: 'no_session' }], JSON.stringify(s));
+  }
+  assert.equal(fs.existsSync(path.join(dirs.alpha, '.fcode')), false);
+  assert.equal(fs.existsSync(path.join(dirs.beta, '.fcode')), false);
+  assert.deepEqual(tmuxCalls(c, 'load-buffer', 'paste-buffer', 'send-keys'), []);
+  // a git work tree is not touched either: no exclude line before the session is known
+  gitIn(dirs.alpha, 'init', '-q');
+  assert.equal((await upPost(c, cookie, 'alpha', JPG, { session: 'ghost' })).status, 404);
+  assert.equal(fs.existsSync(path.join(dirs.alpha, '.git', 'info', 'exclude')) && fs.readFileSync(path.join(dirs.alpha, '.git', 'info', 'exclude'), 'utf8').includes('.fcode'), false);
+  assert.equal(fs.existsSync(path.join(dirs.alpha, '.fcode')), false);
+}));
+
+test('upload: file name, folder 0700, file 0600 and opened O_EXCL (no overwrite) with O_NOFOLLOW; the answer holds the absolute path; .jpg or .png by type', () => withUpload(async (c, dirs, cookie) => {
+  const opened = []; const orig = fs.promises.open;
+  fs.promises.open = (f, flags, mode) => { if (String(f).includes('.fcode')) opened.push([String(f), flags, mode]); return orig.call(fs.promises, f, flags, mode); };
+  let a, b;
+  try { a = await upPost(c, cookie, 'alpha', JPG); b = await upPost(c, cookie, 'alpha', PNG, { type: 'image/png' }); } finally { fs.promises.open = orig; }
+  assert.deepEqual([a.status, b.status], [200, 200], a.text + b.text);
+  const up = path.join(dirs.alpha, '.fcode', 'uploads');
+  for (const [r, ext, body] of [[a, 'jpg', JPG], [b, 'png', PNG]]) {
+    assert.deepEqual(Object.keys(r.json), ['path', 'attached']);
+    assert.equal(r.json.attached, false); // no session given
+    assert.ok(path.isAbsolute(r.json.path));
+    assert.equal(path.dirname(r.json.path), up);
+    assert.match(path.basename(r.json.path), NAME_UP);
+    assert.equal(path.extname(r.json.path), `.${ext}`);
+    assert.deepEqual(fs.readFileSync(r.json.path), body);
+  }
+  assert.notEqual(a.json.path, b.json.path);
+  const K = fs.constants, want = K.O_WRONLY | K.O_CREAT | K.O_EXCL | (K.O_NOFOLLOW ?? 0); // never overwrite, never follow a link at the file name
+  assert.deepEqual(opened.map(([, flags, mode]) => [flags, mode]), [[want, 0o600], [want, 0o600]]);
+  const stamp = path.basename(a.json.path).slice(0, 15); // YYYYMMDD-HHMMSS, UTC, now
+  assert.ok(Math.abs(Date.parse(`${stamp.slice(0, 4)}-${stamp.slice(4, 6)}-${stamp.slice(6, 8)}T${stamp.slice(9, 11)}:${stamp.slice(11, 13)}:${stamp.slice(13, 15)}Z`) - Date.now()) < 60e3, stamp);
+  if (process.platform !== 'win32') {
+    assert.equal(fs.statSync(a.json.path).mode & 0o777, 0o600);
+    assert.equal(fs.statSync(up).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(path.join(dirs.alpha, '.fcode')).mode & 0o777, 0o700);
+  }
+  assert.deepEqual(fs.readdirSync(dirs.alpha), ['.fcode']); // nothing else in the project
+}));
+
+test('upload: a symlinked .fcode is not followed (500 storage, nothing written through it)', { skip: process.platform === 'win32' && 'symlinks need rights' }, () => withUpload(async (c, dirs, cookie) => {
+  const elsewhere = path.join(dirs.beta, 'target'); fs.mkdirSync(elsewhere);
+  fs.symlinkSync(elsewhere, path.join(dirs.alpha, '.fcode'));
+  const r = await upPost(c, cookie, 'alpha', JPG);
+  assert.deepEqual([r.status, r.json], [500, { error: 'storage' }]);
+  assert.deepEqual(fs.readdirSync(elsewhere), []);
+  fs.unlinkSync(path.join(dirs.alpha, '.fcode')); fs.mkdirSync(path.join(dirs.alpha, '.fcode'));
+  fs.symlinkSync(elsewhere, path.join(dirs.alpha, '.fcode', 'uploads')); // the same for the uploads folder itself
+  assert.deepEqual([(await upPost(c, cookie, 'alpha', JPG)).status], [500]);
+  assert.deepEqual(fs.readdirSync(elsewhere), []);
+}));
+
+test('upload: /.fcode/ goes into the work tree\'s info/exclude exactly once across uploads; .gitignore is untouched; git status stays clean', () => withUpload(async (c, dirs, cookie) => {
+  assert.equal(gitIn(dirs.alpha, 'init', '-q').status, 0);
+  const ignore = Buffer.from('node_modules/\r\n*.log');
+  fs.writeFileSync(path.join(dirs.alpha, '.gitignore'), ignore);
+  gitIn(dirs.alpha, 'add', '.gitignore'); gitIn(dirs.alpha, 'commit', '-q', '-m', 'init');
+  const ex = path.join(dirs.alpha, '.git', 'info', 'exclude');
+  fs.writeFileSync(ex, '# mine\n*.swp'); // no final newline: it must be kept and the new line must start on its own line
+  assert.equal((await upPost(c, cookie, 'alpha', JPG)).status, 200);
+  assert.equal((await upPost(c, cookie, 'alpha', PNG, { type: 'image/png' })).status, 200);
+  assert.equal(fs.readFileSync(ex, 'utf8'), '# mine\n*.swp\n/.fcode/\n');
+  assert.deepEqual(fs.readFileSync(path.join(dirs.alpha, '.gitignore')), ignore);
+  assert.equal(gitIn(dirs.alpha, 'status', '--porcelain').stdout, '');
+  // two uploads at once still add one line; a missing exclude file (and info/ dir) is created
+  fs.rmSync(path.join(dirs.beta, '.git'), { recursive: true, force: true });
+  assert.equal(gitIn(dirs.beta, 'init', '-q').status, 0);
+  fs.rmSync(path.join(dirs.beta, '.git', 'info'), { recursive: true, force: true });
+  const rs = [...await Promise.all([1, 2].map(() => upPost(c, cookie, 'beta', JPG))), ...await Promise.all([1, 2].map(() => upPost(c, cookie, 'beta', JPG)))]; // two at a time: that is all the server admits
+  assert.deepEqual(rs.map((r) => r.status), [200, 200, 200, 200]);
+  assert.equal(fs.readFileSync(path.join(dirs.beta, '.git', 'info', 'exclude'), 'utf8'), '/.fcode/\n');
+  assert.equal(gitIn(dirs.beta, 'status', '--porcelain').stdout, '');
+}));
+
+test('upload: in a linked work tree the line goes where `git rev-parse --git-path info/exclude` says', () => withUpload(async (c, dirs, cookie) => {
+  assert.equal(gitIn(dirs.alpha, 'init', '-q').status, 0);
+  assert.equal(gitIn(dirs.alpha, 'commit', '-q', '--allow-empty', '-m', 'init').status, 0);
+  assert.equal(gitIn(dirs.alpha, 'worktree', 'add', '-q', '-b', 'wt1', dirs.spaced).status, 0); // the project folder 'spaced' becomes a linked work tree
+  assert.equal((await upPost(c, cookie, 'spaced', JPG)).status, 200);
+  const common = path.join(dirs.alpha, '.git', 'info', 'exclude');
+  assert.equal(fs.readFileSync(common, 'utf8').split('\n').filter((l) => l === '/.fcode/').length, 1);
+  assert.equal(gitIn(dirs.spaced, 'status', '--porcelain').stdout, '');
+}));
+
+test('upload: a folder that is not a git work tree works and gets no .git; git being missing does not fail the upload', () => withUpload(async (c, dirs, cookie) => {
+  const r = await upPost(c, cookie, 'alpha', JPG);
+  assert.equal(r.status, 200, r.text);
+  assert.equal(fs.existsSync(path.join(dirs.alpha, '.git')), false);
+  assert.equal(fs.existsSync(path.join(dirs.alpha, '.gitignore')), false);
+}));
+test('upload: git missing on the machine does not fail the upload', () => withUpload(async (c, dirs, cookie) => {
+  assert.equal((await upPost(c, cookie, 'alpha', JPG)).status, 200);
+}, { git: ['this-git-does-not-exist'] }));
+
+test('upload: each upload deletes only regular files named like an upload and older than 7 days', () => withUpload(async (c, dirs, cookie) => {
+  const up = path.join(dirs.alpha, '.fcode', 'uploads'); fs.mkdirSync(up, { recursive: true });
+  const age = (name, days, body = 'x') => { const f = path.join(up, name); fs.writeFileSync(f, body); const t = (Date.now() - days * 86400e3) / 1000; fs.utimesSync(f, t, t); return f; };
+  const old1 = age('20260101-010101-abcdef.jpg', 8), old2 = age('20260101-010101-012345.png', 30);
+  const young = age('20260101-010101-aaaaaa.jpg', 6.9), edge = age('20260101-010101-bbbbbb.png', 0);
+  const keep = [age('notes.txt', 40), age('old.jpg', 40), age('20260101-010101-FEDCBA.jpg', 40), age('20260101-010101-abcdef.gif', 40), age('20260101-010101-abcdef.jpg.bak', 40), age('.hidden.jpg', 40)];
+  fs.mkdirSync(path.join(up, '20200101-000000-abcdef.jpg')); // a folder named like an upload
+  fs.utimesSync(path.join(up, '20200101-000000-abcdef.jpg'), 1, 1);
+  if (process.platform !== 'win32') { // a symlink named like an upload, old: removing it is not our job either
+    fs.symlinkSync(keep[0], path.join(up, '20200101-000000-fedcba.jpg'));
+    fs.lutimesSync(path.join(up, '20200101-000000-fedcba.jpg'), 1, 1);
+  }
+  const r = await upPost(c, cookie, 'alpha', JPG);
+  assert.equal(r.status, 200);
+  assert.equal(fs.existsSync(old1) || fs.existsSync(old2), false);
+  for (const f of [young, edge, r.json.path, ...keep, path.join(up, '20200101-000000-abcdef.jpg')]) assert.ok(fs.existsSync(f), f);
+  if (process.platform !== 'win32') assert.ok(fs.lstatSync(path.join(up, '20200101-000000-fedcba.jpg')).isSymbolicLink());
+}));
+
+test('upload: attach puts the path alone in the input, no Enter: claude, omp, shell and a session with no agent by bracketed paste; codex by one send-keys -l', () => withUpload(async (c, dirs, cookie) => {
+  for (const h of ['claude', 'omp', 'codex', 'shell']) await mkAgent(c, cookie, `s-${h}`, h);
+  // a session made outside the app has no agent recorded
+  const state = path.join(process.env.FAKE_TMUX_DIR, 'state.json');
+  const st = JSON.parse(fs.readFileSync(state, 'utf8'));
+  st.sessions['s-none'] = { created: 1700000000, dir: dirs.alpha, cmd: 'x', opts: { '@pc_project': 'alpha' } };
+  fs.writeFileSync(state, JSON.stringify(st));
+  for (const h of ['claude', 'omp', 'codex', 'shell', 'none']) {
+    const before = c.calls().length;
+    const r = await upPost(c, cookie, 'alpha', JPG, { session: `s-${h}` });
+    assert.equal(r.status, 200, r.text);
+    assert.equal(r.json.attached, true, h);
+    const calls = c.calls().slice(before).map((x) => x.argv[0] === 'load-buffer' ? { ...x, text: Buffer.from(x.stdin, 'base64').toString() } : x)
+      .filter((x) => x.argv[0] !== 'list-sessions');
+    const keys = calls.flatMap((x) => x.argv);
+    assert.ok(!keys.includes('Enter'), `${h}: Enter was sent`);
+    assert.ok(!calls.some((x) => x.argv[0] === 'send-keys' && x.argv.some((a) => /^(C-m|KPEnter)$/.test(a))), h);
+    if (h === 'codex') {
+      assert.deepEqual(calls.map((x) => x.argv), [['send-keys', '-t', '=s-codex:', '-l', '--', r.json.path]]);
+    } else {
+      assert.deepEqual(calls.map((x) => x.argv), [['load-buffer', '-b', 'pc', '-'], ['paste-buffer', '-p', '-d', '-b', 'pc', '-t', `=s-${h}:`]]);
+      assert.equal(calls[0].text, r.json.path); // the path and nothing else: no newline, no quotes
+    }
+  }
+}));
+
+test('upload: without a session nothing goes to tmux and attached is false', () => withUpload(async (c, dirs, cookie) => {
+  const r = await upPost(c, cookie, 'alpha', JPG);
+  assert.equal(r.json.attached, false);
+  assert.equal(c.calls().length, 0);
+}));
+
+test('upload: a path with a space is saved but not attached (attached false, no tmux input call)', () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 'sp-claude', 'claude', 'spaced');
+  await mkAgent(c, cookie, 'sp-codex', 'codex', 'spaced');
+  for (const s of ['sp-claude', 'sp-codex']) {
+    const r = await upPost(c, cookie, 'spaced', JPG, { session: s });
+    assert.equal(r.status, 200, r.text);
+    assert.equal(r.json.attached, false, s);
+    assert.ok(r.json.path.includes('with space'));
+    assert.ok(fs.existsSync(r.json.path));
+  }
+  assert.deepEqual(tmuxCalls(c, 'load-buffer', 'paste-buffer', 'send-keys'), []);
+}));
+
+test('upload: when tmux refuses the input the file is still saved and attached is false', () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 'dies', 'claude');
+  // the session is listed, then gone when the paste runs: make tmux's paste fail by deleting the session from the fake's table after the list call
+  const state = path.join(process.env.FAKE_TMUX_DIR, 'state.json');
+  const orig = fs.promises.open;
+  fs.promises.open = async (...a) => { const fh = await orig.apply(fs.promises, a); if (String(a[0]).includes('.fcode')) { fs.writeFileSync(state, JSON.stringify({ sessions: {} })); } return fh; };
+  let r;
+  try { r = await upPost(c, cookie, 'alpha', JPG, { session: 'dies' }); } finally { fs.promises.open = orig; }
+  assert.equal(r.status, 200, r.text);
+  assert.equal(r.json.attached, false);
+  assert.ok(fs.existsSync(r.json.path));
+}));
+
+test('upload: the other routes are unchanged (/api/send still types a short line and pastes a long one, and sends Enter only when asked)', () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 'w', 'shell');
+  assert.equal((await c.req('POST', '/api/send/w', { cookie, body: { text: 'ls', enter: true } })).status, 200);
+  assert.equal((await c.req('POST', '/api/send/w', { cookie, body: { text: 'x'.repeat(600), enter: false } })).status, 200);
+  const calls = tmuxCalls(c, 'send-keys', 'load-buffer', 'paste-buffer').map((x) => x.argv);
+  assert.deepEqual(calls, [['send-keys', '-t', '=w:', '-l', '--', 'ls'], ['send-keys', '-t', '=w:', 'Enter'], ['load-buffer', '-b', 'pc', '-'], ['paste-buffer', '-p', '-d', '-b', 'pc', '-t', '=w:']]);
+}));
+
+// ---- 1.3.3 rework r2: request timeout, admission, session identity, exclude line and links, sweep ----
+test('upload: a body slower than the JSON bound still stores (the request timeout is long); the same slowness on a JSON route is cut', () => withUpload(async (c, dirs, cookie) => {
+  // test-only bounds through createApp: bodyMs 300 (15 s in production), uploadRequestMs 2000 (120 s); the server checks every 500 ms here
+  const p = partialUpload(c, cookie, 'alpha', JPG);
+  await sleep(1200); // four times the JSON bound, inside the request timeout
+  p.finish();
+  const r = await p.done;
+  assert.equal(r.status, 200, JSON.stringify(r));
+  assert.ok(fs.existsSync(r.json.path));
+  await mkAgent(c, cookie, 'w', 'shell');
+  const body = Buffer.from(JSON.stringify({ text: 'hi', enter: false }));
+  const slowJson = (hold) => new Promise((resolve) => {
+    const req = http.request({ host: '127.0.0.1', port: c.port, method: 'POST', path: '/api/send/w',
+      headers: { 'X-PC': '1', Cookie: cookie, 'Content-Type': 'application/json', 'Content-Length': body.length } }, (res) => { res.resume(); res.on('end', () => resolve({ status: res.statusCode })); });
+    req.on('error', (e) => resolve({ error: e.code || e.message }));
+    req.write(body.subarray(0, 5));
+    setTimeout(() => req.end(body.subarray(5)), hold);
+  });
+  const cut = await slowJson(1200);
+  assert.equal(cut.status, undefined, 'a JSON body slower than the bound got an answer');
+  assert.ok(cut.error, 'the connection is cut');
+  assert.equal((await slowJson(0)).status, 200); // a quick one is fine
+}, { uploadRequestMs: 2000, bodyMs: 300 }));
+
+test('upload: at most 2 in flight: the third is 429 busy before it reads anything; slots come back after a success, an abort and every error path', () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 's', 'claude');
+  const listed = () => tmuxCalls(c, 'list-sessions').length;
+  const base = listed();
+  const A = partialUpload(c, cookie, 'alpha', JPG, { session: 's' }), B = partialUpload(c, cookie, 'alpha', JPG, { session: 's' });
+  assert.ok(await until(() => listed() >= base + 2), 'both are admitted and wait for their body');
+  const third = await upPost(c, cookie, 'alpha', JPG);
+  assert.deepEqual([third.status, third.json], [429, { error: 'busy' }]);
+  assert.equal(fs.existsSync(path.join(dirs.alpha, '.fcode')), false, 'the refused one wrote nothing');
+  A.req.destroy(); // a client that goes away gives its slot back
+  assert.ok(await until(async () => (await upPost(c, cookie, 'beta', JPG)).status === 200), 'the aborted upload kept its slot');
+  B.finish();
+  const b = await B.done;
+  assert.deepEqual([b.status, b.json.attached], [200, true]);
+  const big = partialUpload(c, cookie, 'alpha', JPG, { length: UPLOAD_MAX + 1 });
+  const errs = [
+    (await upPost(c, cookie, 'alpha', JPG, { type: 'text/plain' })).status, (await upPost(c, cookie, 'alpha', Buffer.alloc(0))).status,
+    (await upPost(c, cookie, 'alpha', JPG, { session: 'ghost' })).status, (await upPost(c, cookie, 'nope', JPG)).status,
+    (await upPost(c, cookie, 'alpha', PNG)).status, (await big.done).status,
+  ];
+  big.req.destroy();
+  assert.deepEqual(errs, [415, 400, 404, 404, 415, 413]); // six errors in a row: more than the two slots
+  for (let i = 0; i < 3; i++) assert.equal((await upPost(c, cookie, 'alpha', JPG)).status, 200, `after the errors, upload ${i}`);
+}));
+
+test('upload: a session replaced while the body is coming in gets nothing in its input (attached false, file kept); the same session still gets it', () => withUpload(async (c, dirs, cookie) => {
+  const state = path.join(process.env.FAKE_TMUX_DIR, 'state.json');
+  const kill = async (n) => assert.ok((await c.req('DELETE', `/api/sessions/${n}`, { cookie })).status < 300);
+  const modes = {
+    same: async () => {},
+    gone: (n) => kill(n),
+    project: async (n) => { await kill(n); await mkAgent(c, cookie, n, 'claude', 'beta'); }, // the name now belongs to another project's session
+    harness: async (n) => { await kill(n); await mkAgent(c, cookie, n, 'shell', 'alpha'); }, // same project, another agent kind
+    created: async (n) => { const st = JSON.parse(fs.readFileSync(state, 'utf8')); st.sessions[n].created += 99; fs.writeFileSync(state, JSON.stringify(st)); }, // a new tmux session of the same name
+  };
+  for (const [mode, replace] of Object.entries(modes)) {
+    const name = `rep-${mode}`;
+    await mkAgent(c, cookie, name, 'claude');
+    const before = tmuxCalls(c, 'list-sessions').length;
+    const p = partialUpload(c, cookie, 'alpha', JPG, { session: name });
+    assert.ok(await until(() => tmuxCalls(c, 'list-sessions').length > before), `${mode}: admitted`);
+    await replace(name);
+    const calls = c.calls().length;
+    p.finish();
+    const r = await p.done;
+    assert.equal(r.status, 200, `${mode} ${r.text}`);
+    assert.ok(fs.existsSync(r.json.path), mode);
+    assert.equal(r.json.attached, mode === 'same', mode);
+    const input = c.calls().slice(calls).filter((x) => ['load-buffer', 'paste-buffer', 'send-keys'].includes(x.argv[0]));
+    assert.equal(input.length > 0, mode === 'same', `${mode}: tmux input calls ${JSON.stringify(input.map((x) => x.argv))}`);
+  }
+}));
+
+test('upload: a device revoked while its body is coming in gets 401 and nothing is written', () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 's', 'claude');
+  const before = tmuxCalls(c, 'list-sessions').length;
+  const p = partialUpload(c, cookie, 'alpha', JPG, { session: 's' });
+  assert.ok(await until(() => tmuxCalls(c, 'list-sessions').length > before), 'admitted');
+  assert.equal((await c.req('POST', '/api/logout', { cookie })).status, 200); // this device is revoked now
+  p.finish();
+  const r = await p.done;
+  assert.deepEqual([r.status, r.json], [401, { error: 'unauthorized' }]);
+  assert.equal(fs.existsSync(path.join(dirs.alpha, '.fcode')), false);
+  assert.deepEqual(tmuxCalls(c, 'load-buffer', 'paste-buffer', 'send-keys'), []);
+}));
+
+test('upload: a project inside a bigger repository is hidden too: the exclude line carries the folder prefix (glob characters escaped) and git status stays clean', () => withUpload(async (c, dirs, cookie, base) => {
+  assert.equal(gitIn(base, 'init', '-q').status, 0);
+  fs.writeFileSync(path.join(base, 'README'), 'x'); gitIn(base, 'add', 'README'); gitIn(base, 'commit', '-q', '-m', 'init');
+  for (const p of ['nested', 'alpha', 'nested', 'alpha']) assert.equal((await upPost(c, cookie, p, JPG)).status, 200, p);
+  const lines = fs.readFileSync(path.join(base, '.git', 'info', 'exclude'), 'utf8').split('\n').filter((l) => l.includes('.fcode'));
+  assert.deepEqual(lines.sort(), ['/a\\[1]/b/.fcode/', '/alpha/.fcode/']); // once each
+  assert.equal(gitIn(base, 'status', '--porcelain').stdout, '');
+}));
+
+test('upload: the exclude file is opened to append without following a link (O_WRONLY|O_APPEND|O_CREAT|O_NOFOLLOW)', () => withUpload(async (c, dirs, cookie) => {
+  assert.equal(gitIn(dirs.alpha, 'init', '-q').status, 0);
+  const opened = []; const orig = fs.promises.open;
+  fs.promises.open = (f, flags, mode) => { if (String(f).endsWith('exclude')) opened.push([flags, mode]); return orig.call(fs.promises, f, flags, mode); };
+  try { assert.equal((await upPost(c, cookie, 'alpha', JPG)).status, 200); } finally { fs.promises.open = orig; }
+  const K = fs.constants;
+  assert.deepEqual(opened, [[K.O_WRONLY | K.O_APPEND | K.O_CREAT | (K.O_NOFOLLOW ?? 0), 0o644]]);
+}));
+
+test('upload: an info/exclude or info folder that is a symlink is never written through; the upload still succeeds', { skip: process.platform === 'win32' && 'symlinks need rights' }, () => withUpload(async (c, dirs, cookie) => {
+  assert.equal(gitIn(dirs.alpha, 'init', '-q').status, 0);
+  const target = path.join(dirs.beta, 'target'); fs.writeFileSync(target, 'keep\n');
+  const ex = path.join(dirs.alpha, '.git', 'info', 'exclude');
+  fs.rmSync(ex, { force: true }); fs.symlinkSync(target, ex);
+  const a = await upPost(c, cookie, 'alpha', JPG);
+  assert.equal(a.status, 200, a.text);
+  assert.ok(fs.existsSync(a.json.path));
+  assert.equal(fs.readFileSync(target, 'utf8'), 'keep\n'); // the link target is untouched
+  assert.ok(fs.lstatSync(ex).isSymbolicLink());
+  fs.unlinkSync(ex); fs.rmSync(path.join(dirs.alpha, '.git', 'info'), { recursive: true });
+  const elsewhere = path.join(dirs.beta, 'elsewhere'); fs.mkdirSync(elsewhere); fs.writeFileSync(path.join(elsewhere, 'exclude'), 'keep\n');
+  fs.symlinkSync(elsewhere, path.join(dirs.alpha, '.git', 'info'));
+  const b = await upPost(c, cookie, 'alpha', JPG);
+  assert.equal(b.status, 200, b.text);
+  assert.deepEqual(fs.readdirSync(elsewhere), ['exclude']);
+  assert.equal(fs.readFileSync(path.join(elsewhere, 'exclude'), 'utf8'), 'keep\n');
+}));
+
+test('upload: the sweep goes on after one file fails to be deleted', () => withUpload(async (c, dirs, cookie) => {
+  const up = path.join(dirs.alpha, '.fcode', 'uploads'); fs.mkdirSync(up, { recursive: true });
+  const old = ['20260101-010101-000001.jpg', '20260101-010101-000002.jpg', '20260101-010101-000003.png'].map((n) => {
+    const f = path.join(up, n); fs.writeFileSync(f, 'x'); const t = (Date.now() - 30 * 86400e3) / 1000; fs.utimesSync(f, t, t); return f;
+  });
+  const orig = fs.promises.unlink; let failed = 0;
+  fs.promises.unlink = (f) => (failed++ === 0 ? Promise.reject(Object.assign(new Error('busy'), { code: 'EBUSY' })) : orig.call(fs.promises, f));
+  let r;
+  try { r = await upPost(c, cookie, 'alpha', JPG); } finally { fs.promises.unlink = orig; }
+  assert.equal(r.status, 200);
+  assert.equal(old.filter((f) => fs.existsSync(f)).length, 1, 'only the one that failed is left'); // whichever the listing gave first
+}));
+
+test('upload: a git that hangs is killed after 10 s and the upload goes on', () => withUpload(async (c, dirs, cookie) => {
+  const t0 = Date.now();
+  const r = await upPost(c, cookie, 'alpha', JPG);
+  const took = Date.now() - t0;
+  assert.equal(r.status, 200, r.text);
+  assert.ok(took >= 9500 && took < 25000, `took ${took} ms`);
+}, { git: [process.execPath, '-e', 'setTimeout(() => {}, 60000)', '--'] })); // the arguments the server adds come after `--`: they are the script's, not node's
+
+// ---- 1.3.3 rework r3: short by default, long only when admitted; the client-gone check; refused uploads close the connection ----
+const upHead = (cookie, project, { session, type = 'image/jpeg', method = 'POST', pc = true, length } = {}) => [
+  `${method} ${upUrl(project, session)} HTTP/1.1`, 'Host: x', ...(pc ? ['X-PC: 1'] : []), ...(cookie ? [`Cookie: ${cookie}`] : []),
+  ...(type ? [`Content-Type: ${type}`] : []), ...(length ? [`Content-Length: ${length}`] : []),
+];
+// A raw client: the head, then `size` bytes (64 KiB) of body at a time (Content-Length or chunked) until the server closes the connection or `max`
+// bytes are out. read = what the server's side of that socket really took in (its bytesRead): a server that drains the rest of a refused body shows it here.
+function blast(c, head, { chunked = false, max = 48 << 20, size = 65536 } = {}) {
+  const socks = []; const onConn = (s) => socks.push(s);
+  c.app.server.on('connection', onConn);
+  return new Promise((resolve) => {
+    const s = net.connect(c.port, '127.0.0.1');
+    let sent = 0, text = '', timedOut = false;
+    const piece = Buffer.alloc(size, 1);
+    const frame = chunked ? Buffer.concat([Buffer.from(`${size.toString(16)}\r\n`), piece, Buffer.from('\r\n')]) : piece;
+    const pump = () => {
+      for (let i = 0; i < 4 && !s.destroyed && sent < max; i++) { sent += piece.length; if (!s.write(frame)) return void s.once('drain', () => setTimeout(pump, 1)); }
+      if (!s.destroyed && sent < max) setTimeout(pump, 1);
+    };
+    const timer = setTimeout(() => { timedOut = true; s.destroy(); }, 8000);
+    s.on('connect', () => { s.write(`${head.join('\r\n')}\r\n\r\n`); pump(); });
+    s.on('data', (d) => { text += d; });
+    s.on('error', () => {});
+    s.on('close', () => {
+      clearTimeout(timer); c.app.server.off('connection', onConn);
+      resolve({ sent, text, timedOut, status: Number(/^HTTP\/1\.1 (\d+)/.exec(text)?.[1]) || null, read: socks[0]?.bytesRead ?? 0 });
+    });
+  });
+}
+// a refused upload whose client keeps writing megabytes: the server closes the connection and took in at most `maxRead` bytes. The reset that
+// follows the close can overtake the answer for such a client (measured on Linux and Windows loopback), so the answer is checked only when it
+// came; the guaranteed answer is tested with a client that has not gone beyond its first bytes (the "gets its answer" test).
+function assertRefused(r, status, maxRead) {
+  assert.equal(r.timedOut, false, 'the connection was not closed');
+  assert.ok(r.read <= maxRead, `the server took in ${r.read} bytes of a refused upload (client sent ${r.sent})`);
+  if (r.status === null) return;
+  assert.equal(r.status, status, r.text.slice(0, 200));
+  assert.match(r.text, /\r\nconnection: close\r\n/i);
+}
+
+test('upload: every refused upload (429, 413 mid-stream, 401, 403, 404, 415, 405) is answered with Connection: close and the connection is cut; its unread body is not drained', () => withUpload(async (c, dirs, cookie) => {
+  const big = 50e6, small = 1 << 20; // the server takes in about 64 KiB of a refused body here; 1 MiB is far below the 48 MiB the client has ready
+  const A = partialUpload(c, cookie, 'alpha', JPG), B = partialUpload(c, cookie, 'alpha', JPG);
+  await sleep(300); // both admitted: the next one is 429
+  assertRefused(await blast(c, upHead(cookie, 'alpha', { length: big })), 429, small);
+  A.req.destroy(); B.req.destroy();
+  assert.ok(await until(async () => (await upPost(c, cookie, 'beta', JPG)).status === 200), 'slots come back');
+  assertRefused(await blast(c, [...upHead(cookie, 'alpha'), 'Transfer-Encoding: chunked'], { chunked: true }), 413, UPLOAD_MAX + small);
+  assertRefused(await blast(c, upHead(undefined, 'alpha', { length: big })), 401, small);
+  assertRefused(await blast(c, upHead(cookie, 'alpha', { length: big, pc: false })), 403, small);
+  assertRefused(await blast(c, upHead(cookie, 'nope', { length: big })), 404, small);
+  assertRefused(await blast(c, upHead(cookie, 'alpha', { length: big, session: 'ghost' })), 404, small);
+  assertRefused(await blast(c, upHead(cookie, 'alpha', { length: big, type: 'text/plain' })), 415, small);
+  assertRefused(await blast(c, upHead(cookie, 'alpha', { length: big, method: 'PUT' })), 405, small);
+  assert.equal((await upPost(c, cookie, 'alpha', JPG)).status, 200, 'the server is fine afterwards');
+}));
+
+test('upload: a refused upload whose body has only just begun gets its answer (status, error code, Connection: close) and then the server closes the connection', () => withUpload(async (c, dirs, cookie) => {
+  const A = partialUpload(c, cookie, 'alpha', JPG), B = partialUpload(c, cookie, 'alpha', JPG);
+  await sleep(300); // both slots taken
+  const L = { length: 5000 }; // declared, only 4 bytes of it are sent
+  const got = [[429, 'busy', await blast(c, upHead(cookie, 'alpha', L), { max: 1, size: 4 })]];
+  A.req.destroy(); B.req.destroy();
+  assert.ok(await until(async () => (await upPost(c, cookie, 'beta', JPG)).status === 200), 'slots come back');
+  for (const [status, error, head] of [
+    [401, 'unauthorized', upHead(undefined, 'alpha', L)], [403, 'forbidden', upHead(cookie, 'alpha', { ...L, pc: false })],
+    [404, 'no_project', upHead(cookie, 'nope', L)], [404, 'no_session', upHead(cookie, 'alpha', { ...L, session: 'ghost' })],
+    [415, 'bad_type', upHead(cookie, 'alpha', { ...L, type: 'text/plain' })], [405, 'method', upHead(cookie, 'alpha', { ...L, method: 'PUT' })],
+    [413, 'too_big', upHead(cookie, 'alpha', { length: UPLOAD_MAX + 1 })],
+  ]) got.push([status, error, await blast(c, head, { max: 1, size: 4 })]);
+  for (const [status, error, r] of got) {
+    assert.equal(r.timedOut, false, `${status} ${error}: the server did not close the connection`);
+    assert.ok(r.text.startsWith(`HTTP/1.1 ${status}`), `${status} ${error}: ${r.text.slice(0, 80)}`);
+    assert.match(r.text, /\r\nconnection: close\r\n/i, `${status} ${error}`);
+    assert.ok(r.text.includes(`{"error":"${error}"}`), `${status} ${error}: ${r.text.slice(-80)}`);
+  }
+}));
+
+test('upload: a refused request that trickles its body is cut at the short bound (bodyMs), never at the long one; an upload refused before its admission is closed at once', () => withUpload(async (c, dirs, cookie) => {
+  // test-only bounds: bodyMs 400, uploadRequestMs 4000 (15 s and 120 s in production)
+  const trickle = (head) => new Promise((resolve) => {
+    const t0 = Date.now(), s = net.connect(c.port, '127.0.0.1');
+    let text = '';
+    const tick = setInterval(() => { if (!s.destroyed) s.write('x'); }, 50);
+    s.on('connect', () => s.write(`${head.join('\r\n')}\r\n\r\n`));
+    s.on('data', (d) => { text += d; });
+    s.on('error', () => {});
+    s.on('close', () => { clearInterval(tick); clearTimeout(guard); resolve({ ms: Date.now() - t0, text }); });
+    const guard = setTimeout(() => s.destroy(), 6000);
+  });
+  const json = (cookie2, pc) => ['POST /api/send/x HTTP/1.1', 'Host: x', ...(pc ? ['X-PC: 1'] : []), ...(cookie2 ? [`Cookie: ${cookie2}`] : []), 'Content-Type: application/json', 'Content-Length: 100000000'];
+  for (const [what, head, status] of [['401', json(undefined, true), 401], ['403', json(cookie, false), 403]]) {
+    const r = await trickle(head);
+    assert.ok(r.text.startsWith(`HTTP/1.1 ${status}`), `${what}: ${r.text.slice(0, 40)}`);
+    assert.ok(r.ms >= 300 && r.ms < 2500, `${what}: the connection lasted ${r.ms} ms`); // the 401/403 left the body unread; the 400 ms timer cuts it
+  }
+  const up = await trickle(upHead(undefined, 'alpha', { length: 100000000 }));
+  assert.ok(up.text.startsWith('HTTP/1.1 401') && /connection: close/i.test(up.text), up.text.slice(0, 120));
+  assert.ok(up.ms < 2500, `a refused upload stayed ${up.ms} ms`);
+}, { bodyMs: 400, uploadRequestMs: 4000 }));
+
+test('upload: before it is admitted and checked the body has only the short window: a slow session list does not buy the long one', () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 's', 'claude');
+  await withEnv({ FAKE_TMUX_DELAYS: JSON.stringify({ 'list-sessions': 900 }) }, async () => {
+    const t0 = Date.now();
+    const p = partialUpload(c, cookie, 'alpha', JPG, { session: 's' }); // its body never comes
+    const r = await p.done;
+    assert.ok(r.error && Date.now() - t0 < 2000, `an unfinished body was waited for ${Date.now() - t0} ms: ${JSON.stringify(r)}`); // cut at 400 ms, while the list was still running
+    await sleep(700); // the list ends, the upload sees the closed request and stops
+  });
+  for (let i = 0; i < 3; i++) assert.equal((await upPost(c, cookie, 'alpha', JPG, { session: 's' })).status, 200, `slot ${i}`);
+  // while an admitted upload (everything passed) keeps the long window: its body may take much longer than bodyMs
+  const q = partialUpload(c, cookie, 'alpha', JPG, { session: 's' });
+  await sleep(1200); q.finish();
+  assert.equal((await q.done).status, 200);
+}, { bodyMs: 400, uploadRequestMs: 4000 }));
+
+test('upload: a client that goes away while the session list is still running gives its slot back, twice; the next uploads are 200 (no leak)', () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 's', 'claude');
+  await withEnv({ FAKE_TMUX_DELAYS: JSON.stringify({ 'list-sessions': 800 }) }, async () => {
+    for (let i = 0; i < 2; i++) { // two slots: two leaks would block every later upload
+      const p = partialUpload(c, cookie, 'alpha', JPG, { session: 's' });
+      await sleep(250); // admitted, the slow list is running
+      p.req.destroy();
+      await p.done;
+    }
+    await sleep(1300); // both slow lists have ended
+  });
+  for (let i = 0; i < 3; i++) assert.equal((await upPost(c, cookie, 'alpha', JPG, { session: 's' })).status, 200, `upload ${i}`);
+  assert.equal((await upPost(c, cookie, 'beta', JPG)).status, 200);
+}));
+
+test('upload: a client that goes away while the project stat is still running gives its slot back, twice; the next uploads are 200 (no leak)', () => withUpload(async (c, dirs, cookie) => {
+  const realStat = fs.promises.stat; // the server and the test share this process: slow the stat of the alpha folder only
+  fs.promises.stat = async (p, ...a) => { if (p === dirs.alpha) await sleep(600); return realStat.call(fs.promises, p, ...a); };
+  try {
+    for (let i = 0; i < 2; i++) { // two slots: two leaks would block every later upload
+      const p = partialUpload(c, cookie, 'alpha', JPG); // no session: the stat is the only await before the body
+      await sleep(200); // admitted, the slow stat is running
+      p.req.destroy();
+      await p.done;
+    }
+    await sleep(1000); // both slow stats have ended
+  } finally { fs.promises.stat = realStat; }
+  for (let i = 0; i < 3; i++) assert.equal((await upPost(c, cookie, 'alpha', JPG)).status, 200, `upload ${i}`);
+}));
+
+test('upload: the per-request timer leaves a complete request alone: an SSE stream outlives bodyMs',() => withApp(async (c) => {
+  const { cookie } = await c.login();
+  await mkSession(c, cookie);
+  const s = await openStream(c.port, cookie);
+  assert.equal(s.status, 200);
+  let buf = ''; s.res.setEncoding('utf8'); s.res.on('data', (d) => { buf += d; });
+  let closed = false; s.res.on('close', () => { closed = true; });
+  await sleep(1200); // four times bodyMs
+  assert.equal(closed, false, 'the stream was cut');
+  assert.ok(buf.includes('event: screen'));
+  s.req.destroy();
+}, { bodyMs: 300 }));

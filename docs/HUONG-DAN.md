@@ -16,9 +16,11 @@
    - [Xem và gỡ thiết bị](#xem-và-gỡ-thiết-bị)
 7. [Dùng hằng ngày](#7-dùng-hằng-ngày)
    - [Thêm dự án từ app](#thêm-dự-án-từ-app)
+   - [Gửi ảnh trong chat](#gửi-ảnh-trong-chat)
 8. [Dùng từ laptop](#8-dùng-từ-laptop)
    - [Lệnh `fcode` (tùy chọn)](#lệnh-fcode-tùy-chọn)
    - [Đồng bộ phiên chat omp giữa laptop và box (`fcode phien`)](#đồng-bộ-phiên-chat-omp-giữa-laptop-và-box-fcode-phien)
+   - [Tự đồng bộ khi mở agent (`fcode moc`)](#tự-đồng-bộ-khi-mở-agent-fcode-moc)
    - [Cài lệnh fcode trên máy Windows khác](#cài-lệnh-fcode-trên-máy-windows-khác)
 9. [Bảo mật](#9-bảo-mật)
 10. [Phát triển](#10-phát-triển)
@@ -38,6 +40,9 @@ Tính năng chính:
 - Ghép máy bằng **mã 6 số**, không có mật khẩu; iPhone mới ghép thêm được bằng **mã QR** (`fcode-pair --qr`, hoặc `fcode pair` trên laptop).
 - Lệnh **`fcode`** trên laptop Windows: vào phiên, `fcode add` (thêm dự án GitHub vào box), `fcode pair`, cài bằng một dòng lệnh.
 - Box **tự cập nhật** omp, Claude Code và Codex mỗi 6 giờ, không làm hỏng phiên đang mở.
+- **Gửi ảnh trong chat** (v1.3.3): chụp ảnh hoặc chọn ảnh từ thư viện rồi gửi cho trợ lý ([xem mục 7](#gửi-ảnh-trong-chat)).
+- **Laptop tự đồng bộ khi mở agent** (v1.3.3): bật một lần bằng `fcode moc bat` ([xem mục 8](#tự-đồng-bộ-khi-mở-agent-fcode-moc)).
+- Chưa có: hội thoại **Claude Code** và **Codex** chưa được mang qua lại giữa laptop và box (hiện chỉ phiên omp và ghi chú dự án đi theo).
 
 ## 2. Cách hoạt động
 
@@ -300,6 +305,12 @@ Hướng dẫn đầy đủ cho app nằm ở [ios/README.md, mục 4](../ios/RE
 | "iPhone này đã bị gỡ khỏi box, hãy ghép lại." | Chạy `fcode-pair` trên box và ghép lại. |
 | "Phiên đã đóng." | Chương trình trong phiên đã thoát; bấm **Quay lại** rồi mở lại dự án. |
 | "Box đang bận, thử lại sau." | Đợi vài giây. |
+| "Ảnh quá lớn" | Ảnh còn lớn hơn 10 MB dù đã thu nhỏ; chọn ảnh khác. |
+| "Ảnh không đọc được" | Chọn lại một ảnh khác. |
+| "Phiên đã đóng" (khi gửi ảnh) | Phiên đã thoát; mở lại phiên rồi gửi lại. |
+| "Không gửi được ảnh, thử lại" | Kiểm tra mạng rồi gửi lại. Cũng hiện khi box đang nhận ảnh khác và từ chối ảnh này; đợi vài giây rồi gửi lại. |
+| "Đang gửi ảnh khác, thử lại sau" | Box đang nhận ảnh khác; đợi vài giây rồi gửi lại. |
+| "Không tải được ảnh, thử lại" | Ảnh chưa lấy hoặc chưa xử lý xong sau 60 giây; chọn hoặc chụp lại. |
 | "Không kết nối được máy chủ." | Kiểm tra mạng, địa chỉ máy chủ và dịch vụ `fcoding` trên box. |
 
 ### Thêm dự án từ app
@@ -333,6 +344,24 @@ Từ v1.3.2, bạn thêm dự án GitHub vào box ngay trên iPhone, không cầ
 Thêm lại một dự án đã có (cùng tên, cùng repo) không làm gì và báo thành công (`ADDED`, thoát 0).
 
 **Làm tay trên box**: `timeout --kill-after=30 600 bash /data/home/fcoding/fcode-add.sh <chủ/repo> <tên>` (script do `install.sh` cài; tự nó không có giới hạn thời gian, nên lệnh làm tay cần `timeout` như trên). Giới hạn 10 phút tự động chỉ áp dụng khi thêm từ app và bằng `fcode add`; thêm lỗi chỉ xóa thư mục do chính lần đó tạo ra, thư mục có sẵn từ trước không bao giờ bị xóa; thêm lại cùng một repo là an toàn. Cách làm tương đương trên laptop: `fcode add <chủ/repo> [tên]`.
+
+### Gửi ảnh trong chat
+
+Từ v1.3.3, bạn gửi ảnh cho trợ lý ngay trong phiên, ví dụ chụp một màn hình lỗi:
+
+1. Trong phiên, chạm **nút bàn phím** để mở ô nhập, rồi bấm **nút ảnh** (hình bức ảnh) bên trái ô.
+2. Chọn **Chụp ảnh** (mở camera; không hiện nếu máy không có camera) hoặc **Chọn ảnh** (chọn một ảnh trong thư viện). Lần đầu chụp, iPhone hỏi quyền camera: bấm **OK**. Lỡ từ chối thì lần sau bấm **Chụp ảnh**, app báo `Camera đang bị tắt cho FCode: vào Cài đặt → FCode → bật Camera`: vào **Cài đặt → FCode → bật Camera** rồi chụp lại.
+3. App hiện `Đang gửi ảnh…`. Khi xong, app báo `Đã gắn ảnh — gõ lời nhắn rồi gửi`: đường dẫn ảnh đã nằm sẵn trong ô nhập của trợ lý, nhưng **chưa gửi** (app không tự bấm Enter). Trong lúc ảnh đang gửi, nút **Gửi** và nút ảnh tạm không bấm được (vẫn gõ chữ được), để tin nhắn không chạy trước ảnh. Muốn bỏ ảnh đó thì chạm vào dòng `Đang gửi ảnh…` khi còn dấu **×** ở cuối dòng (VoiceOver đọc gợi ý `Chạm để huỷ ảnh`, rồi báo `Đã huỷ ảnh`); nút **Gửi** dùng lại được ngay. Chỉ huỷ được trước khi ảnh bắt đầu gửi lên box; sau đó dấu × biến mất và chạm không còn tác dụng.
+4. Gõ lời nhắn của bạn (ví dụ "sửa lỗi trong ảnh này") rồi gửi như bình thường.
+
+Chi tiết cần biết:
+
+- App tự thu nhỏ ảnh (cạnh dài tối đa 2048 điểm ảnh) và đổi mọi định dạng (kể cả HEIC) sang JPEG trước khi gửi. Ảnh vẫn lớn hơn 10 MB sau khi thu nhỏ thì bị từ chối (`Ảnh quá lớn`).
+- Ảnh được lưu trên box ở thư mục `.fcode/uploads` trong dự án. FCode tự giấu thư mục này khỏi git bằng danh sách bỏ qua riêng của git (`.git/info/exclude`, không sửa `.gitignore`), nên thường ảnh không hiện thành thay đổi và không bị đưa lên GitHub; dự án nằm trong thư mục con của một kho git lớn hơn cũng được giấu. Việc giấu này là cố gắng hết sức: nếu hiếm khi box không cập nhật được cài đặt git của dự án, ảnh vẫn được lưu và có thể hiện trong `git status`; khi đó đừng thêm `.fcode/` vào một lần commit.
+- Ảnh cũ hơn 7 ngày bị xoá vào lần kế tiếp bạn gửi ảnh vào dự án đó (không gửi ảnh vào dự án đó thì chưa xoá).
+- Box nhận tối đa hai ảnh cùng lúc; ảnh thứ ba bị từ chối. Vì box đóng kết nối mà không đọc ảnh bị từ chối, thường app chỉ thấy lỗi mạng và báo `Không gửi được ảnh, thử lại` chứ không phải `Đang gửi ảnh khác, thử lại sau` (câu này chỉ hiện khi app nhận được câu trả lời của box). Cả hai trường hợp: đợi vài giây rồi gửi lại, gửi lại là được.
+- Nếu app báo `Không tải được ảnh, thử lại` thì ảnh chưa lấy hoặc chưa xử lý xong sau 60 giây (từ thư viện hoặc từ camera): chọn hoặc chụp lại.
+- Nếu app báo `Đã lưu ảnh nhưng chưa gắn được vào phiên` thì ảnh đã được lưu nhưng đường dẫn chưa vào được ô nhập (thường vì đường dẫn dự án có dấu cách). Bạn vẫn dùng được ảnh, chỉ cần nhờ trợ lý đọc ảnh mới nhất trong `.fcode/uploads`.
 
 ## 8. Dùng từ laptop
 
@@ -413,13 +442,47 @@ Luật đồng bộ (một phiên = một mã = một file `.jsonl` chỉ đư�
 - Trên box, phiên chép từ laptop có thêm một file nhỏ `<tên phiên>.fcode-origin` (nội dung `laptop`) để app ghi nhãn "laptop"; không ghi gì vào chính file phiên.
 - Nhớ đẩy code lên GitHub (`git push`) trước khi sang máy kia làm tiếp: phiên chỉ mang cuộc trò chuyện, không mang code.
 
-Ghi chú ở thư mục gốc project: cùng lượt đồng bộ này chép hai chiều các file `HANDOFF*.md`, `CLAUDE.md`, `AGENTS.md`, `WORKFLOW.md`, `agent_state.md`, `TASK.md`, `CLAUDE.local.md`, **chỉ khi git không theo dõi file đó ở cả hai máy và nhánh chính trên GitHub (`origin`) cũng chưa có file đó** (file git đã theo dõi đi qua git, không đi qua đây). Máy nhận tự thêm tên file vào `.git/info/exclude` (không sửa `.gitignore`) để file không hiện thành thay đổi và không làm vướng việc tự cập nhật code trên box. File nào chỉ một bên sửa từ lần đồng bộ trước thì chép sang bên kia; cả hai bên cùng sửa thì giữ nguyên và báo `handoff <file> khác nhau ở hai máy, giữ nguyên cả hai`. Trạng thái nằm ở `%LOCALAPPDATA%\fcode\handoff-state.json`. File bị xóa ở một bên thì không bị xóa ở bên kia (lần sau nó được chép lại). Khi git bắt đầu theo dõi một file mà fcode đã chép và giấu bằng `.git/info/exclude` (ví dụ file đó được đưa vào kho), fcode thôi đồng bộ file đó, chỉ gỡ đúng dòng `/<tên file>` do chính nó đã thêm (các dòng khác giữ nguyên), và báo một dòng `ghi chú <file> giờ do git theo dõi (trên <máy>): bản cũ trên <máy kia> xóa được`; fcode không bao giờ tự xóa bản cũ, bạn xóa tay rồi `git pull` để cập nhật code. Dòng này cũng hiện ở đầu menu `fcode` cho tới lần đồng bộ sau.
+Ghi chú ở thư mục gốc project: cùng lượt đồng bộ này chép hai chiều các file `HANDOFF*.md`, `CLAUDE.md`, `AGENTS.md`, `WORKFLOW.md`, `agent_state.md`, `TASK.md`, `CLAUDE.local.md`, **chỉ khi git không theo dõi file đó ở cả hai máy và nhánh chính trên GitHub (`origin`) cũng chưa có file đó** (file git đã theo dõi đi qua git, không đi qua đây). Máy nhận tự thêm tên file vào `.git/info/exclude` (không sửa `.gitignore`) để file không hiện thành thay đổi và không làm vướng việc tự cập nhật code trên box. File nào chỉ một bên sửa từ lần đồng bộ trước thì chép sang bên kia; cả hai bên cùng sửa thì giữ nguyên và báo `handoff <file> khác nhau ở hai máy, giữ nguyên cả hai`. Trạng thái nằm ở `%LOCALAPPDATA%\fcode\handoff-state.json`. File bị xóa ở một bên thì không bị xóa ở bên kia (lần sau nó được chép lại). Khi git bắt đầu theo dõi một file mà fcode đã chép và giấu bằng `.git/info/exclude` (ví dụ file đó được đưa vào kho), fcode thôi đồng bộ file đó, chỉ gỡ đúng dòng `/<tên file>` do chính nó đã thêm (các dòng khác giữ nguyên), và báo một dòng `ghi chú <file> giờ do git theo dõi (trên <máy>): bản cũ trên <máy kia> xóa được`; fcode không bao giờ tự xóa bản cũ, bạn xóa tay rồi `git pull` để cập nhật code. Dòng này cũng hiện ở đầu menu `fcode` cho tới lần đồng bộ sau. Nếu `.git/info/exclude` của dự án ở laptop là một liên kết (symlink) thì fcode không ghi vào đó và chưa đặt file ghi chú đó, rồi báo `[<dự án>] ghi chú <file>: .git/info/exclude là liên kết, fcode không ghi vào đó, chưa đặt` (lần đồng bộ nhanh khi mở agent chỉ ghi dòng này vào phien.log). Hai lỗi khác của phần ghi chú (laptop), mỗi lỗi làm lần chạy kết thúc với mã lỗi 1 (lần nhanh khi mở agent: màn hình hiện `phien: không đồng bộ được, xem phien.log`, chi tiết ở phien.log): `lỗi: không ghi được trạng thái ghi chú (handoff-state.json): <lý do>` (không ghi được file trạng thái nên fcode không đặt ghi chú đó và lần chạy dừng ở đây), và `  [<dự án>] lỗi: ghi chú <file>: chưa gỡ được dòng /<file> của fcode trong .git/info/exclude (liên kết, hoặc git lỗi / không trả lời kịp), lần sau thử lại` (dòng giấu file vẫn còn trong `.git/info/exclude` và fcode còn nhớ là của nó, nên lần đồng bộ sau thử gỡ lại; dòng `ghi chú <file> giờ do git theo dõi …` vẫn hiện ngay trước đó).
 
-Tự động và box nghỉ: box gói miễn phí tự nghỉ sau 30 phút không dùng, và mỗi lần mở kết nối tới box đều tính là có người dùng. Vì vậy tự động chạy kiểu thưa: mỗi 10 phút nó chỉ hỏi `instabox ls` xem box có đang chạy không (không bao giờ đánh thức box). Box không chạy thì thôi. `instabox ls` lỗi hoặc trả về thứ không đọc được thì lần đó bỏ qua, không kết nối box và không đổi trạng thái đã lưu. Box vừa chuyển từ nghỉ sang chạy thì đồng bộ ngay một lần. Còn lại, chỉ đồng bộ khi lần mở kết nối gần nhất (của bất kỳ lần chạy nào, kể cả chạy tay) đã cách từ **40 phút** trở lên, tức là lâu hơn 30 phút box tự nghỉ, nên box không ai dùng vẫn luôn được nghỉ. Lần bị lỗi cũng chỉ chờ đến mốc 40 phút sau, không thử lại dồn dập. Cả hai chiều đều chia theo file thành từng đợt tối đa 50 MB (mỗi đợt một kết nối, gửi xong đợt này mới làm đợt sau), nên đường truyền chậm hoặc bị ngắt giữa chừng thì các đợt đã xong vẫn nằm ở máy nhận và lần sau chỉ làm tiếp phần còn lại, kể cả một phiên rất lớn. Thứ tự: các đợt thường (tối đa 50 MB) làm trước theo cả hai chiều, rồi từng file lớn hơn 50 MB đi riêng một đợt, file nhỏ trước. Một đợt lỗi thì được ghi chú và lần chạy vẫn tiếp tục; chỉ hết giờ hoặc mất kết nối box mới dừng cả lần chạy. File lớn chưa chép xong thì báo `phiên lớn: <file> chưa chép xong — chạy fcode phien khi mạng tốt`, không bao giờ báo thành công; chạy tay (15 phút mỗi kết nối) sẽ làm nốt. Lần chạy tự động có tổng thời gian tối đa 7 phút: hết giờ thì dừng kết nối đang treo và không bắt đầu đợt mới (chạy tay: tối đa 15 phút mỗi kết nối). Thay đổi ở laptop hoặc ở box nhờ vậy sang bên kia chậm nhất sau khoảng 40 phút; muốn ngay thì gõ `fcode phien`. Chạy tay và chạy tự động dùng chung một khóa nên không giẫm lên nhau (chạy tay chờ lượt tự động xong). Chạy thử `--thu` không chép gì nhưng vẫn ghi lại giờ kết nối box, vì kết nối đó cũng tính là dùng box. Lý do và kết quả ghi ở `%USERPROFILE%\.fcode\phien.log`.
+Tự động và box nghỉ: box gói miễn phí tự nghỉ sau 30 phút không dùng, và mỗi lần mở kết nối tới box đều tính là có người dùng. Vì vậy tự động chạy kiểu thưa: mỗi 10 phút nó chỉ hỏi `instabox ls` xem box có đang chạy không (không bao giờ đánh thức box). Box không chạy thì thôi. `instabox ls` lỗi hoặc trả về thứ không đọc được thì lần đó bỏ qua, không kết nối box và không đổi trạng thái đã lưu. Box vừa chuyển từ nghỉ sang chạy thì đồng bộ ngay một lần. Còn lại, chỉ đồng bộ khi lần mở kết nối gần nhất (của lần tự động hoặc lần chạy tay; lần đồng bộ nhanh khi mở agent không tính) đã cách từ **40 phút** trở lên, tức là lâu hơn 30 phút box tự nghỉ, nên box không ai dùng vẫn luôn được nghỉ. Lần bị lỗi cũng chỉ chờ đến mốc 40 phút sau, không thử lại dồn dập. Cả hai chiều đều chia theo file thành từng đợt tối đa 50 MB (mỗi đợt một kết nối, gửi xong đợt này mới làm đợt sau), nên đường truyền chậm hoặc bị ngắt giữa chừng thì các đợt đã xong vẫn nằm ở máy nhận và lần sau chỉ làm tiếp phần còn lại, kể cả một phiên rất lớn. Thứ tự: các đợt thường (tối đa 50 MB) làm trước theo cả hai chiều, rồi từng file lớn hơn 50 MB đi riêng một đợt, file nhỏ trước. Một đợt lỗi thì được ghi chú và lần chạy vẫn tiếp tục; chỉ hết giờ hoặc mất kết nối box mới dừng cả lần chạy. File lớn chưa chép xong thì báo `phiên lớn: <file> chưa chép xong — chạy fcode phien khi mạng tốt`, không bao giờ báo thành công; chạy tay (15 phút mỗi kết nối) sẽ làm nốt. Lần chạy tự động có tổng thời gian tối đa 7 phút: hết giờ thì dừng kết nối đang treo và không bắt đầu đợt mới (chạy tay: tối đa 15 phút mỗi kết nối). Thay đổi ở laptop hoặc ở box nhờ vậy sang bên kia chậm nhất sau khoảng 40 phút; muốn ngay thì gõ `fcode phien`. File lớn hơn 50 MB không đi theo lần đồng bộ nhanh khi mở agent (lần đó chỉ ghi vào phien.log `phiên lớn: <file> — lần nhanh không chép, để lần tự động hoặc fcode phien`); lần tự động hoặc `fcode phien` chép file đó. Chạy tay và chạy tự động dùng chung một khóa nên không giẫm lên nhau (chạy tay chờ lượt tự động xong). Chạy thử `--thu` không chép gì nhưng vẫn ghi lại giờ kết nối box, vì kết nối đó cũng tính là dùng box. Lý do và kết quả ghi ở `%USERPROFILE%\.fcode\phien.log` (mỗi dòng ghi ngay kèm giờ; file quá 200 KB thì được đổi tên thành `phien.log.1`, là phần nhật ký cũ hơn, rồi `phien.log` mới bắt đầu).
 
-Dọn rác: mỗi lần chạy thật, trước tiên fcode xóa các file tạm do chính nó để lại quá 1 giờ (laptop: `%TEMP%\fcode-phien-*` và `*.fcode-part-*`; box: `/tmp/fcode-phien-*` và `*.fcode-part-*`). Không xóa gì khác.
+Dọn rác: mỗi lần chạy thật, fcode xóa các file tạm do chính nó để lại (laptop: `%TEMP%\fcode-phien-*` và `*.fcode-part-*`; box: `/tmp/fcode-phien-*` và `*.fcode-part-*`) khi file đã quá 1 giờ. Ở laptop, file tạm của một lần chạy đã bị dừng ngang (tắt cửa sổ, mất điện, bị ngắt hẳn) được xóa ngay ở lần đồng bộ kế tiếp (một lần tự động chỉ kiểm tra box mà không đồng bộ, hoặc một lần nhanh thấy đang có lần khác chạy, thì chưa dọn). Ngay đầu lần đồng bộ xóa thư mục tạm trong `%TEMP%` và các file `<tên file>.part-<số>` nằm cạnh `handoff-state.json`, `phien-status.json`, `phien-auto.json` (trong `%LOCALAPPDATA%\fcode`); sau khi quét xong xóa tiếp `*.fcode-part-*` trong thư mục phiên và các file `exclude.part-<số>` cạnh `.git\info\exclude` của từng dự án. Mỗi loại file `.part-<số>` bị xóa khi quá 1 giờ hoặc khi lần chạy tạo ra nó (số đó là mã tiến trình) đã không còn chạy. Không xóa gì khác.
 
 Khi omp đổi định dạng phiên (sau khi omp cập nhật): phiên có dòng đầu không đọc được hoặc `version` lạ (hiện chỉ hiểu version 3) **không được chép** và lần chạy báo `omp đổi định dạng phiên (version X) — chưa đồng bộ, báo Claude`; phiên cũ vẫn đồng bộ bình thường. Mỗi lần chạy ghi `%LOCALAPPDATA%\fcode\phien-status.json` (giờ chạy, kết quả, số file chép, phiên lạ, phiên bản omp hai máy, ghi chú đã chép và xung đột). Menu `fcode` hiện một dòng cảnh báo vàng ở đầu khi có phiên định dạng lạ hoặc lần tự động gần nhất bị lỗi. Hai máy khác phiên bản omp thì vẫn đồng bộ phiên đúng định dạng và thêm dòng `omp laptop <a> khác box <b>`.
+
+### Tự đồng bộ khi mở agent (`fcode moc`)
+
+Từ v1.3.3, bạn không cần nhớ gõ `fcode phien` nữa. Bật một lần:
+
+```sh
+fcode moc bat          # bật
+fcode moc trang-thai   # xem đang bật hay tắt
+fcode moc tat          # tắt
+```
+
+Sau khi bật, mỗi lần bạn gõ `omp`, `claude` hoặc `codex` trong thư mục của một dự án có trong `syncRepos` (hoặc trong thư mục con của nó), FCode làm theo thứ tự:
+
+1. Đồng bộ dự án đó trước (như `fcode phien <dự án> --nhanh`; agent chờ tối đa 35 giây), rồi mở agent như bình thường với đúng các tham số bạn gõ.
+2. Khi bạn đóng agent, FCode đồng bộ thêm một lần nữa ở chế độ ngầm (`fcode phien <dự án> --nhanh --nen`): không hiện cửa sổ, không làm bạn phải chờ. Lần này tự chờ khoảng 35 giây (để phiên vừa đóng kịp "nguội") rồi mới đồng bộ, và cũng dừng ở khoảng 20 giây.
+
+Cần biết:
+
+- **Màn hình êm**: đồng bộ xong bình thường thì không hiện gì (chi tiết ghi ở `%USERPROFILE%\.fcode\phien.log`). Nếu có chuyện, màn hình hiện tối đa **một dòng** ở cuối, và agent luôn được mở.
+- **Không đánh thức box.** Box đang ngủ thì hiện `phien: box đang ngủ, bỏ qua` và agent mở ngay. Lần tự động mỗi 10 phút ở trên vẫn là phương án dự phòng.
+- **Không đọc được trạng thái box thì là lỗi, không phải "ngủ".** Nếu `instabox ls` lỗi (ví dụ bạn chưa chạy `instabox login`), màn hình hiện `phien: không đồng bộ được, xem phien.log` và trong phien.log ghi `lỗi: không đọc được trạng thái box (instabox ls lỗi — đã chạy "instabox login" chưa?)`; agent vẫn mở.
+- **Dừng ở khoảng 20 giây** mỗi lần (có thể dư vài giây khi một bước đang hoàn tất); FCode chỉ dừng giữa hai việc, không bao giờ bỏ dở một file, và các lệnh con (ssh, tar, kiểm tra box) cũng bị dừng đúng hạn. Hết giờ thì hiện `phien: hết 20 giây, phần còn lại chạy lần sau`; phần còn lại làm tiếp ở lần mở agent sau, hoặc ở lần tự động kế tiếp theo lịch thường (lần đồng bộ nhanh không đẩy lùi lịch đó). File lớn hơn 50 MB không bao giờ đi theo lần nhanh, mà để lần tự động hoặc `fcode phien` chép (lần nhanh chỉ ghi `phiên lớn: <file> — lần nhanh không chép, để lần tự động hoặc fcode phien` vào phien.log).
+- **Ngắt hẳn ở 30 giây.** Nếu một lần đồng bộ nhanh vẫn chưa xong sau 30 giây (ví dụ một lệnh bị treo), FCode ngắt hẳn nó cùng mọi lệnh con của nó, màn hình hiện `phien: không đồng bộ được, xem phien.log` và phien.log ghi `lỗi: lần chạy nhanh vượt quá 30 giây nên bị ngắt hẳn …`; việc đang làm dở để lần sau, agent vẫn mở. Nếu Windows không cho FCode tạo lớp bảo vệ này, lần nhanh không đồng bộ gì, màn hình hiện cùng dòng `phien: không đồng bộ được, xem phien.log` và phien.log ghi lý do (`lỗi: không tạo được job bảo vệ cho lần chạy nhanh (…) — không đồng bộ`). Lần chạy tay `fcode phien` thì không bị ngắt như vậy.
+- Đang có một lần đồng bộ khác chạy thì hiện `phien: đang có lần đồng bộ khác, bỏ qua` và mở agent luôn.
+- **Đồng bộ lỗi không chặn agent**: agent vẫn mở, màn hình chỉ hiện đúng một dòng `phien: không đồng bộ được, xem phien.log`.
+- Mở agent ở thư mục không thuộc dự án nào thì không đồng bộ gì, agent chạy như thường.
+- **Tắt tạm trong cửa sổ này**: gõ `$env:FCODE_MOC = '0'`. Biến này giữ tới khi bạn đóng cửa sổ PowerShell; muốn bật lại ngay thì gõ `Remove-Item Env:FCODE_MOC`.
+- **Giới hạn của lệnh bọc**: khi bật, `omp`, `claude`, `codex` là lệnh bọc của FCode nên không chuyển nguyên vẹn các tham số dạng `--` và `-x:giá-trị`, cũng như kết quả lỗi vào `$?`. Cần những trường hợp đó thì chạy thẳng `claude.exe`, `codex.exe` hoặc `omp.exe` (bỏ qua FCode).
+- `fcode moc bat` thêm một khối giữa hai dòng `# >>> fcode moc >>>` và `# <<< fcode moc <<<` vào file profile của cả Windows PowerShell 5.1 và PowerShell 7 (`WindowsPowerShell\profile.ps1` và `PowerShell\profile.ps1` trong thư mục Documents của bạn, có thể nằm trong OneDrive). Nếu file đã có, FCode chép một bản dự phòng `profile.ps1.bak-fcode` trước lần sửa đầu tiên. `fcode moc tat` chỉ xoá đúng khối đó, các dòng khác của bạn giữ nguyên.
+- Cần mở lại cửa sổ PowerShell sau khi bật hoặc tắt.
+
+**Nếu không thấy tác dụng**: chạy `fcode moc trang-thai`. Lệnh cho biết từng file profile đã có khối hay chưa và chế độ chạy script (execution policy) của Windows PowerShell 5.1 (cùng của PowerShell 7 nếu máy có `pwsh`). Nếu chế độ của một bên là `Restricted` hoặc `AllSigned`, bên đó sẽ không nạp profile nên khối này không chạy; lệnh sẽ chỉ cách cho phép. FCode không bao giờ tự đổi chế độ này của bạn.
+
+**Chưa có**: hội thoại Claude Code và Codex chưa được mang qua lại giữa laptop và box. Hiện chỉ phiên omp và ghi chú dự án được đồng bộ (như mô tả ở mục `fcode phien` phía trên); mở `claude` hoặc `codex` với `fcode moc` bật vẫn chỉ đồng bộ hai thứ đó.
 
 ### Cài lệnh fcode trên máy Windows khác
 
