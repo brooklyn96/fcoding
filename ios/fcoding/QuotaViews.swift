@@ -152,7 +152,7 @@ struct BoxRing: View {
         let at = r.changeAt.map { HomeLogic.clock($0) } ?? ""
         switch r.mode {
         case .unknown: return "Chưa biết giờ box nghỉ. Chạm để xem giải thích."
-        case .paused: return "Box đang nghỉ, tự dậy sau \(h) giờ \(m) phút, lúc \(at). Chạm để xem giải thích."
+        case .paused: return "Box đang nghỉ, đánh thức lại được sau \(h) giờ \(m) phút, lúc \(at). Chạm để xem giải thích."
         default: return "Box nghỉ sau \(h) giờ \(m) phút, lúc \(at), hoặc sớm hơn nếu rảnh 30 phút. Chạm để xem giải thích."
         }
     }

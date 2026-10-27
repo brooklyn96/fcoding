@@ -921,7 +921,8 @@ if ($env:FCODE_TEST_BOX) {
       [void](Invoke-RealBox "rm $bp/.fcode/.gitignore && printf 'keep\n' > $bt/target && ln -s $bt/target $bp/.fcode/.gitignore && echo ok")
       $r = Invoke-Fcode $w @('phien') $env0; Eq $r.Code 1 $r.Out
       Eq (Invoke-RealBox "readlink $bp/.fcode/.gitignore") "$bt/target" 'the link to a file is still a link'; Eq (Invoke-RealBox "cat $bt/target") 'keep' 'nothing written through it'
-      Ok ((Invoke-RealBox "cat $bp/.git/info/exclude") -match '(?m)^# fcode\r?\n/HANDOFF-laptop\.md$') 'the pair is still on the box'      [void](Invoke-RealBox "rm $bp/.fcode/.gitignore && echo ok")
+      Ok ((Invoke-RealBox "cat $bp/.git/info/exclude") -match '(?m)^# fcode\r?\n/HANDOFF-laptop\.md$') 'the pair is still on the box'
+      [void](Invoke-RealBox "rm $bp/.fcode/.gitignore && echo ok")
       $r = Invoke-Fcode $w @('phien') $env0; Eq $r.Code 0 $r.Out
       Ok ((Invoke-RealBox "cat $bp/.git/info/exclude") -notmatch 'HANDOFF-laptop') 'link gone: the release removed the pair'
       Eq (Invoke-RealBox "cat $bp/.fcode/.gitignore") '*' '.fcode/.gitignore holds *'
@@ -2601,6 +2602,108 @@ mkup()
 print(ign('.fcode/uploads/x.png'), subprocess.run(['git', '-C', d, 'status', '--porcelain'], capture_output=True, text=True).stdout.strip() == '')
 '@ $d
   Eq ($out -join ',') 'True True True,True True True True,True True True True,True True' 'add: both appends kept, nothing created; the uploads made after are ignored; release: the line is lost, the folder own .gitignore hides the uploads, git status is clean'
+}
+# r11 (release 1.3.5): a release gates the rewrite on the config projects a 1.3.3 server can write "/<prefix>.fcode/" for and that share the exclude file
+# (realpath compared): sub-folder projects and linked work trees that are projects, not every work tree root
+T 'notes r11: a: a sub-folder project of the same repository is gated: its uploads stay ignored although the release lost the 1.3.3 line' {
+  $d = Join-Path $Root 'r11a'; New-GitDir $d
+  $out = Invoke-BoxDriver 'r11a' @'
+import subprocess
+def G(*a, cwd=d):
+    return subprocess.run(['git', '-C', cwd] + list(a), capture_output=True, text=True)
+web = os.path.join(d, 'web')
+os.makedirs(web)
+projs = {'root': d, 'web': web}
+real = g['read_exclude']
+def racy(q):
+    b = real(q)
+    if os.path.normpath(q) == os.path.normpath(p):
+        open(q, 'ab').write(b'/web/.fcode/\n')
+    return b
+g['read_exclude'] = racy
+open(p, 'wb').write(b'# user\n# fcode\n/HANDOFF.md\n')
+print(m['unexclude'](d, name, False, projs), open(p, 'rb').read() == b'# user\n')
+os.makedirs(os.path.join(web, '.fcode', 'uploads'))
+open(os.path.join(web, '.fcode', 'uploads', 'x.png'), 'wb').write(b'x')
+print(G('check-ignore', '-q', '--', '.fcode/uploads/x.png', cwd=web).returncode == 0, G('status', '--porcelain').stdout.strip() == '', open(os.path.join(web, '.fcode', '.gitignore'), 'rb').read() == b'*\n', open(os.path.join(d, '.fcode', '.gitignore'), 'rb').read() == b'*\n')
+'@ $d
+  Eq ($out -join ',') 'True True,True True True True' 'release True; the line of web is lost but web/.fcode/.gitignore and the root one hide the uploads, git status is clean'
+}
+T 'notes r11: b: a linked work tree whose project is a sub-folder is gated; a work tree root that is not a project is never touched' {
+  $d = Join-Path $Root 'r11b'; New-GitDir $d
+  $out = Invoke-BoxDriver 'r11b' @'
+import subprocess
+def G(*a, cwd=d):
+    return subprocess.run(['git', '-C', cwd] + list(a), capture_output=True, text=True)
+G('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'x')
+B = os.path.join(os.path.dirname(d), 'r11b-B')
+G('worktree', 'add', '-q', B)
+bapp = os.path.join(B, 'app')
+os.makedirs(bapp)
+projs = {'root': d, 'bapp': bapp}
+real = g['read_exclude']
+def racy(q):
+    b = real(q)
+    if os.path.normpath(q) == os.path.normpath(p):
+        open(q, 'ab').write(b'/app/.fcode/\n')
+    return b
+g['read_exclude'] = racy
+open(p, 'wb').write(b'# user\n# fcode\n/HANDOFF.md\n')
+print(m['unexclude'](d, name, False, projs), open(p, 'rb').read() == b'# user\n')
+os.makedirs(os.path.join(bapp, '.fcode', 'uploads'))
+open(os.path.join(bapp, '.fcode', 'uploads', 'x.png'), 'wb').write(b'x')
+print(G('check-ignore', '-q', '--', '.fcode/uploads/x.png', cwd=bapp).returncode == 0, G('status', '--porcelain', cwd=B).stdout.strip() == '', open(os.path.join(bapp, '.fcode', '.gitignore'), 'rb').read() == b'*\n', not os.path.exists(os.path.join(B, '.fcode')))
+'@ $d
+  Eq ($out -join ',') 'True True,True True True True' 'B/app ignored and clean; B itself (not a project) got no .fcode'
+}
+T 'notes r11: c: projects that cannot receive an upload line are skipped and never given a .fcode: another repository, a plain folder, a missing folder, a bare repository, a folder inside .git, a relative path, a non-string, the same folder twice' {
+  $d = Join-Path $Root 'r11c'; New-GitDir $d
+  $out = Invoke-BoxDriver 'r11c' @'
+import subprocess
+par = os.path.dirname(d)
+S = os.path.join(par, 'r11c-S')
+N = os.path.join(par, 'r11c-N')
+M = os.path.join(par, 'r11c-missing')
+Q = os.path.join(par, 'r11c-Q.git')
+I = os.path.join(d, '.git', 'sub')
+os.makedirs(S)
+subprocess.run(['git', '-C', S, 'init', '-q'])
+os.makedirs(N)
+subprocess.run(['git', 'init', '-q', '--bare', Q])
+os.makedirs(I)
+projs = {'root': d, 'again': d, 'other': S, 'plain': N, 'gone': M, 'bare': Q, 'inside': I, 'rel': 'rel', 'seven': 7}
+open(p, 'wb').write(b'# user\n# fcode\n/HANDOFF.md\n')
+print(m['unexclude'](d, name, False, projs), open(p, 'rb').read() == b'# user\n')
+print(os.path.exists(os.path.join(d, '.fcode', '.gitignore')), [os.path.exists(os.path.join(x, '.fcode')) for x in (S, N, Q, I)], os.path.exists(M))
+'@ $d
+  Eq ($out -join ',') 'True True,True [False, False, False, False] False' 'released; only the project itself got .fcode; nothing was made in the other repo, plain folder, bare repo, .git subfolder or the missing folder'
+}
+T 'notes r11: d + e: a project of the set that cannot be verified (linked .fcode, or git not answering for it) defers the release; fixed, it goes through' {
+  $d = Join-Path $Root 'r11d'; New-GitDir $d
+  $out = Invoke-BoxDriver 'r11d' @'
+web = os.path.join(d, 'web')
+os.makedirs(web)
+projs = {'root': d, 'web': web}
+pair = b'# user\n# fcode\n/HANDOFF.md\n'
+def run():
+    open(p, 'wb').write(pair)
+    return m['unexclude'](d, name, False, projs)
+def exb():
+    return open(p, 'rb').read()
+gw = os.path.join(web, '.fcode', '.gitignore')
+links = {os.path.normpath(os.path.join(web, '.fcode'))}
+os.makedirs(os.path.join(web, '.fcode'))
+os.path.islink = lambda q: os.path.normpath(q) in links
+print(run(), exb() == pair, not os.path.exists(gw))
+links.clear()
+print(run(), exb() == b'# user\n', open(gw, 'rb').read() == b'*\n')
+realgit = g['git']
+g['git'] = lambda dd, *a: None if (os.path.normpath(dd) == os.path.normpath(web) and a[:1] == ('rev-parse',)) else realgit(dd, *a)
+print(run(), exb() == pair)
+g['git'] = realgit
+print(run(), exb() == b'# user\n')
+'@ $d
+  Eq ($out -join ',') 'False True True,True True True,False True,True True' 'a linked .fcode in web: False, pair stays, nothing written; then True; git silent for web: False, pair stays; then True'
 }
 T 'notes r9: a release rewrites the exclude file only when .fcode/.gitignore is verified to hold "*": other content and an empty file are replaced (the server''s own rule); a linked .fcode or .gitignore, a non-file, a failed write and a torn write defer the release (False, the pair stays)' {
   $d = Join-Path $Root 'r9b'; New-GitDir $d
