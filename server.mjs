@@ -1776,28 +1776,25 @@ export function createApp(opts = {}) {
       req.on('close', () => reject(new HttpErr(499, 'cancelled'))); // no-op once settled
     });
   }
-  // best effort: `/<prefix>.fcode/` once in the work tree's own info/exclude (never .gitignore); prefix = where the project sits inside the repo
-  // (`git rev-parse --show-prefix`, empty at the top), so a project that is a sub-folder is hidden too. One at a time so two uploads cannot both add it
-  // (at most UPLOAD_SLOTS are ever waiting here). A symlink at info/ or info/exclude is left alone (nothing is hidden, the upload stays).
-  let excludeChain = Promise.resolve();
-  const hideFromGit = (dir) => (excludeChain = excludeChain.then(async () => {
+  // hides the upload folder from git without touching any file git or the laptop sync share: `.fcode/.gitignore` holds the single line `*`, which
+  // ignores everything in the folder, the .gitignore itself included, in any repo above it. Written atomically (a part file in the same folder, then
+  // rename, which replaces a link instead of following it); `fc` is `<project>/.fcode`, already checked to be a real folder. A link or a non-file
+  // at `.gitignore` throws: the upload is refused (500 storage) like any other unsafe path.
+  async function hideFromGit(fc) {
+    const file = path.join(fc, '.gitignore'), want = '*\n';
+    let st = null;
+    try { st = await fs.promises.lstat(file); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+    if (st) {
+      if (!st.isFile()) throw new Error('not a file');
+      if (await fs.promises.readFile(file, { encoding: 'utf8', flag: fs.constants.O_RDONLY | NOFOLLOW }) === want) return;
+    }
+    const part = `${file}.fcode-part-${process.pid}-${crypto.randomBytes(3).toString('hex')}`;
     try {
-      const out = await execTool(gitSpec, ['-C', dir, '-c', 'core.fsmonitor=false', 'rev-parse', '--is-inside-work-tree', '--git-path', 'info/exclude', '--show-prefix'], 10000);
-      const [inside, rel, prefix = ''] = out.split(/\r?\n/);
-      if (inside.trim() !== 'true' || !rel) return;
-      const line = `/${prefix.replace(/[\\*?[]/g, '\\$&')}.fcode/`; // glob characters of a folder name are escaped
-      const file = path.resolve(dir, rel.trim()), info = path.dirname(file);
-      for (const p of [info, file]) {
-        try { if ((await fs.promises.lstat(p)).isSymbolicLink()) return; } catch (e) { if (e.code !== 'ENOENT') return; }
-      }
-      let text = '';
-      try { text = await fs.promises.readFile(file, { encoding: 'utf8', flag: fs.constants.O_RDONLY | NOFOLLOW }); } catch (e) { if (e.code !== 'ENOENT') return; }
-      if (text.split(/\r?\n/).some((l) => l.trim() === line)) return;
-      await fs.promises.mkdir(info, { recursive: true });
-      const fh = await fs.promises.open(file, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | NOFOLLOW, 0o644);
-      try { await fh.write(`${text && !text.endsWith('\n') ? '\n' : ''}${line}\n`); } finally { await fh.close(); }
-    } catch {} // not a git work tree, or no git: nothing to hide
-  }));
+      const fh = await fs.promises.open(part, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NOFOLLOW, 0o600);
+      try { await fh.writeFile(want); } finally { await fh.close(); }
+      await fs.promises.rename(part, file);
+    } catch (e) { await fs.promises.unlink(part).catch(() => {}); throw e; }
+  }
   // regular files named like our uploads and older than UPLOAD_KEEP_MS; anything else in the folder is left alone, a link is never followed.
   // Runs on upload only; one file failing never stops the rest.
   async function sweepUploads(up) {
@@ -1861,7 +1858,6 @@ export function createApp(opts = {}) {
     if (!valid(ctx)) throw gateErr(ctx); // the device may have been revoked while the body came in
     if (!buf.length) throw new HttpErr(400, 'empty');
     if (!buf.subarray(0, type.magic.length).equals(type.magic)) throw new HttpErr(415, 'bad_type');
-    await hideFromGit(dir);
     const up = path.join(dir, '.fcode', 'uploads');
     const stamp = new Date(now()).toISOString().replace(/[-:]/g, '').slice(0, 15).replace('T', '-'); // UTC: YYYYMMDD-HHMMSS
     let file;
@@ -1870,6 +1866,7 @@ export function createApp(opts = {}) {
         await fs.promises.mkdir(d, { recursive: true, mode: 0o700 });
         if (!(await fs.promises.lstat(d)).isDirectory()) throw new Error('not a directory');
       }
+      await hideFromGit(path.dirname(up));
       let fh;
       for (let i = 0; !fh; i++) {
         file = path.join(up, `${stamp}-${crypto.randomBytes(3).toString('hex')}.${type.ext}`);

@@ -5024,7 +5024,7 @@ test('upload: a session that is not live, not of this project or not a name is 4
 
 test('upload: file name, folder 0700, file 0600 and opened O_EXCL (no overwrite) with O_NOFOLLOW; the answer holds the absolute path; .jpg or .png by type', () => withUpload(async (c, dirs, cookie) => {
   const opened = []; const orig = fs.promises.open;
-  fs.promises.open = (f, flags, mode) => { if (String(f).includes('.fcode')) opened.push([String(f), flags, mode]); return orig.call(fs.promises, f, flags, mode); };
+  fs.promises.open = (f, flags, mode) => { if (String(f).includes('.fcode') && !String(f).includes('.gitignore')) opened.push([String(f), flags, mode]); return orig.call(fs.promises, f, flags, mode); }; // the .gitignore part file has its own test
   let a, b;
   try { a = await upPost(c, cookie, 'alpha', JPG); b = await upPost(c, cookie, 'alpha', PNG, { type: 'image/png' }); } finally { fs.promises.open = orig; }
   assert.deepEqual([a.status, b.status], [200, 200], a.text + b.text);
@@ -5063,36 +5063,75 @@ test('upload: a symlinked .fcode is not followed (500 storage, nothing written t
   assert.deepEqual(fs.readdirSync(elsewhere), []);
 }));
 
-test('upload: /.fcode/ goes into the work tree\'s info/exclude exactly once across uploads; .gitignore is untouched; git status stays clean', () => withUpload(async (c, dirs, cookie) => {
+test('upload: .fcode/.gitignore is `*\\n`; git status stays clean; info/exclude and the project .gitignore are never touched; no part file is left', () => withUpload(async (c, dirs, cookie) => {
   assert.equal(gitIn(dirs.alpha, 'init', '-q').status, 0);
   const ignore = Buffer.from('node_modules/\r\n*.log');
   fs.writeFileSync(path.join(dirs.alpha, '.gitignore'), ignore);
   gitIn(dirs.alpha, 'add', '.gitignore'); gitIn(dirs.alpha, 'commit', '-q', '-m', 'init');
   const ex = path.join(dirs.alpha, '.git', 'info', 'exclude');
-  fs.writeFileSync(ex, '# mine\n*.swp'); // no final newline: it must be kept and the new line must start on its own line
+  fs.writeFileSync(ex, '# mine\n*.swp'); // no final newline
+  const exBefore = fs.statSync(ex);
   assert.equal((await upPost(c, cookie, 'alpha', JPG)).status, 200);
   assert.equal((await upPost(c, cookie, 'alpha', PNG, { type: 'image/png' })).status, 200);
-  assert.equal(fs.readFileSync(ex, 'utf8'), '# mine\n*.swp\n/.fcode/\n');
+  const gi = path.join(dirs.alpha, '.fcode', '.gitignore');
+  assert.equal(fs.readFileSync(gi, 'utf8'), '*\n');
+  assert.deepEqual(fs.readdirSync(path.join(dirs.alpha, '.fcode')).sort(), ['.gitignore', 'uploads']); // no part file
+  assert.equal(fs.readFileSync(ex, 'utf8'), '# mine\n*.swp'); // byte for byte, not even rewritten
+  assert.equal(fs.statSync(ex).mtimeMs, exBefore.mtimeMs);
   assert.deepEqual(fs.readFileSync(path.join(dirs.alpha, '.gitignore')), ignore);
-  assert.equal(gitIn(dirs.alpha, 'status', '--porcelain').stdout, '');
-  // two uploads at once still add one line; a missing exclude file (and info/ dir) is created
+  assert.equal(gitIn(dirs.alpha, 'status', '--porcelain', '--untracked-files=all').stdout, '');
+  assert.equal(gitIn(dirs.alpha, 'check-ignore', '-q', '.fcode/uploads/x.jpg').status, 0);
+  // a missing info/ dir stays missing (nothing writes there); two uploads at a time (all the server admits) leave one clean file
   fs.rmSync(path.join(dirs.beta, '.git'), { recursive: true, force: true });
   assert.equal(gitIn(dirs.beta, 'init', '-q').status, 0);
   fs.rmSync(path.join(dirs.beta, '.git', 'info'), { recursive: true, force: true });
-  const rs = [...await Promise.all([1, 2].map(() => upPost(c, cookie, 'beta', JPG))), ...await Promise.all([1, 2].map(() => upPost(c, cookie, 'beta', JPG)))]; // two at a time: that is all the server admits
+  const rs = [...await Promise.all([1, 2].map(() => upPost(c, cookie, 'beta', JPG))), ...await Promise.all([1, 2].map(() => upPost(c, cookie, 'beta', JPG)))];
   assert.deepEqual(rs.map((r) => r.status), [200, 200, 200, 200]);
-  assert.equal(fs.readFileSync(path.join(dirs.beta, '.git', 'info', 'exclude'), 'utf8'), '/.fcode/\n');
-  assert.equal(gitIn(dirs.beta, 'status', '--porcelain').stdout, '');
+  assert.equal(fs.existsSync(path.join(dirs.beta, '.git', 'info')), false);
+  assert.equal(fs.readFileSync(path.join(dirs.beta, '.fcode', '.gitignore'), 'utf8'), '*\n');
+  assert.deepEqual(fs.readdirSync(path.join(dirs.beta, '.fcode')).sort(), ['.gitignore', 'uploads']);
+  assert.equal(gitIn(dirs.beta, 'status', '--porcelain', '--untracked-files=all').stdout, '');
+  // a leftover from an older version (an `/.fcode/` line in the exclude file) is harmless and stays
+  fs.writeFileSync(ex, '/.fcode/\n');
+  assert.equal((await upPost(c, cookie, 'alpha', JPG)).status, 200);
+  assert.equal(fs.readFileSync(ex, 'utf8'), '/.fcode/\n');
 }));
 
-test('upload: in a linked work tree the line goes where `git rev-parse --git-path info/exclude` says', () => withUpload(async (c, dirs, cookie) => {
+test('upload: a stale or edited .fcode/.gitignore is replaced by `*\\n` atomically (rename of a part file); a correct one is not rewritten', () => withUpload(async (c, dirs, cookie) => {
+  const fc = path.join(dirs.alpha, '.fcode'), gi = path.join(fc, '.gitignore');
+  fs.mkdirSync(fc);
+  fs.writeFileSync(gi, 'something else\n');
+  const calls = []; const orig = { open: fs.promises.open, rename: fs.promises.rename };
+  fs.promises.open = (f, flags, mode) => { if (String(f).includes('.gitignore')) calls.push(['open', path.basename(String(f)), flags, mode]); return orig.open.call(fs.promises, f, flags, mode); };
+  fs.promises.rename = (a, b) => { if (String(b).endsWith('.gitignore')) calls.push(['rename', path.dirname(String(a)) === fc, path.basename(String(a)).startsWith('.gitignore.fcode-part-'), String(b)]); return orig.rename.call(fs.promises, a, b); };
+  try { assert.equal((await upPost(c, cookie, 'alpha', JPG)).status, 200); const n = calls.length; assert.equal((await upPost(c, cookie, 'alpha', JPG)).status, 200); assert.equal(calls.length, n, 'a correct file is left alone'); } finally { Object.assign(fs.promises, orig); }
+  assert.equal(fs.readFileSync(gi, 'utf8'), '*\n');
+  const K = fs.constants;
+  assert.deepEqual(calls.map((x) => x[0]), ['open', 'rename']);
+  assert.deepEqual(calls[0].slice(2), [K.O_WRONLY | K.O_CREAT | K.O_EXCL | (K.O_NOFOLLOW ?? 0), 0o600]); // a new part file, never a link
+  assert.match(calls[0][1], /^\.gitignore\.fcode-part-\d+-[0-9a-f]{6}$/);
+  assert.deepEqual(calls[1].slice(1), [true, true, gi]); // same folder, then renamed over the target
+  assert.deepEqual(fs.readdirSync(fc).sort(), ['.gitignore', 'uploads']);
+}));
+
+test('upload: in a linked work tree git status stays clean and the common exclude file is not touched', () => withUpload(async (c, dirs, cookie) => {
   assert.equal(gitIn(dirs.alpha, 'init', '-q').status, 0);
   assert.equal(gitIn(dirs.alpha, 'commit', '-q', '--allow-empty', '-m', 'init').status, 0);
   assert.equal(gitIn(dirs.alpha, 'worktree', 'add', '-q', '-b', 'wt1', dirs.spaced).status, 0); // the project folder 'spaced' becomes a linked work tree
+  const common = path.join(dirs.alpha, '.git', 'info', 'exclude'), before = fs.existsSync(common) ? fs.readFileSync(common, 'utf8') : null;
   assert.equal((await upPost(c, cookie, 'spaced', JPG)).status, 200);
-  const common = path.join(dirs.alpha, '.git', 'info', 'exclude');
-  assert.equal(fs.readFileSync(common, 'utf8').split('\n').filter((l) => l === '/.fcode/').length, 1);
-  assert.equal(gitIn(dirs.spaced, 'status', '--porcelain').stdout, '');
+  assert.equal(fs.readFileSync(path.join(dirs.spaced, '.fcode', '.gitignore'), 'utf8'), '*\n');
+  assert.equal(gitIn(dirs.spaced, 'status', '--porcelain', '--untracked-files=all').stdout, '');
+  assert.equal(fs.existsSync(common) ? fs.readFileSync(common, 'utf8') : null, before);
+}));
+
+test('upload: projects inside a bigger repository (one with glob characters in its folder name) are hidden by their own .fcode/.gitignore; the repo exclude file is untouched', () => withUpload(async (c, dirs, cookie, base) => {
+  assert.equal(gitIn(base, 'init', '-q').status, 0);
+  fs.writeFileSync(path.join(base, 'README'), 'x'); gitIn(base, 'add', 'README'); gitIn(base, 'commit', '-q', '-m', 'init');
+  for (const p of ['nested', 'alpha', 'nested', 'alpha']) assert.equal((await upPost(c, cookie, p, JPG)).status, 200, p);
+  assert.equal(fs.readFileSync(path.join(dirs.nested, '.fcode', '.gitignore'), 'utf8'), '*\n');
+  assert.equal(gitIn(base, 'status', '--porcelain', '--untracked-files=all').stdout, '');
+  assert.equal(fs.existsSync(path.join(base, '.git', 'info', 'exclude')) && fs.readFileSync(path.join(base, '.git', 'info', 'exclude'), 'utf8').includes('.fcode'), false);
 }));
 
 test('upload: a folder that is not a git work tree works and gets no .git; git being missing does not fail the upload', () => withUpload(async (c, dirs, cookie) => {
@@ -5280,41 +5319,49 @@ test('upload: a device revoked while its body is coming in gets 401 and nothing 
   assert.deepEqual(tmuxCalls(c, 'load-buffer', 'paste-buffer', 'send-keys'), []);
 }));
 
-test('upload: a project inside a bigger repository is hidden too: the exclude line carries the folder prefix (glob characters escaped) and git status stays clean', () => withUpload(async (c, dirs, cookie, base) => {
-  assert.equal(gitIn(base, 'init', '-q').status, 0);
-  fs.writeFileSync(path.join(base, 'README'), 'x'); gitIn(base, 'add', 'README'); gitIn(base, 'commit', '-q', '-m', 'init');
-  for (const p of ['nested', 'alpha', 'nested', 'alpha']) assert.equal((await upPost(c, cookie, p, JPG)).status, 200, p);
-  const lines = fs.readFileSync(path.join(base, '.git', 'info', 'exclude'), 'utf8').split('\n').filter((l) => l.includes('.fcode'));
-  assert.deepEqual(lines.sort(), ['/a\\[1]/b/.fcode/', '/alpha/.fcode/']); // once each
-  assert.equal(gitIn(base, 'status', '--porcelain').stdout, '');
-}));
-
-test('upload: the exclude file is opened to append without following a link (O_WRONLY|O_APPEND|O_CREAT|O_NOFOLLOW)', () => withUpload(async (c, dirs, cookie) => {
+test('upload: nothing is ever opened or written in .git (no exclude append), even when info/exclude or info is a symlink', { skip: process.platform === 'win32' && 'symlinks need rights' }, () => withUpload(async (c, dirs, cookie) => {
   assert.equal(gitIn(dirs.alpha, 'init', '-q').status, 0);
-  const opened = []; const orig = fs.promises.open;
-  fs.promises.open = (f, flags, mode) => { if (String(f).endsWith('exclude')) opened.push([flags, mode]); return orig.call(fs.promises, f, flags, mode); };
-  try { assert.equal((await upPost(c, cookie, 'alpha', JPG)).status, 200); } finally { fs.promises.open = orig; }
-  const K = fs.constants;
-  assert.deepEqual(opened, [[K.O_WRONLY | K.O_APPEND | K.O_CREAT | (K.O_NOFOLLOW ?? 0), 0o644]]);
-}));
-
-test('upload: an info/exclude or info folder that is a symlink is never written through; the upload still succeeds', { skip: process.platform === 'win32' && 'symlinks need rights' }, () => withUpload(async (c, dirs, cookie) => {
-  assert.equal(gitIn(dirs.alpha, 'init', '-q').status, 0);
+  const touched = []; const orig = { open: fs.promises.open, rename: fs.promises.rename };
+  fs.promises.open = (f, ...a) => { if (String(f).includes('.git' + path.sep)) touched.push(String(f)); return orig.open.call(fs.promises, f, ...a); };
+  fs.promises.rename = (f, t) => { if (String(t).includes('.git' + path.sep)) touched.push(String(t)); return orig.rename.call(fs.promises, f, t); };
   const target = path.join(dirs.beta, 'target'); fs.writeFileSync(target, 'keep\n');
   const ex = path.join(dirs.alpha, '.git', 'info', 'exclude');
-  fs.rmSync(ex, { force: true }); fs.symlinkSync(target, ex);
-  const a = await upPost(c, cookie, 'alpha', JPG);
-  assert.equal(a.status, 200, a.text);
-  assert.ok(fs.existsSync(a.json.path));
-  assert.equal(fs.readFileSync(target, 'utf8'), 'keep\n'); // the link target is untouched
-  assert.ok(fs.lstatSync(ex).isSymbolicLink());
-  fs.unlinkSync(ex); fs.rmSync(path.join(dirs.alpha, '.git', 'info'), { recursive: true });
-  const elsewhere = path.join(dirs.beta, 'elsewhere'); fs.mkdirSync(elsewhere); fs.writeFileSync(path.join(elsewhere, 'exclude'), 'keep\n');
-  fs.symlinkSync(elsewhere, path.join(dirs.alpha, '.git', 'info'));
-  const b = await upPost(c, cookie, 'alpha', JPG);
-  assert.equal(b.status, 200, b.text);
-  assert.deepEqual(fs.readdirSync(elsewhere), ['exclude']);
-  assert.equal(fs.readFileSync(path.join(elsewhere, 'exclude'), 'utf8'), 'keep\n');
+  try {
+    fs.rmSync(ex, { force: true }); fs.symlinkSync(target, ex);
+    const a = await upPost(c, cookie, 'alpha', JPG);
+    assert.equal(a.status, 200, a.text);
+    assert.equal(fs.readFileSync(target, 'utf8'), 'keep\n'); // the link target is untouched
+    assert.ok(fs.lstatSync(ex).isSymbolicLink());
+    fs.unlinkSync(ex); fs.rmSync(path.join(dirs.alpha, '.git', 'info'), { recursive: true });
+    const elsewhere = path.join(dirs.beta, 'elsewhere'); fs.mkdirSync(elsewhere); fs.writeFileSync(path.join(elsewhere, 'exclude'), 'keep\n');
+    fs.symlinkSync(elsewhere, path.join(dirs.alpha, '.git', 'info'));
+    const b = await upPost(c, cookie, 'alpha', JPG);
+    assert.equal(b.status, 200, b.text);
+    assert.deepEqual(fs.readdirSync(elsewhere), ['exclude']);
+    assert.equal(fs.readFileSync(path.join(elsewhere, 'exclude'), 'utf8'), 'keep\n');
+  } finally { Object.assign(fs.promises, orig); }
+  assert.deepEqual(touched, []);
+}));
+
+test('upload: a symlinked .fcode/.gitignore is refused (500 storage), not followed, not replaced, and no file is stored', { skip: process.platform === 'win32' && 'symlinks need rights' }, () => withUpload(async (c, dirs, cookie) => {
+  const fc = path.join(dirs.alpha, '.fcode'), gi = path.join(fc, '.gitignore');
+  const target = path.join(dirs.beta, 'target'); fs.writeFileSync(target, 'keep\n');
+  fs.mkdirSync(fc); fs.symlinkSync(target, gi);
+  const r = await upPost(c, cookie, 'alpha', JPG);
+  assert.deepEqual([r.status, r.json], [500, { error: 'storage' }]);
+  assert.equal(fs.readFileSync(target, 'utf8'), 'keep\n');
+  assert.ok(fs.lstatSync(gi).isSymbolicLink());
+  assert.deepEqual(fs.readdirSync(fc).filter((n) => n !== '.gitignore'), ['uploads']); // the uploads folder exists but holds nothing, no part file
+  assert.deepEqual(fs.readdirSync(path.join(fc, 'uploads')), []);
+  // a dangling link too, and a folder named .gitignore
+  fs.unlinkSync(gi); fs.symlinkSync(path.join(dirs.beta, 'missing'), gi);
+  assert.equal((await upPost(c, cookie, 'alpha', JPG)).status, 500);
+  assert.equal(fs.existsSync(path.join(dirs.beta, 'missing')), false);
+  fs.unlinkSync(gi); fs.mkdirSync(gi);
+  assert.equal((await upPost(c, cookie, 'alpha', JPG)).status, 500);
+  fs.rmdirSync(gi);
+  assert.equal((await upPost(c, cookie, 'alpha', JPG)).status, 200); // back to normal once the obstacle is gone
+  assert.equal(fs.readFileSync(gi, 'utf8'), '*\n');
 }));
 
 test('upload: the sweep goes on after one file fails to be deleted', () => withUpload(async (c, dirs, cookie) => {
@@ -5330,12 +5377,13 @@ test('upload: the sweep goes on after one file fails to be deleted', () => withU
   assert.equal(old.filter((f) => fs.existsSync(f)).length, 1, 'only the one that failed is left'); // whichever the listing gave first
 }));
 
-test('upload: a git that hangs is killed after 10 s and the upload goes on', () => withUpload(async (c, dirs, cookie) => {
+test('upload: git is not run at all (a git that hangs does not delay the upload)', () => withUpload(async (c, dirs, cookie) => {
   const t0 = Date.now();
   const r = await upPost(c, cookie, 'alpha', JPG);
   const took = Date.now() - t0;
   assert.equal(r.status, 200, r.text);
-  assert.ok(took >= 9500 && took < 25000, `took ${took} ms`);
+  assert.ok(took < 5000, `took ${took} ms`);
+  assert.equal(fs.readFileSync(path.join(dirs.alpha, '.fcode', '.gitignore'), 'utf8'), '*\n');
 }, { git: [process.execPath, '-e', 'setTimeout(() => {}, 60000)', '--'] })); // the arguments the server adds come after `--`: they are the script's, not node's
 
 // ---- 1.3.3 rework r3: short by default, long only when admitted; the client-gone check; refused uploads close the connection ----

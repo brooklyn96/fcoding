@@ -1210,29 +1210,38 @@ def write_exclude(p, data):
             os.unlink(part)
 
 
+def is_link(p):
+    # the exclude file or its folder is a link: fcode never writes through or over one (the laptop's rule)
+    return os.path.islink(p) or os.path.islink(os.path.dirname(p))
+
+
 def ensure_excluded(d, name):
     # the pair "# fcode" + "/<ten>" in .git/info/exclude (never .gitignore) when git does not ignore the file yet; an exact "/<ten>"
-    # already there is the user's: nothing added, nothing claimed
+    # already there is the user's: nothing added, nothing claimed.
+    # True = git ignores <name> now; False = it could not be made so (git did not answer, no exclude path, or a link: nothing written)
     ig = git(d, 'check-ignore', '-q', '--', name)
-    if ig is None or ig.returncode == 0:
-        return
+    if ig is None or ig.returncode not in (0, 1):
+        return False
+    if ig.returncode == 0:
+        return True
     p = exclude_path(d)
-    if not p:
-        return
+    if not p or is_link(p):
+        return False
     os.makedirs(os.path.dirname(p), exist_ok=True)
     cur = read_exclude(p)
     line = b'/' + name.encode('utf-8')
     if line in cur.splitlines():
-        return
+        return True
     nl = b'\r\n' if b'\r\n' in cur else b'\n'
     write_exclude(p, cur + (b'' if not cur or cur.endswith(b'\n') else nl) + MARK + nl + line + nl)
+    return True
 
 
 def unexclude(d, name, legacy):
     # give fcode's line back: the pair, or the bare "/<ten>" only when legacy (a line 1.3.2/1.3.3 added; the laptop kept its record).
-    # True = no line of fcode's is there now (removed, or not there); False = git could not say where the file is
+    # True = no line of fcode's is there now (removed, or not there); False = git could not say where the file is, or the file / its folder is a link (nothing written)
     p = exclude_path(d)
-    if not p:
+    if not p or is_link(p):
         return False
     if not os.path.exists(p):
         return True
@@ -1274,11 +1283,16 @@ def place_note(d, name, src, expect, sha=''):
         shutil.copyfile(src, part)
         st = os.stat(src)
         os.utime(part, (st.st_atime, st.st_mtime))
+        try:
+            ok = ensure_excluded(d, name)   # the pair first, then the move (the laptop's order): a kill leaves at most an inert pair, never a visible unexcluded note
+        except OSError:
+            ok = False
+        if not ok:
+            return 'failed'
         os.replace(part, dst)
     finally:
         if os.path.exists(part):
             os.unlink(part)
-    ensure_excluded(d, name)
     return 'ok'
 
 
@@ -2675,7 +2689,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
         foreach ($k in @($res.notePlaced)) { if ($k) { $noteRec[[string]$k] = $noteShaPut[[string]$k]; $stat.noteCopied++; $placedPut++ } }
         foreach ($k in @($res.unexcluded)) { if ($k) { [void]$noteDel.Add("exclude:box:$k"); [void]$noteDel.Add([string]$k) } }
         # a release the box could not do (it could not find its exclude file): a failure, nothing forgotten, the next run tries again
-        foreach ($x in @($pb.Unexclude)) { if (@($res.unexcluded) -notcontains "$($x.project)/$($x.name)") { $code = 1; Write-PhienOut "  [$($x.project)] lỗi: ghi chú $($x.name): box chưa gỡ được dòng /$($x.name) của fcode trong .git/info/exclude (git trên box lỗi), lần sau thử lại" } }
+        foreach ($x in @($pb.Unexclude)) { if (@($res.unexcluded) -notcontains "$($x.project)/$($x.name)") { $code = 1; Write-PhienOut "  [$($x.project)] lỗi: ghi chú $($x.name): box chưa gỡ được dòng /$($x.name) của fcode trong .git/info/exclude (liên kết, hoặc git trên box lỗi), lần sau thử lại" } }
         & $saveNotes
         'ok'
       }
