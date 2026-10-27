@@ -896,6 +896,38 @@ if ($env:FCODE_TEST_BOX) {
       Eq (Invoke-RealBox "cat $bt/infodir/exclude") '# shared2' 'folder link: nothing written through it'
     } finally { [void](Invoke-RealBox "rm -rf $bt; echo ok") }
   }
+  # r9 (Rule H): a release rewrites the exclude file only once .fcode/.gitignore holds "*"; a dangling link in that place is never followed or replaced (the release waits)
+  T 'real box: a release with a dangling link at .fcode/.gitignore: the link is never followed or replaced and the release waits (error line, exit 1); link gone: released' {
+    $bt = Invoke-RealBox 'mktemp -d /tmp/fcode-phien-test-XXXXXXXX'; Ok ($bt -match '\A/tmp/fcode-phien-test-[A-Za-z0-9]{8}\z') "throwaway dir: $bt"; $bp = "$bt/ws/proj"
+    $w = New-World 'real5'
+    [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ instabox = $RealIb; box = 'coder'; syncRepos = @($w.LP) } | ConvertTo-Json -Compress))
+    $sd = "$bt/.omp/agent/sessions/$(Get-OmpEncodedDir $bp $bt "$bt/tmp")"
+    try {
+      $cfgB64 = [Convert]::ToBase64String($utf8.GetBytes((@{ projects = @{ proj = $bp } } | ConvertTo-Json -Compress)))
+      [void](Invoke-RealBox "mkdir -p $bp $sd $bt/tmp && git -C $bp init -q && echo $cfgB64 | base64 -d > $bt/cfg.json && echo ready")
+      New-GitDir $w.LP; Put-File "$($w.LP)\HANDOFF-laptop.md" 'laptop handoff'
+      $env0 = @{ FCODE_PHIEN_BOXENV = "HOME=$bt TMPDIR=$bt/tmp FCODE_CFG=$bt/cfg.json" }
+      $r = Invoke-Fcode $w @('phien') $env0; Eq $r.Code 0 $r.Out
+      Ok ((Invoke-RealBox "cat $bp/.git/info/exclude") -match '(?m)^# fcode\r?\n/HANDOFF-laptop\.md$') 'the pair is on the box'
+      [void](Invoke-RealBox "mkdir -p $bp/.fcode && ln -s $bt/nowhere $bp/.fcode/.gitignore && echo ok")
+      Git-Commit $w.LP @('HANDOFF-laptop.md')
+      $r = Invoke-Fcode $w @('phien') $env0; Eq $r.Code 1 $r.Out
+      Ok (($r.Out + (Get-Content (Join-Path $w.U '.fcode\phien.log') -Raw -ErrorAction SilentlyContinue)) -match '\[proj\] lỗi: ghi chú HANDOFF-laptop\.md: box chưa gỡ được dòng /HANDOFF-laptop\.md của fcode trong \.git/info/exclude \(liên kết, git trên box lỗi, hoặc chưa tạo được \.fcode/\.gitignore\), lần sau thử lại') ('the release error line: ' + $r.Out)
+      Ok ((Invoke-RealBox "cat $bp/.git/info/exclude") -match '(?m)^# fcode\r?\n/HANDOFF-laptop\.md$') 'the pair is still on the box (the release waits)'
+      Eq (Invoke-RealBox "readlink $bp/.fcode/.gitignore") "$bt/nowhere" 'the dangling link is still there'
+      Eq (Invoke-RealBox "test -e $bt/nowhere && echo yes || echo no") 'no' 'nothing was made at the link target'
+      Eq (Invoke-RealBox "ls -A $bp/.fcode") '.gitignore' 'nothing else in .fcode'
+      # a link to an existing file: not followed (nothing written into the target) and not replaced either
+      [void](Invoke-RealBox "rm $bp/.fcode/.gitignore && printf 'keep\n' > $bt/target && ln -s $bt/target $bp/.fcode/.gitignore && echo ok")
+      $r = Invoke-Fcode $w @('phien') $env0; Eq $r.Code 1 $r.Out
+      Eq (Invoke-RealBox "readlink $bp/.fcode/.gitignore") "$bt/target" 'the link to a file is still a link'; Eq (Invoke-RealBox "cat $bt/target") 'keep' 'nothing written through it'
+      Ok ((Invoke-RealBox "cat $bp/.git/info/exclude") -match '(?m)^# fcode\r?\n/HANDOFF-laptop\.md$') 'the pair is still on the box'      [void](Invoke-RealBox "rm $bp/.fcode/.gitignore && echo ok")
+      $r = Invoke-Fcode $w @('phien') $env0; Eq $r.Code 0 $r.Out
+      Ok ((Invoke-RealBox "cat $bp/.git/info/exclude") -notmatch 'HANDOFF-laptop') 'link gone: the release removed the pair'
+      Eq (Invoke-RealBox "cat $bp/.fcode/.gitignore") '*' '.fcode/.gitignore holds *'
+      Eq (Invoke-RealBox "ls -A $bp/.fcode") '.gitignore' 'nothing else in .fcode'
+    } finally { [void](Invoke-RealBox "rm -rf $bt; echo ok") }
+  }
   T 'real box: a session file that a box process holds open is left alone (busy) and its top waits; once closed, the next run updates it' {
     $bt = Invoke-RealBox 'mktemp -d /tmp/fcode-phien-test-XXXXXXXX'; Ok ($bt -match '\A/tmp/fcode-phien-test-[A-Za-z0-9]{8}\z') "throwaway dir: $bt"; $bp = "$bt/ws/proj"
     $w = New-World 'real2'
@@ -2382,7 +2414,7 @@ T 'nhanh r6: the box cannot find its exclude file during a release: failure line
   Ok (Test-Path -LiteralPath "$bpw\.git-x") ('the wrapper broke the box repo before the put: ' + (Read-PhienLog $w))
   Rename-Item -LiteralPath "$bpw\.git-x" -NewName '.git'
   Eq $r.Code 1 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $FailMsg 'the failure line'
-  Ok ((Read-PhienLog $w) -match '\[proj\] lỗi: ghi chú HANDOFF-lap\.md: box chưa gỡ được dòng /HANDOFF-lap\.md của fcode trong \.git/info/exclude \(liên kết, hoặc git trên box lỗi\), lần sau thử lại') ('logged: ' + (Read-PhienLog $w))
+  Ok ((Read-PhienLog $w) -match '\[proj\] lỗi: ghi chú HANDOFF-lap\.md: box chưa gỡ được dòng /HANDOFF-lap\.md của fcode trong \.git/info/exclude \(liên kết, git trên box lỗi, hoặc chưa tạo được \.fcode/\.gitignore\), lần sau thử lại') ('logged: ' + (Read-PhienLog $w))
   Ok ((Get-Content $bex -Raw) -match '(?m)^# fcode\r?\n/HANDOFF-lap\.md\r?$') 'the pair is still on the box'
   Ok ($null -ne (Get-NoteState $w).PSObject.Properties['proj/HANDOFF-lap.md']) 'nothing forgotten'
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
@@ -2393,7 +2425,7 @@ T 'nhanh r6: the box cannot find its exclude file during a release: failure line
 T 'notes r6: the box rewrites .git/info/exclude atomically and sweeps only its own part files beside it' {
   foreach ($fn in 'ensure_excluded', 'unexclude') {
     $mm = [regex]::Match($PhienPy, "(?ms)^def $fn\(.*?(?=^\S)")
-    Ok $mm.Success "found $fn"; Ok ($mm.Value -notmatch 'open\(') "$fn opens no file itself (reads: read_exclude, writes: write_exclude)"
+    Ok $mm.Success "found $fn"; Ok ($mm.Value -notmatch 'open\(') "$fn opens no file itself (reads: read_exclude, writes: append_exclude / write_exclude)"
   }
   $d = Join-Path $Root 't7'; [void](New-Item -ItemType Directory -Force -Path $d); $p = Join-Path $d 'exclude'; $drv = Join-Path $Root 't7.py'
   [IO.File]::WriteAllText($drv, ("import os, runpy, sys`nm = runpy.run_path(sys.argv[1], run_name='x')`np, missing = sys.argv[2], sys.argv[3]`norig = b'# user\r\n/a\r\n'`n" +
@@ -2496,7 +2528,7 @@ T 'nhanh r7: a git whose rev-parse --git-path fails after ls-files answered: no 
 function Invoke-BoxDriver([string]$Name, [string]$Body, [string]$Dir) {
   $drv = Join-Path $Root "$Name.py"
   [IO.File]::WriteAllText($drv, ("import os, runpy, sys`nm = runpy.run_path(sys.argv[1], run_name='x')`nd = sys.argv[2]`ng = m['place_note'].__globals__`n" +
-    "p = os.path.join(d, '.git', 'info', 'exclude')`ninfo = os.path.dirname(p)`nname = 'HANDOFF.md'`n" + $Body), $utf8)
+    "p = os.path.join(d, '.git', 'info', 'exclude')`ninfo = os.path.dirname(p)`nname = 'HANDOFF.md'`n" + ($Body -replace "`r`n", "`n")), $utf8)
   @(python -I $drv $PyFile $Dir)
 }
 # r7 R2-1: place_note puts the pair first, then moves the note; a failed pair leaves no note on the box
@@ -2536,29 +2568,155 @@ T 'notes r7: an exclude file without a final newline: the separator newline fcod
     "print(m['unexclude'](d, name, False), open(p, 'rb').read() == b'abc\n')`n") $d
   Eq ($out -join ',') 'True True,True True' 'box: the same'
 }
-# r8 (mixed versions): a 1.3.3 server.mjs appends "/.fcode/" to .git/info/exclude on upload; if that append lands between the box writer's read and its
-# os.replace it is lost. The box writer therefore makes sure .fcode/.gitignore ("*") exists first, like the 1.3.4 server does
-T 'notes r8: a /.fcode/ line a 1.3.3 server appends between the box writer''s read and replace is lost, yet the uploads stay ignored (ensure and unexclude)' {
-  $d = Join-Path $Root 'r8a'; New-GitDir $d
-  $out = Invoke-BoxDriver 'r8a' ("import subprocess`nfc = os.path.join(d, '.fcode')`ngi = os.path.join(fc, '.gitignore')`nos.makedirs(os.path.join(fc, 'uploads'))`nopen(os.path.join(fc, 'uploads', 'x.png'), 'wb').write(b'x')`n" +
-    "def ignored():`n    return subprocess.run(['git', '-C', d, 'check-ignore', '-q', '--', '.fcode/uploads/x.png']).returncode == 0`n" +
-    "real = g['read_exclude']`n" +
-    "def racy(q):`n    b = real(q)`n    open(q, 'ab').write(b'/.fcode/\n')`n    return b`n" +
-    "print(ignored())`ng['read_exclude'] = racy`n" +
-    "print(m['ensure_excluded'](d, name), b'/.fcode/' not in open(p, 'rb').read(), ignored(), open(gi, 'rb').read() == b'*\n')`n" +
-    "os.unlink(gi)`nopen(p, 'wb').write(b'# fcode\n/HANDOFF.md\n')`n" +
-    "print(m['unexclude'](d, name, False), b'/.fcode/' not in open(p, 'rb').read(), ignored(), open(gi, 'rb').read() == b'*\n')`n") $d
-  Eq ($out -join ',') 'False,True True True True,True True True True' 'before: uploads show; ensure: the appended line is lost but .gitignore keeps them ignored; the same for a release'
+# r9 (mixed versions, decision-134-r3): the box ADDS its pair with one O_APPEND write (it composes with the 1.3.3 server's own append of "/.fcode/"),
+# only the release rewrites the file, and before that rewrite .fcode/.gitignore = "*" is made to exist (a lost "/.fcode/" line then exposes nothing)
+T 'notes r9: a /.fcode/ line a 1.3.3 server appends while the box adds its pair is kept; one appended inside a release''s rewrite is lost, but .fcode/.gitignore made before it keeps the uploads hidden' {
+  $d = Join-Path $Root 'r9a'; New-GitDir $d
+  $out = Invoke-BoxDriver 'r9a' @'
+import subprocess, shutil
+fc = os.path.join(d, '.fcode')
+gi = os.path.join(fc, '.gitignore')
+def ign(rel):
+    return subprocess.run(['git', '-C', d, 'check-ignore', '-q', '--', rel]).returncode == 0
+def parts():
+    return [n for n in os.listdir(info) if '.fcode-part-' in n]
+def mkup():
+    os.makedirs(os.path.join(fc, 'uploads'))
+    open(os.path.join(fc, 'uploads', 'x.png'), 'wb').write(b'x')
+real = g['read_exclude']
+def racy(q):
+    b = real(q)
+    if os.path.normpath(q) == os.path.normpath(p):
+        open(q, 'ab').write(b'/.fcode/\n')
+    return b
+g['read_exclude'] = racy
+open(p, 'wb').write(b'# user\n/keep\n')
+print(m['ensure_excluded'](d, name), open(p, 'rb').read() == b'# user\n/keep\n/.fcode/\n# fcode\n/HANDOFF.md\n', not os.path.exists(fc))
+mkup()
+print(ign('.fcode/uploads/x.png'), ign(name), parts() == [], not os.path.exists(gi))
+shutil.rmtree(fc)
+open(p, 'wb').write(b'# user\n/keep\n# fcode\n/HANDOFF.md\n')
+print(m['unexclude'](d, name, False), open(p, 'rb').read() == b'# user\n/keep\n', open(gi, 'rb').read() == b'*\n', sorted(os.listdir(fc)) == ['.gitignore'])
+mkup()
+print(ign('.fcode/uploads/x.png'), subprocess.run(['git', '-C', d, 'status', '--porcelain'], capture_output=True, text=True).stdout.strip() == '')
+'@ $d
+  Eq ($out -join ',') 'True True True,True True True True,True True True True,True True' 'add: both appends kept, nothing created; the uploads made after are ignored; release: the line is lost, the folder own .gitignore hides the uploads, git status is clean'
 }
-T 'notes r8: the .fcode/.gitignore guard never overwrites a file, never follows a link and never creates the folder' {
-  $d = Join-Path $Root 'r8b'; New-GitDir $d
-  $out = Invoke-BoxDriver 'r8b' ("fc = os.path.join(d, '.fcode')`ngi = os.path.join(fc, '.gitignore')`nos.makedirs(os.path.join(fc, 'uploads'))`n" +
-    "def fresh():`n    open(p, 'wb').write(b'')`n" +
-    "open(gi, 'wb').write(b'keep\n')`nfresh()`nprint(m['ensure_excluded'](d, name), open(gi, 'rb').read() == b'keep\n', sorted(os.listdir(fc)) == ['.gitignore', 'uploads'])`n" +
-    "os.unlink(gi)`nfresh()`nlinks = {os.path.normpath(fc)}`nos.path.islink = lambda q: os.path.normpath(q) in links`n" +
-    "print(m['ensure_excluded'](d, name), os.path.exists(gi), os.listdir(fc))`n" +
-    "links.clear()`nimport shutil`nshutil.rmtree(fc)`nfresh()`nprint(m['ensure_excluded'](d, name), os.path.exists(fc))`n") $d
-  Eq ($out -join ',') "True True True,True False ['uploads'],True False" 'an existing .gitignore stays as it is; a linked .fcode gets nothing; no .fcode folder: none made'
+T 'notes r9: a release rewrites the exclude file only when .fcode/.gitignore is verified to hold "*": other content and an empty file are replaced (the server''s own rule); a linked .fcode or .gitignore, a non-file, a failed write and a torn write defer the release (False, the pair stays)' {
+  $d = Join-Path $Root 'r9b'; New-GitDir $d
+  $out = Invoke-BoxDriver 'r9b' @'
+import shutil
+fc = os.path.join(d, '.fcode')
+gi = os.path.join(fc, '.gitignore')
+pair = b'# fcode\n/HANDOFF.md\n'
+def run():
+    open(p, 'wb').write(pair)
+    return m['unexclude'](d, name, False)
+def exb():
+    return open(p, 'rb').read()
+def rd():
+    return open(gi, 'rb').read()
+os.makedirs(fc)
+open(gi, 'wb').write(b'keep\n')
+print(run(), rd() == b'*\n', sorted(os.listdir(fc)) == ['.gitignore'], exb() == b'')
+open(gi, 'wb').write(b'')
+print(run(), rd() == b'*\n', exb() == b'')
+shutil.rmtree(fc)
+os.makedirs(fc)
+links = set()
+os.path.islink = lambda q: os.path.normpath(q) in links
+links.add(os.path.normpath(fc))
+print(run(), not os.path.exists(gi), exb() == pair)
+shutil.rmtree(fc)
+print(run(), not os.path.exists(fc), exb() == pair)
+links.clear()
+os.makedirs(fc)
+open(gi, 'wb').write(b'')
+links.add(os.path.normpath(gi))
+print(run(), os.path.getsize(gi) == 0, exb() == pair)
+links.clear()
+shutil.rmtree(fc)
+os.makedirs(gi)
+print(run(), os.path.isdir(gi), exb() == pair)
+shutil.rmtree(fc)
+os.makedirs(fc)
+realw = g['write_exclude']
+def boom(q, b):
+    raise OSError('x')
+g['write_exclude'] = boom
+print(run(), not os.path.exists(gi), exb() == pair)
+g['write_exclude'] = lambda q, b: open(q, 'wb').close()
+print(run(), os.path.getsize(gi) == 0, exb() == pair)
+g['write_exclude'] = realw
+print(run(), rd() == b'*\n', exb() == b'')
+'@ $d
+  Eq ($out -join ',') 'True True True True,True True True,False True True,False True True,False True True,False True True,False True True,False True True,True True True' 'wrong content and an empty file are replaced; a link, a directory, a failed or a torn write: False and the pair stays; then it works'
+}
+T 'notes r9: a short append is a failure (no note) and the next run completes the pair; a 1.3.3 append right after a short write glues the two patterns (both inert until the next run)' {
+  $d = Join-Path $Root 'r9d'; New-GitDir $d; Put-File (Join-Path $Root 'r9d-src.md') 'note'
+  $out = Invoke-BoxDriver 'r9d' @'
+import subprocess
+src = os.path.join(os.path.dirname(d), 'r9d-src.md')
+dst = os.path.join(d, name)
+def parts():
+    return [n for n in os.listdir(d) if '.fcode-part-' in n]
+def ens():
+    try:
+        return m['ensure_excluded'](d, name)
+    except OSError:
+        return 'raised'
+def ign():
+    return subprocess.run(['git', '-C', d, 'check-ignore', '-q', '--', name]).returncode == 0
+real = os.write
+open(p, 'wb').write(b'')
+os.write = lambda fd, b: real(fd, b[:-1])
+print(ens())
+open(p, 'wb').write(b'')
+print(m['place_note'](d, name, src, ''), os.path.exists(dst), parts() == [], open(p, 'rb').read() == b'# fcode\n/HANDOFF.md')
+os.write = real
+print(ens(), open(p, 'rb').read() == b'# fcode\n/HANDOFF.md', m['place_note'](d, name, src, ''))
+os.unlink(dst)
+open(p, 'wb').write(b'# user\n')
+os.write = lambda fd, b: (real(fd, b[:-1]), open(p, 'ab').write(b'/.fcode/\n'))[0]
+print(m['place_note'](d, name, src, ''), not os.path.exists(dst), open(p, 'rb').read() == b'# user\n# fcode\n/HANDOFF.md/.fcode/\n')
+os.write = real
+print(ens(), open(p, 'rb').read() == b'# user\n# fcode\n/HANDOFF.md/.fcode/\n# fcode\n/HANDOFF.md\n', ign())
+'@ $d
+  Eq ($out -join ',') 'raised,failed False True True,True True ok,failed True True,True True True' 'the append raises on a short write; cut pair: no note; the exact line is there next time (git honours it), placed; glued: no note, a fresh pair completes it'
+}
+T 'notes r9: a /<name> line git does not honour (a .gitignore negation outranks info/exclude): the box adds nothing over the user''s line and places no note; its own pair that git does not honour places no note either; negation gone: placed' {
+  $d = Join-Path $Root 'r9e'; New-GitDir $d; Put-File (Join-Path $Root 'r9e-src.md') 'note'
+  $out = Invoke-BoxDriver 'r9e' @'
+src = os.path.join(os.path.dirname(d), 'r9e-src.md')
+dst = os.path.join(d, name)
+neg = os.path.join(d, '.gitignore')
+def parts():
+    return [n for n in os.listdir(d) if '.fcode-part-' in n]
+open(neg, 'wb').write(b'!HANDOFF.md\n')
+u = b'/HANDOFF.md\n'
+open(p, 'wb').write(u)
+print(m['ensure_excluded'](d, name), open(p, 'rb').read() == u, m['place_note'](d, name, src, ''), os.path.exists(dst), parts() == [])
+pair = b'# fcode\n/HANDOFF.md\n'
+open(p, 'wb').write(b'')
+print(m['ensure_excluded'](d, name), open(p, 'rb').read() == pair)
+print(m['ensure_excluded'](d, name), open(p, 'rb').read() == pair)
+os.unlink(neg)
+print(m['ensure_excluded'](d, name), open(p, 'rb').read() == pair, m['place_note'](d, name, src, ''), os.path.exists(dst))
+'@ $d
+  Eq ($out -join ',') 'False True failed False True,False True,False True,True True ok True' 'a negated name is never placed (the user''s line untouched, no duplicate pair); once git hides it, it is placed'
+}
+T 'nhanh r9: a .gitignore negation on the laptop (!HANDOFF.md) outranks the pair: the note from the box is not placed until the negation is gone' {
+  $w = New-W2 'q40'; Use-LoggedIb $w
+  New-GitDir $w.LP; New-GitDir $w.BP
+  [IO.File]::WriteAllText("$($w.LP)\.gitignore", "!HANDOFF.md`n"); Put-File "$($w.BP)\HANDOFF.md" 'box handoff'
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Ok (-not (Test-Path "$($w.LP)\HANDOFF.md")) 'the note is not placed'
+  Ok ((Get-Content "$($w.LP)\.git\info\exclude" -Raw) -match '(?m)^# fcode\r?\n/HANDOFF\.md\r?$') 'the pair was written (inert)'
+  Eq @((Get-NoteState $w).PSObject.Properties).Count 0 'no state recorded'; Eq @(Get-ChildItem $w.LP -Force -Filter '*.fcode-part*').Count 0 'no part file in the project'
+  Remove-Item -LiteralPath "$($w.LP)\.gitignore"
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Eq (Get-Content "$($w.LP)\HANDOFF.md" -Raw) 'box handoff' 'the negation gone: placed'
+  Ok ($null -ne (Get-NoteState $w).PSObject.Properties['proj/HANDOFF.md']) 'and its sha recorded'
 }
 # r8: an OSError of ensure_excluded in the put's ensure loop is a False, not a traceback: the reply is still sent, the run does not fail as a whole
 T 'nhanh r8: the box cannot read its exclude file in the put''s ensure step (it is a folder): the put still answers, exit 0' {

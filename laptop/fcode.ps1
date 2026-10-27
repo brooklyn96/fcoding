@@ -1183,9 +1183,8 @@ def pid_gone(pid):
     return False
 
 
-def write_exclude(p, data):
-    # the one way the box rewrites .git/info/exclude: a part file beside it, then os.replace (a kill leaves the old file or the new one).
-    # First its own leftovers there go: exactly <leaf>.fcode-part-<PID>-<6hex>, over 1 h old or of a PID that no longer runs
+def sweep_exclude_parts(p):
+    # fcode's own leftovers beside the exclude file go: exactly <leaf>.fcode-part-<PID>-<6hex>, over 1 h old or of a PID that no longer runs
     d, leaf = os.path.split(p)
     rx = re.compile(re.escape(leaf) + r'\.fcode-part-([0-9]+)-[0-9a-f]{6}')
     try:
@@ -1200,6 +1199,11 @@ def write_exclude(p, data):
                 os.unlink(q)
         except OSError:
             pass
+
+
+def write_exclude(p, data):
+    # the one way the box REWRITES .git/info/exclude (the release): a part file beside it, then os.replace (a kill leaves the old file or the new one)
+    sweep_exclude_parts(p)
     part = part_name(p)
     try:
         with open(part, 'wb') as f:
@@ -1210,40 +1214,54 @@ def write_exclude(p, data):
             os.unlink(part)
 
 
+def append_exclude(p, data):
+    # the one way the box ADDS to .git/info/exclude: one O_APPEND write (the pair in one syscall). It composes with any other appender
+    # (a 1.3.3 server.mjs adds "/.fcode/" the same way); a read-then-replace could drop a line appended in between. O_NOFOLLOW: a link is
+    # never written through (is_link already said no). write(2) may write less than asked: that is a failure (no note), never a success
+    sweep_exclude_parts(p)
+    fd = os.open(p, os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0), 0o644)
+    try:
+        if os.write(fd, data) != len(data):
+            raise OSError('short write')
+    finally:
+        os.close(fd)
+
+
 def is_link(p):
     # the exclude file or its folder is a link: fcode never writes through or over one (the laptop's rule)
     return os.path.islink(p) or os.path.islink(os.path.dirname(p))
 
 
-def guard_fcode(d):
-    # Mixed versions: a 1.3.3 server.mjs appends "/<prefix>.fcode/" to .git/info/exclude on upload, and a rewrite below (read, then os.replace) can
-    # drop an append that lands in between, which would show the uploads in git status. So whenever this run is about to touch the exclude file,
-    # the project's upload folder gets what the 1.3.4 server writes: .fcode/.gitignore = "*". Only when .fcode is a real folder and that file is
-    # not there at all (never overwritten, a link never followed); the folder is never created; any OSError is ignored
+def hide_uploads(d):
+    # Rule H: the one rewrite of .git/info/exclude (a release) can drop a "/.fcode/" line a 1.3.3 server.mjs appends during it (on a project's
+    # FIRST upload, before it makes .fcode). So the rewrite is allowed only once the uploads folder hides itself: .fcode/.gitignore holds exactly
+    # "*\n", VERIFIED by reading it back. The folder is made when missing (the one the server makes for photos); the file is FCode's own and the
+    # server keeps it at "*\n" too, so a regular file with any other content (an empty one included) is replaced through write_exclude (part file +
+    # os.replace; its sweep removes stale ".gitignore.fcode-part-*" there, the server's own leftover name); a link at .fcode or .gitignore, or a
+    # non-file there, is never followed or replaced. False = not verified: the caller does not rewrite, the release waits for the next run
     fc = os.path.join(d, '.fcode')
     f = os.path.join(fc, '.gitignore')
-    part = part_name(f)
+
+    def ok():
+        return not os.path.islink(fc) and not os.path.islink(f) and os.path.isfile(f) and os.path.getsize(f) == 2 and read_exclude(f) == b'*\n'
     try:
-        if os.path.islink(fc) or not os.path.isdir(fc) or os.path.lexists(f):
-            return
-        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0), 0o600)
-        with os.fdopen(fd, 'wb') as h:
-            h.write(b'*\n')
-        if not os.path.lexists(f):
-            os.replace(part, f)
+        if os.path.islink(fc):
+            return False
+        os.makedirs(fc, mode=0o700, exist_ok=True)
+        if os.path.islink(fc) or os.path.islink(f) or (os.path.lexists(f) and not os.path.isfile(f)):
+            return False
+        if not ok():
+            write_exclude(f, b'*\n')
+        return ok()
     except OSError:
-        pass
-    finally:
-        try:
-            os.unlink(part)
-        except OSError:
-            pass
+        return False
 
 
 def ensure_excluded(d, name):
     # the pair "# fcode" + "/<ten>" in .git/info/exclude (never .gitignore) when git does not ignore the file yet; an exact "/<ten>"
     # already there is the user's: nothing added, nothing claimed.
-    # True = git ignores <name> now; False = it could not be made so (git did not answer, no exclude path, or a link: nothing written)
+    # True = git ignores <name> now (asked again after the write); False = it could not be made so, or git still shows it (a `!<ten>` in a
+    # .gitignore outranks info/exclude): nothing placed, tried again next run
     ig = git(d, 'check-ignore', '-q', '--', name)
     if ig is None or ig.returncode not in (0, 1):
         return False
@@ -1252,31 +1270,31 @@ def ensure_excluded(d, name):
     p = exclude_path(d)
     if not p or is_link(p):
         return False
-    guard_fcode(d)
     os.makedirs(os.path.dirname(p), exist_ok=True)
     cur = read_exclude(p)
     line = b'/' + name.encode('utf-8')
-    if line in cur.splitlines():
-        return True
-    nl = b'\r\n' if b'\r\n' in cur else b'\n'
-    write_exclude(p, cur + (b'' if not cur or cur.endswith(b'\n') else nl) + MARK + nl + line + nl)
-    return True
+    if line not in cur.splitlines():          # an exact "/<ten>" already there is the user's: nothing added, nothing claimed
+        nl = b'\r\n' if b'\r\n' in cur else b'\n'
+        append_exclude(p, (b'' if not cur or cur.endswith(b'\n') else nl) + MARK + nl + line + nl)
+    ig = git(d, 'check-ignore', '-q', '--', name)   # git's own answer after the write: a line git does not honour places no note
+    return bool(ig is not None and ig.returncode == 0)
 
 
 def unexclude(d, name, legacy):
     # give fcode's line back: the pair, or the bare "/<ten>" only when legacy (a line 1.3.2/1.3.3 added; the laptop kept its record).
-    # True = no line of fcode's is there now (removed, or not there); False = git could not say where the file is, or the file / its folder is a link (nothing written)
+    # True = no line of fcode's is there now (removed, or not there); False = git could not say where the file is, the file / its folder is a link, or .fcode/.gitignore could not be made to hold `*` (nothing written)
     p = exclude_path(d)
     if not p or is_link(p):
         return False
     if not os.path.exists(p):
         return True
-    guard_fcode(d)
     cur = read_exclude(p)
     new = mark_rx(name).sub(b'', cur)
     if new == cur and legacy:
         new = bare_rx(name).sub(b'', cur)
     if new != cur:
+        if not hide_uploads(d):   # Rule H: no rewrite unless the uploads folder is verified to hide itself
+            return False
         write_exclude(p, new)
     return True
 
@@ -2718,8 +2736,8 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
         foreach ($x in @($res.busyFiles)) { if ($x) { [void]$busyFiles.Add([string]$x) } }
         foreach ($k in @($res.notePlaced)) { if ($k) { $noteRec[[string]$k] = $noteShaPut[[string]$k]; $stat.noteCopied++; $placedPut++ } }
         foreach ($k in @($res.unexcluded)) { if ($k) { [void]$noteDel.Add("exclude:box:$k"); [void]$noteDel.Add([string]$k) } }
-        # a release the box could not do (git could not name its exclude file or did not answer, the exclude file or .git/info is a link, or a read / write of it failed with an OSError): a failure, nothing forgotten, the next run tries again
-        foreach ($x in @($pb.Unexclude)) { if (@($res.unexcluded) -notcontains "$($x.project)/$($x.name)") { $code = 1; Write-PhienOut "  [$($x.project)] lỗi: ghi chú $($x.name): box chưa gỡ được dòng /$($x.name) của fcode trong .git/info/exclude (liên kết, hoặc git trên box lỗi), lần sau thử lại" } }
+        # a release the box could not do (git could not name its exclude file or did not answer, the exclude file or .git/info is a link, a read / write of it failed with an OSError, or .fcode/.gitignore could not be verified to hold `*`): a failure, nothing forgotten, the next run tries again
+        foreach ($x in @($pb.Unexclude)) { if (@($res.unexcluded) -notcontains "$($x.project)/$($x.name)") { $code = 1; Write-PhienOut "  [$($x.project)] lỗi: ghi chú $($x.name): box chưa gỡ được dòng /$($x.name) của fcode trong .git/info/exclude (liên kết, git trên box lỗi, hoặc chưa tạo được .fcode/.gitignore), lần sau thử lại" } }
         & $saveNotes
         'ok'
       }
@@ -3027,7 +3045,8 @@ function Remove-PhienNoteExclude([string]$File, [string]$Name, [bool]$Legacy) {
 
 # dat mot file ghi chu da lay tu box vao goc project tren laptop.
 # Tra ve: ok | changed | busy | tracked | failed | link (.git/info/exclude la lien ket) | timeout (git did not answer in time)
-# One item, in this order: the git half, then the marked pair (one atomic write, which is the ownership), then the move.
+# One item, in this order: the git half, then the marked pair (one atomic write, which is the ownership), then git's own answer (check-ignore 0,
+# else `failed`: git still shows the name, e.g. a `!<ten>` in a .gitignore outranks info/exclude), then the move.
 # A kill anywhere leaves at most an inert pair, never a visible unexcluded note.
 function Install-PhienNote([string]$Src, [string]$Dir, [string]$Name, [string]$Expect, [double]$Now, [int]$Busy = 30, [string]$Sha = '') {
   if ($Sha -and (Get-RangeSha $Src 0 (Get-Item -LiteralPath $Src).Length) -ne $Sha) { return 'changed' }
@@ -3051,6 +3070,7 @@ function Install-PhienNote([string]$Src, [string]$Dir, [string]$Name, [string]$E
     [IO.File]::Copy($Src, $part, $true)
     [IO.File]::SetLastWriteTimeUtc($part, $mt)
     if ($ex) { [void](Add-PhienExcludeLine $ex $Name) }
+    if ($ex) { $v = (Invoke-GitQuiet $Dir @('check-ignore', '-q', '--', $Name)).Code; if ($v -eq 124) { return 'timeout' }; if ($v -ne 0) { return 'failed' } }
     if (Test-Path -LiteralPath $dst) { [IO.File]::Replace($part, $dst, [NullString]::Value) } else { [IO.File]::Move($part, $dst) }
   } finally { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }
   'ok'
