@@ -1215,6 +1215,31 @@ def is_link(p):
     return os.path.islink(p) or os.path.islink(os.path.dirname(p))
 
 
+def guard_fcode(d):
+    # Mixed versions: a 1.3.3 server.mjs appends "/<prefix>.fcode/" to .git/info/exclude on upload, and a rewrite below (read, then os.replace) can
+    # drop an append that lands in between, which would show the uploads in git status. So whenever this run is about to touch the exclude file,
+    # the project's upload folder gets what the 1.3.4 server writes: .fcode/.gitignore = "*". Only when .fcode is a real folder and that file is
+    # not there at all (never overwritten, a link never followed); the folder is never created; any OSError is ignored
+    fc = os.path.join(d, '.fcode')
+    f = os.path.join(fc, '.gitignore')
+    part = part_name(f)
+    try:
+        if os.path.islink(fc) or not os.path.isdir(fc) or os.path.lexists(f):
+            return
+        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0), 0o600)
+        with os.fdopen(fd, 'wb') as h:
+            h.write(b'*\n')
+        if not os.path.lexists(f):
+            os.replace(part, f)
+    except OSError:
+        pass
+    finally:
+        try:
+            os.unlink(part)
+        except OSError:
+            pass
+
+
 def ensure_excluded(d, name):
     # the pair "# fcode" + "/<ten>" in .git/info/exclude (never .gitignore) when git does not ignore the file yet; an exact "/<ten>"
     # already there is the user's: nothing added, nothing claimed.
@@ -1227,6 +1252,7 @@ def ensure_excluded(d, name):
     p = exclude_path(d)
     if not p or is_link(p):
         return False
+    guard_fcode(d)
     os.makedirs(os.path.dirname(p), exist_ok=True)
     cur = read_exclude(p)
     line = b'/' + name.encode('utf-8')
@@ -1245,6 +1271,7 @@ def unexclude(d, name, legacy):
         return False
     if not os.path.exists(p):
         return True
+    guard_fcode(d)
     cur = read_exclude(p)
     new = mark_rx(name).sub(b'', cur)
     if new == cur and legacy:
@@ -1683,7 +1710,10 @@ def cmd_put(_req):
             d = note_dir(projs, pn)
             t = tracked_names(d) if d else None
             if d and t is not None and isinstance(name, str) and NOTE_RX.match(name) and name not in t and os.path.isfile(os.path.join(d, name)):
-                ensure_excluded(d, name)
+                try:
+                    ensure_excluded(d, name)
+                except OSError:
+                    pass   # False, like place_note: the pair is not there, nothing else fails; the next run tries again
         unexcl = []
         for it in man.get('unexclude', []):
             pn, name = it.get('project'), it.get('name')
@@ -2688,7 +2718,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
         foreach ($x in @($res.busyFiles)) { if ($x) { [void]$busyFiles.Add([string]$x) } }
         foreach ($k in @($res.notePlaced)) { if ($k) { $noteRec[[string]$k] = $noteShaPut[[string]$k]; $stat.noteCopied++; $placedPut++ } }
         foreach ($k in @($res.unexcluded)) { if ($k) { [void]$noteDel.Add("exclude:box:$k"); [void]$noteDel.Add([string]$k) } }
-        # a release the box could not do (it could not find its exclude file): a failure, nothing forgotten, the next run tries again
+        # a release the box could not do (git could not name its exclude file or did not answer, the exclude file or .git/info is a link, or a read / write of it failed with an OSError): a failure, nothing forgotten, the next run tries again
         foreach ($x in @($pb.Unexclude)) { if (@($res.unexcluded) -notcontains "$($x.project)/$($x.name)") { $code = 1; Write-PhienOut "  [$($x.project)] lỗi: ghi chú $($x.name): box chưa gỡ được dòng /$($x.name) của fcode trong .git/info/exclude (liên kết, hoặc git trên box lỗi), lần sau thử lại" } }
         & $saveNotes
         'ok'

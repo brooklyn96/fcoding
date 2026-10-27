@@ -1735,6 +1735,8 @@ function Use-LoggedIb($w, [string]$Stall = '') {
     'put1late' { "if /i not `"%1`"==`"ssh`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`nfindstr /c:`"ssh put`" `"%FAKE_SSH_LOG%`" >nul 2>&1 && goto run`r`npython -c `"import os,time;time.sleep(max(0,float(os.environ['FAKE_PUT_UNTIL'])-time.time()))`"`r`n:run`r`n" }
     # 'gitbreak': before an `ssh ... put` the box project's .git is renamed to .git-x (FAKE_BP = that folder, Windows form; unset = off): the box can no longer find its exclude file
     'gitbreak' { "if `"%FAKE_BP%`"==`"`" goto run`r`nif /i not `"%1`"==`"ssh`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`nif exist `"%FAKE_BP%\.git`" attrib -h `"%FAKE_BP%\.git`" & ren `"%FAKE_BP%\.git`" .git-x`r`n:run`r`n" }   # .git is hidden: ren does not see it
+    # 'exclbreak': before an `ssh ... put` the box project's .git/info/exclude becomes a folder (FAKE_BP as above; unset = off): reading it fails with an OSError
+    'exclbreak' { "if `"%FAKE_BP%`"==`"`" goto run`r`nif /i not `"%1`"==`"ssh`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`ndel /q `"%FAKE_BP%\.git\info\exclude`" >nul 2>&1`r`nmd `"%FAKE_BP%\.git\info\exclude`" >nul 2>&1`r`n:run`r`n" }
     default { '' }
   }
   [IO.File]::WriteAllText($wrap, "@echo off`r`necho %1 >>`"$($w.IbLog)`"`r`n${hang}call `"$Cmd`" %*`r`nexit /b %errorlevel%`r`n")
@@ -2533,6 +2535,40 @@ T 'notes r7: an exclude file without a final newline: the separator newline fcod
   $out = Invoke-BoxDriver 'r7d' ("open(p, 'wb').write(b'abc')`nprint(m['ensure_excluded'](d, name), open(p, 'rb').read() == b'abc\n# fcode\n/HANDOFF.md\n')`n" +
     "print(m['unexclude'](d, name, False), open(p, 'rb').read() == b'abc\n')`n") $d
   Eq ($out -join ',') 'True True,True True' 'box: the same'
+}
+# r8 (mixed versions): a 1.3.3 server.mjs appends "/.fcode/" to .git/info/exclude on upload; if that append lands between the box writer's read and its
+# os.replace it is lost. The box writer therefore makes sure .fcode/.gitignore ("*") exists first, like the 1.3.4 server does
+T 'notes r8: a /.fcode/ line a 1.3.3 server appends between the box writer''s read and replace is lost, yet the uploads stay ignored (ensure and unexclude)' {
+  $d = Join-Path $Root 'r8a'; New-GitDir $d
+  $out = Invoke-BoxDriver 'r8a' ("import subprocess`nfc = os.path.join(d, '.fcode')`ngi = os.path.join(fc, '.gitignore')`nos.makedirs(os.path.join(fc, 'uploads'))`nopen(os.path.join(fc, 'uploads', 'x.png'), 'wb').write(b'x')`n" +
+    "def ignored():`n    return subprocess.run(['git', '-C', d, 'check-ignore', '-q', '--', '.fcode/uploads/x.png']).returncode == 0`n" +
+    "real = g['read_exclude']`n" +
+    "def racy(q):`n    b = real(q)`n    open(q, 'ab').write(b'/.fcode/\n')`n    return b`n" +
+    "print(ignored())`ng['read_exclude'] = racy`n" +
+    "print(m['ensure_excluded'](d, name), b'/.fcode/' not in open(p, 'rb').read(), ignored(), open(gi, 'rb').read() == b'*\n')`n" +
+    "os.unlink(gi)`nopen(p, 'wb').write(b'# fcode\n/HANDOFF.md\n')`n" +
+    "print(m['unexclude'](d, name, False), b'/.fcode/' not in open(p, 'rb').read(), ignored(), open(gi, 'rb').read() == b'*\n')`n") $d
+  Eq ($out -join ',') 'False,True True True True,True True True True' 'before: uploads show; ensure: the appended line is lost but .gitignore keeps them ignored; the same for a release'
+}
+T 'notes r8: the .fcode/.gitignore guard never overwrites a file, never follows a link and never creates the folder' {
+  $d = Join-Path $Root 'r8b'; New-GitDir $d
+  $out = Invoke-BoxDriver 'r8b' ("fc = os.path.join(d, '.fcode')`ngi = os.path.join(fc, '.gitignore')`nos.makedirs(os.path.join(fc, 'uploads'))`n" +
+    "def fresh():`n    open(p, 'wb').write(b'')`n" +
+    "open(gi, 'wb').write(b'keep\n')`nfresh()`nprint(m['ensure_excluded'](d, name), open(gi, 'rb').read() == b'keep\n', sorted(os.listdir(fc)) == ['.gitignore', 'uploads'])`n" +
+    "os.unlink(gi)`nfresh()`nlinks = {os.path.normpath(fc)}`nos.path.islink = lambda q: os.path.normpath(q) in links`n" +
+    "print(m['ensure_excluded'](d, name), os.path.exists(gi), os.listdir(fc))`n" +
+    "links.clear()`nimport shutil`nshutil.rmtree(fc)`nfresh()`nprint(m['ensure_excluded'](d, name), os.path.exists(fc))`n") $d
+  Eq ($out -join ',') "True True True,True False ['uploads'],True False" 'an existing .gitignore stays as it is; a linked .fcode gets nothing; no .fcode folder: none made'
+}
+# r8: an OSError of ensure_excluded in the put's ensure loop is a False, not a traceback: the reply is still sent, the run does not fail as a whole
+T 'nhanh r8: the box cannot read its exclude file in the put''s ensure step (it is a folder): the put still answers, exit 0' {
+  $w = New-W2 'q39'; Use-LoggedIb $w 'exclbreak'
+  New-GitDir $w.LP; New-GitDir $w.BP
+  Put-File "$($w.LP)\HANDOFF.md" 'same text'; Put-File "$($w.BP)\HANDOFF.md" 'same text'
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FAKE_BP = ($w.BP -replace '/', '\') }
+  $bex = "$($w.BP)\.git\info\exclude"
+  Ok (Test-Path -LiteralPath $bex -PathType Container) ('the wrapper made the box exclude file a folder before the put: ' + (Read-PhienLog $w))
+  Eq $r.Code 0 $r.Out; Ok ((Read-PhienLog $w) -notmatch 'gửi phiên lên box không thành công') ('the put was answered: ' + (Read-PhienLog $w))
 }
 
 # ============================== 1.3.3: fcode moc (profile hook) ==============================

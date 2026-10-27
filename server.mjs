@@ -1786,8 +1786,15 @@ export function createApp(opts = {}) {
     try { st = await fs.promises.lstat(file); } catch (e) { if (e.code !== 'ENOENT') throw e; }
     if (st) {
       if (!st.isFile()) throw new Error('not a file');
-      if (await fs.promises.readFile(file, { encoding: 'utf8', flag: fs.constants.O_RDONLY | NOFOLLOW }) === want) return;
+      if (st.size === want.length && await fs.promises.readFile(file, { encoding: 'utf8', flag: fs.constants.O_RDONLY | NOFOLLOW }) === want) return; // size first: a big file is never read
     }
+    // a part file a crash left (exactly our name, a regular file, over 1 h old; a link is never followed or removed) goes first
+    try {
+      for (const n of await fs.promises.readdir(fc)) {
+        if (!/^\.gitignore\.fcode-part-\d+-[0-9a-f]{6}$/.test(n)) continue;
+        try { const f = path.join(fc, n), s = await fs.promises.lstat(f); if (s.isFile() && now() - s.mtimeMs > 3600e3) await fs.promises.unlink(f); } catch {}
+      }
+    } catch {}
     const part = `${file}.fcode-part-${process.pid}-${crypto.randomBytes(3).toString('hex')}`;
     try {
       const fh = await fs.promises.open(part, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NOFOLLOW, 0o600);

@@ -5114,6 +5114,52 @@ test('upload: a stale or edited .fcode/.gitignore is replaced by `*\\n` atomical
   assert.deepEqual(fs.readdirSync(fc).sort(), ['.gitignore', 'uploads']);
 }));
 
+test('upload: a failed write of .fcode/.gitignore (write, close or rename throws) is 500 storage and leaves no part file; the next upload works', () => withUpload(async (c, dirs, cookie) => {
+  const fc = path.join(dirs.alpha, '.fcode'), orig = fs.promises.rename;
+  for (const where of ['rename', 'write']) {
+    fs.promises.rename = (a, b) => (String(b).endsWith('.gitignore') && where === 'rename' ? Promise.reject(Object.assign(new Error('boom'), { code: 'EIO' })) : orig.call(fs.promises, a, b));
+    const origOpen = fs.promises.open;
+    if (where === 'write') fs.promises.open = async (f, ...a) => { const fh = await origOpen.call(fs.promises, f, ...a); if (String(f).includes('.gitignore.fcode-part-')) fh.writeFile = () => Promise.reject(Object.assign(new Error('boom'), { code: 'ENOSPC' })); return fh; };
+    let r;
+    try { r = await upPost(c, cookie, 'alpha', JPG); } finally { fs.promises.rename = orig; fs.promises.open = origOpen; }
+    assert.deepEqual([r.status, r.json], [500, { error: 'storage' }], where);
+    assert.deepEqual(fs.readdirSync(fc), ['uploads'], where); // the part file is unlinked, no .gitignore, no image
+    assert.deepEqual(fs.readdirSync(path.join(fc, 'uploads')), [], where);
+  }
+  assert.equal((await upPost(c, cookie, 'alpha', JPG)).status, 200);
+  assert.equal(fs.readFileSync(path.join(fc, '.gitignore'), 'utf8'), '*\n');
+}));
+
+test('upload: a part file of .gitignore left by a crash is removed when older than 1 h (exact name, regular file only); a fresh one, other names and links stay', () => withUpload(async (c, dirs, cookie) => {
+  const fc = path.join(dirs.alpha, '.fcode'); fs.mkdirSync(fc);
+  const mk = (n, ageH) => { const f = path.join(fc, n); fs.writeFileSync(f, 'x'); const t = (Date.now() - ageH * 3600e3) / 1000; fs.utimesSync(f, t, t); return f; };
+  const old = mk('.gitignore.fcode-part-123-abcdef', 2), fresh = mk('.gitignore.fcode-part-124-abcdef', 0.5);
+  const other = [mk('.gitignore.fcode-part-125-ABCDEF', 5), mk('.gitignore.fcode-part-123-abcdef.bak', 5), mk('.gitignore.bak', 5), mk('x.gitignore.fcode-part-123-abcdef', 5)];
+  fs.mkdirSync(path.join(fc, '.gitignore.fcode-part-9-abcdef')); fs.utimesSync(path.join(fc, '.gitignore.fcode-part-9-abcdef'), 1, 1); // a folder of that name
+  assert.equal((await upPost(c, cookie, 'alpha', JPG)).status, 200);
+  assert.equal(fs.existsSync(old), false);
+  for (const f of [fresh, ...other, path.join(fc, '.gitignore.fcode-part-9-abcdef')]) assert.ok(fs.existsSync(f), f);
+  assert.equal(fs.readFileSync(path.join(fc, '.gitignore'), 'utf8'), '*\n');
+}));
+
+test('upload: an existing .fcode/.gitignore is read only when its size is that of `*\\n` (a big file is replaced without being read)', () => withUpload(async (c, dirs, cookie) => {
+  const fc = path.join(dirs.alpha, '.fcode'), gi = path.join(fc, '.gitignore'); fs.mkdirSync(fc);
+  const reads = []; const orig = fs.promises.readFile;
+  fs.promises.readFile = (f, ...a) => { if (String(f).endsWith('.gitignore')) reads.push(String(f)); return orig.call(fs.promises, f, ...a); };
+  try {
+    fs.writeFileSync(gi, Buffer.alloc(5 * 1024 * 1024, 0x61)); // far bigger than wanted
+    assert.equal((await upPost(c, cookie, 'alpha', JPG)).status, 200);
+    assert.deepEqual(reads, [], 'a file of the wrong size was read');
+    assert.equal(fs.readFileSync(gi, 'utf8'), '*\n');
+    fs.writeFileSync(gi, 'x\n'); // the right size, wrong content: read, then replaced
+    assert.equal((await upPost(c, cookie, 'alpha', JPG)).status, 200);
+    assert.equal(reads.length, 1);
+    assert.equal(fs.readFileSync(gi, 'utf8'), '*\n');
+    assert.equal((await upPost(c, cookie, 'alpha', JPG)).status, 200); // the right file: read once more, not rewritten
+    assert.equal(reads.length, 2);
+  } finally { fs.promises.readFile = orig; }
+}));
+
 test('upload: in a linked work tree git status stays clean and the common exclude file is not touched', () => withUpload(async (c, dirs, cookie) => {
   assert.equal(gitIn(dirs.alpha, 'init', '-q').status, 0);
   assert.equal(gitIn(dirs.alpha, 'commit', '-q', '--allow-empty', '-m', 'init').status, 0);
