@@ -1780,7 +1780,7 @@ export function createApp(opts = {}) {
   // ignores everything in the folder, the .gitignore itself included, in any repo above it. Written atomically (a part file in the same folder, then
   // rename, which replaces a link instead of following it); `fc` is `<project>/.fcode`, already checked to be a real folder. A link or a non-file
   // at `.gitignore` throws: the upload is refused (500 storage) like any other unsafe path.
-  async function hideFromGit(fc) {
+  async function hideFromGitOnce(fc) {
     const file = path.join(fc, '.gitignore'), want = '*\n';
     let st = null;
     try { st = await fs.promises.lstat(file); } catch (e) { if (e.code !== 'ENOENT') throw e; }
@@ -1796,12 +1796,18 @@ export function createApp(opts = {}) {
       }
     } catch {}
     const part = `${file}.fcode-part-${process.pid}-${crypto.randomBytes(3).toString('hex')}`;
+    let owned = false; // only a part file this call created is ever unlinked: an O_EXCL failure (EEXIST) leaves the other file alone
     try {
       const fh = await fs.promises.open(part, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NOFOLLOW, 0o600);
+      owned = true;
       try { await fh.writeFile(want); } finally { await fh.close(); }
       await fs.promises.rename(part, file);
-    } catch (e) { await fs.promises.unlink(part).catch(() => {}); throw e; }
+    } catch (e) { if (owned) await fs.promises.unlink(part).catch(() => {}); throw e; }
   }
+  // one at a time: two first uploads of a project must not both rename a part file over `.gitignore` (atomic on Linux; EPERM for the loser on
+  // Windows). A failed run never poisons the chain; the caller gets this run's own result
+  let hideChain = Promise.resolve();
+  function hideFromGit(fc) { const p = hideChain.then(() => hideFromGitOnce(fc)); hideChain = p.catch(() => {}); return p; }
   // regular files named like our uploads and older than UPLOAD_KEEP_MS; anything else in the folder is left alone, a link is never followed.
   // Runs on upload only; one file failing never stops the rest.
   async function sweepUploads(up) {

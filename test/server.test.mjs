@@ -5114,7 +5114,25 @@ test('upload: a stale or edited .fcode/.gitignore is replaced by `*\\n` atomical
   assert.deepEqual(fs.readdirSync(fc).sort(), ['.gitignore', 'uploads']);
 }));
 
-test('upload: a failed write of .fcode/.gitignore (write, close or rename throws) is 500 storage and leaves no part file; the next upload works', () => withUpload(async (c, dirs, cookie) => {
+test('upload: hideFromGit never runs twice at once (the two first uploads of one project that the server admits at once): every rename of .gitignore sees no other in flight, all 200', () => withUpload(async (c, dirs, cookie) => {
+  const orig = fs.promises.rename; let inFlight = 0, max = 0, seen = 0;
+  fs.promises.rename = async (a, b) => {
+    if (!String(b).endsWith('.gitignore')) return orig.call(fs.promises, a, b);
+    seen++; inFlight++; max = Math.max(max, inFlight);
+    try { await sleep(30); return await orig.call(fs.promises, a, b); } finally { inFlight--; }
+  };
+  let rs;
+  try { rs = await Promise.all([1, 2].map(() => upPost(c, cookie, 'alpha', JPG))); } finally { fs.promises.rename = orig; } // UPLOAD_SLOTS = 2: a third would be 429
+  assert.deepEqual(rs.map((r) => r.status), [200, 200], rs.map((r) => r.text).join());
+  assert.equal(max, 1, 'two renames of .gitignore overlapped');
+  assert.equal(seen, 1, 'the second run finds the finished file and writes nothing'); // the first one wrote it
+  const fc = path.join(dirs.alpha, '.fcode');
+  assert.equal(fs.readFileSync(path.join(fc, '.gitignore'), 'utf8'), '*\n');
+  assert.deepEqual(fs.readdirSync(fc).sort(), ['.gitignore', 'uploads']);
+  assert.equal(fs.readdirSync(path.join(fc, 'uploads')).length, 2);
+}));
+
+test('upload: a failed write of .fcode/.gitignore (write or rename throws) is 500 storage and leaves no part file; the next upload works', () => withUpload(async (c, dirs, cookie) => {
   const fc = path.join(dirs.alpha, '.fcode'), orig = fs.promises.rename;
   for (const where of ['rename', 'write']) {
     fs.promises.rename = (a, b) => (String(b).endsWith('.gitignore') && where === 'rename' ? Promise.reject(Object.assign(new Error('boom'), { code: 'EIO' })) : orig.call(fs.promises, a, b));
@@ -5130,15 +5148,34 @@ test('upload: a failed write of .fcode/.gitignore (write, close or rename throws
   assert.equal(fs.readFileSync(path.join(fc, '.gitignore'), 'utf8'), '*\n');
 }));
 
+test('upload: a part path that already exists (O_EXCL fails with EEXIST) is refused 500 storage and the file there is not deleted; the next upload works', () => withUpload(async (c, dirs, cookie) => {
+  const fc = path.join(dirs.alpha, '.fcode'); fs.mkdirSync(fc);
+  const theirs = path.join(fc, `.gitignore.fcode-part-${process.pid}-abcdef`); // exactly the part path the stubbed suffix gives; fresh, so the sweep keeps it
+  fs.writeFileSync(theirs, 'not ours');
+  const orig = crypto.randomBytes;
+  crypto.randomBytes = (n, ...a) => (n === 3 ? Buffer.from([0xab, 0xcd, 0xef]) : orig.call(crypto, n, ...a));
+  let r;
+  try { r = await upPost(c, cookie, 'alpha', JPG); } finally { crypto.randomBytes = orig; }
+  assert.deepEqual([r.status, r.json], [500, { error: 'storage' }]);
+  assert.equal(fs.readFileSync(theirs, 'utf8'), 'not ours'); // survived
+  assert.equal(fs.existsSync(path.join(fc, '.gitignore')), false);
+  assert.equal((await upPost(c, cookie, 'alpha', JPG)).status, 200); // the chain is not poisoned
+  assert.equal(fs.readFileSync(path.join(fc, '.gitignore'), 'utf8'), '*\n');
+  assert.equal(fs.readFileSync(theirs, 'utf8'), 'not ours');
+}));
+
 test('upload: a part file of .gitignore left by a crash is removed when older than 1 h (exact name, regular file only); a fresh one, other names and links stay', () => withUpload(async (c, dirs, cookie) => {
   const fc = path.join(dirs.alpha, '.fcode'); fs.mkdirSync(fc);
   const mk = (n, ageH) => { const f = path.join(fc, n); fs.writeFileSync(f, 'x'); const t = (Date.now() - ageH * 3600e3) / 1000; fs.utimesSync(f, t, t); return f; };
   const old = mk('.gitignore.fcode-part-123-abcdef', 2), fresh = mk('.gitignore.fcode-part-124-abcdef', 0.5);
   const other = [mk('.gitignore.fcode-part-125-ABCDEF', 5), mk('.gitignore.fcode-part-123-abcdef.bak', 5), mk('.gitignore.bak', 5), mk('x.gitignore.fcode-part-123-abcdef', 5)];
   fs.mkdirSync(path.join(fc, '.gitignore.fcode-part-9-abcdef')); fs.utimesSync(path.join(fc, '.gitignore.fcode-part-9-abcdef'), 1, 1); // a folder of that name
+  const link = path.join(fc, '.gitignore.fcode-part-126-abcdef'); let linked = false; // a link of that name, 2 h old, to an old regular file: never removed
+  try { fs.symlinkSync('.gitignore.bak', link); fs.lutimesSync(link, (Date.now() - 2 * 3600e3) / 1000, (Date.now() - 2 * 3600e3) / 1000); linked = true; } catch (e) { if (!['EPERM', 'ENOSYS', 'EINVAL'].includes(e.code)) throw e; }
   assert.equal((await upPost(c, cookie, 'alpha', JPG)).status, 200);
   assert.equal(fs.existsSync(old), false);
   for (const f of [fresh, ...other, path.join(fc, '.gitignore.fcode-part-9-abcdef')]) assert.ok(fs.existsSync(f), f);
+  if (linked) assert.ok(fs.lstatSync(link).isSymbolicLink(), 'the link was removed');
   assert.equal(fs.readFileSync(path.join(fc, '.gitignore'), 'utf8'), '*\n');
 }));
 
