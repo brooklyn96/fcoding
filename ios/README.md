@@ -47,7 +47,7 @@ Các bước chi tiết có trong app: bấm nút **?** (Hướng dẫn) ở gó
 ## 4. Cách dùng
 
 - **Màn hình chính** (thanh trên cùng cuộn theo danh sách; chỉ có nút **?** Hướng dẫn và **⚙** Cài đặt). Phiên tự cập nhật mỗi 5 giây, hạn mức và dự án mỗi phút; kéo xuống để cập nhật ngay.
-  - **Vòng giờ box** (bên trái thẻ trên cùng): **Sleeps in** = box còn chạy bao lâu rồi tự nghỉ (tối đa 8 giờ, hoặc sớm hơn nếu rảnh 30 phút). Vòng chuyển vàng khi còn dưới 10 phút. **Wakes in** = box đang nghỉ 10 phút rồi tự dậy. Chạm vào vòng để xem giờ chính xác.
+  - **Vòng giờ box** (bên trái thẻ trên cùng): **Sleeps in** = box còn chạy bao lâu rồi tự nghỉ (tối đa 8 giờ, hoặc sớm hơn nếu rảnh 30 phút). Vòng chuyển vàng khi còn dưới 10 phút. **Wakes in** = box vừa nghỉ vì đã chạy đủ 8 giờ, chưa đánh thức lại được trong khoảng 10 phút. Chạm vào vòng để xem giờ chính xác.
   - **Ô hạn mức** (bên phải): mỗi lần một tài khoản, tự chuyển sang tài khoản kế mỗi 4 giây (giữ ngón tay trên ô để dừng). Chạm để mở màn hình **Hạn mức**.
   - Dòng **đang chạy · chờ bạn**: chạm để nhảy tới phiên tương ứng.
   - **Dự án** (trượt ngang): mỗi thẻ cho biết số PR đang mở, kết quả checks và lần deploy gần nhất. Chạm thẻ để chỉ xem phiên của dự án đó; giữ lâu hoặc bấm **…** để mở phiên mới trong dự án đó.

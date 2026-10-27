@@ -1257,6 +1257,44 @@ def hide_uploads(d):
         return False
 
 
+def shared_projects(d, p, projs):
+    # The folders a 1.3.3 server.mjs can append "/<prefix>.fcode/" to THIS exclude file for are exactly the config projects it uploads into:
+    # a value of `projects` that is a string and an absolute path (1bc8703:server.mjs:196), an existing directory (:1847-1848), inside a work
+    # tree (`rev-parse --is-inside-work-tree`, :1785-1787), whose `--git-path info/exclude` (the server's own question, :1785) is this file p.
+    # Linked work trees, and projects that are sub-folders of one repository, share one file. Paths are compared by realpath: git prints a
+    # relative path from a sub-folder and an absolute one from a linked work tree. Returns the folders other than d, or None when git does
+    # not answer for one of them (the caller waits). A bare repository, a plain folder and a folder that is gone hold no uploads: skipped
+    seen = {os.path.normcase(os.path.realpath(d))}
+    want = os.path.normcase(os.path.realpath(p))
+    out = []
+    for x in projs.values():
+        if not (isinstance(x, str) and os.path.isabs(x) and os.path.isdir(x)):
+            continue
+        k = os.path.normcase(os.path.realpath(x))
+        if k in seen:
+            continue
+        seen.add(k)
+        r = git(x, 'rev-parse', '--is-inside-work-tree', '--git-path', 'info/exclude')
+        if r is None:
+            return None
+        ls = r.stdout.decode('utf-8', 'replace').splitlines()
+        if r.returncode != 0 or len(ls) < 2 or ls[0] != 'true':
+            continue
+        q = ls[1] if os.path.isabs(ls[1]) else os.path.join(x, ls[1])
+        if os.path.normcase(os.path.realpath(q)) == want:
+            out.append(x)
+    return out
+
+
+def hide_all_uploads(d, p, projs):
+    # the Rule H gate for the project d and for every other config project that shares its exclude file p (shared_projects); False = one of them
+    # could not be verified, or git did not answer for one of them
+    others = shared_projects(d, p, projs)
+    if others is None:
+        return False
+    return all([hide_uploads(w) for w in [d] + others])
+
+
 def ensure_excluded(d, name):
     # the pair "# fcode" + "/<ten>" in .git/info/exclude (never .gitignore) when git does not ignore the file yet; an exact "/<ten>"
     # already there is the user's: nothing added, nothing claimed.
@@ -1280,20 +1318,22 @@ def ensure_excluded(d, name):
     return bool(ig is not None and ig.returncode == 0)
 
 
-def unexclude(d, name, legacy):
+def unexclude(d, name, legacy, projs=None):
     # give fcode's line back: the pair, or the bare "/<ten>" only when legacy (a line 1.3.2/1.3.3 added; the laptop kept its record).
-    # True = no line of fcode's is there now (removed, or not there); False = git could not say where the file is, the file / its folder is a link, or .fcode/.gitignore could not be made to hold `*` (nothing written)
+    # True = no line of fcode's is there now (removed, or not there); False = git could not say where the file is, the file / its folder is a link, or .fcode/.gitignore could not be made to hold `*` in this project or in any other box project that shares this exclude file, or git did not answer for one of them (nothing written)
     p = exclude_path(d)
     if not p or is_link(p):
         return False
     if not os.path.exists(p):
         return True
+    if projs is None:
+        projs = cfg_projects()
     cur = read_exclude(p)
     new = mark_rx(name).sub(b'', cur)
     if new == cur and legacy:
         new = bare_rx(name).sub(b'', cur)
     if new != cur:
-        if not hide_uploads(d):   # Rule H: no rewrite unless the uploads folder is verified to hide itself
+        if not hide_all_uploads(d, p, projs):   # Rule H: no rewrite unless the uploads folder of every project sharing this file is verified to hide itself
             return False
         write_exclude(p, new)
     return True
@@ -1737,7 +1777,7 @@ def cmd_put(_req):
             pn, name = it.get('project'), it.get('name')
             d = note_dir(projs, pn)   # the other side tracks the name now; the laptop asks only when the scan saw fcode's pair here (or a 1.3.2/1.3.3 record: legacy)
             try:
-                gone = bool(d and isinstance(name, str) and NOTE_RX.match(name) and unexclude(d, name, bool(it.get('legacy'))))
+                gone = bool(d and isinstance(name, str) and NOTE_RX.match(name) and unexclude(d, name, bool(it.get('legacy')), projs))
             except OSError:
                 gone = False
             if gone:

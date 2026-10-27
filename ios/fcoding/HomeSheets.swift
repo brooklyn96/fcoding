@@ -144,8 +144,8 @@ struct BoxInfoSheet: View {
                      Text("Hoặc ") + Text("sớm hơn").bold() + Text(", nếu rảnh \(idle) phút"),
                      "Không phiên nào làm gì trong \(idle) phút. Mốc này app không đếm được.")
                 step("\(cool)′", Color(hex: 0xA5A3FF),
-                     Text("Sau đó nghỉ ") + Text("\(cool) phút").bold() + Text(", rồi ") + Text("tự dậy").bold(),
-                     "Bạn không cần làm gì.")
+                     Text("Nghỉ vì chạy đủ giờ thì ") + Text("chưa đánh thức lại được trong \(cool) phút").bold(),
+                     "Sau đó box tự dậy khi có thứ dùng tới nó (app, lệnh, SSH). Nghỉ vì rảnh thì dậy ngay ở lần dùng kế tiếp, khoảng vài giây. Bạn không cần làm gì.")
             }
             .padding(.bottom, 16)
             TimelineView(.periodic(from: Date(), by: 1)) { ctx in
@@ -182,7 +182,7 @@ struct BoxInfoSheet: View {
         case .unknown:
             return Text("Bây giờ: chưa biết giờ box nghỉ.")
         case .paused:
-            return Text("Bây giờ: box đang nghỉ, tự dậy lúc ") + at + Text(" (sau ") + left + Text(").")
+            return Text("Bây giờ: box đang nghỉ, đánh thức lại được từ lúc ") + at + Text(" (sau ") + left + Text(").")
         default:
             return Text("Bây giờ: box sẽ nghỉ lúc ") + at + Text(", sau ") + left
                 + Text(" (chạy đủ \(maxRun) phút), hoặc sớm hơn nếu rảnh \(idle) phút.")
@@ -208,7 +208,7 @@ struct HomeGuideView: View {
         ("Vòng giờ box", 0x64D2FF, [
             "**Sleeps in**: box còn chạy bao lâu rồi tự nghỉ (tối đa 8 giờ, sớm hơn nếu rảnh 30 phút).",
             "Vòng chuyển **vàng** khi còn dưới 10 phút.",
-            "**Wakes in**: box đang nghỉ 10 phút và sẽ tự dậy.",
+            "**Wakes in**: box vừa nghỉ vì đã chạy đủ 8 giờ, chưa đánh thức lại được trong khoảng 10 phút.",
             "Chạm vào vòng để xem giờ chính xác.",
         ]),
         ("Hạn mức", 0xD97757, [
