@@ -1257,23 +1257,26 @@ def hide_uploads(d):
         return False
 
 
+def same_file(a, b):
+    # the same file or folder, whatever the spelling (links, relative paths); a path that is gone is not the same as anything
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 def shared_projects(d, p, projs):
     # The folders a 1.3.3 server.mjs can append "/<prefix>.fcode/" to THIS exclude file for are exactly the config projects it uploads into:
     # a value of `projects` that is a string and an absolute path (1bc8703:server.mjs:196), an existing directory (:1847-1848), inside a work
     # tree (`rev-parse --is-inside-work-tree`, :1785-1787), whose `--git-path info/exclude` (the server's own question, :1785) is this file p.
-    # Linked work trees, and projects that are sub-folders of one repository, share one file. Paths are compared by realpath: git prints a
-    # relative path from a sub-folder and an absolute one from a linked work tree. Returns the folders other than d, or None when git does
-    # not answer for one of them (the caller waits). A bare repository, a plain folder and a folder that is gone hold no uploads: skipped
-    seen = {os.path.normcase(os.path.realpath(d))}
-    want = os.path.normcase(os.path.realpath(p))
+    # Linked work trees, and projects that are sub-folders of one repository, share one file. Files are compared with os.path.samefile
+    # (git prints a relative path from a sub-folder and an absolute one from a linked work tree; links and bind mounts resolve to one file).
+    # Returns the folders other than d, or None when git does not answer for one of them (the caller waits). A bare repository, a plain
+    # folder and a folder that is gone hold no uploads: skipped
     out = []
     for x in projs.values():
-        if not (isinstance(x, str) and os.path.isabs(x) and os.path.isdir(x)):
+        if not (isinstance(x, str) and os.path.isabs(x) and os.path.isdir(x)) or same_file(x, d):
             continue
-        k = os.path.normcase(os.path.realpath(x))
-        if k in seen:
-            continue
-        seen.add(k)
         r = git(x, 'rev-parse', '--is-inside-work-tree', '--git-path', 'info/exclude')
         if r is None:
             return None
@@ -1281,18 +1284,50 @@ def shared_projects(d, p, projs):
         if r.returncode != 0 or len(ls) < 2 or ls[0] != 'true':
             continue
         q = ls[1] if os.path.isabs(ls[1]) else os.path.join(x, ls[1])
-        if os.path.normcase(os.path.realpath(q)) == want:
+        if same_file(q, p):
             out.append(x)
     return out
 
 
-def hide_all_uploads(d, p, projs):
-    # the Rule H gate for the project d and for every other config project that shares its exclude file p (shared_projects); False = one of them
-    # could not be verified, or git did not answer for one of them
-    others = shared_projects(d, p, projs)
-    if others is None:
-        return False
+def hide_all_uploads(d, others):
+    # the Rule H gate for the project d and for every other config project that shares its exclude file (shared_projects); False = one of them
+    # could not be verified
     return all([hide_uploads(w) for w in [d] + others])
+
+
+def pair_holders(others, name, releasing):
+    # True = some other project on the shared exclude file still depends on fcode's line for <name> (or that cannot be told: the line stays).
+    # A project depends on it when it holds a regular file <name> at its root that is tracked nowhere for it (index and origin default) and that
+    # git hides through a "/<name>" line of info/exclude (check-ignore -v names the source; a .gitignore or global match is independent).
+    # A project whose own release of this name is in the same batch (`releasing`) does not hold the line: its copy is given back anyway.
+    # NB: with -v, check-ignore exits 0 also for a negated match ("!<name>"), whose pattern is not "/<name>": that copy is visible anyway
+    for x in others:
+        if any(same_file(x, r) for r in releasing):
+            continue
+        f = os.path.join(x, name)
+        if not os.path.isfile(f) or os.path.islink(f):
+            continue
+        t = tracked_names(x)
+        if t is None:
+            return True
+        if name in t:
+            continue
+        ig = git(x, 'check-ignore', '-v', '--', name)
+        if ig is None or ig.returncode not in (0, 1):
+            return True
+        if ig.returncode == 1:
+            continue
+        left = ig.stdout.split(b'\t', 1)[0]
+        if left.startswith(b'"'):
+            return True
+        try:
+            src, _ln, pat = left.rsplit(b':', 2)
+        except ValueError:
+            return True
+        src = src.replace(b'\\', b'/')
+        if pat == b'/' + name.encode('utf-8') and src.rsplit(b'/', 2)[-2:] == [b'info', b'exclude']:
+            return True
+    return False
 
 
 def ensure_excluded(d, name):
@@ -1318,9 +1353,10 @@ def ensure_excluded(d, name):
     return bool(ig is not None and ig.returncode == 0)
 
 
-def unexclude(d, name, legacy, projs=None):
+def unexclude(d, name, legacy, projs=None, releasing=()):
     # give fcode's line back: the pair, or the bare "/<ten>" only when legacy (a line 1.3.2/1.3.3 added; the laptop kept its record).
-    # True = no line of fcode's is there now (removed, or not there); False = git could not say where the file is, the file / its folder is a link, or .fcode/.gitignore could not be made to hold `*` in this project or in any other box project that shares this exclude file, or git did not answer for one of them (nothing written)
+    # True = no line of fcode's is there now (removed, or not there); False = git could not say where the file is, the file / its folder is a link, or .fcode/.gitignore could not be made to hold `*` in this project or in any other box project that shares this exclude file, or git did not answer for one of them (nothing written);
+    # 'kept' = another project that shares this exclude file still depends on the line (pair_holders): nothing written, nothing forgotten
     p = exclude_path(d)
     if not p or is_link(p):
         return False
@@ -1333,7 +1369,12 @@ def unexclude(d, name, legacy, projs=None):
     if new == cur and legacy:
         new = bare_rx(name).sub(b'', cur)
     if new != cur:
-        if not hide_all_uploads(d, p, projs):   # Rule H: no rewrite unless the uploads folder of every project sharing this file is verified to hide itself
+        others = shared_projects(d, p, projs)
+        if others is None:
+            return False
+        if pair_holders(others, name, releasing):
+            return 'kept'
+        if not hide_all_uploads(d, others):   # Rule H: no rewrite unless the uploads folder of every project sharing this file is verified to hide itself
             return False
         write_exclude(p, new)
     return True
@@ -1772,18 +1813,26 @@ def cmd_put(_req):
                     ensure_excluded(d, name)
                 except OSError:
                     pass   # False, like place_note: the pair is not there, nothing else fails; the next run tries again
-        unexcl = []
+        unexcl, kept, rel = [], [], {}
+        for it in man.get('unexclude', []):   # every release of this run rides this one batch: a project releasing its own copy holds nothing for the others
+            pn, name = it.get('project'), it.get('name')
+            d = note_dir(projs, pn)
+            if d and isinstance(name, str) and NOTE_RX.match(name):
+                rel.setdefault(name, []).append(d)
         for it in man.get('unexclude', []):
             pn, name = it.get('project'), it.get('name')
             d = note_dir(projs, pn)   # the other side tracks the name now; the laptop asks only when the scan saw fcode's pair here (or a 1.3.2/1.3.3 record: legacy)
             try:
-                gone = bool(d and isinstance(name, str) and NOTE_RX.match(name) and unexclude(d, name, bool(it.get('legacy')), projs))
+                gone = d and isinstance(name, str) and NOTE_RX.match(name) and unexclude(d, name, bool(it.get('legacy')), projs, rel.get(name, []))
             except OSError:
                 gone = False
-            if gone:
+            if gone is True:
                 unexcl.append(pn + '/' + name)
+            elif gone == 'kept':
+                kept.append(pn + '/' + name)
         cnt['notePlaced'] = placed
         cnt['unexcluded'] = unexcl
+        cnt['noteKept'] = kept
         out_json(cnt)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
@@ -2650,12 +2699,19 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
       $nPutSess = 0; $nGetSess = 0; $nSame = 0; $planIncomplete = 0
       $plans = @{}; $queuedBlob = @{}
       $noteState = Read-PhienNoteState; $noteRec = @{}; $noteShaPut = @{}; $noteGetInfo = @{}; $noteSkipped = 0; $fileSkipped = 0
+      # every note plan first (a pure function): the project dirs whose release of a name on the laptop is planned in this run hold nothing for the
+      # others (Test-PhienSharedNote); the box gets the same set through the one batch that carries every unexclude item
+      $nps = @{}; $relL = @{}
+      foreach ($c in $ctx) {
+        $nps[$c.Name] = Get-PhienNotePlan $c.Name $c.LN $c.RN $noteState $lnow $rnow $PhienBusySec
+        foreach ($rl in $nps[$c.Name].Release) { if ($rl.OldOn -eq 'laptop') { if (-not $relL.ContainsKey($rl.Name)) { $relL[$rl.Name] = New-Object System.Collections.ArrayList }; [void]$relL[$rl.Name].Add($c.LDir) } }
+      }
       foreach ($c in $ctx) {
         $plan = Get-PhienPlan $c.L $c.R $c.Benc $hashes $c.Lsd $lnow $rnow $PhienBusySec $lblobIx $boxBlobs
         $plans[$c.Name] = $plan
         $nSame += $plan.Same; $planIncomplete += $plan.Incomplete + $plan.Deferred
         $stat.unknown += @($plan.Unknown); $stat.diverged += $plan.Diverged
-        $np = Get-PhienNotePlan $c.Name $c.LN $c.RN $noteState $lnow $rnow $PhienBusySec
+        $np = $nps[$c.Name]
         foreach ($cf in $np.Conflicts) { $stat.noteConf += $cf }
         foreach ($k in $np.Record.Keys) { $noteRec[$k] = $np.Record[$k] }
         foreach ($rl in $np.Release) {
@@ -2665,8 +2721,10 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
             $rk = "$($c.Name)/$($rl.Name)"
             if ($rl.OldOn -eq 'laptop') {
               # the records go only when the line is gone for sure (removed now, or not there): else they stay and the next run tries again.
-              # The path is the one the scan resolved (no git call here)
-              if ((Remove-PhienNoteExclude $c.LN.excl $rl.Name $rl.Legacy) -ne 'failed') { [void]$noteDel.Add("exclude:laptop:$rk"); [void]$noteDel.Add($rk) }
+              # The path is the one the scan resolved (no git call inside Remove-PhienNoteExclude); the shared-note check (git calls) runs before it:
+              # another project on the same repository that still depends on the line keeps it, and nothing is forgotten
+              if (Test-PhienSharedNote $c.LDir $rl.Name @($relL[$rl.Name] | Where-Object { $_ -ne $c.LDir })) { Write-PhienOut "  [$($c.Name)] ghi chú $($rl.Name): dự án khác cùng kho trên laptop còn dùng dòng giấu /$($rl.Name), fcode chưa gỡ (xóa bản cũ trên laptop thì không báo nữa)" }
+              elseif ((Remove-PhienNoteExclude $c.LN.excl $rl.Name $rl.Legacy) -ne 'failed') { [void]$noteDel.Add("exclude:laptop:$rk"); [void]$noteDel.Add($rk) }
               else { $code = 1; Write-PhienOut "  [$($c.Name)] lỗi: ghi chú $($rl.Name): chưa gỡ được dòng /$($rl.Name) của fcode trong .git/info/exclude (liên kết, hoặc git lỗi / không trả lời kịp), lần sau thử lại" }
             }
             else { [void]$unexcl.Add(@{ project = $c.Name; name = $rl.Name; legacy = $rl.Legacy }) }
@@ -2777,7 +2835,9 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
         foreach ($k in @($res.notePlaced)) { if ($k) { $noteRec[[string]$k] = $noteShaPut[[string]$k]; $stat.noteCopied++; $placedPut++ } }
         foreach ($k in @($res.unexcluded)) { if ($k) { [void]$noteDel.Add("exclude:box:$k"); [void]$noteDel.Add([string]$k) } }
         # a release the box could not do (git could not name its exclude file or did not answer, the exclude file or .git/info is a link, a read / write of it failed with an OSError, or .fcode/.gitignore could not be verified to hold `*`): a failure, nothing forgotten, the next run tries again
-        foreach ($x in @($pb.Unexclude)) { if (@($res.unexcluded) -notcontains "$($x.project)/$($x.name)") { $code = 1; Write-PhienOut "  [$($x.project)] lỗi: ghi chú $($x.name): box chưa gỡ được dòng /$($x.name) của fcode trong .git/info/exclude (liên kết, git trên box lỗi, hoặc chưa tạo được .fcode/.gitignore), lần sau thử lại" } }
+        # a release a sharing box project still depends on is kept (the box answers noteKept): a notice, not a failure, nothing forgotten
+        foreach ($k in @($res.noteKept)) { if ($k) { $kp = ([string]$k).IndexOf('/'); Write-PhienOut "  [$(([string]$k).Substring(0, $kp))] ghi chú $(([string]$k).Substring($kp + 1)): dự án khác cùng kho trên box còn dùng dòng giấu /$(([string]$k).Substring($kp + 1)), fcode chưa gỡ (xóa bản cũ trên box thì không báo nữa)" } }
+        foreach ($x in @($pb.Unexclude)) { if (@($res.unexcluded) -notcontains "$($x.project)/$($x.name)" -and @($res.noteKept) -notcontains "$($x.project)/$($x.name)") { $code = 1; Write-PhienOut "  [$($x.project)] lỗi: ghi chú $($x.name): box chưa gỡ được dòng /$($x.name) của fcode trong .git/info/exclude (liên kết, git trên box lỗi, hoặc chưa tạo được .fcode/.gitignore), lần sau thử lại" } }
         & $saveNotes
         'ok'
       }
@@ -3012,6 +3072,55 @@ function Get-PhienNotePlan([string]$Proj, $LN, $RN, $State, [double]$LNow, [doub
   [pscustomobject]@{ Put = @($put); Get = @($get); Ensure = @($ensure); Conflicts = @($conf); Record = $rec; Release = @($release) }
 }
 
+# the repository a folder belongs to and where the folder sits in it, from git itself (it resolves junction aliases, `..` and slashes):
+# @{ Common = the shared .git dir; Root = the folder's own root (work tree top + prefix) }; $null = not a repository; 'unknown' = git did not answer
+# in time. This call never reads the index
+function Get-PhienRepoId([string]$Dir) {
+  $r = Invoke-GitQuiet $Dir @('rev-parse', '--git-common-dir', '--show-toplevel', '--show-prefix')
+  if ($r.Code -eq 124) { return 'unknown' }
+  $o = @($r.Out)
+  if ($r.Code -ne 0 -or $o.Count -lt 2) { return $null }
+  $prefix = if ($o.Count -ge 3) { [string]$o[2] } else { '' }
+  $root = [IO.Path]::GetFullPath((Join-Path ([string]$o[1]) $prefix)).TrimEnd('\')
+  $common = [string]$o[0]; if (-not [IO.Path]::IsPathRooted($common)) { $common = Join-Path $root $common }
+  @{ Common = [IO.Path]::GetFullPath($common).TrimEnd('\'); Root = $root }
+}
+# $true = another project (a `syncRepos` folder; the raw list, so folders with the same leaf name count) on the same repository still depends on
+# fcode's `/<name>` line in the shared info/exclude, or that cannot be told (the line stays); $false = the line may go. A folder depends on it when
+# it holds a regular file <name> at its root that is tracked nowhere for it (index and origin default) and that git hides through a `/<name>` line
+# of info/exclude (check-ignore -v names the source: a .gitignore or global match is independent). A folder whose own release of this name is
+# in this run ($Releasing: its project dirs) holds nothing for the others. Only "not a repository" skips a folder; every other git failure keeps the
+# line. NB: with -v, check-ignore exits 0 also for a negated match ("!<name>"), whose pattern is not "/<name>": that copy is visible anyway
+function Test-PhienSharedNote([string]$Dir, [string]$Name, [string[]]$Releasing) {
+  $me = Get-PhienRepoId $Dir
+  if ($null -eq $me -or $me -is [string]) { return $true }
+  $skip = @()
+  foreach ($rd in @($Releasing)) { if (-not $rd) { continue }; $ri = Get-PhienRepoId $rd; if ($ri -is [string]) { return $true }; if ($ri) { $skip += $ri.Root } }
+  foreach ($o in @($SyncRepos)) {
+    $f = Join-Path ([string]$o) $Name
+    if (-not (Test-Path -LiteralPath $f -PathType Leaf) -or (Test-PhienReparse $f)) { continue }
+    $id = Get-PhienRepoId ([string]$o)
+    if ($null -eq $id) { continue }
+    if ($id -is [string]) { return $true }
+    if ($id.Common -ine $me.Common -or $id.Root -ieq $me.Root -or ($skip -icontains $id.Root)) { continue }
+    $t = Invoke-GitQuiet ([string]$o) @('ls-files', '--', $Name)
+    if ($t.Code -ne 0) { return $true }
+    if (@($t.Out) -ccontains $Name) { continue }
+    $up = Get-PhienUpstreamNotes ([string]$o)
+    if ($null -eq $up) { return $true }
+    if (@($up) -ccontains $Name) { continue }
+    $ig = Invoke-GitQuiet ([string]$o) @('check-ignore', '-v', '--', $Name)
+    if ($ig.Code -ne 0 -and $ig.Code -ne 1) { return $true }
+    if ($ig.Code -eq 1) { continue }
+    $left = ([string]@($ig.Out)[0] -split "`t", 2)[0]
+    if ($left.StartsWith('"')) { return $true }
+    $m = [regex]::Match($left, '^(.*):\d+:(.*)$')
+    if (-not $m.Success) { return $true }
+    $src = @($m.Groups[1].Value -split '[\\/]')
+    if ($m.Groups[2].Value -ceq "/$Name" -and $src.Count -ge 2 -and $src[-1] -ceq 'exclude' -and $src[-2] -ceq 'info') { return $true }
+  }
+  $false
+}
 function Get-PhienNoteStatePath { Join-Path $env:LOCALAPPDATA 'fcode\handoff-state.json' }
 # strict: a missing file is an empty state; anything else that is not one JSON object (unreadable, cut, `null`, `42`, an array) stops the run
 # before any change, so the sha memory and the 1.3.2/1.3.3 ownership records are never overwritten with nothing
