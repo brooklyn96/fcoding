@@ -2258,6 +2258,14 @@ function Clear-PhienLeftovers([string[]]$Dirs, [string[]]$Flat = @()) {
       if ($x.LastWriteTimeUtc -lt $old -or (Test-PhienOwnerGone $x $partRx)) { Remove-Item -LiteralPath $x.FullName -Force -ErrorAction SilentlyContinue }
     }
   }
+  # Write-PhienText part files (<file>.part-<PID>) beside the three state files and each project's .git/info/exclude
+  $sd = Join-Path $env:LOCALAPPDATA 'fcode'
+  foreach ($f in @(@('handoff-state.json', 'phien-status.json', 'phien-auto.json' | ForEach-Object { Join-Path $sd $_ }) + @($Flat | Where-Object { $_ } | ForEach-Object { Join-Path $_ '.git\info\exclude' }))) {
+    $fd = Split-Path -Parent $f; if (-not (Test-Path -LiteralPath $fd -PathType Container)) { continue }
+    foreach ($x in @(Get-ChildItem -LiteralPath $fd -File -Force -Filter ((Split-Path -Leaf $f) + '.part-*') -ErrorAction SilentlyContinue)) {
+      if ($x.LastWriteTimeUtc -lt $old -or (Test-PhienOwnerGone $x '\.part-([0-9]+)\z')) { Remove-Item -LiteralPath $x.FullName -Force -ErrorAction SilentlyContinue }
+    }
+  }
 }
 
 function Get-PhienProjects {
@@ -2468,7 +2476,11 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
           Write-PhienOut "  [$($c.Name)] ghi chú $($rl.Name) giờ do git theo dõi (trên $($rl.TrackedOn)): bản cũ trên $($rl.OldOn) xóa được, fcode không còn đồng bộ file này"
           if (-not $DryRun) {
             $rk = "$($c.Name)/$($rl.Name)"
-            if ($rl.OldOn -eq 'laptop') { [void](Remove-PhienNoteExclude $c.LDir $rl.Name); [void]$noteDel.Add("exclude:laptop:$rk"); [void]$noteDel.Add($rk) }
+            if ($rl.OldOn -eq 'laptop') {
+              # the record goes only when the line is gone for sure (removed now, or not there): else it stays and the next run tries again
+              if ((Remove-PhienNoteExclude $c.LDir $rl.Name) -ne 'failed') { [void]$noteDel.Add("exclude:laptop:$rk"); [void]$noteDel.Add($rk) }
+              else { $code = 1; Write-PhienOut "  [$($c.Name)] lỗi: ghi chú $($rl.Name): chưa gỡ được dòng /$($rl.Name) của fcode trong .git/info/exclude (liên kết, hoặc git lỗi / không trả lời kịp), lần sau thử lại" }
+            }
             else { [void]$unexcl.Add(@{ project = $c.Name; name = $rl.Name }) }
           }
         }
@@ -2533,7 +2545,8 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
       if (($ensure.Count -or $unexcl.Count) -and -not $nb) { $nb = New-PhienBatch (Join-Path $tmpRoot 'put\notes'); [void]$putB.Add($nb) }
       if ($nb) { foreach ($x in $ensure) { [void]$nb.Ensure.Add($x) }; foreach ($x in $unexcl) { [void]$nb.Unexclude.Add($x) } }
       $notePlanned = $putN.Count; $placedPut = 0
-      $saveNotes = { if ($noteRec.Count -or $noteDel.Count) { foreach ($k in $noteRec.Keys) { $noteState[$k] = $noteRec[$k] }; foreach ($k in $noteDel) { $noteState.Remove([string]$k) }; try { Write-PhienNoteState $noteState } catch { } } }
+      # $Strict: a failed write throws (the ownership saved before an exclude line: no saved ownership, no line, no note)
+      $saveNotes = { param([bool]$Strict = $false) if ($noteRec.Count -or $noteDel.Count) { foreach ($k in $noteRec.Keys) { $noteState[$k] = $noteRec[$k] }; foreach ($k in $noteDel) { $noteState.Remove([string]$k) }; try { Write-PhienNoteState $noteState } catch { if ($Strict) { throw "không ghi được trạng thái ghi chú (handoff-state.json): $($_.Exception.Message)" } } } }
       $deferredTops = New-Object System.Collections.ArrayList; $busyFiles = New-Object System.Collections.ArrayList
       # --- mot dot gui len box (chep sang thu muc tam, doi cwd, dong goi, gui, xoa): 'ok' | 'fail' | 'lost' (ssh 255: mat box) ---
       $putRes = @{ new = 0; replaced = 0; same = 0; skip = 0; busy = 0; blobs = 0; failed = 0 }
@@ -2641,7 +2654,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
           if (Test-PhienTimeUp) { $cut = $true }   # safe point: before a note
           if ($cut -or -not (Test-Path -LiteralPath $src)) { $noteSkipped++; continue }
           # ownership is saved before fcode adds the line: a kill after the line never leaves a line fcode does not know it owns
-          $ns = Install-PhienNote $src $u.C.LDir $u.Name $info.Expect $gnow $PhienBusySec ([string]$info.Sha) { $noteRec["exclude:laptop:$key"] = '1'; & $saveNotes }
+          $ns = Install-PhienNote $src $u.C.LDir $u.Name $info.Expect $gnow $PhienBusySec ([string]$info.Sha) { $noteRec["exclude:laptop:$key"] = '1'; & $saveNotes $true }
           if ($ns -eq 'ok') { $noteRec[$key] = [string]$info.Sha; $stat.noteCopied++; if ($script:PhienLastExclAdded) { $noteRec["exclude:laptop:$key"] = '1' } } else { $noteSkipped++ }
           if ($ns -eq 'timeout') { $cut = $true; Write-PhienOut "  [$($u.C.Name)] ghi chú $($u.Name): git không trả lời kịp, chưa đặt (lần sau làm tiếp)" }
           if ($ns -eq 'link') { Write-PhienOut "  [$($u.C.Name)] ghi chú $($u.Name): .git/info/exclude là liên kết, fcode không ghi vào đó, chưa đặt" }
@@ -2834,25 +2847,28 @@ function Get-PhienExcludeFile([string]$Dir, [string]$Name) {
 # the file half (plain .NET, no git): add "/<ten>" to that exclude file (whole-file atomic rewrite). Tra ve $true chi khi LAN NAY them dong
 # (noi goi ghi lai de sau nay chi go dung dong do)
 function Add-PhienExcludeLine([string]$File, [string]$Name) {
+  if (Test-PhienExcludeLine $File $Name) { return $false }
   $cur = if ([IO.File]::Exists($File)) { [IO.File]::ReadAllText($File) } else { '' }
-  if (@($cur -split '\r?\n') -ccontains ('/' + $Name)) { return $false }
   Write-PhienText $File ($cur + $(if ($cur -and -not $cur.EndsWith("`n")) { "`n" } else { '' }) + '/' + $Name + "`n")
   $true
 }
+# the exclude file already has the exact line "/<ten>" (then it is not fcode's: fcode never claims it)
+function Test-PhienExcludeLine([string]$File, [string]$Name) { [IO.File]::Exists($File) -and (@([IO.File]::ReadAllText($File) -split '\r?\n') -ccontains ('/' + $Name)) }
 
-# go DUNG dong "/<ten>" (dong fcode da them); moi dong khac trong .git/info/exclude giu nguyen. Tra ve $true neu da go;
-# $false va khong ghi gi khi file hay thu muc cua no la lien ket
+# go DUNG dong "/<ten>" (dong fcode da them); moi dong khac trong .git/info/exclude giu nguyen.
+# Tra ve: removed (da go) | absent (khong co file / khong co dong do) | failed (git loi / khong tra loi kip, hay file / thu muc la lien ket: khong ghi gi)
 function Remove-PhienNoteExclude([string]$Dir, [string]$Name) {
   $r = Invoke-GitQuiet $Dir @('rev-parse', '--git-path', 'info/exclude')
   $p = @($r.Out)[0]
-  if ($r.Code -ne 0 -or -not $p) { return $false }
+  if ($r.Code -ne 0 -or -not $p) { return 'failed' }
   if (-not [IO.Path]::IsPathRooted($p)) { $p = Join-Path $Dir $p }
-  if ((Test-PhienReparse $p) -or -not (Test-Path -LiteralPath $p)) { return $false }
+  if (Test-PhienReparse $p) { return 'failed' }
+  if (-not (Test-Path -LiteralPath $p)) { return 'absent' }
   $cur = [IO.File]::ReadAllText($p)
   $new = [regex]::Replace($cur, '(?m)^/' + [regex]::Escape($Name) + '\r?(?:\n|\z)', '')
-  if ($new -ceq $cur) { return $false }
+  if ($new -ceq $cur) { return 'absent' }
   Write-PhienText $p $new
-  $true
+  'removed'
 }
 
 # dat mot file ghi chu da lay tu box vao goc project tren laptop.
@@ -2881,7 +2897,8 @@ function Install-PhienNote([string]$Src, [string]$Dir, [string]$Name, [string]$E
   try {
     [IO.File]::Copy($Src, $part, $true)
     [IO.File]::SetLastWriteTimeUtc($part, $mt)
-    if ($ex) { if ($BeforeLine) { & $BeforeLine }; $added = Add-PhienExcludeLine $ex $Name } else { $added = $false }
+    # ownership only for a line fcode really adds now: an identical line already there is the user's
+    if ($ex) { if ($BeforeLine -and -not (Test-PhienExcludeLine $ex $Name)) { & $BeforeLine }; $added = Add-PhienExcludeLine $ex $Name } else { $added = $false }
     if (Test-Path -LiteralPath $dst) { [IO.File]::Replace($part, $dst, [NullString]::Value) } else { [IO.File]::Move($part, $dst) }
   } finally { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }
   $script:PhienLastExclAdded = [bool]$added

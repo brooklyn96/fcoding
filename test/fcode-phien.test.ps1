@@ -32,7 +32,7 @@ $tokens = $null; $errs = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($Fcode, [ref]$tokens, [ref]$errs)
 if ($errs.Count) { throw "fcode.ps1 does not parse: $($errs[0].Message)" }
 $wanted = 'Test-WinPath', 'Resolve-OmpPath', 'Get-OmpUnder', 'Join-OmpName', 'Get-OmpEncodedDir', 'ConvertTo-Epoch', 'Convert-OmpCwd', 'ConvertTo-JsonStr',
-  'Get-OmpHeaderSpan', 'Open-ShareRead', 'Read-Head', 'Get-OmpBodyOff', 'Test-OmpNonEmpty', 'Get-RangeSha', 'Get-PhienOff', 'Test-PhienPrefix', 'Get-PhienKnownVersions', 'Test-PhienKnownVersion', 'Get-OmpHeaderVersion', 'Get-OmpHeaderInfo', 'Get-PhienVersionNote', 'Get-PhienUnknownNote', 'Get-PhienNoteRx', 'Get-PhienNoteSpecs', 'Invoke-GitQuiet', 'Get-PhienLocalNotes', 'Get-PhienNotePlan', 'Get-PhienNoteStatePath', 'Read-PhienNoteState', 'Write-PhienNoteState', 'Get-PhienExcludeFile', 'Add-PhienExcludeLine', 'Install-PhienNote',
+  'Get-OmpHeaderSpan', 'Open-ShareRead', 'Read-Head', 'Get-OmpBodyOff', 'Test-OmpNonEmpty', 'Get-RangeSha', 'Get-PhienOff', 'Test-PhienPrefix', 'Get-PhienKnownVersions', 'Test-PhienKnownVersion', 'Get-OmpHeaderVersion', 'Get-OmpHeaderInfo', 'Get-PhienVersionNote', 'Get-PhienUnknownNote', 'Get-PhienNoteRx', 'Get-PhienNoteSpecs', 'Invoke-GitQuiet', 'Get-PhienLocalNotes', 'Get-PhienNotePlan', 'Get-PhienNoteStatePath', 'Read-PhienNoteState', 'Write-PhienNoteState', 'Get-PhienExcludeFile', 'Add-PhienExcludeLine', 'Test-PhienExcludeLine', 'Install-PhienNote',
   'Copy-OmpSession', 'Get-OmpBlobRefs', 'Get-OmpBlobIndex', 'Get-PhienLocalScan', 'Compare-PhienFile', 'Get-PhienPlan', 'Install-PhienFile',
   'Install-PhienTask', 'Remove-PhienTask', 'New-PhienPartName', 'Get-PhienBoxBlobSet', 'New-PhienBatch', 'Get-PhienBatch', 'Remove-PhienNoteExclude',
   'Get-PhienDirFiles', 'Get-PhienIdOf', 'Test-PhienDeps', 'Get-PhienUnitBytes', 'Get-PhienUpstreamNotes',
@@ -362,6 +362,11 @@ T 'notes r4: Install-PhienNote runs $BeforeLine before the exclude line and the 
   $script:snap = $null
   Eq (Install-PhienNote $src $d 'TASK.md' '' (ConvertTo-Epoch (Get-Date)) 30 '' $bl) 'ok'
   Eq $script:snap $null 'git already ignores TASK.md: no line, no ownership'
+  # r5: the same line already there but git says not ignored (a later user rule): the line is the user's, fcode claims nothing
+  [IO.File]::AppendAllText($exf, "/HANDOFF-u.md`n!/HANDOFF-u.md`n")
+  $script:snap = $null
+  Eq (Install-PhienNote $src $d 'HANDOFF-u.md' '' (ConvertTo-Epoch (Get-Date)) 30 '' $bl) 'ok'
+  Eq $script:snap $null 'an identical line already there: no ownership recorded'; Eq $script:PhienLastExclAdded $false 'and no line added'
 }
 T 'batches: <= 50 MB per tar stream, a bigger single item gets its own batch' {
   $bs = New-Object System.Collections.ArrayList
@@ -391,11 +396,11 @@ T 'notes: Add returns true only when it added the line; Remove takes out only th
   [IO.File]::WriteAllText($ex, "# my own comment`n/HANDOFF-ab.md`n/other.txt`n")
   Eq (Add-PhienNoteExclude $d 'HANDOFF-a.md') $true; Eq (Add-PhienNoteExclude $d 'HANDOFF-a.md') $false 'second time: already ignored'
   Eq (Add-PhienNoteExclude $d 'HANDOFF-ab.md') $false 'a pre-existing line is not ours'
-  Eq (Remove-PhienNoteExclude $d 'HANDOFF-a.md') $true
+  Eq (Remove-PhienNoteExclude $d 'HANDOFF-a.md') 'removed'
   $t = Get-Content $ex -Raw
   Ok ($t -notmatch '(?m)^/HANDOFF-a\.md\r?$') 'our line is gone'
   Ok ($t -match '(?m)^/HANDOFF-ab\.md\r?$' -and $t -match '(?m)^/other\.txt\r?$' -and $t -match '# my own comment') 'every other line stays (also the one with the same prefix)'
-  Eq (Remove-PhienNoteExclude $d 'HANDOFF-a.md') $false 'nothing left to remove'
+  Eq (Remove-PhienNoteExclude $d 'HANDOFF-a.md') 'absent' 'nothing left to remove: confirmed absent'
   Ok (Bytes-Eq (Read-Bytes $ex) $utf8.GetBytes("# my own comment`n/HANDOFF-ab.md`n/other.txt`n")) 'the three user rules survive our add + remove byte for byte'
   Eq @(Get-ChildItem "$d\.git\info" -Force -Filter '*.part-*').Count 0 'no part file left'
 }
@@ -411,13 +416,15 @@ T 'notes r4: a junction .git/info: Get-PhienExcludeFile gives $null (the note is
   Eq $null (Get-PhienExcludeFile $d 'HANDOFF-x.md') 'link: no exclude file to write'
   Eq (Get-Content (Join-Path $Root 'nt6-elsewhere\exclude') -Raw) "# user`n" 'the target is untouched'
 }
-T 'notes r4: Remove-PhienNoteExclude through a junction .git/info: $false, the target bytes unchanged, the junction intact' {
+T 'notes r4: Remove-PhienNoteExclude through a junction .git/info: failed (not absent), the target bytes unchanged, the junction intact; no git = failed; no exclude file = absent' {
   $d = Join-Path $Root 'nt7'; New-GitDir $d; $tg = Join-Path $Root 'nt7-elsewhere'
   $txt = "# user rules`n/HANDOFF-z.md`n*.log`n"
   New-InfoJunction $d $tg $txt
-  Eq (Remove-PhienNoteExclude $d 'HANDOFF-z.md') $false 'nothing removed through a link'
+  Eq (Remove-PhienNoteExclude $d 'HANDOFF-z.md') 'failed' 'nothing removed through a link, and that is a failure'
   Ok (Bytes-Eq (Read-Bytes (Join-Path $tg 'exclude')) $utf8.GetBytes($txt)) 'target bytes unchanged'
   Ok ((Get-Item -LiteralPath "$d\.git\info" -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) 'the junction is still a junction'
+  $ng = Join-Path $Root 'nt7-nogit'; [void](New-Item -ItemType Directory -Path $ng -Force); Eq (Remove-PhienNoteExclude $ng 'HANDOFF-z.md') 'failed' 'git cannot say where the file is: failed'
+  $d2 = Join-Path $Root 'nt7b'; New-GitDir $d2; Remove-Item "$d2\.git\info\exclude"; Eq (Remove-PhienNoteExclude $d2 'HANDOFF-z.md') 'absent' 'no exclude file: absent'
 }
 # r4 F1: every rewrite of a file goes through Write-PhienText (part file + atomic Replace / Move); the log is appended
 T 'files r4: outside Write-PhienText, the config / profile writers and the staging manifest, fcode.ps1 has no WriteAllText( / AppendAllText( / Set-Content' {
@@ -2144,6 +2151,60 @@ T 'nhanh r4: the supervisor killed at any moment (before its job, while the work
     Eq $alive.Count 0 "k=$($k): nothing of the run is alive ($($alive -join ', '))"
     Eq (BoxSessions $w) 0 "k=$($k): nothing placed on the box"; Eq (Parts $w.LS) 0 "k=$($k): no part file on the laptop"; Eq (Parts $w.BS) 0 "k=$($k): no part file on the box"
   }
+}
+
+# ---- r5: ownership is saved for sure before the line; a release that could not remove the line keeps it; Write-PhienText leftovers ----
+T 'nhanh r5: handoff-state.json cannot be written: the note from the box is not placed and no exclude line is added; exit 1, the failure line, the reason logged' {
+  $w = New-W2 'q25'; Use-LoggedIb $w
+  New-GitDir $w.LP; New-GitDir $w.BP
+  Put-File "$($w.BP)\HANDOFF.md" 'box handoff'
+  $sf = Join-Path $w.U 'AppData\Local\fcode\handoff-state.json'; Put-File $sf '{}'
+  $exf = "$($w.LP)\.git\info\exclude"; $before = Read-Bytes $exf
+  (Get-Item -LiteralPath $sf).IsReadOnly = $true
+  try {
+    $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh')
+    Eq $r.Code 1 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $FailMsg 'the failure line'
+    Ok (-not (Test-Path "$($w.LP)\HANDOFF.md")) 'the note is not placed'
+    Ok (Bytes-Eq (Read-Bytes $exf) $before) 'no exclude line without saved ownership'
+    Ok ((Read-PhienLog $w) -match 'lỗi: không ghi được trạng thái ghi chú \(handoff-state\.json\)') ('logged: ' + (Read-PhienLog $w))
+  } finally { (Get-Item -LiteralPath $sf).IsReadOnly = $false }
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Eq (Get-Content "$($w.LP)\HANDOFF.md" -Raw) 'box handoff' 'writable again: placed'
+  Eq ((Get-Content $sf -Raw | ConvertFrom-Json).'exclude:laptop:proj/HANDOFF.md') '1' 'with its ownership saved'
+}
+T 'nhanh r5: a release whose exclude line cannot be removed (.git/info became a link) keeps the ownership record, says so, exit 1; once fixed the next run removes it' {
+  $w = New-W2 'q26'; Use-LoggedIb $w
+  New-GitDir $w.LP; New-GitDir $w.BP
+  $bo = Join-Path $w.W 'origin.git'; New-Origin $bo
+  foreach ($d in $w.LP, $w.BP) { Fetch-Origin $d $bo; $ErrorActionPreference = 'Continue'; & git -C $d checkout -q -B main origin/main 2>&1 | Out-Null; $ErrorActionPreference = 'Stop' }
+  Put-File "$($w.BP)\HANDOFF.md" 'box text'
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  $sf = Join-Path $w.U 'AppData\Local\fcode\handoff-state.json'; $key = 'exclude:laptop:proj/HANDOFF.md'
+  Eq (Get-Content $sf -Raw | ConvertFrom-Json).$key '1' 'fcode owns the laptop line'
+  $ErrorActionPreference = 'Continue'; Git-Commit $w.BP @('HANDOFF.md'); & git -C $w.BP push -q $bo HEAD:main 2>&1 | Out-Null; & git -C $w.LP fetch -q origin 2>&1 | Out-Null; $ErrorActionPreference = 'Stop'
+  $info = "$($w.LP)\.git\info"; $tg = Join-Path $w.W 'info-elsewhere'
+  New-InfoJunction $w.LP $tg ([IO.File]::ReadAllText("$info\exclude"))
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 1 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $FailMsg 'the failure line'
+  Ok ((Read-PhienLog $w) -match 'lỗi: ghi chú HANDOFF\.md: chưa gỡ được dòng /HANDOFF\.md của fcode trong \.git/info/exclude') ('logged: ' + (Read-PhienLog $w))
+  Eq (Get-Content $sf -Raw | ConvertFrom-Json).$key '1' 'the ownership record is kept'
+  Ok ((Get-Content (Join-Path $tg 'exclude') -Raw) -match '(?m)^/HANDOFF\.md\r?$') 'nothing written through the link'
+  # fixed: a plain folder again (same content); the kept record lets the next run give the line back
+  $txt = [IO.File]::ReadAllText((Join-Path $tg 'exclude')); [IO.Directory]::Delete($info); [void](New-Item -ItemType Directory -Path $info); [IO.File]::WriteAllText("$info\exclude", $txt)
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Ok ((Get-Content "$info\exclude" -Raw) -notmatch '(?m)^/HANDOFF\.md\r?$') 'the line is given back'
+  Eq (Get-Content $sf -Raw | ConvertFrom-Json).$key $null 'and only now the record goes'
+}
+T 'nhanh r5: Write-PhienText leftovers (<file>.part-<PID> of a dead run) beside the state files and .git/info/exclude are removed by the next run; a live run''s stay' {
+  $w = New-W2 'q27'; Use-LoggedIb $w
+  New-GitDir $w.LP; [void](New-Sess $w.LS '27272727-lft1' $w.LP @('a'))
+  $gone = Start-Process -FilePath $env:ComSpec -ArgumentList '/c', 'exit' -WindowStyle Hidden -PassThru; $gone.WaitForExit(); $dp = $gone.Id
+  $sd = Join-Path $w.U 'AppData\Local\fcode'
+  $dead = @('handoff-state.json', 'phien-status.json', 'phien-auto.json' | ForEach-Object { Join-Path $sd "$_.part-$dp" }) + @("$($w.LP)\.git\info\exclude.part-$dp")
+  $live = @((Join-Path $sd "handoff-state.json.part-$PID"), "$($w.LP)\.git\info\exclude.part-$PID")   # this test process is alive and older than the file
+  foreach ($f in $dead + $live) { Put-File $f 'x' 0 }
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  foreach ($f in $dead) { Ok (-not (Test-Path $f)) "removed: $(Split-Path $f -Leaf)" }
+  foreach ($f in $live) { Ok (Test-Path $f) "kept: $(Split-Path $f -Leaf)" }
 }
 
 # ============================== 1.3.3: fcode moc (profile hook) ==============================
