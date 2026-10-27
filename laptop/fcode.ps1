@@ -1060,10 +1060,10 @@ NOTE_SPECS = [':(glob)HANDOFF*.md', 'CLAUDE.md', 'AGENTS.md', 'WORKFLOW.md', 'ag
 PROJ_RX = re.compile(r'^[a-z0-9][a-z0-9._-]{0,63}$')
 
 
-def git(d, *a):
-    try:
-        return subprocess.run(['git', '--no-optional-locks', '-C', d, '-c', 'core.quotepath=false'] + list(a),
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+def git(d, *a, inp=None):
+    try:   # LC_ALL=C: git's own messages stay English (shared_projects reads "not a git repository"); paths are bytes either way
+        return subprocess.run(['git', '--no-optional-locks', '-C', d, '-c', 'core.quotepath=false'] + list(a), env=dict(os.environ, LC_ALL='C'),
+                              input=inp, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
     except Exception:
         return None
 
@@ -1084,28 +1084,37 @@ def index_names(d):
     return set(x for x in r.stdout.decode('utf-8', 'replace').split('\0') if NOTE_RX.match(x))
 
 
-def upstream_names(d):
+def upstream_names(d, strict=False):
     # ghi chu nam trong nhanh mac dinh cua origin (ban da fetch): git se mang file do toi, nen cung tinh la da theo doi
     # nhanh mac dinh: origin/HEAD, khong co thi origin/main, roi origin/master
+    # strict (the holder check): a git that gives no answer at all (git() None: timeout, not started) is None, never "nothing upstream"; no ref or
+    # rc != 0 stays an empty set (the laptop's Get-PhienUpstreamNotes: only a non-answer is a failure)
     r = git(d, 'symbolic-ref', '-q', 'refs/remotes/origin/HEAD')
+    if r is None and strict:
+        return None
     ref = r.stdout.decode('utf-8', 'replace').strip() if r is not None and r.returncode == 0 else ''
     for c in ('refs/remotes/origin/main', 'refs/remotes/origin/master'):
         if ref:
             break
         r = git(d, 'rev-parse', '-q', '--verify', c)
+        if r is None and strict:
+            return None
         if r is not None and r.returncode == 0:
             ref = c
     if not ref:
         return set()
     r = git(d, 'ls-tree', '-z', '--name-only', ref)
+    if r is None and strict:
+        return None
     if r is None or r.returncode != 0:
         return set()
     return set(x for x in r.stdout.decode('utf-8', 'replace').split('\0') if NOTE_RX.match(x))
 
 
-def tracked_names(d):
+def tracked_names(d, strict=False):
     t = index_names(d)
-    return None if t is None else t | upstream_names(d)
+    u = None if t is None else upstream_names(d, strict)
+    return None if u is None else t | u
 
 
 def scan_notes(d):
@@ -1257,42 +1266,87 @@ def hide_uploads(d):
         return False
 
 
-def shared_projects(d, p, projs):
+def same_file(a, b):
+    # the same file or folder, whatever the spelling (links, relative paths); a path that is gone is not the same as anything
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def holds_note(x, name):
+    # a holder candidate: a regular file <name> (not a link) at the project's root. The ONE test the holder check (pair_holders) and its
+    # git-failure rule (shared_projects) share, the laptop's order: no file, no question to git, no error
+    f = os.path.join(x, name)
+    return os.path.isfile(f) and not os.path.islink(f)
+
+
+def shared_projects(d, p, projs, name=None):
     # The folders a 1.3.3 server.mjs can append "/<prefix>.fcode/" to THIS exclude file for are exactly the config projects it uploads into:
     # a value of `projects` that is a string and an absolute path (1bc8703:server.mjs:196), an existing directory (:1847-1848), inside a work
     # tree (`rev-parse --is-inside-work-tree`, :1785-1787), whose `--git-path info/exclude` (the server's own question, :1785) is this file p.
-    # Linked work trees, and projects that are sub-folders of one repository, share one file. Paths are compared by realpath: git prints a
-    # relative path from a sub-folder and an absolute one from a linked work tree. Returns the folders other than d, or None when git does
-    # not answer for one of them (the caller waits). A bare repository, a plain folder and a folder that is gone hold no uploads: skipped
-    seen = {os.path.normcase(os.path.realpath(d))}
-    want = os.path.normcase(os.path.realpath(p))
+    # Linked work trees, and projects that are sub-folders of one repository, share one file. Files are compared with os.path.samefile
+    # (git prints a relative path from a sub-folder and an absolute one from a linked work tree; links and bind mounts resolve to one file).
+    # Returns the folders other than d, or None when git does not answer for one of them (the caller waits). A bare repository, a plain
+    # folder and a folder that is gone hold no uploads: skipped. `name` (unexclude, the holder check): a config project that holds a regular
+    # `<name>` is a holder candidate; for it only git's own "not a git repository" skips the folder and any other failure (rc 128 "detected
+    # dubious ownership", a bad config, a permission error) is None, the release is retried. A project without the file is skipped on any
+    # rc != 0 as in 1.3.5 (Rule H: the same-uid 1.3.3 server gets the same failure and appends nothing)
     out = []
     for x in projs.values():
-        if not (isinstance(x, str) and os.path.isabs(x) and os.path.isdir(x)):
+        if not (isinstance(x, str) and os.path.isabs(x) and os.path.isdir(x)) or same_file(x, d):
             continue
-        k = os.path.normcase(os.path.realpath(x))
-        if k in seen:
-            continue
-        seen.add(k)
         r = git(x, 'rev-parse', '--is-inside-work-tree', '--git-path', 'info/exclude')
         if r is None:
             return None
         ls = r.stdout.decode('utf-8', 'replace').splitlines()
+        if r.returncode != 0 and name and b'not a git repository' not in r.stderr and holds_note(x, name):
+            return None
         if r.returncode != 0 or len(ls) < 2 or ls[0] != 'true':
             continue
         q = ls[1] if os.path.isabs(ls[1]) else os.path.join(x, ls[1])
-        if os.path.normcase(os.path.realpath(q)) == want:
+        if same_file(q, p):
             out.append(x)
     return out
 
 
-def hide_all_uploads(d, p, projs):
-    # the Rule H gate for the project d and for every other config project that shares its exclude file p (shared_projects); False = one of them
-    # could not be verified, or git did not answer for one of them
-    others = shared_projects(d, p, projs)
-    if others is None:
-        return False
+def hide_all_uploads(d, others):
+    # the Rule H gate for the project d and for every other config project that shares its exclude file (shared_projects); False = one of them
+    # could not be verified
     return all([hide_uploads(w) for w in [d] + others])
+
+
+def pair_holders(others, name, releasing, p):
+    # True = some other project on the shared exclude file still depends on fcode's line for <name>; False = none does; None = git could not tell
+    # (tracked_names or check-ignore failed, or its answer is not the four NUL-separated fields): a failure, the caller reports it, nothing is removed.
+    # A project depends on it when it holds a regular file <name> at its root that is tracked nowhere for it (index and origin default) and that
+    # git hides through a "/<name>" line of info/exclude (check-ignore -v names the source; a .gitignore or global match is independent).
+    # A project whose own release of this name is in the same batch (`releasing`) does not hold the line: its copy is given back anyway.
+    # NB: with -v, check-ignore exits 0 also for a negated match ("!<name>"), whose pattern is not "/<name>": that copy is visible anyway
+    # Every candidate is asked, a holder included: a git failure about any of them is None whatever its place in `others` (DECISION B)
+    held = False
+    for x in others:
+        if any(same_file(x, r) for r in releasing):
+            continue
+        if not holds_note(x, name):
+            continue
+        t = tracked_names(x, True)   # strict: a git that does not answer is a failure here, never "not tracked"
+        if t is None:
+            return None
+        if name in t:
+            continue
+        # -z: <source> NUL <line> NUL <pattern> NUL <path> NUL, never quoted (a path with a special character, a note name holding ':' parse the same)
+        ig = git(x, 'check-ignore', '-v', '-z', '--stdin', inp=name.encode('utf-8') + b'\0')   # -z needs --stdin
+        if ig is None or ig.returncode not in (0, 1):
+            return None
+        if ig.returncode == 1:
+            continue
+        fs = ig.stdout.split(b'\0')
+        if len(fs) != 5 or fs[4] != b'':
+            return None
+        if fs[2] == b'/' + name.encode('utf-8') and same_file(os.path.join(x, os.fsdecode(fs[0])), p):
+            held = True
+    return held
 
 
 def ensure_excluded(d, name):
@@ -1318,9 +1372,11 @@ def ensure_excluded(d, name):
     return bool(ig is not None and ig.returncode == 0)
 
 
-def unexclude(d, name, legacy, projs=None):
+def unexclude(d, name, legacy, projs=None, releasing=()):
     # give fcode's line back: the pair, or the bare "/<ten>" only when legacy (a line 1.3.2/1.3.3 added; the laptop kept its record).
-    # True = no line of fcode's is there now (removed, or not there); False = git could not say where the file is, the file / its folder is a link, or .fcode/.gitignore could not be made to hold `*` in this project or in any other box project that shares this exclude file, or git did not answer for one of them (nothing written)
+    # True = no line of fcode's is there now (removed, or not there); False = git could not say where the file is, the file / its folder is a link, or .fcode/.gitignore could not be made to hold `*` in this project or in any other box project that shares this exclude file, or git did not answer for one of them (nothing written);
+    # 'kept' = another project that shares this exclude file still depends on the line (pair_holders): nothing written, nothing forgotten; False also when
+    # git could not tell whether one does (pair_holders None)
     p = exclude_path(d)
     if not p or is_link(p):
         return False
@@ -1328,13 +1384,27 @@ def unexclude(d, name, legacy, projs=None):
         return True
     if projs is None:
         projs = cfg_projects()
-    cur = read_exclude(p)
-    new = mark_rx(name).sub(b'', cur)
-    if new == cur and legacy:
-        new = bare_rx(name).sub(b'', cur)
+    def cut():
+        cur = read_exclude(p)
+        new = mark_rx(name).sub(b'', cur)
+        if new == cur and legacy:
+            new = bare_rx(name).sub(b'', cur)
+        return cur, new
+    cur, new = cut()
     if new != cur:
-        if not hide_all_uploads(d, p, projs):   # Rule H: no rewrite unless the uploads folder of every project sharing this file is verified to hide itself
+        others = shared_projects(d, p, projs, name)
+        if others is None:
             return False
+        held = pair_holders(others, name, releasing, p)
+        if held is None:   # git could not tell: a failure (the laptop prints the error line and tries again), never 'kept'
+            return False
+        if held:
+            return 'kept'
+        if not hide_all_uploads(d, others):   # Rule H: no rewrite unless the uploads folder of every project sharing this file is verified to hide itself
+            return False
+        cur, new = cut()   # the checks above take time and the file is shared: cut again from what is there now, never from the first read
+        if new == cur:
+            return True
         write_exclude(p, new)
     return True
 
@@ -1772,18 +1842,26 @@ def cmd_put(_req):
                     ensure_excluded(d, name)
                 except OSError:
                     pass   # False, like place_note: the pair is not there, nothing else fails; the next run tries again
-        unexcl = []
+        unexcl, kept, rel = [], [], {}
+        for it in man.get('unexclude', []):   # every release of this run rides this one batch: a project releasing its own copy holds nothing for the others
+            pn, name = it.get('project'), it.get('name')
+            d = note_dir(projs, pn)
+            if d and isinstance(name, str) and NOTE_RX.match(name):
+                rel.setdefault(name, []).append(d)
         for it in man.get('unexclude', []):
             pn, name = it.get('project'), it.get('name')
             d = note_dir(projs, pn)   # the other side tracks the name now; the laptop asks only when the scan saw fcode's pair here (or a 1.3.2/1.3.3 record: legacy)
             try:
-                gone = bool(d and isinstance(name, str) and NOTE_RX.match(name) and unexclude(d, name, bool(it.get('legacy')), projs))
+                gone = d and isinstance(name, str) and NOTE_RX.match(name) and unexclude(d, name, bool(it.get('legacy')), projs, rel.get(name, []))
             except OSError:
                 gone = False
-            if gone:
+            if gone is True:
                 unexcl.append(pn + '/' + name)
+            elif gone == 'kept':
+                kept.append(pn + '/' + name)
         cnt['notePlaced'] = placed
         cnt['unexcluded'] = unexcl
+        cnt['noteKept'] = kept
         out_json(cnt)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
@@ -2308,7 +2386,7 @@ function ConvertTo-PhienArg([string]$a) {
 }
 # run a program with its output captured (stdin closed, so it can never wait for a key). While a phien deadline is set the program is killed with its
 # children after Get-PhienChildMs (Code 124). Out = stdout lines.
-function Invoke-PhienExe([string]$Exe, [string[]]$ExeArgs) {
+function Invoke-PhienExe([string]$Exe, [string[]]$ExeArgs, [string]$StdinText) {   # $StdinText (optional): written to the child's stdin as UTF-8 before it is closed
   $psi = New-Object Diagnostics.ProcessStartInfo
   $psi.FileName = $Exe; $psi.Arguments = (@($ExeArgs | ForEach-Object { ConvertTo-PhienArg ([string]$_) }) -join ' ')
   $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
@@ -2316,7 +2394,10 @@ function Invoke-PhienExe([string]$Exe, [string[]]$ExeArgs) {
   $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
   try { $p = [Diagnostics.Process]::Start($psi) } catch { return [pscustomobject]@{ Code = -1; Out = [string[]]@(); Err = "$($_.Exception.Message)" } }
   try {
-    try { $p.StandardInput.Close() } catch { }
+    try {
+      if ($StdinText) { $sb = [Text.Encoding]::UTF8.GetBytes($StdinText); $p.StandardInput.BaseStream.Write($sb, 0, $sb.Length); $p.StandardInput.BaseStream.Flush() }   # raw UTF-8 bytes (no BOM; 5.1 has no StandardInputEncoding)
+      $p.StandardInput.Close()
+    } catch { }
     $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
     # short waits, so a kill of this process (the job ending it) is never stuck behind one long native wait; -1 = no deadline, wait as long as it runs
     $ms = Get-PhienChildMs; $end = if ($ms -lt 0) { $null } else { [DateTime]::UtcNow.AddMilliseconds($ms) }
@@ -2536,7 +2617,7 @@ function Get-PhienWarning {
 # Che do nhanh chi ghi phien.log; man hinh nhan toi da MOT dong (Invoke-Phien in $script:PhienScreen, hoac dong loi khi that bai); thanh cong thi im lang.
 # Han chot (--nhanh, tu dong) chi duoc xem o diem an toan, truoc moi muc (quet, hash, mot dot, mot ghi chu); mot muc da bat dau thi xong tron hoac hong tron.
 function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [bool]$BoxKnownRunning = $false, [bool]$Quick = $false) {
-  $script:PhienQuiet = $Auto; $script:PhienQuick = $Quick; $script:PhienScreen = $null
+  $script:PhienQuiet = $Auto; $script:PhienQuick = $Quick; $script:PhienScreen = $null; $script:PhienRepoIds = @{}
   $capMsg = $PhienCapMsg
   $code = 0; $capHit = $false
   # lan tu dong: MOT han chot cho ca lan chay, tinh tu luc tien trinh bat dau (nhu gioi han 8 phut cua Task Scheduler)
@@ -2646,30 +2727,45 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
       $putU = New-Object System.Collections.ArrayList; $getU = New-Object System.Collections.ArrayList
       $putN = New-Object System.Collections.ArrayList; $getN = New-Object System.Collections.ArrayList
       $ensure = New-Object System.Collections.ArrayList; $unexcl = New-Object System.Collections.ArrayList
-      $noteDel = New-Object System.Collections.ArrayList
+      $noteDel = New-Object System.Collections.ArrayList; $relPend = @{}
       $nPutSess = 0; $nGetSess = 0; $nSame = 0; $planIncomplete = 0
       $plans = @{}; $queuedBlob = @{}
       $noteState = Read-PhienNoteState; $noteRec = @{}; $noteShaPut = @{}; $noteGetInfo = @{}; $noteSkipped = 0; $fileSkipped = 0
+      # every note plan first (a pure function): the project dirs whose release of a name on the laptop is planned in this run hold nothing for the
+      # others (Test-PhienSharedNote); the box gets the same set through the one batch that carries every unexclude item
+      $nps = @{}; $relL = @{}
+      foreach ($c in $ctx) {
+        $nps[$c.Name] = Get-PhienNotePlan $c.Name $c.LN $c.RN $noteState $lnow $rnow $PhienBusySec
+        foreach ($rl in $nps[$c.Name].Release) { if ($rl.OldOn -eq 'laptop') { if (-not $relL.ContainsKey($rl.Name)) { $relL[$rl.Name] = New-Object System.Collections.ArrayList }; [void]$relL[$rl.Name].Add($c.LDir) } }
+      }
       foreach ($c in $ctx) {
         $plan = Get-PhienPlan $c.L $c.R $c.Benc $hashes $c.Lsd $lnow $rnow $PhienBusySec $lblobIx $boxBlobs
         $plans[$c.Name] = $plan
         $nSame += $plan.Same; $planIncomplete += $plan.Incomplete + $plan.Deferred
         $stat.unknown += @($plan.Unknown); $stat.diverged += $plan.Diverged
-        $np = Get-PhienNotePlan $c.Name $c.LN $c.RN $noteState $lnow $rnow $PhienBusySec
+        $np = $nps[$c.Name]
         foreach ($cf in $np.Conflicts) { $stat.noteConf += $cf }
         foreach ($k in $np.Record.Keys) { $noteRec[$k] = $np.Record[$k] }
         foreach ($rl in $np.Release) {
-          $stat.noteReleased += "$($c.Name)/$($rl.Name)"
-          Write-PhienOut "  [$($c.Name)] ghi chú $($rl.Name) giờ do git theo dõi (trên $($rl.TrackedOn)): bản cũ trên $($rl.OldOn) xóa được, fcode không còn đồng bộ file này"
-          if (-not $DryRun) {
-            $rk = "$($c.Name)/$($rl.Name)"
+          $rk = "$($c.Name)/$($rl.Name)"
+          $relLine = "  [$($c.Name)] ghi chú $($rl.Name) giờ do git theo dõi (trên $($rl.TrackedOn)): bản cũ trên $($rl.OldOn) xóa được, fcode không còn đồng bộ file này"
+          # the release line (and notes.released, the menu's "xóa được") only when the old copy really can go (removed / absent / True): a kept pair gets
+          # the kept line alone and a failed release the error line alone. A dry run asks nothing: its line as before. The box answer comes with the put result ($relPend)
+          if ($DryRun) { $stat.noteReleased += $rk; Write-PhienOut $relLine }
+          else {
             if ($rl.OldOn -eq 'laptop') {
               # the records go only when the line is gone for sure (removed now, or not there): else they stay and the next run tries again.
-              # The path is the one the scan resolved (no git call here)
-              if ((Remove-PhienNoteExclude $c.LN.excl $rl.Name $rl.Legacy) -ne 'failed') { [void]$noteDel.Add("exclude:laptop:$rk"); [void]$noteDel.Add($rk) }
-              else { $code = 1; Write-PhienOut "  [$($c.Name)] lỗi: ghi chú $($rl.Name): chưa gỡ được dòng /$($rl.Name) của fcode trong .git/info/exclude (liên kết, hoặc git lỗi / không trả lời kịp), lần sau thử lại" }
+              # The path is the one the scan resolved (no git call inside Remove-PhienNoteExclude); the shared-note check (git calls) runs before it,
+              # only while fcode's line is still there: another project on the same repository that still depends on the line keeps it (nothing is
+              # forgotten); a git failure there is an error, not a keep (Get-PhienLaptopRelease)
+              $rs = Get-PhienLaptopRelease $c.LDir $c.LN.excl $rl.Name $rl.Legacy @($relL[$rl.Name] | Where-Object { $_ -ne $c.LDir })
+              if ($rs -eq 'kept') { Write-PhienOut "  [$($c.Name)] ghi chú $($rl.Name): dự án khác cùng kho trên laptop còn dùng dòng giấu /$($rl.Name), fcode chưa gỡ" }
+              else {
+                if ($rs -ne 'failed') { $stat.noteReleased += $rk; Write-PhienOut $relLine; [void]$noteDel.Add("exclude:laptop:$rk"); [void]$noteDel.Add($rk) }
+                else { $code = 1; Write-PhienOut "  [$($c.Name)] lỗi: ghi chú $($rl.Name): chưa gỡ được dòng /$($rl.Name) của fcode trong .git/info/exclude (liên kết, hoặc git lỗi / không trả lời kịp), lần sau thử lại" }
+              }
             }
-            else { [void]$unexcl.Add(@{ project = $c.Name; name = $rl.Name; legacy = $rl.Legacy }) }
+            else { $relPend[$rk] = $relLine; [void]$unexcl.Add(@{ project = $c.Name; name = $rl.Name; legacy = $rl.Legacy }) }
           }
         }
         if ($DryRun) {
@@ -2777,7 +2873,15 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
         foreach ($k in @($res.notePlaced)) { if ($k) { $noteRec[[string]$k] = $noteShaPut[[string]$k]; $stat.noteCopied++; $placedPut++ } }
         foreach ($k in @($res.unexcluded)) { if ($k) { [void]$noteDel.Add("exclude:box:$k"); [void]$noteDel.Add([string]$k) } }
         # a release the box could not do (git could not name its exclude file or did not answer, the exclude file or .git/info is a link, a read / write of it failed with an OSError, or .fcode/.gitignore could not be verified to hold `*`): a failure, nothing forgotten, the next run tries again
-        foreach ($x in @($pb.Unexclude)) { if (@($res.unexcluded) -notcontains "$($x.project)/$($x.name)") { $code = 1; Write-PhienOut "  [$($x.project)] lỗi: ghi chú $($x.name): box chưa gỡ được dòng /$($x.name) của fcode trong .git/info/exclude (liên kết, git trên box lỗi, hoặc chưa tạo được .fcode/.gitignore), lần sau thử lại" } }
+        # a release a sharing box project still depends on is kept (the box answers noteKept): a notice, not a failure, nothing forgotten
+        foreach ($k in @($res.noteKept)) { if ($k) { $kp = ([string]$k).IndexOf('/'); Write-PhienOut "  [$(([string]$k).Substring(0, $kp))] ghi chú $(([string]$k).Substring($kp + 1)): dự án khác cùng kho trên box còn dùng dòng giấu /$(([string]$k).Substring($kp + 1)), fcode chưa gỡ" } }
+        # the release line and notes.released only for a real removal (the kept line above and the error line are alone); a batch that never got an answer prints neither (next run)
+        foreach ($x in @($pb.Unexclude)) {
+          $xk = "$($x.project)/$($x.name)"
+          if (@($res.noteKept) -contains $xk) { continue }
+          if (@($res.unexcluded) -contains $xk) { $stat.noteReleased += $xk; Write-PhienOut $relPend[$xk] }
+          else { $code = 1; Write-PhienOut "  [$($x.project)] lỗi: ghi chú $($x.name): box chưa gỡ được dòng /$($x.name) của fcode trong .git/info/exclude (liên kết, git trên box lỗi, hoặc chưa tạo được .fcode/.gitignore), lần sau thử lại" }
+        }
         & $saveNotes
         'ok'
       }
@@ -2922,13 +3026,15 @@ function Format-PhienItem($it) {
 function Get-PhienNoteRx { '\A(?:HANDOFF[^/\\]*\.md|CLAUDE\.md|AGENTS\.md|WORKFLOW\.md|agent_state\.md|TASK\.md|CLAUDE\.local\.md)\z' }
 function Get-PhienNoteSpecs { , @(':(glob)HANDOFF*.md', 'CLAUDE.md', 'AGENTS.md', 'WORKFLOW.md', 'agent_state.md', 'TASK.md', 'CLAUDE.local.md') }
 
-function Invoke-GitQuiet([string]$Dir, [string[]]$GitArgs) {
+function Invoke-GitQuiet([string]$Dir, [string[]]$GitArgs, [string]$StdinText) {
   $git = Get-Command git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
   $script:PhienLastGitCode = -1
-  if (-not $git) { return [pscustomobject]@{ Code = -1; Out = @() } }
-  $r = Invoke-PhienExe $git.Source (@('--no-optional-locks', '-C', $Dir, '-c', 'core.quotepath=false') + @($GitArgs))   # bounded like every other child
+  if (-not $git) { return [pscustomobject]@{ Code = -1; Out = @(); Err = '' } }
+  $old = $env:LC_ALL; $env:LC_ALL = 'C'   # git's messages stay English ("not a git repository" is matched); the child inherits the process environment. Never the ProcessStartInfo environment dictionary: on Windows PowerShell 5.1 its getter fails when two names differ only in case (Path/PATH from an MSYS parent) and git would not start at all
+  try { $r = Invoke-PhienExe $git.Source (@('--no-optional-locks', '-C', $Dir, '-c', 'core.quotepath=false') + @($GitArgs)) $StdinText }   # bounded like every other child
+  finally { $env:LC_ALL = $old }   # $null / '' removes it again
   $script:PhienLastGitCode = $r.Code
-  [pscustomobject]@{ Code = $r.Code; Out = @($r.Out) }   # Code 124 = killed at its timeout: callers never read that as "git said no"
+  [pscustomobject]@{ Code = $r.Code; Out = @($r.Out); Err = [string]$r.Err }   # Code 124 = killed at its timeout: callers never read that as "git said no"
 }
 
 # ghi chu nam trong nhanh mac dinh cua origin (ban da fetch): git se mang file do toi, nen cung tinh la da theo doi (nhu box `upstream_names`)
@@ -3012,6 +3118,83 @@ function Get-PhienNotePlan([string]$Proj, $LN, $RN, $State, [double]$LNow, [doub
   [pscustomobject]@{ Put = @($put); Get = @($get); Ensure = @($ensure); Conflicts = @($conf); Record = $rec; Release = @($release) }
 }
 
+# the repository a folder belongs to and where the folder sits in it, from git itself (it resolves junction aliases, `..` and slashes):
+# @{ Common = the shared .git dir; Root = the folder's own root (work tree top + prefix) }; $null = git said "not a git repository" (rc 128 and that
+# message); 'unknown' = anything else (no answer in time, git missing or not started, any other failure). This call never reads the index
+function Get-PhienRepoId([string]$Dir) {
+  # asked once per folder for the run ($script:PhienRepoIds is reset at the start of each run)
+  if (-not $script:PhienRepoIds) { $script:PhienRepoIds = @{} }
+  $k = $Dir.ToLowerInvariant()
+  if (-not $script:PhienRepoIds.ContainsKey($k)) { $script:PhienRepoIds[$k] = Get-PhienRepoIdNow $Dir }
+  $script:PhienRepoIds[$k]
+}
+function Get-PhienRepoIdNow([string]$Dir) {
+  $r = Invoke-GitQuiet $Dir @('rev-parse', '--git-common-dir', '--show-toplevel', '--show-prefix')
+  if ($r.Code -eq 128 -and "$($r.Err)" -match 'not a git repository') { return $null }
+  $o = @($r.Out)
+  if ($r.Code -ne 0 -or $o.Count -lt 2) { return 'unknown' }
+  $prefix = if ($o.Count -ge 3) { [string]$o[2] } else { '' }
+  $root = [IO.Path]::GetFullPath((Join-Path ([string]$o[1]) $prefix)).TrimEnd('\')
+  $common = [string]$o[0]; if (-not [IO.Path]::IsPathRooted($common)) { $common = Join-Path $root $common }
+  @{ Common = [IO.Path]::GetFullPath($common).TrimEnd('\'); Root = $root }
+}
+# $true = another project (a `syncRepos` folder; the raw list, so folders with the same leaf name count) on the same repository still depends on
+# fcode's `/<name>` line in the shared info/exclude (the line stays: "kept"); $false = the line may go; 'unknown' = git could not tell (a failure:
+# the caller reports an error, nothing is removed or forgotten, the next run tries again). A folder depends on it when
+# it holds a regular file <name> at its root that is tracked nowhere for it (index and origin default) and that git hides through a `/<name>` line
+# of info/exclude (check-ignore -v names the source: a .gitignore or global match is independent). A folder whose own release of this name is
+# in this run ($Releasing: its project dirs) holds nothing for the others. Only "not a repository" skips a folder; every other git failure is 'unknown'.
+# NB: with -v, check-ignore exits 0 also for a negated match ("!<name>"), whose pattern is not "/<name>": that copy is visible anyway
+function Test-PhienSharedNote([string]$Dir, [string]$Name, [string[]]$Releasing) {
+  $me = Get-PhienRepoId $Dir
+  if ($null -eq $me -or $me -is [string]) { return 'unknown' }
+  $skip = @()
+  foreach ($rd in @($Releasing)) { if (-not $rd) { continue }; $ri = Get-PhienRepoId $rd; if ($ri -is [string]) { return 'unknown' }; if ($ri) { $skip += $ri.Root } }
+  $held = $false   # every candidate is asked, a holder included: a git failure about any of them is 'unknown' whatever its place in syncRepos (box pair_holders)
+  foreach ($o in @($SyncRepos)) {
+    $f = Join-Path ([string]$o) $Name
+    # the file itself only (box parity: os.path.islink(f)): a folder that is a junction to a work tree still holds its note
+    if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { continue }
+    try { if ([IO.File]::GetAttributes($f) -band [IO.FileAttributes]::ReparsePoint) { continue } } catch { return 'unknown' }   # cannot read its attributes (access denied, a race): git cannot be told apart from a link: a failure for this release, never an abort of the run
+    $id = Get-PhienRepoId ([string]$o)
+    if ($null -eq $id) { continue }
+    if ($id -is [string]) { return 'unknown' }
+    if ($id.Common -ine $me.Common -or $id.Root -ieq $me.Root -or ($skip -icontains $id.Root)) { continue }
+    $t = Invoke-GitQuiet ([string]$o) @('ls-files', '--', $Name)
+    if ($t.Code -ne 0) { return 'unknown' }
+    if (@($t.Out) -ccontains $Name) { continue }
+    $up = Get-PhienUpstreamNotes ([string]$o)
+    if ($null -eq $up) { return 'unknown' }
+    if (@($up) -ccontains $Name) { continue }
+    # -z: <source> NUL <line> NUL <pattern> NUL <path> NUL, never quoted (a folder name with non-ASCII or special characters parses the same)
+    # -z needs --stdin: the path goes in NUL-terminated. Twice: Windows PowerShell 5.1 puts a BOM in front of the first stdin byte (that record is a
+    # path that does not exist, never a match); the answer is read as records of four fields and the one whose path is <name> counts
+    $ig = Invoke-GitQuiet ([string]$o) @('check-ignore', '-v', '-z', '--stdin') ($Name + "`0" + $Name + "`0")
+    if ($ig.Code -ne 0 -and $ig.Code -ne 1) { return 'unknown' }
+    if ($ig.Code -eq 1) { continue }
+    $fs = @(([string]::Join("`n", [string[]]@($ig.Out))) -split "`0")
+    if ($fs.Count -lt 5 -or $fs[-1] -ne '' -or ($fs.Count - 1) % 4 -ne 0) { return 'unknown' }
+    $hit = $null
+    for ($i = 0; $i -lt $fs.Count - 1; $i += 4) { if ($fs[$i + 3] -ceq $Name) { $hit = @($fs[$i], $fs[$i + 2]); break } }
+    if (-not $hit) { continue }
+    $src = @($hit[0] -split '[\\/]')
+    if ($hit[1] -ceq "/$Name" -and $src.Count -ge 2 -and $src[-1] -ceq 'exclude' -and $src[-2] -ceq 'info') { $held = $true; continue }
+  }
+  $held
+}
+# what the laptop does for one release of <Name> in the project <Dir> whose exclude file the scan resolved ($Excl): kept | failed | removed | absent.
+# Git is asked (Test-PhienSharedNote) only while fcode's line is still in that file: an earlier release of this run may have taken the pair already,
+# then it goes straight to Remove-PhienNoteExclude ('absent'), like the box (new -ne cur). 'unknown' from git is 'failed' (nothing written, retried)
+function Get-PhienLaptopRelease([string]$Dir, [string]$Excl, [string]$Name, [bool]$Legacy, [string[]]$Releasing) {
+  if (-not $Excl -or (Test-PhienReparse $Excl)) { return 'failed' }   # a link is never read through nor written (box order: is_link before the holders)
+  $has = (Test-PhienMarkedLine (Read-PhienExcludeText $Excl) $Name) -or ($Legacy -and (Test-PhienExcludeLine $Excl $Name))
+  if ($has) {
+    $sh = Test-PhienSharedNote $Dir $Name $Releasing
+    if ($sh -is [string]) { return 'failed' }
+    if ($sh) { return 'kept' }
+  }
+  Remove-PhienNoteExclude $Excl $Name $Legacy
+}
 function Get-PhienNoteStatePath { Join-Path $env:LOCALAPPDATA 'fcode\handoff-state.json' }
 # strict: a missing file is an empty state; anything else that is not one JSON object (unreadable, cut, `null`, `42`, an array) stops the run
 # before any change, so the sha memory and the 1.3.2/1.3.3 ownership records are never overwritten with nothing
@@ -3285,8 +3468,9 @@ function Invoke-PhienBounded([string]$Proj, [bool]$Nen) {
   $psi.FileName = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
   $psi.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $FcodeScript + '" phien ' + $Proj + ' --nhanh'
   $psi.UseShellExecute = $false
-  $psi.EnvironmentVariables['FCODE_PHIEN_WORKER'] = '1'
+  $env:FCODE_PHIEN_WORKER = '1'   # the child inherits the process environment (never the ProcessStartInfo environment dictionary: its getter fails on Windows PowerShell 5.1 with two names that differ only in case)
   try { $p = [Diagnostics.Process]::Start($psi) } catch { Add-PhienLog @("lỗi: không chạy được lần đồng bộ nhanh ($($_.Exception.Message))"); Write-Host $PhienFailMsg; return 1 }
+  finally { Remove-Item Env:FCODE_PHIEN_WORKER -ErrorAction SilentlyContinue }
   try {
     $lim = (Get-PhienCapSec) + 10
     if ($p.WaitForExit($lim * 1000)) { return $p.ExitCode }
