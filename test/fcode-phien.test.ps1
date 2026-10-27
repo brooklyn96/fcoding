@@ -38,7 +38,8 @@ $wanted = 'Test-WinPath', 'Resolve-OmpPath', 'Get-OmpUnder', 'Join-OmpName', 'Ge
   'Get-PhienDirFiles', 'Get-PhienIdOf', 'Test-PhienDeps', 'Get-PhienUnitBytes', 'Get-PhienUpstreamNotes',
   'Add-SyncRepoConfig', 'Test-SyncFolder', 'Get-RepoKey', 'Get-GitDirOrigin', 'Find-LocalClones', 'Get-SyncDesktop', 'Get-FcodeAddLimitVars', 'Get-MocPolicy', 'Write-MocPolicy',
   'Test-PhienTimeUp', 'Get-PhienChildMs', 'Stop-PhienProc', 'ConvertTo-PhienArg', 'Invoke-PhienExe',
-  'Write-PhienText', 'Test-PhienReparse', 'Get-PhienLockName', 'Add-PhienLog', 'Write-PhienOut', 'Get-PhienCapSec', 'Get-PhienNenDelaySec', 'Invoke-PhienBounded'
+  'Write-PhienText', 'Test-PhienReparse', 'Get-PhienLockName', 'Add-PhienLog', 'Write-PhienOut', 'Get-PhienCapSec', 'Get-PhienNenDelaySec', 'Invoke-PhienBounded',
+  'Clear-PhienPartFiles', 'Test-PhienOwnerGone', 'Get-PhienMarkRx', 'Test-PhienMarkedLine', 'ConvertTo-PhienLatin1', 'Read-PhienExcludeText'
 foreach ($fn in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in $wanted }, $true)) { . ([scriptblock]::Create($fn.Extent.Text)) }
 # the git half and the file half that Install-PhienNote uses (git first, then the move, then the line), as one call for the exclude tests below
 function Add-PhienNoteExclude([string]$Dir, [string]$Name) { $f = Get-PhienExcludeFile $Dir $Name; [bool]($f -and (Add-PhienExcludeLine $f $Name)) }
@@ -267,7 +268,7 @@ T 'format guard: version note' {
   Ok ($null -eq (Get-PhienVersionNote '18.12.6' '')) 'unknown side is no difference'
 }
 # ============================== project notes (HANDOFF*.md, CLAUDE.md, ...) ==============================
-function Nt([string]$Name, [string]$Sha, [double]$Age = 600, [bool]$Ign = $true) { [pscustomobject]@{ name = $Name; size = 1; mtime = ((ConvertTo-Epoch (Get-Date)) - $Age); sha = $Sha; ign = $Ign } }
+function Nt([string]$Name, [string]$Sha, [double]$Age = 600, [bool]$Ign = $true, [switch]$Fx) { [pscustomobject]@{ name = $Name; size = 1; mtime = ((ConvertTo-Epoch (Get-Date)) - $Age); sha = $Sha; ign = $Ign; fx = [bool]$Fx } }
 function NS($Files, $Tracked = @(), [bool]$GitOk = $true, $Upstream = @()) { [pscustomobject]@{ gitok = $GitOk; tracked = @($Tracked); upstream = @($Upstream); files = @($Files) } }
 T 'notes: name list' {
   $rx = Get-PhienNoteRx
@@ -330,7 +331,8 @@ T 'notes: exclude goes to .git/info/exclude (never .gitignore), once, only when 
   # exclude file without trailing newline
   Add-PhienNoteExclude $d 'HANDOFF-b.md'; Put-File "$d\HANDOFF-b.md" 'b'; [IO.File]::WriteAllText("$d\.git\info\exclude", ((Get-Content "$d\.git\info\exclude" -Raw).TrimEnd("`r", "`n")))
   Add-PhienNoteExclude $d 'HANDOFF-c.md'
-  Ok ((Get-Content "$d\.git\info\exclude" -Raw) -match "(?m)^/HANDOFF-b\.md\r?\n/HANDOFF-c\.md") 'new line started after a file without final newline'
+  Ok ((Get-Content "$d\.git\info\exclude" -Raw) -match "(?m)^/HANDOFF-b\.md\r?\n# fcode\r?\n/HANDOFF-c\.md") 'new pair started after a file without final newline'
+  Ok ((Get-Content "$d\.git\info\exclude" -Raw) -match "(?m)^# fcode\r?\n/HANDOFF-a\.md\r?$") 'each line fcode adds has the # fcode marker right above it'
 }
 T 'notes: install refuses when the target changed, is busy or is tracked' {
   $d = Join-Path $Root 'nt3'; New-GitDir $d; $src = Join-Path $Root 'nt3-src.md'; Put-File $src 'from box'
@@ -348,26 +350,6 @@ T 'notes: install refuses when the target changed, is busy or is tracked' {
   Eq (Install-PhienNote $src $d 'CLAUDE.md' '' $n) 'tracked'
   Ok (-not (Get-ChildItem $d -Filter '*.fcode-part*' -Force)) 'no part files'
 }
-# r4 F3: ownership first: $BeforeLine (the caller saves "fcode owns this line") runs before the exclude line is added and before the note is placed
-T 'notes r4: Install-PhienNote runs $BeforeLine before the exclude line and the move; not at all when git already ignores the name' {
-  $d = Join-Path $Root 'nt8'; New-GitDir $d; $src = Join-Path $Root 'nt8-src.md'; Put-File $src 'from box'; Put-File "$d\.gitignore" "TASK.md`n"
-  $exf = "$d\.git\info\exclude"; $before = [IO.File]::ReadAllText($exf)
-  $script:snap = $null
-  $bl = { $script:snap = @{ Ex = [IO.File]::ReadAllText($exf); Note = (Test-Path -LiteralPath "$d\HANDOFF-o.md") } }
-  Eq (Install-PhienNote $src $d 'HANDOFF-o.md' '' (ConvertTo-Epoch (Get-Date)) 30 '' $bl) 'ok'
-  Ok ($null -ne $script:snap) '$BeforeLine was invoked'
-  Eq $script:snap.Ex $before 'at that moment the exclude file had not changed yet'
-  Eq $script:snap.Note $false 'and the note was not placed yet'
-  Ok ([IO.File]::ReadAllText($exf) -match '(?m)^/HANDOFF-o\.md\r?$') 'afterwards: the line'; Eq (Get-Content "$d\HANDOFF-o.md" -Raw) 'from box' 'and the note'
-  $script:snap = $null
-  Eq (Install-PhienNote $src $d 'TASK.md' '' (ConvertTo-Epoch (Get-Date)) 30 '' $bl) 'ok'
-  Eq $script:snap $null 'git already ignores TASK.md: no line, no ownership'
-  # r5: the same line already there but git says not ignored (a later user rule): the line is the user's, fcode claims nothing
-  [IO.File]::AppendAllText($exf, "/HANDOFF-u.md`n!/HANDOFF-u.md`n")
-  $script:snap = $null
-  Eq (Install-PhienNote $src $d 'HANDOFF-u.md' '' (ConvertTo-Epoch (Get-Date)) 30 '' $bl) 'ok'
-  Eq $script:snap $null 'an identical line already there: no ownership recorded'; Eq $script:PhienLastExclAdded $false 'and no line added'
-}
 T 'batches: <= 50 MB per tar stream, a bigger single item gets its own batch' {
   $bs = New-Object System.Collections.ArrayList
   foreach ($mb in 30, 30, 10, 60, 1, 49, 2) { $b = Get-PhienBatch $bs 'R' ([long]$mb * 1MB); [void]$b.Items.Add($mb) }
@@ -380,10 +362,16 @@ T 'notes planner: release when git starts tracking a name that fcode placed and 
   $now = ConvertTo-Epoch (Get-Date)
   # tracked on the laptop now, the box copy was placed by fcode (marker) -> release on the box
   $p = Get-PhienNotePlan 'proj' (NS @((Nt 'A.md' 'a1')) @('A.md')) (NS @((Nt 'A.md' 'a1'))) @{ 'exclude:box:proj/A.md' = '1'; 'proj/A.md' = 'a1' } $now $now
-  Eq (($p.Release | ForEach-Object { "$($_.Name):$($_.TrackedOn):$($_.OldOn)" }) -join ',') 'A.md:laptop:box'; Eq ($p.Put.Count + $p.Get.Count) 0 'and it is not synced any more'
+  Eq (($p.Release | ForEach-Object { "$($_.Name):$($_.TrackedOn):$($_.OldOn):$($_.Legacy)" }) -join ',') 'A.md:laptop:box:True' 'a 1.3.2/1.3.3 record: legacy'; Eq ($p.Put.Count + $p.Get.Count) 0 'and it is not synced any more'
   # tracked on the box, the laptop copy came from the box (marker) -> release on the laptop
   $p = Get-PhienNotePlan 'proj' (NS @((Nt 'B.md' 'b1'))) (NS @((Nt 'B.md' 'b1')) @('B.md')) @{ 'exclude:laptop:proj/B.md' = '1' } $now $now
-  Eq (($p.Release | ForEach-Object { "$($_.Name):$($_.TrackedOn):$($_.OldOn)" }) -join ',') 'B.md:box:laptop'
+  Eq (($p.Release | ForEach-Object { "$($_.Name):$($_.TrackedOn):$($_.OldOn):$($_.Legacy)" }) -join ',') 'B.md:box:laptop:True'
+  # r6: the "# fcode" pair on that side (fx) is the ownership: a release without any record, not legacy
+  $p = Get-PhienNotePlan 'proj' (NS @((Nt 'F.md' 'f1')) @('F.md')) (NS @((Nt 'F.md' 'f1' -Fx))) @{} $now $now
+  Eq (($p.Release | ForEach-Object { "$($_.Name):$($_.TrackedOn):$($_.OldOn):$($_.Legacy)" }) -join ',') 'F.md:laptop:box:False' 'box pair'
+  $p = Get-PhienNotePlan 'proj' (NS @((Nt 'G.md' 'g1' -Fx))) (NS @((Nt 'G.md' 'g1')) @('G.md')) @{} $now $now
+  Eq (($p.Release | ForEach-Object { "$($_.Name):$($_.TrackedOn):$($_.OldOn):$($_.Legacy)" }) -join ',') 'G.md:box:laptop:False' 'laptop pair'
+  $p = Get-PhienNotePlan 'proj' (NS @((Nt 'H.md' 'h1' -Fx)) @('H.md')) (NS @((Nt 'H.md' 'h1'))) @{} $now $now; Eq $p.Release.Count 0 'a pair on the side that tracks it releases nothing'
   # no marker = the exclude line was not ours (or git ignored it already): nothing to give back
   $p = Get-PhienNotePlan 'proj' (NS @((Nt 'C.md' 'c1')) @('C.md')) (NS @((Nt 'C.md' 'c1'))) @{} $now $now; Eq $p.Release.Count 0
   # marker for the other side only, or tracked on both sides: nothing
@@ -396,11 +384,12 @@ T 'notes: Add returns true only when it added the line; Remove takes out only th
   [IO.File]::WriteAllText($ex, "# my own comment`n/HANDOFF-ab.md`n/other.txt`n")
   Eq (Add-PhienNoteExclude $d 'HANDOFF-a.md') $true; Eq (Add-PhienNoteExclude $d 'HANDOFF-a.md') $false 'second time: already ignored'
   Eq (Add-PhienNoteExclude $d 'HANDOFF-ab.md') $false 'a pre-existing line is not ours'
-  Eq (Remove-PhienNoteExclude $d 'HANDOFF-a.md') 'removed'
+  Ok ((Read-Bytes $ex).Length -gt 0 -and (Latin $ex) -match '(?m)^# fcode\n/HANDOFF-a\.md\n' -and (Latin $ex) -notmatch '# fcode\n/HANDOFF-ab') 'the pair for ours, no marker above the user''s line'
+  Eq (Remove-PhienNoteExclude $ex 'HANDOFF-a.md' $false) 'removed'
   $t = Get-Content $ex -Raw
-  Ok ($t -notmatch '(?m)^/HANDOFF-a\.md\r?$') 'our line is gone'
+  Ok ($t -notmatch '(?m)^/HANDOFF-a\.md\r?$' -and $t -notmatch '# fcode') 'our pair is gone'
   Ok ($t -match '(?m)^/HANDOFF-ab\.md\r?$' -and $t -match '(?m)^/other\.txt\r?$' -and $t -match '# my own comment') 'every other line stays (also the one with the same prefix)'
-  Eq (Remove-PhienNoteExclude $d 'HANDOFF-a.md') 'absent' 'nothing left to remove: confirmed absent'
+  Eq (Remove-PhienNoteExclude $ex 'HANDOFF-a.md' $false) 'absent' 'nothing left to remove: confirmed absent'
   Ok (Bytes-Eq (Read-Bytes $ex) $utf8.GetBytes("# my own comment`n/HANDOFF-ab.md`n/other.txt`n")) 'the three user rules survive our add + remove byte for byte'
   Eq @(Get-ChildItem "$d\.git\info" -Force -Filter '*.part-*').Count 0 'no part file left'
 }
@@ -416,15 +405,47 @@ T 'notes r4: a junction .git/info: Get-PhienExcludeFile gives $null (the note is
   Eq $null (Get-PhienExcludeFile $d 'HANDOFF-x.md') 'link: no exclude file to write'
   Eq (Get-Content (Join-Path $Root 'nt6-elsewhere\exclude') -Raw) "# user`n" 'the target is untouched'
 }
-T 'notes r4: Remove-PhienNoteExclude through a junction .git/info: failed (not absent), the target bytes unchanged, the junction intact; no git = failed; no exclude file = absent' {
+T 'notes r4: Remove-PhienNoteExclude through a junction .git/info: failed (not absent), the target bytes unchanged, the junction intact; no path = failed; no exclude file = absent' {
   $d = Join-Path $Root 'nt7'; New-GitDir $d; $tg = Join-Path $Root 'nt7-elsewhere'
-  $txt = "# user rules`n/HANDOFF-z.md`n*.log`n"
+  $txt = "# user rules`n# fcode`n/HANDOFF-z.md`n*.log`n"
   New-InfoJunction $d $tg $txt
-  Eq (Remove-PhienNoteExclude $d 'HANDOFF-z.md') 'failed' 'nothing removed through a link, and that is a failure'
+  Eq (Remove-PhienNoteExclude "$d\.git\info\exclude" 'HANDOFF-z.md' $true) 'failed' 'nothing removed through a link, and that is a failure'
   Ok (Bytes-Eq (Read-Bytes (Join-Path $tg 'exclude')) $utf8.GetBytes($txt)) 'target bytes unchanged'
   Ok ((Get-Item -LiteralPath "$d\.git\info" -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) 'the junction is still a junction'
-  $ng = Join-Path $Root 'nt7-nogit'; [void](New-Item -ItemType Directory -Path $ng -Force); Eq (Remove-PhienNoteExclude $ng 'HANDOFF-z.md') 'failed' 'git cannot say where the file is: failed'
-  $d2 = Join-Path $Root 'nt7b'; New-GitDir $d2; Remove-Item "$d2\.git\info\exclude"; Eq (Remove-PhienNoteExclude $d2 'HANDOFF-z.md') 'absent' 'no exclude file: absent'
+  Eq (Remove-PhienNoteExclude '' 'HANDOFF-z.md' $true) 'failed' 'the scan had no path: failed'
+  $d2 = Join-Path $Root 'nt7b'; New-GitDir $d2; Remove-Item "$d2\.git\info\exclude"; Eq (Remove-PhienNoteExclude "$d2\.git\info\exclude" 'HANDOFF-z.md' $false) 'absent' 'no exclude file: absent'
+}
+# r6 T9: a bare "/<name>" without the marker is the user's; it goes only when a 1.3.2/1.3.3 record asks (legacy), on both machines
+T 'nhanh r6: the legacy flag: a bare line goes only with it; the pair goes either way (laptop and box)' {
+  $f = Join-Path $Root 't9\exclude'; $user = "# mine`n/HANDOFF.md`n/keep`n"
+  Put-File $f $user
+  Eq (Remove-PhienNoteExclude $f 'HANDOFF.md' $false) 'absent' 'laptop: the user''s bare line without the flag'; Ok (Bytes-Eq (Read-Bytes $f) $utf8.GetBytes($user)) 'laptop: bytes unchanged'
+  Eq (Remove-PhienNoteExclude $f 'HANDOFF.md' $true) 'removed' 'laptop: with the flag'; Eq ([IO.File]::ReadAllText($f)) "# mine`n/keep`n" 'laptop: only the bare line went'
+  Put-File $f "# mine`n/HANDOFF.md`n# fcode`n/HANDOFF.md`n/keep`n"
+  Eq (Remove-PhienNoteExclude $f 'HANDOFF.md' $false) 'removed' 'laptop: the pair without the flag'; Eq ([IO.File]::ReadAllText($f)) $user 'laptop: only the pair went'
+  $bd = Join-Path $Root 't9box'; New-GitDir $bd; $bf = "$bd\.git\info\exclude"
+  $drv = Join-Path $Root 't9.py'
+  [IO.File]::WriteAllText($drv, ("import runpy, sys`nm = runpy.run_path(sys.argv[1], run_name='x')`nd, p = sys.argv[2], sys.argv[3]`n" +
+    "def put(b):`n    open(p, 'wb').write(b)`ndef get():`n    return open(p, 'rb').read()`n" +
+    "u = b'# mine\n/HANDOFF.md\n/keep\n'`nput(u)`nprint(m['unexclude'](d, 'HANDOFF.md', False), get() == u)`n" +
+    "print(m['unexclude'](d, 'HANDOFF.md', True), get() == b'# mine\n/keep\n')`n" +
+    "put(b'# mine\n/HANDOFF.md\n# fcode\n/HANDOFF.md\n/keep\n')`nprint(m['unexclude'](d, 'HANDOFF.md', False), get() == u)`n"))
+  $out = @(python -I $drv $PyFile $bd $bf)
+  Eq ($out -join ',') 'True True,True True,True True' 'box: no flag = nothing touched (still True: nothing of fcode''s there); flag = bare line gone; the pair goes without it'
+}
+# r6 L5: handoff-state.json is read strictly: missing = empty; not one JSON object = stop (PowerShell 7 unwraps a one-item array: the raw text must start with {)
+T 'nhanh r6: Read-PhienNoteState: missing = empty, an object is read, anything else throws the state-file error' {
+  $sl = $env:LOCALAPPDATA; $env:LOCALAPPDATA = Join-Path $Root 'l5'
+  try {
+    Eq (Read-PhienNoteState).Count 0 'no file: empty state'
+    Put-File (Get-PhienNoteStatePath) '{"proj/A.md":"a1","exclude:laptop:proj/B.md":"1"}'
+    $s = Read-PhienNoteState; Eq $s['proj/A.md'] 'a1'; Eq $s['exclude:laptop:proj/B.md'] '1'
+    foreach ($bad in '{', '42', 'null', '', '[{}]', '[{"exclude:laptop:proj/HANDOFF.md":"1"}]', ' [ {"a":"1"} ] ') {
+      Put-File (Get-PhienNoteStatePath) $bad
+      $msg = $null; try { [void](Read-PhienNoteState) } catch { $msg = $_.Exception.Message }
+      Ok ($msg -match '^không đọc được trạng thái ghi chú \(handoff-state\.json\): ') "refused [$bad]: $msg"
+    }
+  } finally { $env:LOCALAPPDATA = $sl }
 }
 # r4 F1: every rewrite of a file goes through Write-PhienText (part file + atomic Replace / Move); the log is appended
 T 'files r4: outside Write-PhienText, the config / profile writers and the staging manifest, fcode.ps1 has no WriteAllText( / AppendAllText( / Set-Content' {
@@ -1042,23 +1063,22 @@ T 'e2e: git starts tracking a note fcode had placed and excluded: sync stops for
   Put-File "$($w.LP)\HANDOFF-lap.md" 'from laptop'          # laptop -> box (box side gets an exclude line from fcode)
   Put-File "$($w.BP)\HANDOFF-box.md" 'from box'            # box -> laptop (laptop side gets an exclude line from fcode)
   Put-File "$($w.LP)\TASK.md" 'task'; [IO.File]::AppendAllText("$($w.BP)\.git\info\exclude", "/TASK.md`n")   # box already ignores TASK.md by the user's own line
+  $boxUser = [IO.File]::ReadAllBytes("$($w.BP)\.git\info\exclude")
   $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
-  Ok ((Get-Content "$($w.BP)\.git\info\exclude" -Raw) -match '(?m)^/HANDOFF-lap\.md\r?$') 'box exclude has our line'
-  Ok ((Get-Content "$($w.LP)\.git\info\exclude" -Raw) -match '(?m)^/HANDOFF-box\.md\r?$') 'laptop exclude has our line'
+  Ok ((Get-Content "$($w.BP)\.git\info\exclude" -Raw) -match '(?m)^# fcode\r?\n/HANDOFF-lap\.md\r?$') 'box exclude has our pair'
+  Ok ((Get-Content "$($w.LP)\.git\info\exclude" -Raw) -match '(?m)^# fcode\r?\n/HANDOFF-box\.md\r?$') 'laptop exclude has our pair'
+  Ok ((Get-Content "$($w.BP)\.git\info\exclude" -Raw) -notmatch '# fcode\r?\n/TASK\.md') 'no marker above the user''s own /TASK.md'
   $st = Get-Content (Join-Path $w.U 'AppData\Local\fcode\handoff-state.json') -Raw | ConvertFrom-Json
-  Ok ($null -ne $st.PSObject.Properties['exclude:box:proj/HANDOFF-lap.md'] -and $null -ne $st.PSObject.Properties['exclude:laptop:proj/HANDOFF-box.md']) 'markers recorded for the lines fcode added'
-  Ok ($null -eq $st.PSObject.Properties['exclude:box:proj/TASK.md']) 'no marker for a line that was the user''s'
+  Eq @($st.PSObject.Properties | Where-Object { $_.Name -like 'exclude:*' }).Count 0 'r6: no ownership record (the pair is the ownership)'
   # B: the laptop starts tracking HANDOFF-lap.md and TASK.md (upstream began to carry them)
   Git-Commit $w.LP @('HANDOFF-lap.md', 'TASK.md')
   $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
   Ok ($r.Out -match 'ghi chú HANDOFF-lap\.md giờ do git theo dõi \(trên laptop\): bản cũ trên box xóa được') ("one line for the user; out: " + $r.Out)
   Ok ($r.Out -notmatch 'TASK\.md giờ do git') 'no line for a name whose exclude was not ours'
-  $bx = Get-Content "$($w.BP)\.git\info\exclude" -Raw
-  Ok ($bx -notmatch '(?m)^/HANDOFF-lap\.md\r?$') 'our line removed on the box'
-  Ok ($bx -match '(?m)^/TASK\.md\r?$' -and $bx -match '(?m)^/user-ignored\.txt\r?$' -and $bx -match '# my own comment') 'every other line stays'
+  Ok (Bytes-Eq ([IO.File]::ReadAllBytes("$($w.BP)\.git\info\exclude")) $boxUser) 'our pair removed on the box; every other byte is what the user had'
   Eq (Get-Content "$($w.BP)\HANDOFF-lap.md" -Raw) 'from laptop' 'the old copy is not deleted'
   $st = Get-Content (Join-Path $w.U 'AppData\Local\fcode\handoff-state.json') -Raw | ConvertFrom-Json
-  Ok ($null -eq $st.PSObject.Properties['exclude:box:proj/HANDOFF-lap.md'] -and $null -eq $st.PSObject.Properties['proj/HANDOFF-lap.md']) 'state forgets the name'
+  Ok ($null -eq $st.PSObject.Properties['proj/HANDOFF-lap.md']) 'state forgets the name'
   $sj = Get-Content (Join-Path $w.U 'AppData\Local\fcode\phien-status.json') -Raw | ConvertFrom-Json
   Eq (@($sj.notes.released) -join ',') 'proj/HANDOFF-lap.md' 'status lists it'
   $m = Invoke-Fcode $w @(); Ok ($m.Out -match 'Ghi chú dự án: git đã theo dõi 1 file') ("menu warns; out: " + $m.Out)
@@ -1071,9 +1091,7 @@ T 'e2e: git starts tracking a note fcode had placed and excluded: sync stops for
   Git-Commit $w.BP @('HANDOFF-box.md')
   $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
   Ok ($r.Out -match 'ghi chú HANDOFF-box\.md giờ do git theo dõi \(trên box\): bản cũ trên laptop xóa được') ("line for the laptop side; out: " + $r.Out)
-  $lx = Get-Content "$($w.LP)\.git\info\exclude" -Raw
-  Ok ($lx -notmatch '(?m)^/HANDOFF-box\.md\r?$') 'our line removed on the laptop'
-  Ok ($lx -match '(?m)^/user-ignored\.txt\r?$' -and $lx -match '# my own comment') 'laptop: other lines stay'
+  Eq ([IO.File]::ReadAllText("$($w.LP)\.git\info\exclude")) "# my own comment`n/user-ignored.txt`n" 'our pair removed on the laptop, the other lines stay'
   Eq (Get-Content "$($w.LP)\HANDOFF-box.md" -Raw) 'from box' 'laptop copy not deleted'
 }
 T 'e2e: sending is split into <= 50 MB batches (one ssh each); a failing batch leaves the rest for the next run' {
@@ -1360,18 +1378,20 @@ T 'e2e r4: leftovers of a cut-off run older than 1 h are removed at the start on
     $t = if ($aged) { $old } else { [DateTime]::UtcNow }
     if ($dir) { [void](New-Item -ItemType Directory -Force -Path $p); Put-File (Join-Path $p 'x.tar') 'x'; [IO.File]::SetLastWriteTimeUtc((Join-Path $p 'x.tar'), $t); [IO.Directory]::SetLastWriteTimeUtc($p, $t) }
     else { Put-File $p 'x'; [IO.File]::SetLastWriteTimeUtc($p, $t) } }
-  & $mk "$lt\fcode-phien-0ld" $true $true; & $mk "$lt\fcode-phien-n3w" $true $false; & $mk "$lt\other-old" $true $true
-  & $mk "$($w.LS)\x.jsonl.fcode-part-1-abc" $false $true; & $mk "$($w.LS)\y.jsonl.fcode-part-2-def" $false $false
-  & $mk "$($w.LBlobs)\.$('ab' * 32).fcode-part-3-ghi" $false $true
-  & $mk "$bt\fcode-phien-0ld" $true $true; & $mk "$bt\fcode-phien-n3w" $true $false; & $mk "$bt\other-old" $true $true
-  & $mk "$($w.BS)\z.jsonl.fcode-part-9-xyz" $false $true; & $mk "$($w.BS)\w.jsonl.fcode-part-8-uvw" $false $false
+  # r6 Rule L: only fcode's complete names (laptop: fcode-phien-[<PID>-]<32hex>, <name>.fcode-part-<PID>-<6hex>; box: fcode-phien-<8>, the same part name)
+  $h32 = 'ab' * 16; $lold = "fcode-phien-$h32"; $lnew = "fcode-phien-$PID-$h32"   # $PID: this test process, alive and older than the dir
+  & $mk "$lt\$lold" $true $true; & $mk "$lt\$lnew" $true $false; & $mk "$lt\other-old" $true $true
+  & $mk "$($w.LS)\x.jsonl.fcode-part-1-abcdef" $false $true; & $mk "$($w.LS)\y.jsonl.fcode-part-$PID-abcdef" $false $false
+  & $mk "$($w.LBlobs)\.$('ab' * 32).fcode-part-3-abcdef" $false $true
+  & $mk "$bt\fcode-phien-0ldaaaaa" $true $true; & $mk "$bt\fcode-phien-n3waaaaa" $true $false; & $mk "$bt\other-old" $true $true
+  & $mk "$($w.BS)\z.jsonl.fcode-part-9-abcdef" $false $true; & $mk "$($w.BS)\w.jsonl.fcode-part-8-abcdef" $false $false
   $env0 = @{ FCODE_PHIEN_BOXENV = ('HOME=' + ($w.BH -replace '\\', '/') + ' FCODE_CFG=' + ($w.Cfg -replace '\\', '/') + ' TMPDIR=' + ($bt -replace '\\', '/')) }
   $r = Invoke-Fcode $w @('phien') $env0; Eq $r.Code 0 $r.Out
-  Ok (-not (Test-Path "$lt\fcode-phien-0ld")) 'laptop: old staging dir removed'; Ok (Test-Path "$lt\fcode-phien-n3w") 'laptop: fresh staging dir kept'; Ok (Test-Path "$lt\other-old") 'laptop: other names untouched'
-  Ok (-not (Test-Path "$($w.LS)\x.jsonl.fcode-part-1-abc")) 'laptop: old part file removed'; Ok (Test-Path "$($w.LS)\y.jsonl.fcode-part-2-def") 'laptop: fresh part file kept'
-  Ok (-not (Test-Path "$($w.LBlobs)\.$('ab' * 32).fcode-part-3-ghi")) 'laptop: old blob part removed'
-  Ok (-not (Test-Path "$bt\fcode-phien-0ld")) 'box: old staging dir removed'; Ok (Test-Path "$bt\fcode-phien-n3w") 'box: fresh staging dir kept'; Ok (Test-Path "$bt\other-old") 'box: other names untouched'
-  Ok (-not (Test-Path "$($w.BS)\z.jsonl.fcode-part-9-xyz")) 'box: old part file removed'; Ok (Test-Path "$($w.BS)\w.jsonl.fcode-part-8-uvw") 'box: fresh part file kept'
+  Ok (-not (Test-Path "$lt\$lold")) 'laptop: old staging dir removed'; Ok (Test-Path "$lt\$lnew") 'laptop: fresh staging dir kept'; Ok (Test-Path "$lt\other-old") 'laptop: other names untouched'
+  Ok (-not (Test-Path "$($w.LS)\x.jsonl.fcode-part-1-abcdef")) 'laptop: old part file removed'; Ok (Test-Path "$($w.LS)\y.jsonl.fcode-part-$PID-abcdef") 'laptop: fresh part file kept'
+  Ok (-not (Test-Path "$($w.LBlobs)\.$('ab' * 32).fcode-part-3-abcdef")) 'laptop: old blob part removed'
+  Ok (-not (Test-Path "$bt\fcode-phien-0ldaaaaa")) 'box: old staging dir removed'; Ok (Test-Path "$bt\fcode-phien-n3waaaaa") 'box: fresh staging dir kept'; Ok (Test-Path "$bt\other-old") 'box: other names untouched'
+  Ok (-not (Test-Path "$($w.BS)\z.jsonl.fcode-part-9-abcdef")) 'box: old part file removed'; Ok (Test-Path "$($w.BS)\w.jsonl.fcode-part-8-abcdef") 'box: fresh part file kept'
 }
 function Set-NoOriginHead([string]$Dir) { $ErrorActionPreference = 'Continue'; & git -C $Dir remote set-head origin -d 2>&1 | Out-Null }
 T 'e2e r4: origin/<default> falls back to origin/master when origin/HEAD is not set (laptop and box)' {
@@ -1691,6 +1711,8 @@ function Use-LoggedIb($w, [string]$Stall = '') {
     'put2' { "if /i not `"%1`"==`"ssh`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`nfindstr /c:`"ssh put`" `"%FAKE_SSH_LOG%`" >nul 2>&1 || goto run`r`nping -n 60 127.0.0.1 >nul`r`n:run`r`n" }
     # 'put1late': the first `ssh ... put` waits until the epoch second in FAKE_PUT_UNTIL, then runs as the fake decides (an item still under way when the deadline passes)
     'put1late' { "if /i not `"%1`"==`"ssh`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`nfindstr /c:`"ssh put`" `"%FAKE_SSH_LOG%`" >nul 2>&1 && goto run`r`npython -c `"import os,time;time.sleep(max(0,float(os.environ['FAKE_PUT_UNTIL'])-time.time()))`"`r`n:run`r`n" }
+    # 'gitbreak': before an `ssh ... put` the box project's .git is renamed to .git-x (FAKE_BP = that folder, Windows form; unset = off): the box can no longer find its exclude file
+    'gitbreak' { "if `"%FAKE_BP%`"==`"`" goto run`r`nif /i not `"%1`"==`"ssh`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`nif exist `"%FAKE_BP%\.git`" attrib -h `"%FAKE_BP%\.git`" & ren `"%FAKE_BP%\.git`" .git-x`r`n:run`r`n" }   # .git is hidden: ren does not see it
     default { '' }
   }
   [IO.File]::WriteAllText($wrap, "@echo off`r`necho %1 >>`"$($w.IbLog)`"`r`n${hang}call `"$Cmd`" %*`r`nexit /b %errorlevel%`r`n")
@@ -1930,15 +1952,15 @@ T 'nhanh r2: a cut quick run leaves phien-auto.json alone; the next 10-minute au
 
 # ---- r3 "safe points only": an item (a batch, a note) ends whole or not at all; the deadline only stops the run between items ----
 function Body-Sha([string]$p) { $o = Get-PhienOff $p; Get-RangeSha $p $o ((Get-Item -LiteralPath $p).Length - $o) }
-# Q1: Install-PhienNote does every git call before it places the note; a git that never answers check-ignore / --git-path is killed (3 s floor or
-# time left + 5 s) and the note waits: never placed without its exclude line
-T 'nhanh r3: a note from the box with a git that stalls (check-ignore, --git-path): never placed without its exclude line; the next run places and excludes it' {
+# Q1: Install-PhienNote does every git call before it places the note; a git that never answers check-ignore is killed (3 s floor or
+# time left + 5 s) and the note waits: never placed without its exclude line (r6: a stall on --git-path now hits the scan: no note work at all)
+T 'nhanh r3: a note from the box with a git that stalls (check-ignore): never placed without its exclude line; the next run places and excludes it' {
   $w = New-W2 'q13'; Use-LoggedIb $w
   New-GitDir $w.LP; New-GitDir $w.BP
   Put-File "$($w.BP)\HANDOFF.md" 'box handoff'
   $realGit = (Get-Command git -CommandType Application | Select-Object -First 1).Source
   $bin = Join-Path $w.W 'shim'; [void](New-Item -ItemType Directory -Path $bin -Force); $glog = Join-Path $w.W 'git-calls.log'
-  [IO.File]::WriteAllText((Join-Path $bin 'git.cmd'), "@echo off`r`n>>`"$glog`" echo %*`r`necho %* | findstr /c:`"check-ignore`" /c:`"--git-path`" >nul || goto run`r`nping -n 60 127.0.0.1 >nul`r`nexit /b 1`r`n:run`r`n`"$realGit`" %*`r`nexit /b %errorlevel%`r`n")
+  [IO.File]::WriteAllText((Join-Path $bin 'git.cmd'), "@echo off`r`n>>`"$glog`" echo %*`r`necho %* | findstr /c:`"check-ignore`" >nul || goto run`r`nping -n 60 127.0.0.1 >nul`r`nexit /b 1`r`n:run`r`n`"$realGit`" %*`r`nexit /b %errorlevel%`r`n")
   $t0 = Get-Date; $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '15'; PATH = ($bin + ';' + $env:PATH) }; $sec = ((Get-Date) - $t0).TotalSeconds
   Ok ((Get-Content $glog -Raw) -match 'check-ignore') ('the note install reached git (the stall was hit): ' + $r.Out)
   Eq $r.Code 0 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $CapMsg 'a git that did not answer in time is a cut, not an error'
@@ -2062,15 +2084,18 @@ T 'nhanh r4: a note placed from the box, then committed on the box and fetched o
   Put-File "$($w.BP)\HANDOFF.md" 'box text'
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
   Eq (Get-Content "$($w.LP)\HANDOFF.md" -Raw) 'box text' 'placed from the box'
+  # r6 T1: the ownership is the "# fcode" pair in the laptop exclude; no record of any kind
+  Ok ((Get-Content "$($w.LP)\.git\info\exclude" -Raw) -match '(?m)^# fcode\r?\n/HANDOFF\.md\r?$') 'the laptop exclude has the pair'
   $st = Get-Content (Join-Path $w.U 'AppData\Local\fcode\handoff-state.json') -Raw | ConvertFrom-Json
-  Eq $st.'exclude:laptop:proj/HANDOFF.md' '1' 'the state says fcode owns the laptop line'
+  Ok ($null -ne $st.PSObject.Properties['proj/HANDOFF.md']) 'the sha record'; Eq @($st.PSObject.Properties | Where-Object { $_.Name -like 'exclude:*' }).Count 0 'no exclude: record'
   Put-File "$($w.LP)\HANDOFF.md" 'laptop edit'
   $ErrorActionPreference = 'Continue'
   Git-Commit $w.BP @('HANDOFF.md'); & git -C $w.BP push -q $bo HEAD:main 2>&1 | Out-Null; & git -C $w.LP fetch -q origin 2>&1 | Out-Null
   $ErrorActionPreference = 'Stop'
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
   Ok ((Read-PhienLog $w) -match 'ghi chú HANDOFF\.md giờ do git theo dõi \(trên (box|origin)\): bản cũ trên laptop xóa được') ('release line: ' + (Read-PhienLog $w))
-  Ok ((Get-Content "$($w.LP)\.git\info\exclude" -Raw) -notmatch '(?m)^/HANDOFF\.md\r?$') 'the line is given back'
+  $lx = Get-Content "$($w.LP)\.git\info\exclude" -Raw
+  Ok ($lx -notmatch '(?m)^/HANDOFF\.md\r?$' -and $lx -notmatch '# fcode') 'both lines of the pair are given back'
   Eq ((& git -C $w.LP status --porcelain | Out-String).Trim()) '?? HANDOFF.md' 'git now shows the laptop copy'
   $ErrorActionPreference = 'Continue'; $mo = (& git -C $w.LP merge origin/main 2>&1 | Out-String); $mc = $LASTEXITCODE; $ErrorActionPreference = 'Stop'
   Ok ($mc -ne 0 -and $mo -match 'would be overwritten') "git refuses to overwrite it: $mo"
@@ -2154,25 +2179,27 @@ T 'nhanh r4: the supervisor killed at any moment (before its job, while the work
 }
 
 # ---- r5: ownership is saved for sure before the line; a release that could not remove the line keeps it; Write-PhienText leftovers ----
-T 'nhanh r5: handoff-state.json cannot be written: the note from the box is not placed and no exclude line is added; exit 1, the failure line, the reason logged' {
+# r6 T4: ownership needs no record (the pair is written with the note); a state file that cannot be written still stops the run with the failure line
+T 'nhanh r5: handoff-state.json cannot be written: the note from the box is placed with its pair; exit 1, the failure line, the reason logged; writable again: the sha is saved' {
   $w = New-W2 'q25'; Use-LoggedIb $w
   New-GitDir $w.LP; New-GitDir $w.BP
   Put-File "$($w.BP)\HANDOFF.md" 'box handoff'
   $sf = Join-Path $w.U 'AppData\Local\fcode\handoff-state.json'; Put-File $sf '{}'
-  $exf = "$($w.LP)\.git\info\exclude"; $before = Read-Bytes $exf
+  $exf = "$($w.LP)\.git\info\exclude"
   (Get-Item -LiteralPath $sf).IsReadOnly = $true
   try {
     $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh')
     Eq $r.Code 1 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $FailMsg 'the failure line'
-    Ok (-not (Test-Path "$($w.LP)\HANDOFF.md")) 'the note is not placed'
-    Ok (Bytes-Eq (Read-Bytes $exf) $before) 'no exclude line without saved ownership'
+    Eq (Get-Content "$($w.LP)\HANDOFF.md" -Raw) 'box handoff' 'the note is placed'
+    Ok ((Get-Content $exf -Raw) -match '(?m)^# fcode\r?\n/HANDOFF\.md\r?$') 'with its pair'
     Ok ((Read-PhienLog $w) -match 'lỗi: không ghi được trạng thái ghi chú \(handoff-state\.json\)') ('logged: ' + (Read-PhienLog $w))
+    Eq ([IO.File]::ReadAllText($sf)) '{}' 'the state file is unchanged'
   } finally { (Get-Item -LiteralPath $sf).IsReadOnly = $false }
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
-  Eq (Get-Content "$($w.LP)\HANDOFF.md" -Raw) 'box handoff' 'writable again: placed'
-  Eq ((Get-Content $sf -Raw | ConvertFrom-Json).'exclude:laptop:proj/HANDOFF.md') '1' 'with its ownership saved'
+  Eq (Get-Content "$($w.LP)\HANDOFF.md" -Raw) 'box handoff' 'writable again: the note unchanged'
+  Ok ($null -ne (Get-Content $sf -Raw | ConvertFrom-Json).PSObject.Properties['proj/HANDOFF.md']) 'and the sha record saved'
 }
-T 'nhanh r5: a release whose exclude line cannot be removed (.git/info became a link) keeps the ownership record, says so, exit 1; once fixed the next run removes it' {
+T 'nhanh r5: a release whose exclude line cannot be removed (.git/info became a link) says so, exit 1, nothing written through the link; once fixed the next run removes the pair' {
   $w = New-W2 'q26'; Use-LoggedIb $w
   New-GitDir $w.LP; New-GitDir $w.BP
   $bo = Join-Path $w.W 'origin.git'; New-Origin $bo
@@ -2180,31 +2207,248 @@ T 'nhanh r5: a release whose exclude line cannot be removed (.git/info became a 
   Put-File "$($w.BP)\HANDOFF.md" 'box text'
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
   $sf = Join-Path $w.U 'AppData\Local\fcode\handoff-state.json'; $key = 'exclude:laptop:proj/HANDOFF.md'
-  Eq (Get-Content $sf -Raw | ConvertFrom-Json).$key '1' 'fcode owns the laptop line'
+  Ok ((Get-Content "$($w.LP)\.git\info\exclude" -Raw) -match '(?m)^# fcode\r?\n/HANDOFF\.md\r?$') 'the pair is in the laptop exclude'
+  Eq @((Get-Content $sf -Raw | ConvertFrom-Json).PSObject.Properties | Where-Object { $_.Name -like 'exclude:*' }).Count 0 'no exclude: record'
   $ErrorActionPreference = 'Continue'; Git-Commit $w.BP @('HANDOFF.md'); & git -C $w.BP push -q $bo HEAD:main 2>&1 | Out-Null; & git -C $w.LP fetch -q origin 2>&1 | Out-Null; $ErrorActionPreference = 'Stop'
   $info = "$($w.LP)\.git\info"; $tg = Join-Path $w.W 'info-elsewhere'
   New-InfoJunction $w.LP $tg ([IO.File]::ReadAllText("$info\exclude"))
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 1 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $FailMsg 'the failure line'
   Ok ((Read-PhienLog $w) -match 'lỗi: ghi chú HANDOFF\.md: chưa gỡ được dòng /HANDOFF\.md của fcode trong \.git/info/exclude') ('logged: ' + (Read-PhienLog $w))
-  Eq (Get-Content $sf -Raw | ConvertFrom-Json).$key '1' 'the ownership record is kept'
-  Ok ((Get-Content (Join-Path $tg 'exclude') -Raw) -match '(?m)^/HANDOFF\.md\r?$') 'nothing written through the link'
-  # fixed: a plain folder again (same content); the kept record lets the next run give the line back
+  Ok ((Get-Content (Join-Path $tg 'exclude') -Raw) -match '(?m)^# fcode\r?\n/HANDOFF\.md\r?$') 'nothing written through the link: the pair is still in the target'
+  Ok ($null -ne (Get-Content $sf -Raw | ConvertFrom-Json).PSObject.Properties['proj/HANDOFF.md']) 'the sha record is kept'
+  # fixed: a plain folder again (same content); the pair is still there, so the next run gives the line back
   $txt = [IO.File]::ReadAllText((Join-Path $tg 'exclude')); [IO.Directory]::Delete($info); [void](New-Item -ItemType Directory -Path $info); [IO.File]::WriteAllText("$info\exclude", $txt)
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
-  Ok ((Get-Content "$info\exclude" -Raw) -notmatch '(?m)^/HANDOFF\.md\r?$') 'the line is given back'
-  Eq (Get-Content $sf -Raw | ConvertFrom-Json).$key $null 'and only now the record goes'
+  $lx = Get-Content "$info\exclude" -Raw
+  Ok ($lx -notmatch '(?m)^/HANDOFF\.md\r?$' -and $lx -notmatch '# fcode') 'the pair is given back'
+  $st = Get-Content $sf -Raw | ConvertFrom-Json
+  Ok ($null -eq $st.PSObject.Properties['proj/HANDOFF.md'] -and $null -eq $st.PSObject.Properties[$key]) 'the state forgets the name (it never had an exclude: record)'
 }
-T 'nhanh r5: Write-PhienText leftovers (<file>.part-<PID> of a dead run) beside the state files and .git/info/exclude are removed by the next run; a live run''s stay' {
+# r6 T-L3a (Rule L): only fcode's complete generated names are deleted, on both machines; a lookalike name is never touched however old
+T 'nhanh r6: lookalike names are never deleted; fcode''s own dead names are (laptop and box)' {
   $w = New-W2 'q27'; Use-LoggedIb $w
-  New-GitDir $w.LP; [void](New-Sess $w.LS '27272727-lft1' $w.LP @('a'))
+  New-GitDir $w.LP; New-GitDir $w.BP; [void](New-Sess $w.LS '27272727-lft1' $w.LP @('a'))
+  Put-File "$($w.BP)\HANDOFF.md" 'box handoff'   # placed on the laptop: the laptop exclude is written in this run
   $gone = Start-Process -FilePath $env:ComSpec -ArgumentList '/c', 'exit' -WindowStyle Hidden -PassThru; $gone.WaitForExit(); $dp = $gone.Id
-  $sd = Join-Path $w.U 'AppData\Local\fcode'
-  $dead = @('handoff-state.json', 'phien-status.json', 'phien-auto.json' | ForEach-Object { Join-Path $sd "$_.part-$dp" }) + @("$($w.LP)\.git\info\exclude.part-$dp")
-  $live = @((Join-Path $sd "handoff-state.json.part-$PID"), "$($w.LP)\.git\info\exclude.part-$PID")   # this test process is alive and older than the file
-  foreach ($f in $dead + $live) { Put-File $f 'x' 0 }
+  $sd = Join-Path $w.U 'AppData\Local\fcode'; $tmp = Join-Path $w.U 'AppData\Local\Temp'; $inf = "$($w.LP)\.git\info"; $h32 = 'cd' * 16
+  $old = [DateTime]::UtcNow.AddHours(-2)
+  $mk = { param([string]$p, [bool]$dir, [bool]$aged)
+    if ($dir) { [void](New-Item -ItemType Directory -Force -Path $p); Put-File (Join-Path $p 'x.tar') 'x' 0; if ($aged) { [IO.File]::SetLastWriteTimeUtc((Join-Path $p 'x.tar'), $old); [IO.Directory]::SetLastWriteTimeUtc($p, $old) } }
+    else { Put-File $p 'x' 0; if ($aged) { [IO.File]::SetLastWriteTimeUtc($p, $old) } } }
+  # the laptop and the fake box share TEMP here: each sweeps only its own patterns
+  $stay = @(@("$tmp\fcode-phien-backup", $true, $true), @("$($w.LS)\s.jsonl.fcode-part-backup", $false, $true), @("$($w.LP)\HANDOFF.md.fcode-part-backup", $false, $true),
+    @("$inf\exclude.part-backup", $false, $true), @("$inf\exclude.part-backup.part-123", $false, $true), @("$sd\handoff-state.json.part-x", $false, $true),
+    @("$sd\handoff-state.json.part-$PID", $false, $false), @("$inf\exclude.part-$PID", $false, $false),   # this test process: alive and older than the file
+    @("$($w.BS)\x.jsonl.fcode-part-backup", $false, $true))
+  $go = @(@("$tmp\fcode-phien-$dp-$h32", $true, $false), @("$tmp\fcode-phien-$h32", $true, $true), @("$($w.LS)\s.jsonl.fcode-part-$dp-abcdef", $false, $false),
+    @("$inf\exclude.part-$dp", $false, $false), @("$sd\handoff-state.json.part-$dp", $false, $false), @("$sd\phien-status.json.part-$dp", $false, $false), @("$sd\phien-auto.json.part-$dp", $false, $false),
+    @("$tmp\fcode-phien-abcdefgh", $true, $true), @("$($w.BS)\x.jsonl.fcode-part-123-abcdef", $false, $true))
+  foreach ($x in $stay + $go) { & $mk $x[0] $x[1] $x[2] }
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
-  foreach ($f in $dead) { Ok (-not (Test-Path $f)) "removed: $(Split-Path $f -Leaf)" }
-  foreach ($f in $live) { Ok (Test-Path $f) "kept: $(Split-Path $f -Leaf)" }
+  Eq (Get-Content "$($w.LP)\HANDOFF.md" -Raw) 'box handoff' 'the note was placed (the exclude file was written)'
+  foreach ($x in $go) { Ok (-not (Test-Path -LiteralPath $x[0])) "removed: $($x[0].Substring($w.W.Length))" }
+  foreach ($x in $stay) { Ok (Test-Path -LiteralPath $x[0]) "kept: $($x[0].Substring($w.W.Length))" }
+}
+# r6 T-L3b: a linked worktree (.git is a file): the exclude file and its leftovers are at the path git names (the main repo's .git\info)
+T 'nhanh r6: a project that is a linked worktree: the note is excluded at the path git names and a dead run''s part file there is swept' {
+  $w = New-W2 'q28'; Use-LoggedIb $w
+  $main = Join-Path $w.W 'main repo'; New-GitDir $main; New-GitDir $w.BP
+  $ErrorActionPreference = 'Continue'
+  & git -C $main -c user.name=t -c user.email=t@t commit -q --allow-empty -m x 2>&1 | Out-Null
+  Remove-Item -LiteralPath $w.LP -Recurse -Force; & git -C $main worktree add -q $w.LP 2>&1 | Out-Null
+  $ErrorActionPreference = 'Stop'
+  Ok (Test-Path -LiteralPath "$($w.LP)\.git" -PathType Leaf) '.git is a file in the worktree'
+  Put-File "$($w.BP)\HANDOFF.md" 'box handoff'
+  $gone = Start-Process -FilePath $env:ComSpec -ArgumentList '/c', 'exit' -WindowStyle Hidden -PassThru; $gone.WaitForExit(); $dp = $gone.Id
+  $dead = "$main\.git\info\exclude.part-$dp"; Put-File $dead 'x' 0
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Eq (Get-Content "$($w.LP)\HANDOFF.md" -Raw) 'box handoff' 'placed in the worktree'
+  Ok ((Get-Content "$main\.git\info\exclude" -Raw) -match '(?m)^# fcode\r?\n/HANDOFF\.md\r?$') 'the pair is in the main repo''s exclude (the path git names)'
+  Ok (-not (Test-Path -LiteralPath $dead)) 'the dead part file there is swept'
+  Ok (-not (Test-Path -LiteralPath "$($w.LP)\.git\info")) 'no .git\info folder made in the worktree'
+  Eq ((& git -C $w.LP status --porcelain | Out-String).Trim()) '' 'git status in the worktree is clean'
+}
+function New-LogMark($w) { (Read-PhienLog $w).Length }
+function Log-Since($w, [int]$Mark) { $t = Read-PhienLog $w; if ($t.Length -gt $Mark) { $t.Substring($Mark) } else { '' } }
+function Get-NoteState($w) { $sf = Join-Path $w.U 'AppData\Local\fcode\handoff-state.json'; if (Test-Path $sf) { Get-Content $sf -Raw | ConvertFrom-Json } else { [pscustomobject]@{} } }
+function Set-NoteState($w, [hashtable]$S) { Put-File (Join-Path $w.U 'AppData\Local\fcode\handoff-state.json') ($S | ConvertTo-Json -Compress) 0 }
+function Get-DeadPid { $g = Start-Process -FilePath $env:ComSpec -ArgumentList '/c', 'exit' -WindowStyle Hidden -PassThru; $g.WaitForExit(); $g.Id }
+# r6 T-L5: the state file is read strictly; a broken one stops the run before any change (and names the file)
+T 'nhanh r6: a handoff-state.json that is not a JSON object stops the run before anything is changed' {
+  $w = New-W2 'q29'; Use-LoggedIb $w
+  New-GitDir $w.LP; New-GitDir $w.BP
+  Put-File "$($w.BP)\HANDOFF.md" 'box handoff'
+  $sf = Join-Path $w.U 'AppData\Local\fcode\handoff-state.json'; $exf = "$($w.LP)\.git\info\exclude"; $ex0 = Read-Bytes $exf
+  foreach ($bad in '{', '42', 'null', '[{}]', '[{"exclude:laptop:proj/HANDOFF.md":"1"}]') {
+    Put-File $sf $bad 0; $b0 = Read-Bytes $sf; $m = New-LogMark $w
+    $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh')
+    Eq $r.Code 1 "[$bad] $($r.Out)"; Eq ((Screen-Lines $r.Out) -join '|') $FailMsg "[$bad] the failure line"
+    Ok ((Log-Since $w $m) -match 'lỗi: không đọc được trạng thái ghi chú \(handoff-state\.json\)') "[$bad] logged: $(Log-Since $w $m)"
+    Ok (Bytes-Eq (Read-Bytes $sf) $b0) "[$bad] the state bytes are unchanged"
+    Ok (-not (Test-Path "$($w.LP)\HANDOFF.md")) "[$bad] the note is not placed"; Ok (Bytes-Eq (Read-Bytes $exf) $ex0) "[$bad] the exclude file is unchanged"
+  }
+  Remove-Item -LiteralPath $sf
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Eq (Get-Content "$($w.LP)\HANDOFF.md" -Raw) 'box handoff' 'the file deleted: the next run places the note'
+}
+# r6 T-L2a: a 1.3.2/1.3.3 record whose line is not there any more ('absent') is forgotten by the release, exit 0
+T 'nhanh r6: a legacy record whose line the user already removed: the release forgets it, exit 0' {
+  $w = New-W2 'q30'; Use-LoggedIb $w
+  New-GitDir $w.LP; New-GitDir $w.BP
+  $bo = Join-Path $w.W 'origin.git'; New-Origin $bo; Push-Origin $bo 'HANDOFF.md' 'in git'; Fetch-Origin $w.LP $bo
+  Put-File "$($w.LP)\HANDOFF.md" 'laptop copy'
+  Set-NoteState $w @{ 'exclude:laptop:proj/HANDOFF.md' = '1'; 'proj/HANDOFF.md' = 'x' }
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Ok ((Read-PhienLog $w) -match 'ghi chú HANDOFF\.md giờ do git theo dõi \(trên origin\): bản cũ trên laptop xóa được') ('release line: ' + (Read-PhienLog $w))
+  $st = Get-NoteState $w
+  Ok ($null -eq $st.PSObject.Properties['exclude:laptop:proj/HANDOFF.md'] -and $null -eq $st.PSObject.Properties['proj/HANDOFF.md']) 'both records are forgotten'
+}
+# r6 T3: ownership comes from the box's own file, never from a reply: a lost reply cannot turn the user's line into fcode's
+T 'nhanh r6: a put whose reply is lost, onto a box that already had the user''s own /HANDOFF.md line: no ownership, the user''s line is never removed' {
+  $w = New-W2 'q31'; Use-LoggedIb $w
+  New-GitDir $w.LP; New-GitDir $w.BP
+  $bex = "$($w.BP)\.git\info\exclude"; [IO.File]::WriteAllText($bex, "# mine`n/HANDOFF.md`n"); $b0 = Read-Bytes $bex
+  Put-File "$($w.LP)\HANDOFF.md" 'laptop handoff'
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FAKE_SSH_CUT = 'put:1:0:noack' }
+  Eq $r.Code 1 $r.Out
+  Eq (Get-Content "$($w.BP)\HANDOFF.md" -Raw) 'laptop handoff' 'the box has the note'; Ok (Bytes-Eq (Read-Bytes $bex) $b0) 'the box exclude is unchanged'
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Eq ((@((Get-NoteState $w).PSObject.Properties | ForEach-Object { $_.Name })) -join ',') 'proj/HANDOFF.md' 'the state is the sha record only'
+  Git-Commit $w.LP @('HANDOFF.md'); $m = New-LogMark $w
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Ok ((Log-Since $w $m) -notmatch 'giờ do git theo dõi') ('no release: ' + (Log-Since $w $m))
+  Ok (Bytes-Eq (Read-Bytes $bex) $b0) 'the user''s line is still there, the file byte for byte'
+}
+# r6 T5: 1.3.2/1.3.3 lines (bare, remembered by a record) are released by the record on both machines; a link keeps the record
+T 'nhanh r6: lines of 1.3.2/1.3.3 (bare, with a record) are still released by the record (laptop and box); a linked .git/info keeps it' {
+  $w = New-W2 'q32'; Use-LoggedIb $w
+  New-GitDir $w.LP; New-GitDir $w.BP
+  $n = 'HANDOFF-legacy.md'; $user = "# mine`n/$n`n/keep`n"
+  $bo = Join-Path $w.W 'origin.git'; New-Origin $bo; Push-Origin $bo $n 'in git'; Fetch-Origin $w.LP $bo
+  Put-File "$($w.LP)\$n" 'laptop copy'
+  Set-NoteState $w @{ "exclude:laptop:proj/$n" = '1'; "proj/$n" = 'x' }
+  $info = "$($w.LP)\.git\info"; $tg = Join-Path $w.W 'info-elsewhere'; New-InfoJunction $w.LP $tg $user
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 1 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $FailMsg 'the failure line'
+  Ok ((Read-PhienLog $w) -match 'lỗi: ghi chú HANDOFF-legacy\.md: chưa gỡ được dòng /HANDOFF-legacy\.md của fcode trong \.git/info/exclude') ('logged: ' + (Read-PhienLog $w))
+  Eq (Get-NoteState $w)."exclude:laptop:proj/$n" '1' 'the record is kept'; Eq ([IO.File]::ReadAllText((Join-Path $tg 'exclude'))) $user 'nothing written through the link'
+  [IO.Directory]::Delete($info); [void](New-Item -ItemType Directory -Path $info); [IO.File]::WriteAllText("$info\exclude", $user)
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Ok ((Read-PhienLog $w) -match 'ghi chú HANDOFF-legacy\.md giờ do git theo dõi \(trên origin\): bản cũ trên laptop xóa được') 'the laptop release line'
+  Eq ([IO.File]::ReadAllText("$info\exclude")) "# mine`n/keep`n" 'laptop: the bare line removed, the other lines intact'
+  Ok ($null -eq (Get-NoteState $w).PSObject.Properties["exclude:laptop:proj/$n"]) 'laptop: the record is gone'
+  # box half: a bare line on the box remembered by exclude:box:, the name now tracked on the laptop
+  Put-File "$($w.BP)\$n" 'box copy'; [IO.File]::WriteAllText("$($w.BP)\.git\info\exclude", $user)
+  $s = @{}; foreach ($q in (Get-NoteState $w).PSObject.Properties) { $s[$q.Name] = [string]$q.Value }; $s["exclude:box:proj/$n"] = '1'; Set-NoteState $w $s
+  Git-Commit $w.LP @($n)
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Ok ((Read-PhienLog $w) -match 'ghi chú HANDOFF-legacy\.md giờ do git theo dõi \(trên laptop\): bản cũ trên box xóa được') 'the box release line'
+  Eq ([IO.File]::ReadAllText("$($w.BP)\.git\info\exclude")) "# mine`n/keep`n" 'box: the bare line removed (unexcluded), the other lines intact'
+  Ok ($null -eq (Get-NoteState $w).PSObject.Properties["exclude:box:proj/$n"]) 'box: the record is gone'
+}
+# r6 T6 (O5): a release the box could not do is a failure; nothing is forgotten; the pair is still there for the next run
+T 'nhanh r6: the box cannot find its exclude file during a release: failure line, exit 1, nothing forgotten; fixed: removed' {
+  $w = New-W2 'q33'; Use-LoggedIb $w 'gitbreak'
+  New-GitDir $w.LP; New-GitDir $w.BP
+  Put-File "$($w.LP)\HANDOFF-lap.md" 'from laptop'
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  $bex = "$($w.BP)\.git\info\exclude"; Ok ((Get-Content $bex -Raw) -match '(?m)^# fcode\r?\n/HANDOFF-lap\.md\r?$') 'the pair on the box'
+  Git-Commit $w.LP @('HANDOFF-lap.md')
+  $bpw = $w.BP -replace '/', '\'
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FAKE_BP = $bpw }
+  Ok (Test-Path -LiteralPath "$bpw\.git-x") ('the wrapper broke the box repo before the put: ' + (Read-PhienLog $w))
+  Rename-Item -LiteralPath "$bpw\.git-x" -NewName '.git'
+  Eq $r.Code 1 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $FailMsg 'the failure line'
+  Ok ((Read-PhienLog $w) -match '\[proj\] lỗi: ghi chú HANDOFF-lap\.md: box chưa gỡ được dòng /HANDOFF-lap\.md của fcode trong \.git/info/exclude \(git trên box lỗi\), lần sau thử lại') ('logged: ' + (Read-PhienLog $w))
+  Ok ((Get-Content $bex -Raw) -match '(?m)^# fcode\r?\n/HANDOFF-lap\.md\r?$') 'the pair is still on the box'
+  Ok ($null -ne (Get-NoteState $w).PSObject.Properties['proj/HANDOFF-lap.md']) 'nothing forgotten'
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Ok ((Get-Content $bex -Raw) -notmatch 'HANDOFF-lap|# fcode') 'fixed: the pair is gone'
+  Ok ($null -eq (Get-NoteState $w).PSObject.Properties['proj/HANDOFF-lap.md']) 'and forgotten'
+}
+# r6 T7 (O6): the box writes its exclude file through write_exclude only (part + os.replace); injected failures leave it as it was
+T 'notes r6: the box rewrites .git/info/exclude atomically and sweeps only its own part files beside it' {
+  foreach ($fn in 'ensure_excluded', 'unexclude') {
+    $mm = [regex]::Match($PhienPy, "(?ms)^def $fn\(.*?(?=^\S)")
+    Ok $mm.Success "found $fn"; Ok ($mm.Value -notmatch 'open\(') "$fn opens no file itself (reads: read_exclude, writes: write_exclude)"
+  }
+  $d = Join-Path $Root 't7'; [void](New-Item -ItemType Directory -Force -Path $d); $p = Join-Path $d 'exclude'; $drv = Join-Path $Root 't7.py'
+  [IO.File]::WriteAllText($drv, ("import os, runpy, sys`nm = runpy.run_path(sys.argv[1], run_name='x')`np, missing = sys.argv[2], sys.argv[3]`norig = b'# user\r\n/a\r\n'`n" +
+    "def reset():`n    open(p, 'wb').write(orig)`ndef parts():`n    return [n for n in os.listdir(os.path.dirname(p)) if '.fcode-part-' in n]`n" +
+    "def boom(a, b):`n    raise OSError('x')`nreset()`nreal = os.replace`nos.replace = boom`n" +
+    "try:`n    m['write_exclude'](p, b'new')`n    print('A-no-raise')`nexcept OSError:`n    print('A-raised')`nos.replace = real`nprint(open(p, 'rb').read() == orig, parts() == [])`n" +
+    "reset()`ng = m['write_exclude'].__globals__`nrp = g['part_name']`ng['part_name'] = lambda q: os.path.join(missing, 'x')`n" +
+    "try:`n    m['write_exclude'](p, b'new')`n    print('B-no-raise')`nexcept OSError:`n    print('B-raised')`ng['part_name'] = rp`nprint(open(p, 'rb').read() == orig, parts() == [])`n" +
+    "m['write_exclude'](p, b'new')`nprint(open(p, 'rb').read() == b'new', parts() == [])`n"))
+  $out = @(python -I $drv $PyFile $p (Join-Path $d 'missing-dir'))
+  Eq ($out -join ',') 'A-raised,True True,B-raised,True True,True True' 'os.replace fails: raised, bytes unchanged, no part; staging fails: the same; a good write replaces it'
+  # end to end: the user's rules survive add + remove byte for byte; the next write sweeps fcode's dead / old part files there, nothing else
+  $w = New-W2 'q34'; New-GitDir $w.LP; New-GitDir $w.BP
+  $bi = "$($w.BP)\.git\info"; $bex = "$bi\exclude"; [IO.File]::WriteAllText($bex, "# user rules`n/one`n*.log`n"); $b0 = Read-Bytes $bex
+  $dp = Get-DeadPid
+  $deadp = "$bi\exclude.fcode-part-$dp-abcdef"; $oldp = "$bi\exclude.fcode-part-$PID-abcdef"; $keep = "$bi\exclude.fcode-part-backup"
+  foreach ($f in $deadp, $oldp, $keep) { Put-File $f 'x' 0 }; foreach ($f in $oldp, $keep) { [IO.File]::SetLastWriteTimeUtc($f, [DateTime]::UtcNow.AddHours(-2)) }
+  Put-File "$($w.LP)\HANDOFF.md" 'laptop handoff'
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
+  Ok ((Get-Content $bex -Raw) -match '(?m)^# fcode\r?\n/HANDOFF\.md\r?$') 'added: the pair'
+  Ok (-not (Test-Path -LiteralPath $deadp)) 'a dead run''s part file is swept'; Ok (-not (Test-Path -LiteralPath $oldp)) 'a part file over 1 h old is swept'
+  Ok (Test-Path -LiteralPath $keep) 'a lookalike name stays'
+  Git-Commit $w.LP @('HANDOFF.md')
+  $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
+  Ok (Bytes-Eq (Read-Bytes $bex) $b0) 'removed: the user''s three rules byte for byte'
+  Eq @(Get-ChildItem -LiteralPath $bi -Force -Filter 'exclude.fcode-part-*' | Where-Object { $_.Name -ne 'exclude.fcode-part-backup' }).Count 0 'no part file of fcode left'
+}
+# r6 T8: both machines edit .git/info/exclude as bytes, keeping the file's newline; the pattern is the note name's UTF-8 bytes (what git reads)
+T 'nhanh r6: .git/info/exclude is edited as bytes on both machines: CRLF, a Latin-1 byte and a Vietnamese note name survive add + remove' {
+  $w = New-W2 'q35'; Use-LoggedIb $w
+  New-GitDir $w.LP; New-GitDir $w.BP
+  $lat = [Text.Encoding]::GetEncoding(28591)
+  $orig = $lat.GetBytes("# mine`r`n/caf" + [char]0xE9 + ".txt`r`n/keep`r`n")
+  foreach ($d in $w.LP, $w.BP) { [IO.File]::WriteAllBytes("$d\.git\info\exclude", $orig) }
+  $nl = 'HANDOFF-ghi-chú.md'; $nb = 'HANDOFF-ghi-chú-b.md'
+  Put-File "$($w.LP)\$nl" 'from laptop'; Put-File "$($w.BP)\$nb" 'from box'
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Ok (Bytes-Eq (Read-Bytes "$($w.BP)\.git\info\exclude") ([byte[]]($orig + $utf8.GetBytes("# fcode`r`n/$nl`r`n")))) ('box: the original bytes + the pair in CRLF, the name in UTF-8: ' + (Latin "$($w.BP)\.git\info\exclude"))
+  Ok (Bytes-Eq (Read-Bytes "$($w.LP)\.git\info\exclude") ([byte[]]($orig + $utf8.GetBytes("# fcode`r`n/$nb`r`n")))) ('laptop: the same: ' + (Latin "$($w.LP)\.git\info\exclude"))
+  $ErrorActionPreference = 'Continue'
+  & git -C $w.BP check-ignore -q -- $nl; $ib = $LASTEXITCODE; & git -C $w.LP check-ignore -q -- $nb; $il = $LASTEXITCODE
+  $ErrorActionPreference = 'Stop'
+  Eq "$ib,$il" '0,0' 'git ignores both notes by those patterns'
+  Git-Commit $w.LP @($nl); Git-Commit $w.BP @($nb)
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Ok (Bytes-Eq (Read-Bytes "$($w.BP)\.git\info\exclude") $orig) ('box: released, the original bytes: ' + (Latin "$($w.BP)\.git\info\exclude"))
+  Ok (Bytes-Eq (Read-Bytes "$($w.LP)\.git\info\exclude") $orig) ('laptop: released, the original bytes: ' + (Latin "$($w.LP)\.git\info\exclude"))
+}
+# r6 T10: an exclude file that cannot be read means no note work for that project this run (never "no line of ours"), then the release
+T 'nhanh r6: an exclude file that cannot be read: no note work for that project this run, then the release (laptop and box)' {
+  # laptop: the pair from a placement, the name then tracked on the box (fetched)
+  $w = New-W2 'q36'; Use-LoggedIb $w
+  New-GitDir $w.LP; New-GitDir $w.BP
+  Put-File "$($w.BP)\HANDOFF.md" 'box text'
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Git-Commit $w.BP @('HANDOFF.md')
+  $exf = "$($w.LP)\.git\info\exclude"; $m = New-LogMark $w
+  $fs = [IO.File]::Open($exf, 'Open', 'Read', 'None')
+  try { $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') } finally { $fs.Dispose() }
+  Eq $r.Code 0 $r.Out
+  $lg = Log-Since $w $m
+  Ok ($lg -match 'không đọc được \.git/info/exclude \(.+\), bỏ qua ghi chú của dự án này lần này') ('the log line: ' + $lg)
+  Ok ($lg -notmatch 'giờ do git theo dõi') 'no release'; Ok ((Get-Content $exf -Raw) -match '(?m)^# fcode\r?\n/HANDOFF\.md\r?$') 'the pair intact'
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Ok ((Get-Content $exf -Raw) -notmatch 'HANDOFF') 'unlocked: released'
+  # box: the pair on the box, the name then tracked on the laptop, and a new laptop note waiting
+  $w = New-W2 'q37'; Use-LoggedIb $w
+  New-GitDir $w.LP; New-GitDir $w.BP
+  Put-File "$($w.LP)\HANDOFF-lap.md" 'from laptop'
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Git-Commit $w.LP @('HANDOFF-lap.md'); Put-File "$($w.LP)\HANDOFF-2.md" 'second'
+  $bex = "$($w.BP)\.git\info\exclude"; $m = New-LogMark $w
+  $fs = [IO.File]::Open($bex, 'Open', 'Read', 'None')
+  try { $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') } finally { $fs.Dispose() }
+  Eq $r.Code 0 $r.Out
+  Ok ((Log-Since $w $m) -notmatch 'giờ do git theo dõi') 'no release'; Ok (-not (Test-Path "$($w.BP)\HANDOFF-2.md")) 'no note work for the project: HANDOFF-2.md not sent'
+  Ok ((Get-Content $bex -Raw) -match '(?m)^# fcode\r?\n/HANDOFF-lap\.md\r?$') 'the pair intact'
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Ok ((Get-Content $bex -Raw) -notmatch 'HANDOFF-lap') 'unlocked: released'; Eq (Get-Content "$($w.BP)\HANDOFF-2.md" -Raw) 'second' 'and HANDOFF-2.md sent'
 }
 
 # ============================== 1.3.3: fcode moc (profile hook) ==============================
