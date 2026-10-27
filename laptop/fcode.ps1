@@ -1323,6 +1323,8 @@ def pair_holders(others, name, releasing, p):
     # git hides through a "/<name>" line of info/exclude (check-ignore -v names the source; a .gitignore or global match is independent).
     # A project whose own release of this name is in the same batch (`releasing`) does not hold the line: its copy is given back anyway.
     # NB: with -v, check-ignore exits 0 also for a negated match ("!<name>"), whose pattern is not "/<name>": that copy is visible anyway
+    # Every candidate is asked, a holder included: a git failure about any of them is None whatever its place in `others` (DECISION B)
+    held = False
     for x in others:
         if any(same_file(x, r) for r in releasing):
             continue
@@ -1343,8 +1345,8 @@ def pair_holders(others, name, releasing, p):
         if len(fs) != 5 or fs[4] != b'':
             return None
         if fs[2] == b'/' + name.encode('utf-8') and same_file(os.path.join(x, os.fsdecode(fs[0])), p):
-            return True
-    return False
+            held = True
+    return held
 
 
 def ensure_excluded(d, name):
@@ -3148,6 +3150,7 @@ function Test-PhienSharedNote([string]$Dir, [string]$Name, [string[]]$Releasing)
   if ($null -eq $me -or $me -is [string]) { return 'unknown' }
   $skip = @()
   foreach ($rd in @($Releasing)) { if (-not $rd) { continue }; $ri = Get-PhienRepoId $rd; if ($ri -is [string]) { return 'unknown' }; if ($ri) { $skip += $ri.Root } }
+  $held = $false   # every candidate is asked, a holder included: a git failure about any of them is 'unknown' whatever its place in syncRepos (box pair_holders)
   foreach ($o in @($SyncRepos)) {
     $f = Join-Path ([string]$o) $Name
     # the file itself only (box parity: os.path.islink(f)): a folder that is a junction to a work tree still holds its note
@@ -3175,9 +3178,9 @@ function Test-PhienSharedNote([string]$Dir, [string]$Name, [string[]]$Releasing)
     for ($i = 0; $i -lt $fs.Count - 1; $i += 4) { if ($fs[$i + 3] -ceq $Name) { $hit = @($fs[$i], $fs[$i + 2]); break } }
     if (-not $hit) { continue }
     $src = @($hit[0] -split '[\\/]')
-    if ($hit[1] -ceq "/$Name" -and $src.Count -ge 2 -and $src[-1] -ceq 'exclude' -and $src[-2] -ceq 'info') { return $true }
+    if ($hit[1] -ceq "/$Name" -and $src.Count -ge 2 -and $src[-1] -ceq 'exclude' -and $src[-2] -ceq 'info') { $held = $true; continue }
   }
-  $false
+  $held
 }
 # what the laptop does for one release of <Name> in the project <Dir> whose exclude file the scan resolved ($Excl): kept | failed | removed | absent.
 # Git is asked (Test-PhienSharedNote) only while fcode's line is still in that file: an earlier release of this run may have taken the pair already,

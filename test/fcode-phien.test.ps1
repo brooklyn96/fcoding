@@ -525,6 +525,9 @@ T 'install: new / same / replaced (only when target is a prefix) / skip / busy; 
 # ============================== end to end through the real fcode.ps1 + fake instabox ==============================
 $Cmd = Join-Path $PSScriptRoot 'fake-instabox.cmd'
 $script:E2E = $null
+function Read-PhienLog($w) { $p = Join-Path $w.U '.fcode\phien.log'; if (Test-Path $p) { Get-Content $p -Raw } else { '' } }
+function New-LogMark($w) { (Read-PhienLog $w).Length }
+function Log-Since($w, [int]$Mark) { $t = Read-PhienLog $w; if ($t.Length -gt $Mark) { $t.Substring($Mark) } else { '' } }
 function New-World([string]$Name) {
   $w = Join-Path $Root $Name
   $u = Join-Path $w 'home'; $lp = Join-Path $u 'Desktop\proj'; $bh = Join-Path $w 'boxhome'; $bp = ($w -replace '\\', '/') + '/boxws/proj'
@@ -910,9 +913,11 @@ if ($env:FCODE_TEST_BOX) {
       $r = Invoke-Fcode $w @('phien') $env0; Eq $r.Code 0 $r.Out
       Ok ((Invoke-RealBox "cat $bp/.git/info/exclude") -match '(?m)^# fcode\r?\n/HANDOFF-laptop\.md$') 'the pair is on the box'
       [void](Invoke-RealBox "mkdir -p $bp/.fcode && ln -s $bt/nowhere $bp/.fcode/.gitignore && echo ok")
-      Git-Commit $w.LP @('HANDOFF-laptop.md')
+      Git-Commit $w.LP @('HANDOFF-laptop.md'); $m = New-LogMark $w
       $r = Invoke-Fcode $w @('phien') $env0; Eq $r.Code 1 $r.Out
       Ok (($r.Out + (Get-Content (Join-Path $w.U '.fcode\phien.log') -Raw -ErrorAction SilentlyContinue)) -match '\[proj\] lỗi: ghi chú HANDOFF-laptop\.md: box chưa gỡ được dòng /HANDOFF-laptop\.md của fcode trong \.git/info/exclude \(liên kết, git trên box lỗi, hoặc chưa tạo được \.fcode/\.gitignore\), lần sau thử lại') ('the release error line: ' + $r.Out)
+      Ok (($r.Out + (Log-Since $w $m)) -notmatch 'giờ do git theo dõi') 'a failed release prints no "xóa được" line (only the error line)'
+      Eq @((Get-Content (Join-Path $w.U 'AppData\Local\fcode\phien-status.json') -Raw | ConvertFrom-Json).notes.released).Count 0 'a failed release is not in notes.released'
       Ok ((Invoke-RealBox "cat $bp/.git/info/exclude") -match '(?m)^# fcode\r?\n/HANDOFF-laptop\.md$') 'the pair is still on the box (the release waits)'
       Eq (Invoke-RealBox "readlink $bp/.fcode/.gitignore") "$bt/nowhere" 'the dangling link is still there'
       Eq (Invoke-RealBox "test -e $bt/nowhere && echo yes || echo no") 'no' 'nothing was made at the link target'
@@ -1780,7 +1785,6 @@ function BoxSessions($w) { if (Test-Path $w.BH) { @(Get-ChildItem (Join-Path $w.
 $CapMsg = 'phien: hết 20 giây, phần còn lại chạy lần sau'
 $FailMsg = 'phien: không đồng bộ được, xem phien.log'
 function Screen-Lines([string]$Text) { @($Text -split "`r?`n" | Where-Object { $_.Trim() }) }   # what a run printed on the screen
-function Read-PhienLog($w) { $p = Join-Path $w.U '.fcode\phien.log'; if (Test-Path $p) { Get-Content $p -Raw } else { '' } }
 
 T 'nhanh: box asleep: exit 0 and a message, only `instabox ls`, never wake or ssh' {
   $w = New-W2 'q1'; Use-LoggedIb $w
@@ -2277,7 +2281,9 @@ T 'nhanh r5: a release whose exclude line cannot be removed (.git/info became a 
   Ok ($null -ne (Get-Content $sf -Raw | ConvertFrom-Json).PSObject.Properties['proj/HANDOFF.md']) 'the sha record is kept'
   # fixed: a plain folder again (same content); the pair is still there, so the next run gives the line back
   $txt = [IO.File]::ReadAllText((Join-Path $tg 'exclude')); [IO.Directory]::Delete($info); [void](New-Item -ItemType Directory -Path $info); [IO.File]::WriteAllText("$info\exclude", $txt)
+  $m = New-LogMark $w
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
+  Eq ([regex]::Matches((Log-Since $w $m), 'ghi chú HANDOFF\.md giờ do git theo dõi').Count) 1 'the healed run prints the release line exactly once'
   $lx = Get-Content "$info\exclude" -Raw
   Ok ($lx -notmatch '(?m)^/HANDOFF\.md\r?$' -and $lx -notmatch '# fcode') 'the pair is given back'
   $st = Get-Content $sf -Raw | ConvertFrom-Json
@@ -2327,8 +2333,6 @@ T 'nhanh r6: a project that is a linked worktree: the note is excluded at the pa
   Ok (-not (Test-Path -LiteralPath "$($w.LP)\.git\info")) 'no .git\info folder made in the worktree'
   Eq ((& git -C $w.LP status --porcelain | Out-String).Trim()) '' 'git status in the worktree is clean'
 }
-function New-LogMark($w) { (Read-PhienLog $w).Length }
-function Log-Since($w, [int]$Mark) { $t = Read-PhienLog $w; if ($t.Length -gt $Mark) { $t.Substring($Mark) } else { '' } }
 function Get-NoteState($w) { $sf = Join-Path $w.U 'AppData\Local\fcode\handoff-state.json'; if (Test-Path $sf) { Get-Content $sf -Raw | ConvertFrom-Json } else { [pscustomobject]@{} } }
 function Set-NoteState($w, [hashtable]$S) { Put-File (Join-Path $w.U 'AppData\Local\fcode\handoff-state.json') ($S | ConvertTo-Json -Compress) 0 }
 function Get-DeadPid { $g = Start-Process -FilePath $env:ComSpec -ArgumentList '/c', 'exit' -WindowStyle Hidden -PassThru; $g.WaitForExit(); $g.Id }
@@ -2387,8 +2391,11 @@ T 'nhanh r6: lines of 1.3.2/1.3.3 (bare, with a record) are still released by th
   Put-File "$($w.LP)\$n" 'laptop copy'
   Set-NoteState $w @{ "exclude:laptop:proj/$n" = '1'; "proj/$n" = 'x' }
   $info = "$($w.LP)\.git\info"; $tg = Join-Path $w.W 'info-elsewhere'; New-InfoJunction $w.LP $tg $user
+  $m = New-LogMark $w
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 1 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $FailMsg 'the failure line'
   Ok ((Read-PhienLog $w) -match 'lỗi: ghi chú HANDOFF-legacy\.md: chưa gỡ được dòng /HANDOFF-legacy\.md của fcode trong \.git/info/exclude') ('logged: ' + (Read-PhienLog $w))
+  Ok ((Log-Since $w $m) -notmatch 'ghi chú HANDOFF-legacy\.md giờ do git theo dõi') 'a failed release prints no "xóa được" line (only the error line)'
+  Eq @((Get-Content (Join-Path $w.U 'AppData\Local\fcode\phien-status.json') -Raw | ConvertFrom-Json).notes.released).Count 0 'a failed release is not in notes.released'
   Eq (Get-NoteState $w)."exclude:laptop:proj/$n" '1' 'the record is kept'; Eq ([IO.File]::ReadAllText((Join-Path $tg 'exclude'))) $user 'nothing written through the link'
   [IO.Directory]::Delete($info); [void](New-Item -ItemType Directory -Path $info); [IO.File]::WriteAllText("$info\exclude", $user)
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
@@ -2840,6 +2847,18 @@ reset()
 print(U(pz), exb() == pair)
 os.unlink(os.path.join(Z, 'HANDOFF.md'))
 g['git'] = realgit
+# 6e order: B holds, and a second candidate C after B (another work tree on the same exclude file, holding a copy) gets no answer from ls-files:
+# False (an error), never kept; the answer does not depend on where the failing candidate sits
+C = os.path.join(par, 'r12a-C')
+G('worktree', 'add', '-q', C)
+fc = os.path.join(C, 'HANDOFF.md')
+open(fc, 'w').write('x')
+g['git'] = lambda dd, *a, **k: None if (iseq(dd, C) and a[:1] == ('ls-files',)) else realgit(dd, *a, **k)
+reset()
+print(U({'root': d, 'b': B, 'c': C}), exb() == pair)
+g['git'] = realgit
+os.unlink(fc)
+shutil.rmtree(os.path.join(C, '.fcode'), ignore_errors=True)
 # 7 the copy sits in a sub-folder project (the /HANDOFF.md line is anchored at the root)
 os.unlink(fb)
 os.makedirs(web)
@@ -2864,7 +2883,7 @@ print(m['unexclude'](B, name, False, projs, []))
 reset()
 print(U(rel=[]))
 '@ $d
-  Eq ($out -join ',') "kept True True,True True,True True,True True True,True True,False True True,False True,False True,False True,False True,True True,False True,False True,True True,False True,True True,True True,kept True,False True,True True,kept True,True True,True True True,True,kept,kept" '1 kept; 2 upstream-only and 2b index-tracked release; 3 independent .gitignore releases and stays hidden; 4 deleted releases; 5a False and nothing made; 5b/5c/6 a git failure on the holder test is False (an error, never kept), the pair stays; 7 sub-folder copy releases; 8 legacy kept, non-legacy untouched; 9 releasing set ends the hold'
+  Eq ($out -join ',') "kept True True,True True,True True,True True True,True True,False True True,False True,False True,False True,False True,True True,False True,False True,True True,False True,True True,True True,kept True,False True,False True,True True,kept True,True True,True True True,True,kept,kept" '1 kept; 2 upstream-only and 2b index-tracked release; 3 independent .gitignore releases and stays hidden; 4 deleted releases; 5a False and nothing made; 5b/5c/6 a git failure on the holder test is False (an error, never kept), the pair stays; 6e a failing candidate after a holder is False too (order-free); 7 sub-folder copy releases; 8 legacy kept, non-legacy untouched; 9 releasing set ends the hold'
 }
 # r12 (release 1.3.6 P3): the box reads check-ignore's "<source>:<line>:<pattern>" from the known pattern, not by colons
 T 'notes r12: b: the box reads check-ignore -v -z (never quoted; fewer than four fields is a failure: False, the pair stays); a note name holding a colon is still told apart (kept by the pair, released by a .gitignore); a negated .gitignore line releases; the exclude file is cut again right before the write' {
@@ -3011,7 +3030,7 @@ T 'notes r12: h: the laptop runs git with LC_ALL=C through the process environme
     $r = Invoke-GitQuiet $rp $al
     Eq ([string]@($r.Out)[0]) 'C' 'C even when the user set another locale'; Eq $env:LC_ALL 'vi_VN.UTF-8' 'set before: restored after'
   } finally { if ($had) { $env:LC_ALL = $was } else { Remove-Item Env:LC_ALL -ErrorAction SilentlyContinue } }
-  Eq @(Select-String -LiteralPath $Fcode -Pattern 'EnvironmentVariables' -SimpleMatch).Count 0 'no environment getter of ProcessStartInfo anywhere (it fails on Windows PowerShell 5.1 when two names differ only in case)'
+  Eq @(Select-String -LiteralPath $Fcode -Pattern '(?<!System)\.Environment(Variables)?\b').Count 0 'no environment dictionary of ProcessStartInfo anywhere (.EnvironmentVariables fails on Windows PowerShell 5.1 when two names differ only in case; .Environment does not exist there)'
 }
 T 'notes r12: i: the box runs git with LC_ALL=C' {
   $d = Join-Path $Root 'r12i'; New-GitDir $d
@@ -3083,6 +3102,7 @@ T 'nhanh r12: laptop side (project registered through a junction): a release the
   Eq $r.Code 1 $r.Out; $lg = Log-Since $w $m
   Ok ($lg -match 'lỗi: ghi chú TASK\.md: chưa gỡ được dòng /TASK\.md') ('run 3 (corrupt index): the error line: ' + $lg); Ok ($lg -notmatch (Kept-Rx 'proj' 'TASK.md' 'laptop') -and $lg -notmatch 'xóa được') ('run 3: not a kept line, no "xóa được" line (the error line alone): ' + $lg); Eq (Pair-Count $lex 'TASK.md') 1 'run 3: the pair stays'
   Ok ($null -ne (Get-NoteState $w).PSObject.Properties['proj/TASK.md']) 'run 3: nothing forgotten'
+  Eq @((Get-Content (Join-Path $w.U 'AppData\Local\fcode\phien-status.json') -Raw | ConvertFrom-Json).notes.released).Count 0 'run 3: the status does not list a failed release'
   $m = New-LogMark $w; $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out; $lg = Log-Since $w $m
   Ok ($lg -match (Kept-Rx 'proj' 'TASK.md' 'laptop') -and $lg -notmatch 'xóa được' -and $lg -notmatch 'lỗi:') ('run 4 (index healed): the kept line again: ' + $lg)
 }
@@ -3165,6 +3185,18 @@ T 'notes r12: f: laptop, real git, folders with non-ASCII names (the exclude pat
   Eq (Test-PhienSharedNote $a 'TASK.md' @()) $true 'the copy the pair hides is held'
   Put-File "$b\.gitignore" "/TASK.md`n"; $script:PhienRepoIds = @{}
   Eq (Test-PhienSharedNote $a 'TASK.md' @()) $false 'its own .gitignore hides it: no hold'
+}
+T 'notes r12: j: laptop, a real holder plus a candidate whose git fails: unknown in either syncRepos order (box pair_holders parity), never kept' {
+  $a = Join-Path $Root 'r12j'; New-GitDir $a; Git-Seed $a
+  $b = Join-Path $Root 'r12j-B'; Add-Wt $a $b 'wtj'
+  Put-File "$b\TASK.md" 'x'; [void](Add-PhienExcludeLine "$a\.git\info\exclude" 'TASK.md')
+  $z = Join-Path $Root 'r12j-Z'; [void](New-Item -ItemType Directory -Path $z -Force); Put-File "$z\TASK.md" 'z'   # a candidate: a regular TASK.md at its root
+  $SyncRepos = @($a, $b); $script:PhienRepoIds = @{}
+  Eq (Test-PhienSharedNote $a 'TASK.md' @()) $true 'the control: B holds'
+  foreach ($order in @(@($a, $b, $z), @($a, $z, $b))) {
+    $SyncRepos = $order; $script:PhienRepoIds = @{}; $script:PhienRepoIds[$z.ToLowerInvariant()] = 'unknown'   # git could not tell what Z is
+    Eq (Test-PhienSharedNote $a 'TASK.md' @()) 'unknown' ('Z failing is unknown whatever its place: ' + (($order | ForEach-Object { Split-Path $_ -Leaf }) -join ','))
+  }
 }
 T 'nhanh r12: laptop side: a sibling registered through a junction to its work tree still holds its note (only the note file being a link skips a folder)' {
   $w = New-ShareWorld 'q47'
