@@ -27,7 +27,7 @@ function Ok([bool]$c, [string]$What) { if (-not $c) { throw $What } }
 $tokens = $null; $errs = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($Fcode, [ref]$tokens, [ref]$errs)
 if ($errs.Count) { throw "fcode.ps1 does not parse: $($errs[0].Message)" }
-$wanted = 'Get-DeployHost', 'Test-DeployWord', 'Invoke-DeploySsh', 'Invoke-DeployGate', 'Read-DeployDraft', 'Test-DeployRunsIdle', 'Confirm-DeployKey', 'Invoke-DeployAdd', 'Invoke-Deploy', 'Write-IpaError'
+$wanted = 'Get-DeployHost', 'Test-DeployWord', 'Test-DeployName', 'Test-DeployRepo', 'Invoke-DeploySsh', 'Invoke-DeployGate', 'Read-DeployDraft', 'Test-DeployRunsIdle', 'Confirm-DeployRegister', 'Confirm-DeployKey', 'Invoke-DeployAdd', 'Invoke-Deploy', 'Write-IpaError'
 $found = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in $wanted }, $true))
 if ($found.Count -ne $wanted.Count) { throw "fcode.ps1 lacks some of: $($wanted -join ', ')" }
 foreach ($fn in $found) { . ([scriptblock]::Create($fn.Extent.Text)) }
@@ -103,7 +103,9 @@ T 'pass-through: every gate verb goes to ssh <host> unchanged; one call, ssh -n,
     @{ W = @('task', 'recheck'); R = "$GATE task recheck" }
     @{ W = @('task', 'compact'); R = "$GATE task compact" }
     @{ W = @('shopee-dashboard', 'status'); R = "$GATE shopee-dashboard status" }
-    @{ W = @('a.b_c-1', 'resume'); R = "$GATE a.b_c-1 resume" }
+    @{ W = @('a-b-1', 'resume'); R = "$GATE a-b-1 resume" }
+    @{ W = @('ab', 'status'); R = "$GATE ab status" }
+    @{ W = @(('a' * 28), 'status'); R = "$GATE $('a' * 28) status" }
   )
   foreach ($c in $table) {
     Reset-World; Add-Rule 'ssh' '.' @(Ans @('LINE one', 'LINE two', 'GATE_EXIT 0') 0)
@@ -138,7 +140,8 @@ T 'refusals: bad name, unknown verb or an unsafe word never reach ssh (rc 65)' {
     @(), @('task'), @('task', 'rm'), @('task', 'STATUS'), @('task', 'status;id'), @('Task', 'status'), @('-x', 'status'), @('a b', 'status'), @('task;id', 'status'), @('', 'status'),
     @('task', 'deploy', 'abc;rm -rf /'), @('task', 'deploy', '$(id)'), @('task', 'deploy', 'a b'), @('task', 'deploy', 'a`b'), @('task', 'deploy', "a`nb"), @('task', 'logs', '-n'),
     @('task', 'deploy', ('a' * 201)), @('task', 'deploy', 'x|y'), @('task', 'deploy', 'x&y'), @('task', 'deploy', "x'y"), @('task', 'deploy', 'x"y'), @('task', 'deploy', 'x>y'),
-    @('task', 'add'), @('task', 'trust', 'on', 'i understand')
+    @('task', 'add'), @('task', 'trust', 'on', 'i understand'),
+    @('a.b_c-1', 'status'), @('a', 'status'), @('1abc', 'status'), @('-abc', 'status'), @('my.proj', 'status'), @('my_proj', 'status'), @(('a' * 29), 'status'), @(('a' * 64), 'status')
   )
   foreach ($w in $bad) {
     Reset-World; Add-Rule 'ssh' '.' @(Ans @('ok') 0)
@@ -147,7 +150,7 @@ T 'refusals: bad name, unknown verb or an unsafe word never reach ssh (rc 65)' {
   }
 }
 T 'refusals: `fcode deploy add` with the wrong arguments is refused before any call' {
-  foreach ($w in @(@('add'), @('add', 'brooklyn96/task'), @('add', 'brooklyn96/task', 'task'), @('add', 'nope', 'task', $Draft), @('add', 'a/b', 'Task', $Draft), @('add', 'a/b/c', 'task', $Draft), @('add', '../b', 'task', $Draft), @('add', 'a/b', 'task', $Draft, 'extra'))) {
+  foreach ($w in @(@('add'), @('add', 'brooklyn96/task'), @('add', 'brooklyn96/task', 'task'), @('add', 'nope', 'task', $Draft), @('add', 'a/b', 'Task', $Draft), @('add', 'a/b/c', 'task', $Draft), @('add', '../b', 'task', $Draft), @('add', 'a/b', 'task', $Draft, 'extra'), @('add', 'brooklyn96/task', 'shopee_dashboard', $Draft), @('add', 'brooklyn96/task', 'a.b', $Draft), @('add', 'brooklyn96/task', '1abc', $Draft), @('add', 'brooklyn96/task', 'a', $Draft), @('add', 'brooklyn96/task', ('a' * 29), $Draft), @('add', 'brooklyn96/task', ('a' * 64), $Draft), @('add', 'brooklyn96/task', 'deal-sync', $Draft), @('add', 'brooklyn96/task', 'gate', $Draft), @('add', 'brooklyn96/task', 'legacy', $Draft))) {
     Reset-World; Add-Rule 'ssh' '.' @(Ans @('ok') 0); Add-Rule 'gh' '.' @(Ans @('[]') 0)
     $r = Run-Fcode $w; Eq $r.Code 65 ('[' + ($w -join '|') + '] code'); Eq $r.Calls.Count 0 'no call'
   }
@@ -206,9 +209,12 @@ T 'inventory and register by hand: the draft file goes to the gate as base64 on 
   Eq (($r.Calls[0].Text -split "$SEP").Count) 2 'with stdin: ssh <host> <command>, no -n'
   Ok (Bytes-Eq ([Convert]::FromBase64String($r.Calls[0].Stdin)) $DraftBytes) 'stdin decodes to the file bytes'
   Ok ($r.Calls[0].Text -notmatch 'SECRET-SENTINEL' -and $r.Calls[0].Text -notmatch [regex]::Escape($DraftB64)) 'no secret in argv'
+  Add-Rule 'gh' 'run list' @(Ans @('[]') 0); $script:Answers.Enqueue('YES')
   $r = Run-Fcode @('task', 'register', $DraftSha, $Draft)
-  Eq (($r.Calls[0].Text -split "$SEP")[-1]) "base64 -di | $GATE task register $DraftSha" 'register remote'
-  Ok (Bytes-Eq ([Convert]::FromBase64String($r.Calls[0].Stdin)) $DraftBytes) 'register stdin'
+  $reg = @($r.Calls | Where-Object { $_.Tool -eq 'ssh' })
+  Eq $reg.Count 1 'one ssh call'
+  Eq (($reg[0].Text -split "$SEP")[-1]) "base64 -di | $GATE task register $DraftSha" 'register remote'
+  Ok (Bytes-Eq ([Convert]::FromBase64String($reg[0].Stdin)) $DraftBytes) 'register stdin'
 }
 T 'inventory and register by hand: wrong argument count, missing, empty, oversized or non-JSON draft = rc 65, no call; a BOM is dropped and the sha covers the sent bytes' {
   Reset-World; Add-Rule 'ssh' '.' @(Ans @('ok') 0)
@@ -243,7 +249,7 @@ function Kind($c) {   # a short label per call
 function New-AddWorld {
   Reset-World
   Add-Rule 'gh' 'run list' @(Ans @('[]') 0)
-  Add-Rule 'gh' 'deploy-key list' @(Ans @('[{"key":"' + $PUB + '"}]') 0)
+  Add-Rule 'gh' 'deploy-key list' @(Ans @('[{"key":"' + $PUB + '","readOnly":true}]') 0)
   Add-Rule 'gh' 'deploy-key add' @(Ans @('') 0)
   Add-Rule 'ssh' '.' @(Ans @('?') 99)
   Add-Rule 'ssh' 'KEY_NONE' @(Ans @($PUB) 0)
@@ -307,6 +313,20 @@ T 'add: an existing key that is NOT in the repo deploy keys is refused (65, neve
   Eq (Kinds $r) 'runs:in_progress runs:queued probe keylist'
   Ok ($r.Text -match 'KHÔNG nằm trong Deploy keys') 'says why'
 }
+T 'add: an existing key listed WITH write access (readOnly false, or the field missing) is refused (65, never reused): no alias, inventory, register' {
+  foreach ($l in ('[{"key":"' + $PUB + '","readOnly":false}]'), ('[{"key":"' + $PUB + '"}]'), ('[{"key":"' + $PUB + ' comment","readOnly":"no"}]'), ('[{"key":"ssh-ed25519 AAAAOTHER","readOnly":true},{"key":"' + $PUB + '","readOnly":false}]')) {
+    New-AddWorld; Add-Rule 'gh' 'deploy-key list' @(Ans @($l) 0)
+    $r = Add-Run; Eq $r.Code 65 $l
+    Eq (Kinds $r) 'runs:in_progress runs:queued probe keylist' $l
+    Ok ($r.Text -match 'CÓ quyền ghi' -and $r.Text -match 'KHÔNG tích Allow write access') 'says why and how to fix'
+    Eq $script:Answers.Count 1 'YES was never asked'
+  }
+  New-AddWorld; $r = Add-Run
+  $kl = $r.Calls | Where-Object { (Kind $_) -eq 'keylist' }
+  Ok ($kl.Text -match '--json key,readOnly$') ('the listing asks for readOnly: ' + $kl.Text)
+  New-AddWorld; Add-Rule 'gh' 'deploy-key list' @(Ans @('[{"key":"ssh-ed25519 AAAAOTHER","readOnly":false},{"key":"' + $PUB + ' c","readOnly":true}]') 0)
+  $r = Add-Run; Eq $r.Code 0 'a write-enabled OTHER key does not matter; the matching one is read-only'
+}
 T 'add: an unreadable existing key is refused (65); gh or ssh failing while reading keys = rc 1, nothing registered' {
   New-AddWorld; Add-Rule 'ssh' 'KEY_NONE' @(Ans @('KEY_UNREADABLE') 0)
   $r = Add-Run; Eq $r.Code 65; Eq (Kinds $r) 'runs:in_progress runs:queued probe'
@@ -365,6 +385,49 @@ T 'add: inventory refused (rc 65, or an INV refuse line with rc 0) or failing = 
   New-AddWorld; Add-Rule 'ssh' '--local task inventory' @(Ans @('x') 70)
   $r = Add-Run; Eq $r.Code 70; Ok ((Kinds $r) -notmatch 'register')
 }
+T 'add: inventory must END with exactly `INV ok` (rc 0 but missing, truncated, not last, or empty = 65, no YES prompt, no register)' {
+  foreach ($out in @('INV repo default_branch=main'), @(), @('INV ok', 'INV unit x'), @('INV okay'), @('INV ok extra'), @('inv ok'), @('INV refuse x', 'INV ok x')) {
+    New-AddWorld; Add-Rule 'ssh' '--local task inventory' @(Ans $out 0)
+    $r = Add-Run; Eq $r.Code 65 ('[' + ($out -join '|') + ']'); Eq $script:Answers.Count 1 'no prompt'; Ok ((Kinds $r) -notmatch 'register') (Kinds $r)
+  }
+  New-AddWorld; Add-Rule 'ssh' '--local task inventory' @(Ans @('INV unit x', 'INV ok', '') 0)
+  $r = Add-Run; Eq $r.Code 0 'a trailing blank line after INV ok is fine'
+}
+T 'add: the draft registry.repo must equal <repo> (case-insensitive); a mismatch or a missing registry.repo = 65 before ANY call' {
+  $mk = { param($body) $f = Join-Path $Root ('d' + [guid]::NewGuid().ToString('N') + '.json'); [IO.File]::WriteAllBytes($f, $utf8.GetBytes($body)); $f }
+  foreach ($body in '{"draft_version":1,"registry":{"repo":"brooklyn96/other"}}', '{"draft_version":1,"registry":{"branch":"main"}}', '{"draft_version":1}', '{"draft_version":1,"registry":{"repo":["brooklyn96/task"]}}') {
+    New-AddWorld; $f = & $mk $body
+    $r = Add-Run @('add', 'brooklyn96/task', 'task', $f); Eq $r.Code 65 $body; Eq $r.Calls.Count 0 'no gh, no ssh'
+  }
+  New-AddWorld; $f = & $mk '{"draft_version":1,"registry":{"repo":"Brooklyn96/TASK"}}'
+  $r = Add-Run @('add', 'brooklyn96/task', 'task', $f); Eq $r.Code 0 ('case-insensitive: ' + $r.Text)
+}
+T 'register by hand: same runs-in-flight check and typed YES as add (one shared function): runs before YES, YES, runs again, then register' {
+  Reset-World; Add-Rule 'gh' 'run list' @(Ans @('[]') 0); Add-Rule 'ssh' '.' @(Ans @('GATE_EXIT 0') 0); $script:Answers.Enqueue('YES')
+  $r = Run-Fcode @('task', 'register', $DraftSha, $Draft); Eq $r.Code 0 $r.Text
+  Eq (Kinds $r) 'runs:in_progress runs:queued runs:in_progress runs:queued register'
+  $ps = $r.Text.IndexOf('<<PROMPT>>'); Ok ($ps -ge 0 -and $r.Text.IndexOf('<<ssh base64 -di') -gt $ps) 'YES before register'
+  Ok ($r.Text.Contains($DraftSha)) 'sha256 shown'
+  foreach ($st in 'in_progress', 'queued') {
+    Reset-World; Add-Rule 'gh' 'run list' @(Ans @('[]') 0); Add-Rule 'gh' "run list .*--status $st" @(Ans @('[{"databaseId":1}]') 0); Add-Rule 'ssh' '.' @(Ans @('x') 0); $script:Answers.Enqueue('YES')
+    $r = Run-Fcode @('task', 'register', $DraftSha, $Draft); Eq $r.Code 65 "early $st"; Eq @($r.Calls | Where-Object { $_.Tool -eq 'ssh' }).Count 0 'no ssh'; Eq $script:Answers.Count 1 'YES never asked'
+    Reset-World; Add-Rule 'gh' 'run list' @(Ans @('[]') 0); Add-Rule 'gh' "run list .*--status $st" @((Ans @('[]') 0), (Ans @('[{"databaseId":1}]') 0)); Add-Rule 'ssh' '.' @(Ans @('x') 0); $script:Answers.Enqueue('YES')
+    $r = Run-Fcode @('task', 'register', $DraftSha, $Draft); Eq $r.Code 65 "late $st"; Eq @($r.Calls | Where-Object { $_.Tool -eq 'ssh' }).Count 0 'no register after the late check'
+  }
+  foreach ($a in 'yes', '', $null) {
+    Reset-World; Add-Rule 'gh' 'run list' @(Ans @('[]') 0); Add-Rule 'ssh' '.' @(Ans @('x') 0); $script:Answers.Enqueue($a)
+    $r = Run-Fcode @('task', 'register', $DraftSha, $Draft); Eq $r.Code 65 "[$a]"; Eq @($r.Calls | Where-Object { $_.Tool -eq 'ssh' }).Count 0 'no ssh without the exact YES'
+  }
+  Reset-World; Add-Rule 'gh' 'run list' @(Ans @('boom') 1); Add-Rule 'ssh' '.' @(Ans @('x') 0); $script:Answers.Enqueue('YES')
+  $r = Run-Fcode @('task', 'register', $DraftSha, $Draft); Eq $r.Code 1 'gh cannot list runs'; Eq @($r.Calls | Where-Object { $_.Tool -eq 'ssh' }).Count 0
+}
+T 'register by hand: a bad sha word or a draft without a usable registry.repo = 65, no call at all' {
+  $nr = Join-Path $Root 'norepo.json'; [IO.File]::WriteAllBytes($nr, $utf8.GetBytes('{"draft_version":1}'))
+  foreach ($w in @(@('task', 'register', 'a b', $Draft), @('task', 'register', 'x;id', $Draft), @('task', 'register', $DraftSha, $nr))) {
+    Reset-World; Add-Rule 'gh' 'run list' @(Ans @('[]') 0); Add-Rule 'ssh' '.' @(Ans @('x') 0); $script:Answers.Enqueue('YES')
+    $r = Run-Fcode $w; Eq $r.Code 65 ($w -join '|'); Eq $r.Calls.Count 0 'no call'
+  }
+}
 T 'add: register rc 70 (needs_human) = exit 70, status printed, recheck hint shown' {
   New-AddWorld; Add-Rule 'ssh' '--local task register' @(Ans @('GATE_RESULT outcome=needs_human reason=paths-busy', 'GATE_EXIT 70') 70)
   $r = Add-Run
@@ -393,6 +456,13 @@ T 'dispatch: `fcode deploy` is routed before the session-name check, and the oth
   $iDep = $src.IndexOf("if (`$arg -eq 'deploy') { exit (Invoke-Deploy) }"); Ok ($iDep -gt 0) 'dispatch line present'
   Ok ($src.IndexOf("if (`$arg -eq 'add') { exit (Invoke-Add) }") -lt $iDep -and $iDep -lt $src.IndexOf("if (`$arg -eq 'pair') { exit (Invoke-Pair) }")) 'next to add and pair'
   foreach ($c in 'sync:Invoke-Sync', 'ipa:Invoke-Ipa', 'add:Invoke-Add', 'pair:Invoke-Pair', 'phien:Invoke-Phien', 'moc:Invoke-Moc') { $p = $c -split ':'; Ok ($src.Contains("if (`$arg -eq '$($p[0])') { exit ($($p[1])) }")) "route $($p[0])" }
+}
+T 'agents-git.md (decision-r4 4.4): no fcode/deploy status yet on the merge sha = still running (poll like waiting); only a 403 or an unreadable answer goes to the user' {
+  $md = [IO.File]::ReadAllText((Join-Path $Repo 'box/agents-git.md'))
+  Ok ($md -match 'No such status yet[^.]*= still running, handled like `waiting`') 'no status yet = waiting'
+  Ok ($md -match 'no `fcode/deploy` status yet = still running: read it again every minute') 'in the polling rule'
+  Ok ($md -notmatch 'No such status yet, or the API answers 403: say so') 'the old "tell the user there is no status" rule is gone'
+  Ok ($md -match 'answers 403 or the answer cannot be read: say so to the user') '403 is still reported'
 }
 T 'help: fcode help lists fcode deploy, fcode deploy add and the deployHost key' {
   $h = $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Show-Help' }, $true)[0].Extent.Text
