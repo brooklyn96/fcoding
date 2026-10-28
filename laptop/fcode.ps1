@@ -718,7 +718,7 @@ function Get-DeployHost {
 # mot tu cua lenh (khong khoang trang, khong ky tu dac biet cua shell)
 function Test-DeployWord([string]$w) { $w -cmatch '\A[A-Za-z0-9._/][A-Za-z0-9._/-]{0,199}\z' }
 # ten project theo luat cua hop dong (contract C1, RE_NAME cua cong) va chu/repo; dung o moi duong cua fcode deploy
-function Test-DeployName([string]$n) { $n -cmatch '\A[a-z][a-z0-9-]{1,27}\z' }
+function Test-DeployName([string]$n) { $n -cmatch '\A[a-z][a-z0-9-]{0,26}[a-z0-9]\z' }
 function Test-DeployRepo([string]$r) { ($r -cmatch '\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z') -and ($r -notmatch '\A\.+/|/\.+\z') }
 
 # chay mot lenh tren VPS qua ssh, in tung dong ngay khi tien toi (tru khi -Quiet), tra @{ Code; Lines }.

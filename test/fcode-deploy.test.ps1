@@ -135,13 +135,17 @@ T 'pass-through: the ssh host is deployHost from the config (default contabo); a
     $r = Run-Fcode @('task', 'status'); Eq $r.Code 1 "[$bad] code"; Eq $r.Calls.Count 0 "[$bad] no call"
   }
 }
+T 'name rule (contract C1): 2..28 chars, letter first, letters/digits/-, no trailing -' {
+  foreach ($n in 'ab', 'a1', 'a-b', 'ab-c', ('a' * 28), ('a' * 27 + '1')) { Ok (Test-DeployName $n) "accepted: $n" }
+  foreach ($n in 'a', '', 'ab-', 'a-', ('a' * 27 + '-'), ('a' * 29), '1ab', '-ab', 'aB', 'a_b', 'a.b') { Ok (-not (Test-DeployName $n)) "refused: $n" }
+}
 T 'refusals: bad name, unknown verb or an unsafe word never reach ssh (rc 65)' {
   $bad = @(
     @(), @('task'), @('task', 'rm'), @('task', 'STATUS'), @('task', 'status;id'), @('Task', 'status'), @('-x', 'status'), @('a b', 'status'), @('task;id', 'status'), @('', 'status'),
     @('task', 'deploy', 'abc;rm -rf /'), @('task', 'deploy', '$(id)'), @('task', 'deploy', 'a b'), @('task', 'deploy', 'a`b'), @('task', 'deploy', "a`nb"), @('task', 'logs', '-n'),
     @('task', 'deploy', ('a' * 201)), @('task', 'deploy', 'x|y'), @('task', 'deploy', 'x&y'), @('task', 'deploy', "x'y"), @('task', 'deploy', 'x"y'), @('task', 'deploy', 'x>y'),
     @('task', 'add'), @('task', 'trust', 'on', 'i understand'),
-    @('a.b_c-1', 'status'), @('a', 'status'), @('1abc', 'status'), @('-abc', 'status'), @('my.proj', 'status'), @('my_proj', 'status'), @(('a' * 29), 'status'), @(('a' * 64), 'status')
+    @('a.b_c-1', 'status'), @('a', 'status'), @('ab-', 'status'), @(('a' * 27 + '-'), 'status'), @('1abc', 'status'), @('-abc', 'status'), @('my.proj', 'status'), @('my_proj', 'status'), @(('a' * 29), 'status'), @(('a' * 64), 'status')
   )
   foreach ($w in $bad) {
     Reset-World; Add-Rule 'ssh' '.' @(Ans @('ok') 0)
@@ -150,10 +154,16 @@ T 'refusals: bad name, unknown verb or an unsafe word never reach ssh (rc 65)' {
   }
 }
 T 'refusals: `fcode deploy add` with the wrong arguments is refused before any call' {
-  foreach ($w in @(@('add'), @('add', 'brooklyn96/task'), @('add', 'brooklyn96/task', 'task'), @('add', 'nope', 'task', $Draft), @('add', 'a/b', 'Task', $Draft), @('add', 'a/b/c', 'task', $Draft), @('add', '../b', 'task', $Draft), @('add', 'a/b', 'task', $Draft, 'extra'), @('add', 'brooklyn96/task', 'shopee_dashboard', $Draft), @('add', 'brooklyn96/task', 'a.b', $Draft), @('add', 'brooklyn96/task', '1abc', $Draft), @('add', 'brooklyn96/task', 'a', $Draft), @('add', 'brooklyn96/task', ('a' * 29), $Draft), @('add', 'brooklyn96/task', ('a' * 64), $Draft), @('add', 'brooklyn96/task', 'deal-sync', $Draft), @('add', 'brooklyn96/task', 'gate', $Draft), @('add', 'brooklyn96/task', 'legacy', $Draft))) {
+  foreach ($w in @(@('add'), @('add', 'brooklyn96/task'), @('add', 'brooklyn96/task', 'task'), @('add', 'nope', 'task', $Draft), @('add', 'a/b', 'Task', $Draft), @('add', 'a/b/c', 'task', $Draft), @('add', '../b', 'task', $Draft), @('add', 'a/b', 'task', $Draft, 'extra'), @('add', 'brooklyn96/task', 'shopee_dashboard', $Draft), @('add', 'brooklyn96/task', 'a.b', $Draft), @('add', 'brooklyn96/task', '1abc', $Draft), @('add', 'brooklyn96/task', 'a', $Draft), @('add', 'brooklyn96/task', 'ab-', $Draft), @('add', 'o/r', 'ab-', $Draft), @('add', 'brooklyn96/task', ('a' * 29), $Draft), @('add', 'brooklyn96/task', ('a' * 64), $Draft), @('add', 'brooklyn96/task', 'deal-sync', $Draft), @('add', 'brooklyn96/task', 'gate', $Draft), @('add', 'brooklyn96/task', 'legacy', $Draft))) {
     Reset-World; Add-Rule 'ssh' '.' @(Ans @('ok') 0); Add-Rule 'gh' '.' @(Ans @('[]') 0)
     $r = Run-Fcode $w; Eq $r.Code 65 ('[' + ($w -join '|') + '] code'); Eq $r.Calls.Count 0 'no call'
   }
+}
+
+T 'refusals: `fcode deploy add o/r ab-` (draft says the same name) is refused by the name rule before any gh or ssh call' {
+  $f = Join-Path $Root 'trail.json'; [IO.File]::WriteAllBytes($f, $utf8.GetBytes('{"draft_version":1,"registry":{"name":"ab-","repo":"o/r"}}'))
+  Reset-World; Add-Rule 'ssh' '.' @(Ans @('ok') 0); Add-Rule 'gh' '.' @(Ans @('[]') 0)
+  $r = Run-Fcode @('add', 'o/r', 'ab-', $f); Eq $r.Code 65 'code'; Eq $r.Calls.Count 0 'no call'
 }
 
 # ============================== trust ==============================
