@@ -80,7 +80,7 @@ function Run-Fcode([string[]]$Words) {   # fcode deploy <Words>: @{ Code; Text; 
 
 # a draft file with a sentinel (a "secret" that must never reach an argument list)
 $Draft = Join-Path $Root 'task.draft.json'
-$DraftBytes = $utf8.GetBytes('{"draft_version":1,"registry":{"repo":"brooklyn96/task","branch":"main","note":"SECRET-SENTINEL-9f3"},"deployed_sha":null,"legacy_config":null,"drop":[],"guard_files":{},"stop_units":false}')
+$DraftBytes = $utf8.GetBytes('{"draft_version":1,"registry":{"name":"task","repo":"brooklyn96/task","branch":"main","note":"SECRET-SENTINEL-9f3"},"deployed_sha":null,"legacy_config":null,"drop":[],"guard_files":{},"stop_units":false}')
 [IO.File]::WriteAllBytes($Draft, $DraftBytes)
 $DraftSha = ([BitConverter]::ToString(([Security.Cryptography.SHA256]::Create()).ComputeHash($DraftBytes)) -replace '-', '').ToLowerInvariant()
 $DraftB64 = [Convert]::ToBase64String($DraftBytes)
@@ -390,17 +390,31 @@ T 'add: inventory must END with exactly `INV ok` (rc 0 but missing, truncated, n
     New-AddWorld; Add-Rule 'ssh' '--local task inventory' @(Ans $out 0)
     $r = Add-Run; Eq $r.Code 65 ('[' + ($out -join '|') + ']'); Eq $script:Answers.Count 1 'no prompt'; Ok ((Kinds $r) -notmatch 'register') (Kinds $r)
   }
-  New-AddWorld; Add-Rule 'ssh' '--local task inventory' @(Ans @('INV unit x', 'INV ok', '') 0)
-  $r = Add-Run; Eq $r.Code 0 'a trailing blank line after INV ok is fine'
+  foreach ($out in @('INV unit x', 'INV ok', ''), @('INV ok', 'GATE_EXIT 0'), @('INV repo x', 'INV ok', 'GATE_EXIT 0', '')) {
+    New-AddWorld; Add-Rule 'ssh' '--local task inventory' @(Ans $out 0)
+    $r = Add-Run; Eq $r.Code 0 ('a trailing blank or GATE_EXIT line after INV ok is fine: [' + ($out -join '|') + '] ' + $r.Text)
+  }
+  foreach ($out in @('INV ok', 'INV refuse x', 'GATE_EXIT 65'), @('GATE_EXIT 0')) {   # the LAST INV line decides; a bare GATE_EXIT is no INV ok
+    New-AddWorld; Add-Rule 'ssh' '--local task inventory' @(Ans $out 0)
+    $r = Add-Run; Eq $r.Code 65 ('[' + ($out -join '|') + ']'); Eq $script:Answers.Count 1 'no prompt'
+  }
 }
 T 'add: the draft registry.repo must equal <repo> (case-insensitive); a mismatch or a missing registry.repo = 65 before ANY call' {
   $mk = { param($body) $f = Join-Path $Root ('d' + [guid]::NewGuid().ToString('N') + '.json'); [IO.File]::WriteAllBytes($f, $utf8.GetBytes($body)); $f }
-  foreach ($body in '{"draft_version":1,"registry":{"repo":"brooklyn96/other"}}', '{"draft_version":1,"registry":{"branch":"main"}}', '{"draft_version":1}', '{"draft_version":1,"registry":{"repo":["brooklyn96/task"]}}') {
+  foreach ($body in '{"draft_version":1,"registry":{"name":"task","repo":"brooklyn96/other"}}', '{"draft_version":1,"registry":{"name":"task","branch":"main"}}', '{"draft_version":1,"registry":{"name":"task"}}', '{"draft_version":1,"registry":{"name":"task","repo":["brooklyn96/task"]}}') {
     New-AddWorld; $f = & $mk $body
     $r = Add-Run @('add', 'brooklyn96/task', 'task', $f); Eq $r.Code 65 $body; Eq $r.Calls.Count 0 'no gh, no ssh'
   }
-  New-AddWorld; $f = & $mk '{"draft_version":1,"registry":{"repo":"Brooklyn96/TASK"}}'
+  New-AddWorld; $f = & $mk '{"draft_version":1,"registry":{"name":"task","repo":"Brooklyn96/TASK"}}'
   $r = Add-Run @('add', 'brooklyn96/task', 'task', $f); Eq $r.Code 0 ('case-insensitive: ' + $r.Text)
+}
+T 'add: the draft registry.name must equal <name> exactly (case-sensitive); a mismatch or a missing name = 65 before ANY call (no key, alias or deploy key is created)' {
+  $mk = { param($body) $f = Join-Path $Root ('d' + [guid]::NewGuid().ToString('N') + '.json'); [IO.File]::WriteAllBytes($f, $utf8.GetBytes($body)); $f }
+  foreach ($body in '{"draft_version":1,"registry":{"name":"vps-tracker","repo":"brooklyn96/task"}}', '{"draft_version":1,"registry":{"name":"Task","repo":"brooklyn96/task"}}', '{"draft_version":1,"registry":{"repo":"brooklyn96/task"}}', '{"draft_version":1,"registry":{"name":["task"],"repo":"brooklyn96/task"}}') {
+    New-AddWorld; $f = & $mk $body
+    $r = Add-Run @('add', 'brooklyn96/task', 'task', $f); Eq $r.Code 65 $body; Eq $r.Calls.Count 0 'no gh, no ssh'
+    Ok ($r.Text -match 'registry\.name') 'says which field'
+  }
 }
 T 'register by hand: same runs-in-flight check and typed YES as add (one shared function): runs before YES, YES, runs again, then register' {
   Reset-World; Add-Rule 'gh' 'run list' @(Ans @('[]') 0); Add-Rule 'ssh' '.' @(Ans @('GATE_EXIT 0') 0); $script:Answers.Enqueue('YES')
@@ -420,6 +434,16 @@ T 'register by hand: same runs-in-flight check and typed YES as add (one shared 
   }
   Reset-World; Add-Rule 'gh' 'run list' @(Ans @('boom') 1); Add-Rule 'ssh' '.' @(Ans @('x') 0); $script:Answers.Enqueue('YES')
   $r = Run-Fcode @('task', 'register', $DraftSha, $Draft); Eq $r.Code 1 'gh cannot list runs'; Eq @($r.Calls | Where-Object { $_.Tool -eq 'ssh' }).Count 0
+}
+T 'register by hand: a typed sha256 that differs from the sha256 of the draft file = 65 before any call (never shown as the draft sha); the YES prompt shows the real sha' {
+  $old = 'f' * 64
+  foreach ($w in $old, $DraftSha.ToUpperInvariant(), $DraftSha.Substring(0, 63)) {
+    Reset-World; Add-Rule 'gh' 'run list' @(Ans @('[]') 0); Add-Rule 'ssh' '.' @(Ans @('GATE_EXIT 0') 0); $script:Answers.Enqueue('YES')
+    $r = Run-Fcode @('task', 'register', $w, $Draft); Eq $r.Code 65 $w; Eq $r.Calls.Count 0 'no gh, no ssh'; Eq $script:Answers.Count 1 'YES never asked'
+    Ok ($r.Text.Contains($DraftSha) -and $r.Text.Contains($w)) 'both shas named'; Ok ($r.Text -notmatch '<<PROMPT>>') 'no prompt'
+  }
+  Reset-World; Add-Rule 'gh' 'run list' @(Ans @('[]') 0); Add-Rule 'ssh' '.' @(Ans @('GATE_EXIT 0') 0); $script:Answers.Enqueue('YES')
+  $r = Run-Fcode @('task', 'register', $DraftSha, $Draft); Eq $r.Code 0 $r.Text; Ok ($r.Text -match ('sha256 của bản nháp: ' + $DraftSha)) 'the prompt shows the draft sha'
 }
 T 'register by hand: a bad sha word or a draft without a usable registry.repo = 65, no call at all' {
   $nr = Join-Path $Root 'norepo.json'; [IO.File]::WriteAllBytes($nr, $utf8.GetBytes('{"draft_version":1}'))

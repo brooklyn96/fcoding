@@ -756,7 +756,8 @@ function Read-DeployDraft([string]$Path) {
   try { $j = [Text.Encoding]::UTF8.GetString($b) | ConvertFrom-Json } catch { return @{ Err = 'bản nháp không phải JSON hợp lệ' } }
   $sha = ([BitConverter]::ToString(([Security.Cryptography.SHA256]::Create()).ComputeHash($b)) -replace '-', '').ToLowerInvariant()
   $dr = ''; try { if ($j.registry.repo -is [string]) { $dr = $j.registry.repo } } catch { }
-  @{ B64 = [Convert]::ToBase64String($b); Sha = $sha; Repo = $dr }
+  $dn = ''; try { if ($j.registry.name -is [string]) { $dn = $j.registry.name } } catch { }
+  @{ B64 = [Convert]::ToBase64String($b); Sha = $sha; Repo = $dr; Name = $dn }
 }
 
 # repo khong con lan chay Actions nao dang chay hoac dang cho (in_progress, queued)? Tra @{ Code; Msg }: 0 = rong; 65 = con lan chay (doi chay xong roi lam lai); 1 = gh khong doc duoc (khong xac nhan duoc thi khong dang ky)
@@ -863,6 +864,7 @@ function Invoke-DeployAdd([string[]]$AddArgs) {
   $d = Read-DeployDraft ([string]$AddArgs[2])
   if ($d.Err) { Write-Host "lỗi: $($d.Err)"; return 65 }
   if ($d.Repo -ne $repo) { Write-Host "lỗi: bản nháp ghi registry.repo = '$($d.Repo)' nhưng repo ở dòng lệnh là '$repo'. Hai repo phải giống nhau. Chưa làm gì."; return 65 }
+  if ($d.Name -cne $name) { Write-Host "lỗi: bản nháp ghi registry.name = '$($d.Name)' nhưng tên ở dòng lệnh là '$name'. Hai tên phải giống nhau. Chưa làm gì."; return 65 }
   if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { Write-Host 'lỗi: không tìm thấy gh (GitHub CLI). Cài gh rồi chạy: gh auth login'; return 1 }
   # lan 1 (som, chua doi gi): co lan chay dang chay hoac cho thi dung ngay
   $r = Test-DeployRunsIdle $repo
@@ -872,8 +874,8 @@ function Invoke-DeployAdd([string[]]$AddArgs) {
   if ($k -ne 0) { return $k }
   Write-Host '[4] Đọc hiện trạng trên VPS (chỉ đọc, chưa đổi gì):'
   $inv = Invoke-DeployGate $name @('inventory') -B64 $d.B64
-  # chi tiep tuc khi cong ket thuc dung bang dong `INV ok` (C13.3); thieu, cut giua chung hay `INV refuse` = tu choi
-  $invLast = @($inv.Lines | Where-Object { "$_".Trim() -ne '' } | Select-Object -Last 1)
+  # chi tiep tuc khi ma = 0 va dong CUOI bat dau bang `INV ` dung la `INV ok` (C13.3; dong GATE_EXIT di sau la binh thuong); thieu, cut giua chung hay `INV refuse` = tu choi
+  $invLast = @($inv.Lines | Where-Object { "$_" -cmatch '\AINV ' } | Select-Object -Last 1)
   if ($inv.Code -ne 0 -or $invLast.Count -eq 0 -or $invLast[0] -cne 'INV ok') {
     Write-Host "Cổng không xác nhận bản nháp (mã $($inv.Code); kết quả phải kết thúc bằng dòng 'INV ok'). Sửa theo các dòng INV ở trên rồi chạy lại. Chưa đăng ký."
     return $(if ($inv.Code -ne 0) { $inv.Code } else { 65 })
@@ -925,11 +927,12 @@ function Invoke-Deploy {
   foreach ($w in $gateArgs) { if (-not (Test-DeployWord ([string]$w))) { Write-Host "lỗi: đối số '$("$w" -replace '[\x00-\x1f\x7f]', '?')' không hợp lệ (chỉ chữ, số, dấu . _ / -)."; return 65 } }
   if ($verb -ceq 'register') {
     # register tay di qua cung buoc voi add: Actions khong con lan chay, go YES, kiem tra lai (tren repo ghi trong ban nhap)
+    if ($rest[0] -cne $d.Sha) { Write-Host "lỗi: sha256 đã gõ ($($rest[0])) khác sha256 của file bản nháp ($($d.Sha)). Chạy lại inventory và dùng đúng sha256 của file. Chưa làm gì."; return 65 }
     if (-not (Test-DeployRepo $d.Repo)) { Write-Host "lỗi: registry.repo của bản nháp ('$($d.Repo)') không phải dạng chủ/repo. Chưa làm gì."; return 65 }
     if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { Write-Host 'lỗi: không tìm thấy gh (GitHub CLI). Cài gh rồi chạy: gh auth login'; return 1 }
     $r = Test-DeployRunsIdle $d.Repo
     if ($r.Code -ne 0) { Write-Host "lỗi: $($r.Msg)"; return $r.Code }
-    $c = Confirm-DeployRegister $d.Repo ([string]$rest[0])
+    $c = Confirm-DeployRegister $d.Repo $d.Sha
     if ($c -ne 0) { return $c }
   }
   if ($verb -ceq 'trust' -and $rest.Count -eq 2 -and $rest[0] -ceq 'on' -and $rest[1] -ceq 'i-understand-root') {
