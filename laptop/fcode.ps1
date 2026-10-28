@@ -4,7 +4,7 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $arg = if ($Rest -and $Rest.Count -gt 0) { $Rest[0] } else { '' }
 # Cau hinh rieng tung may: %USERPROFILE%\.fcode\config.json (install.ps1 tao). Thieu khoa thi dung mac dinh.
-# Khoa: instabox (duong dan instabox.exe), box (ten box), syncRepos (danh sach thu muc cho fcode sync), ipaRepo, ipaTag.
+# Khoa: instabox (duong dan instabox.exe), box (ten box), syncRepos (danh sach thu muc cho fcode sync), ipaRepo, ipaTag, deployHost (ten ssh den VPS cho fcode deploy, mac dinh contabo).
 $ConfigFile = Join-Path $env:USERPROFILE '.fcode\config.json'
 $Cfg = $null; $CfgBroken = $null
 if (Test-Path -LiteralPath $ConfigFile) {
@@ -508,6 +508,14 @@ function Show-Help {
   Write-Host '      Thêm một project GitHub vào box để omp làm việc và app FCode hiện trong danh sách.'
   Write-Host '      Nếu token GitHub của box ghi được repo thì xong ngay; nếu không, lệnh hướng dẫn bạn dán một khoá vào trang GitHub của repo (một lần cho mỗi repo).'
   Write-Host '      Ví dụ: fcode add ten-tai-khoan/ten-repo    hoặc    fcode add ten-tai-khoan/ten-repo ten-ngan'
+  Write-Host '  fcode deploy <tên> <lệnh> [đối số]'
+  Write-Host '      Điều khiển cổng deploy chung trên VPS (qua ssh; máy ssh lấy từ deployHost trong file cấu hình, mặc định contabo). Lệnh được chuyển nguyên cho cổng, kết quả in ra ngay và fcode thoát với đúng mã của cổng (70 = cần người xử lý).'
+  Write-Host '      Lệnh: status [id] · deploy <sha> · retry [sha] · pause · resume · trust on i-understand-root | off · logs [id] [số dòng] · recheck · compact · inventory <draft.json> · register <sha256> <draft.json>'
+  Write-Host '      "trust on" in cảnh báo (ai merge được vào nhánh đó đều có quyền root trên VPS và đọc được token GitHub của cổng) trước khi gửi.'
+  Write-Host '      Ví dụ: fcode deploy task status    hoặc    fcode deploy task deploy <sha>'
+  Write-Host '  fcode deploy add <chủ/repo> <tên> <draft.json>'
+  Write-Host '      Đăng ký một project vào cổng deploy: dùng lại hoặc tạo khoá chỉ đọc của repo, từ chối nếu repo còn lượt Actions đang chạy, in hiện trạng VPS (inventory), chờ bạn gõ YES rồi mới đăng ký. Cổng báo cần người xử lý thì in status và nhắc lệnh recheck.'
+  Write-Host '      Ví dụ: fcode deploy add ten-tai-khoan/ten-repo ten-ngan ten-ngan.draft.json'
   Write-Host '  fcode pair [tên thiết bị]'
   Write-Host '      Tạo mã ghép (kèm mã QR) để ghép một iPhone mới với server FCode. Mã dùng 1 lần và hết hạn nhanh.'
   Write-Host '      Ví dụ: fcode pair    hoặc    fcode pair iPhone của Mẹ'
@@ -696,6 +704,217 @@ function Invoke-Add {
   if ($rules) { Write-Host 'Repo có CLAUDE.md/AGENTS.md nhắc tới deploy: omp sẽ theo quy tắc deploy của repo.' }
   Write-Host "Muốn có project này trên laptop: chạy fcode sync (tìm bản đã có trên máy, không có thì hỏi chỗ để tải về)."
   return 0
+}
+
+# fcode deploy <ten> <lenh> [doi so]: cong deploy chung tren VPS (/usr/local/sbin/fcode-deploy-gate --local <ten> <lenh>), qua ssh.
+# Cong tu kiem tra moi yeu cau; o day chi chuyen lenh nguyen ven, in ket qua ngay khi co va thoat voi ma cua cong (70 = can nguoi xu ly).
+# May ssh den VPS: khoa deployHost trong config.json (mac dinh contabo). Khong co bi mat nao di qua tham so dong lenh: ban nhap di qua stdin.
+# Ma thoat cua chinh fcode khi cong khong chay: 65 = yeu cau bi tu choi tai may nay, chua doi gi; 1 = loi cong cu (ssh, gh) hoac mang.
+function Get-DeployHost {
+  $h = [string](Get-Cfg 'deployHost' 'contabo')
+  if ($h -cmatch '\A[A-Za-z0-9][A-Za-z0-9._@-]{0,99}\z') { $h }
+}
+
+# mot tu cua lenh (khong khoang trang, khong ky tu dac biet cua shell); ten project theo luat cua fcode add
+function Test-DeployWord([string]$w) { $w -cmatch '\A[A-Za-z0-9._/][A-Za-z0-9._/-]{0,199}\z' }
+
+# chay mot lenh tren VPS qua ssh, in tung dong ngay khi tien toi (tru khi -Quiet), tra @{ Code; Lines }.
+# $B64 (tuy chon): noi dung (base64, mot dong) gui vao stdin cua lenh tu xa
+function Invoke-DeploySsh([string]$Remote, [string]$B64, [switch]$Quiet) {
+  $dh = Get-DeployHost
+  $buf = New-Object 'System.Collections.Generic.List[string]'
+  if (-not $dh) { Write-Host 'lỗi: deployHost trong file cấu hình không dùng được (chỉ chữ, số, dấu . _ @ -).'; return @{ Code = 1; Lines = @() } }
+  $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+  try {
+    if ($B64) { $B64 | & ssh $dh $Remote | ForEach-Object { $buf.Add([string]$_); if (-not $Quiet) { Write-Host $_ } } }
+    else { & ssh -n $dh $Remote | ForEach-Object { $buf.Add([string]$_); if (-not $Quiet) { Write-Host $_ } } }
+    $code = [int]$LASTEXITCODE
+  } catch { Write-Host "lỗi: không chạy được ssh ($($_.Exception.Message))"; $code = 1 }
+  finally { $ErrorActionPreference = $old }
+  if ($code -eq 255) { Write-Host "lỗi: không nối được VPS bằng ssh $dh (mã 255). Thử gõ: ssh $dh" }
+  @{ Code = $code; Lines = @($buf) }
+}
+
+# mot lenh cua cong cho project $Name; $B64 (tuy chon) = ban nhap onboarding gui vao stdin cua cong
+function Invoke-DeployGate([string]$Name, [string[]]$GateArgs, [string]$B64, [switch]$Quiet) {
+  $cmd = ('/usr/local/sbin/fcode-deploy-gate --local ' + $Name + ' ' + (@($GateArgs) -join ' ')).TrimEnd()
+  if ($B64) { $cmd = 'base64 -di | ' + $cmd }
+  Invoke-DeploySsh $cmd $B64 -Quiet:$Quiet
+}
+
+# ban nhap onboarding: toi da 16 KiB, JSON hop le (bo BOM neu co). Tra @{ B64; Sha } (sha256 cua dung cac byte se gui) hoac @{ Err }
+function Read-DeployDraft([string]$Path) {
+  try {
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @{ Err = "không thấy file bản nháp: $Path" } }
+    $b = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $Path).ProviderPath)
+  } catch { return @{ Err = "không đọc được file bản nháp: $($_.Exception.Message)" } }
+  if ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) { $t = New-Object byte[] ($b.Length - 3); [Array]::Copy($b, 3, $t, 0, $t.Length); $b = $t }
+  if ($b.Length -eq 0 -or $b.Length -gt 16384) { return @{ Err = 'bản nháp phải có nội dung và tối đa 16 KiB' } }
+  try { [void]([Text.Encoding]::UTF8.GetString($b) | ConvertFrom-Json) } catch { return @{ Err = 'bản nháp không phải JSON hợp lệ' } }
+  $sha = ([BitConverter]::ToString(([Security.Cryptography.SHA256]::Create()).ComputeHash($b)) -replace '-', '').ToLowerInvariant()
+  @{ B64 = [Convert]::ToBase64String($b); Sha = $sha }
+}
+
+# repo khong con lan chay Actions nao dang chay hoac dang cho (in_progress, queued)? Tra @{ Code; Msg }: 0 = rong; 65 = con lan chay (doi chay xong roi lam lai); 1 = gh khong doc duoc (khong xac nhan duoc thi khong dang ky)
+function Test-DeployRunsIdle([string]$Repo) {
+  foreach ($st in 'in_progress', 'queued') {
+    $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try { $o = @(& gh run list -R $Repo --status $st --json databaseId 2>&1 | ForEach-Object { "$_" }); $code = [int]$LASTEXITCODE } catch { $o = @("$($_.Exception.Message)"); $code = 1 }
+    finally { $ErrorActionPreference = $old }
+    $n = -1
+    if ($code -eq 0) { try { $j = ConvertFrom-Json ($o -join "`n"); $n = $(if ($null -eq $j) { 0 } else { @($j).Count }) } catch { } }
+    if ($n -lt 0) { return @{ Code = 1; Msg = "gh không đọc được các lượt chạy Actions ($st) của $Repo nên chưa xác nhận được là không còn lượt nào. Chưa đăng ký.`n  (chi tiết: $(($o | Select-Object -First 1)))" } }
+    if ($n -gt 0) { return @{ Code = 65; Msg = "runs-in-flight: $Repo còn $n lượt Actions ở trạng thái $st. Chờ chúng chạy xong (hoặc huỷ), rồi chạy lại. Chưa đăng ký." } }
+  }
+  @{ Code = 0; Msg = '' }
+}
+
+# khoa deploy chi doc cua repo (/root/.ssh/<ten>_deploy tren VPS + ban ghi github-<ten> trong /root/.ssh/config + khoa trong Deploy keys cua repo).
+# Khoa da co chi duoc dung lai khi khoa cong cua no nam trong `gh repo deploy-key list`; khong thi tu choi, khong bao gio ghi de. Tra ma: 0 = san sang, 65 = tu choi, 1 = loi
+function Confirm-DeployKey([string]$Repo, [string]$Name) {
+  $probe = 'k=/root/.ssh/@NAME@_deploy; if [ -e $k ]; then ssh-keygen -y -f $k || echo KEY_UNREADABLE; else echo KEY_NONE; fi'
+  $create = "umask 077; k=/root/.ssh/@NAME@_deploy; mkdir -p /root/.ssh && [ ! -e `$k ] && [ ! -e `$k.pub ] && ssh-keygen -q -t ed25519 -N '' -C fcode-deploy-@NAME@ -f `$k && cat `$k.pub"
+  $alias = "umask 077; c=/root/.ssh/config; mkdir -p /root/.ssh; touch `$c; if grep -qE '^[[:space:]]*Host[[:space:]]+github-@NAME@[[:space:]]*`$' `$c; then echo ALIAS_EXISTS; else { [ -e `$c.bak-fcode-@NAME@ ] || cp -a `$c `$c.bak-fcode-@NAME@; } && printf '\nHost github-@NAME@\n  HostName github.com\n  User git\n  IdentityFile ~/.ssh/@NAME@_deploy\n  IdentitiesOnly yes\n' >> `$c && echo ALIAS_ADDED; fi"
+  $keyFile = "/root/.ssh/${Name}_deploy"
+  $p = Invoke-DeploySsh $probe.Replace('@NAME@', $Name) -Quiet
+  if ($p.Code -ne 0) { Write-Host "lỗi: không đọc được khoá deploy trên VPS (mã $($p.Code))."; return 1 }
+  $none = $false; $unread = $false; $pk = ''
+  foreach ($l in $p.Lines) {
+    if ($l -cmatch '\AKEY_NONE\s*\z') { $none = $true }
+    elseif ($l -cmatch '\AKEY_UNREADABLE\s*\z') { $unread = $true }
+    elseif (-not $pk -and $l -cmatch '\A(\S+)\s+(AAAA\S+)') { $pk = $Matches[1] + ' ' + $Matches[2] }
+  }
+  $isNew = $false
+  if ($none) {
+    $c = Invoke-DeploySsh $create.Replace('@NAME@', $Name) -Quiet
+    foreach ($l in $c.Lines) { if (-not $pk -and $l -cmatch '\A(\S+)\s+(AAAA\S+)') { $pk = $Matches[1] + ' ' + $Matches[2] } }
+    if ($c.Code -ne 0 -or -not $pk) { Write-Host "lỗi: VPS không tạo được khoá $keyFile (không ghi đè khoá hay file có sẵn). Kiểm tra trên VPS rồi chạy lại."; return 1 }
+    $isNew = $true
+    Write-Host "[1] Đã tạo khoá deploy mới $keyFile trên VPS"
+  } elseif ($unread -or -not $pk) {
+    Write-Host "lỗi: có sẵn $keyFile trên VPS nhưng không đọc được khoá công khai của nó. Không ghi đè. Xử lý tay trên VPS rồi chạy lại."
+    return 65
+  }
+  if ($isNew) {
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ('fcode-deploy-' + [guid]::NewGuid().ToString('N') + '.pub')   # chi khoa CONG KHAI
+    $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try {
+      [IO.File]::WriteAllBytes($tmp, [Text.Encoding]::ASCII.GetBytes($pk + "`n"))
+      $o = @(& gh repo deploy-key add $tmp -R $Repo --title "fcode deploy $Name (read-only)" 2>&1 | ForEach-Object { "$_" }); $code = [int]$LASTEXITCODE
+    } catch { $o = @("$($_.Exception.Message)"); $code = 1 }
+    finally { $ErrorActionPreference = $old; Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+    if ($code -ne 0) {
+      Write-IpaError "gh không thêm được khoá chỉ đọc vào $Repo (mã $code)." ($o -join "`n")
+      Write-Host "  Khoá đã tạo trên VPS, chưa vào GitHub. Khoá công khai: $pk"
+      Write-Host "  Thêm tay ở https://github.com/$Repo/settings/keys/new (KHÔNG tích Allow write access) rồi chạy lại lệnh này."
+      return 1
+    }
+    Write-Host "[2] Đã thêm khoá chỉ đọc vào Deploy keys của $Repo"
+  } else {
+    $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try { $o = @(& gh repo deploy-key list -R $Repo --json key 2>&1 | ForEach-Object { "$_" }); $code = [int]$LASTEXITCODE } catch { $o = @("$($_.Exception.Message)"); $code = 1 }
+    finally { $ErrorActionPreference = $old }
+    $listed = $null
+    if ($code -eq 0) { try { $listed = @(@(($o -join "`n") | ConvertFrom-Json) | ForEach-Object { (([string]$_.key).Trim() -split '\s+' | Select-Object -First 2) -join ' ' }) } catch { } }
+    if ($null -eq $listed) { Write-IpaError "gh không đọc được Deploy keys của $Repo." ($o -join "`n"); return 1 }
+    if ($listed -cnotcontains $pk) {
+      Write-Host "lỗi: $keyFile đã có trên VPS nhưng khoá công khai của nó KHÔNG nằm trong Deploy keys của $Repo. Không ghi đè khoá."
+      Write-Host '  Nếu là khoá của repo này: thêm nó vào Deploy keys của repo (chỉ đọc) rồi chạy lại. Nếu không: đổi tên project.'
+      return 65
+    }
+    Write-Host "[1] Khoá deploy $keyFile đã có trên VPS và đã nằm trong Deploy keys của $Repo, dùng lại"
+  }
+  $al = Invoke-DeploySsh $alias.Replace('@NAME@', $Name) -Quiet
+  if ($al.Code -ne 0 -or -not (@($al.Lines) -match '\AALIAS_(ADDED|EXISTS)\s*\z')) { Write-Host "lỗi: VPS không khai báo được kết nối GitHub github-$Name trong /root/.ssh/config (mã $($al.Code))."; return 1 }
+  if (@($al.Lines) -match '\AALIAS_ADDED') { Write-Host "[3] Đã khai báo kết nối GitHub github-$Name trong /root/.ssh/config của VPS (có bản sao lưu)" } else { Write-Host "[3] Kết nối GitHub github-$Name đã có trong /root/.ssh/config của VPS, giữ nguyên" }
+  0
+}
+
+# fcode deploy add <chu/repo> <ten> <draft.json>: dang ky mot project vao cong (khoa chi doc -> kiem tra Actions -> xem hien trang -> go YES -> register)
+function Invoke-DeployAdd([string[]]$AddArgs) {
+  $repo = if ($AddArgs.Count -gt 0) { [string]$AddArgs[0] } else { '' }; $name = if ($AddArgs.Count -gt 1) { [string]$AddArgs[1] } else { '' }
+  if ($AddArgs.Count -ne 3 -or $repo -cnotmatch '\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z' -or $repo -match '\A\.+/|/\.+\z' -or $name -cnotmatch '\A[a-z0-9][a-z0-9._-]{0,63}\z') {
+    Write-Host 'Cách dùng: fcode deploy add <chủ/repo> <tên> <draft.json>'
+    Write-Host '  <tên>: chữ thường, số, dấu . _ -   ·   <draft.json>: bản nháp đăng ký (tối đa 16 KiB)'
+    return 65
+  }
+  $d = Read-DeployDraft ([string]$AddArgs[2])
+  if ($d.Err) { Write-Host "lỗi: $($d.Err)"; return 65 }
+  if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { Write-Host 'lỗi: không tìm thấy gh (GitHub CLI). Cài gh rồi chạy: gh auth login'; return 1 }
+  # lan 1 (som, chua doi gi): co lan chay dang chay hoac cho thi dung ngay
+  $r = Test-DeployRunsIdle $repo
+  if ($r.Code -ne 0) { Write-Host "lỗi: $($r.Msg)"; return $r.Code }
+  Write-Host "Đăng ký $repo vào cổng deploy với tên '$name'..."
+  $k = Confirm-DeployKey $repo $name
+  if ($k -ne 0) { return $k }
+  Write-Host '[4] Đọc hiện trạng trên VPS (chỉ đọc, chưa đổi gì):'
+  $inv = Invoke-DeployGate $name @('inventory') -B64 $d.B64
+  if ($inv.Code -ne 0 -or @($inv.Lines | Where-Object { $_ -match '\AINV refuse\b' }).Count) {
+    Write-Host "Cổng từ chối bản nháp (mã $($inv.Code)). Sửa theo dòng INV ở trên rồi chạy lại. Chưa đăng ký."
+    return $(if ($inv.Code -ne 0) { $inv.Code } else { 65 })
+  }
+  Write-Host ''
+  Write-Host "sha256 của bản nháp: $($d.Sha)"
+  $ans = Read-SyncLine 'Đã xem hiện trạng ở trên. Gõ YES để đăng ký (chữ khác = huỷ): '
+  if ($null -eq $ans -or $ans.Trim() -cne 'YES') { Write-Host 'Đã huỷ, chưa đăng ký gì.'; return 65 }
+  # lan 2 (ngay truoc register): trong luc xem va go YES co the vua co lan chay moi
+  $r = Test-DeployRunsIdle $repo
+  if ($r.Code -ne 0) { Write-Host "lỗi: $($r.Msg)"; return $r.Code }
+  $reg = Invoke-DeployGate $name @('register', $d.Sha) -B64 $d.B64
+  if ($reg.Code -eq 0) {
+    Write-Host ''
+    Write-Host "Xong: '$name' đã đăng ký và đang tạm dừng. Việc tiếp theo, theo thứ tự:"
+    Write-Host "  fcode deploy $name status"
+    Write-Host "  (nếu dòng INV unit ở trên có trusted_needed=yes, hoặc project là compose / script:  fcode deploy $name trust on i-understand-root)"
+    Write-Host "  fcode deploy $name deploy <sha của main>"
+    Write-Host "  fcode deploy $name resume"
+    return 0
+  }
+  if ($reg.Code -eq 70) {
+    Write-Host ''
+    Write-Host 'Cổng cần người xử lý (needs_human). Trạng thái hiện tại:'
+    [void](Invoke-DeployGate $name @('status'))
+    Write-Host "Xử lý theo dòng BLOCKED ở trên (ví dụ kết thúc tiến trình đang giữ thư mục), rồi chạy:  fcode deploy $name recheck"
+    return 70
+  }
+  Write-Host "Đăng ký chưa xong (mã $($reg.Code)). Xem thông báo ở trên."
+  $reg.Code
+}
+
+function Invoke-Deploy {
+  $a = @($Rest | Select-Object -Skip 1)
+  $verbs = 'status', 'deploy', 'retry', 'pause', 'resume', 'trust', 'logs', 'recheck', 'inventory', 'register', 'compact'
+  if ($a.Count -gt 0 -and $a[0] -ceq 'add') { return (Invoke-DeployAdd @($a | Select-Object -Skip 1)) }
+  $name = if ($a.Count -gt 0) { [string]$a[0] } else { '' }; $verb = if ($a.Count -gt 1) { [string]$a[1] } else { '' }
+  $rest = @($a | Select-Object -Skip 2)
+  if ($name -cnotmatch '\A[a-z0-9][a-z0-9._-]{0,63}\z' -or $verbs -cnotcontains $verb) {
+    Write-Host 'Cách dùng: fcode deploy <tên> <lệnh> [đối số]'
+    Write-Host '  lệnh: status [id] · deploy <sha> · retry [sha] · pause · resume · trust on i-understand-root | off · logs [id] [số dòng] · recheck · compact · inventory <draft.json> · register <sha256> <draft.json>'
+    Write-Host '  Đăng ký project mới: fcode deploy add <chủ/repo> <tên> <draft.json>'
+    return 65
+  }
+  $b64 = ''; $gateArgs = @($rest)
+  if ($verb -ceq 'inventory' -or $verb -ceq 'register') {
+    # hai lenh nay doc ban nhap tu stdin cua cong: tham so cuoi la file ban nhap tren may nay, khong gui di
+    if ($rest.Count -ne $(if ($verb -ceq 'inventory') { 1 } else { 2 })) { Write-Host "Cách dùng: fcode deploy $name $verb $(if ($verb -ceq 'register') { '<sha256> ' })<draft.json>"; return 65 }
+    $d = Read-DeployDraft ([string]$rest[-1])
+    if ($d.Err) { Write-Host "lỗi: $($d.Err)"; return 65 }
+    $b64 = $d.B64; $gateArgs = @($rest | Select-Object -First ($rest.Count - 1))
+  }
+  foreach ($w in $gateArgs) { if (-not (Test-DeployWord ([string]$w))) { Write-Host "lỗi: đối số '$("$w" -replace '[\x00-\x1f\x7f]', '?')' không hợp lệ (chỉ chữ, số, dấu . _ / -)."; return 65 } }
+  if ($verb -ceq 'trust' -and $rest.Count -eq 2 -and $rest[0] -ceq 'on' -and $rest[1] -ceq 'i-understand-root') {
+    # canh bao truoc khi gui, nhac ten repo va nhanh that cua project (doc tu dong PROJECT cua status)
+    $s = Invoke-DeployGate $name @('status') -Quiet
+    $tr = ''; $tb = ''
+    foreach ($l in $s.Lines) { if ($l -match '\APROJECT\s') { if ($l -match '\brepo=(\S+)') { $tr = $Matches[1] }; if ($l -match '\bbranch=(\S+)') { $tb = $Matches[1] } } }
+    if (-not $tr -or -not $tb) {
+      Write-Host "lỗi: không đọc được repo và nhánh của '$name' từ lệnh status (project đã đăng ký chưa?). Chưa bật chế độ tin cậy."
+      foreach ($l in $s.Lines) { Write-Host $l }
+      return $(if ($s.Code -ne 0) { $s.Code } else { 65 })
+    }
+    Write-Host "Trusted mode: anyone who can merge to $tr $tb gets root on the VPS (compose controls the root docker daemon; script runs as root) and can read the gate's GitHub token, which can post statuses and issues on every brooklyn96 repository." -ForegroundColor Yellow
+  }
+  (Invoke-DeployGate $name (@($verb) + $gateArgs) -B64 $b64).Code
 }
 
 # fcode pair [ten thiet bi]: tao ma ghep 1 lan (kem ma QR) tren box cho iPhone moi
@@ -3676,6 +3895,7 @@ if ($CfgBroken) {
 if ($arg -eq 'sync') { exit (Invoke-Sync) }
 if ($arg -eq 'ipa') { exit (Invoke-Ipa) }
 if ($arg -eq 'add') { exit (Invoke-Add) }
+if ($arg -eq 'deploy') { exit (Invoke-Deploy) }
 if ($arg -eq 'pair') { exit (Invoke-Pair) }
 if ($arg -eq 'phien') { exit (Invoke-Phien) }
 if ($arg -eq 'moc') { exit (Invoke-Moc) }
