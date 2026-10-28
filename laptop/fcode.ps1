@@ -858,7 +858,7 @@ function Invoke-DeployAdd([string[]]$AddArgs) {
   $repo = if ($AddArgs.Count -gt 0) { [string]$AddArgs[0] } else { '' }; $name = if ($AddArgs.Count -gt 1) { [string]$AddArgs[1] } else { '' }
   if ($AddArgs.Count -ne 3 -or -not (Test-DeployRepo $repo) -or -not (Test-DeployName $name) -or $name -cin $reserved) {
     Write-Host 'Cách dùng: fcode deploy add <chủ/repo> <tên> <draft.json>'
-    Write-Host '  <tên>: chữ thường, số, dấu -, bắt đầu bằng chữ, 2 đến 28 ký tự (không dùng tên dành riêng)   ·   <draft.json>: bản nháp đăng ký (tối đa 16 KiB)'
+    Write-Host '  <tên>: chữ thường, số, dấu -, bắt đầu bằng chữ thường, không kết thúc bằng dấu -, 2 đến 28 ký tự (không dùng tên dành riêng)   ·   <draft.json>: bản nháp đăng ký (tối đa 16 KiB)'
     return 65
   }
   $d = Read-DeployDraft ([string]$AddArgs[2])
