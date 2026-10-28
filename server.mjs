@@ -356,7 +356,7 @@ export function pairPage(appLink) {
 }
 
 // ---------- home screen v2 (CONTRACT.md A8): quota, spend, box timer, projects, updates, Codex reset ----------
-const QUOTA_TTL = 60e3, LISTING_TTL = 300e3, SPEND_TTL = 300e3, PROJECTS_TTL = 120e3, RUN_WINDOW = 100; // RUN_WINDOW: Actions runs read per project (deploy line and PR checks)
+const QUOTA_TTL = 60e3, LISTING_TTL = 300e3, SPEND_TTL = 300e3, PROJECTS_TTL = 120e3, GATE_CONFIG_TTL = 600e3, RUN_WINDOW = 100; // RUN_WINDOW: Actions runs read per project (deploy line and PR checks)
 const LIST_AFTER_RESET_MS = 10e3, STALE_QUOTA_TTL = 15e3; // omp's own listing timeout is 10 s
 const HOME_WAIT_MS = 8000; // a part with no value yet is waited for this long at most, then it is empty and fills in the background
 const QUOTA_STALE_MS = 10 * 60e3; // a report omp fetched longer ago than this is stale
@@ -700,6 +700,28 @@ export function deployRunOf(runs, workflows) {
   if (!Array.isArray(runs)) return null;
   const ids = new Set(deployWorkflows(workflows).map(wfKey));
   return runOf(runs.filter((r) => { const n = str(r?.workflowName) ?? str(r?.name); return n && (/deploy/i.test(n) || ids.has(wfKey(r))); }));
+}
+// Generic deploy gate (decision-r4 §4.4): the deploy line of a gate project is the commit status `fcode/deploy` of the head. The
+// status text is untrusted: only its first word is read and mapped to a fixed (status, kind); the text itself is never shown or logged.
+// status uses the lastRun values the app already knows (done -> success, failed -> failure); `kind` is the finer state (absent on an Actions line).
+export const GATE_CONTEXT = 'fcode/deploy';
+const GATE_KEYWORDS = new Map([['deployed', ['success', 'deployed']], ['skipped', ['success', 'skipped']], ['superseded', ['success', 'superseded']],
+  ...['queued', 'waiting', 'building', 'activating', 'deferred', 'paused'].map((k) => [k, ['in_progress', 'waiting']]),
+  ...['refused', 'rolled', 'config'].map((k) => [k, ['failure', 'failed']]), ['needs', ['failure', 'needs_human']]]);
+// the statuses list (one JSON array per line: [context, description, created_at, target_url], newest first) -> the first fcode/deploy entry or null
+export function gateStatusOf(text) {
+  for (const l of String(text).split('\n')) {
+    if (!l.trim()) continue;
+    const e = JSON.parse(l);
+    if (Array.isArray(e) && typeof e[0] === 'string' && e[0].toLowerCase() === GATE_CONTEXT) return e;
+  }
+  return null;
+}
+// a status entry (null: the head has none yet) -> lastRun
+export function gateRunOf(e) {
+  const [status, kind] = (e && GATE_KEYWORDS.get(String(e[1] ?? '').split(/[\s:;]+/)[0].toLowerCase())) || ['in_progress', 'waiting'];
+  const url = typeof e?.[3] === 'string' && /^https:\/\/github\.com\/\S{1,300}$/.test(e[3]) ? e[3] : null;
+  return { workflow: GATE_CONTEXT, status, kind, at: isoOf(e?.[2]), url };
 }
 // status.json of the box updater: the harness tools only (omp, claude, codex); a result outside updated|current|failed is null
 const UPDATE_RESULTS = ['updated', 'current', 'failed'];
@@ -1505,6 +1527,38 @@ export function createApp(opts = {}) {
   }, now, QUOTA_TTL, (q) => q.ttl);
   const scan = spendScanner(spendRoots, now);
   const spend = memo(SPEND_TTL, scan, now);
+  // Generic deploy gate (decision-r4 §4.4). A gate project = its repo is in gate-repos.json (a JSON array of "owner/repo", added the first
+  // time the context is seen on any sha, never removed), else .fcode/deploy.json exists on the head (answer kept 10 min). The default
+  // branch head is resolved once per refresh and used for both reads. undefined: not a gate project (the Actions rule); null: a gate
+  // project whose status could not be read; else the lastRun.
+  const gateFile = path.join(configDir, 'gate-repos.json');
+  const gateRepos = new Set();
+  try { for (const r of JSON.parse(fs.readFileSync(gateFile, 'utf8'))) if (typeof r === 'string') gateRepos.add(r.toLowerCase()); } catch {}
+  const gateConfig = new Map(); // repo -> {at, has}
+  const ghApi = (...a) => execTool(ghSpec, ['api', ...a], 20e3);
+  async function gateLastRun(repo) {
+    const key = repo.toLowerCase();
+    const c = gateConfig.get(key);
+    const seen = c && now() - c.at < GATE_CONFIG_TTL ? c : null;
+    if (!gateRepos.has(key) && seen && !seen.has) return undefined; // no config on the head a moment ago
+    let gate = gateRepos.has(key) || !!seen?.has;
+    try {
+      const sha = (await ghApi(`repos/${repo}/commits/HEAD`, '--jq', '.sha')).trim();
+      if (!/^[0-9a-f]{40}$/.test(sha)) throw new Error('no head');
+      if (!gate) {
+        let has = true;
+        await ghApi(`repos/${repo}/contents/.fcode/deploy.json?ref=${sha}`, '--silent').catch((e) => { if (e.killed || !/HTTP 404/.test(e.stderr ?? '')) throw e; has = false; });
+        gateConfig.set(key, { at: now(), has });
+        if (!has) return undefined;
+        gate = true;
+      }
+      const e = gateStatusOf(await ghApi(`repos/${repo}/commits/${sha}/statuses?per_page=100`, '--paginate', '--jq', '.[] | [.context, .description, .created_at, .target_url] | @json'));
+      if (e && !gateRepos.has(key)) { // stays a gate project from now on, whatever happens to its config; a failed write is retried at the next refresh
+        try { writeFile(gateFile, JSON.stringify([...gateRepos, key].sort())); gateRepos.add(key); } catch (er) { if (er.committed) gateRepos.add(key); }
+      }
+      return gateRunOf(e);
+    } catch { return gate ? null : undefined; }
+  }
   async function projectInfo(name) {
     const dir = cfg.projects[name];
     const out = { name, repo: null, branch: null, prs: null, lastRun: null };
@@ -1517,15 +1571,17 @@ export function createApp(opts = {}) {
     if (!out.repo) return out;
     const runList = (limit, ...a) => gh('run', 'list', '--limit', String(limit), '--json', 'workflowDatabaseId,workflowName,name,status,conclusion,createdAt,url,headSha', ...a);
     const prList = (fields) => gh('pr', 'list', '--state', 'open', '--limit', '20', '--json', fields);
-    const [prs, runs, workflows] = await Promise.all([
+    const [prs, runs, workflows, gate] = await Promise.all([
       // a token without checks access fails the whole query with statusCheckRollup (a GraphQL "not accessible" error or an HTTP 403):
       // then the list without it, and the checks come from the Actions runs of each head SHA; a timeout or any other failure is not retried
       ghRaw('pr', 'list', '--state', 'open', '--limit', '20', '--json', 'number,title,mergeable,headRefOid,statusCheckRollup')
         .catch((e) => (!e.killed && !/rate limit/i.test(e.stderr ?? '') && /not accessible|permission|scope|403|forbidden/i.test(e.stderr ?? '') ? prList('number,title,mergeable,headRefOid') : null)),
       runList(RUN_WINDOW), // one list: the deploy line and the PR checks
       gh('workflow', 'list', '--all', '--json', 'id,name,path'), // a deploy workflow is also known by its file path (--all: a disabled one too)
+      gateLastRun(out.repo), // never rejects
     ]);
     out.prs = Array.isArray(prs) ? prsOf(prs, runs) : null;
+    if (gate !== undefined) { out.lastRun = gate; return out; } // a gate project: the commit status, not the Actions runs
     out.lastRun = deployRunOf(runs, workflows);
     if (!out.lastRun && Array.isArray(runs) && runs.length >= RUN_WINDOW) { // window full: a deploy run may be older than all of it
       const old = await Promise.all(deployWorkflows(workflows).filter((w) => w.id != null).map((w) => runList(1, '--workflow', String(w.id))));
