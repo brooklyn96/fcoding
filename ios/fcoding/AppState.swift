@@ -30,6 +30,38 @@ final class AppState: ObservableObject {
         if token != nil && !PairLink.isSupportedStored(stored) {
             unsupportedServer = PairLink.escapedAuthority(stored)
         }
+        prefetch()
+    }
+
+    /// The first home and prefs requests of an activation (see LaunchFetch).
+    let launch = LaunchFetch()
+
+    private func loginKey(_ api: API) -> String { ResponseCache.key(server: api.base.absoluteString, token: api.token) }
+
+    /// Called at launch and each time the app becomes active: opens the connection and gets the
+    /// home and prefs replies before the home screen asks for them. Nothing while unpaired.
+    func prefetch() {
+        guard let api = api else { return }
+        begin(api, ["api/home", "api/prefs"])
+    }
+
+    private func begin(_ api: API, _ paths: [String], timeout: TimeInterval = 20) {
+        launch.start(key: loginKey(api), paths) { try await api.call("GET", $0, timeout: timeout) }
+    }
+
+    /// GET `path` and when the reply arrived. Unless `reuse` is false (a caller that needs a reply
+    /// from a request started after its call) or there is a query (?fresh=1), it starts the
+    /// request itself when prefetch() has not (one per activation either way) and takes it, but
+    /// only when it began at or after `since`. A prefetch that failed is not an error here: the
+    /// caller's own request goes out.
+    func get(_ api: API, _ path: String, query: [URLQueryItem] = [], timeout: TimeInterval = 20,
+             reuse: Bool = true, since: Date = .distantPast) async throws -> (data: Data, at: Date) {
+        if reuse && query.isEmpty {
+            begin(api, [path], timeout: timeout)
+            if let early = launch.take(path, key: loginKey(api), since: since), let reply = try? await early.value { return reply }
+        }
+        let data = try await api.call("GET", path, query: query, timeout: timeout)
+        return (data, Date())
     }
 
     static func oldBoxLine(_ address: String) -> String {
