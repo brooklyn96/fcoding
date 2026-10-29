@@ -4616,6 +4616,22 @@ test('GET /api/home box estimate: more than a cooldown past its sleep time while
   assert.equal(JSON.parse(fs.readFileSync(path.join(c.configDir, 'box-timer.json'), 'utf8')).resume, c.clock.t - 30e3);
 }));
 
+test('GET /api/home box: a running record more than a cooldown past runStartedAt + max run is not used (the estimate answers, in the future); inside the cooldown it still is', async () => {
+  const s = stubDir();
+  const clock = { t: 1_700_000_000_000 };
+  try {
+    for (const [ago, source, sleeps] of [[9 * HOUR, 'estimate', clock.t + 8 * HOUR], [8 * HOUR + 5 * 60e3, 'instabox', null]]) {
+      s.ls([boxRec(clock, { maxRunMinutes: 480, runStartedAt: new Date(clock.t - ago).toISOString() })]);
+      await withApp(async (c) => {
+        const { cookie } = await c.login();
+        await stagingOf(c, cookie);
+        const b = await homeBox(c, cookie);
+        assert.deepEqual([b.source, b.sleepsAt], [source, sleeps && new Date(sleeps).toISOString()]);
+      }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t, boxName: 'coder' });
+    }
+  } finally { s.cleanup(); }
+});
+
 test('GET /api/home box: the restart rule never fights a known run: the estimate follows the record, so when ls then fails past 10 min it keeps runStartedAt + max run (no restart, no jump)', async () => {
   const s = stubDir();
   const clock = { t: 1_700_000_000_000 };
