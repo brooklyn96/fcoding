@@ -168,8 +168,10 @@ struct ProjectsView: View {
         }
     }
 
+    /// Pull to refresh, as on "Hạn mức": GET api/home?fresh=1 with the overview and the prefs;
+    /// the spinner stays until all three have answered.
     private func reload() async {
-        let quota = Task { await home.load(app) }
+        let quota = Task { await home.refresh(app) }
         let names = Task { await prefs.load(app) }
         await model.load(app)
         await quota.value
@@ -305,6 +307,17 @@ struct ProjectsView: View {
                 Text(model.errorText == nil ? "Đang tải…" : " ").foregroundColor(.l2).padding(.leading, 2)
             }
             Spacer(minLength: 0)
+            // The sessions or the cards are the copy saved at the last launch, until the box answers.
+            if model.overview != nil && (model.fromCache || home.fromCache) {
+                let saved = home.cacheLabel ?? "đang cập nhật"
+                Text(saved)
+                    .scaledFont(12)
+                    .foregroundColor(.l2)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+                    .padding(.trailing, 2)
+                    .accessibilityLabel("Số liệu cũ, " + saved)
+            }
         }
         .scaledFont(15)
         .frame(minHeight: 44)
@@ -773,11 +786,12 @@ struct ProjectCard: View {
         .contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: 14, style: .continuous))
         .onTapGesture(perform: onTap)
         .contextMenu {
+            // The long press used to open a new session: that stays first, then the two new ones.
             Button(action: onMore) { Label("Mở phiên mới", systemImage: "plus") }
             if let onRename = onRename {
-                Button(action: onRename) { Label("Đổi tên hiển thị…", systemImage: "pencil") }
+                Button(action: onRename) { Label("Đổi tên", systemImage: "pencil") }
             }
-            Button(action: onArrange) { Label("Sắp xếp & đổi tên…", systemImage: "arrow.up.arrow.down") }
+            Button(action: onArrange) { Label("Sắp xếp", systemImage: "arrow.up.arrow.down") }
         }
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
@@ -786,7 +800,8 @@ struct ProjectCard: View {
         .accessibilityAction(named: "Mở phiên mới", onMore)
         .accessibilityActions {
             if staging?.canStart == true { Button("Bật staging", action: onStartStaging) }
-            if let onRename = onRename { Button("Đổi tên hiển thị", action: onRename) }
+            if let onRename = onRename { Button("Đổi tên", action: onRename) }
+            Button("Sắp xếp", action: onArrange)
         }
     }
 
