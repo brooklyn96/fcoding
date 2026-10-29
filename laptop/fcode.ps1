@@ -1281,12 +1281,13 @@ resolve() { # $1 = so hoac ten (hoac dau ten) -> dat $sel
     sel="${names[$((10#$q - 1))]}"; return 0
   fi
   for i in "${!names[@]}"; do [ "${names[$i]}" = "$q" ] && { sel="$q"; return 0; }; done
-  for i in "${!names[@]}"; do
-    n2="${names[$i]}"; [[ "${n2,,}" == "$ql"* ]] && matches+=("$i")
+  for i in "${!rows[@]}"; do   # đầu tên phiên, hoặc phiên gắn với project đó (@pc_project: tên phiên không luôn bắt đầu bằng tên project: my_app -> my-app-omp, phiên đã đổi tên)
+    IFS='|' read -r n2 _ p2 _ <<<"${rows[$i]}"
+    if [[ "${n2,,}" == "$ql"* ]] || { [ -n "$p2" ] && [ "${p2,,}" = "$ql" ]; }; then matches+=("$i"); fi
   done
   if [ "${#matches[@]}" -eq 1 ]; then sel="${names[${matches[0]}]}"; return 0; fi
   if [ "${#matches[@]}" -eq 0 ]; then
-    echo "Không thấy phiên nào tên \"$q\"."
+    echo "Không thấy phiên nào tên \"$q\"."; return 78   # 78 = không có phiên nào tên này (laptop chỉ thử hỏi tên gọi khi gặp mã này, không phải khi ssh đứt)
   else
     echo "Có nhiều phiên khớp \"$q\", gõ dài hơn hoặc dùng số:"
     for i in "${matches[@]}"; do show "$i"; done
@@ -1352,7 +1353,7 @@ if [ "$arg" = "--new" ]; then
   [ "$rc" -eq 2 ] && exit 1
   exit 0
 fi
-if [ -n "$arg" ]; then resolve "$arg" || exit 1; attach "$sel"; fi
+if [ -n "$arg" ]; then resolve "$arg" || exit $?; attach "$sel"; fi
 
 show_all
 [ -t 0 ] || { [ "$n" -eq 0 ] && echo "Mở phiên mới bằng lệnh: fcode new"; exit 0; }
@@ -1415,8 +1416,9 @@ RX_BLOBNAME = re.compile(r'^([a-f0-9]{64})(?:\.[A-Za-z0-9][A-Za-z0-9._-]{0,31})?
 
 
 def out_json(o):
-    sys.stdout.write('FCODE-JSON ' + json.dumps(o, ensure_ascii=False) + '\n')
-    sys.stdout.flush()
+    # bytes UTF-8 thang vao stdout (laptop doc UTF-8); sys.stdout.write di qua bang ma cua locale, locale khong phai UTF-8 thi tieng Viet thanh '?'
+    sys.stdout.buffer.write(('FCODE-JSON ' + json.dumps(o, ensure_ascii=False) + '\n').encode('utf-8', 'replace'))
+    sys.stdout.buffer.flush()
 
 
 # ---- thu muc ma hoa cua omp (cung quy tac voi omp: tmp truoc, roi home, roi duong dan tuyet doi) ----
@@ -4262,13 +4264,14 @@ while ($true) {
   & $ib wake $box *> $null
   if ($arg -eq '--list') { & $ib ssh $box -- $remote } else { & $ib ssh $box -- -q -tt $remote }
   $rc = $LASTEXITCODE
-  if ($rc -ne 0 -and $bareWord -and -not $asked) {   # box khong biet tu nay: co the la ten goi moi dat trong app. Hoi box mot lan; doi duoc ra ten that thi chay lai
+  if ($rc -eq 78 -and $bareWord -and -not $asked) {   # box bao khong co phien nao ten nay (ma 78; ssh dut, 255, thi khong): co the la ten goi moi dat trong app. Hoi box mot lan; doi duoc ra ten that thi chay lai
     $asked = $true
     $new = Resolve-ProjectArg $arg @(Get-PrefsNames) $true
     if ($new -cne $arg -and $new -match '\A[A-Za-z0-9._-]+\z') { $arg = $new; continue }
   }
   break
 }
+if ($rc -eq 78) { $rc = 1 }   # 78 chi la tin hieu giua script tren box va laptop; nguoi dung van thay ma 1
 if ($rc -eq 77 -and -not $arg) { exit (Invoke-PhienMenu) }
 # tham so khong khop phien nao (hoac loi) thi nhac lenh help
 if ($rc -ne 0 -and $arg -and $arg -ne '--list' -and $arg -ne '--new') { Write-Host "Nếu '$arg' không phải tên phiên, gõ fcode help để xem các lệnh." }
