@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import { createApp, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, strictOrigin, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock,
-  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, parseUpdates, gateStatusOf, gateRunOf, resetReply, RESET_MSG, BOX, memo, codexChildMeta, parseGitSync, ompDirName, ompHead, parseStaging, KNOWN_VERSIONS, repoOfLink } from '../server.mjs';
+  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, releaseRunOf, parseUpdates, gateStatusOf, gateRunOf, resetReply, RESET_MSG, BOX, memo, codexChildMeta, parseGitSync, ompDirName, ompHead, parseStaging, KNOWN_VERSIONS, repoOfLink } from '../server.mjs';
 
 process.env.TZ = 'America/Los_Angeles'; // spend days follow config.json timeZone, never the process zone: a third zone proves it
 
@@ -3038,19 +3038,23 @@ test('GET /api/home: a full 100-run window without a deploy run reads the deploy
   const old = [GH.runs.find((r) => r.workflowDatabaseId === 13)];
   const ci = GH.workflows.filter((w) => w.id === 12);
   const wfCalls = () => c.toolCalls('--workflow').length;
-  c.setRules([['--workflow 13', { stdout: JSON.stringify(old) }], ['run list', { stdout: JSON.stringify(full) }], ...baseRules()]);
+  const rel = ['release list', { stdout: RELEASES }], relCalls = () => c.toolCalls('release list').length;
+  c.setRules([rel, ['--workflow 13', { stdout: JSON.stringify(old) }], ['run list', { stdout: JSON.stringify(full) }], ...baseRules()]);
   let h = await c.homeUntil((x) => x.projects[0].lastRun && x.projects[1].lastRun);
   assert.deepEqual(h.projects.map((p) => p.lastRun.workflow), ['Ship it', 'Ship it']);
   await c.app.homeIdle();
   assert.equal(wfCalls(), 2); // two projects, the one deploy workflow each
   assert.ok(c.toolCalls('--workflow 13').every((l) => l.includes('--limit 1 ')));
-  // the window full and no deploy workflow at all: no extra call, none
-  c.setRules([['workflow list', { stdout: JSON.stringify(ci) }], ['run list', { stdout: JSON.stringify(full) }], ...baseRules()]);
-  c.clock.t += 121e3;
-  await c.home();
-  await c.app.homeIdle();
-  h = await c.home();
-  assert.deepEqual([h.projects[0].lastRun, wfCalls()], [null, 2]);
+  assert.equal(relCalls(), 0); // the fallback found an old deploy run: that run, no release
+  // the fallback finds nothing (the deploy workflow has no run): there is a deploy workflow, so still no release
+  c.setRules([rel, ['--workflow 13', { stdout: '[]' }], ['run list', { stdout: JSON.stringify(full) }], ...baseRules()]);
+  h = await ghRefresh(c);
+  assert.deepEqual([h.projects[0].lastRun, relCalls()], [null, 0]);
+  // the window full and no deploy workflow at all: no extra call; the release is the line
+  c.setRules([rel, ['workflow list', { stdout: JSON.stringify(ci) }], ['run list', { stdout: JSON.stringify(full) }], ...baseRules()]);
+  const wf = wfCalls();
+  h = await ghRefresh(c);
+  assert.deepEqual([h.projects[0].lastRun, wfCalls() - wf, relCalls()], [V139, 0, 2]);
 }));
 
 // ---------- generic deploy gate (decision-r4 §4.4): the deploy line of a gate project is the commit status fcode/deploy ----------
@@ -3221,6 +3225,89 @@ test('GET /api/home: gate-repos.json from an earlier run: no config on the head 
     const h = await c.homeUntil((x) => x.projects[0].lastRun && x.projects[1].lastRun);
     assert.deepEqual(h.projects.map((p) => p.lastRun), [SHIP, SHIP]); // not a gate project
   }, seedGate('{not json'));
+});
+
+// ---------- release line: no deploy line -> the newest published release ----------
+const REL = (tagName, publishedAt, isLatest = false) => ({ tagName, publishedAt, isLatest });
+const RELEASES = JSON.stringify([REL('v1.3.8', '2026-10-29T06:13:50Z'), REL('v1.3.9', '2026-10-29T08:47:53Z', true)]); // not sorted: the newest publishedAt wins
+const V139 = { workflow: 'v1.3.9', status: 'success', kind: 'released', at: '2026-10-29T08:47:53.000Z', url: 'https://github.com/owner/repo/releases/tag/v1.3.9' };
+// the gh.json runs and workflows without the "Ship it" deploy workflow (id 13): no deploy run
+const NO_DEPLOY = () => [['workflow list', { stdout: JSON.stringify(GH.workflows.filter((w) => w.id === 12)) }], ['run list', { stdout: JSON.stringify(GH.runs.filter((r) => r.workflowDatabaseId !== 13)) }]];
+
+test('releaseRunOf: newest publishedAt, tag sanitised, url only on github.com, nothing usable -> null', () => {
+  assert.deepEqual(releaseRunOf(JSON.parse(RELEASES), 'owner/repo'), V139);
+  const r = releaseRunOf([REL('v1\u001b[31m\nx y/z#', '2026-10-29T08:47:53Z')], 'owner/repo');
+  assert.equal(r.workflow, 'v1x y/z#'); // the ANSI sequence and the newline are gone, the rest is as is
+  assert.equal(r.url, 'https://github.com/owner/repo/releases/tag/v1%1B%5B31m%0Ax%20y/z%23');
+  const long = releaseRunOf([REL('a'.repeat(400), '2026-10-29T08:47:53Z')], 'owner/repo');
+  assert.deepEqual([long.workflow.length, long.url], [160, null]); // over the 300-character url limit
+  for (const bad of [null, {}, [], [REL('v1', 'not a date')], [REL(5, '2026-10-29T08:47:53Z')], [REL('\u001b[0m', '2026-10-29T08:47:53Z')]]) assert.equal(releaseRunOf(bad, 'owner/repo'), null, JSON.stringify(bad));
+});
+
+test('GET /api/home: no deploy run and not a gate project -> the latest release (flags: no drafts, no prereleases); a failing call -> null', () => homeApp(async (c) => {
+  c.setRules([['release list', { stdout: RELEASES }], ['commits/HEAD', NO_CONFIG], ...NO_DEPLOY(), ...baseRules()]);
+  let h = await c.homeUntil((x) => x.projects[0].lastRun && x.projects[1].lastRun);
+  assert.deepEqual(h.projects.map((p) => p.lastRun), [V139, V139]);
+  const calls = c.toolCalls('release list');
+  assert.equal(calls.length, 2); // one per project
+  assert.ok(calls.every((l) => l.includes('-R owner/repo release list --limit 10 --exclude-drafts --exclude-pre-releases --json tagName,publishedAt,isLatest')), calls[0]);
+  // a failing call, a non-JSON answer or no release: today's "no deploy line"
+  for (const rel of [{ code: 1, stderr: 'HTTP 502' }, { stdout: 'not json' }, { stdout: '[]' }]) {
+    c.setRules([['release list', rel], ['commits/HEAD', NO_CONFIG], ...NO_DEPLOY(), ...baseRules()]);
+    h = await ghRefresh(c);
+    assert.deepEqual(h.projects.map((p) => p.lastRun), [null, null]);
+  }
+}));
+
+test('GET /api/home: the release line is never read for a project with a deploy run or for a gate project', async () => {
+  await homeApp(async (c) => { // a deploy run exists: the Actions line, no release call
+    c.setRules([['release list', { stdout: RELEASES }], ['commits/HEAD', NO_CONFIG], ...baseRules()]);
+    const h = await c.homeUntil((x) => x.projects[0].lastRun && x.projects[1].lastRun);
+    assert.deepEqual(h.projects.map((p) => p.lastRun), [SHIP, SHIP]);
+    await c.app.homeIdle();
+    assert.equal(c.toolCalls('release list').length, 0);
+  });
+  await homeApp(async (c) => { // a gate project with no status yet (and one with a failing head): never the release
+    for (const rules of [gateRules({ statuses: '' }), gateRules({ head: GH_FAIL })]) {
+      c.setRules([['release list', { stdout: RELEASES }], ...NO_DEPLOY(), ...rules]);
+      const h = await ghRefresh(c);
+      assert.ok(h.projects.every((p) => p.lastRun?.kind !== 'released'), JSON.stringify(h.projects.map((p) => p.lastRun)));
+    }
+    assert.equal(c.toolCalls('release list').length, 0);
+  }, seedGate(JSON.stringify(['owner/repo'])));
+});
+
+test('GET /api/home: a failed run list or workflow list, or a deploy workflow known only by its file path, never gives the release', async () => {
+  const rel = ['release list', { stdout: RELEASES }];
+  const gh502 = { code: 1, stderr: 'HTTP 502' };
+  // the deploy workflow ("Ship it", deploy.yml) exists but its runs cannot be read: unknown (null), never a green release
+  await homeApp(async (c) => {
+    c.setRules([rel, ['run list', gh502], ['commits/HEAD', NO_CONFIG], ...baseRules()]);
+    await c.homeUntil((x) => !x.projects[0].loading && !x.projects[1].loading);
+    await c.app.homeIdle();
+    assert.deepEqual([(await c.home()).projects.map((p) => p.lastRun), c.toolCalls('release list').length], [[null, null], 0]);
+  });
+  // the workflow list cannot be read (a deploy workflow known only by path would be missed), the runs have no deploy run
+  await homeApp(async (c) => {
+    c.setRules([rel, ['workflow list', gh502], ...NO_DEPLOY().slice(1), ['commits/HEAD', NO_CONFIG], ...baseRules()]);
+    await c.homeUntil((x) => !x.projects[0].loading && !x.projects[1].loading);
+    await c.app.homeIdle();
+    assert.deepEqual([(await c.home()).projects.map((p) => p.lastRun), c.toolCalls('release list').length], [[null, null], 0]);
+  });
+  // no deploy workflow at all but the runs cannot be read: still unknown, never the release
+  await homeApp(async (c) => {
+    c.setRules([rel, ['run list', gh502], NO_DEPLOY()[0], ['commits/HEAD', NO_CONFIG], ...baseRules()]);
+    await c.homeUntil((x) => !x.projects[0].loading && !x.projects[1].loading);
+    await c.app.homeIdle();
+    assert.deepEqual([(await c.home()).projects.map((p) => p.lastRun), c.toolCalls('release list').length], [[null, null], 0]);
+  });
+  // the deploy workflow is known only by its path (deploy.yml, the name says nothing) and has no run in the list: no release
+  await homeApp(async (c) => {
+    c.setRules([rel, ...NO_DEPLOY().slice(1), ['commits/HEAD', NO_CONFIG], ...baseRules()]); // workflow list: gh.json (Ship it, deploy.yml)
+    await c.homeUntil((x) => !x.projects[0].loading && !x.projects[1].loading);
+    await c.app.homeIdle();
+    assert.deepEqual([(await c.home()).projects.map((p) => p.lastRun), c.toolCalls('release list').length], [[null, null], 0]);
+  });
 });
 
 test('GET /api/home: a failing gh call never makes a 500 or a wrong line (gate project: null; other repo: the Actions line)', async () => {

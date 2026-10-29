@@ -720,8 +720,17 @@ export function gateStatusOf(text) {
 // a status entry (null: the head has none yet) -> lastRun
 export function gateRunOf(e) {
   const [status, kind] = (e && GATE_KEYWORDS.get(String(e[1] ?? '').split(/[\s:;]+/)[0].toLowerCase())) || ['in_progress', 'waiting'];
-  const url = typeof e?.[3] === 'string' && /^https:\/\/github\.com\/\S{1,300}$/.test(e[3]) ? e[3] : null;
-  return { workflow: GATE_CONTEXT, status, kind, at: isoOf(e?.[2]), url };
+  return { workflow: GATE_CONTEXT, status, kind, at: isoOf(e?.[2]), url: githubUrl(e?.[3]) };
+}
+const githubUrl = (u) => (typeof u === 'string' && /^https:\/\/github\.com\/\S{1,300}$/.test(u) ? u : null);
+// A project with no deploy line shows its newest published release (gh release list --json tagName,publishedAt,isLatest; drafts and
+// prereleases are excluded by flags) as kind "released"; no usable release -> null. The tag is untrusted text.
+export function releaseRunOf(list, repo) {
+  const r = (Array.isArray(list) ? list : []).filter((x) => typeof x?.tagName === 'string' && Date.parse(x.publishedAt) > 0)
+    .sort((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt))[0];
+  const tag = r && clip(cleanLine(r.tagName));
+  if (!tag) return null;
+  return { workflow: tag, status: 'success', kind: 'released', at: isoOf(r.publishedAt), url: githubUrl(`https://github.com/${repo}/releases/tag/${r.tagName.split('/').map(encodeURIComponent).join('/')}`) };
 }
 // status.json of the box updater: the harness tools only (omp, claude, codex); a result outside updated|current|failed is null
 const UPDATE_RESULTS = ['updated', 'current', 'failed'];
@@ -1587,6 +1596,8 @@ export function createApp(opts = {}) {
       const old = await Promise.all(deployWorkflows(workflows).filter((w) => w.id != null).map((w) => runList(1, '--workflow', String(w.id))));
       out.lastRun = runOf(old.flat().filter(Boolean).sort((a, b) => (a.createdAt < b.createdAt) - (a.createdAt > b.createdAt)));
     }
+    // no deploy line and the Actions reads worked and the repo has no deploy workflow: its latest release (a failed read is "unknown", never a release)
+    if (!out.lastRun && Array.isArray(runs) && Array.isArray(workflows) && !deployWorkflows(workflows).length) out.lastRun = releaseRunOf(await gh('release', 'list', '--limit', '10', '--exclude-drafts', '--exclude-pre-releases', '--json', 'tagName,publishedAt,isLatest'), out.repo);
     return out;
   }
   const projects = memo(PROJECTS_TTL, () => Promise.all(cfg.projectNames.map(projectInfo)), now);

@@ -235,7 +235,7 @@ struct HomeRun: Decodable {
     var status: String
     var at: Date?
     var url: String?
-    /// Deploy-gate projects only (workflow "fcode/deploy"): "deployed" | "skipped" | "superseded" | "waiting" | "failed" | "needs_human". Nil on a GitHub Actions line.
+    /// Deploy-gate projects only (workflow "fcode/deploy"): "deployed" | "skipped" | "superseded" | "waiting" | "failed" | "needs_human". "released": a project with no deploy line, its newest release (tag in `workflow`). Nil on a GitHub Actions line.
     var kind: String?
 
     init(status: String, at: Date?, kind: String? = nil) { workflow = ""; self.status = status; self.at = at; self.kind = kind }
@@ -642,6 +642,7 @@ enum HomeLogic {
         case "skipped": return ("– deploy bỏ qua", .none)
         case "superseded": return ("– deploy thay bằng bản mới", .none)
         case "needs_human": return ("⚠ deploy cần người xử lý", .warn)
+        case "released": return ("✓ đã phát hành " + run.workflow + (when.map { " · " + $0 } ?? ""), .ok)
         default: break // "waiting" and "failed" read like the status below; an Actions line has no kind
         }
         switch run.status {
@@ -1282,6 +1283,7 @@ enum HomeLogic {
         eq("gate failed", deployLine(HomeRun(status: "failure", at: now.addingTimeInterval(-3 * hr), kind: "failed"), now: now).text, "✗ deploy lỗi · 3 giờ trước")
         eq("gate needs human", deployLine(HomeRun(status: "failure", at: now, kind: "needs_human"), now: now).text, "⚠ deploy cần người xử lý")
         eq("gate needs human tone", deployLine(HomeRun(status: "failure", at: now, kind: "needs_human"), now: now).tone, .warn)
+        eq("release line", deployLine({ var r = HomeRun(status: "success", at: now.addingTimeInterval(-3 * hr), kind: "released"); r.workflow = "v1.3.9"; return r }(), now: now).text, "✓ đã phát hành v1.3.9 · 3 giờ trước")
         eq("gate unknown kind", deployLine(HomeRun(status: "success", at: now.addingTimeInterval(-3 * hr), kind: "later-kind"), now: now).text, "✓ deploy 3 giờ trước")
         eq("ago", ago(55 * 60), "55 phút trước")
 
