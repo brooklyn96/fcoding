@@ -575,6 +575,9 @@ function Show-Help([string]$Topic = '') {
     'fcode deploy add <chủ/repo> <tên> <draft.json>@@Đăng ký project vào cổng deploy',
     'fcode deploy allow <tên> [root]@@Cho khoá box dùng project (root: +trust)',
     'fcode deploy disallow <tên>@@Thu hồi quyền của khoá box',
+    'fcode move plan <máy mới>@@Kiểm tra, lập kế hoạch chuyển VPS',
+    'fcode move copy | cutover@@Chép trước, rồi chuyển (tạm dừng 1 lần)',
+    'fcode move finish | back | status@@Bỏ máy cũ, quay lại, xem trạng thái',
     'Đồng bộ phiên omp (laptop <-> box)',
     'fcode phien [project]@@Đồng bộ phiên hai chiều',
     'fcode phien --thu [project]@@Chạy thử, không chép gì',
@@ -694,6 +697,32 @@ function Show-Help([string]$Topic = '') {
       '  fcode deploy task deploy <sha>',
       '  fcode deploy add ten-tai-khoan/ten-repo ten-ngan ten-ngan.draft.json'
     )
+    move = @(
+      '#fcode move <lệnh>',
+      '  Chuyển cả VPS (cổng deploy, mọi ứng dụng, database, tunnel) sang máy',
+      '  mới trong vài lệnh, một lần tạm dừng chung. Hai máy chép dữ liệu',
+      '  thẳng cho nhau; không bí mật nào đi qua máy này. Trạng thái nằm ở',
+      '  %USERPROFILE%\.fcode\move\state.json; chạy lại lệnh là tiếp tục.',
+      '',
+      '#Lệnh',
+      'plan <máy mới> [--map f]@@Chỉ đọc: kiểm tra, ước tính thời gian',
+      'copy@@Cài công cụ, chép trước (chạy lại = làm mới)',
+      'cutover@@Tạm dừng, chép nốt, bật bên máy mới, chuyển tunnel',
+      'finish@@Bỏ máy cũ (hoặc huỷ lần chuyển chưa xong)',
+      'back@@Chuyển ngược lại (thêm một lần tạm dừng)',
+      'status@@Xem giai đoạn và trạng thái hai máy',
+      '',
+      '#Lưu ý',
+      '  <máy mới>: tên ssh (alias) của máy mới, root vào được từ laptop.',
+      '  cutover / back / finish hỏi gõ YES. Lỗi trước khi chuyển xong thì máy',
+      '  cũ tự chạy lại như cũ. Workflow GitHub deploy thẳng vào máy cũ qua',
+      '  SSH bị tắt cho tới khi trỏ lại.',
+      '',
+      '#Ví dụ',
+      '  fcode move plan newbox',
+      '  fcode move copy',
+      '  fcode move cutover'
+    )
     pair = @(
       '#fcode pair [tên thiết bị]',
       '  Tạo mã ghép (kèm mã QR) để ghép một iPhone mới với server FCode.',
@@ -770,8 +799,8 @@ function Show-Help([string]$Topic = '') {
       '#fcode help [lệnh]',
       '  Không có lệnh: in bảng tổng quan (cũng là fcode -h, fcode --help,',
       '  fcode /?). Có lệnh: in chi tiết của lệnh đó.',
-      '  Các lệnh có chi tiết: vao, new, sync, ipa, add, deploy, pair, phien,',
-      '  moc, help.',
+      '  Các lệnh có chi tiết: vao, new, sync, ipa, add, deploy, move, pair,',
+      '  phien, moc, help.',
       '',
       '#Cấu hình riêng của máy',
       "  $ConfigFile",
@@ -990,11 +1019,12 @@ function Test-DeployRepo([string]$r) { ($r -cmatch '\A[A-Za-z0-9_.-]+/[A-Za-z0-9
 
 # chay mot lenh tren VPS qua ssh, in tung dong ngay khi tien toi (tru khi -Quiet), tra @{ Code; Lines }.
 # $B64 (tuy chon): noi dung (base64, mot dong) gui vao stdin cua lenh tu xa
-function Invoke-DeploySsh([string]$Remote, [string]$B64, [switch]$Quiet) {
-  $dh = Get-DeployHost
+# $HostName (tuy chon): ten ssh cua may khac (fcode move); khong co thi deployHost. Cung luat ky tu nhu deployHost.
+function Invoke-DeploySsh([string]$Remote, [string]$B64, [switch]$Quiet, [string]$HostName) {
+  $dh = if ($HostName) { if ($HostName -cmatch '\A[A-Za-z0-9][A-Za-z0-9._@-]{0,99}\z') { $HostName } } else { Get-DeployHost }
   $buf = New-Object 'System.Collections.Generic.List[string]'
   $emit = { param($l) $buf.Add([string]$l); if (-not $Quiet) { if ("$l" -cmatch '\AGATE_WARN') { Write-Host $l -ForegroundColor Yellow } else { Write-Host $l } } }   # GATE_WARN = canh bao cua cong: mau vang
-  if (-not $dh) { Write-Host 'lỗi: deployHost trong file cấu hình không dùng được (chỉ chữ, số, dấu . _ @ -).'; return @{ Code = 1; Lines = @() } }
+  if (-not $dh) { Write-Host $(if ($HostName) { "lỗi: tên ssh '$($HostName -replace '[\x00-\x1f\x7f]', '?')' không dùng được (chỉ chữ, số, dấu . _ @ -)." } else { 'lỗi: deployHost trong file cấu hình không dùng được (chỉ chữ, số, dấu . _ @ -).' }); return @{ Code = 1; Lines = @() } }
   $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
   try {
     if ($B64) { $B64 | & ssh $dh $Remote | ForEach-Object { & $emit $_ } }
@@ -1231,6 +1261,1168 @@ function Invoke-Deploy {
   }
   (Invoke-DeployGate $name (@($verb) + $gateArgs) -B64 $b64).Code
 }
+
+# ============================== fcode move ==============================
+# fcode move plan <may-moi> [--map <file>] | copy | cutover | finish | back | status: move the whole VPS to a new machine.
+# The spec is docs/move/CONTRACT.md section 8 of the deploy-gate repo. The laptop conducts and its state file is the one authority;
+# the servers are reached only through `fcode-deploy-gate --move <verb>` (Invoke-DeploySsh -HostName) and a few small scripts sent on
+# stdin. Only INV / MOVE / GATE_EXIT lines are parsed and printed; no secret is ever written to disk or to the screen.
+function Get-MoveNow { [DateTime]::UtcNow }
+function Wait-Move([int]$Sec) { Start-Sleep -Seconds $Sec }
+function Format-MoveTs([DateTime]$d) { $d.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [Globalization.CultureInfo]::InvariantCulture) }
+# a state field as UTC DateTime, $null when empty (PowerShell 7 turns ISO strings into DateTime while reading JSON, 5.1 does not)
+function ConvertTo-MoveTime($v) {
+  if ($null -eq $v -or "$v" -eq '') { return $null }
+  if ($v -is [DateTime]) { return $v.ToUniversalTime() }
+  try { [DateTime]::ParseExact([string]$v, "yyyy-MM-dd'T'HH:mm:ss'Z'", [Globalization.CultureInfo]::InvariantCulture, ([Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal)) } catch { $null }
+}
+function Get-MoveDir { $d = Join-Path (Join-Path $env:USERPROFILE '.fcode') 'move'; [void][IO.Directory]::CreateDirectory($d); $d }
+function Get-MovePath([string]$Leaf) { Join-Path (Get-MoveDir) $Leaf }
+function Set-MoveProp($o, [string]$Name, $Value) { if ($o.PSObject.Properties[$Name]) { $o.$Name = $Value } else { Add-Member -InputObject $o -NotePropertyName $Name -NotePropertyValue $Value } }
+function Get-MoveSha256Hex([byte[]]$b) { ([BitConverter]::ToString(([Security.Cryptography.SHA256]::Create()).ComputeHash($b)) -replace '-', '').ToLowerInvariant() }
+# a word of a gate request (the gate allows [A-Za-z0-9 ._=:/,-]; no space in one word)
+function Test-MoveWord([string]$w) { $w -cmatch '\A[A-Za-z0-9._=:/,-]{1,100}\z' }
+# exit codes of fcode move: the gate's 0 / 65 / 69 / 70 / 75 come back unchanged, everything else (ssh 255, 1 ...) is 1
+function ConvertTo-MoveExit([int]$Code) { if ($Code -eq 0) { 0 } elseif ($Code -in 65, 69, 70, 75) { $Code } else { 1 } }
+
+# ---- the state file: %USERPROFILE%\.fcode\move\state.json, written atomically (Write-PhienText) after every step ----
+function Read-MoveState {
+  $p = Get-MovePath 'state.json'
+  if (-not [IO.File]::Exists($p)) { return $null }
+  try { $s = [IO.File]::ReadAllText($p) | ConvertFrom-Json } catch { throw "file trạng thái $p bị hỏng ($($_.Exception.Message))" }
+  if ($null -eq $s -or $s.schema -ne 1 -or -not $s.move_id -or -not $s.old -or -not $s.new -or -not $s.answers) { throw "file trạng thái $p không đúng định dạng" }
+  foreach ($f in 'cut_at', 'cut_not_before') { $t = ConvertTo-MoveTime $s.$f; Set-MoveProp $s $f $(if ($t) { Format-MoveTs $t } else { $null }) }
+  foreach ($k in 'cut', 'back', 'finish', 'finish_early') { $a = $s.answers.$k; if ($a -and $a.ts) { $t = ConvertTo-MoveTime $a.ts; $a.ts = $(if ($t) { Format-MoveTs $t } else { $null }) } }
+  $s
+}
+function Save-MoveState($S) { Write-PhienText (Get-MovePath 'state.json') (ConvertTo-Json -InputObject $S -Depth 8) }
+function New-MoveState([string]$Id, [string]$Dir, [string]$Via, $Old, $New) {
+  [pscustomobject][ordered]@{
+    schema = 1; move_id = $Id; dir = $Dir; via = $Via; old = $Old; new = $New
+    manifest_sha = ''; est_downtime_s = 0; cap_s = 1800
+    phase = 'planned'; mark = $null; cut_at = $null; cut_not_before = $null; dst_started = $false
+    answers = [pscustomobject][ordered]@{ cut = $null; back = $null; finish = $null; finish_early = $null }
+    repos = @()
+    backups = [pscustomobject][ordered]@{ ssh_config = $null; coder_ssh_config = $null; coder_known_hosts = $null }
+  }
+}
+# only one fcode move at a time: move.lock opened with no sharing; $null when another run holds it
+function Open-MoveLock { try { New-Object IO.FileStream((Get-MovePath 'move.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) } catch { $null } }
+
+# ---- lines and remote calls ----
+# "INV target moveid=x peer=y" -> @{ Words = @('INV','target'); Kv = @{ moveid = 'x'; peer = 'y' } }
+function ConvertFrom-MoveLine([string]$Line) {
+  $kv = @{}; $w = @()
+  foreach ($x in @("$Line".Trim() -split '\s+')) { $i = $x.IndexOf('='); if ($i -gt 0) { $kv[$x.Substring(0, $i)] = $x.Substring($i + 1) } else { $w += $x } }
+  @{ Words = $w; Kv = $kv }
+}
+# print only the grammar lines (INV, MOVE, GATE_*); the manifest and key payloads (b64=) are never echoed, and the server's own `INV ok` is left to the laptop
+function Write-MoveLines($Lines) {
+  foreach ($l in @($Lines)) {
+    $t = "$l"
+    if ($t -cnotmatch '\A(INV|MOVE|GATE_EXIT|GATE_ERROR|GATE_WARN)\b' -or $t -ceq 'INV ok') { continue }
+    $t = $t -replace '\b((?:pub_)?b64)=\S+', '$1=...'
+    if ($t -cmatch '\AGATE_WARN') { Write-Host $t -ForegroundColor Yellow } else { Write-Host $t }
+  }
+}
+# run a program (gh, ssh -G, ssh-keygen) and return @{ Code; Out } (stderr merged); $Stdin is piped in when given
+function Invoke-MoveTool([string]$Tool, [string[]]$ToolArgs, [string]$Stdin = $null) {
+  $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+  try {
+    $o = if ($null -ne $Stdin) { @($Stdin | & $Tool @ToolArgs 2>&1 | ForEach-Object { "$_" }) } else { @(& $Tool @ToolArgs 2>&1 | ForEach-Object { "$_" }) }
+    $code = [int]$LASTEXITCODE
+  } catch { $o = @("$($_.Exception.Message)"); $code = 1 } finally { $ErrorActionPreference = $old }
+  @{ Code = $code; Out = $o }
+}
+# the result of one ssh call: the code is the GATE_EXIT line when there is one (ssh 255 stays 255), the grammar lines are printed unless -Quiet
+function Complete-MoveResult($R, [switch]$Quiet) {
+  $code = [int]$R.Code
+  $g = @($R.Lines | Where-Object { "$_" -cmatch '\AGATE_EXIT\s+[0-9]+\s*\z' } | Select-Object -Last 1)
+  if ($code -ne 255 -and $g.Count) { $code = [int](("$($g[0])".Trim() -split '\s+')[1]) }
+  if (-not $Quiet) { Write-MoveLines $R.Lines }
+  @{ Code = $code; Lines = @($R.Lines) }
+}
+# `ssh <host> "fcode-deploy-gate --move <verb> <move_id> <args>"`; $B64 = stdin (one base64 line, decoded on the server side)
+function Invoke-MoveGate([string]$HostName, [string]$Verb, [string]$Id, [string[]]$VArgs = @(), [string]$B64 = '', [switch]$Quiet) {
+  foreach ($w in (@($Verb) + @($Id) + @($VArgs))) { if ($w -and -not (Test-MoveWord ([string]$w))) { Write-Host "lỗi: tham số '$("$w" -replace '[\x00-\x1f\x7f]', '?')' không hợp lệ."; return @{ Code = 65; Lines = @() } } }
+  $cmd = '/usr/local/sbin/fcode-deploy-gate --move ' + $Verb
+  if ($Id) { $cmd += ' ' + $Id }
+  foreach ($a in @($VArgs)) { $cmd += ' ' + $a }
+  if ($B64) { $cmd = 'base64 -di | ' + $cmd }
+  Complete-MoveResult (Invoke-DeploySsh $cmd $B64 -Quiet -HostName $HostName) -Quiet:$Quiet
+}
+# a small bash script over plain ssh (before the gate exists on the machine): the arguments travel in a `set --` line of the payload, never on the ssh command line
+function Invoke-MoveScript([string]$HostName, [string]$Script, [string[]]$ScriptArgs = @(), [switch]$Quiet) {
+  foreach ($a in @($ScriptArgs)) { if ("$a" -match '[\x00-\x1f\x7f]') { Write-Host 'lỗi: tham số của script có ký tự điều khiển.'; return @{ Code = 65; Lines = @() } } }
+  $pre = if (@($ScriptArgs).Count) { 'set -- ' + ((@($ScriptArgs) | ForEach-Object { "'" + ("$_" -replace "'", "'\''") + "'" }) -join ' ') + "`n" } else { '' }
+  $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($pre + ($Script -replace "`r`n", "`n")))   # a Windows checkout may have CRLF in the here-strings; bash needs LF
+  $remote = 'f=$(mktemp) && base64 -di >$f && bash $f </dev/null; rc=$?; rm -f $f; exit $rc'
+  Complete-MoveResult (Invoke-DeploySsh $remote $b64 -Quiet -HostName $HostName) -Quiet:$Quiet
+}
+
+# ---- the scripts sent on stdin (plain ssh, bash, root). FCM_ROOT is a test hook: a prefix for every path ----
+# preflight on dst (plan step 2): read-only, prints INV lines only
+function Get-MovePreflightScript {
+@'
+#!/bin/bash
+# fcode move: preflight (plan step 2). Read-only; prints INV lines only.
+R=${FCM_ROOT:-}
+os=unknown-0
+if [ -r "$R/etc/os-release" ]; then os=$(. "$R/etc/os-release"; echo "${ID:-unknown}-${VERSION_ID:-0}"); fi
+mem=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}'); swap=$(free -m 2>/dev/null | awk '/^Swap:/{print $2}')
+tz=$(timedatectl show -p Timezone --value 2>/dev/null); [ -n "$tz" ] || tz=$(cat "$R/etc/timezone" 2>/dev/null); [ -n "$tz" ] || tz=UTC
+nm=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null); [ -n "$nm" ] || nm=0
+echo "INV host os=$os arch=$(uname -m) cpus=$(nproc 2>/dev/null || echo 1) mem_mb=${mem:-0} swap_mb=${swap:-0} tz=${tz// /_} node_major=$nm"
+df -P -BM "${R:-/}" 2>/dev/null | awk 'NR==2 { u=$3; f=$4; sub(/M$/, "", u); sub(/M$/, "", f); print "INV disk mount=/ used_mb=" u " free_mb=" f }'
+smtp=unknown
+if command -v timeout >/dev/null 2>&1; then
+  if timeout 6 bash -c 'exec 3<>/dev/tcp/aspmx.l.google.com/25' >/dev/null 2>&1; then smtp=open; else smtp=blocked; fi
+fi
+echo "INV egress smtp=$smtp"
+mid=; peer=
+f=$R/var/lib/fcode-move/move-id
+if [ -r "$f" ]; then
+  mid=$(sed -n 's/.*"move_id":"\([0-9a-f-]*\)".*/\1/p' "$f" | head -n 1)
+  peer=$(sed -n 's/.*"peer":"\([a-z][a-z0-9-]*\)".*/\1/p' "$f" | head -n 1)
+fi
+n=$(ls "$R/etc/fcode-deploy/projects/"*.json 2>/dev/null | wc -l)
+echo "INV target moveid=${mid:--} peer=${peer:--} projects=$((n + 0))"
+for d in /root/.cloudflared /etc/cloudflared; do
+  [ -d "$R$d" ] || continue
+  find "$R$d" \( -type f -o -type l \) 2>/dev/null
+done | while IFS= read -r p; do printf '%s\n' "${p#"$R"}"; done | grep -E '^/[A-Za-z0-9._/+@=,:-]+$' | sort -u | while IFS= read -r p; do echo "INV target-file $p"; done
+for d in /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system; do
+  [ -d "$R$d" ] || continue
+  grep -lsE '^[[:space:]]*ExecStart=.*cloudflared' "$R$d"/*.service 2>/dev/null
+done | while IFS= read -r p; do basename "$p"; done | grep -E '^[A-Za-z0-9@._-]+$' | sort -u | while IFS= read -r u; do
+  if systemctl is-active --quiet "$u" 2>/dev/null; then a=yes; else a=no; fi
+  echo "INV target-unit $u active=$a"
+done
+exit 0
+'@
+}
+# can this machine open a TCP connection to $1:$2 (exit 0 = yes)? Used for `INV reach` (new -> old) and the coder -> new warning
+function Get-MoveTcpScript {
+@'
+#!/bin/bash
+# fcode move: TCP test to $1:$2 (exit 0 = reachable)
+timeout 8 bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$1" "$2" 2>/dev/null
+'@
+}
+# copy step (a), on new: tools, Node.js, the move key, old's host key. Prints `MOVE key ...` (with the PUBLIC key as base64) and nothing secret.
+function Get-MoveBootstrapKeyScript {
+@'
+#!/bin/bash
+# fcode move: bootstrap key (copy step a), on the new machine. Idempotent.
+# args: $1 = alias of this machine, $2 = known_hosts line of the old machine, $3 = Node.js major to have at least
+set -u
+umask 077
+alias=$1; known=$2; need=$3
+R=${FCM_ROOT:-}
+MV=$R/var/lib/fcode-move
+key=$R/root/.ssh/fcode-move
+nodemajor() { node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0; }
+missing=
+for t in rsync git curl flock fallocate mkfs.ext4 mountpoint mount losetup systemd-run systemctl ssh-keygen; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done
+have=$(nodemajor)
+if [ -n "$missing" ] || [ "${have:-0}" -lt "$need" ]; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -q >/dev/null 2>&1 || true
+  apt-get install -y -q rsync git curl util-linux e2fsprogs ca-certificates gnupg >/dev/null 2>&1 || { echo "MOVE error tool-missing name=apt-install"; exit 70; }
+  if [ "${have:-0}" -lt "$need" ]; then
+    install -d -m 0755 "$R/etc/apt/keyrings"
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor --yes -o "$R/etc/apt/keyrings/nodesource.gpg" || { echo "MOVE error tool-missing name=nodesource-key"; exit 70; }
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${need}.x nodistro main" > "$R/etc/apt/sources.list.d/nodesource.list"
+    apt-get update -q >/dev/null 2>&1 || true
+    apt-get install -y -q nodejs >/dev/null 2>&1 || { echo "MOVE error tool-missing name=nodejs"; exit 70; }
+  fi
+fi
+for t in rsync git curl flock fallocate mkfs.ext4 mountpoint mount losetup systemd-run systemctl ssh-keygen node; do
+  command -v "$t" >/dev/null 2>&1 || { echo "MOVE error tool-missing name=$t"; exit 70; }
+done
+mkdir -p "$MV" "$R/root/.ssh" && chmod 700 "$MV" "$R/root/.ssh" || { echo "MOVE error bad-request what=dirs"; exit 1; }
+state=exists
+if [ ! -e "$key" ]; then
+  rm -f "$key.pub"
+  ssh-keygen -q -t ed25519 -N '' -C "fcode-move-$alias" -f "$key" || { echo "MOVE error tool-missing name=ssh-keygen"; exit 70; }
+  state=created
+elif [ ! -e "$key.pub" ]; then
+  ssh-keygen -y -f "$key" > "$key.pub" || { echo "MOVE error tool-missing name=ssh-keygen"; exit 70; }
+fi
+chmod 600 "$key"
+if [ -n "$known" ] && [ "$known" != - ]; then
+  printf '%s\n' "$known" > "$MV/known_hosts.tmp" && mv -f "$MV/known_hosts.tmp" "$MV/known_hosts" || { echo "MOVE error bad-request what=known_hosts"; exit 1; }
+fi
+pub=$(cut -d' ' -f1,2 "$key.pub")
+echo "MOVE key $state name=$alias pub_b64=$(printf '%s' "$pub" | base64 -w0 | tr -d =)"
+exit 0
+'@
+}
+# copy step (d), on new: pull the gate (entry, lib, units) from old with the move key when the entry is missing; the entry comes last, so a cut-off run is redone
+function Get-MoveBootstrapGateScript {
+@'
+#!/bin/bash
+# fcode move: bootstrap gate (copy step d), on the new machine. Idempotent.
+# args: $1 = old address, $2 = old ssh port, $3 = gate entry file, $4 = gate lib dir, $5... = gate unit files
+set -u
+umask 022
+addr=$1; port=$2; entry=$3; lib=$4; shift 4
+R=${FCM_ROOT:-}
+MV=$R/var/lib/fcode-move
+if [ -e "$R$entry" ]; then echo "MOVE step bootstrap-gate skipped=yes"; exit 0; fi
+ssh="ssh -i $R/root/.ssh/fcode-move -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$MV/known_hosts -p $port"
+pull() { mkdir -p "$(dirname "$R$2")" && rsync -aHAX -e "$ssh" "root@$ra:$1" "$R$2"; }
+ra=$addr; case $addr in *:*) ra="[$addr]" ;; esac   # an IPv6 address needs brackets in an rsync source
+mkdir -p "$R$lib" && rsync -aHAX -e "$ssh" "root@$ra:$lib/" "$R$lib/" || { echo "MOVE error rsync-failed what=lib"; exit 1; }
+for u in "$@"; do pull "$u" "$u" || { echo "MOVE error rsync-failed what=units"; exit 1; }; done
+pull "$entry" "$entry" || { echo "MOVE error rsync-failed what=entry"; exit 1; }
+systemctl daemon-reload 2>/dev/null
+echo "MOVE step bootstrap-gate skipped=no"
+exit 0
+'@
+}
+# post-cut chore (c), on the coder box: print its ssh config (base64) so the laptop can rewrite it
+function Get-MoveCoderReadScript {
+@'
+#!/bin/bash
+# fcode move: coder ssh config (read)
+f=$HOME/.ssh/config
+if [ -r "$f" ]; then echo "MOVE coder-config exists=yes b64=$(base64 -w0 "$f")"; else echo "MOVE coder-config exists=no b64="; fi
+'@
+}
+# post-cut chore (c), on the coder box: $1 = the new ssh config (base64, or - = unchanged), $2 = safety-copy tag, $3 = known_hosts line to add (or -)
+function Get-MoveCoderWriteScript {
+@'
+#!/bin/bash
+# fcode move: coder ssh config (write). The safety copies are written only when absent and never restored by code.
+set -u
+umask 077
+d=$HOME/.ssh; mkdir -p "$d" && chmod 700 "$d"
+if [ "$1" != - ]; then
+  cfg=$d/config; bak=$d/config.fcode-move.$2.bak
+  new=$(mktemp "$d/.fcode-move.XXXXXX") || exit 1
+  printf '%s' "$1" | base64 -d > "$new" || { rm -f "$new"; exit 1; }
+  if [ -e "$cfg" ] && [ ! -e "$bak" ]; then cp -a "$cfg" "$bak" || { rm -f "$new"; exit 1; }; fi
+  mv -f "$new" "$cfg" && chmod 600 "$cfg" || exit 1
+fi
+if [ "$3" != - ]; then
+  kh=$d/known_hosts; kbak=$d/known_hosts.fcode-move.$2.bak
+  touch "$kh"
+  if ! grep -qxF -- "$3" "$kh"; then
+    [ -e "$kbak" ] || cp -a "$kh" "$kbak" || exit 1
+    printf '%s\n' "$3" >> "$kh" || exit 1
+  fi
+fi
+echo "MOVE alias coder done"
+'@
+}
+
+# ---- ssh facts of an alias, host keys ----
+# `ssh -G <alias>`: @{ Addr; Port; Proxy; HostKeyAlias }, $null when ssh cannot resolve it
+function Get-MoveSshInfo([string]$Alias) {
+  $r = Invoke-MoveTool 'ssh' @('-G', $Alias)
+  if ($r.Code -ne 0) { return $null }
+  $h = @{}
+  foreach ($l in $r.Out) { if ($l -match '\A(\S+)\s+(.*)\z') { $k = $Matches[1].ToLowerInvariant(); if (-not $h.ContainsKey($k)) { $h[$k] = $Matches[2].Trim() } } }
+  if (-not $h.ContainsKey('hostname')) { return $null }
+  $px = [bool](($h['proxycommand'] -and $h['proxycommand'] -ne 'none') -or ($h['proxyjump'] -and $h['proxyjump'] -ne 'none'))
+  @{ Addr = [string]$h['hostname']; Port = $(if ("$($h['port'])" -match '\A[0-9]+\z') { [int]$h['port'] } else { 22 }); Proxy = $px; HostKeyAlias = [string]$h['hostkeyalias'] }
+}
+# a machine behind a ProxyCommand / ProxyJump, or at a private, CGNAT (100.64/10), link-local, .local or .lan address, is `home`
+function Test-MoveHome($Info) {
+  if ($Info.Proxy) { return $true }
+  $a = [string]$Info.Addr
+  if ($a -match '(?i)\.(local|lan)\z') { return $true }
+  $ip = $null
+  if ([Net.IPAddress]::TryParse($a, [ref]$ip)) {
+    if ($ip.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) {
+      $b = $ip.GetAddressBytes()
+      return [bool]($b[0] -eq 10 -or $b[0] -eq 127 -or ($b[0] -eq 172 -and $b[1] -ge 16 -and $b[1] -le 31) -or ($b[0] -eq 192 -and $b[1] -eq 168) -or ($b[0] -eq 100 -and $b[1] -ge 64 -and $b[1] -le 127) -or ($b[0] -eq 169 -and $b[1] -eq 254))
+    }
+    return [bool]($a -match '(?i)\A(fe80:|f[cd][0-9a-f]{2}:|::1\z)')
+  }
+  $false
+}
+# the laptop's verified known_hosts entry of a machine: @{ Line = '<addr> <type> <key>' ([addr]:port when the port is not 22); Fp = 'SHA256:..' }, $null when there is none
+function Get-MoveHostKey($Info) {
+  $spec = if ($Info.Port -ne 22) { "[$($Info.Addr)]:$($Info.Port)" } else { [string]$Info.Addr }
+  $names = @($spec); if ($Info.HostKeyAlias -and $Info.HostKeyAlias -cne $spec) { $names += $Info.HostKeyAlias }
+  $best = $null
+  foreach ($n in $names) {
+    $r = Invoke-MoveTool 'ssh-keygen' @('-F', $n)
+    if ($r.Code -ne 0) { continue }
+    foreach ($l in $r.Out) {
+      if ("$l" -match '\A#' -or -not ("$l" -match '\A\S+\s+(\S+)\s+([A-Za-z0-9+/=]+)')) { continue }
+      $type = $Matches[1]; $key = $Matches[2]
+      try { $kb = [Convert]::FromBase64String($key) } catch { continue }
+      if (-not $best -or ($type -ceq 'ssh-ed25519' -and $best.Type -cne 'ssh-ed25519')) { $best = @{ Type = $type; Key = $key; Kb = $kb } }
+    }
+    if ($best) { break }
+  }
+  if (-not $best) { return $null }
+  @{ Line = "$spec $($best.Type) $($best.Key)"; Fp = 'SHA256:' + [Convert]::ToBase64String(([Security.Cryptography.SHA256]::Create()).ComputeHash($best.Kb)).TrimEnd('=') }
+}
+
+# ---- the laptop's and the coder's ssh config, rewritten by content ----
+function Get-MoveSshConfigPath { Join-Path (Join-Path $env:USERPROFILE '.ssh') 'config' }
+function Get-MoveKnownHostsPath { Join-Path (Join-Path $env:USERPROFILE '.ssh') 'known_hosts' }
+# blocks of an ssh config as lines: @{ Start; End (exclusive); IsHost; Names } for every Host / Match line
+function Get-MoveHostBlocks($Lines) {
+  $b = @(); $cur = $null
+  for ($i = 0; $i -lt $Lines.Count; $i++) {
+    if ($Lines[$i] -match '^\s*(Host|Match)(?:\s*=\s*|\s+)(.*?)\s*$') {
+      $isHost = ($Matches[1] -ieq 'Host'); $rest = $Matches[2]
+      if ($cur) { $cur.End = $i; $b += $cur }
+      $cur = @{ Start = $i; End = $Lines.Count; IsHost = $isHost; Names = $(if ($isHost) { @($rest -split '\s+' | Where-Object { $_ }) } else { @() }) }
+    }
+  }
+  if ($cur) { $b += $cur }
+  , $b
+}
+function Find-MoveHostBlock($Lines, [string]$Name) {
+  foreach ($b in (Get-MoveHostBlocks $Lines)) { if ($b.IsHost -and @($b.Names | Where-Object { $_ -ieq $Name }).Count) { return $b } }
+  $null
+}
+# the directive lines of a block: First..Last (the trailing blank and comment lines belong to what follows); Last < First when empty
+function Get-MoveBlockBody($Lines, $B) {
+  $last = $B.End - 1
+  while ($last -gt $B.Start -and ($Lines[$last].Trim() -eq '' -or $Lines[$last].TrimStart().StartsWith('#'))) { $last-- }
+  @{ First = $B.Start + 1; Last = $last }
+}
+# the directives of the laptop's `Host <new>` block, with a HostName always present (the rewritten alias must not fall back to its own name)
+function Get-MoveNewDirectives([string]$Text, [string]$New, [string]$NewAddr) {
+  $lines = @($Text -split '\r?\n')
+  $b = Find-MoveHostBlock $lines $New
+  if (-not $b) { return @{ Err = "không thấy khối 'Host $New' trong ~/.ssh/config của máy này"; Lines = @() } }
+  $body = Get-MoveBlockBody $lines $b
+  $d = @(if ($body.Last -ge $body.First) { $lines[$body.First..$body.Last] })
+  if (-not @($d | Where-Object { $_ -match '^\s*HostName(\s|=)' }).Count) {
+    $ind = '  '; foreach ($x in $d) { if ($x -match '^(\s+)\S') { $ind = $Matches[1]; break } }
+    $d = @($ind + 'HostName ' + $NewAddr) + $d
+  }
+  @{ Err = ''; Lines = $d }
+}
+# forward: `Host <old>` -> the directives of `Host <new>` + HostKeyAlias <new>; the original goes to `Host <old>-old`. Skipped when `Host <old>-old` exists.
+# $Coder: the coder's own block keeps its other directives (IdentityFile ...); only HostName / Port / ProxyCommand / ProxyJump come from the laptop's new block.
+function Convert-MoveSshFwd([string]$Text, [string]$Old, [string[]]$NewLines, [string]$NewAlias, [bool]$Coder) {
+  $nl = if ($Text -match "`r`n") { "`r`n" } else { "`n" }
+  $lines = @($Text -split '\r?\n')
+  if (Find-MoveHostBlock $lines "$Old-old") { return @{ Text = $Text; Changed = $false; Why = 'old-exists' } }
+  $b = Find-MoveHostBlock $lines $Old
+  if (-not $b) { return @{ Text = $Text; Changed = $false; Why = 'no-block' } }
+  if (@($b.Names).Count -ne 1) { return @{ Text = $Text; Changed = $false; Why = 'shared-block' } }
+  $body = Get-MoveBlockBody $lines $b
+  $oldDir = @(if ($body.Last -ge $body.First) { $lines[$body.First..$body.Last] })
+  $ind = '  '; foreach ($x in (@($NewLines) + $oldDir)) { if ($x -match '^(\s+)\S') { $ind = $Matches[1]; break } }
+  if ($Coder) {
+    $newDir = @($NewLines | Where-Object { $_ -match '^\s*(HostName|Port|ProxyCommand|ProxyJump)(\s|=)' }) + @($oldDir | Where-Object { $_ -notmatch '^\s*(HostName|Port|ProxyCommand|ProxyJump|HostKeyAlias)(\s|=)' })
+  } else { $newDir = @($NewLines | Where-Object { $_ -notmatch '^\s*HostKeyAlias(\s|=)' }) }
+  $newDir += ($ind + 'HostKeyAlias ' + $NewAlias)
+  $out = @()
+  if ($b.Start -gt 0) { $out += $lines[0..($b.Start - 1)] }
+  $out += "Host $Old"; $out += $newDir; $out += ''; $out += "Host $Old-old"; $out += $oldDir
+  if ($body.Last + 1 -le $lines.Count - 1) { $out += $lines[($body.Last + 1)..($lines.Count - 1)] }
+  @{ Text = ($out -join $nl); Changed = $true; Why = 'ok' }
+}
+# reverse (a `back` that ends on old), by content: `Host <old>` is rebuilt from `Host <old>-old`, which is removed; nothing else changes. Skipped without a -old block.
+function Convert-MoveSshBack([string]$Text, [string]$Old) {
+  $nl = if ($Text -match "`r`n") { "`r`n" } else { "`n" }
+  $lines = @($Text -split '\r?\n')
+  $ob = Find-MoveHostBlock $lines "$Old-old"
+  if (-not $ob) { return @{ Text = $Text; Changed = $false; Why = 'no-old-block' } }
+  $cur = Find-MoveHostBlock $lines $Old
+  if (@($ob.Names).Count -ne 1 -or ($cur -and @($cur.Names).Count -ne 1)) { return @{ Text = $Text; Changed = $false; Why = 'shared-block' } }
+  if (-not $cur) { $lines[$ob.Start] = "Host $Old"; return @{ Text = ($lines -join $nl); Changed = $true; Why = 'ok' } }
+  $obody = Get-MoveBlockBody $lines $ob
+  $oldDir = @(if ($obody.Last -ge $obody.First) { $lines[$obody.First..$obody.Last] })
+  $cb = Get-MoveBlockBody $lines $cur
+  $rmFrom = $ob.Start; if ($rmFrom -gt 0 -and $lines[$rmFrom - 1].Trim() -eq '') { $rmFrom-- }
+  $out = New-Object 'System.Collections.Generic.List[string]'
+  for ($i = 0; $i -lt $lines.Count; $i++) {
+    if ($i -ge $rmFrom -and $i -le $obody.Last) { continue }
+    if ($i -eq $cb.First) { foreach ($d in $oldDir) { $out.Add([string]$d) } }
+    if ($i -ge $cb.First -and $i -le $cb.Last) { continue }
+    $out.Add([string]$lines[$i])
+  }
+  @{ Text = ($out -join $nl); Changed = $true; Why = 'ok' }
+}
+# Reach-Old: the alias every laptop ssh to the OLD machine uses = `<old>-old` while that Host block exists, else `<old>`. Derived at every call, never stored.
+function Get-MoveReachOld([string]$OldAlias) {
+  try {
+    $p = Get-MoveSshConfigPath
+    if ([IO.File]::Exists($p) -and (Find-MoveHostBlock @([IO.File]::ReadAllText($p) -split '\r?\n') "$OldAlias-old")) { return "$OldAlias-old" }
+  } catch { }
+  $OldAlias
+}
+# append a known_hosts line unless it is already there (by content); $true when written
+function Add-MoveKnownHost([string]$Path, [string]$Line) {
+  $t = if ([IO.File]::Exists($Path)) { [IO.File]::ReadAllText($Path) } else { '' }
+  foreach ($l in @($t -split '\r?\n')) { if ($l.Trim() -ceq $Line) { return $false } }
+  $nl = if ($t -match "`r`n") { "`r`n" } else { "`n" }
+  if ($t -and -not $t.EndsWith("`n")) { $t += $nl }
+  Write-PhienText $Path ($t + $Line + $nl)
+  $true
+}
+# `<new alias> <type> <key>`: the known_hosts name that `HostKeyAlias <new alias>` looks up
+function Get-MoveAliasKnownLine($Machine) {
+  $f = @("$($Machine.hostkey_line)" -split '\s+')
+  if ($f.Count -ge 3) { "$($Machine.alias) $($f[1]) $($f[2])" } else { '' }
+}
+# post-cut chore (b): the laptop's alias follows the move. Returns 0 or 1 (printed).
+function Set-MoveLaptopAlias($S) {
+  $cfg = Get-MoveSshConfigPath
+  $text = if ([IO.File]::Exists($cfg)) { [IO.File]::ReadAllText($cfg) } else { '' }
+  $old = [string]$S.old.alias
+  if ([string]$S.dir -ceq 'fwd') {
+    $nd = Get-MoveNewDirectives $text ([string]$S.new.alias) ([string]$S.new.addr)
+    if ($nd.Err) { Write-Host "lỗi: $($nd.Err)"; return 1 }
+    $r = Convert-MoveSshFwd $text $old $nd.Lines ([string]$S.new.alias) $false
+    if ($r.Why -ceq 'old-exists') { Write-Host "ssh config của máy này: đã có 'Host $old-old', giữ nguyên."; return 0 }
+    if ($r.Why -ceq 'no-block') { Write-Host "lỗi: ~/.ssh/config của máy này không có khối 'Host $old' để chuyển sang máy mới (nó có nằm trong file Include không?)."; return 1 }
+    if ($r.Why -ceq 'shared-block') { Write-Host "lỗi: khối 'Host $old' dùng chung dòng Host với tên khác; tách riêng ra rồi chạy lại cutover."; return 1 }
+    $kh = Get-MoveAliasKnownLine $S.new
+    if ($kh) { [void](Add-MoveKnownHost (Get-MoveKnownHostsPath) $kh) }
+    $bak = Get-MovePath ('ssh_config.' + $S.move_id + '.bak')
+    if ([IO.File]::Exists($cfg) -and -not [IO.File]::Exists($bak)) { [IO.File]::Copy($cfg, $bak) }
+    Set-MoveProp $S.backups 'ssh_config' $bak
+    Write-PhienText $cfg $r.Text
+    Save-MoveState $S
+    Write-Host "ssh config của máy này: 'Host $old' giờ vào máy mới; máy cũ là 'Host $old-old'."
+    return 0
+  }
+  $r = Convert-MoveSshBack $text $old
+  if ($r.Why -ceq 'shared-block') { Write-Host "lỗi: khối 'Host $old' hoặc '$old-old' dùng chung dòng Host với tên khác; tách riêng ra rồi chạy lại cutover."; return 1 }
+  if (-not $r.Changed) { Write-Host "ssh config của máy này: không có 'Host $old-old', giữ nguyên."; return 0 }
+  Write-PhienText $cfg $r.Text
+  Write-Host "ssh config của máy này: 'Host $old' lại vào máy cũ; khối '$old-old' đã bỏ."
+  0
+}
+function Invoke-MoveBox([string]$Script, [string[]]$ScriptArgs = @()) {
+  $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+  try { $o = @(Invoke-BoxScript ($Script -replace "`r`n", "`n") $ScriptArgs 2>&1 | ForEach-Object { "$_" }); $code = [int]$LASTEXITCODE } catch { $o = @("$($_.Exception.Message)"); $code = 1 } finally { $ErrorActionPreference = $old }
+  @{ Code = $code; Lines = $o }
+}
+# post-cut chore (c): the same rewrite in the coder box's ~/.ssh/config through Invoke-BoxScript. An unreachable coder is a warning, never a failure. Returns 0 or 1.
+function Set-MoveCoderAlias($S) {
+  $rd = Invoke-MoveBox (Get-MoveCoderReadScript) @()
+  $hit = @($rd.Lines | Where-Object { "$_" -cmatch '\AMOVE coder-config exists=(yes|no) b64=' } | Select-Object -First 1)
+  if ($rd.Code -ne 0 -or -not $hit.Count) { Write-Host 'INV warn coder-unreachable'; return 0 }
+  $b64 = ("$($hit[0])" -replace '\A.*\bb64=', '').Trim()
+  try { $ctext = if ($b64) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64)) } else { '' } } catch { Write-Host 'INV warn coder-unreachable'; return 0 }
+  $old = [string]$S.old.alias; $newCfg = '-'; $kh = '-'
+  if ([string]$S.dir -ceq 'fwd') {
+    $lt = if ([IO.File]::Exists((Get-MoveSshConfigPath))) { [IO.File]::ReadAllText((Get-MoveSshConfigPath)) } else { '' }
+    $nd = Get-MoveNewDirectives $lt ([string]$S.new.alias) ([string]$S.new.addr)
+    if ($nd.Err) { Write-Host "lỗi: $($nd.Err)"; return 1 }
+    $r = Convert-MoveSshFwd $ctext $old $nd.Lines ([string]$S.new.alias) $true
+    if ($r.Why -ceq 'no-block') { Write-Host "coder: ~/.ssh/config không có khối 'Host $old', không đổi gì ở đó."; return 0 }
+    if ($r.Why -ceq 'shared-block') { Write-Host "lỗi: coder: khối 'Host $old' dùng chung dòng Host với tên khác; tách riêng ra rồi chạy lại cutover."; return 1 }
+    if ($r.Changed) { $newCfg = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($r.Text)) }
+    $l = Get-MoveAliasKnownLine $S.new; if ($l) { $kh = $l }
+  } else {
+    $r = Convert-MoveSshBack $ctext $old
+    if ($r.Why -ceq 'shared-block') { Write-Host "lỗi: coder: khối 'Host $old' hoặc '$old-old' dùng chung dòng Host với tên khác."; return 1 }
+    if ($r.Changed) { $newCfg = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($r.Text)) }
+  }
+  if ($newCfg -ceq '-' -and $kh -ceq '-') { Write-Host 'coder: ssh config đã đúng, giữ nguyên.'; return 0 }
+  $w = Invoke-MoveBox (Get-MoveCoderWriteScript) @($newCfg, [string]$S.move_id, $kh)
+  if ($w.Code -ne 0) { Write-Host "lỗi: coder: không ghi được ssh config (mã $($w.Code)). Chạy lại cutover."; return 1 }
+  if ($newCfg -cne '-' -and [string]$S.dir -ceq 'fwd') { Set-MoveProp $S.backups 'coder_ssh_config' ('~/.ssh/config.fcode-move.' + $S.move_id + '.bak') }
+  if ($kh -cne '-') { Set-MoveProp $S.backups 'coder_known_hosts' ('~/.ssh/known_hosts.fcode-move.' + $S.move_id + '.bak') }
+  Save-MoveState $S
+  Write-Host 'coder: ssh config đã cập nhật.'
+  0
+}
+
+# ---- the manifest the laptop keeps, preflight facts, the laptop refusals of plan step (6) ----
+# `manifest <id>` on a machine: @{ Code; Text; Sha; Obj }; the sha256 of the bytes must equal the line the server prints
+function Get-MoveRemoteManifest([string]$HostName, [string]$Id) {
+  $r = Invoke-MoveGate $HostName 'manifest' $Id
+  if ($r.Code -ne 0) { return @{ Code = $r.Code } }
+  $b64 = ''; $sha = ''
+  foreach ($l in $r.Lines) {
+    if ("$l" -match '\AMOVE manifest b64=(\S+)\s*\z') { $b64 = $Matches[1] }
+    elseif ("$l" -match '\AMOVE manifest-sha ([0-9a-f]{64})\s*\z') { $sha = $Matches[1] }
+  }
+  if (-not $b64 -or -not $sha) { Write-Host 'lỗi: máy không trả manifest (thiếu dòng MOVE manifest).'; return @{ Code = 1 } }
+  while ($b64.Length % 4) { $b64 += '=' }
+  try { $bytes = [Convert]::FromBase64String($b64) } catch { Write-Host 'lỗi: manifest không giải mã được.'; return @{ Code = 1 } }
+  if ($bytes.Length -gt 1048576 -or (Get-MoveSha256Hex $bytes) -cne $sha) { Write-Host 'lỗi: manifest nhận về không khớp sha256 của máy gửi.'; return @{ Code = 1 } }
+  $text = [Text.Encoding]::UTF8.GetString($bytes)
+  try { $obj = ConvertFrom-Json $text } catch { Write-Host 'lỗi: manifest không phải JSON.'; return @{ Code = 1 } }
+  if ($obj.schema -ne 1 -or "$($obj.move_id)" -cne $Id) { Write-Host 'lỗi: manifest của lần chuyển khác.'; return @{ Code = 1 } }
+  @{ Code = 0; Text = $text; Sha = $sha; Obj = $obj }
+}
+function Save-MoveManifest([string]$Text) { Write-PhienText (Get-MovePath 'manifest.json') $Text }
+# the saved manifest: @{ Text; Sha; Obj } or $null
+function Read-MoveManifestFile {
+  $p = Get-MovePath 'manifest.json'
+  if (-not [IO.File]::Exists($p)) { return $null }
+  try { $b = [IO.File]::ReadAllBytes($p); $t = [Text.Encoding]::UTF8.GetString($b); @{ Text = $t; Sha = (Get-MoveSha256Hex $b); Obj = (ConvertFrom-Json $t) } } catch { $null }
+}
+# the INV lines of the preflight script
+function ConvertFrom-MovePreflight($Lines) {
+  $f = @{ HasHost = $false; Arch = ''; Os = ''; FreeMb = -1.0; MoveId = '-'; Peer = '-'; Projects = 0; Files = @(); Units = @(); Smtp = 'unknown' }
+  foreach ($l in @($Lines)) {
+    if ("$l" -cnotmatch '\AINV ') { continue }
+    $p = ConvertFrom-MoveLine "$l"; $w = $p.Words; $k = $p.Kv
+    if ($w.Count -lt 2) { continue }
+    switch -CaseSensitive ($w[1]) {
+      'host' { $f.HasHost = $true; $f.Arch = [string]$k['arch']; $f.Os = [string]$k['os'] }
+      'disk' { if ($k['mount'] -ceq '/' -and "$($k['free_mb'])" -match '\A[0-9]+\z') { $f.FreeMb = [double]$k['free_mb'] } }
+      'egress' { $f.Smtp = [string]$k['smtp'] }
+      'target' { $f.MoveId = [string]$k['moveid']; $f.Peer = [string]$k['peer']; if ("$($k['projects'])" -match '\A[0-9]+\z') { $f.Projects = [int]$k['projects'] } }
+      'target-file' { if ($w.Count -ge 3) { $f.Files += $w[2] } }
+      'target-unit' { if ($w.Count -ge 3) { $f.Units += $w[2] } }
+    }
+  }
+  $f
+}
+# free MB of `/` in the `INV disk` lines of a plan on src, -1 when there is none
+function Get-MoveDiskFree($Lines) {
+  foreach ($l in @($Lines)) {
+    if ("$l" -cmatch '\AINV disk ') { $p = ConvertFrom-MoveLine "$l"; if ($p.Kv['mount'] -ceq '/' -and "$($p.Kv['free_mb'])" -match '\A[0-9]+\z') { return [double]$p.Kv['free_mb'] } }
+  }
+  -1.0
+}
+function Get-MoveOsKey([string]$Os) { $p = @("$Os" -split '-', 2); $mj = (@("$($p[1])" -split '\.'))[0]; "$($p[0])-$mj" }
+# the refusals of plan step (6) as `INV refuse ...` lines. $M = manifest, $D = preflight facts of dst, $SrcFree = src `/` free MB, $Repos = state repos.
+# `target-not-empty` and `target-access-path` are not checked in a `back` run ($Back).
+function Get-MoveRefusals($M, $D, [double]$SrcFree, [bool]$ReachOk, $Repos, [string]$OldAlias, [bool]$Back, [bool]$DstHome) {
+  $r = New-Object 'System.Collections.Generic.List[string]'
+  $sumAll = 0.0; $db = 0.0
+  foreach ($it in @($M.items)) {
+    $sz = [double]$it.size_mb; $sumAll += $sz
+    if ((@('pgdb', 'pgroles') -ccontains [string]$it.kind) -or ([string]$it.kind -ceq 'image' -and $it.meta.local -eq $true)) { $db += $sz }
+  }
+  if ([string]$M.host.arch -cne $D.Arch) { $r.Add("INV refuse arch src=$($M.host.arch) dst=$($D.Arch)") }
+  if ((Get-MoveOsKey ([string]$M.host.os)) -cne (Get-MoveOsKey $D.Os)) { $r.Add("INV refuse os src=$($M.host.os) dst=$($D.Os)") }
+  $foreign = ($D.MoveId -ceq '-' -or $D.Peer -cne $OldAlias)
+  # dst already holds this peer's copy (a re-plan after copy) or is old in a back run (it still holds everything): only the dump space is still needed
+  $needDst = $(if ($Back -or -not $foreign) { 2 * $db + 4096 } else { [Math]::Ceiling(1.2 * $sumAll) + 2 * $db + 4096 })
+  if ($D.FreeMb -lt 0 -or $D.FreeMb -lt $needDst) { $r.Add("INV refuse disk side=dst need_mb=$([int64]$needDst) free_mb=$(if ($D.FreeMb -lt 0) { 'unknown' } else { [int64]$D.FreeMb })") }
+  $needSrc = $db + 4096
+  if ($SrcFree -lt 0 -or $SrcFree -lt $needSrc) { $r.Add("INV refuse disk side=src need_mb=$([int64]$needSrc) free_mb=$(if ($SrcFree -lt 0) { 'unknown' } else { [int64]$SrcFree })") }
+  if (-not $Back -and $D.Projects -gt 0 -and $foreign) { $r.Add("INV refuse target-not-empty projects=$($D.Projects)") }
+  if (-not $Back -and $foreign) {
+    $seen = @{}
+    foreach ($it in @($M.items)) {
+      if ([string]$it.kind -ceq 'tunnel') { foreach ($root in @($it.roots)) { if (@($D.Files) -ccontains [string]$root -and -not $seen["file=$root"]) { $seen["file=$root"] = $true; $r.Add("INV refuse target-access-path file=$root") } } }
+      foreach ($u in @($it.meta.connector_units)) { if ($u -and @($D.Units) -ccontains [string]$u -and -not $seen["unit=$u"]) { $seen["unit=$u"] = $true; $r.Add("INV refuse target-access-path unit=$u") } }
+    }
+  }
+  if ($DstHome) { foreach ($a in @(@($Repos | Where-Object { $_.kind -ceq 'gate-push' } | ForEach-Object { [string]$_.app }) | Select-Object -Unique)) { $r.Add("INV refuse push-deploy-unreachable app=$a") } }
+  if (-not $ReachOk) { $r.Add('INV refuse old-unreachable') }
+  $r.ToArray()
+}
+# plan step (5): push deploys of every app with a repo. @{ Code; Repos = @(state entries); Lines = @(INV lines) }; Code 1 = gh could not tell (nothing is registered)
+function Get-MovePushScan($Apps, [string]$OldAddr) {
+  $repos = @(); $lines = @()
+  foreach ($a in @($Apps)) {
+    $repo = [string]$a.repo; $app = [string]$a.name
+    if (-not $repo) { continue }
+    if (-not (Test-DeployRepo $repo)) { Write-Host "lỗi: repo '$repo' của app $app không đúng dạng chủ/repo."; return @{ Code = 1 } }
+    $sec = Invoke-MoveTool 'gh' @('secret', 'list', '-R', $repo)
+    if ($sec.Code -ne 0) { Write-Host "lỗi: gh không đọc được tên secret của $repo (mã $($sec.Code)); chưa xác nhận được push deploy. Chạy gh auth login rồi plan lại."; return @{ Code = 1 } }
+    $secNames = @($sec.Out | ForEach-Object { @("$_" -split '\s+')[0] } | Where-Object { $_ })
+    $ls = Invoke-MoveTool 'gh' @('api', "repos/$repo/contents/.github/workflows")
+    $files = @()
+    if ($ls.Code -eq 0) {
+      try { $j = ConvertFrom-Json ($ls.Out -join "`n"); $files = @(foreach ($e in @($j)) { [string]$e.name }) | Where-Object { $_ -cmatch '\A[A-Za-z0-9._-]+\.ya?ml\z' } } catch { Write-Host "lỗi: gh trả danh sách workflow của $repo không đọc được."; return @{ Code = 1 } }
+    } elseif (($ls.Out -join ' ') -notmatch '404|Not Found') { Write-Host "lỗi: gh không đọc được workflow của $repo (mã $($ls.Code))."; return @{ Code = 1 } }
+    $states = @{}
+    if (@($files).Count) {
+      $wl = Invoke-MoveTool 'gh' @('workflow', 'list', '-R', $repo, '--all', '--json', 'path,state')
+      if ($wl.Code -ne 0) { Write-Host "lỗi: gh không đọc được trạng thái workflow của $repo (mã $($wl.Code))."; return @{ Code = 1 } }
+      try { $wj = ConvertFrom-Json ($wl.Out -join "`n"); foreach ($e in @($wj)) { $states[[string]$e.path] = [string]$e.state } } catch { Write-Host "lỗi: gh trả trạng thái workflow của $repo không đọc được."; return @{ Code = 1 } }   # foreach over $wj: Windows PowerShell 5.1 gives a JSON array as ONE object
+    }
+    $found = 0
+    foreach ($f in @($files)) {
+      $tx = Invoke-MoveTool 'gh' @('api', "repos/$repo/contents/.github/workflows/$f", '-H', 'Accept: application/vnd.github.raw')
+      if ($tx.Code -ne 0) { Write-Host "lỗi: gh không đọc được workflow $f của $repo (mã $($tx.Code))."; return @{ Code = 1 } }
+      $t = $tx.Out -join "`n"
+      $kind = ''
+      if ($t -match 'secrets\.DEPLOY_KNOWN_HOSTS\b') { $kind = 'gate-push' }
+      elseif ($t -match 'secrets\.(VPS_HOST|VPS_SSH_KEY|SSH_PRIVATE_KEY|DEPLOY_SSH_KEY)\b' -or ($OldAddr -and $t.Contains($OldAddr))) { $kind = 'ssh-push' }
+      if (-not $kind) { continue }
+      $found++
+      $st = $states[".github/workflows/$f"]
+      $repos += [pscustomobject][ordered]@{ repo = $repo; app = $app; kind = $kind; workflow = $f; enabled = $(if ($st) { $st -ceq 'active' } else { $true }) }
+      $lines += "INV push $repo app=$app kind=$kind workflow=$f"
+      if ($kind -ceq 'ssh-push') { $lines += "INV warn ssh-push repo=$repo app=$app workflow=$f" }
+    }
+    if (-not $found -and @($secNames | Where-Object { $_ -cmatch '\A(VPS_HOST|VPS_SSH_KEY|SSH_PRIVATE_KEY|DEPLOY_SSH_KEY|DEPLOY_KNOWN_HOSTS)\z' }).Count) { $lines += "INV warn ssh-push repo=$repo app=$app unverified" }
+  }
+  @{ Code = 0; Repos = $repos; Lines = $lines }
+}
+
+
+# ---- questions (DESIGN.md section 1, verbatim). The agent asks in chat; the CLI also needs the typed word YES, as `deploy add` does ----
+function Get-MoveMinutes($S) { [int][Math]::Max(1, [Math]::Ceiling([double]$S.est_downtime_s / 60)) }
+function Get-MoveQuestion([string]$Kind, $S) {
+  $n = Get-MoveMinutes $S
+  switch -CaseSensitive ($Kind) {
+    'cut' { "Chuyển tất cả ứng dụng sang máy mới bây giờ? Mọi ứng dụng sẽ cùng tạm dừng một lần, khoảng $n phút. Nếu có lỗi trước khi chuyển xong, máy cũ tự chạy lại như cũ. Các workflow GitHub deploy thẳng vào máy cũ qua SSH sẽ bị tắt. (Có/Không)" }
+    'back' {
+      if ([string]$S.dir -ceq 'back') { "Quay lại máy cũ? Dữ liệu ghi ở máy mới sẽ được chép ngược về máy cũ; mọi ứng dụng cùng tạm dừng một lần, khoảng $n phút. (Có/Không)" }
+      else { "Chuyển lại sang máy mới? Dữ liệu ghi ở máy cũ sẽ được chép sang máy mới; mọi ứng dụng cùng tạm dừng một lần, khoảng $n phút. (Có/Không)" }
+    }
+    'finish' { 'Máy cũ có thể bỏ được chưa? Lệnh sẽ tắt hẳn ứng dụng trên máy cũ và xoá khoá chuyển máy. Sau bước này KHÔNG quay lại được nữa. Huỷ gói VPS cũ ở trang Contabo do bạn tự làm. (Có/Không)' }
+    'finish-early' { 'Mới chuyển chưa đủ 72 giờ. Vẫn bỏ máy cũ ngay? (Có/Không)' }
+    'abandon' {
+      $running = if ([string]$S.dir -ceq 'fwd') { [string]$S.old.alias } else { [string]$S.new.alias }
+      "Huỷ lần chuyển này? Ứng dụng vẫn chạy ở máy $running; khoá chuyển máy và file tạm bị xoá. Máy mới vẫn giữ bản sao dữ liệu và mật khẩu của các ứng dụng (đã tắt). Nếu không dùng máy mới nữa, hãy xoá hoặc cài lại máy đó. (Có/Không)"
+    }
+  }
+}
+function Confirm-MoveYes([string]$Question) {
+  Write-Host ''
+  Write-Host $Question
+  $ans = Read-SyncLine 'Gõ YES để đồng ý (chữ khác = huỷ): '
+  [bool]($null -ne $ans -and $ans.Trim() -ceq 'YES')
+}
+function New-MoveAnswer { [pscustomobject][ordered]@{ a = 'yes'; ts = (Format-MoveTs (Get-MoveNow)) } }
+
+# ---- the re-run table (CONTRACT section 8): what a command does in the phase / mark of the state ----
+# @{ Do = refuse | plan-new | replan | copy | cutover | cutover-resume | rollback-finish | chores | finish | abandon | done | back-start | back-copy-cutover; Msg }
+function Resolve-MoveAction([string]$Cmd, $S) {
+  $phase = if ($S) { [string]$S.phase } else { 'none' }
+  $mark = if ($S) { [string]$S.mark } else { '' }
+  $isBack = [bool]($S -and [string]$S.via -ceq 'back')
+  $ref = @{ Do = 'refuse'; Msg = "lệnh '$Cmd' không dùng được khi lần chuyển đang ở giai đoạn '$phase'$(if ($mark) { " (đang $mark)" })." }
+  $viaPlan = @{ Do = 'refuse'; Msg = "lệnh '$Cmd': lần chuyển này bắt đầu bằng 'fcode move plan', chưa chuyển xong nên chưa dùng được; giai đoạn '$phase'." }
+  $viaBack = @{ Do = 'refuse'; Msg = "lệnh '$Cmd': lần chuyển này bắt đầu bằng 'fcode move back'; chạy tiếp bằng  fcode move back  (giai đoạn '$phase')." }
+  if ($phase -ceq 'none') {
+    if ($Cmd -ceq 'plan') { return @{ Do = 'plan-new' } }
+    return @{ Do = 'refuse'; Msg = "lệnh '$Cmd': chưa có lần chuyển nào; chạy  fcode move plan <máy mới>  trước." }
+  }
+  if ($mark -ceq 'rolling-back') {
+    if ($Cmd -ceq 'cutover' -or ($Cmd -ceq 'back' -and $isBack)) { return @{ Do = 'rollback-finish' } }
+    return $ref
+  }
+  switch -CaseSensitive ($phase) {
+    'finished' {
+      if ($Cmd -ceq 'plan') { return @{ Do = 'plan-new' } }
+      if ($Cmd -ceq 'finish') { return @{ Do = 'done' } }
+      return $ref
+    }
+    'planned' {
+      if ($Cmd -ceq 'plan') { if ($isBack) { return $viaBack }; return @{ Do = 'replan' } }
+      if ($Cmd -ceq 'copy') { return @{ Do = 'copy' } }
+      if ($Cmd -ceq 'finish') { return @{ Do = 'abandon' } }
+      if ($Cmd -ceq 'back') { if ($isBack) { return @{ Do = 'back-copy-cutover' } }; return $viaPlan }
+      return $ref
+    }
+    { $_ -ceq 'copied' -or $_ -ceq 'rolled-back' } {
+      if ($mark -ceq 'switching') {
+        if ($Cmd -ceq 'cutover' -or ($Cmd -ceq 'back' -and $isBack)) { return @{ Do = 'cutover-resume' } }
+        return $ref
+      }
+      if ($Cmd -ceq 'plan') { if ($isBack) { return $viaBack }; return @{ Do = 'replan' } }
+      if ($Cmd -ceq 'copy') { return @{ Do = 'copy' } }
+      if ($Cmd -ceq 'cutover') { return @{ Do = 'cutover' } }
+      if ($Cmd -ceq 'finish') { return @{ Do = 'abandon' } }
+      if ($Cmd -ceq 'back') { if ($isBack) { return @{ Do = 'cutover' } }; return $viaPlan }
+      return $ref
+    }
+    'cut' {
+      if ($Cmd -ceq 'cutover') { return @{ Do = 'chores' } }
+      if ($Cmd -ceq 'finish') { return @{ Do = 'finish' } }
+      if ($Cmd -ceq 'back') { return @{ Do = 'back-start' } }
+      return $ref
+    }
+  }
+  $ref
+}
+
+# ---- hosts: src / dst follow `dir`; every laptop ssh to old goes through Reach-Old, derived at every call ----
+function Get-MoveOldHost($S) { Get-MoveReachOld ([string]$S.old.alias) }
+function Get-MoveNewHost($S) { [string]$S.new.alias }
+function Get-MoveSrcHost($S) { if ([string]$S.dir -ceq 'fwd') { Get-MoveOldHost $S } else { Get-MoveNewHost $S } }
+function Get-MoveDstHost($S) { if ([string]$S.dir -ceq 'fwd') { Get-MoveNewHost $S } else { Get-MoveOldHost $S } }
+function Get-MoveItemRoots($Obj, [string]$Id) { foreach ($it in @($Obj.items)) { if ([string]$it.id -ceq $Id) { foreach ($r in @($it.roots)) { [string]$r } } } }
+function Get-MoveCap($Obj) { $c = 1800; foreach ($a in @($Obj.apps)) { if ([int]$a.guard_cap_s -gt $c) { $c = [int]$a.guard_cap_s } }; $c }
+function ConvertTo-MoveJsonStr([string]$s) { ConvertTo-Json -InputObject $s -Compress }
+# stdin of `init`: the manifest goes in byte for byte (its sha256 is manifest_sha); pub only for old, peer_* only for new
+function New-MoveInitJson([string]$Machine, [string]$Peer, [string]$Sha, [string]$ManifestText, [string]$Pub, [string]$PeerAddr, [int]$PeerPort, [string]$PeerHostKey) {
+  $j = '{"schema":1,"machine":' + (ConvertTo-MoveJsonStr $Machine) + ',"peer":' + (ConvertTo-MoveJsonStr $Peer) + ',"manifest_sha":"' + $Sha + '","manifest":' + $ManifestText.Trim()
+  if ($Pub) { $j += ',"pub":' + (ConvertTo-MoveJsonStr $Pub) }
+  if ($PeerAddr) { $j += ',"peer_addr":' + (ConvertTo-MoveJsonStr $PeerAddr) + ',"peer_port":' + $PeerPort + ',"peer_hostkey":' + (ConvertTo-MoveJsonStr $PeerHostKey) }
+  $j + '}'
+}
+
+# ---- plan (sequence 1) ----
+# steps (2)-(6) for the run in $S (nothing is saved here). @{ Code; Obj; Text; Sha; Repos }; Code 0 = nothing refused. $Back: a `back` run (no scan, no target checks).
+function Invoke-MovePlanSteps($S, [string]$MapText, [string]$FromText, [bool]$Back) {
+  $id = [string]$S.move_id
+  $src = Get-MoveSrcHost $S; $dst = Get-MoveDstHost $S; $newH = Get-MoveNewHost $S
+  $oi = Get-MoveSshInfo (Get-MoveOldHost $S); $ni = Get-MoveSshInfo $newH
+  if (-not $oi -or -not $ni) { Write-Host 'lỗi: ssh -G không đọc được cấu hình của máy cũ hoặc máy mới.'; return @{ Code = 1 } }
+  Write-Host "plan: kiểm tra máy đích '$dst'..."
+  $pf = Invoke-MoveScript $dst (Get-MovePreflightScript) @()
+  $D = ConvertFrom-MovePreflight $pf.Lines
+  if ($pf.Code -ne 0 -or -not $D.HasHost) { Write-Host 'INV refuse target-unreachable'; return @{ Code = 65 } }
+  $reachOk = $false
+  if ("$($S.old.addr)" -cmatch '\A[A-Za-z0-9._:-]{1,255}\z') { $rc = Invoke-MoveScript $newH (Get-MoveTcpScript) @([string]$S.old.addr, [string]$oi.Port) -Quiet; $reachOk = ($rc.Code -eq 0) }
+  Write-Host ('INV reach old=' + $(if ($reachOk) { 'yes' } else { 'no' }))
+  Write-Host "plan: máy nguồn '$src' lập manifest..."
+  $json = '{"schema":1,"map":' + $(if ($MapText) { $MapText.Trim() } else { 'null' }) + ',"from":' + $(if ($FromText) { $FromText.Trim() } else { 'null' }) + '}'
+  $jb = [Text.Encoding]::UTF8.GetBytes($json)
+  if ($jb.Length -gt 2097152) { Write-Host 'INV refuse map-invalid'; return @{ Code = 65 } }
+  $pr = Invoke-MoveGate $src 'plan' $id @() ([Convert]::ToBase64String($jb))
+  if ($pr.Code -eq 255) { Write-Host $(if ([string]$S.dir -ceq 'fwd') { 'INV refuse old-unreachable' } else { 'INV refuse target-unreachable' }); return @{ Code = 65 } }
+  if ($pr.Code -ne 0 -and $pr.Code -ne 65) { return @{ Code = (ConvertTo-MoveExit $pr.Code) } }
+  $serverRefused = @($pr.Lines | Where-Object { "$_" -cmatch '\AINV refuse ' }).Count -gt 0 -or $pr.Code -eq 65
+  $mf = Get-MoveRemoteManifest $src $id
+  if ($mf.Code -ne 0) { return @{ Code = $(if ($serverRefused) { 65 } else { ConvertTo-MoveExit $mf.Code }) } }
+  $repos = @($S.repos)
+  if (-not $Back) {
+    $sc = Get-MovePushScan $mf.Obj.apps ([string]$S.old.addr)
+    if ($sc.Code -ne 0) { return @{ Code = $sc.Code } }
+    foreach ($l in @($sc.Lines)) { Write-Host $l }
+    $repos = @($sc.Repos)
+  }
+  $dstHome = [bool](-not $Back -and [string]$S.new.kind -ceq 'home')
+  $ref = @(Get-MoveRefusals $mf.Obj $D (Get-MoveDiskFree $pr.Lines) $reachOk $repos ([string]$S.old.alias) $Back $dstHome)
+  foreach ($l in $ref) { Write-Host $l }
+  if ("$($S.new.addr)" -cmatch '\A[A-Za-z0-9._:-]{1,255}\z') { $cb = Invoke-MoveBox (Get-MoveTcpScript) @([string]$S.new.addr, [string]$ni.Port); if ($cb.Code -ne 0) { Write-Host 'INV warn coder-unreachable' } }
+  if ($serverRefused -or $ref.Count) { return @{ Code = 65 } }
+  @{ Code = 0; Obj = $mf.Obj; Text = $mf.Text; Sha = $mf.Sha; Repos = $repos }
+}
+# fcode move plan <new alias> [--map f]: a new move ($New) or a re-plan of the move in $S0. Returns the exit code.
+function Invoke-MovePlan($S0, [string]$Alias, [string]$MapFile, [bool]$New) {
+  if (-not $Alias -and $S0 -and -not $New) { $Alias = [string]$S0.new.alias }
+  if ($Alias -cnotmatch '\A[a-z][a-z0-9-]{0,30}\z') { Write-Host 'Cách dùng: fcode move plan <máy mới> [--map <file>]   (<máy mới> = tên ssh: chữ thường, số, dấu -, bắt đầu bằng chữ)'; return 65 }
+  $oldAlias = if ($New) { Get-DeployHost } else { [string]$S0.old.alias }
+  if (-not $oldAlias) { Write-Host 'lỗi: deployHost trong file cấu hình không dùng được (chỉ chữ, số, dấu . _ @ -).'; return 1 }
+  if ($oldAlias -cnotmatch '\A[a-z][a-z0-9-]{0,30}\z') { Write-Host "lỗi: tên ssh của máy cũ ('$oldAlias') không dùng được cho fcode move (chữ thường, số, dấu -, bắt đầu bằng chữ; đổi deployHost hoặc đặt lại tên Host)."; return 65 }
+  if ($Alias -ceq $oldAlias) { Write-Host "lỗi: máy mới không thể trùng tên ssh với máy cũ ($oldAlias)."; return 65 }
+  if (-not $New -and $Alias -cne [string]$S0.new.alias) { Write-Host "lỗi: lần chuyển này nhắm máy '$($S0.new.alias)'. Muốn đổi máy: fcode move finish (huỷ lần này) rồi plan lại."; return 65 }
+  if ($New -and (Get-MoveReachOld $oldAlias) -cne $oldAlias) { Write-Host "lỗi: ~/.ssh/config đã có 'Host $oldAlias-old' (lần chuyển trước chưa dọn). Xoá khối đó khi máy cũ đã bỏ, rồi plan lại."; return 65 }
+  $mapText = $null
+  if ($MapFile) {
+    try { $mb = [IO.File]::ReadAllBytes($MapFile); $mapText = [Text.Encoding]::UTF8.GetString($mb).TrimStart([char]0xFEFF); if ($mb.Length -gt 16384) { throw 'quá 16 KiB' }; [void](ConvertFrom-Json $mapText) }
+    catch { Write-Host "lỗi: move-map không đọc được ($($_.Exception.Message))."; Write-Host 'INV refuse map-invalid'; return 65 }
+  } elseif (-not $New -and [IO.File]::Exists((Get-MovePath 'move-map.json'))) { $mapText = [IO.File]::ReadAllText((Get-MovePath 'move-map.json')) }
+  $oldHost = if ($New) { $oldAlias } else { Get-MoveOldHost $S0 }
+  $oi = Get-MoveSshInfo $oldHost; $ni = Get-MoveSshInfo $Alias
+  if (-not $oi -or -not $ni) { Write-Host "lỗi: ssh -G không đọc được cấu hình của '$oldHost' hoặc '$Alias'."; return 1 }
+  # the alias rewrite of the cutover (chore b) needs `Host <old>` and `Host <new>` as their own blocks directly in ~/.ssh/config: find out now, not after the cut
+  $cfgP = Get-MoveSshConfigPath
+  $cfgT = if ([IO.File]::Exists($cfgP)) { [IO.File]::ReadAllText($cfgP) } else { '' }
+  $dnd = Get-MoveNewDirectives $cfgT $Alias ([string]$ni.Addr)
+  $drw = if ($dnd.Err) { $null } else { Convert-MoveSshFwd $cfgT $oldAlias $dnd.Lines $Alias $false }
+  if ($dnd.Err -or $drw.Why -in 'no-block', 'shared-block') {
+    Write-Host 'lỗi: ~/.ssh/config của máy này không dùng được cho fcode move (chưa chạy gì).'
+    Write-Host "  $(if ($dnd.Err) { $dnd.Err } elseif ($drw.Why -ceq 'shared-block') { "khối 'Host $oldAlias' dùng chung dòng Host với tên khác" } else { "không thấy khối 'Host $oldAlias' (nó có nằm trong file Include không?)" })"
+    Write-Host "  Cần mỗi máy một khối 'Host <tên>' riêng, nằm thẳng trong ~/.ssh/config (không phải trong file Include): '$oldAlias' và '$Alias'."
+    return 65
+  }
+  if ($New) {
+    $mo = [pscustomobject][ordered]@{ alias = $oldAlias; addr = $oi.Addr; hostkey_line = ''; fp = '' }
+    $mn = [pscustomobject][ordered]@{ alias = $Alias; kind = $(if (Test-MoveHome $ni) { 'home' } else { 'vps' }); addr = $ni.Addr; hostkey_line = ''; fp = '' }
+    $S = New-MoveState ([guid]::NewGuid().ToString()) 'fwd' 'plan' $mo $mn
+  } else {
+    $S = $S0
+    Set-MoveProp $S.old 'addr' $oi.Addr; Set-MoveProp $S.new 'addr' $ni.Addr; Set-MoveProp $S.new 'kind' $(if (Test-MoveHome $ni) { 'home' } else { 'vps' })
+  }
+  $r = Invoke-MovePlanSteps $S $mapText $null $false
+  if ($r.Code -ne 0) { return $r.Code }
+  $ok = Get-MoveHostKey $oi; $nk = Get-MoveHostKey $ni
+  if (-not $ok) { Write-Host "INV refuse old-unreachable"; Write-Host "  (chưa có khoá máy của '$oldHost' trong known_hosts: chạy  ssh $oldHost  một lần để xác nhận rồi plan lại)"; return 65 }
+  if (-not $nk) { Write-Host "INV refuse target-unreachable"; Write-Host "  (chưa có khoá máy của '$Alias' trong known_hosts: chạy  ssh $Alias  một lần để xác nhận rồi plan lại)"; return 65 }
+  Set-MoveProp $S.old 'hostkey_line' $ok.Line; Set-MoveProp $S.old 'fp' $ok.Fp
+  Set-MoveProp $S.new 'hostkey_line' $nk.Line; Set-MoveProp $S.new 'fp' $nk.Fp
+  # `enabled` is the workflow's state at the FIRST plan: a re-plan keeps what is recorded (a cut-off cutover may have disabled it since)
+  $merged = @(foreach ($n in @($r.Repos)) { $e = @(@($S.repos) | Where-Object { $_.repo -ceq $n.repo -and $_.workflow -ceq $n.workflow })[0]; if ($e) { $n.enabled = [bool]$e.enabled }; $n })
+  Set-MoveProp $S 'repos' $merged
+  Set-MoveProp $S 'manifest_sha' $r.Sha; Set-MoveProp $S 'est_downtime_s' ([int]$r.Obj.est_downtime_s); Set-MoveProp $S 'cap_s' (Get-MoveCap $r.Obj)
+  Set-MoveProp $S 'phase' 'planned'; Set-MoveProp $S 'mark' $null
+  Save-MoveManifest $r.Text
+  $mp = Get-MovePath 'move-map.json'
+  if ($mapText) { Write-PhienText $mp $mapText } elseif ([IO.File]::Exists($mp)) { [IO.File]::Delete($mp) }
+  Save-MoveState $S
+  Write-Host 'INV ok'
+  Write-Host "Kế hoạch xong: ước tính tạm dừng khoảng $(Get-MoveMinutes $S) phút. Việc tiếp theo:  fcode move copy"
+  0
+}
+
+# ---- copy (sequence 2) ----
+# cut_not_before: the largest ttl of the a-record hostnames of the saved manifest (+60 s), never lowered
+function Update-MoveCutNotBefore($S, $Obj) {
+  $ttl = 0
+  foreach ($h in @($Obj.hostnames)) { if ([string]$h.kind -ceq 'a-record' -and [int]$h.ttl -gt $ttl) { $ttl = [int]$h.ttl } }
+  if ($ttl -le 0) { return }
+  $nb = (Get-MoveNow).AddSeconds($ttl + 60)
+  $cur = ConvertTo-MoveTime $S.cut_not_before
+  if (-not $cur -or $nb -gt $cur) { Set-MoveProp $S 'cut_not_before' (Format-MoveTs $nb); Save-MoveState $S }
+}
+# new: poll `status` every 10 s until transfer=done|failed. 0 = done.
+function Wait-MoveTransferEnd([string]$NewHost) {
+  $last = ''; $idle = 0; $bad = 0
+  while ($true) {
+    Wait-Move 10
+    $st = Invoke-MoveGate $NewHost 'status' '' @() -Quiet
+    if ($st.Code -ne 0) { $bad++; if ($bad -ge 12) { Write-Host "lỗi: mất liên lạc với máy mới '$NewHost' khi đang chép."; return 1 }; continue }
+    $bad = 0; $v = ''
+    foreach ($l in $st.Lines) { if ("$l" -match '\AMOVE state .*\btransfer=([a-z]+)') { $v = $Matches[1] } }
+    if ($v -cne $last) { Write-Host "transfer: $(if ($v) { $v } else { '?' })"; $last = $v }
+    if ($v -ceq 'done') { return 0 }
+    if ($v -ceq 'failed') { Write-Host "lỗi: transfer thất bại trên máy mới (xem /var/lib/fcode-move/transfer.out trên đó); chạy lại lệnh để thử lại."; return 1 }
+    if ($v -ceq 'idle' -or -not $v) { $idle++; if ($idle -ge 4) { Write-Host 'lỗi: transfer không chạy trên máy mới.'; return 1 } } else { $idle = 0 }
+  }
+}
+# `transfer` (a detached unit), then poll. A `--final` call that finds a transfer already RUNNING (a non-final one left by a killed `copy`) did not start the final pass:
+# wait for that one to end, then call `--final` again and poll that.
+function Invoke-MoveTransfer([string]$NewHost, [string]$Id, [bool]$Final) {
+  $va = $(if ($Final) { @('--final') } else { @() })
+  $r = Invoke-MoveGate $NewHost 'transfer' $Id $va
+  if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
+  if ($Final -and @($r.Lines | Where-Object { "$_" -cmatch '\AMOVE transfer state=running\b' }).Count) {
+    Write-Host 'Một lần chép trước đang chạy trên máy mới: chờ nó xong rồi chạy lượt chép nốt (--final).'
+    $w = Wait-MoveTransferEnd $NewHost
+    if ($w -ne 0) { return $w }
+    $r = Invoke-MoveGate $NewHost 'transfer' $Id $va
+    if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
+  }
+  Wait-MoveTransferEnd $NewHost
+}
+# the machine must run no hold item or connector (`status` shows hold_active=0); 65 = dst-running
+function Test-MoveHoldIdle([string]$HostName) {
+  $r = Invoke-MoveGate $HostName 'status' ''
+  if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
+  foreach ($l in $r.Lines) {
+    if ("$l" -match '\AMOVE state .*\bhold_active=([0-9]+)') {
+      if ([int]$Matches[1] -eq 0) { return 0 }
+      Write-Host "dừng: máy '$HostName' đang chạy ứng dụng hoặc connector (dst-running). Kiểm tra máy đó rồi chạy lại."
+      return 65
+    }
+  }
+  Write-Host "lỗi: status của '$HostName' không có hold_active."
+  1
+}
+function Invoke-MoveCopy($S) {
+  $id = [string]$S.move_id; $fwd = ([string]$S.dir -ceq 'fwd')
+  $src = Get-MoveSrcHost $S; $dst = Get-MoveDstHost $S; $newH = Get-MoveNewHost $S; $oldH = Get-MoveOldHost $S
+  $mf = Read-MoveManifestFile
+  if (-not $mf) { Write-Host 'lỗi: chưa có manifest đã lưu (manifest.json); chạy lại  fcode move plan.'; return 1 }
+  $oi = Get-MoveSshInfo $oldH
+  if (-not $oi) { Write-Host "lỗi: ssh -G không đọc được cấu hình của '$oldH'."; return 1 }
+  Write-Host "copy (a): công cụ và khoá chuyển máy trên '$newH'..."
+  $need = [Math]::Max(20, [int]$mf.Obj.host.node_major)
+  $kr = Invoke-MoveScript $newH (Get-MoveBootstrapKeyScript) @([string]$S.new.alias, [string]$S.old.hostkey_line, "$need")
+  if ($kr.Code -ne 0) { return (ConvertTo-MoveExit $kr.Code) }
+  $pub = ''
+  foreach ($l in $kr.Lines) { if ("$l" -match '\AMOVE key (created|exists) .*\bpub_b64=(\S+)') { $p = $Matches[2]; while ($p.Length % 4) { $p += '=' }; try { $pub = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($p)) } catch { } } }
+  if ($pub -cnotmatch '\Assh-ed25519 [A-Za-z0-9+/=]+\z') { Write-Host 'lỗi: máy mới không trả khoá công khai của khoá chuyển máy.'; return 1 }
+  Write-Host "copy (b): tunnel trên '$src'..."
+  Update-MoveCutNotBefore $S $mf.Obj
+  $t = Invoke-MoveGate $src 'tunnels' $id
+  if ($t.Code -ne 0) { Write-Host "copy dừng ở tunnels (mã $($t.Code)); sửa theo dòng MOVE ở trên rồi chạy lại fcode move copy."; return (ConvertTo-MoveExit $t.Code) }
+  $m2 = Get-MoveRemoteManifest $src $id
+  if ($m2.Code -ne 0) { return (ConvertTo-MoveExit $m2.Code) }
+  Save-MoveManifest $m2.Text; Set-MoveProp $S 'manifest_sha' $m2.Sha; Save-MoveState $S
+  Write-Host "copy (c): init trên máy cũ '$oldH'..."
+  $ij = New-MoveInitJson 'old' ([string]$S.new.alias) $m2.Sha $m2.Text $pub '' 0 ''
+  $r = Invoke-MoveGate $oldH 'init' $id @($(if ($fwd) { 'src' } else { 'dst' })) ([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($ij)))
+  if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
+  Write-Host "copy (d): chép cổng deploy sang '$newH' khi chưa có..."
+  $entry = @(Get-MoveItemRoots $m2.Obj 'gate-entry'); $lib = @(Get-MoveItemRoots $m2.Obj 'gate-lib'); $units = @(Get-MoveItemRoots $m2.Obj 'gate-units')
+  $roots = @($entry) + @($lib) + @($units)
+  if ($entry.Count -ne 1 -or $lib.Count -ne 1 -or @($roots | Where-Object { $_ -cnotmatch '\A/[A-Za-z0-9._/+@=,:-]{1,255}\z' }).Count -or "$($S.old.addr)" -cnotmatch '\A[A-Za-z0-9._:-]{1,255}\z') { Write-Host 'INV refuse gate-missing'; return 65 }
+  $g = Invoke-MoveScript $newH (Get-MoveBootstrapGateScript) (@([string]$S.old.addr, [string]$oi.Port, $entry[0], $lib[0]) + $units)
+  if ($g.Code -ne 0) { return (ConvertTo-MoveExit $g.Code) }
+  Write-Host "copy (e): init trên máy mới '$newH'..."
+  $nj = New-MoveInitJson 'new' ([string]$S.old.alias) $m2.Sha $m2.Text '' ([string]$S.old.addr) ([int]$oi.Port) ([string]$S.old.hostkey_line)
+  $r = Invoke-MoveGate $newH 'init' $id @($(if ($fwd) { 'dst' } else { 'src' })) ([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($nj)))
+  if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
+  Write-Host "copy (f, g): prepare trên '$dst'..."
+  $r = Invoke-MoveGate $dst 'prepare' $id
+  if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
+  $h = Test-MoveHoldIdle $dst; if ($h -ne 0) { return $h }
+  Write-Host "copy (h): dump trên '$src'..."
+  $r = Invoke-MoveGate $src 'dump' $id
+  if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
+  Write-Host "copy (i): chép dữ liệu (máy mới kéo / đẩy trực tiếp)..."
+  $x = Invoke-MoveTransfer $newH $id $false; if ($x -ne 0) { return $x }
+  Write-Host "copy (j): adopt và restore trên '$dst'..."
+  foreach ($v in 'adopt', 'restore') { $r = Invoke-MoveGate $dst $v $id; if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) } }
+  Write-Host "copy (k): verify (chỉ báo cáo)..."
+  $r = Invoke-MoveGate $newH 'verify' $id
+  if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
+  Set-MoveProp $S 'phase' 'copied'; Save-MoveState $S
+  Write-Host "Copy xong (giai đoạn: copied). Chạy lại fcode move copy để làm mới bất cứ lúc nào. Khi sẵn sàng:  fcode move cutover"
+  0
+}
+
+# ---- cutover (sequence 3) ----
+# the ssh-push workflows that were enabled at plan: disable / enable them (a workflow the user had disabled is never touched)
+function Set-MoveWorkflows($S, [bool]$Enable) {
+  $act = if ($Enable) { 'enable' } else { 'disable' }; $rc = 0
+  foreach ($r in @(@($S.repos) | Where-Object { $_.kind -ceq 'ssh-push' -and $_.enabled -eq $true })) {
+    $o = Invoke-MoveTool 'gh' @('workflow', $act, [string]$r.workflow, '-R', [string]$r.repo)
+    if ($o.Code -ne 0 -and (($o.Out -join ' ') -notmatch "already $($act)d")) { Write-Host "lỗi: gh workflow $act $($r.workflow) -R $($r.repo) mã $($o.Code)."; $rc = 1 }
+  }
+  $rc
+}
+# wait (poll 10 s, cap 900 s) until no run of those workflows is queued or in progress; 1 = still busy or unreadable
+function Wait-MoveRunsIdle($S) {
+  $t0 = Get-MoveNow
+  foreach ($r in @(@($S.repos) | Where-Object { $_.kind -ceq 'ssh-push' -and $_.enabled -eq $true })) {
+    while ($true) {
+      $busy = $false
+      foreach ($st in 'queued', 'in_progress') {
+        $o = Invoke-MoveTool 'gh' @('run', 'list', '-R', [string]$r.repo, '--workflow', [string]$r.workflow, '--status', $st, '--json', 'databaseId')
+        if ($o.Code -ne 0) { Write-Host "lỗi: gh không đọc được các lượt chạy của $($r.workflow) ($($r.repo))."; return 1 }
+        try { $j = ConvertFrom-Json ($o.Out -join "`n"); if ($null -ne $j -and @($j).Count -gt 0) { $busy = $true } } catch { Write-Host "lỗi: gh trả danh sách lượt chạy của $($r.repo) không đọc được."; return 1 }
+      }
+      if (-not $busy) { break }
+      if (((Get-MoveNow) - $t0).TotalSeconds -ge 900) { Write-Host "lỗi: workflow $($r.workflow) ($($r.repo)) vẫn còn lượt chạy sau 900 giây."; return 1 }
+      Wait-Move 10
+    }
+  }
+  0
+}
+# a step that answers 75 (busy, nothing changed) is run again after the smallest retry_s of its MOVE wait lines, until the cap (counted from $T0) is over
+function Invoke-MoveWaitStep([string]$HostName, [string]$Verb, [string]$Id, [string[]]$VArgs, [DateTime]$T0, [int]$Cap) {
+  while ($true) {
+    $r = Invoke-MoveGate $HostName $Verb $Id $VArgs
+    if ($r.Code -ne 75) { return $r }
+    $min = 0
+    foreach ($l in $r.Lines) { if ("$l" -match '\AMOVE wait .*\bretry_s=([0-9]+)') { $v = [int]$Matches[1]; if ($v -gt 0 -and ($min -eq 0 -or $v -lt $min)) { $min = $v } } }
+    if ($min -eq 0) { $min = 10 }
+    if (((Get-MoveNow) - $T0).TotalSeconds -ge $Cap) { return @{ Code = 75; Lines = $r.Lines; Cap = $true } }
+    Write-Host "busy ($Verb): thử lại sau $min giây..."
+    Wait-Move $min
+  }
+}
+function Invoke-MoveTry3([scriptblock]$Do) {
+  for ($i = 1; $i -le 3; $i++) { $r = & $Do; if ($r.Code -eq 0) { return $true }; if ($i -lt 3) { Wait-Move 5 } }
+  $false
+}
+# steps (2)-(11); @{ Code; Why; NoRollback }. Code 0 = phase cut reached. $Resume: mark switching = resume at step (10).
+function Invoke-MoveCutSteps($S, [bool]$Resume) {
+  $id = [string]$S.move_id; $src = Get-MoveSrcHost $S; $dst = Get-MoveDstHost $S; $newH = Get-MoveNewHost $S
+  if (-not $Resume) {
+    Write-Host '(2) tắt workflow deploy thẳng vào máy cũ qua SSH (nếu có)...'
+    $w = Set-MoveWorkflows $S $false
+    if ($w -eq 0) { $w = Wait-MoveRunsIdle $S }
+    if ($w -ne 0) { return @{ Code = 1; Why = 'không tắt được workflow deploy' } }
+    $t0 = Get-MoveNow; $cap = [int]$S.cap_s
+    Write-Host "(3) freeze trên '$src'..."
+    $r = Invoke-MoveWaitStep $src 'freeze' $id @() $t0 $cap
+    if ($r.Code -ne 0) { return @{ Code = (ConvertTo-MoveExit $r.Code); Why = $(if ($r.Cap) { "quá hạn chờ $cap giây (freeze)" } else { 'freeze lỗi' }) } }
+    Write-Host "(4) stop --guards trên '$src' (chờ mọi ứng dụng rảnh cùng lúc)..."
+    $r = Invoke-MoveWaitStep $src 'stop' $id @('--guards') $t0 $cap
+    if ($r.Code -ne 0) { return @{ Code = (ConvertTo-MoveExit $r.Code); Why = $(if ($r.Cap) { "quá hạn chờ $cap giây (guard)" } else { 'stop --guards lỗi' }) } }
+    Write-Host "(5) stop và prepare trên '$dst'..."
+    $r = Invoke-MoveGate $dst 'stop' $id
+    if ($r.Code -ne 0) { return @{ Code = (ConvertTo-MoveExit $r.Code); Why = "stop trên '$dst' lỗi" } }
+    Set-MoveProp $S 'dst_started' $false; Save-MoveState $S
+    $r = Invoke-MoveGate $dst 'prepare' $id
+    if ($r.Code -ne 0) { return @{ Code = (ConvertTo-MoveExit $r.Code); Why = "prepare trên '$dst' lỗi" } }
+    $h = Test-MoveHoldIdle $dst; if ($h -ne 0) { return @{ Code = $h; Why = "'$dst' không rảnh" } }
+    Write-Host "(6) dump trên '$src'..."
+    $r = Invoke-MoveGate $src 'dump' $id
+    if ($r.Code -ne 0) { return @{ Code = (ConvertTo-MoveExit $r.Code); Why = 'dump lỗi' } }
+    Write-Host '(7) chép nốt (transfer --final)...'
+    $x = Invoke-MoveTransfer $newH $id $true
+    if ($x -ne 0) { return @{ Code = $x; Why = 'transfer --final lỗi' } }
+    Write-Host "(8) adopt, restore trên '$dst'; verify --strict..."
+    foreach ($v in 'adopt', 'restore') { $r = Invoke-MoveGate $dst $v $id; if ($r.Code -ne 0) { return @{ Code = (ConvertTo-MoveExit $r.Code); Why = "$v lỗi" } } }
+    $r = Invoke-MoveGate $newH 'verify' $id @('--strict')
+    if ($r.Code -ne 0) { return @{ Code = (ConvertTo-MoveExit $r.Code); Why = 'verify --strict lỗi' } }
+    Write-Host "(9) start và health trên '$dst'..."
+    Set-MoveProp $S 'dst_started' $true; Save-MoveState $S
+    $r = Invoke-MoveGate $dst 'start' $id
+    if ($r.Code -ne 0) { return @{ Code = (ConvertTo-MoveExit $r.Code); Why = "start trên '$dst' lỗi" } }
+    $r = Invoke-MoveGate $dst 'health' $id
+    if ($r.Code -ne 0) { return @{ Code = (ConvertTo-MoveExit $r.Code); Why = "health trên '$dst' lỗi" } }
+  }
+  Write-Host "(10) switch trên '$dst'..."
+  Set-MoveProp $S 'mark' 'switching'; Save-MoveState $S
+  $r = Invoke-MoveGate $dst 'switch' $id
+  if ($r.Code -ne 0) { return @{ Code = (ConvertTo-MoveExit $r.Code); Why = 'switch lỗi' } }
+  Write-Host "(11) unfreeze trên '$dst'..."
+  $r = Invoke-MoveGate $dst 'unfreeze' $id
+  if ($r.Code -ne 0) { return @{ Code = (ConvertTo-MoveExit $r.Code); Why = 'unfreeze lỗi'; NoRollback = $true } }
+  Set-MoveProp $S 'mark' $null; Set-MoveProp $S 'cut_at' (Format-MoveTs (Get-MoveNow)); Set-MoveProp $S 'phase' 'cut'; Save-MoveState $S
+  @{ Code = 0 }
+}
+# the rollback: dst stop, src start --connectors, src unfreeze, workflows (src is old), phase rolled-back, src health. Each step is tried 3 times;
+# when dst cannot be reached and has started nothing, dst-unreachable is only a warning. Returns the exit code of the cutover that failed (70 = needs a human).
+function Invoke-MoveRollback($S, [int]$Cause, [string]$Why) {
+  $id = [string]$S.move_id
+  Write-Host "Quay lại: $Why"
+  Set-MoveProp $S 'mark' 'rolling-back'; Set-MoveProp $S.answers 'cut' $null; Set-MoveProp $S.answers 'back' $null; Save-MoveState $S
+  $dst = Get-MoveDstHost $S; $src = Get-MoveSrcHost $S
+  if (Invoke-MoveTry3 { Invoke-MoveGate $dst 'stop' $id }) { Set-MoveProp $S 'dst_started' $false; Save-MoveState $S }
+  elseif ([bool]$S.dst_started) { Write-Host "CẦN NGƯỜI (70): không dừng được máy đích '$dst' mà nó có thể đang chạy ứng dụng. Giữ nguyên mark rolling-back; khi máy đích nối lại được, chạy lại fcode move cutover."; return 70 }
+  else { Write-Host 'INV warn dst-unreachable' }
+  if (-not (Invoke-MoveTry3 { Invoke-MoveGate $src 'start' $id @('--connectors') })) { Write-Host "CẦN NGƯỜI (70): máy cũ '$src' không start lại được. Giữ nguyên mark rolling-back."; return 70 }
+  if (-not (Invoke-MoveTry3 { Invoke-MoveGate $src 'unfreeze' $id })) { Write-Host "CẦN NGƯỜI (70): máy cũ '$src' không unfreeze được. Giữ nguyên mark rolling-back."; return 70 }
+  if ([string]$S.dir -ceq 'fwd' -and -not (Invoke-MoveTry3 { @{ Code = (Set-MoveWorkflows $S $true) } })) { Write-Host 'CẦN NGƯỜI (70): không bật lại được workflow deploy. Giữ nguyên mark rolling-back.'; return 70 }
+  Set-MoveProp $S 'mark' $null; Set-MoveProp $S 'phase' 'rolled-back'; Save-MoveState $S
+  $h = Invoke-MoveGate $src 'health' $id
+  if ($h.Code -ne 0) { Write-Host "CẦN NGƯỜI (70): máy cũ '$src' đã được start lại nhưng health lỗi (phase rolled-back)."; return 70 }
+  Write-Host "rolled_back: các ứng dụng đã chạy lại ở máy '$src' như cũ."
+  if ($Cause -eq 0) { 1 } else { $Cause }
+}
+# step (12): chores, each idempotent by content. From here nothing is rolled back; a failure is fixed by running `cutover` again.
+function Invoke-MoveChores($S) {
+  Write-Host '(12) việc sau khi chuyển: secret GitHub, ssh alias...'
+  $fwd = ([string]$S.dir -ceq 'fwd')
+  $dside = if ($fwd) { $S.new } else { $S.old }
+  $kf = @("$($dside.hostkey_line)" -split '\s+')
+  $line = if ($kf.Count -ge 3 -and $dside.addr) { "$($dside.addr) $($kf[1]) $($kf[2])" } else { '' }   # CONTRACT: `<dst addr> <keytype> <key>` (hostkey_line is [addr]:port when the port is not 22)
+  $gp = @(@(@($S.repos) | Where-Object { $_.kind -ceq 'gate-push' } | ForEach-Object { [string]$_.repo }) | Select-Object -Unique)
+  if ($gp.Count) {
+    if (-not $line) { Write-Host 'lỗi: thiếu khoá máy đích trong state; chạy lại fcode move plan.'; return 1 }
+    foreach ($repo in $gp) {
+      $o = Invoke-MoveTool 'gh' @('secret', 'set', 'DEPLOY_KNOWN_HOSTS', '-R', $repo) $line
+      if ($o.Code -ne 0) { Write-IpaError "gh không đặt được DEPLOY_KNOWN_HOSTS của $repo (mã $($o.Code))." ($o.Out -join "`n"); Write-Host 'Chạy lại:  fcode move cutover'; return 1 }
+      Write-Host "DEPLOY_KNOWN_HOSTS của $repo đã trỏ vào máy mới nhất."
+    }
+  }
+  if ((Set-MoveLaptopAlias $S) -ne 0) { Write-Host 'Chạy lại:  fcode move cutover'; return 1 }
+  if ((Set-MoveCoderAlias $S) -ne 0) { Write-Host 'Chạy lại:  fcode move cutover'; return 1 }
+  Write-Host 'MOVE done cutover'
+  $sp = @(@(@($S.repos) | Where-Object { $_.kind -ceq 'ssh-push' -and $_.enabled -eq $true } | ForEach-Object { "$($_.repo) ($($_.workflow))" }) | Select-Object -Unique)
+  if ($sp.Count) { Write-Host "Workflow deploy thẳng qua SSH vẫn đang TẮT: $($sp -join ', '). Trỏ repo vào máy mới rồi bật lại tay$(if (-not $fwd) { ' (lệnh finish bật lại chúng)' })." }
+  Write-Host $(if ($fwd) { 'Đã chuyển xong. Giữ máy cũ ít nhất 72 giờ; khi chắc chắn:  fcode move finish   (cần quay lại:  fcode move back)' } else { 'Đã quay lại xong. Khi chắc chắn:  fcode move finish   (chuyển lại sang máy mới:  fcode move back)' })
+  0
+}
+function Invoke-MoveCutover($S) {
+  $mark = [string]$S.mark
+  if ($mark -ceq 'rolling-back') { return (Invoke-MoveRollback $S 1 'làm nốt lần quay lại đang dở') }
+  if ([string]$S.phase -ceq 'cut') { return (Invoke-MoveChores $S) }
+  $resume = ($mark -ceq 'switching')
+  if (-not $resume) {
+    $nb = ConvertTo-MoveTime $S.cut_not_before; $now = Get-MoveNow
+    if ($nb -and $now -lt $nb) {
+      Write-Host "Chưa chuyển được: bản ghi DNS cũ còn trong thời gian TTL, cần chờ thêm khoảng $([int][Math]::Ceiling(($nb - $now).TotalMinutes)) phút (đến $(Format-MoveTs $nb)). Chưa chạy gì."
+      return 65
+    }
+    $key = if ([string]$S.via -ceq 'back') { 'back' } else { 'cut' }
+    if (-not $S.answers.$key) {
+      if (-not (Confirm-MoveYes (Get-MoveQuestion $key $S))) { Write-Host 'Đã huỷ, chưa đổi gì.'; return 65 }
+      Set-MoveProp $S.answers $key (New-MoveAnswer); Save-MoveState $S
+    }
+  }
+  $f = Invoke-MoveCutSteps $S $resume
+  if ($f.Code -eq 0) { return (Invoke-MoveChores $S) }
+  if ($f.NoRollback) { Write-Host "lỗi ở bước cuối ($($f.Why)); chạy lại  fcode move cutover  để làm tiếp (mark switching giữ nguyên)."; return $f.Code }
+  Invoke-MoveRollback $S ([int]$f.Code) ([string]$f.Why)
+}
+
+# ---- finish (sequence 5) and back (sequence 4) ----
+function Invoke-MoveFinish($S, [string]$Do) {
+  if ($Do -ceq 'done') { Write-Host 'Lần chuyển này đã xong (finished).'; return 0 }
+  $abandon = ($Do -ceq 'abandon')
+  $ca = ConvertTo-MoveTime $S.cut_at
+  $needEarly = [bool]($ca -and (Get-MoveNow) -lt $ca.AddHours(72) -and -not $S.answers.finish_early)
+  $needMain = [bool](-not $S.answers.finish)
+  if ($needMain -and -not (Confirm-MoveYes (Get-MoveQuestion $(if ($abandon) { 'abandon' } else { 'finish' }) $S))) { Write-Host 'Đã huỷ, chưa đổi gì.'; return 65 }
+  if ($needEarly -and -not (Confirm-MoveYes (Get-MoveQuestion 'finish-early' $S))) { Write-Host 'Đã huỷ, chưa đổi gì.'; return 65 }
+  if ($needMain) { Set-MoveProp $S.answers 'finish' (New-MoveAnswer) }
+  if ($needEarly) { Set-MoveProp $S.answers 'finish_early' (New-MoveAnswer) }
+  if ($needMain -or $needEarly) { Save-MoveState $S }
+  $id = [string]$S.move_id; $fwd = ([string]$S.dir -ceq 'fwd')
+  $order = if ($abandon) { @('old', 'new') } elseif ($fwd) { @('old', 'new') } else { @('new', 'old') }   # phase cut: src first, then dst
+  foreach ($m in $order) {
+    $h = if ($m -ceq 'old') { Get-MoveOldHost $S } else { Get-MoveNewHost $S }
+    $peer = if ($m -ceq 'old') { [string]$S.new.alias } else { [string]$S.old.alias }
+    Write-Host "finish trên '$h'..."
+    $r = Invoke-MoveGate $h 'finish' $id @($peer)
+    $lines = @($r.Lines | ForEach-Object { "$_" })
+    $done = ($r.Code -eq 0) -or ($abandon -and (($r.Code -eq 65 -and @($lines | Where-Object { $_ -cmatch '\AMOVE error (no-move|move-id-mismatch)\b' }).Count) -or $r.Code -eq 127))   # abandon: `copy`/`init` of this run never reached that machine (nothing, or the move-id of an earlier move)
+    if (-not $done) { return (ConvertTo-MoveExit $r.Code) }
+  }
+  $reenable = if ($abandon) { $fwd } else { -not $fwd }   # workflows come back when the apps run on old
+  if ($reenable -and (Set-MoveWorkflows $S $true) -ne 0) { Write-Host 'lỗi: không bật lại được workflow; chạy lại fcode move finish.'; return 1 }
+  Set-MoveProp $S 'phase' 'finished'; Set-MoveProp $S 'mark' $null; Save-MoveState $S
+  Write-Host $(if ($abandon) { 'Đã huỷ lần chuyển (finished). Máy mới vẫn giữ bản sao dữ liệu và mật khẩu (đã tắt): nếu không dùng nữa, hãy xoá hoặc cài lại máy đó.' } else { 'Đã bỏ máy cũ (finished): ứng dụng trên máy đó đã tắt, khoá chuyển máy đã xoá. Huỷ gói VPS cũ ở trang Contabo là việc của bạn.' })
+  0
+}
+# phase cut: Q-back, then a new run with src and dst swapped (plan on its src with the saved move-map and manifest), then its copy and cutover
+function Invoke-MoveBackStart($S) {
+  $N = New-MoveState ([guid]::NewGuid().ToString()) $(if ([string]$S.dir -ceq 'fwd') { 'back' } else { 'fwd' }) 'back' $S.old $S.new
+  Set-MoveProp $N 'est_downtime_s' $S.est_downtime_s; Set-MoveProp $N 'cap_s' $S.cap_s; Set-MoveProp $N 'cut_at' $S.cut_at
+  Set-MoveProp $N 'repos' @($S.repos); Set-MoveProp $N 'backups' $S.backups
+  if (-not (Confirm-MoveYes (Get-MoveQuestion 'back' $N))) { Write-Host 'Đã huỷ, chưa đổi gì.'; return 65 }
+  Set-MoveProp $N.answers 'back' (New-MoveAnswer)
+  $from = Read-MoveManifestFile
+  if (-not $from) { Write-Host 'lỗi: chưa có manifest đã lưu của lần chuyển trước (manifest.json).'; return 1 }
+  $mp = Get-MovePath 'move-map.json'
+  $mapText = if ([IO.File]::Exists($mp)) { [IO.File]::ReadAllText($mp) } else { $null }
+  $r = Invoke-MovePlanSteps $N $mapText $from.Text $true
+  if ($r.Code -ne 0) { return $r.Code }
+  Set-MoveProp $N 'manifest_sha' $r.Sha; Set-MoveProp $N 'est_downtime_s' ([int]$r.Obj.est_downtime_s); Set-MoveProp $N 'cap_s' (Get-MoveCap $r.Obj)
+  Save-MoveManifest $r.Text; Save-MoveState $N
+  Write-Host 'INV ok'
+  $c = Invoke-MoveCopy $N; if ($c -ne 0) { return $c }
+  Invoke-MoveCutover $N
+}
+
+# ---- status and the entry ----
+function Show-MoveStatus {
+  try { $S = Read-MoveState } catch { Write-Host "lỗi: $($_.Exception.Message)"; return 1 }
+  if (-not $S) { Write-Host 'Chưa có lần chuyển nào. Bắt đầu bằng:  fcode move plan <máy mới>'; return 0 }
+  $nz = { param($v) if ($v) { [string]$v } else { '-' } }
+  Write-Host "move_id=$($S.move_id) hướng=$($S.dir) bắt đầu bằng=$($S.via) giai đoạn=$($S.phase) mark=$(& $nz $S.mark) dst_started=$($S.dst_started)"
+  Write-Host "  cut_at=$(& $nz $S.cut_at) cut_not_before=$(& $nz $S.cut_not_before) máy cũ=$($S.old.alias) máy mới=$($S.new.alias) (kiểu $($S.new.kind))"
+  foreach ($m in @(@{ N = 'máy cũ'; H = (Get-MoveOldHost $S) }, @{ N = 'máy mới'; H = (Get-MoveNewHost $S) })) {
+    Write-Host "$($m.N) ($($m.H)):"
+    $r = Invoke-MoveGate $m.H 'status' ''
+    if ($r.Code -ne 0) { Write-Host "  không đọc được trạng thái (mã $($r.Code))." }
+  }
+  0
+}
+function Invoke-MoveDispatch($Act, $S, [string]$Alias, [string]$MapFile) {
+  switch -CaseSensitive ($Act.Do) {
+    'refuse' { Write-Host "lỗi: $($Act.Msg)"; 65 }
+    'plan-new' { Invoke-MovePlan $null $Alias $MapFile $true }
+    'replan' { Invoke-MovePlan $S $Alias $MapFile $false }
+    'copy' { Invoke-MoveCopy $S }
+    { $_ -in 'cutover', 'cutover-resume', 'rollback-finish', 'chores' } { Invoke-MoveCutover $S }
+    { $_ -in 'finish', 'abandon', 'done' } { Invoke-MoveFinish $S $Act.Do }
+    'back-start' { Invoke-MoveBackStart $S }
+    'back-copy-cutover' { $c = Invoke-MoveCopy $S; if ([int]@($c)[-1] -ne 0) { [int]@($c)[-1] } else { Invoke-MoveCutover $S } }
+    default { Write-Host "lỗi: việc '$($Act.Do)' không biết."; 1 }
+  }
+}
+# fcode move plan <máy mới> [--map <file>] | copy | cutover | finish | back | status. Returns the exit code (0 / 1 / 65 / 69 / 70 / 75).
+function Invoke-Move {
+  $a = @($Rest | Select-Object -Skip 1)
+  $verb = if ($a.Count -gt 0) { [string]$a[0] } else { '' }
+  $usage = {
+    Write-Host 'Cách dùng: fcode move plan <máy mới> [--map <file>] | copy | cutover | finish | back | status'
+    Write-Host '  Chi tiết: fcode help move'
+  }
+  if ($verb -cnotin 'plan', 'copy', 'cutover', 'finish', 'back', 'status') { & $usage; return 65 }
+  $alias = ''; $mapFile = ''
+  if ($verb -ceq 'plan') {
+    $i = 1
+    while ($i -lt $a.Count) {
+      if ($a[$i] -ceq '--map') { if ($i + 1 -ge $a.Count -or $mapFile) { & $usage; return 65 }; $mapFile = [string]$a[$i + 1]; $i += 2 }
+      elseif (-not $alias -and ([string]$a[$i]) -notmatch '\A-') { $alias = [string]$a[$i]; $i++ }
+      else { & $usage; return 65 }
+    }
+  } elseif ($a.Count -gt 1) { & $usage; return 65 }
+  if ($verb -ceq 'status') { return [int]@(Show-MoveStatus)[-1] }
+  $lock = Open-MoveLock
+  if (-not $lock) { Write-Host 'lỗi: đang có một lần fcode move khác chạy (move.lock); chờ nó xong rồi chạy lại.'; return 1 }
+  try {
+    $S = Read-MoveState
+    $act = Resolve-MoveAction $verb $S
+    $res = @(Invoke-MoveDispatch $act $S $alias $mapFile)
+    return [int]$res[-1]
+  } catch {
+    Write-Host "lỗi: $($_.Exception.Message)"
+    return 1
+  } finally { $lock.Dispose() }
+}
+
 
 # fcode pair [ten thiet bi]: tao ma ghep 1 lan (kem ma QR) tren box cho iPhone moi
 function Invoke-Pair {
@@ -4264,6 +5456,7 @@ if ($arg -eq 'ipa') { exit (Invoke-Ipa) }
 if ($arg -eq 'add') { exit (Invoke-Add) }
 if ($arg -eq 'deploy') { exit (Invoke-Deploy) }
 if ($arg -eq 'pair') { exit (Invoke-Pair) }
+if ($arg -eq 'move') { exit (Invoke-Move) }
 if ($arg -eq 'phien') { exit (Invoke-Phien) }
 if ($arg -eq 'moc') { exit (Invoke-Moc) }
 if ($arg -eq '-l') { $arg = '--list' }
