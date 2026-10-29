@@ -309,7 +309,8 @@ struct ProjectsView: View {
             Spacer(minLength: 0)
             // The sessions or the cards are the copy saved at the last launch, until the box answers.
             if model.overview != nil && (model.fromCache || home.fromCache) {
-                let saved = home.cacheLabel ?? "đang cập nhật"
+                // "Cũ" once the overview request failed: nothing is updating it then.
+                let saved = home.cacheLabel ?? (model.errorText == nil ? "đang cập nhật" : "Cũ")
                 Text(saved)
                     .scaledFont(12)
                     .foregroundColor(.l2)
@@ -509,6 +510,7 @@ struct ProjectsView: View {
             time: model.relativeTime(s),
             busy: model.busy.contains(s.name),
             answered: model.answered[s.name] != nil,
+            saved: model.fromCache,
             flash: flash == s.name,
             onOpen: { open(s.name) },
             onReply: { open(s.name, reply: true) },
@@ -789,7 +791,7 @@ struct ProjectCard: View {
             // The long press used to open a new session: that stays first, then the two new ones.
             Button(action: onMore) { Label("Mở phiên mới", systemImage: "plus") }
             if let onRename = onRename {
-                Button(action: onRename) { Label("Đổi tên", systemImage: "pencil") }
+                Button(action: onRename) { Label("Đổi tên hiển thị…", systemImage: "pencil") }
             }
             Button(action: onArrange) { Label("Sắp xếp", systemImage: "arrow.up.arrow.down") }
         }
@@ -800,7 +802,7 @@ struct ProjectCard: View {
         .accessibilityAction(named: "Mở phiên mới", onMore)
         .accessibilityActions {
             if staging?.canStart == true { Button("Bật staging", action: onStartStaging) }
-            if let onRename = onRename { Button("Đổi tên", action: onRename) }
+            if let onRename = onRename { Button("Đổi tên hiển thị…", action: onRename) }
             Button("Sắp xếp", action: onArrange)
         }
     }
@@ -889,6 +891,8 @@ struct SessionRow: View {
     let busy: Bool
     /// A y/n answer was sent and the refresh does not show it yet.
     let answered: Bool
+    /// The row is the copy saved at the last launch: no answer is sent until the box confirms it.
+    var saved = false
     let flash: Bool
     let onOpen: () -> Void
     let onReply: () -> Void
@@ -987,15 +991,15 @@ struct SessionRow: View {
     }
 
     private var actions: some View {
-        // y/n stay off while an action runs or the sent answer is not yet reflected; the other
-        // buttons are off only while an action runs.
+        // y/n stay off while an action runs or the sent answer is not yet reflected; y/n and
+        // "Trả lời" also stay off on the saved copy; "Mở" is off only while an action runs.
         HStack(spacing: 8) {
             // Not beside a numbered menu: there "n" + Enter would confirm the highlighted option.
             if OverviewModel.isYesNo(session.preview) && session.menu != true {
-                pill("y · Đồng ý", fill: .greenTone, text: .black, off: busy || answered) { onAnswer("y") }
-                pill("n · Từ chối", fill: .fill3, text: .white, off: busy || answered) { onAnswer("n") }
+                pill("y · Đồng ý", fill: .greenTone, text: .black, off: busy || answered || saved) { onAnswer("y") }
+                pill("n · Từ chối", fill: .fill3, text: .white, off: busy || answered || saved) { onAnswer("n") }
             } else {
-                pill("Trả lời", fill: .fill3, text: .accentBlue, off: busy, action: onReply)
+                pill("Trả lời", fill: .fill3, text: .accentBlue, off: busy || saved, action: onReply)
             }
             pill("Mở", fill: .fill3, text: .accentBlue, off: busy, action: onOpen)
             if busy || answered { ProgressView().padding(.leading, 2) }

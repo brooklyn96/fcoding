@@ -1223,7 +1223,8 @@ enum HomeLogic {
     }
 
     /// The server's alias rules, checked before the PUT (the server checks again and has the
-    /// last word): letters (Vietnamese too), digits, space, "-", "_", "." only, at most 30;
+    /// last word): letters (Vietnamese too), digits, space, "-", "_", "." only, at most 30
+    /// unicode scalars after NFC (the server's `[...a].length`, so "1️⃣" counts 3);
     /// unique and never another project's real name, both ignoring case. nil = fine.
     static func aliasProblem(_ aliases: [String: String], projects: [String]) -> String? {
         var used: [String: String] = [:]
@@ -1231,7 +1232,7 @@ enum HomeLogic {
             let a = cleanAlias(aliases[name] ?? "")
             guard !a.isEmpty, a != name else { continue }
             let raw = (aliases[name] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            if raw.count > aliasMax { return "Tên “\(a)…” dài quá \(aliasMax) ký tự." }
+            if raw.precomposedStringWithCanonicalMapping.unicodeScalars.count > aliasMax { return "Tên “\(a)…” dài quá \(aliasMax) ký tự." }
             if a.range(of: "^[\\p{L}\\p{M}\\p{N} ._-]+$", options: .regularExpression) == nil {
                 return "Tên “\(a)” chỉ được có chữ, số, dấu cách và - _ ."
             }
@@ -1894,6 +1895,10 @@ enum HomeLogic {
         eq("rule emoji", aliasProblem(["web": "web 🚀"], projects: server) != nil, true)
         eq("rule long", aliasProblem(["web": String(repeating: "x", count: 31)], projects: server) != nil, true)
         eq("rule 30 ok", aliasProblem(["web": String(repeating: "x", count: 30)], projects: server), nil)
+        // "1️⃣" = U+0031 U+FE0F U+20E3: one Character, three scalars; the server counts 33 here.
+        eq("rule keycap long", aliasProblem(["web": String(repeating: "1\u{FE0F}\u{20E3}", count: 11)], projects: server)?.hasSuffix("dài quá 30 ký tự.") == true, true)
+        eq("rule keycap 30 ok", aliasProblem(["web": String(repeating: "1\u{FE0F}\u{20E3}", count: 10)], projects: server), nil)
+        eq("rule NFC counts precomposed", aliasProblem(["web": String(repeating: "e\u{301}", count: 30)], projects: server), nil)
         eq("rule other real name", aliasProblem(["web": "API"], projects: server), "Tên “API” trùng tên dự án api.")
         eq("rule unique", aliasProblem(["web": "monitor", "api": "Monitor"], projects: server) != nil, true)
         eq("rule unknown project ignored", aliasProblem(["gone": "a/b"], projects: server), nil)

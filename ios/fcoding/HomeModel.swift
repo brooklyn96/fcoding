@@ -21,19 +21,22 @@ final class HomeModel: ObservableObject {
     /// Now on the server's clock: compare server times (sleepsAt, resetsAt, run times) with this.
     func serverNow(_ date: Date = Date()) -> Date { date.addingTimeInterval(offset) }
 
-    /// "đang cập nhật · 14:05" (the day too when older than today) while `home` is the saved copy.
+    /// "đang cập nhật · 14:05" (the day too when older than today) while `home` is the saved copy;
+    /// "Cũ · 14:05" once the live request has failed and nothing is updating it.
     var cacheLabel: String? {
         guard fromCache, let at = loadedAt else { return nil }
         let time = Calendar.current.isDateInToday(at)
             ? at.formatted(date: .omitted, time: .shortened)
             : at.formatted(.dateTime.day().month(.twoDigits).hour().minute())
-        return "đang cập nhật · " + time
+        return (failed ? "Cũ · " : "đang cập nhật · ") + time
     }
 
     private var current: Task<Void, Never>?
     /// Requests started so far, and the number of the one in flight.
     private var starts = 0
     private var currentIndex = 0
+    /// The request in flight is a refresh (?fresh=1).
+    private var currentForced = false
 
     /// One request at a time; a call during one waits for it. `fresh`: the reply must come from
     /// a request started after this call (one already in flight may carry older server state).
@@ -51,12 +54,14 @@ final class HomeModel: ObservableObject {
         restore(app)
         let needed = starts + 1
         while let running = current {
-            if !fresh || currentIndex >= needed { await running.value; return }
+            // A refresh is met only by a forced request started after it was asked for.
+            if !fresh || (currentIndex >= needed && (!force || currentForced)) { await running.value; return }
             await running.value
         }
         starts += 1
         let index = starts
         currentIndex = index
+        currentForced = force
         // Cleared inside the task, so a waiter never sees a finished task as still running.
         let task = Task {
             await self.fetch(app, force: force)
@@ -90,7 +95,9 @@ final class HomeModel: ObservableObject {
         loading = true
         defer { loading = false }
         do {
-            let data = try await api.call("GET", "api/home", query: force ? [URLQueryItem(name: "fresh", value: "1")] : [])
+            // ?fresh=1 may wait up to the server's HOME_FRESH_WAIT_MS (25 s) before the reply.
+            let data = try await api.call("GET", "api/home", query: force ? [URLQueryItem(name: "fresh", value: "1")] : [],
+                                          timeout: force ? 35 : 20)
             let reply = try JSONDecoder().decode(HomeData.self, from: data)
             let received = Date()
             if reply.generatedAt != nil {
@@ -107,7 +114,6 @@ final class HomeModel: ObservableObject {
         } catch {
             // A 401 goes back to pairing; anything else keeps the last data, marked old.
             _ = app.report(error)
-            if app.token == nil { ResponseCache.clear() }
             if !(error is CancellationError) { failed = true }
         }
     }

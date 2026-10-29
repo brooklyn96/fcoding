@@ -86,8 +86,6 @@ extension API {
         return (reply, Date().addingTimeInterval(reply.expiresAt.timeIntervalSince(serverNow)))
     }
 
-    func overview() async throws -> Overview { try await get("api/overview", as: Overview.self) }
-
     /// POST /api/open with fresh:true: always a new session (CONTRACT A5 update 4).
     func openFresh(project: String, harness: String) async throws -> OpenResponse {
         let data = try await call("POST", "api/open", body: ["project": project, "harness": harness, "fresh": true])
@@ -187,8 +185,8 @@ struct API {
 
     @discardableResult
     func call(_ method: String, _ path: String, query: [URLQueryItem] = [],
-              body: [String: Any]? = nil) async throws -> Data {
-        let req = try request(method, path, query: query, body: body)
+              body: [String: Any]? = nil, timeout: TimeInterval = 20) async throws -> Data {
+        let req = try request(method, path, query: query, body: body, timeout: timeout)
         let (data, resp) = try await URLSession.shared.data(for: req)
         try API.check(resp, data, token: token)
         return data

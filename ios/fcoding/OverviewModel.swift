@@ -101,7 +101,6 @@ final class OverviewModel: ObservableObject {
             }
         } catch {
             if let message = app.report(error) { errorText = message }
-            if app.token == nil { ResponseCache.clear() }
         }
     }
 

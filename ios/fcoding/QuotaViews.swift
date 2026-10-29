@@ -316,7 +316,7 @@ struct QuotaTile: View {
                 + HomeLogic.resetText(w, now: now, exact: false).lowercased()
         }
         return (home.cacheLabel.map { "Số liệu cũ, " + $0 + ". " } ?? "")
-            + "Hạn mức tài khoản \(current + 1) trên \(accounts.count):\(a.email), \(a.plan ?? "")\(a.org.map { " " + $0 } ?? ""), \(detail). Chạm để xem chi tiết."
+            + "Hạn mức tài khoản \(current + 1) trên \(accounts.count): \(a.email), \(a.plan ?? "")\(a.org.map { " " + $0 } ?? ""), \(detail). Chạm để xem chi tiết."
     }
 }
 
@@ -634,11 +634,14 @@ struct QuotaDetailView: View {
                     .foregroundColor(pace.level == .normal ? .primary : pace.level.color)
                 + Text(" (\(lo.label))")
         }
-        if home.failed || accounts.contains(where: \.stale) {
+        let saved = home.cacheLabel
+        // A failed saved copy already reads "Cũ · <time>": no second "⚠ Cũ".
+        if (home.failed && saved == nil) || (!home.failed && accounts.contains(where: \.stale)) {
             line = line + Text(" · ") + Text("⚠ Cũ").foregroundColor(.paneWarn)
         }
-        if let saved = home.cacheLabel {
-            line = line + Text(" · ") + Text(saved).foregroundColor(.paneMuted)
+        if let saved = saved {
+            line = line + Text(" · ") + Text((home.failed ? "⚠ " : "") + saved)
+                .foregroundColor(home.failed ? .paneWarn : .paneMuted)
         }
         return line.scaledFont(14)
     }
