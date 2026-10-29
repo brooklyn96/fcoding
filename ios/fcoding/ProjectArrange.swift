@@ -24,7 +24,8 @@ final class PrefsModel: ObservableObject {
         guard let api = app.api, !saving else { return }
         let at = saves
         guard let reply = try? await api.get("api/prefs", as: ProjectPrefs.self), at == saves, !saving else { return }
-        keep(reply)
+        // Not after a sign-out or re-pair that happened while the request was out.
+        if app.token == api.token { keep(reply) }
     }
 
     /// PUT the new prefs; shown at once, put back as they were when the box refuses. Returns the
@@ -38,7 +39,7 @@ final class PrefsModel: ObservableObject {
         prefs = new
         do {
             let data = try await api.call("PUT", "api/prefs", body: ["order": new.order, "aliases": new.aliases])
-            keep((try? JSONDecoder().decode(ProjectPrefs.self, from: data)) ?? new)
+            if app.token == api.token { keep((try? JSONDecoder().decode(ProjectPrefs.self, from: data)) ?? new) }
             return nil
         } catch {
             prefs = old
