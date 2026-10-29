@@ -4621,16 +4621,16 @@ test('GET /api/home box: the restart rule never fights a known run: the estimate
   const clock = { t: 1_700_000_000_000 };
   const t0 = clock.t;
   try {
-    s.ls([boxRec(clock, { maxRunMinutes: 480 })]); // the run started 1 h ago
+    s.ls([boxRec(clock)]); // the run started 1 h ago, max run 240 min (not the default 480)
     await withApp(async (c) => {
       const { cookie } = await c.login();
       await stagingOf(c, cookie);
       const b = await homeBox(c, cookie); // the stored estimate is 491 min old (past sleep + cooldown), the record is right
-      assert.deepEqual([b.source, b.sleepsAt], ['instabox', new Date(t0 + 7 * HOUR).toISOString()]);
+      assert.deepEqual([b.source, b.sleepsAt], ['instabox', new Date(t0 + 3 * HOUR).toISOString()]);
       fs.writeFileSync(path.join(s.dir, 'ls-fail'), '');
       for (let i = 0; i < 22; i++) { clock.t += 30e3; c.app.tickBox(); } // 11 min with regular ticks: the record is past BOX_REC_MS
       const e = await homeBox(c, cookie);
-      assert.deepEqual([e.source, e.sleepsAt], ['estimate', new Date(t0 + 7 * HOUR).toISOString()]); // the same moment, not now + 8 h
+      assert.deepEqual([e.source, e.sleepsAt, e.maxRunMinutes], ['estimate', new Date(t0 + 3 * HOUR).toISOString(), 240]); // the same moment and max run, not 480 / now + 8 h
       assert.equal(JSON.parse(fs.readFileSync(path.join(c.configDir, 'box-timer.json'), 'utf8')).resume, t0 - HOUR); // and stored as the true run start
     }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t, boxName: 'coder', bootIdFile: path.join(s.dir, 'no-boot-id'),
       seedConfig: (d) => fs.writeFileSync(path.join(d, 'box-timer.json'), JSON.stringify({ resume: t0 - 491 * 60e3, tick: t0 - 10e3, boot: null })) });

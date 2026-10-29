@@ -1716,6 +1716,7 @@ export function createApp(opts = {}) {
   // rec: this box's record from the cached `instabox ls` (staging part: stale-while-revalidate, never waited for here) with the time it was read.
   // instabox's own numbers win: sleeps at runStartedAt + maxRunMinutes (a paused box: its cooldownUntil is the wake, which the app reads as
   // sleepsAt + cooldown). A record read before the last resume (a tick gap) or older than BOX_REC_MS is not used: the estimate answers until a new one lands.
+  let boxNums = BOX; // maxRun / idle pause / cooldown of the estimate: the last record's, so a lapsed record does not change them
   function boxInfo(rec) {
     tick();
     const t = now();
@@ -1725,15 +1726,16 @@ export function createApp(opts = {}) {
       const paused = ib.state !== 'running' && ib.cooldownUntil > t;
       // the estimate follows the known run start (tickBox stores it too): it stays right when the record lapses and never restarts against a live run
       if (!paused && ib.runStartedAt <= t) boxResume = ib.runStartedAt;
+      boxNums = { maxRunMinutes: ib.maxRunMinutes, idlePauseMinutes: ib.idlePauseMinutes, cooldownMinutes: ib.cooldownMinutes };
       const at = paused ? ib.cooldownUntil - cool : ib.runStartedAt + ib.maxRunMinutes * 60e3;
-      return { state: 'running', sleepsAt: paused || at > t ? iso(at) : null, maxRunMinutes: ib.maxRunMinutes, idlePauseMinutes: ib.idlePauseMinutes, cooldownMinutes: ib.cooldownMinutes, source: 'instabox' };
+      return { state: 'running', sleepsAt: paused || at > t ? iso(at) : null, ...boxNums, source: 'instabox' };
     }
-    const maxMs = BOX.maxRunMinutes * 60e3;
+    const maxMs = boxNums.maxRunMinutes * 60e3;
     let at = boxResume + maxMs;
     // We are answering this request, so the box runs. An estimate already past its sleep time plus a whole cooldown is wrong (a pause the
     // tick gap did not catch): the run starts again now, or the ring stays at "--:--" for good.
-    if (t > at + BOX.cooldownMinutes * 60e3) { boxResume = t; at = t + maxMs; }
-    return { state: 'running', sleepsAt: at > t ? iso(at) : null, ...BOX, source: 'estimate' };
+    if (t > at + boxNums.cooldownMinutes * 60e3) { boxResume = t; at = t + maxMs; }
+    return { state: 'running', sleepsAt: at > t ? iso(at) : null, ...boxNums, source: 'estimate' };
   }
   // fresh (?fresh=1): each part older than freshMin is read again now and waited for, freshWait at most; else as the cache holds it
   async function homeView(fresh = false) {
