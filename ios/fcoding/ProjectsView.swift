@@ -21,6 +21,7 @@ struct ProjectsView: View {
     @StateObject private var home = HomeModel()
     @StateObject private var prefs = PrefsModel()
     @State private var path = NavigationPath()
+    @State private var wasBackground = false
     @State private var project = "all"
     @AppStorage("inbox.open.running") private var runningOpen = true
     @AppStorage("inbox.open.idle") private var idleOpen = false
@@ -127,6 +128,16 @@ struct ProjectsView: View {
                     await home.load(app)
                     await names
                     try? await Task.sleep(nanoseconds: 60_000_000_000)
+                }
+            }
+            .onChange(of: scenePhase) { phase in
+                // A real return from the background with the list on screen: start the home and
+                // prefs requests now (the launch's own start in AppState.init). The loads below
+                // start them too when this has not, so there is one request each either way.
+                if phase == .background { wasBackground = true }
+                else if phase == .active, wasBackground {
+                    wasBackground = false
+                    if path.isEmpty { app.prefetch() }
                 }
             }
             .onChange(of: path) { newPath in

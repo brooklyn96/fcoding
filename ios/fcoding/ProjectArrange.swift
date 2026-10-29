@@ -11,6 +11,9 @@ final class PrefsModel: ObservableObject {
     /// Saves started so far; a GET that began before one is dropped (it may carry the old prefs).
     private var saves = 0
     private var saving = false
+    /// When the last save ended: a prefs GET that began before it may carry the old prefs, so
+    /// the one started at launch is not taken after it (see AppState.get).
+    private var lastSave = Date.distantPast
 
     init() {
         let data = UserDefaults.standard.data(forKey: PrefsModel.cacheKey)
@@ -23,7 +26,8 @@ final class PrefsModel: ObservableObject {
     func load(_ app: AppState) async {
         guard let api = app.api, !saving else { return }
         let at = saves
-        guard let reply = try? await api.get("api/prefs", as: ProjectPrefs.self), at == saves, !saving else { return }
+        guard let got = try? await app.get(api, "api/prefs", since: lastSave),
+              let reply = try? JSONDecoder().decode(ProjectPrefs.self, from: got.data), at == saves, !saving else { return }
         // Not after a sign-out or re-pair that happened while the request was out.
         if app.token == api.token { keep(reply) }
     }
@@ -35,7 +39,7 @@ final class PrefsModel: ObservableObject {
         let old = prefs
         saves += 1
         saving = true
-        defer { saving = false }
+        defer { saving = false; lastSave = Date() }
         prefs = new
         do {
             let data = try await api.call("PUT", "api/prefs", body: ["order": new.order, "aliases": new.aliases])

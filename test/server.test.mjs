@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import { createApp, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, strictOrigin, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock,
-  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, releaseRunOf, parseUpdates, gateStatusOf, gateRunOf, resetReply, RESET_MSG, BOX, memo, codexChildMeta, parseGitSync, ompDirName, ompHead, parseStaging, KNOWN_VERSIONS, repoOfLink } from '../server.mjs';
+  boxOf, parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, releaseRunOf, parseUpdates, gateStatusOf, gateRunOf, resetReply, RESET_MSG, BOX, memo, codexChildMeta, parseGitSync, ompDirName, ompHead, parseStaging, KNOWN_VERSIONS, repoOfLink } from '../server.mjs';
 
 process.env.TZ = 'America/Los_Angeles'; // spend days follow config.json timeZone, never the process zone: a third zone proves it
 
@@ -4308,7 +4308,7 @@ if (process.argv[2] === '--version') console.log('omp/18.12.6'); else process.ex
   fs.writeFileSync(path.join(dir, 'instabox.mjs'), `import fs from 'node:fs';
 const d = ${JSON.stringify(dir)}, a = process.argv.slice(2);
 fs.appendFileSync(d + '/instabox.log', JSON.stringify({ argv: a, key: process.env.INSTABOX_API_KEY ?? null }) + '\\n');
-if (a[0] === 'ls') { if (fs.existsSync(d + '/ls-fail')) process.exit(2); process.stdout.write(fs.readFileSync(d + '/ls.json', 'utf8')); }
+if (a[0] === 'ls') setTimeout(() => { if (fs.existsSync(d + '/ls-fail')) process.exit(2); process.stdout.write(fs.readFileSync(d + '/ls.json', 'utf8')); }, fs.existsSync(d + '/ls-slow') ? 1500 : 0)
 else if (a[0] === 'start') setTimeout(() => process.exit(fs.existsSync(d + '/start-fail') ? 3 : 0), 400); // a start takes a moment\n`);
   fs.writeFileSync(path.join(dir, 'ls.json'), '[]');
   return {
@@ -4505,6 +4505,152 @@ test('POST staging/start: a failing start logs one line (no key); ls down with n
       assert.deepEqual([r.status, r.json], [503, { ok: false, error: 'staging_unavailable' }]);
       assert.equal(s.calls().filter((x) => x.argv[0] === 'start').length, 1); // only the first app's
     }, { instabox: s.instabox, instaboxKey: 'ibk_test' });
+  } finally { s.cleanup(); }
+});
+
+// box ring: GET /api/home box from the box's own instabox record (hostname instabox-<name>), the estimate otherwise
+const HOUR = 3600e3;
+const boxRec = (clock, o = {}) => ({ name: 'coder', desiredState: 'running', state: 'running', maxRunMinutes: 240, runStartedAt: new Date(clock.t - HOUR).toISOString(), cooldownUntil: '2026-10-26T19:53:20.620244Z', ...o });
+const homeBox = async (c, cookie) => (await c.req('GET', '/api/home', { cookie })).json.box;
+
+test('boxOf: the box by name or id; no run, an unlimited max run or an unknown box -> null; cooldownMinutes defaults to 10', () => {
+  const r = { id: 'm_1', name: 'coder', state: 'running', maxRunMinutes: 480, runStartedAt: '2026-10-29T14:40:04.056599Z', cooldownUntil: '2026-10-26T19:53:20.620244Z' };
+  const want = { state: 'running', runStartedAt: Date.parse('2026-10-29T14:40:04.056Z'), maxRunMinutes: 480, cooldownUntil: Date.parse('2026-10-26T19:53:20.620Z'), cooldownMinutes: 10, idlePauseMinutes: 30 };
+  assert.deepEqual(boxOf([{ name: 'other' }, r], ['coder']), want);
+  assert.deepEqual(boxOf([r], ['nope', 'm_1']), want);
+  assert.deepEqual(boxOf([{ ...r, cooldownMinutes: 15, cooldownUntil: 'x' }], ['coder']), { ...want, cooldownUntil: null, cooldownMinutes: 15 });
+  assert.equal(boxOf([{ ...r, autoSuspendAfterSeconds: 1800 }], ['coder']).idlePauseMinutes, 30); // the idle pause from the record, in minutes
+  assert.equal(boxOf([{ ...r, autoSuspendAfterSeconds: 900 }], ['coder']).idlePauseMinutes, 15);
+  assert.equal(boxOf([{ ...r, autoSuspendAfterSeconds: 0 }], ['coder']).idlePauseMinutes, 30); // 0 = off, or bad: the default
+  assert.equal(boxOf([r], ['zzz']), null);
+  for (const bad of [[{ ...r, maxRunMinutes: -1 }], [{ ...r, runStartedAt: null }], [{ ...r, maxRunMinutes: '480' }], 'nope', null, [null, 'x']]) assert.equal(boxOf(bad, ['coder']), null);
+});
+
+test('GET /api/home box: from the box\'s own instabox record (runStartedAt + maxRunMinutes), not the tick estimate; a paused record uses cooldownUntil; the key stays secret', async () => {
+  const s = stubDir();
+  const clock = { t: 1_700_000_000_000 };
+  try {
+    s.ls([{ name: 'alpha', state: 'running' }, boxRec(clock, { cooldownMinutes: 15, autoSuspendAfterSeconds: 900 })]);
+    for (const boxName of ['coder', 'instabox-coder']) { // the plain name or the hostname
+      await withApp(async (c) => {
+        const { cookie } = await c.login();
+        await stagingOf(c, cookie); // the first listing has landed
+        assert.deepEqual(await homeBox(c, cookie), { state: 'running', sleepsAt: new Date(clock.t + 3 * HOUR).toISOString(), maxRunMinutes: 240, idlePauseMinutes: 15, cooldownMinutes: 15, source: 'instabox' });
+        assert.ok(!JSON.stringify(c.logs).includes('ibk_test'));
+      }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t, boxName });
+    }
+    // paused (not running, cooldown ahead): the wake is cooldownUntil, which the app reads as sleepsAt + cooldown
+    s.ls([boxRec(clock, { state: 'suspended', cooldownUntil: new Date(clock.t + 5 * 60e3).toISOString() })]);
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      await stagingOf(c, cookie);
+      const b = await homeBox(c, cookie);
+      assert.deepEqual([b.source, b.sleepsAt], ['instabox', new Date(clock.t - 5 * 60e3).toISOString()]);
+    }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t, boxName: 'coder' });
+  } finally { s.cleanup(); }
+});
+
+test('GET /api/home box: a failing CLI, an unlisted box, an unlimited max run or no key -> the estimate, unchanged', async () => {
+  const s = stubDir();
+  const clock = { t: 1_700_000_000_000 };
+  const est = () => ({ state: 'running', sleepsAt: new Date(clock.t + 480 * 60e3).toISOString(), ...BOX, source: 'estimate' });
+  try {
+    for (const [ls, key, fail] of [[[boxRec(clock)], 'ibk_test', true], [[boxRec(clock, { name: 'elsewhere' })], 'ibk_test'], [[boxRec(clock, { maxRunMinutes: -1 })], 'ibk_test'], [[boxRec(clock)], null], [[], 'ibk_test']]) {
+      s.ls(ls);
+      if (fail) fs.writeFileSync(path.join(s.dir, 'ls-fail'), ''); else fs.rmSync(path.join(s.dir, 'ls-fail'), { force: true });
+      await withApp(async (c) => {
+        const { cookie } = await c.login();
+        await stagingOf(c, cookie);
+        assert.deepEqual(await homeBox(c, cookie), est());
+      }, { instabox: s.instabox, instaboxKey: key, now: () => clock.t, boxName: 'coder' });
+    }
+  } finally { s.cleanup(); }
+});
+
+test('GET /api/home box: a record read before the last resume is not used; the fresh one is, once it lands', async () => {
+  const s = stubDir();
+  const clock = { t: 1_700_000_000_000 };
+  try {
+    s.ls([boxRec(clock)]);
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      await stagingOf(c, cookie);
+      assert.equal((await homeBox(c, cookie)).source, 'instabox');
+      clock.t += 120e3; c.app.tickBox(); // a tick gap: the box slept and woke, a new run
+      s.ls([boxRec(clock, { runStartedAt: new Date(clock.t).toISOString() })]);
+      const b = await homeBox(c, cookie); // the old record is served stale by the staging part, but dated before the resume
+      assert.deepEqual([b.source, b.sleepsAt], ['estimate', new Date(clock.t + 4 * HOUR).toISOString()]); // the estimate runs on the last record's max run (240 min)
+      await c.app.homeIdle();
+      assert.deepEqual(await homeBox(c, cookie), { state: 'running', sleepsAt: new Date(clock.t + 4 * HOUR).toISOString(), maxRunMinutes: 240, idlePauseMinutes: 30, cooldownMinutes: 10, source: 'instabox' });
+    }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t, boxName: 'coder' });
+  } finally { s.cleanup(); }
+});
+
+test('GET /api/home box: a slow instabox CLI never holds /api/home back: the estimate answers within homeWait, the record is used once it lands', async () => {
+  const s = stubDir();
+  const clock = { t: 1_700_000_000_000 };
+  try {
+    s.ls([boxRec(clock)]);
+    fs.writeFileSync(path.join(s.dir, 'ls-slow'), ''); // ls takes 1.5 s
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      const t0 = Date.now();
+      const r = await c.req('GET', '/api/home', { cookie });
+      assert.ok(Date.now() - t0 < 1200, `answered in ${Date.now() - t0} ms`);
+      assert.equal(r.status, 200);
+      assert.equal(r.json.box.source, 'estimate');
+      await c.app.homeIdle(); // the slow listing lands behind the reply
+      assert.equal((await homeBox(c, cookie)).source, 'instabox');
+    }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t, boxName: 'coder', homeWaitMs: 150 });
+  } finally { s.cleanup(); }
+});
+
+test('GET /api/home box estimate: more than a cooldown past its sleep time while we answer = a missed pause: the run restarts now (never --:-- for good)', () => homeApp(async (c) => {
+  const maxMs = BOX.maxRunMinutes * 60e3;
+  for (let i = 0; i < 962; i++) { c.clock.t += 30e3; c.app.tickBox(); } // 481 min with no tick gap: inside the cooldown, still null
+  assert.equal((await c.home()).box.sleepsAt, null);
+  for (let i = 0; i < 19; i++) { c.clock.t += 30e3; c.app.tickBox(); } // 490.5 min: past sleep time + cooldown
+  assert.equal((await c.home()).box.sleepsAt, new Date(c.clock.t + maxMs).toISOString());
+  c.clock.t += 30e3; c.app.tickBox(); // the restarted run goes on from now, and is stored
+  assert.equal((await c.home()).box.sleepsAt, new Date(c.clock.t - 30e3 + maxMs).toISOString());
+  assert.equal(JSON.parse(fs.readFileSync(path.join(c.configDir, 'box-timer.json'), 'utf8')).resume, c.clock.t - 30e3);
+}));
+
+test('GET /api/home box: a record not paused, more than a cooldown past runStartedAt + max run, is not used (the estimate answers, in the future, on the record\'s own max run 240); inside the cooldown it still is', async () => {
+  const s = stubDir();
+  const clock = { t: 1_700_000_000_000 };
+  try {
+    for (const [ago, state, source, sleeps] of [[5 * HOUR, 'running', 'estimate', clock.t + 4 * HOUR], [4 * HOUR + 5 * 60e3, 'running', 'instabox', null], [5 * HOUR, 'starting', 'estimate', clock.t + 4 * HOUR]]) {
+      // max run 240 min, not the default 480; cooldownUntil in the past (the default one is ahead of this test's clock)
+      s.ls([boxRec(clock, { state, runStartedAt: new Date(clock.t - ago).toISOString(), cooldownUntil: new Date(clock.t - HOUR).toISOString() })]);
+      await withApp(async (c) => {
+        const { cookie } = await c.login();
+        await stagingOf(c, cookie);
+        const b = await homeBox(c, cookie);
+        assert.deepEqual([b.source, b.sleepsAt, b.maxRunMinutes], [source, sleeps && new Date(sleeps).toISOString(), 240]);
+      }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t, boxName: 'coder' });
+    }
+  } finally { s.cleanup(); }
+});
+
+test('GET /api/home box: the restart rule never fights a known run: the estimate follows the record, so when ls then fails past 10 min it keeps runStartedAt + max run (no restart, no jump)', async () => {
+  const s = stubDir();
+  const clock = { t: 1_700_000_000_000 };
+  const t0 = clock.t;
+  try {
+    s.ls([boxRec(clock)]); // the run started 1 h ago, max run 240 min (not the default 480)
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      await stagingOf(c, cookie);
+      const b = await homeBox(c, cookie); // the stored estimate is 491 min old (past sleep + cooldown), the record is right
+      assert.deepEqual([b.source, b.sleepsAt], ['instabox', new Date(t0 + 3 * HOUR).toISOString()]);
+      fs.writeFileSync(path.join(s.dir, 'ls-fail'), '');
+      for (let i = 0; i < 22; i++) { clock.t += 30e3; c.app.tickBox(); } // 11 min with regular ticks: the record is past BOX_REC_MS
+      const e = await homeBox(c, cookie);
+      assert.deepEqual([e.source, e.sleepsAt, e.maxRunMinutes], ['estimate', new Date(t0 + 3 * HOUR).toISOString(), 240]); // the same moment and max run, not 480 / now + 8 h
+      assert.equal(JSON.parse(fs.readFileSync(path.join(c.configDir, 'box-timer.json'), 'utf8')).resume, t0 - HOUR); // and stored as the true run start
+    }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t, boxName: 'coder', bootIdFile: path.join(s.dir, 'no-boot-id'),
+      seedConfig: (d) => fs.writeFileSync(path.join(d, 'box-timer.json'), JSON.stringify({ resume: t0 - 491 * 60e3, tick: t0 - 10e3, boot: null })) });
   } finally { s.cleanup(); }
 });
 
