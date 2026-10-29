@@ -366,7 +366,7 @@ test('SSE: retry, screen event, gone on logout', () => withApp(async (c) => {
   s2.req.destroy();
 }));
 
-test('logs hold method, path, status, ms only', () => withApp(async (c) => {
+test('logs hold method, path, status, ms and numbers only',() => withApp(async (c) => {
   const secret = '987654';
   await c.req('POST', '/api/pair', { body: { code: secret } });
   const p = await adminRequest(c.configDir, { cmd: 'pair', name: 'logtest' });
@@ -405,10 +405,11 @@ test('request log: lag from X-PC-Sent, only for a plain number', () => withApp(a
   for (const bad of ['abc', '1e99', '', '1700000000000x', '1', String(Date.now() + 2 * 86400000), String(Date.now() - 2 * 86400000)]) {
     c.logs.length = 0;
     await c.req('GET', '/', { headers: { 'X-PC-Sent': bad } });
-    assert.equal(c.logs.length, 1);
-    assert.match(c.logs[0], LOG_LINE);
-    assert.ok(!c.logs[0].includes('lag='), `${bad}: ${c.logs[0]}`);
-    if (/[a-z]/.test(bad)) assert.ok(!c.logs[0].includes(bad), bad); // the numeric ones share digits with the timestamps
+    const l = reqLines(c);
+    assert.equal(l.length, 1);
+    assert.match(l[0], LOG_LINE);
+    assert.ok(!l[0].includes('lag='), `${bad}: ${l[0]}`);
+    if (/[a-z]/.test(bad)) assert.ok(!l[0].includes(bad), bad); // the numeric ones share digits with the timestamps
   }
 }));
 
@@ -1037,7 +1038,7 @@ test('pairing: code from --pair, token once, cookie set, device persisted (keyed
     const code = /Mã ghép: (\d{6}) /.exec(out.stdout)?.[1];
     assert.ok(code, out.stdout);
     assert.match(out.stdout, /hết hạn sau 120 giây/);
-    assert.equal(c.logs.length, 0); // the code is never logged
+    assert.equal(logsOf(c).length, 0); // the code is never logged (a stall line does not count)
     const r = await pairReq(c, code, { name: 'ignored: the CLI name wins' });
     assert.equal(r.status, 200);
     assert.equal(r.json.ok, true);
@@ -3889,7 +3890,7 @@ test('fcode-new: the install.sh wrapper passes its arguments through to server.m
 
 // ======================= v1.3.1 phase 2: git sync state in GET /api/home, fcode-git-sync before a fresh session =======================
 // projects[].git from git-sync.json (the box timer fcode-git-sync); openFresh first runs `fcode-git-sync <project>` (8 s cap)
-const logsOf = (c) => c.logs.filter((l) => !/^(GET|POST|PATCH|DELETE|PUT|HEAD) /.test(l)); // the log without the access lines
+const logsOf = (c) => c.logs.filter((l) => !/^(GET|POST|PATCH|DELETE|PUT|HEAD) /.test(l) && !/^event loop blocked /.test(l)); // the log without the access lines and the stall lines (a slow runner can write one)
 const gitFile = () => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-gsync-')); return { dir, file: path.join(dir, 'git-sync.json') }; };
 
 test('parseGitSync: field mapping; wrong types, a broken file or a non-object are null on their own, never a throw', () => {
@@ -4319,9 +4320,12 @@ else if (a[0] === 'start') setTimeout(() => process.exit(fs.existsSync(d + '/sta
   };
 };
 const homeOmp = async (c, cookie) => { await c.app.homeIdle(); return (await c.req('GET', '/api/home', { cookie })).json.omp; };
+// the start-up scan may have run before the test wrote its files: step the clock past the 10 min window so the next read scans again
+const homeOmpRescan = async (c, cookie, clock) => { await c.app.homeIdle(); clock.t += 11 * 60e3; await homeOmp(c, cookie); return homeOmp(c, cookie); };
 
 test('omp format guard: known versions -> formatOk true with the omp version; a version 4 header -> false, unknown_version:4; the sessions list skips it', async () => {
   const s = stubDir();
+  const clock = { t: 1_700_000_000_000 };
   try {
     await withApp(async (c) => {
       const { cookie } = await c.login();
@@ -4331,16 +4335,17 @@ test('omp format guard: known versions -> formatOk true with the omp version; a 
     await withApp(async (c) => {
       const { cookie } = await c.login();
       ompTree(c);
-      const g = await homeOmp(c, cookie);
+      const g = await homeOmpRescan(c, cookie, clock);
       assert.deepEqual(g, { version: '18.12.6', formatOk: false, reason: 'unknown_version:4' });
       assert.ok(!(await ompGet(c, cookie)).json.sessions.some((x) => x.id === ID.d));
       assert.deepEqual(s.ompCalls().filter((x) => x === '--version').length >= 1, true);
-    }, { omp: s.omp });
+    }, { omp: s.omp, now: () => clock.t });
   } finally { s.cleanup(); }
 });
 
 test('omp format guard: an unreadable header, and a project session sitting outside the encoded dir (omp renamed its dirs), are alarms; known formats are not', async () => {
   const s = stubDir();
+  const clock = { t: 1_700_000_000_000 };
   try {
     await withApp(async (c) => { // only the newest 20 headers are looked at, whatever else lies below
       const { cookie } = await c.login();
@@ -4353,14 +4358,14 @@ test('omp format guard: an unreadable header, and a project session sitting outs
       const d = ompDirOf(c); fs.mkdirSync(d, { recursive: true });
       const bad = path.join(d, `2026-10-25T10-00-00-000Z_${ID.a}.jsonl`);
       fs.writeFileSync(bad, 'this is not json\n{"type":"session"}\n{"type":"message"}\n'); fs.utimesSync(bad, 1_700_000_000, 1_700_000_000);
-      assert.deepEqual(await homeOmp(c, cookie), { version: '18.12.6', formatOk: false, reason: 'no_header' });
-    }, { omp: s.omp });
+      assert.deepEqual(await homeOmpRescan(c, cookie, clock), { version: '18.12.6', formatOk: false, reason: 'no_header' });
+    }, { omp: s.omp, now: () => clock.t });
     await withApp(async (c) => {
       const { cookie } = await c.login();
       const d = path.join(c.root, 'omp-sessions', 'some-other-name'); fs.mkdirSync(d, { recursive: true }); // not what ompDirName gives for ABS
       fs.writeFileSync(path.join(d, `2026-10-25T10-00-00-000Z_${ID.a}.jsonl`), `{"type":"title","title":"x"}\n{"type":"session","version":3,"cwd":${JSON.stringify(ABS)}}\n{"type":"message"}\n`);
-      assert.deepEqual(await homeOmp(c, cookie), { version: '18.12.6', formatOk: false, reason: 'dir_rule' });
-    }, { omp: s.omp });
+      assert.deepEqual(await homeOmpRescan(c, cookie, clock), { version: '18.12.6', formatOk: false, reason: 'dir_rule' });
+    }, { omp: s.omp, now: () => clock.t });
     await withApp(async (c) => { // omp missing: version null, and no alarm by itself
       const { cookie } = await c.login();
       assert.deepEqual(await homeOmp(c, cookie), { version: null, formatOk: true, reason: null });
@@ -6345,8 +6350,9 @@ test('GET /api/overview: git and tmux reads run in parallel (several in flight, 
         // the same answer a serial run gives: projects in config order with their git, sessions in tmux's order with their own screen
         assert.deepEqual(r.json.projects, names.map((name) => ({ name, branch: 'main', ahead: 2, diff: { files: 0, add: 0, del: 0 } })));
         assert.deepEqual(r.json.sessions.map((x) => [x.name, x.preview]), sess.map((n) => [n, `output of ${n}`]));
-        // 6 git rounds of 3 calls and 8 captures, 150 ms each: ~ 1.2 s four at a time, ~ 3.9 s in series
-        assert.ok(took < 3000, `took ${took} ms`);
+        // 6 git rounds of 3 calls and 8 captures, 150 ms each: ~ 1.2 s four at a time, ~ 3.9 s in series plus the spawns.
+        // Process starts under load (Windows, a busy CI runner) add seconds, so the clock bound is loose; the overlap checks below are the proof.
+        assert.ok(took < 6000, `took ${took} ms`);
         const gitCalls = fs.readFileSync(gitLog, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
         const tmuxCalls = c.calls().slice(before).filter((x) => x.argv[0] === 'list-sessions' || (x.argv[0] === 'capture-pane' && !x.argv.includes('-S')));
         const caps = tmuxCalls.filter((x) => x.argv[0] === 'capture-pane');

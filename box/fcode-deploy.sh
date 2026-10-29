@@ -28,7 +28,7 @@ usage() {
   exit "${1:-65}"
 }
 
-name_ok() { [[ $1 =~ ^[a-z][a-z0-9-]{0,26}[a-z0-9]$ ]]; }
+name_ok() { [[ $1 =~ ^[a-z][a-z0-9-]{0,26}[a-z0-9]$ ]] && [[ $1 != add && $1 != allow && $1 != disallow ]]; }   # add / allow / disallow are leading commands, never project names (same as the laptop)
 repo_ok() { [[ $1 =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] && ! [[ $1 =~ ^\.+/ || $1 =~ /\.+$ ]]; }
 
 # the VPS host and the operator key; checked only when something is really sent

@@ -140,6 +140,9 @@ refuse 'name too short' a status
 refuse 'name ends with dash' demo- status
 refuse 'name starts with dash' -demo status
 refuse 'injection in name' 'x;id' status
+refuse 'allow is not a name' allow status
+refuse 'disallow is not a name' disallow status
+refuse 'allow as a name (add path)' add acme/shop allow "$DRAFT"
 refuse 'unknown verb' demo logs
 refuse 'unknown verb (rm)' demo rm
 refuse 'name only' demo
