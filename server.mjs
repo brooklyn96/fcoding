@@ -397,7 +397,7 @@ const LIST_AFTER_RESET_MS = 10e3, STALE_QUOTA_TTL = 15e3; // omp's own listing t
 const HOME_WAIT_MS = 8000; // a part with no value yet is waited for this long at most, then it is empty and fills in the background
 const FRESH_MIN_MS = 10e3, HOME_FRESH_WAIT_MS = 25e3; // GET /api/home?fresh=1: a part older than 10 s is read again and waited for, 25 s at most
 const WARM_TICK_MS = 5e3; // from boot every home part is checked this often and refreshed once it is past its own TTL (never more than one refresh at a time)
-const OVERVIEW_PAR = 4; // GET /api/overview: its git and tmux reads run at most this many at a time, each holding one of the MAX_READS slots
+const OVERVIEW_PAR = 3, OVERVIEW_KEEP = 4; // GET /api/overview: its git and tmux reads run at most this many at a time, each inside one of the MAX_READS slots; it leaves OVERVIEW_KEEP slots free (two screen reads)
 const QUOTA_STALE_MS = 10 * 60e3; // a report omp fetched longer ago than this is stale
 const DEFAULT_TZ = 'Asia/Ho_Chi_Minh';
 export const BOX = { maxRunMinutes: 480, idlePauseMinutes: 30, cooldownMinutes: 10 };
@@ -1347,20 +1347,23 @@ export function createApp(opts = {}) {
   async function overview(ctx) {
     if (reads >= MAX_READS) throw new HttpErr(503, 'busy'); // reads never queue
     if (!valid(ctx)) throw gateErr(ctx);
-    // its own read slot, plus free ones up to OVERVIEW_PAR, but never the last 3 (a screen read takes 2, another overview 1): every child
-    // runs inside a slot, so MAX_READS still bounds the children in all, and a busy server runs the job one child at a time as before
-    let width = 1; reads++; ctx.held = true;
-    while (width < OVERVIEW_PAR && reads < MAX_READS - 3) { reads++; width++; }
-    // fn over items, `width` at a time, results in item order; after an error no new item starts, the running ones end, then it is thrown
+    // the job holds its own read slot all along. fn over items, results in item order, min(OVERVIEW_PAR, items) at a time: for the length of
+    // one phase it takes the extra slots that are free, never the last OVERVIEW_KEEP (two screen reads), and gives them back at the end of
+    // the phase (listSessions runs on the own slot alone). Every child runs inside a slot, so MAX_READS still bounds the children in all,
+    // and a busy server runs the job one child at a time as before. After an error no new item starts, the running ones end, then it is thrown.
+    reads++; ctx.held = true;
     const each = async (items, fn) => {
-      const out = new Array(items.length);
-      let next = 0, err;
-      await Promise.all(Array.from({ length: Math.min(width, items.length) }, async () => {
-        while (!err && next < items.length) {
-          const i = next++;
-          try { out[i] = await fn(items[i]); } catch (e) { err ??= { e }; }
-        }
-      }));
+      const out = new Array(items.length), want = Math.min(OVERVIEW_PAR, items.length);
+      let got = 0, next = 0, err;
+      while (1 + got < want && reads < MAX_READS - OVERVIEW_KEEP) { reads++; got++; }
+      try {
+        await Promise.all(Array.from({ length: Math.min(1 + got, items.length) }, async () => {
+          while (!err && next < items.length) {
+            const i = next++;
+            try { out[i] = await fn(items[i]); } catch (e) { err ??= { e }; }
+          }
+        }));
+      } finally { reads -= got; }
       if (err) throw err.e;
       return out;
     };
@@ -1375,7 +1378,7 @@ export function createApp(opts = {}) {
         return { ...x, state, preview, menu };
       });
       return { now: Math.floor(now() / 1000), projects, sessions };
-    } finally { reads -= width; ctx.held = false; }
+    } finally { reads--; ctx.held = false; }
   }
   // the session name /api/open reuses for a project and harness
   const openName = (project, harness) => `${project}-${harness}`.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+/, '').slice(0, 32);
@@ -1587,6 +1590,8 @@ export function createApp(opts = {}) {
   // stored with stale: true and the quota value only for STALE_QUOTA_TTL, so the next request reads both again. A stored listing
   // started at or after lastResetAt stays trusted even when a later listing refresh fails (as when no reset ever happened).
   let lastResetAt = -Infinity;
+  // ?fresh=1: the listing the stored quota was built from (its refresh start), and the listing a pull already dropped the quota for
+  let quotaListingAt = -Infinity, quotaClearedFor = -Infinity;
   const quota = memo(QUOTA_TTL, async () => {
     const resetAt = lastResetAt;
     const needNew = listing.at() < resetAt;
@@ -1595,6 +1600,7 @@ export function createApp(opts = {}) {
       .catch((e) => { quotaBare = true; throw e; })]); // set now: a listing landing before usage --json ends must drop this quota
     if (u.status === 'rejected') throw u.reason;
     const q = parseQuota(JSON.parse(u.value), r.status === 'fulfilled' ? r.value.value : null, now());
+    quotaListingAt = r.status === 'fulfilled' ? r.value.at : -Infinity;
     // by the listing's age only: a later listing failure is the same with or without a past reset
     if (resetAt > -Infinity && !(r.status === 'fulfilled' && r.value.at >= resetAt)) { for (const a of q.accounts) a.stale = true; q.ttl = STALE_QUOTA_TTL; }
     if (r.status === 'fulfilled') quotaBare = false; else q.ttl = STALE_QUOTA_TTL;
@@ -1714,7 +1720,17 @@ export function createApp(opts = {}) {
     // right after a project was added or removed the cached list is not waited for (wait 0: the reply is at once, the refresh runs on)
     const projWait = projectsDirty ? 0 : homeWait; projectsDirty = false;
     const part = (m, wait) => (fresh ? m.fresh(freshWait, freshMin) : m.get(wait));
-    const [q, s, p, b, g] = await Promise.allSettled([part(quota, homeWait), part(spend, homeWait), part(projects, projWait),
+    // a pull reads the reset listing first (same 10 s guard, joined), then the quota: a quota built from an older listing than the one
+    // now stored is dropped once (its old value stays as the fallback) so its reset counts and targets come from the new listing. The quota
+    // gets what is left of the 25 s.
+    const t0 = Date.now();
+    const quotaPart = !fresh ? quota.get(homeWait) : (async () => {
+      await listing.fresh(freshWait, freshMin).catch(() => {});
+      const la = listing.at();
+      if (la > quotaListingAt && la !== quotaClearedFor) { quotaClearedFor = la; quota.clear(); }
+      return quota.fresh(Math.max(0, freshWait - (Date.now() - t0)), freshMin);
+    })();
+    const [q, s, p, b, g] = await Promise.allSettled([quotaPart, part(spend, homeWait), part(projects, projWait),
       instaboxKey ? part(staging, homeWait) : Promise.reject(new Error('no instabox key')), part(ompGuard, homeWait)]);
     const boxes = b.status === 'fulfilled' ? b.value.value : null; // no key, or instabox failed with nothing cached: every staging is null
     const t = now();
@@ -2212,7 +2228,7 @@ export function createApp(opts = {}) {
       }
       want('PUT');
       const prefs = normalizePrefs(parseJson(req, body), cfg.projectNames);
-      try { writeFile(file, JSON.stringify(prefs)); } catch { throw new HttpErr(500, 'storage'); }
+      try { writeFile(file, JSON.stringify(prefs)); } catch (e) { if (!e.committed) throw new HttpErr(500, 'storage'); } // renamed, only the directory fsync failed: saved
       return json(res, 200, prefs);
     }
     if (pathname === '/api/sessions') {

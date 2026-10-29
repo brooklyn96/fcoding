@@ -6215,7 +6215,7 @@ test('GET /api/home?fresh=1: a burst makes one refresh per part, waits for it, a
   const burst = await Promise.all(Array.from({ length: 5 }, () => freshHome(c)));
   assert.ok(Date.now() - t0 >= 250, 'the reply waited for the refresh');
   for (const h of burst) assert.deepEqual([pct(h), h.projects[0].prs, h.projects[1].prs], [42, [], []]);
-  assert.deepEqual(toolCounts(c), { usage: n0.usage + 1, listing: n0.listing, pr: n0.pr + 2, guard: n0.guard + 1 }); // one per part (2 projects)
+  assert.deepEqual(toolCounts(c), { usage: n0.usage + 1, listing: n0.listing + 1, pr: n0.pr + 2, guard: n0.guard + 1 }); // one per part (2 projects)
   const n1 = toolCounts(c);
   await freshHome(c); // the same instant: younger than 10 s
   c.clock.t += 9e3;
@@ -6223,7 +6223,7 @@ test('GET /api/home?fresh=1: a burst makes one refresh per part, waits for it, a
   assert.deepEqual(toolCounts(c), n1);
   c.clock.t += 2e3; // 11 s since the refresh
   await freshHome(c);
-  assert.deepEqual(toolCounts(c), { usage: n1.usage + 1, listing: n1.listing, pr: n1.pr + 2, guard: n1.guard + 1 });
+  assert.deepEqual(toolCounts(c), { usage: n1.usage + 1, listing: n1.listing + 1, pr: n1.pr + 2, guard: n1.guard + 1 });
 }));
 
 test('GET /api/home without fresh=1 (or with any other value) changes nothing: the cache answers, no part is read', () => homeApp(async (c) => {
@@ -6231,7 +6231,7 @@ test('GET /api/home without fresh=1 (or with any other value) changes nothing: t
   const n0 = toolCounts(c);
   c.setRules([['usage --json', usageAt(42)], ...baseRules()]);
   c.clock.t += 30e3; // older than 10 s, inside every TTL
-  for (const q of ['', '?fresh=0', '?fresh=true', '?fresh=', '?fresh=11', '?fresh=1x', '?other=1']) {
+  for (const q of ['', '?fresh=0', '?fresh=true', '?fresh=', '?fresh=11', '?fresh=1x', '?other=1', '?fresh=0&fresh=1']) {
     const h = await freshHome(c, q);
     assert.deepEqual([pct(h), h.projects[0].prs.length > 0], [7, true], q); // the cached quota
   }
@@ -6239,6 +6239,9 @@ test('GET /api/home without fresh=1 (or with any other value) changes nothing: t
   assert.deepEqual(toolCounts(c), n0);
   assert.equal(pct(await freshHome(c, '?fresh=%31')), 42); // %31 is the digit 1: a real flag
   assert.equal(toolCounts(c).usage, n0.usage + 1);
+  c.setRules([['usage --json', usageAt(55)], ...baseRules()]);
+  c.clock.t += 11e3;
+  assert.equal(pct(await freshHome(c, '?fresh=1&fresh=0')), 55); // a repeated key: the first value decides
 }));
 
 test('GET /api/home?fresh=1: a slow or failing part gives its old value after the wait; the rest is fresh; no retry inside 10 s', () => homeApp(async (c) => {
@@ -6333,3 +6336,66 @@ test('GET /api/overview: a git round that ends in an error stops the job, gives 
   assert.ok(await until(() => c.app.stats().reads === 0 && c.app.stats().running === 0));
   assert.equal((await c.req('GET', '/api/overview', { cookie })).status, 200); // nothing leaked
 }, { git: NO_GIT }));
+
+test('GET /api/home?fresh=1: the quota is built from a reset listing no older than 10 s (a reset made elsewhere shows at once)', () => homeApp(async (c) => {
+  await settleHome(c);
+  const codex = (h) => h.accounts.find((a) => a.harness === 'codex').resets.available;
+  assert.equal(codex(await c.home()), 1);
+  // omp usage reset run on the laptop: 3 saved resets now; nothing on this server cleared its listing
+  const text = fs.readFileSync(FIX('omp-reset-list.json'), 'utf8').replace('"availableCount": 1, "redeemableCount": 1', '"availableCount": 3, "redeemableCount": 3');
+  assert.notEqual(text, fs.readFileSync(FIX('omp-reset-list.json'), 'utf8'));
+  c.setRules([['usage reset --json', { stdout: text }], ...baseRules()]);
+  c.clock.t += 11e3; // the listing is 11 s old, inside its 5 min TTL
+  const n0 = toolCounts(c);
+  assert.equal(codex(await c.home()), 1); // no flag: the cached listing
+  assert.equal(toolCounts(c).listing, n0.listing);
+  const h = await freshHome(c);
+  assert.equal(codex(h), 3);
+  assert.ok(h.accounts.find((a) => a.harness === 'codex').resets.target); // still a target
+  assert.deepEqual([toolCounts(c).listing, toolCounts(c).usage], [n0.listing + 1, n0.usage + 1]);
+  c.clock.t += 5e3; // a second pull: the listing is 5 s old, nothing is read again
+  assert.equal(codex(await freshHome(c)), 3);
+  assert.deepEqual([toolCounts(c).listing, toolCounts(c).usage], [n0.listing + 1, n0.usage + 1]);
+  // a listing that cannot be read: the quota keeps the counts it has
+  c.setRules([['usage reset --json', { code: 1, stderr: 'boom' }], ...baseRules()]);
+  c.clock.t += 11e3;
+  assert.equal(codex(await freshHome(c)), 3);
+}));
+
+test('GET /api/overview: a cold overview and two screen reads at once all fit (1 + 2 + 2 slots), and the extra slots go back after the phase', async () => {
+  const gitDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-sgit-'));
+  try {
+    fs.writeFileSync(path.join(gitDir, 'git.mjs'), SLOW_GIT_SRC);
+    await withEnv({ FAKE_GIT_LOG: path.join(gitDir, 'log.jsonl') }, () => withApp(async (c) => {
+      const { cookie } = await c.login();
+      for (const n of ['s1', 's2', 's3']) assert.equal((await mkSession(c, cookie, n)).status, 201);
+      const projects = {};
+      for (const n of ['p1', 'p2', 'p3', 'p4', 'p5', 'p6']) { projects[n] = path.join(c.root, n); fs.mkdirSync(projects[n]); }
+      setProjects(c, projects);
+      await withEnv({ FAKE_TMUX_DELAYS: JSON.stringify({ 'display-message': 700, 'capture-pane -S': 700 }) }, async () => {
+        const ov = c.req('GET', '/api/overview', { cookie });
+        assert.ok(await until(() => c.app.stats().reads >= 3, 3000), 'the cold git phase took its extra slots');
+        const shots = await Promise.all([c.req('GET', '/api/screen/s1', { cookie }), c.req('GET', '/api/screen/s2', { cookie })]);
+        assert.deepEqual(shots.map((r) => r.status), [200, 200]);
+        assert.equal((await ov).status, 200);
+      });
+      assert.ok(await until(() => c.app.stats().reads === 0 && c.app.stats().running === 0));
+    }, { git: [process.execPath, path.join(gitDir, 'git.mjs')] }));
+  } finally { fs.rmSync(gitDir, { recursive: true, force: true }); }
+});
+
+test('prefs: an error after the rename (the directory fsync) is not a failure; any other write error is 500 storage and saves nothing', async () => {
+  const body = { order: ['my.proj', 'alpha'], aliases: { alpha: 'A1' } };
+  await withApp(async (c) => {
+    const { cookie } = await c.login();
+    const r = await putPrefs(c, cookie, body);
+    assert.deepEqual([r.status, r.json], [200, body]);
+    assert.deepEqual((await c.req('GET', '/api/prefs', { cookie })).json, body);
+  }, { writePrivate: (f, d) => { writePrivate(f, d); if (path.basename(f) === 'prefs.json') throw Object.assign(new Error('fsync'), { committed: true }); } });
+  await withApp(async (c) => {
+    const { cookie } = await c.login();
+    const r = await putPrefs(c, cookie, body);
+    assert.deepEqual([r.status, r.json], [500, { error: 'storage' }]);
+    assert.deepEqual((await c.req('GET', '/api/prefs', { cookie })).json, emptyPrefs);
+  }, { writePrivate: (f, d) => { if (path.basename(f) === 'prefs.json') throw new Error('disk full'); return writePrivate(f, d); } });
+});
