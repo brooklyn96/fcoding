@@ -679,7 +679,8 @@ function Show-Help([string]$Topic = '') {
       '>fcode deploy allow <tên> [root]',
       '    Duyệt project cho khoá của box (chạy trên laptop, không hỏi lại).',
       '    "root" thêm quyền trust on i-understand-root: in một dòng cảnh báo',
-      '    vàng rồi gửi. Cổng từ chối tên dành riêng (mã 65).',
+      '    vàng rồi gửi. Cổng từ chối tên dành riêng, deal-sync, vps-scraper',
+      '    (mã 65).',
       '>fcode deploy disallow <tên>',
       '    Thu hồi quyền đó. Project vẫn nằm trong cổng và vẫn deploy; muốn',
       '    bỏ root thì chạy thêm  fcode deploy <tên> trust off.',
@@ -984,7 +985,7 @@ function Get-DeployHost {
 # mot tu cua lenh (khong khoang trang, khong ky tu dac biet cua shell)
 function Test-DeployWord([string]$w) { $w -cmatch '\A[A-Za-z0-9._/][A-Za-z0-9._/-]{0,199}\z' }
 # ten project theo luat cua hop dong (contract C1, RE_NAME cua cong) va chu/repo; dung o moi duong cua fcode deploy
-function Test-DeployName([string]$n) { $n -cmatch '\A[a-z][a-z0-9-]{0,26}[a-z0-9]\z' }
+function Test-DeployName([string]$n) { ($n -cmatch '\A[a-z][a-z0-9-]{0,26}[a-z0-9]\z') -and $n -cnotin 'add', 'allow', 'disallow' }   # add / allow / disallow = lenh dung dau, khong the la ten project
 function Test-DeployRepo([string]$r) { ($r -cmatch '\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z') -and ($r -notmatch '\A\.+/|/\.+\z') }
 
 # chay mot lenh tren VPS qua ssh, in tung dong ngay khi tien toi (tru khi -Quiet), tra @{ Code; Lines }.

@@ -27,7 +27,7 @@ function Ok([bool]$c, [string]$What) { if (-not $c) { throw $What } }
 $tokens = $null; $errs = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($Fcode, [ref]$tokens, [ref]$errs)
 if ($errs.Count) { throw "fcode.ps1 does not parse: $($errs[0].Message)" }
-$wanted = 'Get-DeployHost', 'Test-DeployWord', 'Test-DeployName', 'Test-DeployRepo', 'Invoke-DeploySsh', 'Invoke-DeployGate', 'Read-DeployDraft', 'Test-DeployRunsIdle', 'Confirm-DeployRegister', 'Confirm-DeployKey', 'Invoke-DeployAdd', 'Invoke-DeployAllow', 'Invoke-Deploy', 'Write-IpaError'
+$wanted = 'Get-DeployHost', 'Test-DeployWord', 'Test-DeployName', 'Test-DeployRepo', 'Get-PrefsPath', 'Get-PrefsMap', 'Get-ProjectAliases', 'Invoke-DeploySsh', 'Invoke-DeployGate', 'Read-DeployDraft', 'Test-DeployRunsIdle', 'Confirm-DeployRegister', 'Confirm-DeployKey', 'Invoke-DeployAdd', 'Invoke-DeployAllow', 'Invoke-Deploy', 'Write-IpaError'
 $found = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in $wanted }, $true))
 if ($found.Count -ne $wanted.Count) { throw "fcode.ps1 lacks some of: $($wanted -join ', ')" }
 foreach ($fn in $found) { . ([scriptblock]::Create($fn.Extent.Text)) }
@@ -137,6 +137,8 @@ T 'pass-through: the ssh host is deployHost from the config (default contabo); a
 }
 T 'name rule (contract C1): 2..28 chars, letter first, letters/digits/-, no trailing -' {
   foreach ($n in 'ab', 'a1', 'a-b', 'ab-c', ('a' * 28), ('a' * 27 + '1')) { Ok (Test-DeployName $n) "accepted: $n" }
+  foreach ($n in 'add', 'allow', 'disallow') { Ok (-not (Test-DeployName $n)) "refused (leading command word): $n" }
+  Ok (Test-DeployName 'allowed') 'allowed is a fine name'; Ok (Test-DeployName 'add-on') 'add-on is a fine name'
   foreach ($n in 'a', '', 'ab-', 'a-', ('a' * 27 + '-'), ('a' * 29), '1ab', '-ab', 'aB', 'a_b', 'a.b') { Ok (-not (Test-DeployName $n)) "refused: $n" }
 }
 T 'refusals: bad name, unknown verb or an unsafe word never reach ssh (rc 65)' {
@@ -268,6 +270,29 @@ T 'allow / disallow: GATE_WARN is shown in yellow, other lines are not; the gate
   $script:Shown = New-Object Collections.ArrayList; Reset-World; Add-Rule 'ssh' '.' @(Ans @('x') 0)
   $script:Rest = @('deploy', 'allow', 'task', 'root'); [void](Invoke-Deploy)
   Eq @($script:Shown | Where-Object { $_.T -ceq $AllowWarn })[0].C 'Yellow' 'the allow root warning is yellow'
+}
+
+T 'allow / disallow / add are command words: never a project name, so `deploy allow status` can only mean "allow the project status"' {
+  foreach ($w in @(@('allow', 'allow'), @('allow', 'disallow'), @('disallow', 'add'), @('allow', 'add', 'root'))) {
+    Reset-World; Add-Rule 'ssh' '.' @(Ans @('ok') 0)
+    $r = Run-Fcode $w; Eq $r.Code 65 ($w -join ' ' + ' code'); Eq $r.Calls.Count 0 ($w -join ' ' + ' no call')
+  }
+  foreach ($w in @(@('allow', 'status'), @('disallow', 'status'))) {
+    Reset-World; Add-Rule 'ssh' '.' @(Ans @('ok') 0)
+    $r = Run-Fcode $w; Eq $r.Calls.Count 1 'one call'; Eq (($r.Calls[0].Text -split "$SEP")[2]) ("$GATE status " + $w[0]) ($w -join ' ')
+  }
+}
+T 'allow / disallow: no alias resolution (prefs alias map task -> myapp is read by the laptop but the names go to the gate literally)' {
+  $old = $env:LOCALAPPDATA; $env:LOCALAPPDATA = Join-Path $Root 'localapp'
+  try {
+    [void](New-Item -ItemType Directory -Force -Path (Join-Path $env:LOCALAPPDATA 'fcode'))
+    [IO.File]::WriteAllText((Get-PrefsPath), '{"aliases":{"task":"myapp"}}', $utf8)
+    Eq (Get-ProjectAliases)['task'] 'myapp' 'the alias map is really seeded'
+    foreach ($c in @(@('allow', 'myapp', "$GATE myapp allow"), @('allow', 'task', "$GATE task allow"), @('disallow', 'myapp', "$GATE myapp disallow"), @('disallow', 'task', "$GATE task disallow"), @('allow', 'myapp', 'root', "$GATE myapp allow root"))) {
+      Reset-World; Add-Rule 'ssh' '.' @(Ans @('GATE_EXIT 0') 0)
+      $r = Run-Fcode @($c[0..($c.Count - 2)]); Eq $r.Calls.Count 1 'one call'; Eq (($r.Calls[0].Text -split "$SEP")[2]) $c[-1] ($c -join ' ')
+    }
+  } finally { $env:LOCALAPPDATA = $old }
 }
 
 # ============================== inventory / register with a draft file ==============================
