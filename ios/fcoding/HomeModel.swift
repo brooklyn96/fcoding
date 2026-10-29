@@ -1,4 +1,8 @@
 import Foundation
+import os
+
+/// Debug level only: when the first GET /api/home of a launch leaves and lands (Console, include debug).
+private let homeLog = Logger(subsystem: "com.brooklyn96.fcoding", category: "home")
 
 /// GET /api/home for the top card, the quota detail and the project cards. The last good reply
 /// stays on screen when a refresh fails (`failed` then marks it as old).
@@ -51,7 +55,6 @@ final class HomeModel: ObservableObject {
     }
 
     private func run(_ app: AppState, fresh: Bool, force: Bool) async {
-        restore(app)
         let needed = starts + 1
         while let running = current {
             // A refresh is met only by a forced request started after it was asked for.
@@ -62,16 +65,24 @@ final class HomeModel: ObservableObject {
         let index = starts
         currentIndex = index
         currentForced = force
+        // The request leaves first, off the main actor: reading and decoding the saved copy below,
+        // and the first frames it causes on a cold launch, no longer hold it back (T26). A waiter
+        // above always comes after the first start, so the saved copy is already restored for it.
+        let api = app.api
+        let request = api.map { api in
+            Task.detached(priority: .userInitiated) { try await HomeModel.get(api, force: force, first: index == 1) }
+        }
+        restore(app)
         // Cleared inside the task, so a waiter never sees a finished task as still running.
         let task = Task {
-            await self.fetch(app, force: force)
+            if let api = api, let request = request { await self.fetch(app, api, request) }
             if self.currentIndex == index { self.current = nil }
         }
         current = task
         await task.value
     }
 
-    /// Once, before the first request: the saved reply for this server and login, if it decodes.
+    /// Once, just after the first request has left: the saved reply for this server and login, if it decodes.
     private func restore(_ app: AppState) {
         guard !restored else { return }
         restored = true
@@ -90,16 +101,22 @@ final class HomeModel: ObservableObject {
         fromCache = true
     }
 
-    private func fetch(_ app: AppState, force: Bool) async {
-        guard let api = app.api else { return }
+    /// GET api/home, run detached so it never waits for the main thread; `received` is when it landed.
+    nonisolated private static func get(_ api: API, force: Bool, first: Bool) async throws -> (data: Data, received: Date) {
+        if first { homeLog.debug("first home request: start") }
+        // ?fresh=1 may wait up to the server's HOME_FRESH_WAIT_MS (25 s) before the reply.
+        let data = try await api.call("GET", "api/home", query: force ? [URLQueryItem(name: "fresh", value: "1")] : [],
+                                      timeout: force ? 35 : 20)
+        if first { homeLog.debug("first home request: landed") }
+        return (data, Date())
+    }
+
+    private func fetch(_ app: AppState, _ api: API, _ request: Task<(data: Data, received: Date), Error>) async {
         loading = true
         defer { loading = false }
         do {
-            // ?fresh=1 may wait up to the server's HOME_FRESH_WAIT_MS (25 s) before the reply.
-            let data = try await api.call("GET", "api/home", query: force ? [URLQueryItem(name: "fresh", value: "1")] : [],
-                                          timeout: force ? 35 : 20)
+            let (data, received) = try await request.value
             let reply = try JSONDecoder().decode(HomeData.self, from: data)
-            let received = Date()
             if reply.generatedAt != nil {
                 offset = HomeLogic.clockOffset(generatedAt: reply.generatedAt, received: received)
             }
