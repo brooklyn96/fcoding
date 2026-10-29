@@ -366,21 +366,49 @@ Chi tiết cần biết:
 
 ### Deploy từ box (`fcode-deploy`)
 
-Lệnh `fcode-deploy` (cài cùng `install.sh` vào `~/.local/bin`) cho agent trên box điều khiển cổng deploy trên VPS, giống `fcode deploy` của laptop. Nó dùng **khoá ssh riêng của cổng** (`~/.ssh/fcode-operator`); khoá này chỉ chạy được các lệnh của cổng, không mở được shell hay đọc file trên VPS. Lệnh không bao giờ hỏi gì, nên agent chạy thẳng được.
+Lệnh `fcode-deploy` (cài cùng `install.sh` vào `~/.local/bin`) cho agent trên box điều khiển cổng deploy trên VPS, giống `fcode deploy` của laptop. Nó dùng **khoá ssh riêng của cổng** (`~/.ssh/fcode-operator`). Lệnh không bao giờ hỏi gì, nên agent chạy thẳng được.
 
-Cấu hình một lần: khoá `~/.ssh/fcode-operator` (chmod 600; dòng khoá công khai tương ứng do người quản trị cài trên VPS) và tên máy VPS, đặt bằng biến `FCODE_DEPLOY_HOST` hoặc ghi một dòng vào `~/.config/fcode/deploy-host`. Cần `gh` (có `GH_TOKEN`) cho lệnh `add`.
+**Khoá này làm được gì, và không làm được gì.**
+
+- Không có shell, không chạy được lệnh tự do, không xoá được secret, `authorized_keys`, deploy key hay workflow của GitHub.
+- Chỉ tác động lên project mà **người dùng đã duyệt trên laptop** (bước đầu tiên, xem dưới). Project chưa duyệt bị cổng từ chối (mã 65).
+- `add --yes` (register) và `deploy` chạy **code của repo đó trên VPS**: bằng user riêng `fcd-<tên>`, và bằng root chỉ khi người dùng duyệt kèm `root`. `register` còn nhận thư mục dưới `/opt`, `/srv`, `/var/www` và có thể dừng / chạy lại các service ngoài danh sách dành riêng của project đã duyệt. `inventory` đọc thông tin thư mục (tên, chủ, quyền, kích thước) và thử các cổng localhost.
+
+**Bước 1, trên laptop, người dùng làm (mỗi project một lần):**
+
+```sh
+fcode deploy allow <tên>          # cho khoá của box dùng project này
+fcode deploy allow <tên> root     # thêm: cho phép trust on i-understand-root (compose / script chạy root)
+fcode deploy disallow <tên>       # thu hồi
+```
+
+Chưa duyệt thì mọi lệnh của `fcode-deploy`, kể cả `status`, trả về 65 kèm một dòng "Gợi ý" bảo agent nhờ người dùng chạy đúng lệnh trên; hãy dừng và nói với người dùng, đừng tự thử cách khác.
+
+**Bước 2, cấu hình một lần trên box:**
+
+- Khoá `~/.ssh/fcode-operator` (chmod 600; dòng khoá công khai tương ứng do người quản trị cài trên VPS) và tên máy VPS, đặt bằng biến `FCODE_DEPLOY_HOST` hoặc ghi một dòng vào `~/.config/fcode/deploy-host`. Cần `gh` (có `GH_TOKEN`) cho lệnh `add`.
+- Lệnh luôn ssh với `StrictHostKeyChecking=yes`: khoá máy chủ VPS phải có sẵn trong `~/.ssh/known_hosts` của box, nếu không ssh báo lỗi 255. Nạp một lần và **so dấu vân tay với laptop** (laptop đã vào VPS nên có sẵn trong `known_hosts`; xem bằng `ssh-keygen -F <máy> -l` trên laptop):
+
+  ```sh
+  ssh-keyscan -t ed25519 <máy VPS> > /tmp/vps.key
+  ssh-keygen -lf /tmp/vps.key        # dấu vân tay này phải TRÙNG với laptop, rồi mới:
+  cat /tmp/vps.key >> ~/.ssh/known_hosts && rm /tmp/vps.key
+  ```
+
+**Lệnh:**
 
 ```sh
 fcode-deploy add <chủ/repo> <tên> <draft.json>          # kiểm tra, thêm khoá deploy chỉ đọc vào repo, in các dòng INV, rồi DỪNG (mã 0)
 fcode-deploy add <chủ/repo> <tên> <draft.json> --yes    # như trên, rồi đăng ký (sau khi kiểm tra lại Actions)
 fcode-deploy <tên> status | recheck | pause | resume
 fcode-deploy <tên> deploy <sha đủ 40 ký tự>
-fcode-deploy <tên> trust on i-understand-root           # cho phép compose / script chạy với quyền root: đọc cảnh báo trước
+fcode-deploy <tên> trust on i-understand-root           # cần duyệt "allow <tên> root" trên laptop; compose / script chạy với quyền root
 fcode-deploy <tên> trust off
 ```
 
-- Mã thoát là mã của cổng (0 xong, 1 bị từ chối hoặc rollback, 65 yêu cầu sai, 69 dịch vụ chết, 70 cần người xử lý). Riêng 65 cũng là mã khi lệnh từ chối ngay trên box (tên, sha, bản nháp sai: chưa gửi gì); 1 là lỗi công cụ (thiếu cấu hình, `gh` lỗi); 255 là ssh không nối được.
-- `add` từ chối (65) khi repo còn lượt Actions đang chạy hoặc đang chờ, và khi khoá deploy của repo có quyền ghi. Chưa có `--yes` thì không bao giờ gửi `register`.
+- **Thời gian chạy:** `add --yes` và `deploy` có thể mất tới 30 phút (dựng, dừng / chạy lại service, chờ khoẻ). Agent chạy chúng ở nền, hoặc với timeout **từ 30 phút trở lên**; nếu timeout ngắn cắt ssh giữa chừng, cổng có thể bỏ dở lượt đăng ký và để service đang dừng cho tới khi chạy `recheck`.
+- Mã thoát là mã của cổng (0 xong, 1 bị từ chối hoặc rollback, 65 yêu cầu sai hoặc chưa được duyệt, 69 dịch vụ chết, 70 cần người xử lý). Riêng 65 cũng là mã khi lệnh từ chối ngay trên box (tên, sha, bản nháp sai: chưa gửi gì); 1 là lỗi công cụ (thiếu cấu hình, `gh` lỗi); 255 là ssh không nối được (kể cả khoá máy chủ chưa có trong `known_hosts`).
+- `add` từ chối (65) khi repo còn lượt Actions đang chạy hoặc đang chờ, và khi khoá deploy của repo có quyền ghi (kiểm tra cả sau khi vừa thêm). Chưa có `--yes` thì không bao giờ gửi `register`.
 - Các project cũ `deal-sync` và `vps-scraper` dùng khoá riêng của chúng, không qua lệnh này.
 
 ## 8. Dùng từ laptop

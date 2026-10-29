@@ -42,7 +42,8 @@ case "$1 $2 $3" in
     c=0; [ -f "$FAKE/runs.$st" ] && c=$(cat "$FAKE/runs.$st"); { [ -f "$FAKE/busy" ] && [ "$st" = in_progress ]; } && c=1
     printf '['; i=0; while [ "$i" -lt "$c" ]; do [ "$i" -gt 0 ] && printf ','; printf '{"databaseId":%s}' "$i"; i=$((i + 1)); done; printf ']\n' ;;
   "repo deploy-key list") cat "$FAKE/dk.json" ;;
-  "repo deploy-key add") echo "PUB=$(cat "$4")" >>"$FAKE/gh.log"; [ -f "$FAKE/rc.gh-add" ] && exit "$(cat "$FAKE/rc.gh-add")"; exit 0 ;;
+  "repo deploy-key add") echo "PUB=$(cat "$4")" >>"$FAKE/gh.log"; [ -f "$FAKE/rc.gh-add" ] && exit "$(cat "$FAKE/rc.gh-add")"
+    if [ -f "$FAKE/dk-after-add.json" ]; then cp "$FAKE/dk-after-add.json" "$FAKE/dk.json"; else printf '[{"key":"%s fcode","readOnly":true}]' "$(cat "$4")" >"$FAKE/dk.json"; fi; exit 0 ;;
   *) exit 2 ;;
 esac
 FAKE
@@ -52,7 +53,7 @@ export PATH="$T/bin:$PATH"
 PK='ssh-ed25519 AAAAC3NzaFAKEKEY'
 KEYFILE="$T/operator-key"; : >"$KEYFILE"
 SHA40=0123456789abcdef0123456789abcdef01234567
-OPTS="-i $KEYFILE -o IdentitiesOnly=yes -o BatchMode=yes vps.test"   # what every ssh call must carry before the remote command
+OPTS="-i $KEYFILE -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes vps.test"   # what every ssh call must carry before the remote command
 DRAFT="$T/draft.json"
 printf '{"registry":{"repo":"acme/shop","name":"shop"},"units":[]}\n' >"$DRAFT"
 DSHA=$(sha256sum "$DRAFT" | cut -d' ' -f1)
@@ -95,6 +96,32 @@ reset; echo 255 >"$FAKE/rc.status"; fd demo status
 eq 'ssh failure 255 passes through' "$RC" 255
 has '255 prints a hint' 'không nối được VPS' "$T/out"
 
+# ---- host keys are checked, never auto-accepted ----
+reset; fd demo status
+has 'ssh is told StrictHostKeyChecking=yes (verb)' 'StrictHostKeyChecking=yes' "$FAKE/ssh.log"
+reset; fd add acme/shop shop "$DRAFT" --yes
+eq 'every ssh call of add carries StrictHostKeyChecking=yes' "$(grep -c 'StrictHostKeyChecking=yes' "$FAKE/ssh.log")" 3
+eq 'add made 3 ssh calls' "$(wc -l <"$FAKE/ssh.log" | tr -d ' ')" 3
+
+# ---- the project is not approved on the laptop: one hint line, the gate's exit code kept ----
+reset; printf 'GATE_ERROR operator: demo is not approved (laptop: fcode deploy allow demo [root])\nGATE_EXIT 65\n' >"$FAKE/out.status"; echo 65 >"$FAKE/rc.status"; fd demo status
+eq 'not approved: exit 65 kept' "$RC" 65
+has 'not approved: the gate line is shown' 'is not approved' "$T/out"
+has 'not approved: hint tells the agent to ask the user for the laptop approval' 'fcode deploy allow demo' "$T/out"
+eq 'not approved: exactly one hint line' "$(grep -c '^Gợi ý' "$T/out")" 1
+hasnt 'not approved: hint does not ask for root' 'allow demo root' "$T/out"
+reset; printf 'GATE_ERROR operator: trust on needs approval with root (laptop: fcode deploy allow demo root)\nGATE_EXIT 65\n' >"$FAKE/out.trust"; echo 65 >"$FAKE/rc.trust"
+echo 'PROJECT demo repo=acme/shop branch=main' >"$FAKE/out.status"; fd demo trust on i-understand-root
+eq 'needs root approval: exit 65 kept' "$RC" 65
+has 'needs root approval: hint names allow <name> root' 'fcode deploy allow demo root' "$T/out"
+reset; printf 'GATE_ERROR operator: shop is not approved\nGATE_EXIT 65\n' >"$FAKE/out.prepare-key"; echo 65 >"$FAKE/rc.prepare-key"; fd add acme/shop shop "$DRAFT" --yes
+eq 'add, not approved: exit 65 kept' "$RC" 65
+has 'add, not approved: hint with the name' 'fcode deploy allow shop' "$T/out"
+reset; printf 'GATE_ERROR something else\nGATE_EXIT 65\n' >"$FAKE/out.status"; echo 65 >"$FAKE/rc.status"; fd demo status
+eq 'other 65 refusals get no hint' "$(grep -c '^Gợi ý' "$T/out")" 0
+reset; printf 'GATE_ERROR operator: demo is not approved\nGATE_EXIT 1\n' >"$FAKE/out.status"; echo 1 >"$FAKE/rc.status"; fd demo status
+eq 'hint only on exit 65' "$(grep -c '^Gợi ý' "$T/out")" 0
+
 # ---- refused locally: nothing is sent ----
 refuse() { # refuse <label> <args...>
   local l=$1; shift; reset; fd "$@"
@@ -129,6 +156,7 @@ refuse 'add repo with ..' add ../x shop "$DRAFT"
 refuse 'add bad name' add acme/shop Shop "$DRAFT"
 refuse 'add reserved name' add acme/shop gate "$DRAFT"
 refuse 'add legacy name' add acme/shop deal-sync "$DRAFT"
+refuse 'add reserved name registry' add acme/shop registry "$DRAFT"
 refuse 'add 5 args' add acme/shop shop "$DRAFT" --yes extra
 reset; bash "$FD" --help >"$T/out" 2>&1; eq '--help exits 0' "$?" 0
 
@@ -140,7 +168,7 @@ eq 'host that looks like an ssh option: 1' "$RC" 1; eq 'bad host: nothing sent' 
 reset; FCODE_DEPLOY_KEY="$T/none" fd demo status
 eq 'no key file: 1' "$RC" 1; eq 'no key file: nothing sent' "$(sent)" no
 reset; unset FCODE_DEPLOY_HOST; mkdir -p "$HOME/.config/fcode"; echo 'file.host' >"$HOME/.config/fcode/deploy-host"; fd demo status
-eq 'host from the config file' "$(cut -f1 "$FAKE/ssh.log")" "-n -i $KEYFILE -o IdentitiesOnly=yes -o BatchMode=yes file.host demo status"
+eq 'host from the config file' "$(cut -f1 "$FAKE/ssh.log")" "-n -i $KEYFILE -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes file.host demo status"
 rm -rf "$HOME/.config"
 
 # ---- add without --yes: checks, key, INV lines, then stop ----
@@ -164,6 +192,15 @@ has 'add: the public key was the file given to gh' "PUB=$PK" "$FAKE/gh.log"
 reset; echo '[]' >"$FAKE/dk.json"; echo 1 >"$FAKE/rc.gh-add"; fd add acme/shop shop "$DRAFT"
 eq 'add: gh refuses the key = 1' "$RC" 1
 eq 'add: gh add failed, inventory not reached' "$(calls)" "-n $OPTS shop prepare-key"
+# after adding, GitHub's list is read again and the key must be read-only
+reset; echo '[]' >"$FAKE/dk.json"; echo "[{\"key\":\"$PK fcode\",\"readOnly\":false}]" >"$FAKE/dk-after-add.json"; fd add acme/shop shop "$DRAFT" --yes
+eq 'add: key comes back with write access after adding: 65' "$RC" 65
+eq 'add: rw after adding, inventory not reached' "$(calls)" "-n $OPTS shop prepare-key"
+eq 'add: the key list was read again after adding' "$(grep -c 'deploy-key list' "$FAKE/gh.log")" 2
+reset; echo '[]' >"$FAKE/dk.json"; echo '[]' >"$FAKE/dk-after-add.json"; fd add acme/shop shop "$DRAFT" --yes
+eq 'add: key not listed after adding: 65' "$RC" 65
+reset; echo '[]' >"$FAKE/dk.json"; echo "[{\"key\":\"$PK fcode\",\"read_only\":true}]" >"$FAKE/dk-after-add.json"; fd add acme/shop shop "$DRAFT" --yes
+eq 'add: read_only:true after adding is accepted' "$RC" 0
 
 # ---- add --yes ----
 reset; fd add acme/shop shop "$DRAFT" --yes
@@ -174,7 +211,7 @@ $OPTS shop register $DSHA"
 has 'add --yes: register carries the draft on stdin' "shop register $DSHA	IN=$DSHA" "$FAKE/ssh.log"
 has 'add --yes: next steps printed' "fcode-deploy shop status" "$T/out"
 reset; fd add --yes acme/shop shop "$DRAFT"
-eq 'add: --yes before the arguments works too' "$(calls | tail -n 1 | cut -d' ' -f8-9)" "shop register"
+eq 'add: --yes before the arguments works too' "$(calls | tail -n 1 | cut -d" " -f10-11)" "shop register"
 reset; echo 70 >"$FAKE/rc.register"; echo 'BLOCKED x' >"$FAKE/out.status"; fd add acme/shop shop "$DRAFT" --yes
 eq 'add --yes: register 70 passes through' "$RC" 70
 has 'add --yes: 70 shows status' 'BLOCKED x' "$T/out"

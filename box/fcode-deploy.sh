@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # fcode-deploy (runs ON the coder box, installed as ~/.local/bin/fcode-deploy): drives the deploy gate on the VPS through the gate's operator
-# key. That key can run only the gate's own verbs (no shell, no file read). The same verbs as the laptop's `fcode deploy`; never interactive,
-# so an agent can drive it: `add` stops after the INV lines unless --yes is given.
+# key. That key gives no shell and no free-form command, and acts only on projects the user approved on the laptop
+# (`fcode deploy allow <name> [root]`); register / deploy run that repo's code on the VPS (as root only when approved with root).
+# The same verbs as the laptop's `fcode deploy`; never interactive, so an agent can drive it: `add` stops after the INV lines unless --yes.
+# `add --yes` and `deploy` can take up to 30 min: run them in the background or with a timeout of at least 30 min.
 #   fcode-deploy add <owner/repo> <name> <draft.json> [--yes]
 #   fcode-deploy <name> status | recheck | pause | resume
 #   fcode-deploy <name> deploy <sha1, 40 hex>
@@ -22,6 +24,7 @@ usage() {
   echo '  fcode-deploy <tên> deploy <sha đủ 40 ký tự>'
   echo '  fcode-deploy <tên> trust on i-understand-root | trust off'
   echo '  <tên>: chữ thường, số, dấu -, bắt đầu bằng chữ thường, không kết thúc bằng dấu -, 2 đến 28 ký tự'
+  echo '  Chỉ dùng được cho project người dùng đã duyệt trên laptop: fcode deploy allow <tên> [root]. add --yes và deploy có thể chạy tới 30 phút.'
   exit "${1:-65}"
 }
 
@@ -40,18 +43,28 @@ need_ssh() {
     || die 1 'chưa có máy chủ VPS hợp lệ: đặt FCODE_DEPLOY_HOST hoặc ghi một dòng tên máy vào ~/.config/fcode/deploy-host (chỉ chữ, số, dấu . _ @ -).'
   KEY=${FCODE_DEPLOY_KEY:-$HOME/.ssh/fcode-operator}
   [ -r "$KEY" ] || die 1 "không thấy khoá ssh của cổng: $KEY"
+  if [ -z "${T:-}" ]; then T=$(mktemp -d) || die 1 'không tạo được thư mục tạm.'; trap 'rm -rf "$T"' EXIT; fi
 }
 
-# remote <draft file or ""> <command>: one gate command over ssh; the draft (if any) is the remote stdin
+# remote <draft file or ""> <command>: one gate command over ssh; the draft (if any) is the remote stdin.
+# The host key must already be in known_hosts (StrictHostKeyChecking=yes: no prompt, no auto-accept, so nobody can stand in for the VPS).
+# stdout is copied to $T/seen: when the gate refuses 65 because the project is not approved, one line tells the agent what the user must do.
 remote() {
   local rc
   if [ -n "$1" ]; then
-    ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes "$HOST" "$2" <"$1"
+    ssh -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes "$HOST" "$2" <"$1" | tee "$T/seen"
   else
-    ssh -n -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes "$HOST" "$2"
+    ssh -n -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes "$HOST" "$2" | tee "$T/seen"
   fi
-  rc=$?
-  [ "$rc" -ne 255 ] || echo "lỗi: không nối được VPS bằng ssh $HOST (mã 255). Kiểm tra FCODE_DEPLOY_HOST và khoá $KEY." >&2
+  rc=${PIPESTATUS[0]}
+  [ "$rc" -ne 255 ] || echo "lỗi: không nối được VPS bằng ssh $HOST (mã 255). Kiểm tra FCODE_DEPLOY_HOST, khoá $KEY và known_hosts (khoá máy chủ phải có sẵn)." >&2
+  if [ "$rc" -eq 65 ]; then
+    if grep -q 'needs approval with root' "$T/seen"; then
+      echo "Gợi ý: '$name' chưa được duyệt quyền root. Nhờ người dùng chạy trên laptop: fcode deploy allow $name root" >&2
+    elif grep -q 'is not approved' "$T/seen"; then
+      echo "Gợi ý: '$name' chưa được duyệt cho khoá này. Nhờ người dùng chạy trên laptop: fcode deploy allow $name" >&2
+    fi
+  fi
   return "$rc"
 }
 
@@ -96,12 +109,18 @@ runs_idle() {
   return 0
 }
 
+# key_state: sets $st = none | ro | rw for $pk in the Deploy keys of $repo (a gh failure ends the run with 1)
+key_state() {
+  o=$(gh repo deploy-key list -R "$repo" --json key,readOnly 2>&1) && st=$(printf '%s' "$o" | node -e "$KEYS_JS" "$pk") \
+    || die 1 "gh không đọc được Deploy keys của $repo. ${o%%$'\n'*}"
+}
+
 cmd_add() {
   local yes=0 a pos=() repo name draft info sha drepo dname out rc pk l st o last
   for a in "$@"; do if [ "$a" = --yes ]; then yes=1; else pos+=("$a"); fi; done
   [ "${#pos[@]}" -eq 3 ] || usage
   repo=${pos[0]} name=${pos[1]} draft=${pos[2]}
-  case $name in deal-sync | vps-scraper | all | admin | gate | gen | src | build | poll | report | slot | legacy) usage ;; esac
+  case $name in deal-sync | vps-scraper | all | admin | gate | gen | src | build | poll | report | slot | legacy | registry) usage ;; esac
   repo_ok "$repo" && name_ok "$name" || usage
   command -v node >/dev/null || die 1 'không tìm thấy node.'
   T=$(mktemp -d) || die 1 'không tạo được thư mục tạm.'
@@ -127,8 +146,7 @@ cmd_add() {
     if [[ $l =~ ^([^[:space:]]+)[[:space:]]+(AAAA[^[:space:]]+) ]]; then pk="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"; break; fi
   done <<<"$out"
   [ -n "$pk" ] || { printf '%s\n' "$out"; die 1 "cổng không trả về khoá công khai của '$name'."; }
-  o=$(gh repo deploy-key list -R "$repo" --json key,readOnly 2>&1) && st=$(printf '%s' "$o" | node -e "$KEYS_JS" "$pk") \
-    || die 1 "gh không đọc được Deploy keys của $repo. ${o%%$'\n'*}"
+  key_state
   case $st in
     rw)
       echo "lỗi: khoá deploy của '$name' đã nằm trong Deploy keys của $repo nhưng CÓ quyền ghi (Allow write access). Cổng chỉ dùng khoá chỉ đọc nên không dùng lại." >&2
@@ -141,6 +159,12 @@ cmd_add() {
         echo "  Thêm tay ở https://github.com/$repo/settings/keys/new (KHÔNG tích Allow write access), khoá công khai: $pk" >&2
         exit 1
       }
+      key_state   # trust but verify: the key GitHub now lists must be read-only
+      if [ "$st" != ro ]; then
+        echo "lỗi: sau khi thêm, khoá deploy của '$name' không ở trạng thái chỉ đọc trong Deploy keys của $repo (kết quả: $st). Không dùng." >&2
+        echo "  Xoá khoá đó ở https://github.com/$repo/settings/keys rồi chạy lại. Khoá công khai: $pk" >&2
+        exit 65
+      fi
       echo "[1] Đã thêm khoá chỉ đọc vào Deploy keys của $repo" ;;
     *) echo "[1] Khoá deploy của '$name' đã nằm trong Deploy keys của $repo (chỉ đọc), dùng lại" ;;
   esac
