@@ -1596,7 +1596,8 @@ export function createApp(opts = {}) {
       const old = await Promise.all(deployWorkflows(workflows).filter((w) => w.id != null).map((w) => runList(1, '--workflow', String(w.id))));
       out.lastRun = runOf(old.flat().filter(Boolean).sort((a, b) => (a.createdAt < b.createdAt) - (a.createdAt > b.createdAt)));
     }
-    if (!out.lastRun) out.lastRun = releaseRunOf(await gh('release', 'list', '--limit', '10', '--exclude-drafts', '--exclude-pre-releases', '--json', 'tagName,publishedAt,isLatest'), out.repo); // no deploy line: the latest release
+    // no deploy line and the Actions reads worked and the repo has no deploy workflow: its latest release (a failed read is "unknown", never a release)
+    if (!out.lastRun && Array.isArray(runs) && Array.isArray(workflows) && !deployWorkflows(workflows).length) out.lastRun = releaseRunOf(await gh('release', 'list', '--limit', '10', '--exclude-drafts', '--exclude-pre-releases', '--json', 'tagName,publishedAt,isLatest'), out.repo);
     return out;
   }
   const projects = memo(PROJECTS_TTL, () => Promise.all(cfg.projectNames.map(projectInfo)), now);
