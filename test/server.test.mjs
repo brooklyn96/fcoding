@@ -3450,7 +3450,7 @@ test('POST /api/codex-reset: errors are not kept (a retry runs omp again); a kil
   assert.equal(c.toolCalls('usage --json').length, before + 1);
 }, { resetTimeoutMs: 500 }));
 
-test('after a reset the quota waits for the new listing; a listing that is late or fails marks the accounts stale, briefly cached', () => homeApp(async (c) => {
+test('after a reset the reset counts wait for the new listing; a listing that is late or fails marks the accounts stale until one lands', () => homeApp(async (c) => {
   const body = { accountId: 'openai-codex/4', requestId: '0f8f7a6e-1111-4222-8333-000000000099' };
   await c.warm();
   assert.equal((await c.home()).accounts[3].resets.available, 1);
@@ -3463,20 +3463,18 @@ test('after a reset the quota waits for the new listing; a listing that is late 
   assert.deepEqual([cx.resets.available, cx.stale], [1, true]); // not ready within homeWait: the old count, marked stale
   cx = (await c.homeUntil((h) => !h.accounts[3].stale)).accounts[3];
   assert.equal(cx.resets.available, 0); // the refresh waited for the new listing: its count, not the old one
-  // the listing fails after a reset: the old count is shown marked stale and read again within 15 s, not kept 60 s
+  // the listing fails after a reset: the old count is shown marked stale until a listing fetched after the reset lands
   c.setRules([['usage reset --json', { code: 1, stderr: 'down' }], ['usage reset openai-codex/4', { stdout: RESET_OK }], ...baseRules()]);
   assert.equal((await c.reset({ ...body, requestId: `${body.requestId}-2` })).json.result, 'reset');
   cx = (await c.home()).accounts[3];
   assert.equal(cx.stale, true);
-  const reads = c.toolCalls('usage --json').length;
   c.clock.t += 16e3;
   c.setRules([['usage reset --json', { stdout: JSON.stringify(spent) }], ...baseRules()]);
-  await c.home(); // the short-lived stale value has expired: served once more while the refresh runs
-  await waitFor(() => c.toolCalls('usage --json').length > reads);
+  assert.equal((await c.home()).accounts[3].stale, true); // inside the listing's 60 s retry delay: not asked again, still stale
   c.clock.t += 61e3; // the listing's retry delay after its failure is over
   cx = (await c.homeUntil((h) => !h.accounts[3].stale && h.accounts[3].resets.available === 0)).accounts[3];
   assert.deepEqual([cx.resets.available, cx.stale], [0, false]);
-}, { homeWaitMs: 600, listAfterResetMs: 8000 }));
+}, { homeWaitMs: 600 }));
 
 test('two resets close together: a listing fetched before the second reset never gives its count as fresh', () => homeApp(async (c) => {
   const id = (n) => `0f8f7a6e-1111-4222-8333-0000000001${n}0`;
@@ -3502,7 +3500,7 @@ test('two resets close together: a listing fetched before the second reset never
   await c.app.homeIdle();
   c.clock.t += 20e3; // also later: the fresh 0 stays (no old count stored for 60 s)
   assert.deepEqual([(await c.home()).accounts[3].resets.available], [0]);
-}, { homeWaitMs: 600, listAfterResetMs: 8000 }));
+}, { homeWaitMs: 600 }));
 
 test('after a reset and a good listing, a later listing failure is handled as without a reset: not stale, 60 s TTL', () => homeApp(async (c) => {
   await c.warm();
@@ -3524,9 +3522,9 @@ test('after a reset and a good listing, a later listing failure is handled as wi
   await c.home();
   await c.app.homeIdle();
   assert.equal(c.toolCalls('usage --json').length, reads);
-}, { homeWaitMs: 600, listAfterResetMs: 8000 }));
+}, { homeWaitMs: 600 }));
 
-test('cold start: a quota built before a slow first listing is dropped when the listing lands; without one it is kept 15 s only', () => homeApp(async (c) => {
+test('cold start: a first listing slower than its wait gives ~ ids and no target; the real ids follow at the next reply and the quota is not read again', () => homeApp(async (c) => {
   const ids = (h) => h.accounts.map((a) => a.id).join(' ');
   c.setRules([['usage reset --json', { file: FIX('omp-reset-list.json'), delay: 1500 }], ...baseRules()]); // slower than homeWait / 2
   let h = await c.home();
@@ -3544,7 +3542,7 @@ test('cold start: a quota built before a slow first listing is dropped when the 
   assert.equal(c.toolCalls('usage --json').length, reads);
 }, { homeWaitMs: 600 }));
 
-test('cold start: a first listing that lands after its wait but before usage --json ends still drops the quota', () => homeApp(async (c) => {
+test('cold start: a first listing that lands after its wait but before usage --json ends: real ids at the next reply', () => homeApp(async (c) => {
   // listing wait 300 ms (homeWait / 2), listing 700 ms, usage --json 1.5 s
   c.setRules([['usage reset --json', { file: FIX('omp-reset-list.json'), delay: 700 }], ['usage --json', { file: FIX('omp-usage.json'), delay: 1500 }], ...baseRules()]);
   await c.home();
@@ -3555,18 +3553,18 @@ test('cold start: a first listing that lands after its wait but before usage --j
   assert.equal(h.accounts[3].resets.target, 'openai-codex/4');
 }, { homeWaitMs: 600 }));
 
-test('cold start: the first listing fails: the quota with ~ ids is read again after 15 s, not 60 s', () => homeApp(async (c) => {
+test('cold start: the first listing fails: ~ ids until the listing is asked again after its 60 s retry delay; then the ids are real at once', () => homeApp(async (c) => {
   c.setRules([['usage reset --json', { code: 1, stderr: 'down' }], ...baseRules()]);
   assert.equal((await c.home()).accounts[3].resets.target, null);
   await c.app.homeIdle();
-  const reads = c.toolCalls('usage --json').length;
+  const asked = c.toolCalls('usage reset --json').length;
   c.clock.t += 16e3;
-  await c.home(); await c.app.homeIdle();
-  assert.equal(c.toolCalls('usage --json').length, reads + 1);
+  assert.equal((await c.home()).accounts[3].resets.target, null);
+  assert.equal(c.toolCalls('usage reset --json').length, asked); // not asked again before the retry delay
   c.setRules(baseRules()); // omp's listing is back after its 60 s retry delay
   c.clock.t += 61e3;
-  await c.home(); await c.app.homeIdle(); await c.app.homeIdle();
-  assert.equal((await c.home()).accounts[3].resets.target, 'openai-codex/4'); // dropped when the listing landed
+  await c.home(); await c.app.homeIdle();
+  assert.equal((await c.home()).accounts[3].resets.target, 'openai-codex/4'); // built from the listing as it landed
 }, { homeWaitMs: 600 }));
 
 test('box timer: kept across a server restart within 90 s of the last tick on the same boot (box-timer.json); a longer gap or a reboot is a new run', async () => {
@@ -6337,7 +6335,7 @@ test('GET /api/overview: a git round that ends in an error stops the job, gives 
   assert.equal((await c.req('GET', '/api/overview', { cookie })).status, 200); // nothing leaked
 }, { git: NO_GIT }));
 
-test('GET /api/home?fresh=1: the quota is built from a reset listing no older than 10 s (a reset made elsewhere shows at once)', () => homeApp(async (c) => {
+test('GET /api/home?fresh=1: the reset listing is a part of its own: a reset made elsewhere shows on the next pull', () => homeApp(async (c) => {
   await settleHome(c);
   const codex = (h) => h.accounts.find((a) => a.harness === 'codex').resets.available;
   assert.equal(codex(await c.home()), 1);
@@ -6399,3 +6397,34 @@ test('prefs: an error after the rename (the directory fsync) is not a failure; a
     assert.deepEqual((await c.req('GET', '/api/prefs', { cookie })).json, emptyPrefs);
   }, { writePrivate: (f, d) => { if (path.basename(f) === 'prefs.json') throw new Error('disk full'); return writePrivate(f, d); } });
 });
+
+const resetsOf = (h) => h.accounts.find((a) => a.harness === 'codex').resets.available;
+const listingWith = (n, delay) => ({ stdout: fs.readFileSync(FIX('omp-reset-list.json'), 'utf8').replace('"availableCount": 1, "redeemableCount": 1', `"availableCount": ${n}, "redeemableCount": ${n}`), delay });
+
+test('GET /api/home?fresh=1: a slow reset listing does not hold back or age the quota: new numbers, not stale; the old reset count until the listing lands', () => homeApp(async (c) => {
+  await settleHome(c);
+  assert.equal(resetsOf(await c.home()), 1);
+  c.setRules([['usage --json', usageAt(42)], ['usage reset --json', listingWith(3, 2000)], ...baseRules()]); // the listing takes 2 s, the wait is 1.5 s
+  c.clock.t += 11e3;
+  const t0 = Date.now();
+  let h = await freshHome(c);
+  const took = Date.now() - t0;
+  assert.ok(took >= 1300 && took < 2400, `took ${took} ms`); // the listing ran past the wait
+  assert.equal(pct(h), 42); // the quota is the new one ...
+  assert.ok(h.accounts.every((a) => !a.stale)); // ... and not marked old
+  assert.equal(resetsOf(h), 1); // the listing gave its old value (fresh: false inside the memo)
+  await c.app.homeIdle(); // the slow listing lands
+  h = await c.home();
+  assert.deepEqual([resetsOf(h), pct(h), h.accounts.every((a) => !a.stale)], [3, 42, true]);
+}, { homeFreshWaitMs: 1500 }));
+
+test('GET /api/home?fresh=1: the quota and the reset listing are read side by side: 1.5 s + 1.5 s takes about 1.5 s', () => homeApp(async (c) => {
+  await settleHome(c);
+  c.setRules([['usage --json', { ...usageAt(42), delay: 1500 }], ['usage reset --json', listingWith(3, 1500)], ...baseRules()]);
+  c.clock.t += 11e3;
+  const t0 = Date.now();
+  const h = await freshHome(c);
+  const took = Date.now() - t0;
+  assert.ok(took >= 1400 && took < 2700, `took ${took} ms`); // in series it would be 3 s and more
+  assert.deepEqual([resetsOf(h), pct(h), h.accounts.every((a) => !a.stale)], [3, 42, true]);
+}));

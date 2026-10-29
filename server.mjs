@@ -393,7 +393,6 @@ export function pairPage(appLink) {
 
 // ---------- home screen v2 (CONTRACT.md A8): quota, spend, box timer, projects, updates, Codex reset ----------
 const QUOTA_TTL = 60e3, LISTING_TTL = 300e3, SPEND_TTL = 300e3, PROJECTS_TTL = 120e3, GATE_CONFIG_TTL = 600e3, RUN_WINDOW = 100; // RUN_WINDOW: Actions runs read per project (deploy line and PR checks)
-const LIST_AFTER_RESET_MS = 10e3, STALE_QUOTA_TTL = 15e3; // omp's own listing timeout is 10 s
 const HOME_WAIT_MS = 8000; // a part with no value yet is waited for this long at most, then it is empty and fills in the background
 const FRESH_MIN_MS = 10e3, HOME_FRESH_WAIT_MS = 25e3; // GET /api/home?fresh=1: a part older than 10 s is read again and waited for, 25 s at most
 const WARM_TICK_MS = 5e3; // from boot every home part is checked this often and refreshed once it is past its own TTL (never more than one refresh at a time)
@@ -1572,40 +1571,27 @@ export function createApp(opts = {}) {
   }
 
   // --- GET /api/home (A8): each part cached on its own; a failing part is empty or stale, never a 500 ---
-  const listAfterReset = opts.listAfterResetMs ?? LIST_AFTER_RESET_MS;
   const freshMin = opts.freshMinMs ?? FRESH_MIN_MS, freshWait = opts.homeFreshWaitMs ?? HOME_FRESH_WAIT_MS; // tests only: shorter bounds
   const homeWait = opts.homeWaitMs ?? HOME_WAIT_MS, resetReplyMs = opts.resetReplyMs ?? RESET_REPLY_MS, resetTimeout = opts.resetTimeoutMs ?? RESET_TIMEOUT;
-  // `omp usage reset --json` (credential ids, reset counts) on its own longer TTL; the last good listing is kept on a failure
-  // A quota built with no listing at all (slow or failed first listing: `~` ids, no reset target) is kept STALE_QUOTA_TTL only,
-  // and the listing that then succeeds drops it, so the next GET is built from that listing at once.
-  let quotaBare = false;
-  const listing = memo(LISTING_TTL, async () => {
-    const v = JSON.parse(await execTool(ompSpec, ['usage', 'reset', '--json'], 30e3));
-    if (quotaBare) { quotaBare = false; quota.clear(); }
-    return v;
-  }, now, QUOTA_TTL);
-  // After a reset the reset counts must come from a listing fetched after it: a kept listing whose refresh started at or after
-  // lastResetAt. While the stored listing is older than the last reset, a quota refresh waits up to LIST_AFTER_RESET_MS (omp's own
-  // listing timeout) for one, not homeWait / 2. Without one (slow, failed, or a refresh dropped by a later reset) the accounts are
-  // stored with stale: true and the quota value only for STALE_QUOTA_TTL, so the next request reads both again. A stored listing
-  // started at or after lastResetAt stays trusted even when a later listing refresh fails (as when no reset ever happened).
-  let lastResetAt = -Infinity;
-  // ?fresh=1: the listing the stored quota was built from (its refresh start), and the listing a pull already dropped the quota for
-  let quotaListingAt = -Infinity, quotaClearedFor = -Infinity;
+  // Two parts, each its own memo: the quota (`omp usage --json`, 60 s) and the reset listing (`omp usage reset --json`: credential ids, reset
+  // counts and targets, 5 min, the last good listing is kept on a failure). The accounts of a reply are built from both when the reply is made
+  // (accountsOf), so a slow or failing listing never holds back or ages the usage numbers, and a listing that lands shows at the next reply.
+  const listing = memo(LISTING_TTL, async () => JSON.parse(await execTool(ompSpec, ['usage', 'reset', '--json'], 30e3)), now, QUOTA_TTL);
   const quota = memo(QUOTA_TTL, async () => {
-    const resetAt = lastResetAt;
-    const needNew = listing.at() < resetAt;
-    quotaBare = false; // this refresh replaces the stored value; it sets the flag again if its own listing wait fails
-    const [u, r] = await Promise.allSettled([execTool(ompSpec, ['usage', '--json'], 30e3), listing.get(needNew ? listAfterReset : homeWait / 2)
-      .catch((e) => { quotaBare = true; throw e; })]); // set now: a listing landing before usage --json ends must drop this quota
-    if (u.status === 'rejected') throw u.reason;
-    const q = parseQuota(JSON.parse(u.value), r.status === 'fulfilled' ? r.value.value : null, now());
-    quotaListingAt = r.status === 'fulfilled' ? r.value.at : -Infinity;
-    // by the listing's age only: a later listing failure is the same with or without a past reset
-    if (resetAt > -Infinity && !(r.status === 'fulfilled' && r.value.at >= resetAt)) { for (const a of q.accounts) a.stale = true; q.ttl = STALE_QUOTA_TTL; }
-    if (r.status === 'fulfilled') quotaBare = false; else q.ttl = STALE_QUOTA_TTL;
-    return q;
-  }, now, QUOTA_TTL, (q) => q.ttl);
+    const usage = JSON.parse(await execTool(ompSpec, ['usage', '--json'], 30e3));
+    return { usage, at: now() }; // the raw report and when it was read (its accounts are stale by that clock)
+  }, now, QUOTA_TTL);
+  // After a reset the reset counts must come from a listing fetched after it: a kept listing whose refresh started at or after lastResetAt.
+  // While the stored listing is older (slow, failed, or a refresh dropped by a later reset) the accounts are marked stale: true. A stored
+  // listing started at or after lastResetAt stays trusted even when a later listing refresh fails (as when no reset ever happened).
+  // No listing at all (slow or failed first listing): `~` ids and no reset target.
+  let lastResetAt = -Infinity;
+  // qv, lv: the answers of quota.get / listing.get (lv null: no listing yet) -> {accounts, byAccountId}
+  function accountsOf(qv, lv) {
+    const { accounts, byAccountId } = parseQuota(qv.value.usage, lv?.value ?? null, qv.value.at);
+    const afterReset = lastResetAt > -Infinity && !(lv && lv.at >= lastResetAt);
+    return { accounts: accounts.map((a) => ({ ...a, stale: a.stale || afterReset || !qv.fresh })), byAccountId };
+  }
   const scan = spendScanner(spendRoots, now);
   const spend = memo(SPEND_TTL, scan, now);
   // Generic deploy gate (decision-r4 §4.4). A gate project = its repo is in gate-repos.json (a JSON array of "owner/repo", added the first
@@ -1720,23 +1706,14 @@ export function createApp(opts = {}) {
     // right after a project was added or removed the cached list is not waited for (wait 0: the reply is at once, the refresh runs on)
     const projWait = projectsDirty ? 0 : homeWait; projectsDirty = false;
     const part = (m, wait) => (fresh ? m.fresh(freshWait, freshMin) : m.get(wait));
-    // a pull reads the reset listing first (same 10 s guard, joined), then the quota: a quota built from an older listing than the one
-    // now stored is dropped once (its old value stays as the fallback) so its reset counts and targets come from the new listing. The quota
-    // gets what is left of the 25 s.
-    const t0 = Date.now();
-    const quotaPart = !fresh ? quota.get(homeWait) : (async () => {
-      await listing.fresh(freshWait, freshMin).catch(() => {});
-      const la = listing.at();
-      if (la > quotaListingAt && la !== quotaClearedFor) { quotaClearedFor = la; quota.clear(); }
-      return quota.fresh(Math.max(0, freshWait - (Date.now() - t0)), freshMin);
-    })();
-    const [q, s, p, b, g] = await Promise.allSettled([quotaPart, part(spend, homeWait), part(projects, projWait),
+    // the listing is waited for half as long as the quota when it has no value yet (a slow first listing: `~` ids, filled in at a later reply)
+    const [q, l, s, p, b, g] = await Promise.allSettled([part(quota, homeWait), part(listing, homeWait / 2), part(spend, homeWait), part(projects, projWait),
       instaboxKey ? part(staging, homeWait) : Promise.reject(new Error('no instabox key')), part(ompGuard, homeWait)]);
     const boxes = b.status === 'fulfilled' ? b.value.value : null; // no key, or instabox failed with nothing cached: every staging is null
     const t = now();
     const qv = q.status === 'fulfilled' ? q.value : null;
-    const accounts = qv ? qv.value.accounts.map((a) => ({ ...a, stale: a.stale || !qv.fresh })) : [];
-    const view = s.status === 'fulfilled' ? spendView(s.value.value, accounts, qv?.value.byAccountId ?? new Map(), t, cfg.timeZone) : null;
+    const { accounts, byAccountId } = qv ? accountsOf(qv, l.status === 'fulfilled' ? l.value : null) : { accounts: [], byAccountId: new Map() };
+    const view = s.status === 'fulfilled' ? spendView(s.value.value, accounts, byAccountId, t, cfg.timeZone) : null;
     let updates = {};
     try { updates = parseUpdates(fs.readFileSync(updatesFile, 'utf8')); } catch {}
     let gits = new Map(); // read once per home reply; the projects part is cached, this is not
@@ -1766,7 +1743,10 @@ export function createApp(opts = {}) {
     if (busy) return busy.requestId === requestId ? busy.promise : Promise.reject(new HttpErr(409, 'in_progress'));
     const job = (async () => { // the lock is taken before the first await
       let acct;
-      try { acct = (await quota.get(homeWait)).value.accounts.find((a) => a.id === accountId); } catch { throw new HttpErr(503, 'unavailable'); }
+      try {
+        const [qv, lv] = await Promise.all([quota.get(homeWait), listing.get(homeWait / 2).catch(() => null)]);
+        acct = accountsOf(qv, lv).accounts.find((a) => a.id === accountId);
+      } catch { throw new HttpErr(503, 'unavailable'); }
       if (!acct) throw new HttpErr(404, 'unknown_account'); // not 'not_found', which an older server gives for the unknown route
       if (acct.harness !== 'codex') throw new HttpErr(400, 'not_allowed');
       if (!acct.resets.target) throw new HttpErr(409, 'no_target');
