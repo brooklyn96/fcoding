@@ -30,6 +30,26 @@ final class AppState: ObservableObject {
         if token != nil && !PairLink.isSupportedStored(stored) {
             unsupportedServer = PairLink.escapedAuthority(stored)
         }
+        prefetch()
+    }
+
+    /// The first home and prefs requests of an activation (see LaunchFetch).
+    let launch = LaunchFetch()
+
+    private func loginKey(_ api: API) -> String { ResponseCache.key(server: api.base.absoluteString, token: api.token) }
+
+    /// Called at launch and each time the app becomes active: opens the connection and gets the
+    /// home and prefs replies before the home screen asks for them. Nothing while unpaired.
+    func prefetch() {
+        guard let api = api else { return }
+        launch.start(key: loginKey(api), ["api/home", "api/prefs"]) { try await api.call("GET", $0) }
+    }
+
+    /// GET `path`: the reply prefetch() started a moment ago (once) when there is one, else a new
+    /// request. A request with a query (?fresh=1) is always new.
+    func get(_ api: API, _ path: String, query: [URLQueryItem] = [], timeout: TimeInterval = 20) async throws -> Data {
+        if query.isEmpty, let early = launch.take(path, key: loginKey(api)) { return try await early.value }
+        return try await api.call("GET", path, query: query, timeout: timeout)
     }
 
     static func oldBoxLine(_ address: String) -> String {

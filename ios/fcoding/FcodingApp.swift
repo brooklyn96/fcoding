@@ -36,7 +36,12 @@ struct RootView: View {
         .onChange(of: app.token) { _ in Overlay.shared.sync(app) }
         .onChange(of: app.cardState) { _ in Overlay.shared.sync(app) }
         .onChange(of: app.unsupportedServer) { _ in Overlay.shared.sync(app) }
-        .onChange(of: scenePhase) { _ in Overlay.shared.sync(app) }
+        .onChange(of: scenePhase) { phase in
+            Overlay.shared.sync(app)
+            // Back in the foreground: the home and prefs requests start before the list asks
+            // (the launch's own were started by AppState.init; LaunchFetch drops the duplicate).
+            if phase == .active { app.prefetch() }
+        }
     }
 }
 

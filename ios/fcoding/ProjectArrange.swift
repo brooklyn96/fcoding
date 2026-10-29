@@ -23,7 +23,8 @@ final class PrefsModel: ObservableObject {
     func load(_ app: AppState) async {
         guard let api = app.api, !saving else { return }
         let at = saves
-        guard let reply = try? await api.get("api/prefs", as: ProjectPrefs.self), at == saves, !saving else { return }
+        guard let data = try? await app.get(api, "api/prefs"),
+              let reply = try? JSONDecoder().decode(ProjectPrefs.self, from: data), at == saves, !saving else { return }
         // Not after a sign-out or re-pair that happened while the request was out.
         if app.token == api.token { keep(reply) }
     }

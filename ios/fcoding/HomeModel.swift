@@ -96,8 +96,8 @@ final class HomeModel: ObservableObject {
         defer { loading = false }
         do {
             // ?fresh=1 may wait up to the server's HOME_FRESH_WAIT_MS (25 s) before the reply.
-            let data = try await api.call("GET", "api/home", query: force ? [URLQueryItem(name: "fresh", value: "1")] : [],
-                                          timeout: force ? 35 : 20)
+            let data = try await app.get(api, "api/home", query: force ? [URLQueryItem(name: "fresh", value: "1")] : [],
+                                         timeout: force ? 35 : 20)
             let reply = try JSONDecoder().decode(HomeData.self, from: data)
             let received = Date()
             if reply.generatedAt != nil {
