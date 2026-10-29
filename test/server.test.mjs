@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import { createApp, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, strictOrigin, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock,
-  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, parseUpdates, gateStatusOf, gateRunOf, resetReply, RESET_MSG, BOX, memo, codexChildMeta, parseGitSync, ompDirName, ompHead, parseStaging, KNOWN_VERSIONS, repoOfLink } from '../server.mjs';
+  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, releaseRunOf, parseUpdates, gateStatusOf, gateRunOf, resetReply, RESET_MSG, BOX, memo, codexChildMeta, parseGitSync, ompDirName, ompHead, parseStaging, KNOWN_VERSIONS, repoOfLink } from '../server.mjs';
 
 process.env.TZ = 'America/Los_Angeles'; // spend days follow config.json timeZone, never the process zone: a third zone proves it
 
@@ -3221,6 +3221,56 @@ test('GET /api/home: gate-repos.json from an earlier run: no config on the head 
     const h = await c.homeUntil((x) => x.projects[0].lastRun && x.projects[1].lastRun);
     assert.deepEqual(h.projects.map((p) => p.lastRun), [SHIP, SHIP]); // not a gate project
   }, seedGate('{not json'));
+});
+
+// ---------- release line: no deploy line -> the newest published release ----------
+const REL = (tagName, publishedAt, isLatest = false) => ({ tagName, publishedAt, isLatest });
+const RELEASES = JSON.stringify([REL('v1.3.8', '2026-10-29T06:13:50Z'), REL('v1.3.9', '2026-10-29T08:47:53Z', true)]); // not sorted: the newest publishedAt wins
+const V139 = { workflow: 'v1.3.9', status: 'success', kind: 'released', at: '2026-10-29T08:47:53.000Z', url: 'https://github.com/owner/repo/releases/tag/v1.3.9' };
+// the gh.json runs and workflows without the "Ship it" deploy workflow (id 13): no deploy run
+const NO_DEPLOY = () => [['workflow list', { stdout: JSON.stringify(GH.workflows.filter((w) => w.id === 12)) }], ['run list', { stdout: JSON.stringify(GH.runs.filter((r) => r.workflowDatabaseId !== 13)) }]];
+
+test('releaseRunOf: newest publishedAt, tag sanitised, url only on github.com, nothing usable -> null', () => {
+  assert.deepEqual(releaseRunOf(JSON.parse(RELEASES), 'owner/repo'), V139);
+  const r = releaseRunOf([REL('v1\u001b[31m\nx y/z#', '2026-10-29T08:47:53Z')], 'owner/repo');
+  assert.equal(r.workflow, 'v1x y/z#'); // the ANSI sequence and the newline are gone, the rest is as is
+  assert.equal(r.url, 'https://github.com/owner/repo/releases/tag/v1%1B%5B31m%0Ax%20y/z%23');
+  const long = releaseRunOf([REL('a'.repeat(400), '2026-10-29T08:47:53Z')], 'owner/repo');
+  assert.deepEqual([long.workflow.length, long.url], [160, null]); // over the 300-character url limit
+  for (const bad of [null, {}, [], [REL('v1', 'not a date')], [REL(5, '2026-10-29T08:47:53Z')], [REL('\u001b[0m', '2026-10-29T08:47:53Z')]]) assert.equal(releaseRunOf(bad, 'owner/repo'), null, JSON.stringify(bad));
+});
+
+test('GET /api/home: no deploy run and not a gate project -> the latest release (flags: no drafts, no prereleases); a failing call -> null', () => homeApp(async (c) => {
+  c.setRules([['release list', { stdout: RELEASES }], ['commits/HEAD', NO_CONFIG], ...NO_DEPLOY(), ...baseRules()]);
+  let h = await c.homeUntil((x) => x.projects[0].lastRun && x.projects[1].lastRun);
+  assert.deepEqual(h.projects.map((p) => p.lastRun), [V139, V139]);
+  const calls = c.toolCalls('release list');
+  assert.equal(calls.length, 2); // one per project
+  assert.ok(calls.every((l) => l.includes('-R owner/repo release list --limit 10 --exclude-drafts --exclude-pre-releases --json tagName,publishedAt,isLatest')), calls[0]);
+  // a failing call, a non-JSON answer or no release: today's "no deploy line"
+  for (const rel of [{ code: 1, stderr: 'HTTP 502' }, { stdout: 'not json' }, { stdout: '[]' }]) {
+    c.setRules([['release list', rel], ['commits/HEAD', NO_CONFIG], ...NO_DEPLOY(), ...baseRules()]);
+    h = await ghRefresh(c);
+    assert.deepEqual(h.projects.map((p) => p.lastRun), [null, null]);
+  }
+}));
+
+test('GET /api/home: the release line is never read for a project with a deploy run or for a gate project', async () => {
+  await homeApp(async (c) => { // a deploy run exists: the Actions line, no release call
+    c.setRules([['release list', { stdout: RELEASES }], ['commits/HEAD', NO_CONFIG], ...baseRules()]);
+    const h = await c.homeUntil((x) => x.projects[0].lastRun && x.projects[1].lastRun);
+    assert.deepEqual(h.projects.map((p) => p.lastRun), [SHIP, SHIP]);
+    await c.app.homeIdle();
+    assert.equal(c.toolCalls('release list').length, 0);
+  });
+  await homeApp(async (c) => { // a gate project with no status yet (and one with a failing head): never the release
+    for (const rules of [gateRules({ statuses: '' }), gateRules({ head: GH_FAIL })]) {
+      c.setRules([['release list', { stdout: RELEASES }], ...NO_DEPLOY(), ...rules]);
+      const h = await ghRefresh(c);
+      assert.ok(h.projects.every((p) => p.lastRun?.kind !== 'released'), JSON.stringify(h.projects.map((p) => p.lastRun)));
+    }
+    assert.equal(c.toolCalls('release list').length, 0);
+  }, seedGate(JSON.stringify(['owner/repo'])));
 });
 
 test('GET /api/home: a failing gh call never makes a 500 or a wrong line (gate project: null; other repo: the Actions line)', async () => {
