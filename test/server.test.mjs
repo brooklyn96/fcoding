@@ -4579,7 +4579,7 @@ test('GET /api/home box: a record read before the last resume is not used; the f
       clock.t += 120e3; c.app.tickBox(); // a tick gap: the box slept and woke, a new run
       s.ls([boxRec(clock, { runStartedAt: new Date(clock.t).toISOString() })]);
       const b = await homeBox(c, cookie); // the old record is served stale by the staging part, but dated before the resume
-      assert.deepEqual([b.source, b.sleepsAt], ['estimate', new Date(clock.t + 480 * 60e3).toISOString()]);
+      assert.deepEqual([b.source, b.sleepsAt], ['estimate', new Date(clock.t + 4 * HOUR).toISOString()]); // the estimate runs on the last record's max run (240 min)
       await c.app.homeIdle();
       assert.deepEqual(await homeBox(c, cookie), { state: 'running', sleepsAt: new Date(clock.t + 4 * HOUR).toISOString(), maxRunMinutes: 240, idlePauseMinutes: 30, cooldownMinutes: 10, source: 'instabox' });
     }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t, boxName: 'coder' });
