@@ -401,6 +401,7 @@ const OVERVIEW_PAR = 3, OVERVIEW_KEEP = 4; // GET /api/overview: its git and tmu
 const QUOTA_STALE_MS = 10 * 60e3; // a report omp fetched longer ago than this is stale
 const DEFAULT_TZ = 'Asia/Ho_Chi_Minh';
 export const BOX = { maxRunMinutes: 480, idlePauseMinutes: 30, cooldownMinutes: 10 };
+const BOX_REC_MS = 10 * 60e3; // the box's own instabox record is used while it was read less than this ago (staging refreshes it every 30 s)
 const BOX_TICK_MS = 30e3, BOX_GAP_MS = 90e3; // a tick that comes more than 90 s late = the box was asleep and resumed
 const SPEND_DAYS = 30, SCAN_DAYS = 31, SCAN_CHUNK = 8 << 20, MAX_LINE = 4 << 20;
 const RESET_TIMEOUT = 45e3, RESET_KEEP_MS = 15 * 60e3, RESET_REPLY_MS = 15e3; // a reset still running after 15 s is answered 202 pending
@@ -908,6 +909,14 @@ export function parseStaging(list) {
     out.set(b.name, { state: b.desiredState === 'running' && s !== 'running' ? 'starting' : STAGING_STATES.includes(s) ? s : 'unknown', updatedAt: isoOf(b.updatedAt) });
   }
   return out;
+}
+// the box's own record in `instabox ls --json` (by name or id) -> the numbers the ring needs, or null: no such box, no run, or no max run (-1 unlimited)
+export function boxOf(list, names) {
+  const r = (Array.isArray(list) ? list : []).find((b) => b && typeof b === 'object' && (names.includes(b.name) || names.includes(b.id)));
+  const run = Date.parse(r?.runStartedAt), cool = Date.parse(r?.cooldownUntil);
+  const pos = (v) => typeof v === 'number' && v > 0;
+  if (!(run > 0) || !pos(r.maxRunMinutes)) return null;
+  return { state: r.state, runStartedAt: run, maxRunMinutes: r.maxRunMinutes, cooldownUntil: cool > 0 ? cool : null, cooldownMinutes: pos(r.cooldownMinutes) ? r.cooldownMinutes : BOX.cooldownMinutes };
 }
 // the instabox key reaches the service through start.sh; the server keeps it in memory and takes it out of its own environment, so the
 // tmux server and every harness session it starts never inherit it
@@ -1532,7 +1541,14 @@ export function createApp(opts = {}) {
   }
 
   // --- staging box: `instabox ls --json` (30 s) and `instabox start <box> --no-wait`, box name = project name ---
-  const lsBoxes = async () => parseStaging(JSON.parse(await execTool(instaboxSpec, ['ls', '--json'], 15e3, { ...toolEnv(), INSTABOX_API_KEY: instaboxKey })));
+  // The same listing also holds this box's own record (.box: the real run start and max run for the home ring, see boxInfo). The box is
+  // told by its hostname "instabox-<name>" (or the plain name), PC_BOX_NAME / opts.boxName overriding it; not listed: .box is null.
+  const hostName = String(opts.boxName ?? process.env.PC_BOX_NAME ?? os.hostname());
+  const boxNames = [hostName, hostName.replace(/^instabox-/, '')];
+  const lsBoxes = async () => {
+    const list = JSON.parse(await execTool(instaboxSpec, ['ls', '--json'], 15e3, { ...toolEnv(), INSTABOX_API_KEY: instaboxKey }));
+    return Object.assign(parseStaging(list), { box: boxOf(list, boxNames) });
+  };
   const staging = memo(STAGING_TTL, lsBoxes, now);
   const startingBoxes = new Set(); // projects whose `instabox start` runs now
   // detached and unref'd with its output ignored; a failure only logs one line (never the key)
@@ -1696,10 +1712,25 @@ export function createApp(opts = {}) {
     warmTimer = setInterval(warmUp, warmTick);
     warmTimer.unref();
   }
-  function boxInfo() {
+  // rec: this box's record from the cached `instabox ls` (staging part: stale-while-revalidate, never waited for here) with the time it was read.
+  // instabox's own numbers win: sleeps at runStartedAt + maxRunMinutes (a paused box: its cooldownUntil is the wake, which the app reads as
+  // sleepsAt + cooldown). A record read before the last resume (a tick gap) or older than BOX_REC_MS is not used: the estimate answers until a new one lands.
+  function boxInfo(rec) {
     tick();
-    const at = boxResume + BOX.maxRunMinutes * 60e3;
-    return { state: 'running', sleepsAt: at > now() ? iso(at) : null, ...BOX, source: 'estimate' };
+    const t = now();
+    const ib = rec?.box && rec.at >= boxResume && t - rec.at < BOX_REC_MS ? rec.box : null;
+    if (ib) {
+      const cool = ib.cooldownMinutes * 60e3;
+      const paused = ib.state !== 'running' && ib.cooldownUntil > t;
+      const at = paused ? ib.cooldownUntil - cool : ib.runStartedAt + ib.maxRunMinutes * 60e3;
+      return { state: 'running', sleepsAt: paused || at > t ? iso(at) : null, maxRunMinutes: ib.maxRunMinutes, idlePauseMinutes: BOX.idlePauseMinutes, cooldownMinutes: ib.cooldownMinutes, source: 'instabox' };
+    }
+    const maxMs = BOX.maxRunMinutes * 60e3;
+    let at = boxResume + maxMs;
+    // We are answering this request, so the box runs. An estimate already past its sleep time plus a whole cooldown is wrong (a pause the
+    // tick gap did not catch): the run starts again now, or the ring stays at "--:--" for good.
+    if (t > at + BOX.cooldownMinutes * 60e3) { boxResume = t; at = t + maxMs; }
+    return { state: 'running', sleepsAt: at > t ? iso(at) : null, ...BOX, source: 'estimate' };
   }
   // fresh (?fresh=1): each part older than freshMin is read again now and waited for, freshWait at most; else as the cache holds it
   async function homeView(fresh = false) {
@@ -1722,7 +1753,7 @@ export function createApp(opts = {}) {
     const withGit = (list) => list.map((x) => ({ ...x, git: gits.get(x.name) ?? NO_GIT, staging: boxes?.get(x.name) ?? null }));
     const cachedProjects = new Map((p.status === 'fulfilled' ? p.value.value : []).map((x) => [x.name, x]));
     return {
-      generatedAt: iso(t), box: boxInfo(),
+      generatedAt: iso(t), box: boxInfo(b.status === 'fulfilled' ? { box: b.value.value.box, at: b.value.at } : null),
       accounts: accounts.map((a) => ({ ...a, spend: view?.perAccount.get(a.id) ?? null })),
       totals: view?.totals ?? { spend: null, byHarness: [] },
       // not read yet (first request, slow gh): each project with nothing known and loading: true (a gh failure has no loading)
