@@ -309,6 +309,8 @@ struct NewSessionSheet: View {
     let loadError: String?
     let sessions: [OverviewSession]
     let initialProject: String?
+    /// A project's display name (its alias, or the real name); requests keep the real name.
+    var title: (String) -> String = { $0 }
     /// Server clock minus phone clock (HomeModel.offset), for the omp sessions' times.
     var clockOffset: TimeInterval = 0
     let onOpened: (String) -> Void
@@ -343,8 +345,8 @@ struct NewSessionSheet: View {
                                                                              ompError = nil
                                                                          })
                 // Off while a session opens: a late reply would open it after the sheet is gone.
-                SheetHeader(title: initialProject ?? "Phiên mới", left: back).disabled(opening != nil)
-                (Text(initialProject != nil ? "" : "Bước 2/2 · ") + Text("Chọn chương trình cho ") + Text(p).bold())
+                SheetHeader(title: initialProject.map(title) ?? "Phiên mới", left: back).disabled(opening != nil)
+                (Text(initialProject != nil ? "" : "Bước 2/2 · ") + Text("Chọn chương trình cho ") + Text(title(p)).bold())
                     .stepCaption()
                 options(Self.harnesses) { h in
                         row(disabled: opening != nil, action: { Task { await open(p, h) } }) {
@@ -386,8 +388,8 @@ struct NewSessionSheet: View {
                                         .frame(width: 34, height: 34)
                                         .background(Color.accentBlue.opacity(0.16), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
                                     VStack(alignment: .leading, spacing: 1) {
-                                        Text(p).scaledFont(15, weight: .semibold)
-                                        Text(detail(p)).scaledFont(13).foregroundColor(.l2)
+                                        Text(title(p)).scaledFont(15, weight: .semibold)
+                                        Text((title(p) == p ? "" : p + " · ") + detail(p)).scaledFont(13).foregroundColor(.l2)
                                     }
                                     Spacer()
                                     chevron
