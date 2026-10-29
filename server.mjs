@@ -1721,14 +1721,14 @@ export function createApp(opts = {}) {
     tick();
     const t = now();
     const fresh = rec?.box && rec.at >= boxResume && t - rec.at < BOX_REC_MS ? rec.box : null;
-    // A running box more than a cooldown past its own deadline (we are answering, so it runs) is not what the record says: the estimate answers, never a past sleepsAt.
-    const ib = fresh && !(fresh.state === 'running' && t > fresh.runStartedAt + (fresh.maxRunMinutes + fresh.cooldownMinutes) * 60e3) ? fresh : null;
+    if (fresh) boxNums = { maxRunMinutes: fresh.maxRunMinutes, idlePauseMinutes: fresh.idlePauseMinutes, cooldownMinutes: fresh.cooldownMinutes }; // also when the record itself is not used
+    const paused = !!fresh && fresh.state !== 'running' && fresh.cooldownUntil > t;
+    // A box not paused more than a cooldown past its own deadline (we are answering, so it runs) is not what the record says: the estimate answers, never a past sleepsAt.
+    const ib = fresh && (paused || t <= fresh.runStartedAt + (fresh.maxRunMinutes + fresh.cooldownMinutes) * 60e3) ? fresh : null;
     if (ib) {
       const cool = ib.cooldownMinutes * 60e3;
-      const paused = ib.state !== 'running' && ib.cooldownUntil > t;
       // the estimate follows the known run start (tickBox stores it too): it stays right when the record lapses and never restarts against a live run
       if (!paused && ib.runStartedAt <= t) boxResume = ib.runStartedAt;
-      boxNums = { maxRunMinutes: ib.maxRunMinutes, idlePauseMinutes: ib.idlePauseMinutes, cooldownMinutes: ib.cooldownMinutes };
       const at = paused ? ib.cooldownUntil - cool : ib.runStartedAt + ib.maxRunMinutes * 60e3;
       return { state: 'running', sleepsAt: paused || at > t ? iso(at) : null, ...boxNums, source: 'instabox' };
     }
