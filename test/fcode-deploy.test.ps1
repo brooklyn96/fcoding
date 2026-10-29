@@ -324,7 +324,7 @@ T 'add: an existing key that is NOT in the repo deploy keys is refused (65, neve
   Ok ($r.Text -match 'KHÔNG nằm trong Deploy keys') 'says why'
 }
 T 'add: an existing key listed WITH write access (readOnly false, or the field missing) is refused (65, never reused): no alias, inventory, register' {
-  foreach ($l in ('[{"key":"' + $PUB + '","readOnly":false}]'), ('[{"key":"' + $PUB + '"}]'), ('[{"key":"' + $PUB + ' comment","readOnly":"no"}]'), ('[{"key":"ssh-ed25519 AAAAOTHER","readOnly":true},{"key":"' + $PUB + '","readOnly":false}]')) {
+  foreach ($l in ('[{"key":"' + $PUB + '","readOnly":false}]'), ('[{"key":"' + $PUB + '","read_only":false}]'), ('[{"key":"' + $PUB + '"}]'), ('[{"key":"' + $PUB + ' comment","readOnly":"no"}]'), ('[{"key":"ssh-ed25519 AAAAOTHER","readOnly":true},{"key":"' + $PUB + '","readOnly":false}]')) {
     New-AddWorld; Add-Rule 'gh' 'deploy-key list' @(Ans @($l) 0)
     $r = Add-Run; Eq $r.Code 65 $l
     Eq (Kinds $r) 'runs:in_progress runs:queued probe keylist' $l
@@ -336,6 +336,10 @@ T 'add: an existing key listed WITH write access (readOnly false, or the field m
   Ok ($kl.Text -match '--json key,readOnly$') ('the listing asks for readOnly: ' + $kl.Text)
   New-AddWorld; Add-Rule 'gh' 'deploy-key list' @(Ans @('[{"key":"ssh-ed25519 AAAAOTHER","readOnly":false},{"key":"' + $PUB + ' c","readOnly":true}]') 0)
   $r = Add-Run; Eq $r.Code 0 'a write-enabled OTHER key does not matter; the matching one is read-only'
+}
+T 'add: the real gh output shape (read_only true, with id/title/created_at) is accepted as read-only' {
+  New-AddWorld; Add-Rule 'gh' 'deploy-key list' @(Ans @('[{"id":167812789,"key":"' + $PUB + ' c","title":"fcode-deploy-task","created_at":"2026-10-29T00:00:00Z","read_only":true}]') 0)
+  $r = Add-Run; Eq $r.Code 0 'read_only:true is a read-only key'
 }
 T 'add: an unreadable existing key is refused (65); gh or ssh failing while reading keys = rc 1, nothing registered' {
   New-AddWorld; Add-Rule 'ssh' 'KEY_NONE' @(Ans @('KEY_UNREADABLE') 0)
