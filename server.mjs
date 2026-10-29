@@ -395,6 +395,9 @@ export function pairPage(appLink) {
 const QUOTA_TTL = 60e3, LISTING_TTL = 300e3, SPEND_TTL = 300e3, PROJECTS_TTL = 120e3, GATE_CONFIG_TTL = 600e3, RUN_WINDOW = 100; // RUN_WINDOW: Actions runs read per project (deploy line and PR checks)
 const LIST_AFTER_RESET_MS = 10e3, STALE_QUOTA_TTL = 15e3; // omp's own listing timeout is 10 s
 const HOME_WAIT_MS = 8000; // a part with no value yet is waited for this long at most, then it is empty and fills in the background
+const FRESH_MIN_MS = 10e3, HOME_FRESH_WAIT_MS = 25e3; // GET /api/home?fresh=1: a part older than 10 s is read again and waited for, 25 s at most
+const WARM_TICK_MS = 5e3; // from boot every home part is checked this often and refreshed once it is past its own TTL (never more than one refresh at a time)
+const OVERVIEW_PAR = 4; // GET /api/overview: its git and tmux reads run at most this many at a time, each holding one of the MAX_READS slots
 const QUOTA_STALE_MS = 10 * 60e3; // a report omp fetched longer ago than this is stale
 const DEFAULT_TZ = 'Asia/Ho_Chi_Minh';
 export const BOX = { maxRunMinutes: 480, idlePauseMinutes: 30, cooldownMinutes: 10 };
@@ -936,6 +939,14 @@ export function memo(ttl, fn, now, retry = ttl, ttlOf = () => undefined) {
     return p;
   };
   const old = (e) => { if (value === undefined) throw e; return { value, fresh: false, at }; };
+  const settle = async (wait) => { // join the one refresh (start it when none runs) and wait for it at most `wait` ms
+    const p = refresh();
+    let timer;
+    try {
+      const r = await (Number.isFinite(wait) ? Promise.race([p, new Promise((_, rej) => { timer = setTimeout(rej, wait, new Error('timeout')); })]) : p);
+      return r.kept ? { value: r.v, fresh: true, at: r.started } : { value: r.v, fresh: false, at: -Infinity }; // dropped: of no age
+    } catch (e) { return old(e); } finally { clearTimeout(timer); }
+  };
   return {
     async get(wait = Infinity) {
       const t = now();
@@ -943,12 +954,16 @@ export function memo(ttl, fn, now, retry = ttl, ttlOf = () => undefined) {
       const backoff = t - failedAt < retry;
       if (value !== undefined && !cleared) { if (!backoff) refresh(); return { value, fresh: ok && !backoff, at }; }
       if (backoff) return old(new Error('failed recently'));
-      const p = refresh();
-      let timer;
-      try {
-        const r = await (Number.isFinite(wait) ? Promise.race([p, new Promise((_, rej) => { timer = setTimeout(rej, wait, new Error('timeout')); })]) : p);
-        return r.kept ? { value: r.v, fresh: true, at: r.started } : { value: r.v, fresh: false, at: -Infinity }; // dropped: of no age
-      } catch (e) { return old(e); } finally { clearTimeout(timer); }
+      return settle(wait);
+    },
+    // fresh(wait, minAge): like get, but a value older than minAge ms is refreshed now and waited for (at most `wait` ms) instead of served
+    // stale; a refresh that fails or runs past `wait` gives the old value with fresh: false. A value younger than minAge is not redone,
+    // nor is a refresh that failed less than minAge ago: a burst of calls does not hammer the source.
+    async fresh(wait, minAge) {
+      const t = now();
+      if (value !== undefined && ok && t - at < minAge) return { value, fresh: true, at };
+      if (!ok && t - failedAt < minAge) return old(new Error('failed recently'));
+      return settle(wait);
     },
     clear() { at = -Infinity; failedAt = -Infinity; cleared = true; gen++; pending = null; },
     settled: () => Promise.resolve(pending).catch(() => {}), // the refresh running now, if any, has ended
@@ -1292,7 +1307,7 @@ export function createApp(opts = {}) {
     return { text, rows, cols, cursor: { x, y }, hash };
   }
 
-  // --- GET /api/overview: ONE read job holding one read slot; its tmux/git calls run one after another ---
+  // --- GET /api/overview: ONE read job; its tmux/git calls run up to OVERVIEW_PAR at a time, each child inside a read slot the job holds ---
   const gitCache = new Map(); // dir -> {at, value} once done, {pending} while one overview runs git for it
   const gateStop = (e) => e instanceof HttpErr && (e.status === 401 || e.status === 499);
   async function gitRound(dir, ctx) {
@@ -1332,21 +1347,35 @@ export function createApp(opts = {}) {
   async function overview(ctx) {
     if (reads >= MAX_READS) throw new HttpErr(503, 'busy'); // reads never queue
     if (!valid(ctx)) throw gateErr(ctx);
-    reads++; ctx.held = true;
+    // its own read slot, plus free ones up to OVERVIEW_PAR, but never the last 3 (a screen read takes 2, another overview 1): every child
+    // runs inside a slot, so MAX_READS still bounds the children in all, and a busy server runs the job one child at a time as before
+    let width = 1; reads++; ctx.held = true;
+    while (width < OVERVIEW_PAR && reads < MAX_READS - 3) { reads++; width++; }
+    // fn over items, `width` at a time, results in item order; after an error no new item starts, the running ones end, then it is thrown
+    const each = async (items, fn) => {
+      const out = new Array(items.length);
+      let next = 0, err;
+      await Promise.all(Array.from({ length: Math.min(width, items.length) }, async () => {
+        while (!err && next < items.length) {
+          const i = next++;
+          try { out[i] = await fn(items[i]); } catch (e) { err ??= { e }; }
+        }
+      }));
+      if (err) throw err.e;
+      return out;
+    };
     try {
-      const projects = [];
-      for (const name of cfg.projectNames) projects.push({ name, ...(await gitInfo(cfg.projects[name], ctx)) });
-      const sessions = [];
-      for (const x of await listSessions(ctx)) {
+      const projects = await each(cfg.projectNames, async (name) => ({ name, ...(await gitInfo(cfg.projects[name], ctx)) }));
+      const sessions = await each(await listSessions(ctx), async (x) => {
         let state = null, preview = null, menu = null; // nulls when this item fails
         try {
           const text = await run(ctx, ['capture-pane', '-p', '-J', '-t', pane(x.name)]); // the visible pane, no escapes
           ({ state, preview, menu } = summarize(text, x.activity, now()));
         } catch (e) { if (gateStop(e)) throw e; }
-        sessions.push({ ...x, state, preview, menu });
-      }
+        return { ...x, state, preview, menu };
+      });
       return { now: Math.floor(now() / 1000), projects, sessions };
-    } finally { reads--; ctx.held = false; }
+    } finally { reads -= width; ctx.held = false; }
   }
   // the session name /api/open reuses for a project and harness
   const openName = (project, harness) => `${project}-${harness}`.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+/, '').slice(0, 32);
@@ -1541,6 +1570,7 @@ export function createApp(opts = {}) {
 
   // --- GET /api/home (A8): each part cached on its own; a failing part is empty or stale, never a 500 ---
   const listAfterReset = opts.listAfterResetMs ?? LIST_AFTER_RESET_MS;
+  const freshMin = opts.freshMinMs ?? FRESH_MIN_MS, freshWait = opts.homeFreshWaitMs ?? HOME_FRESH_WAIT_MS; // tests only: shorter bounds
   const homeWait = opts.homeWaitMs ?? HOME_WAIT_MS, resetReplyMs = opts.resetReplyMs ?? RESET_REPLY_MS, resetTimeout = opts.resetTimeoutMs ?? RESET_TIMEOUT;
   // `omp usage reset --json` (credential ids, reset counts) on its own longer TTL; the last good listing is kept on a failure
   // A quota built with no listing at all (slow or failed first listing: `~` ids, no reset target) is kept STALE_QUOTA_TTL only,
@@ -1660,17 +1690,32 @@ export function createApp(opts = {}) {
   tickBox();
   const boxTimer = setInterval(tickBox, BOX_TICK_MS);
   boxTimer.unref();
+  // from boot every part is kept warm: one check per tick, and get(0) starts a refresh only for a part past its own TTL (and not in its
+  // retry wait), through the memo, so a part is never refreshed twice at once; /api/home then answers from memory
+  const warmTick = opts.warmTickMs ?? WARM_TICK_MS;
+  let warmTimer = null;
+  const warmUp = () => {
+    for (const m of [quota, listing, spend, projects, ...(instaboxKey ? [staging] : [])]) m.get(0).catch(() => {});
+  };
+  function startWarm() {
+    if (warmTimer || !(warmTick > 0)) return;
+    warmUp();
+    warmTimer = setInterval(warmUp, warmTick);
+    warmTimer.unref();
+  }
   function boxInfo() {
     tick();
     const at = boxResume + BOX.maxRunMinutes * 60e3;
     return { state: 'running', sleepsAt: at > now() ? iso(at) : null, ...BOX, source: 'estimate' };
   }
-  async function homeView() {
+  // fresh (?fresh=1): each part older than freshMin is read again now and waited for, freshWait at most; else as the cache holds it
+  async function homeView(fresh = false) {
     // each part answers at once from its cache, or within homeWait the first time; a part not ready is empty and fills later
     // right after a project was added or removed the cached list is not waited for (wait 0: the reply is at once, the refresh runs on)
     const projWait = projectsDirty ? 0 : homeWait; projectsDirty = false;
-    const [q, s, p, b, g] = await Promise.allSettled([quota.get(homeWait), spend.get(homeWait), projects.get(projWait),
-      instaboxKey ? staging.get(homeWait) : Promise.reject(new Error('no instabox key')), ompGuard.get(homeWait)]);
+    const part = (m, wait) => (fresh ? m.fresh(freshWait, freshMin) : m.get(wait));
+    const [q, s, p, b, g] = await Promise.allSettled([part(quota, homeWait), part(spend, homeWait), part(projects, projWait),
+      instaboxKey ? part(staging, homeWait) : Promise.reject(new Error('no instabox key')), part(ompGuard, homeWait)]);
     const boxes = b.status === 'fulfilled' ? b.value.value : null; // no key, or instabox failed with nothing cached: every staging is null
     const t = now();
     const qv = q.status === 'fulfilled' ? q.value : null;
@@ -2119,7 +2164,7 @@ export function createApp(opts = {}) {
       return json(res, 200, { code: p.code, expiresAt: new Date(p.expiresAt).toISOString(), ...pairLinks() });
     }
     if (pathname === '/api/overview') { want('GET'); return json(res, 200, await overview(ctx)); }
-    if (pathname === '/api/home') { want('GET'); return json(res, 200, await homeView()); }
+    if (pathname === '/api/home') { want('GET'); return json(res, 200, await homeView(url.searchParams.get('fresh') === '1')); }
     if (pathname === '/api/projects') {
       want('POST');
       const { repo, name } = parseAddRequest(parseJson(req, body));
@@ -2331,11 +2376,14 @@ export function createApp(opts = {}) {
   const listen = async (port = Number(process.env.PC_PORT) || cfg.port || 7681, host = '0.0.0.0') => {
     await listenAdmin();
     try {
-      return await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, host, () => resolve(server.address().port)); });
+      const bound = await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, host, () => resolve(server.address().port)); });
+      startWarm();
+      return bound;
     } catch (e) { adminServer.close(); throw e; }
   };
   const close = () => {
     clearInterval(boxTimer);
+    clearInterval(warmTimer); warmTimer = null;
     for (const abort of [...addStops]) abort();
     return Promise.all([
       new Promise((resolve) => { server.close(() => resolve()); server.closeAllConnections(); }),
