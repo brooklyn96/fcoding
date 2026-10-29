@@ -14,6 +14,8 @@ mkdir -p "$APP"
 [ "$SRC" = "$APP" ] || install -m 644 "$SRC/server.mjs" "$APP/server.mjs"
 # the box script behind "Thêm dự án" (POST /api/projects runs it from next to server.mjs; see CONTRACT.md A11)
 [ ! -f "$SRC/box/fcode-add.sh" ] || install -m 755 "$SRC/box/fcode-add.sh" "$APP/fcode-add.sh"
+# the box CLI for the deploy gate's operator key: ~/.local/bin/fcode-deploy (docs/HUONG-DAN.md, "Deploy từ box")
+[ ! -f "$SRC/box/fcode-deploy.sh" ] || install -D -m 755 "$SRC/box/fcode-deploy.sh" "$HOME/.local/bin/fcode-deploy"
 
 mkdir -p "$CFG"
 chmod 700 "$CFG"

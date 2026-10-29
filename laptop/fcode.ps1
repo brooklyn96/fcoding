@@ -573,6 +573,8 @@ function Show-Help([string]$Topic = '') {
     'Deploy (cổng deploy trên VPS)',
     'fcode deploy <tên> <lệnh> [đối số]@@Điều khiển cổng deploy',
     'fcode deploy add <chủ/repo> <tên> <draft.json>@@Đăng ký project vào cổng deploy',
+    'fcode deploy allow <tên> [root]@@Cho khoá box dùng project (root: +trust)',
+    'fcode deploy disallow <tên>@@Thu hồi quyền của khoá box',
     'Đồng bộ phiên omp (laptop <-> box)',
     'fcode phien [project]@@Đồng bộ phiên hai chiều',
     'fcode phien --thu [project]@@Chạy thử, không chép gì',
@@ -672,6 +674,16 @@ function Show-Help([string]$Topic = '') {
       '    lệnh recheck.',
       '    Tên: chữ thường, số, dấu -, 2 đến 28 ký tự, bắt đầu bằng chữ.',
       '    "register" gõ tay cũng kiểm tra Actions và hỏi YES như lệnh add.',
+      '',
+      '#Cho khoá của box dùng project',
+      '>fcode deploy allow <tên> [root]',
+      '    Duyệt project cho khoá của box (chạy trên laptop, không hỏi lại).',
+      '    "root" thêm quyền trust on i-understand-root: in một dòng cảnh báo',
+      '    vàng rồi gửi. Cổng từ chối tên dành riêng, deal-sync, vps-scraper',
+      '    (mã 65).',
+      '>fcode deploy disallow <tên>',
+      '    Thu hồi quyền đó. Project vẫn nằm trong cổng và vẫn deploy; muốn',
+      '    bỏ root thì chạy thêm  fcode deploy <tên> trust off.',
       '',
       '#Cảnh báo',
       '  "trust on" in cảnh báo trước khi gửi: ai merge được vào nhánh đó đều',
@@ -973,7 +985,7 @@ function Get-DeployHost {
 # mot tu cua lenh (khong khoang trang, khong ky tu dac biet cua shell)
 function Test-DeployWord([string]$w) { $w -cmatch '\A[A-Za-z0-9._/][A-Za-z0-9._/-]{0,199}\z' }
 # ten project theo luat cua hop dong (contract C1, RE_NAME cua cong) va chu/repo; dung o moi duong cua fcode deploy
-function Test-DeployName([string]$n) { $n -cmatch '\A[a-z][a-z0-9-]{0,26}[a-z0-9]\z' }
+function Test-DeployName([string]$n) { ($n -cmatch '\A[a-z][a-z0-9-]{0,26}[a-z0-9]\z') -and $n -cnotin 'add', 'allow', 'disallow' }   # add / allow / disallow = lenh dung dau, khong the la ten project
 function Test-DeployRepo([string]$r) { ($r -cmatch '\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z') -and ($r -notmatch '\A\.+/|/\.+\z') }
 
 # chay mot lenh tren VPS qua ssh, in tung dong ngay khi tien toi (tru khi -Quiet), tra @{ Code; Lines }.
@@ -981,11 +993,12 @@ function Test-DeployRepo([string]$r) { ($r -cmatch '\A[A-Za-z0-9_.-]+/[A-Za-z0-9
 function Invoke-DeploySsh([string]$Remote, [string]$B64, [switch]$Quiet) {
   $dh = Get-DeployHost
   $buf = New-Object 'System.Collections.Generic.List[string]'
+  $emit = { param($l) $buf.Add([string]$l); if (-not $Quiet) { if ("$l" -cmatch '\AGATE_WARN') { Write-Host $l -ForegroundColor Yellow } else { Write-Host $l } } }   # GATE_WARN = canh bao cua cong: mau vang
   if (-not $dh) { Write-Host 'lỗi: deployHost trong file cấu hình không dùng được (chỉ chữ, số, dấu . _ @ -).'; return @{ Code = 1; Lines = @() } }
   $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
   try {
-    if ($B64) { $B64 | & ssh $dh $Remote | ForEach-Object { $buf.Add([string]$_); if (-not $Quiet) { Write-Host $_ } } }
-    else { & ssh -n $dh $Remote | ForEach-Object { $buf.Add([string]$_); if (-not $Quiet) { Write-Host $_ } } }
+    if ($B64) { $B64 | & ssh $dh $Remote | ForEach-Object { & $emit $_ } }
+    else { & ssh -n $dh $Remote | ForEach-Object { & $emit $_ } }
     $code = [int]$LASTEXITCODE
   } catch { Write-Host "lỗi: không chạy được ssh ($($_.Exception.Message))"; $code = 1 }
   finally { $ErrorActionPreference = $old }
@@ -1159,16 +1172,30 @@ function Invoke-DeployAdd([string[]]$AddArgs) {
   $reg.Code
 }
 
+# fcode deploy allow <ten> [root] | disallow <ten>: duyet / thu hoi quyen cua khoa box tren cong (chi chay tu laptop; cong tu choi ten danh rieng, ma 65). `root` = them quyen trust on
+function Invoke-DeployAllow([string]$Verb, [string[]]$AllowArgs) {
+  $name = if ($AllowArgs.Count -gt 0) { [string]$AllowArgs[0] } else { '' }
+  $root = ($Verb -ceq 'allow') -and $AllowArgs.Count -eq 2 -and $AllowArgs[1] -ceq 'root'
+  if (-not (Test-DeployName $name) -or $AllowArgs.Count -gt $(if ($Verb -ceq 'allow') { 2 } else { 1 }) -or ($AllowArgs.Count -eq 2 -and -not $root)) {
+    Write-Host "Cách dùng: fcode deploy $Verb <tên>$(if ($Verb -ceq 'allow') { ' [root]' })"
+    return 65
+  }
+  $g = @($Verb); if ($root) { $g += 'root'; Write-Host 'coder sẽ được bật trust on (chạy bằng root) cho project này' -ForegroundColor Yellow }
+  (Invoke-DeployGate $name $g).Code
+}
+
 function Invoke-Deploy {
   $a = @($Rest | Select-Object -Skip 1)
   $verbs = 'status', 'deploy', 'retry', 'pause', 'resume', 'trust', 'logs', 'recheck', 'inventory', 'register', 'compact'
   if ($a.Count -gt 0 -and $a[0] -ceq 'add') { return (Invoke-DeployAdd @($a | Select-Object -Skip 1)) }
+  if ($a.Count -gt 0 -and ($a[0] -ceq 'allow' -or $a[0] -ceq 'disallow')) { return (Invoke-DeployAllow ([string]$a[0]) @($a | Select-Object -Skip 1)) }
   $name = if ($a.Count -gt 0) { [string]$a[0] } else { '' }; $verb = if ($a.Count -gt 1) { [string]$a[1] } else { '' }
   $rest = @($a | Select-Object -Skip 2)
   if (-not (Test-DeployName $name) -or $verbs -cnotcontains $verb) {
     Write-Host 'Cách dùng: fcode deploy <tên> <lệnh> [đối số]'
     Write-Host '  lệnh: status [id] · deploy <sha> · retry [sha] · pause · resume · trust on i-understand-root | off · logs [id] [số dòng] · recheck · compact · inventory <draft.json> · register <sha256> <draft.json>'
     Write-Host '  Đăng ký project mới: fcode deploy add <chủ/repo> <tên> <draft.json>'
+    Write-Host '  Duyệt / thu hồi quyền của khoá box: fcode deploy allow <tên> [root] · fcode deploy disallow <tên>'
     return 65
   }
   $b64 = ''; $gateArgs = @($rest)
