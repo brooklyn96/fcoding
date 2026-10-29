@@ -198,26 +198,71 @@ function Add-SyncRepoConfig([string]$Path) {
   } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
 }
 
+# Ten goi (alias) cua project: server FCode giu trong prefs.json canh config.json tren box; laptop chi doc (qua lenh 'scan' / 'projects' da co)
+# va nho ban sao o %LOCALAPPDATA%\fcode\prefs.json. Box khong toi duoc thi dung ban sao; thieu hay hong file = khong co ten goi, khong bao gio la loi.
+function Get-PrefsPath { Join-Path $env:LOCALAPPDATA 'fcode\prefs.json' }
+function Get-ProjectAliases {   # @{ ten that = ten goi }
+  $h = @{}
+  try {
+    $o = [IO.File]::ReadAllText((Get-PrefsPath)) | ConvertFrom-Json
+    if ($o.aliases -is [Management.Automation.PSCustomObject]) { foreach ($p in $o.aliases.PSObject.Properties) { if ($p.Value -is [string] -and $p.Value.Trim()) { $h[$p.Name] = $p.Value } } }
+  } catch { }
+  $h
+}
+function Save-PrefsCache($Prefs) {   # $null (box khong tra loi) thi giu ban cu
+  if ($null -eq $Prefs) { return }
+  try { Write-PhienText (Get-PrefsPath) ($Prefs | ConvertTo-Json -Compress -Depth 5) } catch { }
+}
+# ten that -> chinh no (ten that luon thang); ten goi, khong phan biet hoa thuong -> ten that; con lai giu nguyen (thong bao "khong thay project" van hien)
+function Resolve-ProjectName([string]$Name, [string[]]$Known = @()) {
+  if (-not $Name) { return $Name }
+  $al = Get-ProjectAliases
+  foreach ($k in (@($Known) + @($al.Keys))) { if ($k -ieq $Name) { return $Name } }
+  foreach ($k in $al.Keys) { if ($al[$k] -ieq $Name) { return [string]$k } }
+  $Name
+}
+# "ten goi (ten that)" khi co ten goi; ky tu dieu khien trong ten goi thanh '?'
+function Format-ProjectName([string]$Name) {
+  $al = Get-ProjectAliases
+  if ($al.ContainsKey($Name)) { ($al[$Name] -replace '[\x00-\x1f\x7f]', '?') + " ($Name)" } else { $Name }
+}
+# project cua box (ten + URL origin + ten goi): danh thuc box, hoi mot lan (han 60 giay, khong phai 900 giay cua mot dot chep phien, tinh tu luc box da thuc).
+# $null neu khong doc duoc. Cung cap nhat ban sao ten goi.
+function Get-BoxProjects {
+  $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+  try { & (Get-InstaboxExe) wake $box *> $null; $script:PhienDeadline = [DateTime]::UtcNow.AddSeconds([Math]::Min(60, (Get-PhienLimitSec $false))); $bp = Get-BoxJson (Invoke-BoxPy 'projects' ([byte[]]@())) } catch { $bp = $null } finally { $ErrorActionPreference = $old; $script:PhienDeadline = $null }
+  if ($bp) { Save-PrefsCache $bp.prefs }
+  $bp
+}
+# doi tham so project (ten goi hoac ten that) ra ten that. $Ask: ten la ma chua biet (khong nam trong $Known, khong la ten goi trong ban sao) thi hoi box mot lan roi thu lai
+function Resolve-ProjectArg([string]$Name, [string[]]$Known, [bool]$Ask) {
+  $r = Resolve-ProjectName $Name $Known
+  if ($Ask -and $r -ceq $Name -and -not @($Known | Where-Object { $_ -ieq $Name }).Count) {
+    Write-Host 'Đang hỏi box tên gọi của các project...'
+    [void](Get-BoxProjects)
+    $r = Resolve-ProjectName $Name $Known
+  }
+  $r
+}
+
 # project cua box (ten + URL origin) chua co trong syncRepos -> tim / hoi / tai, them vao syncRepos
 function Add-SyncMissing {
   if ($env:FCODE_SYNC_REPOS) { return }   # danh sach dat tam cho lan chay nay: khong tim, khong ghi config
   Write-Host 'Đang hỏi box danh sách project...'
-  $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-  # han 60 giay cho lenh nay (khong phai 900 giay cua mot dot chep phien), tinh tu luc box da thuc
-  try { & (Get-InstaboxExe) wake $box *> $null; $script:PhienDeadline = [DateTime]::UtcNow.AddSeconds([Math]::Min(60, (Get-PhienLimitSec $false))); $bp = Get-BoxJson (Invoke-BoxPy 'projects' ([byte[]]@())) } catch { $bp = $null } finally { $ErrorActionPreference = $old; $script:PhienDeadline = $null }
+  $bp = Get-BoxProjects
   if (-not $bp) { Write-Host 'cảnh báo: không đọc được danh sách project trên box; chỉ cập nhật các project đã có trên laptop.'; return }
   $have = @{}; foreach ($r in $SyncRepos) { $k = Get-LocalRepoKey $r; if ($k) { $have[$k] = $true } }
   $miss = @(@($bp.projects) | Where-Object { $_ -and $_.repo -and -not $have.ContainsKey([string]$_.repo) })
   if (-not $miss.Count) { return }
   Write-Host "Box có $($miss.Count) project chưa có trên laptop:"
-  foreach ($m in $miss) { Write-Host "  $($m.name)  $($m.origin)" }
+  foreach ($m in $miss) { Write-Host "  $(Format-ProjectName ([string]$m.name))  $($m.origin)" }
   $want = @{}; foreach ($m in $miss) { $want[[string]$m.repo] = $true }
   $f = Find-LocalClones $want
   Write-Host ('Đã tìm bản có sẵn trong: ' + ($f.Where -join '; '))
   $base = if ($env:FCODE_GITHUB_BASE) { $env:FCODE_GITHUB_BASE.TrimEnd('/', '\') } else { 'https://github.com' }
   foreach ($m in $miss) {
     Write-Host ''
-    Write-Host "== $($m.name) ($($m.repo))"
+    Write-Host "== $(Format-ProjectName ([string]$m.name)) ($($m.repo))"
     $v = Select-SyncFolder $m $f.Found[[string]$m.repo]
     if ($null -eq $v) { Write-Host 'Không đọc được câu trả lời: các project còn lại để lần sau.'; break }
     if ($v -is [string]) { Write-Host '  bỏ qua project này'; continue }
@@ -252,7 +297,7 @@ function Invoke-Sync {
   }
   foreach ($repo in $SyncRepos) {
     Write-Host ''
-    Write-Host ("== " + (Split-Path $repo -Leaf))
+    Write-Host ("== " + (Format-ProjectName (Split-Path $repo -Leaf)))
     if (-not (Test-Path -LiteralPath (Join-Path $repo '.git'))) { Write-Host '  lỗi: không tìm thấy project (thư mục hoặc .git)'; $fetchFail++; continue }
     $f = Invoke-Git $repo @('fetch', '--prune', 'origin')
     if ($f.Code -ne 0) { Write-Host ('  lỗi: không tải được từ GitHub: ' + (Get-GitError $f)); $fetchFail++; continue }
@@ -527,7 +572,8 @@ function Show-Help([string]$Topic = '') {
       '    Xem danh sách phiên đang chạy trên box, gõ số để vào',
       '    (gõ 0 để mở phiên mới).',
       '>fcode <số hoặc tên phiên>',
-      '    Vào thẳng một phiên (tên có thể gõ phần đầu).',
+      '    Vào thẳng một phiên (tên có thể gõ phần đầu). Gõ tên project hoặc',
+      '    tên gọi (alias) của nó cũng được.',
       '    Thoát mà không tắt phiên: Ctrl+B rồi D.',
       '>fcode --list',
       '    Chỉ in danh sách phiên, không vào (viết tắt: fcode -l).',
@@ -636,6 +682,8 @@ function Show-Help([string]$Topic = '') {
       '    (HANDOFF*.md, CLAUDE.md, AGENTS.md, WORKFLOW.md, agent_state.md,',
       '    TASK.md, CLAUDE.local.md) khi git không theo dõi chúng; file nào',
       '    hai máy cùng sửa thì giữ nguyên và báo.',
+      '    [project] là tên project hoặc tên gọi (alias) đặt trong app FCode;',
+      '    tên gọi mới đặt được cập nhật mỗi khi fcode hỏi box.',
       '>fcode phien --thu [project]',
       '    Chạy thử: chỉ liệt kê những phiên sẽ được chép đi đâu, không chép',
       '    gì (chỉ ghi lại giờ vừa kết nối box).',
@@ -726,6 +774,7 @@ function Show-Help([string]$Topic = '') {
   }
   Write-Host ''
   Write-Host 'Xem chi tiết: fcode help <lệnh>   (ví dụ: fcode help deploy)'
+  Write-Host 'Tên project: gõ tên thật hoặc tên gọi (alias) đặt trong app đều được.'
   $cfg = "Cấu hình: $ConfigFile"
   if ($cfg.Length -le 80) { Write-Host $cfg }
 }
@@ -1973,6 +2022,21 @@ def cfg_projects():
         return {}
 
 
+def read_prefs():
+    # prefs.json canh config.json (ten goi + thu tu project do server FCode giu). Chi doc; thieu hay hong = rong. Chi ten, khong gi khac.
+    out = {'order': [], 'aliases': {}}
+    try:
+        with open(os.path.join(os.path.dirname(CFG), 'prefs.json'), encoding='utf-8') as f:
+            p = json.load(f)
+        if isinstance(p.get('order'), list):
+            out['order'] = [x for x in p['order'] if isinstance(x, str)][:500]
+        if isinstance(p.get('aliases'), dict):
+            out['aliases'] = dict((k, v) for k, v in list(p['aliases'].items())[:500] if k and len(k) <= 100 and isinstance(v, str) and v.strip() and len(v) <= 100)
+    except Exception:
+        pass
+    return out
+
+
 def repo_key(u):
     # owner/name (chu thuong) cua mot URL GitHub o moi dang (https, git@github.com:, alias github-<ten>:); khong phai GitHub -> ''
     u = (u or '').strip().replace('\\', '/').rstrip('/')
@@ -2048,11 +2112,11 @@ def cmd_scan(req):
     except OSError:
         blobs = []
     out_json({'now': NOW, 'projects': out, 'blobs': blobs, 'blobsize': dict((n, os.path.getsize(os.path.join(BLOBS, n))) for n in blobs),
-              'omp': omp_version(), 'all': [{'name': x['name'], 'repo': x['repo']} for x in allp]})
+              'omp': omp_version(), 'all': [{'name': x['name'], 'repo': x['repo']} for x in allp], 'prefs': read_prefs()})
 
 
 def cmd_projects(_req):
-    out_json({'projects': [{'name': x['name'], 'origin': x['origin'], 'repo': x['repo']} for x in box_projects()]})
+    out_json({'projects': [{'name': x['name'], 'origin': x['origin'], 'repo': x['repo']} for x in box_projects()], 'prefs': read_prefs()})
 
 
 def cmd_hash(req):
@@ -3083,7 +3147,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
     $names = @($projs.Keys)
     if ($Only) {
       $o = $Only.ToLowerInvariant()
-      if (-not $projs.Contains($o)) { Write-PhienOut "Không thấy project '$Only' trong syncRepos. Có: $($names -join ', ')"; return 1 }
+      if (-not $projs.Contains($o)) { Write-PhienOut "Không thấy project '$Only' trong syncRepos. Có: $(@($names | ForEach-Object { Format-ProjectName $_ }) -join ', ')"; return 1 }
       $names = @($o)
     }
     if ($Quick) {   # only `instabox ls`: never wakes the box
@@ -3108,6 +3172,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
     if (Test-PhienTimeUp) { return (Stop-PhienAtCap $Quick $stat) }   # safe point: before the scan
     $r = Invoke-BoxPy 'scan' ([Text.Encoding]::UTF8.GetBytes((@{ projects = @($names); repos = @($repoDir.Keys); clean = (-not $DryRun) } | ConvertTo-Json -Compress)))
     $scan = Get-BoxJson $r
+    if ($scan) { Save-PrefsCache $scan.prefs }
     if (-not $scan) {
       if ($Quick -and $r.Code -eq 124) { Set-PhienScreen $capMsg; return 0 }   # the deadline ended the call: a cap hit, not an error
       $stat.ok = $false
@@ -3133,14 +3198,14 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
       if (Test-PhienTimeUp) { return (Stop-PhienAtCap $Quick $stat) }   # safe point: before the local scan of a project
       $ldir = $pick[[string]$bp.name]
       if (-not $ldir -and $bp.repo -and $repoDir.ContainsKey([string]$bp.repo)) { continue }   # thu muc cua repo nay da thuoc project khac
-      if (-not $ldir -or -not (Test-Path -LiteralPath $ldir)) { Write-PhienOut "== $($bp.name): bỏ qua, không thấy thư mục project trên laptop"; continue }
+      if (-not $ldir -or -not (Test-Path -LiteralPath $ldir)) { Write-PhienOut "== $(Format-ProjectName ([string]$bp.name)): bỏ qua, không thấy thư mục project trên laptop"; continue }
       $lsd = Join-Path $sessRoot (Get-LaptopEncodedDir $ldir)
       $ctx += [pscustomobject]@{ Name = [string]$bp.name; LDir = $ldir; BDir = [string]$bp.dir; Lsd = $lsd; Benc = [string]$bp.enc; L = (Get-PhienLocalScan $lsd); R = @($bp.sessions); LN = (Get-PhienLocalNotes $ldir); RN = $bp.notes }
     }
     # project moi tren box chua co tren laptop: chi ghi lai (lan tu dong khong hoi, khong clone; `fcode sync` moi them)
     if (-not $Only) {
       $stat.newProjects = @(@($scan.all) | Where-Object { $_ -and -not $projs.Contains([string]$_.name) -and -not ($_.repo -and $repoDir.ContainsKey([string]$_.repo)) } | ForEach-Object { [string]$_.name })
-      if ($stat.newProjects.Count) { Write-PhienOut "project trên box chưa có trên laptop: $($stat.newProjects -join ', ') (chạy fcode sync để thêm)" }
+      if ($stat.newProjects.Count) { Write-PhienOut "project trên box chưa có trên laptop: $(@($stat.newProjects | ForEach-Object { Format-ProjectName $_ }) -join ', ') (chạy fcode sync để thêm)" }
     }
     if (-not $DryRun) { Clear-PhienLeftovers @(@($ctx | ForEach-Object { $_.Lsd }) + @($laptopBlobDir)) @($ctx | ForEach-Object { $_.LDir }) }
     # lan 1: tim cac cho can hash cua box; hoi mot lan; lan 2: ke hoach that
@@ -3420,7 +3485,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
       # --- bao cao ---
       $up = [int]$putRes.new + [int]$putRes.replaced
       $down = [int]$getRes.new + [int]$getRes.replaced
-      foreach ($c in $ctx) { $pl = $plans[$c.Name]; Write-PhienOut ("== $($c.Name): gửi $(@($pl.Put | Where-Object { $_.Top }).Count) phiên lên box, lấy $(@($pl.Get | Where-Object { $_.Top }).Count) phiên về, $($pl.Same) đã giống nhau") }
+      foreach ($c in $ctx) { $pl = $plans[$c.Name]; Write-PhienOut ("== $(Format-ProjectName $c.Name): gửi $(@($pl.Put | Where-Object { $_.Top }).Count) phiên lên box, lấy $(@($pl.Get | Where-Object { $_.Top }).Count) phiên về, $($pl.Same) đã giống nhau") }
       if ($deferredTops.Count) { Write-PhienOut "$($deferredTops.Count) phiên chưa đặt file chính vì file đi kèm chưa đủ, lần sau làm tiếp" }
       if ($busyFiles.Count) { Write-PhienOut "$($busyFiles.Count) file đang mở trên box (omp đang chạy phiên đó), để lần sau" }
       $failed = [int]$putRes.failed + [int]$getRes.failed
@@ -3927,6 +3992,7 @@ function Invoke-Phien {
   foreach ($a in $Rest) { if (Test-HasControlChar $a) { Write-Host 'lỗi: tham số có ký tự không hợp lệ.'; return 1 } }
   if ($sub -eq '--tu-dong') { return (Invoke-PhienAutoRun) }   # khoa chung (Local\fcode-phien) nam trong Invoke-PhienSync
   if ($sub -eq 'tu-dong') { return (Invoke-PhienAuto $(if ($pa.Count -gt 1) { $pa[1] } else { '' })) }
+  if ($sub) { $sub = Resolve-ProjectArg $sub @((Get-PhienProjects).Keys) (-not $quick) }   # ten goi -> ten that, truoc moi viec khac (hook --nhanh khong hoi box)
   if (($sub -and $sub -notmatch '\A[A-Za-z0-9._-]+\z') -or ($quick -and (-not $sub -or $dry)) -or ($nen -and -not $quick)) { Write-Host 'Cách dùng: fcode phien [project]    fcode phien <project> --nhanh    fcode phien tu-dong bat|tat'; return 1 }
   if ($quick -and $env:FCODE_PHIEN_WORKER -ne '1') { return (Invoke-PhienBounded $sub $nen) }
   $rc = Invoke-PhienSync $sub $false $dry $false $quick
@@ -4118,6 +4184,8 @@ if ($arg -eq 'phien') { exit (Invoke-Phien) }
 if ($arg -eq 'moc') { exit (Invoke-Moc) }
 if ($arg -eq '-l') { $arg = '--list' }
 if ($arg -eq 'new') { $arg = '--new' }
+# ten goi cua project -> ten that (ban sao tren laptop; chua co ban sao thi hoi box mot lan), truoc khi kiem tra ten
+if ($arg -and $arg -ne '--list' -and $arg -ne '--new' -and $arg -notmatch '\A[0-9]+\z') { $arg = Resolve-ProjectArg $arg @() (-not (Test-Path -LiteralPath (Get-PrefsPath))) }
 # ten phien: chi chu, so, . _ - (\z, khong dung $: $ chap nhan them 1 ky tu xuong dong o cuoi)
 if ($arg -and $arg -ne '--list' -and $arg -ne '--new' -and $arg -notmatch '\A[A-Za-z0-9._-]+\z') {
   Write-Host "Không hiểu lệnh '$($arg -replace '[\x00-\x1f\x7f]', '?')'. Gõ fcode help để xem các lệnh."
