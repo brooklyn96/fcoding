@@ -45,8 +45,8 @@ final class AppState: ObservableObject {
         begin(api, ["api/home", "api/prefs"])
     }
 
-    private func begin(_ api: API, _ paths: [String]) {
-        launch.start(key: loginKey(api), paths) { try await api.call("GET", $0) }
+    private func begin(_ api: API, _ paths: [String], timeout: TimeInterval = 20) {
+        launch.start(key: loginKey(api), paths) { try await api.call("GET", $0, timeout: timeout) }
     }
 
     /// GET `path` and when the reply arrived. Unless `reuse` is false (a caller that needs a reply
@@ -57,7 +57,7 @@ final class AppState: ObservableObject {
     func get(_ api: API, _ path: String, query: [URLQueryItem] = [], timeout: TimeInterval = 20,
              reuse: Bool = true, since: Date = .distantPast) async throws -> (data: Data, at: Date) {
         if reuse && query.isEmpty {
-            begin(api, [path])
+            begin(api, [path], timeout: timeout)
             if let early = launch.take(path, key: loginKey(api), since: since), let reply = try? await early.value { return reply }
         }
         let data = try await api.call("GET", path, query: query, timeout: timeout)
