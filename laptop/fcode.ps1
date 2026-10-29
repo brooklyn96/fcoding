@@ -497,7 +497,7 @@ function Write-HelpRow([string]$Cmd, [string]$Desc, [int]$W) {
 # Du lieu: dong khong co @@ la tieu de nhom, "lenh@@mo ta" la mot dong; trong chi tiet: "#" tieu de, ">" lenh, "lenh@@mo ta" la bang thang cot, con lai la chu thuong (da ngat dong <= 78 ky tu).
 function Show-Help([string]$Topic = '') {
   $overview = @(
-    'Vào phiên trên box',
+    'Vào phiên trên box (chi tiết: fcode help vao)',
     'fcode@@Xem danh sách phiên, gõ số để vào',
     'fcode <số hoặc tên phiên>@@Vào thẳng một phiên',
     'fcode --list@@Chỉ in danh sách (viết tắt: -l)',
@@ -584,15 +584,17 @@ function Show-Help([string]$Topic = '') {
       '#Lệnh (viết sau fcode deploy <tên>)',
       'status [id]@@Xem trạng thái',
       'deploy <sha>@@Deploy tay một commit',
-      'retry [sha]@@Thử lại',
+      'retry [sha]@@Thử lại commit mới nhất (hoặc <sha>)',
       'pause@@Tạm dừng deploy tự động',
       'resume@@Bật lại deploy tự động',
-      'trust on i-understand-root | off@@Bật / tắt chế độ tin cậy',
+      'trust on i-understand-root | off@@Cho phép chạy quyền root (xem Cảnh báo)',
       'logs [id] [số dòng]@@Xem nhật ký',
       'recheck@@Kiểm tra lại sau khi đã xử lý lỗi 70',
       'compact@@Dọn gọn nhật ký của cổng',
       'inventory <draft.json>@@In hiện trạng VPS theo bản nháp',
       'register <sha256> <draft.json>@@Đăng ký tay (sha256 của file nháp)',
+      '',
+      '  deploy <sha> cũng tạm dừng deploy tự động; gõ resume để bật lại.',
       '',
       '#Đăng ký project mới',
       '>fcode deploy add <chủ/repo> <tên> <draft.json>',
@@ -724,6 +726,8 @@ function Show-Help([string]$Topic = '') {
   }
   Write-Host ''
   Write-Host 'Xem chi tiết: fcode help <lệnh>   (ví dụ: fcode help deploy)'
+  $cfg = "Cấu hình: $ConfigFile"
+  if ($cfg.Length -le 80) { Write-Host $cfg }
 }
 
 # Chay script bash tren box. Tham so di CUNG script (dong "set -- '..'" dau payload, da kiem tra), khong bao gio nam tren dong lenh ssh.

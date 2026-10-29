@@ -568,6 +568,7 @@ T 'help: the overview is compact (every line <= 80 chars), has the two rollout-g
   Ok (@($d | Where-Object { $_.Contains('fcode deploy add <chủ/repo> <tên> <draft.json>') }).Count -ge 1) 'deploy add <chủ/repo> <tên> <draft.json>'
   foreach ($c in 'sync', 'ipa', 'add', 'deploy', 'pair', 'phien', 'moc', 'new', '--list', 'help') { Ok ($r.Out.Contains("fcode $c")) "overview lists fcode $c" }
   Ok ($r.Out.Contains('fcode help <lệnh>')) 'closing hint'
+  Ok ($r.Out.Contains('fcode help vao')) 'overview names the topic vao'
   foreach ($f in '-h', '--help', '/?') { $x = Run-E2E @($f); Eq $x.Code 0 $f; Eq $x.Out $r.Out "$f prints the same overview" }
 }
 T 'help: fcode help <lệnh> prints the detail of every command (lines <= 78 chars, no ESC); unknown topic -> message + overview, exit 0' {
@@ -578,6 +579,7 @@ T 'help: fcode help <lệnh> prints the detail of every command (lines <= 78 cha
   }
   $r = Run-E2E @('help', 'deploy'); Eq $r.Code 0
   foreach ($s in 'status [id]', 'deploy <sha>', 'retry [sha]', 'pause', 'resume', 'trust on i-understand-root | off', 'logs [id] [số dòng]', 'recheck', 'compact', 'inventory <draft.json>', 'register <sha256> <draft.json>', 'fcode deploy add <chủ/repo> <tên> <draft.json>', 'deployHost', 'quyền root', 'fcode deploy task status') { Ok ($r.Out.Contains($s)) "help deploy lacks: $s" }
+  Ok (@($r.Out -split "`n" | Where-Object { $_ -match 'deploy <sha>' -and $_ -match 'tạm dừng' -and $_ -match 'resume' }).Count -ge 1) 'help deploy: deploy <sha> pauses until resume'
   $o = Run-E2E @('help'); $u = Run-E2E @('help', 'xyz')
   Eq $u.Code 0; Ok ($u.Out.Contains("Không có lệnh 'xyz'")) 'unknown topic message'; Ok ($u.Out.Contains($o.Out)) 'unknown topic prints the overview'
   Eq (Run-E2E @('help', '-l')).Out (Run-E2E @('help', 'vao')).Out 'alias -l'
