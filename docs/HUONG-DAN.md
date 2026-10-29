@@ -17,6 +17,7 @@
 7. [Dùng hằng ngày](#7-dùng-hằng-ngày)
    - [Thêm dự án từ app](#thêm-dự-án-từ-app)
    - [Gửi ảnh trong chat](#gửi-ảnh-trong-chat)
+   - [Deploy từ box (`fcode-deploy`)](#deploy-từ-box-fcode-deploy)
 8. [Dùng từ laptop](#8-dùng-từ-laptop)
    - [Lệnh `fcode` (tùy chọn)](#lệnh-fcode-tùy-chọn)
    - [Đồng bộ phiên chat omp giữa laptop và box (`fcode phien`)](#đồng-bộ-phiên-chat-omp-giữa-laptop-và-box-fcode-phien)
@@ -362,6 +363,25 @@ Chi tiết cần biết:
 - Box nhận tối đa hai ảnh cùng lúc; ảnh thứ ba bị từ chối. Vì box đóng kết nối mà không đọc ảnh bị từ chối, thường app chỉ thấy lỗi mạng và báo `Không gửi được ảnh, thử lại` chứ không phải `Đang gửi ảnh khác, thử lại sau` (câu này chỉ hiện khi app nhận được câu trả lời của box). Cả hai trường hợp: đợi vài giây rồi gửi lại, gửi lại là được.
 - Nếu app báo `Không tải được ảnh, thử lại` thì ảnh chưa lấy hoặc chưa xử lý xong sau 60 giây (từ thư viện hoặc từ camera): chọn hoặc chụp lại.
 - Nếu app báo `Đã lưu ảnh nhưng chưa gắn được vào phiên` thì ảnh đã được lưu nhưng đường dẫn chưa vào được ô nhập (thường vì đường dẫn dự án có dấu cách). Bạn vẫn dùng được ảnh, chỉ cần nhờ trợ lý đọc ảnh mới nhất trong `.fcode/uploads`.
+
+### Deploy từ box (`fcode-deploy`)
+
+Lệnh `fcode-deploy` (cài cùng `install.sh` vào `~/.local/bin`) cho agent trên box điều khiển cổng deploy trên VPS, giống `fcode deploy` của laptop. Nó dùng **khoá ssh riêng của cổng** (`~/.ssh/fcode-operator`); khoá này chỉ chạy được các lệnh của cổng, không mở được shell hay đọc file trên VPS. Lệnh không bao giờ hỏi gì, nên agent chạy thẳng được.
+
+Cấu hình một lần: khoá `~/.ssh/fcode-operator` (chmod 600; dòng khoá công khai tương ứng do người quản trị cài trên VPS) và tên máy VPS, đặt bằng biến `FCODE_DEPLOY_HOST` hoặc ghi một dòng vào `~/.config/fcode/deploy-host`. Cần `gh` (có `GH_TOKEN`) cho lệnh `add`.
+
+```sh
+fcode-deploy add <chủ/repo> <tên> <draft.json>          # kiểm tra, thêm khoá deploy chỉ đọc vào repo, in các dòng INV, rồi DỪNG (mã 0)
+fcode-deploy add <chủ/repo> <tên> <draft.json> --yes    # như trên, rồi đăng ký (sau khi kiểm tra lại Actions)
+fcode-deploy <tên> status | recheck | pause | resume
+fcode-deploy <tên> deploy <sha đủ 40 ký tự>
+fcode-deploy <tên> trust on i-understand-root           # cho phép compose / script chạy với quyền root: đọc cảnh báo trước
+fcode-deploy <tên> trust off
+```
+
+- Mã thoát là mã của cổng (0 xong, 1 bị từ chối hoặc rollback, 65 yêu cầu sai, 69 dịch vụ chết, 70 cần người xử lý). Riêng 65 cũng là mã khi lệnh từ chối ngay trên box (tên, sha, bản nháp sai: chưa gửi gì); 1 là lỗi công cụ (thiếu cấu hình, `gh` lỗi); 255 là ssh không nối được.
+- `add` từ chối (65) khi repo còn lượt Actions đang chạy hoặc đang chờ, và khi khoá deploy của repo có quyền ghi. Chưa có `--yes` thì không bao giờ gửi `register`.
+- Các project cũ `deal-sync` và `vps-scraper` dùng khoá riêng của chúng, không qua lệnh này.
 
 ## 8. Dùng từ laptop
 
