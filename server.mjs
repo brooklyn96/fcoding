@@ -1720,7 +1720,9 @@ export function createApp(opts = {}) {
   function boxInfo(rec) {
     tick();
     const t = now();
-    const ib = rec?.box && rec.at >= boxResume && t - rec.at < BOX_REC_MS ? rec.box : null;
+    const fresh = rec?.box && rec.at >= boxResume && t - rec.at < BOX_REC_MS ? rec.box : null;
+    // A running box more than a cooldown past its own deadline (we are answering, so it runs) is not what the record says: the estimate answers, never a past sleepsAt.
+    const ib = fresh && !(fresh.state === 'running' && t > fresh.runStartedAt + (fresh.maxRunMinutes + fresh.cooldownMinutes) * 60e3) ? fresh : null;
     if (ib) {
       const cool = ib.cooldownMinutes * 60e3;
       const paused = ib.state !== 'running' && ib.cooldownUntil > t;
