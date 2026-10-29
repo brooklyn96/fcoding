@@ -3456,13 +3456,13 @@ test('after a reset the reset counts wait for the new listing; a listing that is
   assert.equal((await c.home()).accounts[3].resets.available, 1);
   const spent = JSON.parse(fs.readFileSync(FIX('omp-reset-list.json'), 'utf8'));
   for (const a of spent.accounts) if (a.provider === 'openai-codex') { a.redeemableCount = 0; a.availableCount = 0; }
-  // the listing after the reset is slower than homeWait / 2 (and than homeWait) but within the post-reset wait
+  // the listing after the reset is slower than homeWait / 2 (and than homeWait); it lands in the background
   c.setRules([['usage reset --json', { stdout: JSON.stringify(spent), delay: 1500 }], ...baseRules()]);
   assert.equal((await c.reset(body)).json.result, 'reset');
   let cx = (await c.home()).accounts[3];
   assert.deepEqual([cx.resets.available, cx.stale], [1, true]); // not ready within homeWait: the old count, marked stale
   cx = (await c.homeUntil((h) => !h.accounts[3].stale)).accounts[3];
-  assert.equal(cx.resets.available, 0); // the refresh waited for the new listing: its count, not the old one
+  assert.equal(cx.resets.available, 0); // once the new listing has landed: its count, not the old one
   // the listing fails after a reset: the old count is shown marked stale until a listing fetched after the reset lands
   c.setRules([['usage reset --json', { code: 1, stderr: 'down' }], ['usage reset openai-codex/4', { stdout: RESET_OK }], ...baseRules()]);
   assert.equal((await c.reset({ ...body, requestId: `${body.requestId}-2` })).json.result, 'reset');
@@ -3511,14 +3511,14 @@ test('after a reset and a good listing, a later listing failure is handled as wi
   const fails = c.toolCalls('usage reset --json').length;
   for (const step of [305e3, 61e3]) { // the listing expires and fails; then its retry delay is over and it fails again
     c.clock.t += step;
-    await c.home(); // served while the quota refresh runs
+    await c.home(); // served while the listing refresh runs
     await c.app.homeIdle(); await c.app.homeIdle();
     const h = await c.home();
     assert.ok(h.accounts.every((a) => !a.stale), JSON.stringify(h.accounts.map((a) => [a.id, a.stale])));
   }
   assert.equal(c.toolCalls('usage reset --json').length, fails + 2); // both listing refreshes ran and failed
   const reads = c.toolCalls('usage --json').length;
-  c.clock.t += 20e3; // past the 15 s stale TTL, within the normal 60 s
+  c.clock.t += 20e3; // within the quota's normal 60 s TTL: no new usage read
   await c.home();
   await c.app.homeIdle();
   assert.equal(c.toolCalls('usage --json').length, reads);
