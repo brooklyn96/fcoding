@@ -27,7 +27,7 @@ function Ok([bool]$c, [string]$What) { if (-not $c) { throw $What } }
 $tokens = $null; $errs = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($Fcode, [ref]$tokens, [ref]$errs)
 if ($errs.Count) { throw "fcode.ps1 does not parse: $($errs[0].Message)" }
-$wanted = 'Get-DeployHost', 'Test-DeployWord', 'Test-DeployName', 'Test-DeployRepo', 'Invoke-DeploySsh', 'Invoke-DeployGate', 'Read-DeployDraft', 'Test-DeployRunsIdle', 'Confirm-DeployRegister', 'Confirm-DeployKey', 'Invoke-DeployAdd', 'Invoke-Deploy', 'Write-IpaError'
+$wanted = 'Get-DeployHost', 'Test-DeployWord', 'Test-DeployName', 'Test-DeployRepo', 'Invoke-DeploySsh', 'Invoke-DeployGate', 'Read-DeployDraft', 'Test-DeployRunsIdle', 'Confirm-DeployRegister', 'Confirm-DeployKey', 'Invoke-DeployAdd', 'Invoke-DeployAllow', 'Invoke-Deploy', 'Write-IpaError'
 $found = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in $wanted }, $true))
 if ($found.Count -ne $wanted.Count) { throw "fcode.ps1 lacks some of: $($wanted -join ', ')" }
 foreach ($fn in $found) { . ([scriptblock]::Create($fn.Extent.Text)) }
@@ -208,6 +208,66 @@ T 'trust off and a wrong or missing confirmation word: one unchanged call, no wa
     Eq $r.Calls.Count 1 ($w -join ' '); Eq (($r.Calls[0].Text -split "$SEP")[2]) ("$GATE " + ($w -join ' ')) 'unchanged'
     Ok ($r.Text -notmatch 'Trusted mode') 'no warning'
   }
+}
+
+# ============================== allow / disallow ==============================
+$AllowWarn = 'coder sẽ được bật trust on (chạy bằng root) cho project này'
+T 'allow / allow root / disallow: each maps to the exact remote command (one ssh -n call, no stdin); the gate lines come back in order, exit code 0' {
+  $table = @(
+    @{ W = @('allow', 'task'); R = "$GATE task allow" }
+    @{ W = @('allow', 'task', 'root'); R = "$GATE task allow root" }
+    @{ W = @('disallow', 'task'); R = "$GATE task disallow" }
+    @{ W = @('allow', 'shopee-dashboard', 'root'); R = "$GATE shopee-dashboard allow root" }
+    @{ W = @('disallow', 'ab'); R = "$GATE ab disallow" }
+  )
+  foreach ($c in $table) {
+    Reset-World; Add-Rule 'ssh' '.' @(Ans @('GATE_RESULT outcome=x name=y root=no', 'GATE_EXIT 0') 0)
+    $r = Run-Fcode $c.W
+    Eq $r.Code 0 ($c.R + ' code'); Eq $r.Calls.Count 1 ($c.R + ' calls')
+    $parts = $r.Calls[0].Text -split "$SEP"
+    Eq $parts.Count 3 'ssh argv: -n host command'; Eq $parts[0] '-n'; Eq $parts[1] 'contabo'; Eq $parts[2] $c.R 'remote command'
+    Eq $r.Calls[0].Stdin '' 'no stdin'
+    Ok ($r.Text.IndexOf('GATE_RESULT') -ge 0 -and $r.Text.IndexOf('GATE_EXIT 0') -gt $r.Text.IndexOf('GATE_RESULT')) ('output: ' + $r.Text)
+  }
+}
+T 'allow root: one warning line BEFORE the call, no question asked; allow and disallow print no warning' {
+  Reset-World; Add-Rule 'ssh' '.' @(Ans @('GATE_EXIT 0') 0)
+  $r = Run-Fcode @('allow', 'task', 'root')
+  $iw = $r.Text.IndexOf($AllowWarn); $it = $r.Text.IndexOf("<<ssh $GATE task allow root>>")
+  Ok ($iw -ge 0) ('warning missing: ' + $r.Text); Ok ($it -gt $iw) 'warning comes before the call'
+  Ok ($r.Text -notmatch '<<PROMPT>>') 'no question'; Eq (([regex]::Matches($r.Text, [regex]::Escape($AllowWarn))).Count) 1 'warning printed once'
+  foreach ($w in @(@('allow', 'task'), @('disallow', 'task'))) {
+    Reset-World; Add-Rule 'ssh' '.' @(Ans @('GATE_EXIT 0') 0)
+    $r = Run-Fcode $w; Ok ($r.Text -notmatch 'trust on') ($w -join ' ' + ' prints no warning')
+  }
+}
+T 'allow / disallow: a bad name or extra / wrong argument is refused locally (rc 65, usage, no call); no alias resolution' {
+  $bad = @(
+    @('allow'), @('disallow'), @('allow', 'Task'), @('allow', 'a'), @('allow', 'ab-'), @('allow', '-x'), @('allow', 'a b'), @('allow', 'task;id'), @('allow', ('a' * 29)), @('allow', '1abc'),
+    @('allow', 'task', 'ROOT'), @('allow', 'task', 'roots'), @('allow', 'task', 'root', 'x'), @('allow', 'task', 'x'), @('allow', 'task', ''),
+    @('disallow', 'task', 'root'), @('disallow', 'task', 'x'), @('disallow', 'Task'), @('disallow', 'a;b'), @('disallow', '')
+  )
+  foreach ($w in $bad) {
+    Reset-World; Add-Rule 'ssh' '.' @(Ans @('ok') 0)
+    $r = Run-Fcode $w
+    Eq $r.Code 65 ('[' + ($w -join '|') + '] code'); Eq $r.Calls.Count 0 ('[' + ($w -join '|') + '] no call')
+    Ok ($r.Text -match 'Cách dùng: fcode deploy (allow|disallow) <tên>') ('[' + ($w -join '|') + '] usage')
+    Ok ($r.Text -notmatch 'trust on') ('[' + ($w -join '|') + '] no warning for a refused call')
+  }
+}
+T 'allow / disallow: GATE_WARN is shown in yellow, other lines are not; the gate exit code (0 65 70 255) comes back unchanged' {
+  function Write-Host { param([Parameter(Position = 0, ValueFromRemainingArguments)]$Objects, $ForegroundColor) $script:Shown.Add([pscustomobject]@{ T = ($Objects -join ' '); C = "$ForegroundColor" }) }
+  foreach ($rc in 0, 65, 70, 255) {
+    Reset-World; $script:Shown = New-Object Collections.ArrayList
+    Add-Rule 'ssh' '.' @(Ans @('GATE_WARN root stays', 'GATE_RESULT outcome=disallowed name=task root=yes', 'GATE_EXIT ' + $rc) $rc)
+    $script:Rest = @('deploy', 'disallow', 'task'); $got = @(Invoke-Deploy)
+    Eq $got.Count 1 'one value'; Eq ([int]$got[0]) $rc "code $rc"
+    $w = @($script:Shown | Where-Object { $_.T -ceq 'GATE_WARN root stays' }); Eq $w.Count 1 'GATE_WARN shown once'; Eq $w[0].C 'Yellow' 'GATE_WARN is yellow'
+    $o = @($script:Shown | Where-Object { $_.T -cmatch '^GATE_(RESULT|EXIT)' }); Ok ($o.Count -eq 2 -and @($o | Where-Object { $_.C -ne '' }).Count -eq 0) ("other gate lines are plain: " + (($script:Shown | ForEach-Object { $_.T + "=" + $_.C }) -join " | "))
+  }
+  $script:Shown = New-Object Collections.ArrayList; Reset-World; Add-Rule 'ssh' '.' @(Ans @('x') 0)
+  $script:Rest = @('deploy', 'allow', 'task', 'root'); [void](Invoke-Deploy)
+  Eq @($script:Shown | Where-Object { $_.T -ceq $AllowWarn })[0].C 'Yellow' 'the allow root warning is yellow'
 }
 
 # ============================== inventory / register with a draft file ==============================
@@ -561,6 +621,14 @@ T 'e2e: trust on i-understand-root through the real script: status first, warnin
   Ok ($r.Out.Contains((Expected-Warning 'brooklyn96/task' 'main'))) ('warning: ' + $r.Out)
   Ok ($r.Log[1] -match 'trust on i-understand-root') 'second call is the trust'
 }
+T 'e2e: allow root / disallow through the real script: one ssh -n call, the gate lines shown, exit code = the gate code; a bad name never starts ssh' {
+  $r = Run-E2E @('deploy', 'allow', 'task', 'root') 'GATE_WARN root stays;GATE_RESULT outcome=allowed name=task root=yes;GATE_EXIT 0' 0
+  Eq $r.Code 0 $r.Out; Eq $r.Log.Count 1; Eq ($r.Log[0] -replace ' STDIN=.*$', '') ("ssh -n${SEP}vps-e2e${SEP}$GATE task allow root") 'argv'
+  Ok ($r.Out.Contains($AllowWarn) -and $r.Out -match 'GATE_WARN root stays' -and $r.Out -match 'outcome=allowed') ('output: ' + $r.Out)
+  $r = Run-E2E @('deploy', 'disallow', 'task') 'GATE_ERROR reserved name;GATE_EXIT 65' 65
+  Eq $r.Code 65 $r.Out; Eq ($r.Log[0] -replace ' STDIN=.*$', '') ("ssh -n${SEP}vps-e2e${SEP}$GATE task disallow") 'argv'
+  foreach ($w in @(@('deploy', 'allow'), @('deploy', 'allow', 'Task'), @('deploy', 'disallow', 'task', 'root'))) { $r = Run-E2E $w; Eq $r.Code 65 ($w -join ' '); Eq $r.Log.Count 0 'no ssh' }
+}
 T 'help: the overview is compact (every line <= 80 chars), has the two rollout-guide strings, lists every command, no ESC when piped' {
   $r = Run-E2E @('help'); Eq $r.Code 0; Eq $r.Log.Count 0
   $lines = @($r.Out -split "`n")
@@ -571,6 +639,7 @@ T 'help: the overview is compact (every line <= 80 chars), has the two rollout-g
   Ok (@($d | Where-Object { $_.Contains('fcode deploy <tên> <lệnh> [đối số]') }).Count -ge 1) 'deploy <tên> <lệnh> [đối số]'
   Ok (@($d | Where-Object { $_.Contains('fcode deploy add <chủ/repo> <tên> <draft.json>') }).Count -ge 1) 'deploy add <chủ/repo> <tên> <draft.json>'
   foreach ($c in 'sync', 'ipa', 'add', 'deploy', 'pair', 'phien', 'moc', 'new', '--list', 'help') { Ok ($r.Out.Contains("fcode $c")) "overview lists fcode $c" }
+  foreach ($c in 'fcode deploy allow <tên> [root]', 'fcode deploy disallow <tên>') { Ok ($r.Out.Contains($c)) "overview lists $c" }
   Ok ($r.Out.Contains('fcode help <lệnh>')) 'closing hint'
   Ok ($r.Out.Contains('fcode help vao')) 'overview names the topic vao'
   foreach ($f in '-h', '--help', '/?') { $x = Run-E2E @($f); Eq $x.Code 0 $f; Eq $x.Out $r.Out "$f prints the same overview" }
@@ -582,7 +651,7 @@ T 'help: fcode help <lệnh> prints the detail of every command (lines <= 78 cha
     Ok ($r.Out.Contains("fcode $t") -or $t -eq 'vao') "$t names its command"
   }
   $r = Run-E2E @('help', 'deploy'); Eq $r.Code 0
-  foreach ($s in 'status [id]', 'deploy <sha>', 'retry [sha]', 'pause', 'resume', 'trust on i-understand-root | off', 'logs [id] [số dòng]', 'recheck', 'compact', 'inventory <draft.json>', 'register <sha256> <draft.json>', 'fcode deploy add <chủ/repo> <tên> <draft.json>', 'deployHost', 'quyền root', 'fcode deploy task status') { Ok ($r.Out.Contains($s)) "help deploy lacks: $s" }
+  foreach ($s in 'status [id]', 'deploy <sha>', 'retry [sha]', 'pause', 'resume', 'trust on i-understand-root | off', 'logs [id] [số dòng]', 'recheck', 'compact', 'inventory <draft.json>', 'register <sha256> <draft.json>', 'fcode deploy add <chủ/repo> <tên> <draft.json>', 'fcode deploy allow <tên> [root]', 'fcode deploy disallow <tên>', 'trust on i-understand-root: in một dòng cảnh báo', 'deployHost', 'quyền root', 'fcode deploy task status') { Ok ($r.Out.Contains($s)) "help deploy lacks: $s" }
   Ok (@($r.Out -split "`n" | Where-Object { $_ -match 'deploy <sha>' -and $_ -match 'tạm dừng' -and $_ -match 'resume' }).Count -ge 1) 'help deploy: deploy <sha> pauses until resume'
   $o = Run-E2E @('help'); $u = Run-E2E @('help', 'xyz')
   Eq $u.Code 0; Ok ($u.Out.Contains("Không có lệnh 'xyz'")) 'unknown topic message'; Ok ($u.Out.Contains($o.Out)) 'unknown topic prints the overview'
