@@ -6044,3 +6044,26 @@ test('prefs: two PUTs at once leave one whole, valid file', () => withApp(async 
   assert.ok(bodies.some((b) => JSON.stringify(b) === JSON.stringify(got)), JSON.stringify(got));
   assert.deepEqual(fs.readdirSync(c.configDir).filter((f) => f.endsWith('.tmp')), []);
 }));
+
+test('prefs: a project added later whose name equals a stored alias: GET drops only that alias', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  const saved = { order: ['my.proj', 'alpha'], aliases: { alpha: 'dev', 'my.proj': 'Mine' } };
+  assert.deepEqual((await putPrefs(c, cookie, saved)).json, saved);
+  setProjects(c, { alpha: ABS, 'my.proj': ABS, dev: ABS });
+  assert.deepEqual((await c.req('GET', '/api/prefs', { cookie })).json, { order: ['my.proj', 'alpha'], aliases: { 'my.proj': 'Mine' } });
+  assert.equal((await putPrefs(c, cookie, saved)).status, 400); // a PUT stays strict
+  setProjects(c, { alpha: ABS, 'my.proj': ABS }); // the file was not rewritten: the alias is back when the clash is gone
+  assert.deepEqual((await c.req('GET', '/api/prefs', { cookie })).json, saved);
+}));
+
+test('prefs: GET of a stored file keeps what fits: unknown names, duplicate aliases (first wins), bad characters and long aliases are dropped one by one', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  setProjects(c, { alpha: ABS, 'my.proj': ABS, beta: ABS, gamma: ABS });
+  fs.writeFileSync(path.join(c.configDir, 'prefs.json'), JSON.stringify({
+    order: ['gone', 'beta', 7, 'alpha', 'beta'],
+    aliases: { alpha: 'Same', 'my.proj': 'SAME', beta: 'a/b', gamma: 'x'.repeat(31), gone: 'Ghost', delta: 5 },
+  }));
+  assert.deepEqual((await c.req('GET', '/api/prefs', { cookie })).json, { order: ['beta', 'alpha'], aliases: { alpha: 'Same' } });
+  fs.writeFileSync(path.join(c.configDir, 'prefs.json'), JSON.stringify({ order: 'alpha', aliases: { beta: 'Keep' } }));
+  assert.deepEqual((await c.req('GET', '/api/prefs', { cookie })).json, { order: [], aliases: { beta: 'Keep' } }); // a bad half does not cost the other half
+}));

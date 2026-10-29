@@ -65,28 +65,33 @@ class HttpErr extends Error {
 const ALIAS_MAX = 30;
 const ALIAS_RE = /^[\p{L}\p{M}\p{N} ._-]+$/u;
 const PREFS_BAD = 'Dữ liệu sắp xếp không đúng dạng.';
-// The body of a PUT (or the stored file) -> {order, aliases}: only known project names, unique order, NFC trimmed aliases; an alias equal to
-// its own project name is dropped. Throws HttpErr(400, <Vietnamese sentence>) for a wrong shape or a refused alias (the app mirrors these rules).
-function normalizePrefs(v, names) {
-  if (!v || !Array.isArray(v.order) || !v.aliases || typeof v.aliases !== 'object' || Array.isArray(v.aliases)) throw new HttpErr(400, PREFS_BAD);
+// The body of a PUT or the stored file -> {order, aliases}: only known project names, unique order, NFC trimmed aliases; an alias equal to its
+// own project name is dropped. Strict (PUT): a wrong shape or a refused alias throws HttpErr(400, <Vietnamese sentence>); the app mirrors these
+// rules. Lenient (GET of the stored file): the same checks drop only the entry that no longer fits (the first alias in project order wins), keep the rest.
+function normalizePrefs(v, names, lenient = false) {
+  const bad = (msg) => { if (!lenient) throw new HttpErr(400, msg); };
+  const root = v && typeof v === 'object' ? v : {};
+  const orderIn = Array.isArray(root.order) ? root.order : [];
+  const aliasesIn = root.aliases && typeof root.aliases === 'object' && !Array.isArray(root.aliases) ? root.aliases : {};
+  if (orderIn !== root.order || aliasesIn !== root.aliases) bad(PREFS_BAD);
   const order = [];
-  for (const n of v.order) {
-    if (typeof n !== 'string') throw new HttpErr(400, PREFS_BAD);
+  for (const n of orderIn) {
+    if (typeof n !== 'string') { bad(PREFS_BAD); continue; }
     if (names.includes(n) && !order.includes(n)) order.push(n);
   }
   const aliases = {}; const used = new Map(); // lower-cased alias -> project
   for (const name of names) {
-    const raw = Object.hasOwn(v.aliases, name) ? v.aliases[name] : undefined; // own keys only: a project called "constructor" has no alias
+    const raw = Object.hasOwn(aliasesIn, name) ? aliasesIn[name] : undefined; // own keys only: a project called "constructor" has no alias
     if (raw === undefined || raw === null) continue;
-    if (typeof raw !== 'string') throw new HttpErr(400, PREFS_BAD);
+    if (typeof raw !== 'string') { bad(PREFS_BAD); continue; }
     const a = raw.normalize('NFC').trim();
     if (!a || a === name) continue;
-    if ([...a].length > ALIAS_MAX) throw new HttpErr(400, `Tên “${[...a].slice(0, ALIAS_MAX).join('')}…” dài quá ${ALIAS_MAX} ký tự.`);
-    if (!ALIAS_RE.test(a)) throw new HttpErr(400, `Tên “${a}” chỉ được có chữ, số, dấu cách và - _ .`);
+    if ([...a].length > ALIAS_MAX) { bad(`Tên “${[...a].slice(0, ALIAS_MAX).join('')}…” dài quá ${ALIAS_MAX} ký tự.`); continue; }
+    if (!ALIAS_RE.test(a)) { bad(`Tên “${a}” chỉ được có chữ, số, dấu cách và - _ .`); continue; }
     const key = a.toLowerCase();
     const other = names.find((n) => n !== name && n.toLowerCase() === key);
-    if (other) throw new HttpErr(400, `Tên “${a}” trùng tên dự án ${other}.`);
-    if (used.has(key)) throw new HttpErr(400, `Tên “${a}” đã dùng cho ${used.get(key)}.`);
+    if (other) { bad(`Tên “${a}” trùng tên dự án ${other}.`); continue; }
+    if (used.has(key)) { bad(`Tên “${a}” đã dùng cho ${used.get(key)}.`); continue; }
     used.set(key, name); aliases[name] = a;
   }
   return { order, aliases };
@@ -2157,7 +2162,7 @@ export function createApp(opts = {}) {
       const file = path.join(configDir, 'prefs.json');
       if (method === 'GET') {
         let prefs = { order: [], aliases: {} };
-        try { prefs = normalizePrefs(JSON.parse(fs.readFileSync(file, 'utf8')), cfg.projectNames); } catch {} // no file, a broken one, or one the project list outgrew: empty
+        try { prefs = normalizePrefs(JSON.parse(fs.readFileSync(file, 'utf8')), cfg.projectNames, true); } catch {} // no file or not JSON: empty; an entry the project list outgrew is dropped alone
         return json(res, 200, prefs);
       }
       want('PUT');
