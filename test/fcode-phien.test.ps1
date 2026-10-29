@@ -3710,7 +3710,7 @@ T 'alias e2e: the project list shows "alias (real name)"' {
 function Use-BareIb($w) {
   $py = Join-Path $w.W 'ib-bare.py'; $cmd = Join-Path $w.W 'ib-bare.cmd'; $w | Add-Member -NotePropertyName BareLog -NotePropertyValue (Join-Path $w.W 'bare.log') -Force
   $fake = Join-Path $PSScriptRoot 'fake-instabox.py'
-  # BARE_FAIL=<word>,<word>: a call whose word is one of these exits 1 (the box knows no session of that name)
+  # BARE_FAIL=<word>,<word>: a call whose word is one of these exits 78 (the box script found no session of that name); BARE_DROP: exits 255 (the ssh dropped)
   $src = @'
 import base64, os, re, subprocess, sys
 a = sys.argv[1:]
@@ -3718,7 +3718,7 @@ if a and a[0] == 'ssh' and 'base64 -d' in a[-1] and 'python3' not in a[-1]:
     open(os.environ['BARE_LOG'], 'a', encoding='utf-8').write(a[-1] + '\n')
     t = base64.b64decode(re.search(r'echo (\S+) \|', a[-1]).group(1)).decode('utf-8')
     w = re.search(r"(?m)^set -- '(.*)'", t).group(1)
-    sys.exit(1 if w in os.environ.get('BARE_FAIL', '').split(',') else 0)
+    sys.exit(78 if w in os.environ.get('BARE_FAIL', '').split(',') else 255 if w in os.environ.get('BARE_DROP', '').split(',') else 0)
 sys.exit(subprocess.call([sys.executable, r'@@FAKE@@'] + a))
 '@
   [IO.File]::WriteAllText($py, $src.Replace('@@FAKE@@', $fake), $utf8)
@@ -3820,13 +3820,13 @@ T 'alias e2e: fcode phien <alias> (or the box name) works when the laptop folder
 }
 # the bare-form script runs on the box; here it runs in Git's bash with fake tmux and fcode-new
 $GitBash = Join-Path (Split-Path (Split-Path (Split-Path (((& git --exec-path) | Select-Object -First 1) -replace '/', '\')))) 'bin\bash.exe'
-function Invoke-BareScript([string]$Text, [string]$Stdin, [string]$Tag) {
+function Invoke-BareScript([string]$Text, [string]$Stdin, [string]$Tag, [string]$Sessions = '') {
   $d = Join-Path $Root ('bs-' + $Tag); $bin = Join-Path $d 'bin'; [void](New-Item -ItemType Directory -Path $bin -Force)
   $log = Join-Path $d 'calls.log'
   [IO.File]::WriteAllText((Join-Path $bin 'tmux'), @'
 #!/bin/bash
 case "$1" in
-  list-sessions) echo 'deal-sync-omp|0|deal-sync|omp' ;;
+  list-sessions) printf '%s\n' "${FAKE_SESSIONS:-deal-sync-omp|0|deal-sync|omp}" ;;
   *) echo "tmux $*" >> "$FAKE_LOG" ;;
 esac
 '@.Replace("`r`n", "`n"), $utf8)
@@ -3844,12 +3844,12 @@ esac
   $psi.Arguments = '"' + ($sf -replace '\\', '/') + '"'
   $psi.UseShellExecute = $false; $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
   $psi.StandardOutputEncoding = $utf8
-  $psi.EnvironmentVariables['PATH'] = $bin + ';' + $env:PATH; $psi.EnvironmentVariables['FAKE_LOG'] = $log
+  $psi.EnvironmentVariables['PATH'] = $bin + ';' + $env:PATH; $psi.EnvironmentVariables['FAKE_LOG'] = $log; if ($Sessions) { $psi.EnvironmentVariables['FAKE_SESSIONS'] = $Sessions }
   $p = [Diagnostics.Process]::Start($psi)
   $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
   $p.StandardInput.Write($Stdin); $p.StandardInput.Close()
   if (-not $p.WaitForExit(60000)) { $p.Kill(); throw 'the box script timed out' }
-  [pscustomobject]@{ Out = $o.Result; Err = $e.Result; Log = $(if (Test-Path $log) { [IO.File]::ReadAllText($log) } else { '' }) }
+  [pscustomobject]@{ Code = $p.ExitCode; Out = $o.Result; Err = $e.Result; Log = $(if (Test-Path $log) { [IO.File]::ReadAllText($log) } else { '' }) }
 }
 T 'alias: the box script shows "alias (real name)" in the session list and the `fcode new` project picker; the real name is what is picked and run; alias text is data, never code' {
   With-PrefsCache '{"order":[],"aliases":{"deal-sync":"Cửa hàng","other":"a$(echo PWNED)b\t;x","bad key":"zzz"}}' {
@@ -3868,6 +3868,27 @@ T 'alias: the box script shows "alias (real name)" in the session list and the `
     $r = Invoke-BareScript (Get-BareScript '--list') '' 'list0'
     Ok ($r.Out.Contains('dự án: deal-sync') -and -not $r.Out.Contains('(deal-sync)')) ("no aliases: the real name alone; out: " + $r.Out)
   }
+}
+T 'alias: the box script finds a session by its project tag (@pc_project), not only by the start of its name: my_app, a renamed session; no session = exit 78' {
+  $ss = "my-app-omp|0|my_app|omp`nrenamed|0|my_app|claude`nother-omp|0|other|omp"
+  $r = Invoke-BareScript (Get-BareScript 'my_app') '' 'proj1' $ss
+  Eq $r.Code 1 $r.Out
+  Ok ($r.Out.Contains('Có nhiều phiên khớp "my_app"') -and $r.Out.Contains('my-app-omp') -and $r.Out.Contains('renamed') -and -not $r.Out.Contains('other-omp')) ("both sessions of the project, not the other; out: " + $r.Out)
+  $r = Invoke-BareScript (Get-BareScript 'MY_APP') '' 'proj2' 'renamed|0|my_app|claude'
+  Eq $r.Code 0 ($r.Out + $r.Err)
+  Ok ($r.Log.Contains('tmux -u attach -t =renamed')) ("one session tagged with the project: attached, any case; log: " + $r.Log)
+  $r = Invoke-BareScript (Get-BareScript 'my-app-omp') '' 'proj3' $ss
+  Eq $r.Code 0 'an exact session name still wins'
+  Ok ($r.Log.Contains('=my-app-omp')) $r.Log
+  $r = Invoke-BareScript (Get-BareScript 'zz') '' 'proj4' $ss
+  Eq $r.Code 78 'no such session: 78'
+  $r = Invoke-BareScript (Get-BareScript 'my_a') '' 'proj5' $ss
+  Eq $r.Code 78 'a prefix of a project name is not a project tag, and my_a starts no session name'
+}
+T 'alias e2e: the box program writes UTF-8 whatever the locale: a Vietnamese alias survives a non-UTF-8 stdout encoding' {
+  $w = New-W2 'al15'; Set-BoxPrefs $w ('{"aliases":{"proj":"D\u1ef1 \u00e1n"}}')
+  $r = Invoke-Fcode $w @('phien', 'proj') @{ PYTHONIOENCODING = 'cp1252'; PYTHONUTF8 = '0' }; Eq $r.Code 0 $r.Out
+  Eq (((Get-AliasCache $w) | ConvertFrom-Json).aliases.proj) ('D' + [char]0x1EF1 + ' ' + [char]0xE1 + 'n') 'bytes are UTF-8, not the locale encoding'
 }
 T 'alias e2e: project names that differ only in case cannot break the scan reply; the CLI keeps working' {
   $w = New-W2 'al12'; Set-BoxCfg $w @('Alpha', 'alpha', 'proj'); Set-BoxPrefs $w '{"aliases":{"Alpha":"x","alpha":"y","proj":"pj"}}'
@@ -3890,6 +3911,17 @@ T 'alias e2e: the bare form asks the box once for a word the box does not know, 
   Set-BoxPrefs $w '{"aliases":{"proj":"my proj"}}'
   $r = Invoke-Fcode $w @('my proj') $e; Eq $r.Code 0 $r.Out
   Eq (@(Get-BareArgs $w) | Select-Object -Last 1) 'proj' 'a word with a space can only be an alias: asked before the first script'
+}
+T 'alias e2e: a dropped ssh (255) or any other failure is not "no such session": the bare form does not wake the box or ask it; the user sees the exit code' {
+  $w = New-W2 'al14'; Use-BareIb $w; Set-AliasCache $w '{"order":[],"names":["proj"],"aliases":{},"repos":{}}'
+  Set-BoxPrefs $w '{"aliases":{"proj":"pj"}}'
+  $r = Invoke-Fcode $w @('pj') @{ BARE_LOG = $w.BareLog; BARE_DROP = 'pj' }
+  Eq $r.Code 255 $r.Out
+  Eq ((Get-BareArgs $w) -join '|') 'pj' 'one script, no retry'
+  Eq (Calls $w 'projects') 0 'the box was not asked'
+  $r = Invoke-Fcode $w @('zz') @{ BARE_LOG = $w.BareLog; BARE_FAIL = 'zz' }
+  Eq $r.Code 1 'no such session: the user still sees exit code 1'
+  Eq (Calls $w 'projects') 1 'asked now'
 }
 if ($env:FCODE_TEST_KEEP) { Write-Host "kept: $Root" } else { for ($i = 0; $i -lt 4 -and (Test-Path -LiteralPath $Root); $i++) { Set-Location -LiteralPath $env:TEMP; Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue; if (Test-Path -LiteralPath $Root) { Start-Sleep -Seconds 3 } } }   # omp may still hold its native addon for a moment
 Write-Host ''
