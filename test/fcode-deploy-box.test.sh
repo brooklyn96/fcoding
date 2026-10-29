@@ -96,6 +96,12 @@ reset; echo 255 >"$FAKE/rc.status"; fd demo status
 eq 'ssh failure 255 passes through' "$RC" 255
 has '255 prints a hint' 'không nối được VPS' "$T/out"
 
+# ---- GATE_WARN lines of the gate reach the user ----
+reset; printf 'GATE_WARN demo is trusted: its code runs as root\nGATE_EXIT 0\n' >"$FAKE/out.status"; fd demo status
+has 'GATE_WARN line is shown (verb)' 'GATE_WARN demo is trusted' "$T/out"
+reset; printf 'GATE_WARN shop is trusted: x\nINV ok\nGATE_EXIT 0\n' >"$FAKE/out.inventory"; fd add acme/shop shop "$DRAFT"
+has 'GATE_WARN line is shown (add inventory)' 'GATE_WARN shop is trusted' "$T/out"
+
 # ---- host keys are checked, never auto-accepted ----
 reset; fd demo status
 has 'ssh is told StrictHostKeyChecking=yes (verb)' 'StrictHostKeyChecking=yes' "$FAKE/ssh.log"

@@ -370,7 +370,7 @@ Lệnh `fcode-deploy` (cài cùng `install.sh` vào `~/.local/bin`) cho agent tr
 
 **Khoá này làm được gì, và không làm được gì.**
 
-- Không có shell, không chạy được lệnh tự do, không xoá được secret, `authorized_keys`, deploy key hay workflow của GitHub.
+- Không có shell, không chạy được lệnh tự do, không xoá được secret, `authorized_keys`, deploy key hay workflow của GitHub (trừ project đã duyệt root và `trust on`: code của nó chạy bằng root, làm được mọi thứ trên VPS). Riêng token `gh` của box thì xoá được secret, deploy key và workflow, như tài liệu của cổng đã nêu.
 - Chỉ tác động lên project mà **người dùng đã duyệt trên laptop** (bước đầu tiên, xem dưới). Project chưa duyệt bị cổng từ chối (mã 65).
 - `add --yes` (register) và `deploy` chạy **code của repo đó trên VPS**: bằng user riêng `fcd-<tên>`, và bằng root chỉ khi người dùng duyệt kèm `root`. `register` còn nhận thư mục dưới `/opt`, `/srv`, `/var/www` và có thể dừng / chạy lại các service ngoài danh sách dành riêng của project đã duyệt. `inventory` đọc thông tin thư mục (tên, chủ, quyền, kích thước) và thử các cổng localhost.
 
@@ -381,6 +381,8 @@ fcode deploy allow <tên>          # cho khoá của box dùng project này
 fcode deploy allow <tên> root     # thêm: cho phép trust on i-understand-root (compose / script chạy root)
 fcode deploy disallow <tên>       # thu hồi
 ```
+
+**`disallow` chỉ chặn lệnh của khoá này.** Project vẫn đăng ký trên cổng và vẫn deploy các lần push mới, bằng root nếu nó đang ở chế độ trust. Muốn lấy lại quyền root: `fcode deploy <tên> trust off`; muốn dừng deploy: `fcode deploy <tên> pause` (cả hai chạy trên laptop).
 
 Chưa duyệt thì mọi lệnh của `fcode-deploy`, kể cả `status`, trả về 65 kèm một dòng "Gợi ý" bảo agent nhờ người dùng chạy đúng lệnh trên; hãy dừng và nói với người dùng, đừng tự thử cách khác.
 
