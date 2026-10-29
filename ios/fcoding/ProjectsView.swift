@@ -108,6 +108,9 @@ struct ProjectsView: View {
             }
             .toolbar(.hidden, for: .navigationBar)
             .navigationTitle("FCode")
+            // Inline, not the default large title: with the bar hidden, a large title puts the
+            // pull-to-refresh spinner in the bar's empty slot under the status bar, out of sight.
+            .navigationBarTitleDisplayMode(.inline)
             .navigationDestination(for: Route.self) { SessionView(name: $0.name, harness: $0.harness, focusComposer: $0.reply) }
             .navigationDestination(for: QuotaRoute.self) { _ in QuotaDetailView(home: home) }
             .task(id: polling) {

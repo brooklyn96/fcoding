@@ -509,6 +509,7 @@ struct QuotaDetailView: View {
         .overlay(alignment: .top) { StatusBarCover() }
         .overlay(alignment: .top) { ToastView(text: $toast) }
         .toolbar(.hidden, for: .navigationBar)
+        .navigationBarTitleDisplayMode(.inline)   // keeps the refresh spinner below the status bar
         .task(id: scenePhase == .active) {
             guard scenePhase == .active else { return }
             while !Task.isCancelled {
