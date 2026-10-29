@@ -429,6 +429,8 @@ fcode phien tu-dong tat    # tắt tự động (trangthai để xem đang bật
 
 Gõ `fcode` rồi bấm `p` trong danh sách cũng mở menu này (đồng bộ ngay, bật hoặc tắt tự động).
 
+**Tên gọi (alias) của project.** Chỗ nào `fcode` cần tên project (`fcode phien <project>`, `fcode <tên>` để vào phiên), gõ tên thật hay tên gọi đặt trong app đều được, không phân biệt chữ hoa thường; tên thật luôn được ưu tiên. Danh sách project hiện dạng `tên gọi (tên thật)`. Tên gọi do server trên box giữ (file `prefs.json` cạnh `config.json`); laptop chỉ đọc nó qua lần hỏi box có sẵn và nhớ một bản ở `%LOCALAPPDATA%\fcode\prefs.json`, nên khi box không với tới được thì dùng bản nhớ. Tên gọi mới đặt trong app được cập nhật ở lần `fcode phien` hoặc `fcode sync` kế tiếp (gõ tên chưa biết thì `fcode phien` tự hỏi box một lần). `fcode deploy` dùng tên riêng của cổng deploy, không dùng tên gọi.
+
 Luật đồng bộ (một phiên = một mã = một file `.jsonl` chỉ được nối thêm):
 
 - Phiên chỉ có ở một máy: chép sang máy kia, kèm thư mục đi kèm (nhật ký lệnh, phiên con) và các file đính kèm (blob) phiên đó dùng. Chỉ đổi đúng dòng đầu của file (thư mục làm việc `cwd` thành đường dẫn project của máy nhận); mọi byte khác giữ nguyên, giờ sửa file giữ nguyên.
