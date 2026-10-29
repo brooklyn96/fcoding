@@ -1015,7 +1015,7 @@ function Confirm-DeployKey([string]$Repo, [string]$Name) {
     try { $o = @(& gh repo deploy-key list -R $Repo --json 'key,readOnly' 2>&1 | ForEach-Object { "$_" }); $code = [int]$LASTEXITCODE } catch { $o = @("$($_.Exception.Message)"); $code = 1 }
     finally { $ErrorActionPreference = $old }
     $listed = $null
-    if ($code -eq 0) { try { $j = ConvertFrom-Json ($o -join "`n"); $listed = @(foreach ($e in @($j)) { [pscustomobject]@{ Key = ((([string]$e.key).Trim() -split '\s+' | Select-Object -First 2) -join ' '); Ro = ($e.readOnly -eq $true) } }) } catch { } }   # foreach: Windows PowerShell 5.1 gives a JSON array as ONE object
+    if ($code -eq 0) { try { $j = ConvertFrom-Json ($o -join "`n"); $listed = @(foreach ($e in @($j)) { [pscustomobject]@{ Key = ((([string]$e.key).Trim() -split '\s+' | Select-Object -First 2) -join ' '); Ro = (($e.readOnly -eq $true) -or ($e.read_only -eq $true)) } }) } catch { } }   # foreach: Windows PowerShell 5.1 gives a JSON array as ONE object; read_only: gh 2.92 accepts --json readOnly but prints the field as read_only
     if ($null -eq $listed) { Write-IpaError "gh không đọc được Deploy keys của $Repo." ($o -join "`n"); return 1 }
     $mine = @($listed | Where-Object { $_.Key -ceq $pk })
     if ($mine.Count -eq 0) {
