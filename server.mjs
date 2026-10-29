@@ -916,7 +916,8 @@ export function boxOf(list, names) {
   const run = Date.parse(r?.runStartedAt), cool = Date.parse(r?.cooldownUntil);
   const pos = (v) => typeof v === 'number' && v > 0;
   if (!(run > 0) || !pos(r.maxRunMinutes)) return null;
-  return { state: r.state, runStartedAt: run, maxRunMinutes: r.maxRunMinutes, cooldownUntil: cool > 0 ? cool : null, cooldownMinutes: pos(r.cooldownMinutes) ? r.cooldownMinutes : BOX.cooldownMinutes };
+  return { state: r.state, runStartedAt: run, maxRunMinutes: r.maxRunMinutes, cooldownUntil: cool > 0 ? cool : null, cooldownMinutes: pos(r.cooldownMinutes) ? r.cooldownMinutes : BOX.cooldownMinutes,
+    idlePauseMinutes: pos(r.autoSuspendAfterSeconds) ? r.autoSuspendAfterSeconds / 60 : BOX.idlePauseMinutes };
 }
 // the instabox key reaches the service through start.sh; the server keeps it in memory and takes it out of its own environment, so the
 // tmux server and every harness session it starts never inherit it
@@ -1722,8 +1723,10 @@ export function createApp(opts = {}) {
     if (ib) {
       const cool = ib.cooldownMinutes * 60e3;
       const paused = ib.state !== 'running' && ib.cooldownUntil > t;
+      // the estimate follows the known run start (tickBox stores it too): it stays right when the record lapses and never restarts against a live run
+      if (!paused && ib.runStartedAt <= t) boxResume = ib.runStartedAt;
       const at = paused ? ib.cooldownUntil - cool : ib.runStartedAt + ib.maxRunMinutes * 60e3;
-      return { state: 'running', sleepsAt: paused || at > t ? iso(at) : null, maxRunMinutes: ib.maxRunMinutes, idlePauseMinutes: BOX.idlePauseMinutes, cooldownMinutes: ib.cooldownMinutes, source: 'instabox' };
+      return { state: 'running', sleepsAt: paused || at > t ? iso(at) : null, maxRunMinutes: ib.maxRunMinutes, idlePauseMinutes: ib.idlePauseMinutes, cooldownMinutes: ib.cooldownMinutes, source: 'instabox' };
     }
     const maxMs = BOX.maxRunMinutes * 60e3;
     let at = boxResume + maxMs;
