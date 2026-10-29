@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync, execFile, spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import { createApp, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, strictOrigin, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock,
@@ -36,7 +36,7 @@ async function boot(opts = {}) {
   // home v2 sources default to nothing real: no scan of this machine's logs, no omp/gh on PATH
   const app = createApp({ configDir, tmux: [process.execPath, FAKE], log: (l) => logs.push(l), pollMs: 40, pasteEnterDelayMs: 0,
     spendRoots: {}, updatesFile: path.join(root, 'no-status.json'), gitSync: null, gitSyncFile: path.join(root, 'no-git-sync.json'), omp: [process.execPath, '-e', 'process.exit(1)'], gh: [process.execPath, '-e', 'process.exit(1)'],
-    ompSessionsRoot: path.join(root, 'omp-sessions'), instabox: [process.execPath, '-e', 'process.exit(1)'], instaboxKey: null, ...opts });
+    ompSessionsRoot: path.join(root, 'omp-sessions'), instabox: [process.execPath, '-e', 'process.exit(1)'], instaboxKey: null, warmTickMs: 0, ...opts }); // warmTickMs 0: no warm-up from boot, so the tests that count tool calls stay as they are
   const port = await app.listen(0, '127.0.0.1');
   const ctx = { app, port, logs, root, configDir };
   ctx.req = (method, p, o = {}) => request(port, method, p, o);
@@ -2335,17 +2335,17 @@ test('open fresh: a name created outside the server meanwhile moves on to base-2
 
 test('overview: a client disconnect mid-job frees the read slot and starts no later capture', () => withApp(async (c) => {
   const { cookie } = await c.login();
-  for (const n of ['s1', 's2', 's3', 's4']) await mkSession(c, cookie, n);
+  for (const n of ['s1', 's2', 's3', 's4', 's5', 's6', 's7', 's8']) await mkSession(c, cookie, n);
   await withEnv({ FAKE_TMUX_DELAYS: JSON.stringify({ 'capture-pane': 400 }) }, async () => {
     const req = http.get({ host: '127.0.0.1', port: c.port, path: '/api/overview', headers: { 'X-PC': '1', Cookie: cookie } });
     req.on('error', () => {});
-    assert.ok(await until(() => c.calls().length >= 0 && c.app.stats().running === 1 && c.app.stats().reads === 1, 3000));
+    assert.ok(await until(() => c.calls().length >= 0 && c.app.stats().running === 1 && c.app.stats().reads >= 1, 3000));
     await sleep(150); // inside list-sessions or the first, delayed capture
     req.destroy();
     assert.ok(await until(() => c.app.stats().reads === 0 && c.app.stats().running === 0, 3000), JSON.stringify(c.app.stats()));
     await sleep(900);
     const caps = c.calls().filter((x) => x.argv[0] === 'capture-pane');
-    assert.ok(caps.length <= 1, `captures: ${caps.length} (at most the one in flight; 4 without the gate)`);
+    assert.ok(caps.length <= 4, `captures: ${caps.length} (at most the 4 in flight when it went; 8 without the gate)`);
     assert.equal(c.app.stats().reads, 0);
   });
 }, { git: NO_GIT }));
@@ -3294,6 +3294,13 @@ test('GET /api/home: a failed run list or workflow list, or a deploy workflow kn
     await c.app.homeIdle();
     assert.deepEqual([(await c.home()).projects.map((p) => p.lastRun), c.toolCalls('release list').length], [[null, null], 0]);
   });
+  // no deploy workflow at all but the runs cannot be read: still unknown, never the release
+  await homeApp(async (c) => {
+    c.setRules([rel, ['run list', gh502], NO_DEPLOY()[0], ['commits/HEAD', NO_CONFIG], ...baseRules()]);
+    await c.homeUntil((x) => !x.projects[0].loading && !x.projects[1].loading);
+    await c.app.homeIdle();
+    assert.deepEqual([(await c.home()).projects.map((p) => p.lastRun), c.toolCalls('release list').length], [[null, null], 0]);
+  });
   // the deploy workflow is known only by its path (deploy.yml, the name says nothing) and has no run in the list: no release
   await homeApp(async (c) => {
     c.setRules([rel, ...NO_DEPLOY().slice(1), ['commits/HEAD', NO_CONFIG], ...baseRules()]); // workflow list: gh.json (Ship it, deploy.yml)
@@ -3309,7 +3316,7 @@ test('GET /api/home: a failing gh call never makes a 500 or a wrong line (gate p
     const sets = [gateRules({ head: GH_FAIL }), gateRules({ head: { stdout: 'oops\n' } }), gateRules({ statuses: GH_FAIL }), gateRules({ statuses: 'not json at all\n' }),
       gateRules({ statuses: stLine('fcode/deploy', 'deployed') })];
     c.setRules(sets[0]);
-    let h = await c.homeUntil((x) => !x.projects[0].loading && !x.projects[1].loading);
+    let h = await c.homeUntil((x) => x.projects[0].repo && x.projects[1].repo);
     await c.app.homeIdle();
     h = await c.home();
     assert.deepEqual(h.projects.map((p) => p.lastRun), [null, null]);
@@ -3373,6 +3380,8 @@ test('GET /api/home never waits long: a slow part is empty the first time, then 
 }, { homeWaitMs: 300 }));
 
 test('home routes: auth on both, CSRF on the reset; nothing runs for a refused request', () => homeApp(async (c) => {
+  await c.app.homeIdle(); // the start-up scan of the omp format guard has ended (its call is logged once its process runs)
+  const before = c.toolCalls();
   const body = { accountId: 'openai-codex/4', requestId: '0f8f7a6e-1111-4222-8333-944455556666' };
   assert.equal((await c.req('GET', '/api/home')).status, 401);
   assert.equal((await c.req('GET', '/api/home', { cookie: 'pc_sid=forged' })).status, 401);
@@ -3381,7 +3390,7 @@ test('home routes: auth on both, CSRF on the reset; nothing runs for a refused r
   assert.equal((await c.reset(body, { headers: { Origin: 'https://evil.example' } })).status, 403);
   assert.equal((await c.req('POST', '/api/home', { cookie: c.cookie, body: {} })).status, 405);
   assert.equal((await c.req('GET', '/api/codex-reset', { cookie: c.cookie })).status, 405);
-  assert.equal(c.toolCalls().length, 0);
+  assert.deepEqual(c.toolCalls(), before);
 }));
 
 test('POST /api/codex-reset: Codex only, validated, lock per account, the same requestId never runs twice', () => homeApp(async (c) => {
@@ -5932,3 +5941,395 @@ test('upload: the per-request timer leaves a complete request alone: an SSE stre
   assert.ok(buf.includes('event: screen'));
   s.req.destroy();
 }, { bodyMs: 300 }));
+
+// ---------- /api/prefs (CONTRACT A13): project order + display names ----------
+const putPrefs = (c, cookie, body) => c.req('PUT', '/api/prefs', { cookie, body });
+const emptyPrefs = { order: [], aliases: {} };
+
+test('prefs: no file is empty prefs; a PUT then a GET round-trips; the last write wins', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  const g0 = await c.req('GET', '/api/prefs', { cookie });
+  assert.equal(g0.status, 200);
+  assert.deepEqual(g0.json, emptyPrefs);
+  const body = { order: ['my.proj', 'alpha'], aliases: { alpha: 'Dự án Một', 'my.proj': 'x_y-z.1' } };
+  const p = await putPrefs(c, cookie, body);
+  assert.equal(p.status, 200);
+  assert.deepEqual(p.json, body);
+  assert.deepEqual((await c.req('GET', '/api/prefs', { cookie })).json, body);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(c.configDir, 'prefs.json'), 'utf8')), body);
+  assert.equal((await putPrefs(c, cookie, emptyPrefs)).status, 200);
+  assert.deepEqual((await c.req('GET', '/api/prefs', { cookie })).json, emptyPrefs);
+}));
+
+test('prefs: a broken file reads as empty prefs', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  fs.writeFileSync(path.join(c.configDir, 'prefs.json'), '{not json');
+  assert.deepEqual((await c.req('GET', '/api/prefs', { cookie })).json, emptyPrefs);
+}));
+
+test('prefs: unknown names are dropped, order has no duplicates, aliases are NFC and trimmed', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  const r = await putPrefs(c, cookie, { order: ['alpha', 'ghost', 'alpha', 'my.proj'], aliases: { ghost: 'Ma', alpha: '  Các  ', 'my.proj': '   ' } });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.json, { order: ['alpha', 'my.proj'], aliases: { alpha: 'Các' } });
+}));
+
+test('prefs: an alias equal to its own project name is removed, an empty alias removes the entry', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  const r = await putPrefs(c, cookie, { order: [], aliases: { alpha: 'alpha', 'my.proj': 'Mine' } });
+  assert.deepEqual(r.json, { order: [], aliases: { 'my.proj': 'Mine' } });
+  assert.deepEqual((await putPrefs(c, cookie, { order: [], aliases: { 'my.proj': '' } })).json, emptyPrefs);
+}));
+
+test('prefs: Unicode letters, digits, space and . _ - are accepted; 30 characters is the limit', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  const a30 = 'ắ'.repeat(30);
+  const r = await putPrefs(c, cookie, { order: [], aliases: { alpha: a30, 'my.proj': 'Dự án 2.0_b-c' } });
+  assert.equal(r.status, 200, r.text);
+  assert.deepEqual(r.json.aliases, { alpha: a30, 'my.proj': 'Dự án 2.0_b-c' });
+}));
+
+test('prefs: refused with 400 and a Vietnamese sentence; nothing is saved', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  const good = { order: ['alpha'], aliases: { alpha: 'Giữ' } };
+  assert.equal((await putPrefs(c, cookie, good)).status, 200);
+  const cases = [
+    [{ order: [], aliases: { alpha: 'Dup', 'my.proj': 'dUP' } }, /đã dùng cho/], // two aliases the same, case-insensitively
+    [{ order: [], aliases: { alpha: 'MY.PROJ' } }, /trùng tên dự án my\.proj/], // another project's real name
+    [{ order: [], aliases: { alpha: 'a/b' } }, /chỉ được có/], // a character that is not allowed
+    [{ order: [], aliases: { alpha: 'a<b' } }, /chỉ được có/],
+    [{ order: [], aliases: { alpha: 'a\nb' } }, /chỉ được có/],
+    [{ order: [], aliases: { alpha: 'x'.repeat(31) } }, /dài quá 30/], // longer than 30
+    [{ order: [], aliases: { alpha: 5 } }, /không đúng dạng/], // wrong shapes
+    [{ order: 'alpha', aliases: {} }, /không đúng dạng/],
+    [{ order: [1], aliases: {} }, /không đúng dạng/],
+    [{ order: [] }, /không đúng dạng/],
+    [{ order: [], aliases: [] }, /không đúng dạng/],
+    [{ order: [], aliases: null }, /không đúng dạng/],
+  ];
+  for (const [body, re] of cases) {
+    const r = await putPrefs(c, cookie, body);
+    assert.equal(r.status, 400, JSON.stringify(body));
+    assert.match(r.json.error, re, JSON.stringify(body));
+  }
+  assert.equal((await c.req('PUT', '/api/prefs', { cookie, raw: '[1]', headers: JSON_CT })).status, 400); // not an object
+  assert.equal((await c.req('PUT', '/api/prefs', { cookie, raw: '{x', headers: JSON_CT })).status, 400);
+  assert.deepEqual((await c.req('GET', '/api/prefs', { cookie })).json, good);
+}));
+
+test('prefs: needs a session; a PUT needs X-PC; other methods are 405; the body limit applies', () => withApp(async (c) => {
+  assert.equal((await c.req('GET', '/api/prefs')).status, 401);
+  assert.equal((await c.req('PUT', '/api/prefs', { body: emptyPrefs })).status, 401);
+  const { cookie } = await c.login();
+  assert.equal((await c.req('PUT', '/api/prefs', { cookie, pc: false, body: emptyPrefs })).status, 403);
+  assert.equal((await c.req('POST', '/api/prefs', { cookie, body: emptyPrefs })).status, 405);
+  assert.equal((await c.req('DELETE', '/api/prefs', { cookie })).status, 405);
+  assert.equal((await putPrefs(c, cookie, { order: Array(20000).fill('alpha'), aliases: {} })).status, 413);
+  assert.equal(fs.existsSync(path.join(c.configDir, 'prefs.json')), false); // none of the refused calls wrote
+}));
+
+test('prefs: the file is private (0600)', async (t) => {
+  if (process.platform === 'win32') return t.skip('POSIX modes');
+  await withApp(async (c) => {
+    const { cookie } = await c.login();
+    assert.equal((await putPrefs(c, cookie, { order: ['alpha'], aliases: {} })).status, 200);
+    assert.equal(fs.statSync(path.join(c.configDir, 'prefs.json')).mode & 0o777, 0o600);
+  });
+});
+
+test('prefs: two PUTs at once leave one whole, valid file', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  const bodies = [{ order: ['alpha'], aliases: { alpha: 'Một' } }, { order: ['my.proj'], aliases: { 'my.proj': 'Hai' } }];
+  const rs = await Promise.all(bodies.map((b) => putPrefs(c, cookie, b)));
+  assert.deepEqual(rs.map((r) => r.status), [200, 200]);
+  const got = (await c.req('GET', '/api/prefs', { cookie })).json;
+  assert.ok(bodies.some((b) => JSON.stringify(b) === JSON.stringify(got)), JSON.stringify(got));
+  assert.deepEqual(fs.readdirSync(c.configDir).filter((f) => f.endsWith('.tmp')), []);
+}));
+
+test('prefs: a project added later whose name equals a stored alias: GET drops only that alias', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  const saved = { order: ['my.proj', 'alpha'], aliases: { alpha: 'dev', 'my.proj': 'Mine' } };
+  assert.deepEqual((await putPrefs(c, cookie, saved)).json, saved);
+  setProjects(c, { alpha: ABS, 'my.proj': ABS, dev: ABS });
+  assert.deepEqual((await c.req('GET', '/api/prefs', { cookie })).json, { order: ['my.proj', 'alpha'], aliases: { 'my.proj': 'Mine' } });
+  assert.equal((await putPrefs(c, cookie, saved)).status, 400); // a PUT stays strict
+  setProjects(c, { alpha: ABS, 'my.proj': ABS }); // the file was not rewritten: the alias is back when the clash is gone
+  assert.deepEqual((await c.req('GET', '/api/prefs', { cookie })).json, saved);
+}));
+
+test('prefs: GET of a stored file keeps what fits: unknown names, duplicate aliases (first wins), bad characters and long aliases are dropped one by one', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  setProjects(c, { alpha: ABS, 'my.proj': ABS, beta: ABS, gamma: ABS });
+  fs.writeFileSync(path.join(c.configDir, 'prefs.json'), JSON.stringify({
+    order: ['gone', 'beta', 7, 'alpha', 'beta'],
+    aliases: { alpha: 'Same', 'my.proj': 'SAME', beta: 'a/b', gamma: 'x'.repeat(31), gone: 'Ghost', delta: 5 },
+  }));
+  assert.deepEqual((await c.req('GET', '/api/prefs', { cookie })).json, { order: ['beta', 'alpha'], aliases: { alpha: 'Same' } });
+  fs.writeFileSync(path.join(c.configDir, 'prefs.json'), JSON.stringify({ order: 'alpha', aliases: { beta: 'Keep' } }));
+  assert.deepEqual((await c.req('GET', '/api/prefs', { cookie })).json, { order: [], aliases: { beta: 'Keep' } }); // a bad half does not cost the other half
+}));
+
+// ======================= v1.3.11 fast open: warm parts from boot, GET /api/home?fresh=1, parallel overview =======================
+test('memo.fresh(wait, minAge): younger than minAge is not redone, older is refreshed and waited for, one refresh for a burst, a failure or slow refresh gives the old value', async () => {
+  let t = 1000, n = 0, gate;
+  const m = memo(60e3, () => { n++; return new Promise((r, j) => { gate = { r, j }; }); }, () => t);
+  const first = m.get(1000);
+  await new Promise((r) => setImmediate(r));
+  gate.r('v1');
+  assert.deepEqual((await first).value, 'v1');
+  assert.equal(n, 1);
+  // 9 s later (inside the TTL too): not redone
+  t = 10e3;
+  assert.deepEqual(await m.fresh(500, 10e3), { value: 'v1', fresh: true, at: 1000 });
+  assert.equal(n, 1);
+  // 10 s old: refreshed now; a burst shares the one refresh, and every caller gets the new value
+  t = 11e3;
+  const burst = [m.fresh(1000, 10e3), m.fresh(1000, 10e3), m.fresh(1000, 10e3)];
+  await new Promise((r) => setImmediate(r));
+  assert.equal(n, 2);
+  gate.r('v2');
+  for (const r of await Promise.all(burst)) assert.deepEqual(r, { value: 'v2', fresh: true, at: 11e3 });
+  t = 15e3;
+  assert.deepEqual((await m.fresh(500, 10e3)).value, 'v2'); // 4 s old
+  assert.equal(n, 2);
+  // a refresh slower than the wait: the old value, fresh false; the refresh carries on and lands
+  t = 30e3;
+  const slow = await m.fresh(30, 10e3);
+  assert.deepEqual([slow.value, slow.fresh, slow.at], ['v2', false, 11e3]);
+  assert.equal(n, 3);
+  gate.r('v3');
+  await m.settled();
+  assert.deepEqual((await m.fresh(500, 10e3)).value, 'v3');
+  // a failing refresh: the old value, fresh false; no second try inside minAge, one after it
+  t = 50e3;
+  const bad = m.fresh(500, 10e3);
+  await new Promise((r) => setImmediate(r));
+  gate.j(new Error('down'));
+  assert.deepEqual([(await bad).value, (await bad).fresh], ['v3', false]);
+  assert.equal(n, 4);
+  t = 55e3;
+  assert.equal((await m.fresh(500, 10e3)).fresh, false);
+  assert.equal(n, 4);
+  t = 61e3;
+  const again = m.fresh(500, 10e3);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(n, 5);
+  gate.r('v5');
+  assert.deepEqual(await again, { value: 'v5', fresh: true, at: 61e3 });
+  // no value yet and a failing refresh: the part is empty (throws), as get() does
+  const e = memo(60e3, () => { throw new Error('no'); }, () => t);
+  await assert.rejects(e.fresh(100, 10e3), /no/);
+  await assert.rejects(e.fresh(100, 10e3), /failed recently/);
+});
+
+test('warm-up: from boot quota, listing, spend and projects are filled with no request; ticks inside the TTL start no refresh', () => homeApp(async (c) => {
+  await waitFor(() => c.toolCalls('pr list').length === 2 && c.toolCalls('usage --json').length === 1 && c.toolCalls('usage reset --json').length === 1);
+  await c.app.homeIdle();
+  const before = c.toolCalls().length;
+  const h = await c.home(); // the first request: nothing is read for it
+  assert.equal(h.accounts.length, 4);
+  assert.ok(h.accounts[3].resets.target && !h.accounts[3].stale); // built from the listing
+  assert.ok(h.totals.spend);
+  assert.deepEqual(h.projects.map((p) => [p.repo, p.loading]), [['owner/repo', undefined], ['owner/repo', undefined]]);
+  await sleep(250); // many warm ticks
+  assert.equal(c.toolCalls().length, before);
+}, { warmTickMs: 30, homeWaitMs: 3000 }));
+
+test('warm-up: a part past its TTL is refreshed by the timer with no request, one refresh at a time', () => homeApp(async (c) => {
+  await waitFor(() => c.toolCalls('pr list').length === 2 && c.toolCalls('usage --json').length === 1 && c.toolCalls('usage reset --json').length === 1);
+  await c.app.homeIdle();
+  c.setRules([['usage --json', { file: FIX('omp-usage.json'), delay: 400 }], ...baseRules()]);
+  c.clock.t += 61e3; // the quota TTL; the projects (2 min) and the listing (5 min) are not due
+  await waitFor(() => c.toolCalls('usage --json').length === 2);
+  await sleep(300); // the slow refresh still runs through several ticks: no second one starts
+  assert.equal(c.toolCalls('usage --json').length, 2);
+  await c.app.homeIdle();
+  await sleep(100);
+  assert.equal(c.toolCalls('usage --json').length, 2);
+  assert.equal(c.toolCalls('pr list').length, 2);
+  assert.equal(c.toolCalls('usage reset --json').length, 1);
+  c.clock.t += 121e3; // now the projects too, one round of the two
+  await waitFor(() => c.toolCalls('pr list').length === 4);
+  await c.app.homeIdle();
+  await sleep(100);
+  assert.equal(c.toolCalls('pr list').length, 4);
+}, { warmTickMs: 30, homeWaitMs: 3000 }));
+
+test('warm-up: the staging box list is kept warm too (only with a key), and close() stops the timer', async () => {
+  const s = stubDir();
+  const clock = { t: 1_700_000_000_000 };
+  try {
+    s.ls(BOXES);
+    await withApp(async (c) => {
+      assert.ok(await until(() => s.calls().length === 1)); // no request yet
+      await sleep(150);
+      assert.equal(s.calls().length, 1);
+      clock.t += 31e3; // past the 30 s TTL
+      assert.ok(await until(() => s.calls().length === 2));
+      await c.app.close();
+      clock.t += 61e3;
+      await sleep(200); // a timer left running would have read again
+      assert.equal(s.calls().length, 2);
+    }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t, warmTickMs: 30 });
+  } finally { s.cleanup(); }
+});
+
+test('warm-up: a server that closed leaves nothing running (the process exits on its own)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-warm-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({ cookieSecret: Buffer.alloc(32, 7).toString('base64'), projects: { alpha: ABS }, port: 7681 }));
+    const code = `import { createApp } from ${JSON.stringify(pathToFileURL(SERVER).href)};
+const bad = [process.execPath, '-e', 'process.exit(1)'];
+const app = createApp({ configDir: ${JSON.stringify(dir)}, tmux: bad, omp: bad, gh: bad, git: bad, instabox: bad, instaboxKey: 'k', spendRoots: {}, ompSessionsRoot: ${JSON.stringify(path.join(dir, 'o'))}, warmTickMs: 20, log: () => {} });
+await app.listen(0, '127.0.0.1');
+await new Promise((r) => setTimeout(r, 150));
+await app.close();`;
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8', timeout: 20000 });
+    assert.equal(r.error, undefined, String(r.error));
+    assert.equal(r.status, 0, r.stderr);
+  } finally { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
+});
+
+// every part has just been read at the current clock, so any later read is the pull's
+async function settleHome(c) {
+  await c.warm();
+  c.clock.t += 301e3; // past every TTL
+  await c.home(); await c.app.homeIdle(); await c.app.homeIdle(); // the stale parts are refreshed behind this reply
+  assert.equal((await c.home()).accounts.length, 4);
+}
+const freshHome = async (c, q = '?fresh=1') => { const r = await c.req('GET', `/api/home${q}`, { cookie: c.cookie }); assert.equal(r.status, 200, r.text); return r.json; };
+const toolCounts = (c) => ({ usage: c.toolCalls('usage --json').length, listing: c.toolCalls('usage reset --json').length, pr: c.toolCalls('pr list').length, guard: c.toolCalls('--version').length });
+const pct = (h) => h.accounts[0].windows[0].usedPercent;
+const usageAt = (p) => ({ stdout: fs.readFileSync(FIX('omp-usage.json'), 'utf8').replace('"usedFraction": 0.07', `"usedFraction": ${p / 100}`) }); // the first window of the first account
+
+test('GET /api/home?fresh=1: a burst makes one refresh per part, waits for it, and a part younger than 10 s is not redone', () => homeApp(async (c) => {
+  await settleHome(c);
+  const n0 = toolCounts(c);
+  const h0 = await c.home();
+  assert.ok(h0.projects[0].prs.length > 0);
+  assert.equal(pct(h0), 7);
+  c.setRules([['usage --json', usageAt(42)], ['pr list', { stdout: '[]', delay: 300 }], ...baseRules()]);
+  c.clock.t += 11e3; // older than 10 s, well inside every TTL
+  const t0 = Date.now();
+  const burst = await Promise.all(Array.from({ length: 5 }, () => freshHome(c)));
+  assert.ok(Date.now() - t0 >= 250, 'the reply waited for the refresh');
+  for (const h of burst) assert.deepEqual([pct(h), h.projects[0].prs, h.projects[1].prs], [42, [], []]);
+  assert.deepEqual(toolCounts(c), { usage: n0.usage + 1, listing: n0.listing, pr: n0.pr + 2, guard: n0.guard + 1 }); // one per part (2 projects)
+  const n1 = toolCounts(c);
+  await freshHome(c); // the same instant: younger than 10 s
+  c.clock.t += 9e3;
+  await Promise.all([freshHome(c), freshHome(c)]);
+  assert.deepEqual(toolCounts(c), n1);
+  c.clock.t += 2e3; // 11 s since the refresh
+  await freshHome(c);
+  assert.deepEqual(toolCounts(c), { usage: n1.usage + 1, listing: n1.listing, pr: n1.pr + 2, guard: n1.guard + 1 });
+}));
+
+test('GET /api/home without fresh=1 (or with any other value) changes nothing: the cache answers, no part is read', () => homeApp(async (c) => {
+  await settleHome(c);
+  const n0 = toolCounts(c);
+  c.setRules([['usage --json', usageAt(42)], ...baseRules()]);
+  c.clock.t += 30e3; // older than 10 s, inside every TTL
+  for (const q of ['', '?fresh=0', '?fresh=true', '?fresh=', '?fresh=11', '?fresh=1x', '?other=1']) {
+    const h = await freshHome(c, q);
+    assert.deepEqual([pct(h), h.projects[0].prs.length > 0], [7, true], q); // the cached quota
+  }
+  await c.app.homeIdle();
+  assert.deepEqual(toolCounts(c), n0);
+  assert.equal(pct(await freshHome(c, '?fresh=%31')), 42); // %31 is the digit 1: a real flag
+  assert.equal(toolCounts(c).usage, n0.usage + 1);
+}));
+
+test('GET /api/home?fresh=1: a slow or failing part gives its old value after the wait; the rest is fresh; no retry inside 10 s', () => homeApp(async (c) => {
+  await settleHome(c);
+  const n0 = toolCounts(c);
+  c.setRules([['usage --json', { ...usageAt(42), delay: 4000 }], ['pr list', { stdout: '[]' }], ...baseRules()]);
+  c.clock.t += 11e3;
+  const t0 = Date.now();
+  let h = await freshHome(c);
+  assert.ok(Date.now() - t0 < 3000, `took ${Date.now() - t0} ms`); // homeFreshWaitMs 1500: the reply does not wait for the 4 s quota
+  assert.equal(pct(h), 7); // the old quota
+  assert.ok(h.accounts.every((a) => a.stale === true)); // marked: not fresh
+  assert.deepEqual(h.projects.map((p) => p.prs), [[], []]); // the other parts did refresh
+  assert.equal(toolCounts(c).usage, n0.usage + 1);
+  await c.app.homeIdle(); // the slow refresh lands
+  assert.equal(pct(await c.home()), 42);
+  // a failing refresh: the value stays, and a second pull inside 10 s does not try again
+  c.setRules([['usage --json', { code: 1, stderr: 'boom' }], ...baseRules()]);
+  c.clock.t += 11e3;
+  const n1 = toolCounts(c);
+  h = await freshHome(c);
+  assert.equal(pct(h), 42);
+  assert.equal(toolCounts(c).usage, n1.usage + 1);
+  c.clock.t += 5e3;
+  await freshHome(c);
+  assert.equal(toolCounts(c).usage, n1.usage + 1);
+  c.clock.t += 6e3; // 11 s after the failure: one more try
+  await freshHome(c);
+  assert.equal(toolCounts(c).usage, n1.usage + 2);
+}, { homeFreshWaitMs: 1500 }));
+
+// a git that takes 150 ms and logs when it ran (same shape as fake-tmux's log)
+const SLOW_GIT_SRC = `import fs from 'node:fs';
+const t0 = Date.now(); const a = process.argv.slice(2).join(' ');
+setTimeout(() => {
+  fs.appendFileSync(process.env.FAKE_GIT_LOG, JSON.stringify({ argv: a, t0, t1: Date.now() }) + '\\n');
+  if (a.includes('rev-parse')) process.stdout.write('main\\n'); else if (a.includes('rev-list')) process.stdout.write('2\\n');
+}, 150);
+`;
+
+test('GET /api/overview: git and tmux reads run in parallel (several in flight, never more than MAX_READS), the output keeps the config and tmux order', async () => {
+  const gitDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-sgit-'));
+  try {
+    fs.writeFileSync(path.join(gitDir, 'git.mjs'), SLOW_GIT_SRC);
+    const gitLog = path.join(gitDir, 'log.jsonl');
+    await withEnv({ FAKE_GIT_LOG: gitLog }, () => withApp(async (c) => {
+      const { cookie } = await c.login();
+      const sess = ['s1', 's2', 's3', 's4', 's5', 's6', 's7', 's8'];
+      for (const n of sess) assert.equal((await mkSession(c, cookie, n)).status, 201);
+      const names = ['p1', 'p2', 'p3', 'p4', 'p5', 'p6'];
+      const projects = {};
+      for (const n of names) { projects[n] = path.join(c.root, n); fs.mkdirSync(projects[n]); }
+      setProjects(c, projects);
+      sess.forEach((n, i) => setSession(c, n, { activity: 1_700_000_100 + i, screen: `output of ${n}\n` }));
+      await withEnv({ FAKE_TMUX_DELAYS: JSON.stringify({ 'capture-pane': 150 }) }, async () => {
+        const before = c.calls().length;
+        const samples = [];
+        const iv = setInterval(() => samples.push(c.app.stats().reads), 5);
+        const t0 = Date.now();
+        const r = await c.req('GET', '/api/overview', { cookie });
+        const took = Date.now() - t0;
+        clearInterval(iv);
+        assert.equal(r.status, 200, r.text);
+        // the same answer a serial run gives: projects in config order with their git, sessions in tmux's order with their own screen
+        assert.deepEqual(r.json.projects, names.map((name) => ({ name, branch: 'main', ahead: 2, diff: { files: 0, add: 0, del: 0 } })));
+        assert.deepEqual(r.json.sessions.map((x) => [x.name, x.preview]), sess.map((n) => [n, `output of ${n}`]));
+        // 6 git rounds of 3 calls and 8 captures, 150 ms each: ~ 1.2 s four at a time, ~ 3.9 s in series
+        assert.ok(took < 3000, `took ${took} ms`);
+        const gitCalls = fs.readFileSync(gitLog, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+        const tmuxCalls = c.calls().slice(before).filter((x) => x.argv[0] === 'list-sessions' || (x.argv[0] === 'capture-pane' && !x.argv.includes('-S')));
+        const caps = tmuxCalls.filter((x) => x.argv[0] === 'capture-pane');
+        const maxFlight = maxOverlap([...gitCalls, ...tmuxCalls]);
+        assert.ok(maxOverlap(gitCalls) >= 2 && maxOverlap(caps) >= 2, `git ${maxOverlap(gitCalls)}, captures ${maxOverlap(caps)}`);
+        assert.ok(maxFlight <= 7, `children in flight: ${maxFlight}`); // MAX_READS
+        assert.ok(Math.max(...samples) <= 7 && samples.every((x) => x >= 0), `reads: ${Math.max(...samples)}`);
+        assert.equal(c.app.stats().reads, 0); // every slot given back
+      });
+    }, { git: [process.execPath, path.join(gitDir, 'git.mjs')] }));
+  } finally { fs.rmSync(gitDir, { recursive: true, force: true }); }
+});
+
+test('GET /api/overview: a git round that ends in an error stops the job, gives every slot back, and leaves no child running', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  for (const n of ['s1', 's2', 's3']) await mkSession(c, cookie, n);
+  const a = await c.login({}, 'victim');
+  await withEnv({ FAKE_TMUX_DELAY_MS: '150' }, async () => {
+    const ov = c.req('GET', '/api/overview', { cookie: a.cookie });
+    assert.ok(await until(() => c.app.stats().running >= 1, 3000));
+    await adminRequest(c.configDir, { cmd: 'revoke', id: await c.deviceId('victim') });
+    assert.equal((await ov).status, 401);
+  });
+  assert.ok(await until(() => c.app.stats().reads === 0 && c.app.stats().running === 0));
+  assert.equal((await c.req('GET', '/api/overview', { cookie })).status, 200); // nothing leaked
+}, { git: NO_GIT }));
