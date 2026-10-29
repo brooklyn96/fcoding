@@ -482,68 +482,252 @@ function Get-InstaboxExe {
   Join-Path $env:LOCALAPPDATA 'Programs\instabox\instabox.exe'
 }
 
-function Show-Help {
-  Write-Host 'fcode - điều khiển box coding từ máy này. Các lệnh:'
+# In mot phan cua bang help: co mau chi khi dau ra la cua so that (khong bi chuyen huong / pipe), nen khong bao gio co ky tu ESC trong van ban
+function Write-HelpPart([string]$Text, [string]$Color, [switch]$NoNewline) {
+  if ($Color -and -not [Console]::IsOutputRedirected) { Write-Host $Text -ForegroundColor $Color -NoNewline:$NoNewline } else { Write-Host $Text -NoNewline:$NoNewline }
+}
+# mot dong "lenh  mo ta": cot lenh rong $W; lenh dai hon cot thi mo ta xuong dong duoi
+function Write-HelpRow([string]$Cmd, [string]$Desc, [int]$W) {
+  if ($Cmd.Length -gt $W) { Write-HelpPart "  $Cmd" 'Green'; Write-Host ((' ' * ($W + 3)) + $Desc); return }
+  Write-HelpPart "  $Cmd" 'Green' -NoNewline
+  Write-Host ((' ' * ($W - $Cmd.Length + 1)) + $Desc)
+}
+
+# fcode help: bang tong quan, mot dong cho moi lenh. fcode help <lenh>: chi tiet cua lenh do.
+# Du lieu: dong khong co @@ la tieu de nhom, "lenh@@mo ta" la mot dong; trong chi tiet: "#" tieu de, ">" lenh, "lenh@@mo ta" la bang thang cot, con lai la chu thuong (da ngat dong <= 78 ky tu).
+function Show-Help([string]$Topic = '') {
+  $overview = @(
+    'Vào phiên trên box (chi tiết: fcode help vao)',
+    'fcode@@Xem danh sách phiên, gõ số để vào',
+    'fcode <số hoặc tên phiên>@@Vào thẳng một phiên',
+    'fcode --list@@Chỉ in danh sách (viết tắt: -l)',
+    'fcode new@@Mở một phiên mới trên box',
+    'Dự án',
+    'fcode sync@@Cập nhật project từ GitHub',
+    'fcode add <chủ/repo> [tên]@@Thêm project GitHub vào box',
+    'Deploy (cổng deploy trên VPS)',
+    'fcode deploy <tên> <lệnh> [đối số]@@Điều khiển cổng deploy',
+    'fcode deploy add <chủ/repo> <tên> <draft.json>@@Đăng ký project vào cổng deploy',
+    'Đồng bộ phiên omp (laptop <-> box)',
+    'fcode phien [project]@@Đồng bộ phiên hai chiều',
+    'fcode phien --thu [project]@@Chạy thử, không chép gì',
+    'fcode phien tu-dong bat|tat@@Bật / tắt tự đồng bộ mỗi 10 phút',
+    'fcode phien <project> --nhanh@@Bản nhanh cho hook (--nen: chờ 35 giây)',
+    'fcode moc bat|tat|trang-thai@@Hook đồng bộ khi gõ omp/claude/codex',
+    'App và thiết bị',
+    'fcode ipa@@Tải bản FCode mới nhất (Downloads)',
+    'fcode pair [tên thiết bị]@@Ghép iPhone mới (mã QR)',
+    'Khác',
+    'fcode help [lệnh]@@Bảng này, hoặc chi tiết một lệnh'
+  )
+  $topics = @{
+    vao = @(
+      '#Vào phiên trên box',
+      '>fcode',
+      '    Xem danh sách phiên đang chạy trên box, gõ số để vào',
+      '    (gõ 0 để mở phiên mới).',
+      '>fcode <số hoặc tên phiên>',
+      '    Vào thẳng một phiên (tên có thể gõ phần đầu).',
+      '    Thoát mà không tắt phiên: Ctrl+B rồi D.',
+      '>fcode --list',
+      '    Chỉ in danh sách phiên, không vào (viết tắt: fcode -l).',
+      '',
+      '#Ví dụ',
+      '  fcode 2',
+      '  fcode ten-phien',
+      '  fcode -l'
+    )
+    new = @(
+      '#fcode new',
+      '  Mở một phiên MỚI trên box (như nút "+" trong app): chọn project,',
+      '  chọn omp / claude / codex, rồi vào luôn phiên đó.',
+      '  Gõ fcode rồi chọn 0 cũng được.',
+      '  Bấm Enter ở bất kỳ câu hỏi nào để quay lại.',
+      '',
+      '#Ví dụ',
+      '  fcode new'
+    )
+    sync = @(
+      '#fcode sync',
+      '  Cập nhật các project trên máy này từ GitHub, báo nhánh box chờ',
+      '  merge và PR đang mở.',
+      '',
+      '#Ví dụ',
+      '  fcode sync'
+    )
+    ipa = @(
+      '#fcode ipa',
+      '  Tải bản FCode mới nhất về thư mục Downloads để kéo vào Sideloadly.',
+      '',
+      '#Ví dụ',
+      '  fcode ipa'
+    )
+    add = @(
+      '#fcode add <chủ/repo> [tên]',
+      '  Thêm một project GitHub vào box để omp làm việc và app FCode hiện',
+      '  trong danh sách.',
+      '  Nếu token GitHub của box ghi được repo thì xong ngay; nếu không,',
+      '  lệnh hướng dẫn bạn dán một khoá vào trang GitHub của repo (một lần',
+      '  cho mỗi repo).',
+      '',
+      '#Ví dụ',
+      '  fcode add ten-tai-khoan/ten-repo',
+      '  fcode add ten-tai-khoan/ten-repo ten-ngan'
+    )
+    deploy = @(
+      '#fcode deploy <tên> <lệnh> [đối số]',
+      '  Điều khiển cổng deploy chung trên VPS (qua ssh; máy ssh lấy từ',
+      '  deployHost trong file cấu hình, mặc định contabo). Lệnh được chuyển',
+      '  nguyên cho cổng, kết quả in ra ngay và fcode thoát với đúng mã của',
+      '  cổng (70 = cần người xử lý).',
+      '',
+      '#Lệnh (viết sau fcode deploy <tên>)',
+      'status [id]@@Xem trạng thái',
+      'deploy <sha>@@Deploy tay một commit',
+      'retry [sha]@@Thử lại commit mới nhất (hoặc <sha>)',
+      'pause@@Tạm dừng deploy tự động',
+      'resume@@Bật lại deploy tự động',
+      'trust on i-understand-root | off@@Cho phép chạy quyền root (xem Cảnh báo)',
+      'logs [id] [số dòng]@@Xem nhật ký',
+      'recheck@@Kiểm tra lại sau khi đã xử lý lỗi 70',
+      'compact@@Dọn gọn nhật ký của cổng',
+      'inventory <draft.json>@@In hiện trạng VPS theo bản nháp',
+      'register <sha256> <draft.json>@@Đăng ký tay (sha256 của file nháp)',
+      '',
+      '  deploy <sha> cũng tạm dừng deploy tự động; gõ resume để bật lại.',
+      '',
+      '#Đăng ký project mới',
+      '>fcode deploy add <chủ/repo> <tên> <draft.json>',
+      '    Đăng ký một project vào cổng deploy: dùng lại (chỉ khi khoá đó chỉ',
+      '    đọc) hoặc tạo khoá chỉ đọc của repo, từ chối nếu repo còn lượt',
+      '    Actions đang chạy, in hiện trạng VPS (inventory), chờ bạn gõ YES',
+      '    rồi mới đăng ký. Cổng báo cần người xử lý thì in status và nhắc',
+      '    lệnh recheck.',
+      '    Tên: chữ thường, số, dấu -, 2 đến 28 ký tự, bắt đầu bằng chữ.',
+      '    "register" gõ tay cũng kiểm tra Actions và hỏi YES như lệnh add.',
+      '',
+      '#Cảnh báo',
+      '  "trust on" in cảnh báo trước khi gửi: ai merge được vào nhánh đó đều',
+      '  có quyền root trên VPS và đọc được token GitHub của cổng.',
+      '',
+      '#Ví dụ',
+      '  fcode deploy task status',
+      '  fcode deploy task deploy <sha>',
+      '  fcode deploy add ten-tai-khoan/ten-repo ten-ngan ten-ngan.draft.json'
+    )
+    pair = @(
+      '#fcode pair [tên thiết bị]',
+      '  Tạo mã ghép (kèm mã QR) để ghép một iPhone mới với server FCode.',
+      '  Mã dùng 1 lần và hết hạn nhanh.',
+      '  Tên thiết bị: tối đa 64 ký tự, không bắt đầu bằng dấu -.',
+      '',
+      '#Ví dụ',
+      '  fcode pair',
+      '  fcode pair iPhone của Mẹ'
+    )
+    phien = @(
+      '#Đồng bộ phiên chat omp giữa laptop và box',
+      '>fcode phien [project]',
+      '    Đồng bộ hai chiều (mọi project, hoặc chỉ một project): phiên nào',
+      '    chỉ có ở một bên thì chép sang bên kia, phiên đã đi tiếp ở một bên',
+      '    thì cập nhật bên còn lại. Không xoá gì. Sau đó omp trên mỗi máy tự',
+      '    thấy phiên đó trong /resume, omp -c và omp -r.',
+      '    Cùng lượt này đồng bộ cả ghi chú ở thư mục gốc project',
+      '    (HANDOFF*.md, CLAUDE.md, AGENTS.md, WORKFLOW.md, agent_state.md,',
+      '    TASK.md, CLAUDE.local.md) khi git không theo dõi chúng; file nào',
+      '    hai máy cùng sửa thì giữ nguyên và báo.',
+      '>fcode phien --thu [project]',
+      '    Chạy thử: chỉ liệt kê những phiên sẽ được chép đi đâu, không chép',
+      '    gì (chỉ ghi lại giờ vừa kết nối box).',
+      '>fcode phien tu-dong bat    |    fcode phien tu-dong tat',
+      '    Bật / tắt tự động đồng bộ phiên mỗi 10 phút, chạy ngầm (không hiện',
+      '    cửa sổ), chỉ khi box đang chạy, và chỉ mở kết nối khi box vừa bật',
+      '    hoặc cách lần mở trước từ 40 phút (để box tự nghỉ được).',
+      '>fcode phien tu-dong trangthai',
+      '    Xem tự động đồng bộ đang bật hay tắt.',
+      '>fcode phien <project> --nhanh',
+      '    Bản nhanh cho hook (fcode moc): chỉ một project, không đánh thức',
+      '    box (box đang ngủ thì bỏ qua), tối đa 20 giây, đang có lượt đồng',
+      '    bộ khác thì bỏ qua. Lần chạy nhanh chưa xong sau 30 giây thì bị',
+      '    ngắt hẳn và báo lỗi (fcode phien chạy tay thì không bị ngắt như',
+      '    vậy).',
+      '>fcode phien <project> --nhanh --nen',
+      '    Như --nhanh nhưng chờ 35 giây rồi mới đồng bộ (hook dùng sau khi',
+      '    omp / claude / codex thoát).',
+      '',
+      '#Ví dụ',
+      '  fcode phien',
+      '  fcode phien deal-sync',
+      '  fcode phien --thu',
+      '  fcode phien tu-dong bat',
+      '  fcode phien deal-sync --nhanh',
+      '  fcode phien deal-sync --nhanh --nen'
+    )
+    moc = @(
+      '#fcode moc bat    |    fcode moc tat    |    fcode moc trang-thai',
+      '  Bật / tắt / xem hook trong profile PowerShell: gõ omp, claude hoặc',
+      '  codex trong thư mục một project (có trong syncRepos) thì fcode đồng',
+      '  bộ nhanh phiên trước và sau khi chạy (tối đa khoảng 20 giây, box ngủ',
+      '  thì bỏ qua).',
+      '  Phiên Claude Code / Codex chưa được chép giữa hai máy, chỉ phiên omp',
+      '  và ghi chú project.',
+      '',
+      '#Tắt hook trong cửa sổ này',
+      '  Gõ $env:FCODE_MOC = ''0'' (đến khi gõ Remove-Item Env:FCODE_MOC hoặc',
+      '  đóng cửa sổ).',
+      '',
+      '#Lưu ý',
+      '  Hook là hàm bọc nên không chuyển đúng hoàn toàn các tham số kiểu --',
+      '  và -x:giá-trị, cũng không để lại lỗi của chương trình trong $?; những',
+      '  lúc cần đúng tuyệt đối, chạy thẳng claude.exe / codex.exe / omp.exe.',
+      '',
+      '#Ví dụ',
+      '  fcode moc bat'
+    )
+    help = @(
+      '#fcode help [lệnh]',
+      '  Không có lệnh: in bảng tổng quan (cũng là fcode -h, fcode --help,',
+      '  fcode /?). Có lệnh: in chi tiết của lệnh đó.',
+      '  Các lệnh có chi tiết: vao, new, sync, ipa, add, deploy, pair, phien,',
+      '  moc, help.',
+      '',
+      '#Cấu hình riêng của máy',
+      "  $ConfigFile",
+      '',
+      '#Ví dụ',
+      '  fcode help',
+      '  fcode help deploy'
+    )
+  }
+  $alias = @{ '-l' = 'vao'; '--list' = 'vao'; list = 'vao'; fcode = 'vao'; '-h' = 'help'; '--help' = 'help'; '/?' = 'help' }
+  $key = $Topic.Trim().ToLowerInvariant()
+  if ($alias.ContainsKey($key)) { $key = $alias[$key] }
+  if ($key -and -not $topics.ContainsKey($key)) {
+    Write-Host "Không có lệnh '$($Topic -replace '[\x00-\x1f\x7f]', '?')'. Dưới đây là các lệnh có sẵn:"
+    Write-Host ''
+    $key = ''
+  }
+  if ($key) {
+    $lines = @($topics[$key])
+    $w = 0; foreach ($l in $lines) { if ($l -match '@@') { $w = [Math]::Max($w, $l.Split(@('@@'), 2, [StringSplitOptions]::None)[0].Length) } }
+    $w += 1
+    foreach ($l in $lines) {
+      if ($l.StartsWith('#')) { Write-HelpPart $l.Substring(1) 'Cyan' }
+      elseif ($l.StartsWith('>')) { Write-HelpPart ('  ' + $l.Substring(1)) 'Green' }
+      elseif ($l -match '@@') { $p = $l.Split(@('@@'), 2, [StringSplitOptions]::None); Write-HelpRow $p[0] $p[1] $w }
+      else { Write-Host $l }
+    }
+    return
+  }
+  Write-Host 'fcode - điều khiển box coding từ máy này'
+  foreach ($l in $overview) {
+    if ($l -match '@@') { $p = $l.Split(@('@@'), 2, [StringSplitOptions]::None); Write-HelpRow $p[0] $p[1] 36 }
+    else { Write-Host ''; Write-HelpPart $l 'Cyan' }
+  }
   Write-Host ''
-  Write-Host '  fcode'
-  Write-Host '      Xem danh sách phiên đang chạy trên box, gõ số để vào (gõ 0 để mở phiên mới).'
-  Write-Host '      Ví dụ: fcode'
-  Write-Host '  fcode <số hoặc tên phiên>'
-  Write-Host '      Vào thẳng một phiên (tên có thể gõ phần đầu). Thoát mà không tắt phiên: Ctrl+B rồi D.'
-  Write-Host '      Ví dụ: fcode 2    hoặc    fcode ten-phien'
-  Write-Host '  fcode --list'
-  Write-Host '      Chỉ in danh sách phiên, không vào (viết tắt: fcode -l).'
-  Write-Host '      Ví dụ: fcode -l'
-  Write-Host '  fcode new'
-  Write-Host '      Mở một phiên MỚI trên box (như nút "+" trong app): chọn project, chọn omp / claude / codex, rồi vào luôn phiên đó.'
-  Write-Host '      Gõ fcode rồi chọn 0 cũng được. Bấm Enter ở bất kỳ câu hỏi nào để quay lại.'
-  Write-Host '      Ví dụ: fcode new'
-  Write-Host '  fcode sync'
-  Write-Host '      Cập nhật các project trên máy này từ GitHub, báo nhánh box chờ merge và PR đang mở.'
-  Write-Host '      Ví dụ: fcode sync'
-  Write-Host '  fcode ipa'
-  Write-Host '      Tải bản FCode mới nhất về thư mục Downloads để kéo vào Sideloadly.'
-  Write-Host '      Ví dụ: fcode ipa'
-  Write-Host '  fcode add <chủ/repo> [tên]'
-  Write-Host '      Thêm một project GitHub vào box để omp làm việc và app FCode hiện trong danh sách.'
-  Write-Host '      Nếu token GitHub của box ghi được repo thì xong ngay; nếu không, lệnh hướng dẫn bạn dán một khoá vào trang GitHub của repo (một lần cho mỗi repo).'
-  Write-Host '      Ví dụ: fcode add ten-tai-khoan/ten-repo    hoặc    fcode add ten-tai-khoan/ten-repo ten-ngan'
-  Write-Host '  fcode deploy <tên> <lệnh> [đối số]'
-  Write-Host '      Điều khiển cổng deploy chung trên VPS (qua ssh; máy ssh lấy từ deployHost trong file cấu hình, mặc định contabo). Lệnh được chuyển nguyên cho cổng, kết quả in ra ngay và fcode thoát với đúng mã của cổng (70 = cần người xử lý).'
-  Write-Host '      Lệnh: status [id] · deploy <sha> · retry [sha] · pause · resume · trust on i-understand-root | off · logs [id] [số dòng] · recheck · compact · inventory <draft.json> · register <sha256> <draft.json>'
-  Write-Host '      "trust on" in cảnh báo (ai merge được vào nhánh đó đều có quyền root trên VPS và đọc được token GitHub của cổng) trước khi gửi.'
-  Write-Host '      Ví dụ: fcode deploy task status    hoặc    fcode deploy task deploy <sha>'
-  Write-Host '  fcode deploy add <chủ/repo> <tên> <draft.json>'
-  Write-Host '      Đăng ký một project vào cổng deploy: dùng lại (chỉ khi khoá đó chỉ đọc) hoặc tạo khoá chỉ đọc của repo, từ chối nếu repo còn lượt Actions đang chạy, in hiện trạng VPS (inventory), chờ bạn gõ YES rồi mới đăng ký. Cổng báo cần người xử lý thì in status và nhắc lệnh recheck.'
-  Write-Host '      Ví dụ: fcode deploy add ten-tai-khoan/ten-repo ten-ngan ten-ngan.draft.json (tên: chữ thường, số, dấu -, 2 đến 28 ký tự, bắt đầu bằng chữ). "register" gõ tay cũng kiểm tra Actions và hỏi YES như lệnh add.'
-  Write-Host '  fcode pair [tên thiết bị]'
-  Write-Host '      Tạo mã ghép (kèm mã QR) để ghép một iPhone mới với server FCode. Mã dùng 1 lần và hết hạn nhanh.'
-  Write-Host '      Ví dụ: fcode pair    hoặc    fcode pair iPhone của Mẹ'
-  Write-Host '  fcode phien [project]'
-  Write-Host '      Đồng bộ phiên chat omp hai chiều giữa laptop và box (mọi project, hoặc chỉ một project): phiên nào chỉ có ở một bên thì chép sang bên kia, phiên đã đi tiếp ở một bên thì cập nhật bên còn lại. Không xoá gì. Sau đó omp trên mỗi máy tự thấy phiên đó trong /resume, omp -c và omp -r.'
-  Write-Host '      Cùng lượt này đồng bộ cả ghi chú ở thư mục gốc project (HANDOFF*.md, CLAUDE.md, AGENTS.md, WORKFLOW.md, agent_state.md, TASK.md, CLAUDE.local.md) khi git không theo dõi chúng; file nào hai máy cùng sửa thì giữ nguyên và báo.'
-  Write-Host '      Ví dụ: fcode phien    hoặc    fcode phien deal-sync'
-  Write-Host '  fcode phien --thu [project]'
-  Write-Host '      Chạy thử: chỉ liệt kê những phiên sẽ được chép đi đâu, không chép gì (chỉ ghi lại giờ vừa kết nối box).'
-  Write-Host '      Ví dụ: fcode phien --thu'
-  Write-Host '  fcode phien tu-dong bat   |   fcode phien tu-dong tat'
-  Write-Host '      Bật / tắt tự động đồng bộ phiên mỗi 10 phút, chạy ngầm (không hiện cửa sổ), chỉ khi box đang chạy, và chỉ mở kết nối khi box vừa bật hoặc cách lần mở trước từ 40 phút (để box tự nghỉ được).'
-  Write-Host '      Ví dụ: fcode phien tu-dong bat'
-  Write-Host '  fcode phien <project> --nhanh'
-  Write-Host '      Bản nhanh cho hook (fcode moc): chỉ một project, không đánh thức box (box đang ngủ thì bỏ qua), tối đa 20 giây, đang có lượt đồng bộ khác thì bỏ qua. Lần chạy nhanh chưa xong sau 30 giây thì bị ngắt hẳn và báo lỗi (fcode phien chạy tay thì không bị ngắt như vậy).'
-  Write-Host '      Ví dụ: fcode phien deal-sync --nhanh'
-  Write-Host '  fcode phien <project> --nhanh --nen'
-  Write-Host '      Như --nhanh nhưng chờ 35 giây rồi mới đồng bộ (hook dùng sau khi omp / claude / codex thoát).'
-  Write-Host '      Ví dụ: fcode phien deal-sync --nhanh --nen'
-  Write-Host '  fcode moc bat   |   fcode moc tat   |   fcode moc trang-thai'
-  Write-Host '      Bật / tắt / xem hook trong profile PowerShell: gõ omp, claude hoặc codex trong thư mục một project (có trong syncRepos) thì fcode đồng bộ nhanh phiên trước và sau khi chạy (tối đa khoảng 20 giây, box ngủ thì bỏ qua). Tắt hook trong cửa sổ này: gõ $env:FCODE_MOC = ''0'' (đến khi gõ Remove-Item Env:FCODE_MOC hoặc đóng cửa sổ). Phiên Claude Code / Codex chưa được chép giữa hai máy, chỉ phiên omp và ghi chú project.'
-  Write-Host '      Hook là hàm bọc nên không chuyển đúng hoàn toàn các tham số kiểu -- và -x:giá-trị, cũng không để lại lỗi của chương trình trong $?; những lúc cần đúng tuyệt đối, chạy thẳng claude.exe / codex.exe / omp.exe.'
-  Write-Host '      Ví dụ: fcode moc bat'
-  Write-Host '  fcode help'
-  Write-Host '      In bảng này (cũng là fcode -h, fcode --help, fcode /?).'
-  Write-Host '      Ví dụ: fcode help'
-  Write-Host ''
-  Write-Host "Cấu hình riêng của máy: $ConfigFile"
+  Write-Host 'Xem chi tiết: fcode help <lệnh>   (ví dụ: fcode help deploy)'
+  $cfg = "Cấu hình: $ConfigFile"
+  if ($cfg.Length -le 80) { Write-Host $cfg }
 }
 
 # Chay script bash tren box. Tham so di CUNG script (dong "set -- '..'" dau payload, da kiem tra), khong bao gio nam tren dong lenh ssh.
@@ -3918,7 +4102,7 @@ function Invoke-Moc {
   $rc
 }
 
-if ($arg -in '-h', '--help', '/?', 'help') { Show-Help; exit 0 }
+if ($arg -in '-h', '--help', '/?', 'help') { Show-Help $(if ($Rest.Count -gt 1) { [string]$Rest[1] } else { '' }); exit 0 }
 if ($CfgBroken) {
   Write-Host "lỗi: file cấu hình bị sai, không đọc được: $ConfigFile"
   Write-Host '  Mở file bằng Notepad để sửa, hoặc xóa file rồi chạy lại install.ps1 để tạo lại.'

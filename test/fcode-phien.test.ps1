@@ -3569,10 +3569,11 @@ T 'moc hook: with nothing piped the real program keeps the console (stdin and st
   Eq (@(Get-MocLog $b | Where-Object { $_ -match '^(omp via-hook|codex c)$' }).Count) 2 'both programs ran through the functions'
 }
 T 'moc help: fcode help names how to turn the hook off in a window and back on, and the wrapper limits' {
-  $w = New-World 'help1'; $r = Invoke-Fcode $w @('help'); Eq $r.Code 0
-  Ok ($r.Out -match "FCODE_MOC = '0'" -and $r.Out -match 'Remove-Item Env:FCODE_MOC' -and $r.Out -match 'cửa sổ này') 'turn off in this window / on again'
-  Ok ($r.Out -match 'claude\.exe / codex\.exe / omp\.exe' -and $r.Out -match 'x:giá-trị') 'wrapper limits and the bypass'
-  Ok ($r.Out -match 'fcode phien <project> --nhanh --nen' -and $r.Out -match 'chưa xong sau 30 giây thì bị ngắt hẳn và báo lỗi') 'r4: --nen and the 30 s hard end are in the help'
+  $w = New-World 'help1'; $r = Invoke-Fcode $w @('help', 'moc'); Eq $r.Code 0; $r2 = Invoke-Fcode $w @('help', 'phien'); Eq $r2.Code 0
+  $o = ($r.Out + ' ' + $r2.Out) -replace '\s+', ' '   # the detail text is wrapped at 78 chars: compare with single spaces
+  Ok ($o -match "FCODE_MOC = '0'" -and $o -match 'Remove-Item Env:FCODE_MOC' -and $o -match 'cửa sổ này') 'turn off in this window / on again'
+  Ok ($o -match 'claude\.exe / codex\.exe / omp\.exe' -and $o -match 'x:giá-trị') 'wrapper limits and the bypass'
+  Ok ($o -match 'fcode phien <project> --nhanh --nen' -and $o -match 'chưa xong sau 30 giây thì bị ngắt hẳn và báo lỗi') 'r4: --nen and the 30 s hard end are in the help'
 }
 T 'moc hook: a failing sync does not stop the agent; a sync that hangs is killed after 35 s (the backstop: fcode itself ends by about 30 s)' {
   $w = New-MocWorld 'moc6'; $b = New-MocBin $w

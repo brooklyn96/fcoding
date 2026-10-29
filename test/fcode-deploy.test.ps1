@@ -498,11 +498,6 @@ T 'agents-git.md (decision-r4 4.4): no fcode/deploy status yet on the merge sha 
   Ok ($md -notmatch 'No such status yet, or the API answers 403: say so') 'the old "tell the user there is no status" rule is gone'
   Ok ($md -match 'answers 403 or the answer cannot be read: say so to the user') '403 is still reported'
 }
-T 'help: fcode help lists fcode deploy, fcode deploy add and the deployHost key' {
-  $h = $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Show-Help' }, $true)[0].Extent.Text
-  Ok ($h.Contains('fcode deploy <tên> <lệnh> [đối số]') -and $h.Contains('fcode deploy add <chủ/repo> <tên> <draft.json>')) 'both commands in the help'
-  Ok ($h.Contains('deployHost') -and $h.Contains('i-understand-root')) 'host key and the trust word'
-}
 T 'source: the deploy code never writes files except the one public-key temp file, and never puts the draft into an argument' {
   $d = ($found | ForEach-Object { $_.Extent.Text }) -join "`n"
   Ok ($d -notmatch 'Set-Content|AppendAllText|WriteAllText|Out-File') 'no text writers'
@@ -562,8 +557,32 @@ T 'e2e: trust on i-understand-root through the real script: status first, warnin
   Ok ($r.Out.Contains((Expected-Warning 'brooklyn96/task' 'main'))) ('warning: ' + $r.Out)
   Ok ($r.Log[1] -match 'trust on i-understand-root') 'second call is the trust'
 }
-T 'e2e: help works and lists deploy; the other commands still answer (unknown name -> usage hint path untouched)' {
-  $r = Run-E2E @('help'); Eq $r.Code 0; Ok ($r.Out -match 'fcode deploy add') 'help lists add'; Eq $r.Log.Count 0
+T 'help: the overview is compact (every line <= 80 chars), has the two rollout-guide strings, lists every command, no ESC when piped' {
+  $r = Run-E2E @('help'); Eq $r.Code 0; Eq $r.Log.Count 0
+  $lines = @($r.Out -split "`n")
+  foreach ($l in $lines) { Ok ($l.Length -le 80) ("line too long (" + $l.Length + "): $l") }
+  Ok ($r.Out.IndexOf([char]27) -lt 0) 'no escape code in piped output'
+  $d = @($lines | Where-Object { $_ -match 'fcode deploy' })
+  Ok ($d.Count -ge 2) 'at least two fcode deploy lines'
+  Ok (@($d | Where-Object { $_.Contains('fcode deploy <tên> <lệnh> [đối số]') }).Count -ge 1) 'deploy <tên> <lệnh> [đối số]'
+  Ok (@($d | Where-Object { $_.Contains('fcode deploy add <chủ/repo> <tên> <draft.json>') }).Count -ge 1) 'deploy add <chủ/repo> <tên> <draft.json>'
+  foreach ($c in 'sync', 'ipa', 'add', 'deploy', 'pair', 'phien', 'moc', 'new', '--list', 'help') { Ok ($r.Out.Contains("fcode $c")) "overview lists fcode $c" }
+  Ok ($r.Out.Contains('fcode help <lệnh>')) 'closing hint'
+  Ok ($r.Out.Contains('fcode help vao')) 'overview names the topic vao'
+  foreach ($f in '-h', '--help', '/?') { $x = Run-E2E @($f); Eq $x.Code 0 $f; Eq $x.Out $r.Out "$f prints the same overview" }
+}
+T 'help: fcode help <lệnh> prints the detail of every command (lines <= 78 chars, no ESC); unknown topic -> message + overview, exit 0' {
+  foreach ($t in 'vao', 'new', 'sync', 'ipa', 'add', 'deploy', 'pair', 'phien', 'moc', 'help') {
+    $r = Run-E2E @('help', $t); Eq $r.Code 0 $t; Ok ($r.Out.IndexOf([char]27) -lt 0) "$t no escape code"
+    foreach ($l in @($r.Out -split "`n")) { if ($l -notmatch 'config\.json') { Ok ($l.Length -le 78) ("$t line too long (" + $l.Length + "): $l") } }
+    Ok ($r.Out.Contains("fcode $t") -or $t -eq 'vao') "$t names its command"
+  }
+  $r = Run-E2E @('help', 'deploy'); Eq $r.Code 0
+  foreach ($s in 'status [id]', 'deploy <sha>', 'retry [sha]', 'pause', 'resume', 'trust on i-understand-root | off', 'logs [id] [số dòng]', 'recheck', 'compact', 'inventory <draft.json>', 'register <sha256> <draft.json>', 'fcode deploy add <chủ/repo> <tên> <draft.json>', 'deployHost', 'quyền root', 'fcode deploy task status') { Ok ($r.Out.Contains($s)) "help deploy lacks: $s" }
+  Ok (@($r.Out -split "`n" | Where-Object { $_ -match 'deploy <sha>' -and $_ -match 'tạm dừng' -and $_ -match 'resume' }).Count -ge 1) 'help deploy: deploy <sha> pauses until resume'
+  $o = Run-E2E @('help'); $u = Run-E2E @('help', 'xyz')
+  Eq $u.Code 0; Ok ($u.Out.Contains("Không có lệnh 'xyz'")) 'unknown topic message'; Ok ($u.Out.Contains($o.Out)) 'unknown topic prints the overview'
+  Eq (Run-E2E @('help', '-l')).Out (Run-E2E @('help', 'vao')).Out 'alias -l'
 }
 
 Set-Location $env:TEMP
