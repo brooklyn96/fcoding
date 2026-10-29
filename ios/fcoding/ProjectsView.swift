@@ -19,6 +19,7 @@ struct ProjectsView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var model = OverviewModel()
     @StateObject private var home = HomeModel()
+    @StateObject private var prefs = PrefsModel()
     @State private var path = NavigationPath()
     @State private var project = "all"
     @AppStorage("inbox.open.running") private var runningOpen = true
@@ -36,9 +37,10 @@ struct ProjectsView: View {
     private var polling: Bool { path.isEmpty && scenePhase == .active }
 
     private var allSessions: [OverviewSession] { model.overview?.sessions ?? [] }
+    /// The server's projects in the user's order (GET /api/prefs).
     private var projectNames: [String] {
-        if let o = model.overview { return o.projects.map(\.name) }
-        return home.home?.projects.map(\.name) ?? []
+        let names = model.overview?.projects.map(\.name) ?? home.home?.projects.map(\.name) ?? []
+        return HomeLogic.orderedProjects(names, order: prefs.prefs.order)
     }
 
     private var visible: [OverviewSession] {
@@ -84,11 +86,7 @@ struct ProjectsView: View {
                     TopCard(home: home, visible: polling, onRing: { sheet = .box }, onQuota: { path.append(QuotaRoute()) })
                         .homeRow(top: 0, bottom: 0)
                     summary(proxy).homeRow(top: 6, bottom: 2)
-                    Text("Dự án")
-                        .scaledFont(13)
-                        .foregroundColor(.l2)
-                        .padding(.horizontal, 2)
-                        .homeRow(top: 10, bottom: 6)
+                    projectsHeader.homeRow(top: 4, bottom: 0)
                     rail.homeRow(top: 0, bottom: 0, side: 0)
                     sessionRows
                 }
@@ -125,7 +123,9 @@ struct ProjectsView: View {
                 await MainActor.run { home.visible = on }
                 guard on else { return }
                 while !Task.isCancelled {
+                    async let names: Void = prefs.load(app)
                     await home.load(app)
+                    await names
                     try? await Task.sleep(nanoseconds: 60_000_000_000)
                 }
             }
@@ -170,8 +170,10 @@ struct ProjectsView: View {
 
     private func reload() async {
         let quota = Task { await home.load(app) }
+        let names = Task { await prefs.load(app) }
         await model.load(app)
         await quota.value
+        await names.value
     }
 
     private func open(_ name: String, reply: Bool = false) {
@@ -195,6 +197,7 @@ struct ProjectsView: View {
                             loadError: model.errorText,
                             sessions: allSessions,
                             initialProject: project,
+                            title: { [aliases = prefs.prefs.aliases] in HomeLogic.displayName($0, aliases: aliases) },
                             clockOffset: home.offset,
                             onOpened: { openAfterSheet = $0 },
                             onAdded: { result in
@@ -206,6 +209,10 @@ struct ProjectsView: View {
                                     await cards
                                 }
                             })
+        case .arrange:
+            ProjectArrangeSheet(projects: projectNames, prefs: prefs.prefs) { await prefs.save($0, app: app) }
+        case .alias(let name):
+            ProjectAliasSheet(name: name, projects: projectNames, prefs: prefs.prefs) { await prefs.save($0, app: app) }
         case .rename(let name):
             RenameSheet(name: name, taken: Set(allSessions.map(\.name))) { newName in
                 await model.rename(name, to: newName, app: app)
@@ -321,6 +328,27 @@ struct ProjectsView: View {
 
     // MARK: - Project cards
 
+    /// "Dự án" and, once there are projects, "Sắp xếp" (order and display names).
+    private var projectsHeader: some View {
+        HStack {
+            Text("Dự án").scaledFont(13).foregroundColor(.l2).padding(.horizontal, 2)
+            Spacer(minLength: 0)
+            if !projectNames.isEmpty {
+                Button { sheet = .arrange } label: {
+                    Label("Sắp xếp", systemImage: "arrow.up.arrow.down")
+                        .scaledFont(13)
+                        .foregroundColor(.accentBlue)
+                        .frame(minHeight: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Sắp xếp và đổi tên dự án")
+            }
+        }
+        .frame(minHeight: 44)
+        .dynamicTypeSize(...DynamicTypeSize.xxLarge)
+    }
+
     private var rail: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             // Equal-height cards: the tallest (git line) sets the row, the others stretch.
@@ -367,14 +395,18 @@ struct ProjectsView: View {
                 ProjectLine(text: Text(reading ? " " : deploy.text), color: deploy.tone.color),
             ]
         }
-        return ProjectCard(title: id == "all" ? "Tất cả" : id, count: waiting > 0 ? waiting : inP.count,
+        let title = id == "all" ? "Tất cả" : prefs.displayName(id)
+        return ProjectCard(title: title, subtitle: id == "all" || title == id ? nil : id,
+                           count: waiting > 0 ? waiting : inP.count,
                            waiting: waiting > 0, lines: lines, selected: project == id,
                            onTap: { withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) { project = id } },
                            onMore: { sheet = .new(project: id == "all" ? nil : id) },
                            showMore: id != "all",
                            staging: id == "all" ? nil
                                : HomeLogic.stagingChip(info?.staging, startedAt: home.stagingStarted[id], now: Date()),
-                           onStartStaging: { startStaging(id) })
+                           onStartStaging: { startStaging(id) },
+                           onRename: id == "all" ? nil : { sheet = .alias(id) },
+                           onArrange: { sheet = .arrange })
     }
 
     private func startStaging(_ project: String) {
@@ -388,7 +420,7 @@ struct ProjectsView: View {
     @ViewBuilder
     private var sessionRows: some View {
         if model.overview != nil && visible.isEmpty {
-            EmptySessions(project: project == "all" ? nil : project) {
+            EmptySessions(project: project == "all" ? nil : prefs.displayName(project)) {
                 sheet = .new(project: project == "all" ? nil : project)
             }
             .homeRow(top: 8, bottom: 0)
@@ -459,6 +491,7 @@ struct ProjectsView: View {
             session: s,
             info: model.overview?.projects.first { $0.name == s.project },
             showProject: project == "all",
+            projectTitle: s.project.map(prefs.displayName),
             unread: model.isUnread(s),
             time: model.relativeTime(s),
             busy: model.busy.contains(s.name),
@@ -501,15 +534,18 @@ struct ProjectsView: View {
 
 /// The sheets of the main screen (one at a time).
 enum HomeSheet: Identifiable {
-    case settings, guide, box
+    case settings, guide, box, arrange
     case new(project: String?)
     case rename(String)
+    case alias(String)
 
     var id: String {
         switch self {
         case .settings: return "settings"
         case .guide: return "guide"
         case .box: return "box"
+        case .arrange: return "arrange"
+        case .alias(let n): return "alias." + n
         case .new(let p): return "new." + (p ?? "")
         case .rename(let n): return "rename." + n
         }
@@ -664,9 +700,11 @@ struct ProjectLine {
 }
 
 /// 182 pt card: name + count, three or four status lines, "…" for a new session; tap filters the
-/// sessions, a long press opens a new session in that project.
+/// sessions, a long press shows a menu (new session, display name, order).
 struct ProjectCard: View {
     let title: String
+    /// The real repo name under a display name (nil when there is no alias).
+    var subtitle: String? = nil
     let count: Int
     let waiting: Bool
     let lines: [ProjectLine]
@@ -676,7 +714,9 @@ struct ProjectCard: View {
     let showMore: Bool
     var staging: HomeLogic.StagingChip? = nil
     var onStartStaging: () -> Void = {}
-    @State private var pressing = false
+    /// "Đổi tên hiển thị…" (project cards only).
+    var onRename: (() -> Void)? = nil
+    var onArrange: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -691,6 +731,15 @@ struct ProjectCard: View {
             }
             .padding(.trailing, showMore ? 30 : 0)
             .padding(.bottom, 0)
+            if let subtitle = subtitle {
+                Text(subtitle)
+                    .scaledFont(11.5, design: .monospaced)
+                    .foregroundColor(.l3)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .padding(.trailing, showMore ? 30 : 0)
+                    .accessibilityLabel("repo \(subtitle)")
+            }
             ForEach(lines.indices, id: \.self) { i in
                 lines[i].text
                     .scaledFont(12.5)
@@ -720,14 +769,16 @@ struct ProjectCard: View {
                 .accessibilityLabel("Mở phiên mới trong \(title)")
             }
         }
-        .scaleEffect(pressing ? 0.97 : 1)
-        .animation(.easeOut(duration: 0.15), value: pressing)
         .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: 14, style: .continuous))
         .onTapGesture(perform: onTap)
-        .onLongPressGesture(minimumDuration: 0.5, perform: {
-            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            onMore()
-        }, onPressingChanged: { pressing = $0 })
+        .contextMenu {
+            Button(action: onMore) { Label("Mở phiên mới", systemImage: "plus") }
+            if let onRename = onRename {
+                Button(action: onRename) { Label("Đổi tên hiển thị…", systemImage: "pencil") }
+            }
+            Button(action: onArrange) { Label("Sắp xếp & đổi tên…", systemImage: "arrow.up.arrow.down") }
+        }
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
         // A double tap filters (the combined "…" button would otherwise take it).
@@ -735,6 +786,7 @@ struct ProjectCard: View {
         .accessibilityAction(named: "Mở phiên mới", onMore)
         .accessibilityActions {
             if staging?.canStart == true { Button("Bật staging", action: onStartStaging) }
+            if let onRename = onRename { Button("Đổi tên hiển thị", action: onRename) }
         }
     }
 
@@ -815,6 +867,8 @@ struct SessionRow: View {
     let session: OverviewSession
     let info: ProjectInfo?
     let showProject: Bool
+    /// The project's display name (alias or real name).
+    var projectTitle: String? = nil
     let unread: Bool
     let time: String
     let busy: Bool
@@ -903,7 +957,7 @@ struct SessionRow: View {
 
     private var meta: some View {
         HStack(spacing: 5) {
-            if showProject, let p = session.project {
+            if showProject, let p = projectTitle ?? session.project {
                 Text(p)
                 Text("·").foregroundColor(.l3)
             }
