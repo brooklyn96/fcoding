@@ -315,7 +315,7 @@ struct QuotaTile: View {
             detail = w.label + " " + HomeLogic.headline(w, showUsed: showUsed).lowercased() + ", "
                 + HomeLogic.resetText(w, now: now, exact: false).lowercased()
         }
-        return (home.cacheLabel.map { "Số liệu cũ, " + $0 + ". " } ?? "")
+        return (home.cacheLabel.map { ($0.hasPrefix("Cũ") ? "" : "Số liệu cũ, ") + $0 + ". " } ?? "")
             + "Hạn mức tài khoản \(current + 1) trên \(accounts.count): \(a.email), \(a.plan ?? "")\(a.org.map { " " + $0 } ?? ""), \(detail). Chạm để xem chi tiết."
     }
 }

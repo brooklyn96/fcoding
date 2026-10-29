@@ -317,7 +317,7 @@ struct ProjectsView: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.85)
                     .padding(.trailing, 2)
-                    .accessibilityLabel("Số liệu cũ, " + saved)
+                    .accessibilityLabel(saved.hasPrefix("Cũ") ? saved : "Số liệu cũ, " + saved)
             }
         }
         .scaledFont(15)

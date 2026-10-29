@@ -71,6 +71,8 @@ struct ProjectArrangeSheet: View {
     /// The names as the sheet opened: only a field the user changed is sent, so a GET that lands
     /// meanwhile (another device's edit, in `prefs`) is not written back over.
     @State private var seed: [String: String] = [:]
+    /// The order as the sheet opened: only a drag by the user sends a new order.
+    @State private var orderSeed: [String] = []
     @State private var saving = false
     @State private var errorText: String?
     @State private var confirmReset = false
@@ -79,10 +81,10 @@ struct ProjectArrangeSheet: View {
         var aliases = prefs.aliases
         for p in order where typed[p] != seed[p] { aliases = HomeLogic.settingAlias(aliases, p, typed[p] ?? "") }
         // A names-only edit keeps the saved order (new projects keep their server place).
-        return ProjectPrefs(order: order == projects ? prefs.order : order, aliases: aliases)
+        return ProjectPrefs(order: order == orderSeed ? prefs.order : order, aliases: aliases)
     }
 
-    private var changed: Bool { order != projects || edited.aliases != prefs.aliases }
+    private var changed: Bool { order != orderSeed || edited.aliases != prefs.aliases }
 
     var body: some View {
         NavigationStack {
@@ -134,6 +136,7 @@ struct ProjectArrangeSheet: View {
         .interactiveDismissDisabled(saving || changed)
         .onAppear {
             order = projects
+            orderSeed = projects
             typed = Dictionary(uniqueKeysWithValues: projects.map { ($0, HomeLogic.cleanAlias(prefs.aliases[$0] ?? "")) })
             seed = typed
         }
