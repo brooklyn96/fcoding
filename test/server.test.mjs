@@ -5939,3 +5939,108 @@ test('upload: the per-request timer leaves a complete request alone: an SSE stre
   assert.ok(buf.includes('event: screen'));
   s.req.destroy();
 }, { bodyMs: 300 }));
+
+// ---------- /api/prefs (CONTRACT A13): project order + display names ----------
+const putPrefs = (c, cookie, body) => c.req('PUT', '/api/prefs', { cookie, body });
+const emptyPrefs = { order: [], aliases: {} };
+
+test('prefs: no file is empty prefs; a PUT then a GET round-trips; the last write wins', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  const g0 = await c.req('GET', '/api/prefs', { cookie });
+  assert.equal(g0.status, 200);
+  assert.deepEqual(g0.json, emptyPrefs);
+  const body = { order: ['my.proj', 'alpha'], aliases: { alpha: 'Dự án Một', 'my.proj': 'x_y-z.1' } };
+  const p = await putPrefs(c, cookie, body);
+  assert.equal(p.status, 200);
+  assert.deepEqual(p.json, body);
+  assert.deepEqual((await c.req('GET', '/api/prefs', { cookie })).json, body);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(c.configDir, 'prefs.json'), 'utf8')), body);
+  assert.equal((await putPrefs(c, cookie, emptyPrefs)).status, 200);
+  assert.deepEqual((await c.req('GET', '/api/prefs', { cookie })).json, emptyPrefs);
+}));
+
+test('prefs: a broken file reads as empty prefs', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  fs.writeFileSync(path.join(c.configDir, 'prefs.json'), '{not json');
+  assert.deepEqual((await c.req('GET', '/api/prefs', { cookie })).json, emptyPrefs);
+}));
+
+test('prefs: unknown names are dropped, order has no duplicates, aliases are NFC and trimmed', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  const r = await putPrefs(c, cookie, { order: ['alpha', 'ghost', 'alpha', 'my.proj'], aliases: { ghost: 'Ma', alpha: '  Các  ', 'my.proj': '   ' } });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.json, { order: ['alpha', 'my.proj'], aliases: { alpha: 'Các' } });
+}));
+
+test('prefs: an alias equal to its own project name is removed, an empty alias removes the entry', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  const r = await putPrefs(c, cookie, { order: [], aliases: { alpha: 'alpha', 'my.proj': 'Mine' } });
+  assert.deepEqual(r.json, { order: [], aliases: { 'my.proj': 'Mine' } });
+  assert.deepEqual((await putPrefs(c, cookie, { order: [], aliases: { 'my.proj': '' } })).json, emptyPrefs);
+}));
+
+test('prefs: Unicode letters, digits, space and . _ - are accepted; 30 characters is the limit', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  const a30 = 'ắ'.repeat(30);
+  const r = await putPrefs(c, cookie, { order: [], aliases: { alpha: a30, 'my.proj': 'Dự án 2.0_b-c' } });
+  assert.equal(r.status, 200, r.text);
+  assert.deepEqual(r.json.aliases, { alpha: a30, 'my.proj': 'Dự án 2.0_b-c' });
+}));
+
+test('prefs: refused with 400 and a Vietnamese sentence; nothing is saved', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  const good = { order: ['alpha'], aliases: { alpha: 'Giữ' } };
+  assert.equal((await putPrefs(c, cookie, good)).status, 200);
+  const cases = [
+    [{ order: [], aliases: { alpha: 'Dup', 'my.proj': 'dUP' } }, /đã dùng cho/], // two aliases the same, case-insensitively
+    [{ order: [], aliases: { alpha: 'MY.PROJ' } }, /trùng tên dự án my\.proj/], // another project's real name
+    [{ order: [], aliases: { alpha: 'a/b' } }, /chỉ được có/], // a character that is not allowed
+    [{ order: [], aliases: { alpha: 'a<b' } }, /chỉ được có/],
+    [{ order: [], aliases: { alpha: 'a\nb' } }, /chỉ được có/],
+    [{ order: [], aliases: { alpha: 'x'.repeat(31) } }, /dài quá 30/], // longer than 30
+    [{ order: [], aliases: { alpha: 5 } }, /không đúng dạng/], // wrong shapes
+    [{ order: 'alpha', aliases: {} }, /không đúng dạng/],
+    [{ order: [1], aliases: {} }, /không đúng dạng/],
+    [{ order: [] }, /không đúng dạng/],
+    [{ order: [], aliases: [] }, /không đúng dạng/],
+    [{ order: [], aliases: null }, /không đúng dạng/],
+  ];
+  for (const [body, re] of cases) {
+    const r = await putPrefs(c, cookie, body);
+    assert.equal(r.status, 400, JSON.stringify(body));
+    assert.match(r.json.error, re, JSON.stringify(body));
+  }
+  assert.equal((await c.req('PUT', '/api/prefs', { cookie, raw: '[1]', headers: JSON_CT })).status, 400); // not an object
+  assert.equal((await c.req('PUT', '/api/prefs', { cookie, raw: '{x', headers: JSON_CT })).status, 400);
+  assert.deepEqual((await c.req('GET', '/api/prefs', { cookie })).json, good);
+}));
+
+test('prefs: needs a session; a PUT needs X-PC; other methods are 405; the body limit applies', () => withApp(async (c) => {
+  assert.equal((await c.req('GET', '/api/prefs')).status, 401);
+  assert.equal((await c.req('PUT', '/api/prefs', { body: emptyPrefs })).status, 401);
+  const { cookie } = await c.login();
+  assert.equal((await c.req('PUT', '/api/prefs', { cookie, pc: false, body: emptyPrefs })).status, 403);
+  assert.equal((await c.req('POST', '/api/prefs', { cookie, body: emptyPrefs })).status, 405);
+  assert.equal((await c.req('DELETE', '/api/prefs', { cookie })).status, 405);
+  assert.equal((await putPrefs(c, cookie, { order: Array(20000).fill('alpha'), aliases: {} })).status, 413);
+  assert.equal(fs.existsSync(path.join(c.configDir, 'prefs.json')), false); // none of the refused calls wrote
+}));
+
+test('prefs: the file is private (0600)', async (t) => {
+  if (process.platform === 'win32') return t.skip('POSIX modes');
+  await withApp(async (c) => {
+    const { cookie } = await c.login();
+    assert.equal((await putPrefs(c, cookie, { order: ['alpha'], aliases: {} })).status, 200);
+    assert.equal(fs.statSync(path.join(c.configDir, 'prefs.json')).mode & 0o777, 0o600);
+  });
+});
+
+test('prefs: two PUTs at once leave one whole, valid file', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  const bodies = [{ order: ['alpha'], aliases: { alpha: 'Một' } }, { order: ['my.proj'], aliases: { 'my.proj': 'Hai' } }];
+  const rs = await Promise.all(bodies.map((b) => putPrefs(c, cookie, b)));
+  assert.deepEqual(rs.map((r) => r.status), [200, 200]);
+  const got = (await c.req('GET', '/api/prefs', { cookie })).json;
+  assert.ok(bodies.some((b) => JSON.stringify(b) === JSON.stringify(got)), JSON.stringify(got));
+  assert.deepEqual(fs.readdirSync(c.configDir).filter((f) => f.endsWith('.tmp')), []);
+}));

@@ -61,6 +61,37 @@ class HttpErr extends Error {
   constructor(status, code, extra = {}) { super(code); this.status = status; this.code = code; Object.assign(this, extra); }
 }
 
+// ---------- project order + display names (GET / PUT /api/prefs, CONTRACT A13) ----------
+const ALIAS_MAX = 30;
+const ALIAS_RE = /^[\p{L}\p{M}\p{N} ._-]+$/u;
+const PREFS_BAD = 'Dữ liệu sắp xếp không đúng dạng.';
+// The body of a PUT (or the stored file) -> {order, aliases}: only known project names, unique order, NFC trimmed aliases; an alias equal to
+// its own project name is dropped. Throws HttpErr(400, <Vietnamese sentence>) for a wrong shape or a refused alias (the app mirrors these rules).
+function normalizePrefs(v, names) {
+  if (!v || !Array.isArray(v.order) || !v.aliases || typeof v.aliases !== 'object' || Array.isArray(v.aliases)) throw new HttpErr(400, PREFS_BAD);
+  const order = [];
+  for (const n of v.order) {
+    if (typeof n !== 'string') throw new HttpErr(400, PREFS_BAD);
+    if (names.includes(n) && !order.includes(n)) order.push(n);
+  }
+  const aliases = {}; const used = new Map(); // lower-cased alias -> project
+  for (const name of names) {
+    const raw = Object.hasOwn(v.aliases, name) ? v.aliases[name] : undefined; // own keys only: a project called "constructor" has no alias
+    if (raw === undefined || raw === null) continue;
+    if (typeof raw !== 'string') throw new HttpErr(400, PREFS_BAD);
+    const a = raw.normalize('NFC').trim();
+    if (!a || a === name) continue;
+    if ([...a].length > ALIAS_MAX) throw new HttpErr(400, `Tên “${[...a].slice(0, ALIAS_MAX).join('')}…” dài quá ${ALIAS_MAX} ký tự.`);
+    if (!ALIAS_RE.test(a)) throw new HttpErr(400, `Tên “${a}” chỉ được có chữ, số, dấu cách và - _ .`);
+    const key = a.toLowerCase();
+    const other = names.find((n) => n !== name && n.toLowerCase() === key);
+    if (other) throw new HttpErr(400, `Tên “${a}” trùng tên dự án ${other}.`);
+    if (used.has(key)) throw new HttpErr(400, `Tên “${a}” đã dùng cho ${used.get(key)}.`);
+    used.set(key, name); aliases[name] = a;
+  }
+  return { order, aliases };
+}
+
 // ---------- add a project (POST /api/projects, CONTRACT A11) ----------
 const CTRL_RE = /[\x00-\x1f\x7f]/;
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -2121,6 +2152,18 @@ export function createApp(opts = {}) {
     if (pathname === '/api/meta') {
       want('GET');
       return json(res, 200, { projects: cfg.projectNames, harnesses: Object.keys(HARNESSES), keys: KEYS });
+    }
+    if (pathname === '/api/prefs') { // CONTRACT A13: <configDir>/prefs.json, written whole and atomically; the code below is synchronous, so two PUTs never interleave and the last wins
+      const file = path.join(configDir, 'prefs.json');
+      if (method === 'GET') {
+        let prefs = { order: [], aliases: {} };
+        try { prefs = normalizePrefs(JSON.parse(fs.readFileSync(file, 'utf8')), cfg.projectNames); } catch {} // no file, a broken one, or one the project list outgrew: empty
+        return json(res, 200, prefs);
+      }
+      want('PUT');
+      const prefs = normalizePrefs(parseJson(req, body), cfg.projectNames);
+      try { writeFile(file, JSON.stringify(prefs)); } catch { throw new HttpErr(500, 'storage'); }
+      return json(res, 200, prefs);
     }
     if (pathname === '/api/sessions') {
       if (method === 'GET') return json(res, 200, { sessions: await listSessions(ctx) });
