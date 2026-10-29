@@ -39,13 +39,14 @@ $wanted = 'Test-WinPath', 'Resolve-OmpPath', 'Get-OmpUnder', 'Join-OmpName', 'Ge
   'Add-SyncRepoConfig', 'Test-SyncFolder', 'Get-RepoKey', 'Get-GitDirOrigin', 'Find-LocalClones', 'Get-SyncDesktop', 'Get-FcodeAddLimitVars', 'Get-MocPolicy', 'Write-MocPolicy',
   'Test-PhienTimeUp', 'Get-PhienChildMs', 'Stop-PhienProc', 'ConvertTo-PhienArg', 'Invoke-PhienExe',
   'Write-PhienText', 'Test-PhienReparse', 'Get-PhienLockName', 'Add-PhienLog', 'Write-PhienOut', 'Get-PhienCapSec', 'Get-PhienNenDelaySec', 'Invoke-PhienBounded',
-  'Clear-PhienPartFiles', 'Test-PhienOwnerGone', 'Get-PhienMarkRx', 'Test-PhienMarkedLine', 'ConvertTo-PhienLatin1', 'Read-PhienExcludeText', 'Get-PhienRepoId', 'Get-PhienRepoIdNow', 'Test-PhienSharedNote', 'Get-PhienLaptopRelease'
+  'Clear-PhienPartFiles', 'Test-PhienOwnerGone', 'Get-PhienMarkRx', 'Test-PhienMarkedLine', 'ConvertTo-PhienLatin1', 'Read-PhienExcludeText', 'Get-PhienRepoId', 'Get-PhienRepoIdNow', 'Test-PhienSharedNote', 'Get-PhienLaptopRelease',
+  'Get-PrefsPath', 'Get-PrefsMap', 'Get-PrefsNames', 'Get-ProjectAliases', 'Save-PrefsCache', 'Resolve-ProjectName', 'Format-ProjectName', 'Get-PhienKeyOf', 'Get-LocalRepoKey', 'Get-BareScript'
 foreach ($fn in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in $wanted }, $true)) { . ([scriptblock]::Create($fn.Extent.Text)) }
 # the git half and the file half that Install-PhienNote uses (git first, then the move, then the line), as one call for the exclude tests below
 function Add-PhienNoteExclude([string]$Dir, [string]$Name) { $f = Get-PhienExcludeFile $Dir $Name; [bool]($f -and (Add-PhienExcludeLine $f $Name)) }
 $pyAssign = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$PhienPy' }, $true)
 Invoke-Expression $pyAssign.Extent.Text
-foreach ($mn in '$MocBegin', '$MocEnd', '$MocRx', '$MocBlock', '$PhienFailMsg') {   # the profile hook text and its markers, exactly as `fcode moc bat` writes them; the failure line
+foreach ($mn in '$MocBegin', '$MocEnd', '$MocRx', '$MocBlock', '$PhienFailMsg', '$FcodeSh') {   # the profile hook text and its markers, exactly as `fcode moc bat` writes them; the failure line
   Invoke-Expression ($ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq $mn }, $true).Extent.Text)
 }
 $PhienLog = Join-Path $Root 'unit-phien.log'   # in-process Add-PhienLog / Write-PhienOut write here, never to the real log
@@ -3590,6 +3591,338 @@ T 'moc hook: a failing sync does not stop the agent; a sync that hangs is killed
   Eq (@(Get-MocLog $b2 | Where-Object { $_ -match '^fcode phien' }).Count) 2
 }
 
+# ============================== 1.3.11: a project alias works wherever a project name does (phien [project], the bare session form) ==============================
+# The box keeps <configDir>/prefs.json (next to config.json); the laptop only reads it through the scan / projects call it already makes and caches it in %LOCALAPPDATA%\fcode\prefs.json.
+function With-PrefsCache($Text, [scriptblock]$Body) {   # $Text = the cache file's text; $null = no file
+  $save = $env:LOCALAPPDATA; $d = Join-Path $Root ('lad-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+  [void](New-Item -ItemType Directory -Path (Join-Path $d 'fcode') -Force)
+  if ($null -ne $Text) { [IO.File]::WriteAllText((Join-Path $d 'fcode\prefs.json'), $Text, $utf8) }
+  $env:LOCALAPPDATA = $d
+  try { & $Body } finally { $env:LOCALAPPDATA = $save }
+}
+function Set-BoxPrefs($w, [string]$Text) { [IO.File]::WriteAllText((Join-Path $w.W 'prefs.json'), $Text, $utf8) }   # beside the box config.json (boxcfg.json)
+function Get-AliasCache($w) { $p = Join-Path $w.U 'AppData\Local\fcode\prefs.json'; if (Test-Path $p) { [IO.File]::ReadAllText($p) } else { $null } }
+function Set-AliasCache($w, [string]$Text) { $p = Join-Path $w.U 'AppData\Local\fcode\prefs.json'; [void](New-Item -ItemType Directory -Path (Split-Path $p) -Force); [IO.File]::WriteAllText($p, $Text, $utf8) }
+
+T 'alias: the resolver turns an alias into the real name (exact, case-insensitive); a real name wins; unknown stays' {
+  $json = '{"order":[],"aliases":{"deal-sync":"ds","vps-scraper":"deal-sync","other":"Cửa Hàng 1","proj":"p"}}'
+  With-PrefsCache $json {
+    Eq (Resolve-ProjectName 'ds') 'deal-sync' 'alias'
+    Eq (Resolve-ProjectName 'DS') 'deal-sync' 'alias, upper case'
+    Eq (Resolve-ProjectName 'cửa hàng 1') 'other' 'alias with spaces and Vietnamese letters, lower case'
+    Eq (Resolve-ProjectName 'CỬA HÀNG 1') 'other' 'alias with spaces and Vietnamese letters, upper case'
+    Eq (Resolve-ProjectName 'deal-sync') 'deal-sync' 'a name that is a real name and also another project''s alias: the real name wins'
+    Eq (Resolve-ProjectName 'DEAL-SYNC') 'DEAL-SYNC' 'the real name, other case: left as typed'
+    Eq (Resolve-ProjectName 'p' @('p')) 'p' 'a known real name (not in the aliases) wins over an alias of that spelling'
+    Eq (Resolve-ProjectName 'nope') 'nope' 'unknown stays'
+    Eq (Resolve-ProjectName 'ds ') 'ds ' 'no trimming: not an exact match'
+    Eq (Resolve-ProjectName '') '' 'empty'
+  }
+  With-PrefsCache '{"order":[],"aliases":{"proj":"pj","other":"proj"}}' {
+    Eq (Resolve-ProjectName 'proj' @('proj', 'other')) 'proj' 'alias of another project spelled like this one''s real name'
+    Eq (Resolve-ProjectName 'pj' @('proj', 'other')) 'proj'
+  }
+}
+T 'alias: a missing, empty or broken prefs cache is harmless (no aliases, no error)' {
+  foreach ($c in @($null, '', '   ', '{oops', 'null', '[]', '"x"', '42', '{}', '{"aliases":5}', '{"aliases":null}', '{"aliases":["a"]}', '{"aliases":{"a":5,"b":"","c":"  ","d":null,"e":["x"],"f":{"g":1}}}')) {
+    With-PrefsCache $c {
+      Eq (@((Get-ProjectAliases).Keys).Count) 0 "aliases of [$c]"
+      Eq (Resolve-ProjectName 'a') 'a' "resolve with [$c]"
+      Eq (Format-ProjectName 'a') 'a' "format with [$c]"
+    }
+  }
+}
+T 'alias: lists print "alias (real name)"; control characters in an alias are shown as ?' {
+  With-PrefsCache ('{"order":[],"aliases":{"proj":"Dự án 1","other":"a' + '\u001b[31mb"}}') {
+    Eq (Format-ProjectName 'proj') 'Dự án 1 (proj)'
+    Eq (Format-ProjectName 'PROJ') 'Dự án 1 (PROJ)' 'the key is found whatever its case'
+    Eq (Format-ProjectName 'other') 'a?[31mb (other)'
+  }
+  With-PrefsCache ('{"order":[],"aliases":{"p":"a' + '\u009bb' + '\u202ec' + '\u200bd"}}') {
+    Eq (Format-ProjectName 'p') 'a?b?c?d (p)' 'C1 control, bidi override and zero-width space are masked'
+    Eq (Format-ProjectName 'third') 'third' 'no alias: the name alone'
+  }
+}
+T 'alias: Save-PrefsCache keeps the old copy when the box said nothing, and replaces it when it answered' {
+  With-PrefsCache $null {
+    Save-PrefsCache $null
+    Ok (-not (Test-Path (Get-PrefsPath))) 'nothing to save, nothing written'
+    Save-PrefsCache ([pscustomobject]@{ order = @('proj'); aliases = [pscustomobject]@{ proj = 'pj' } })
+    Eq (Resolve-ProjectName 'pj') 'proj' 'saved'
+    Save-PrefsCache $null
+    Eq (Resolve-ProjectName 'pj') 'proj' 'a silent box does not wipe it'
+    Save-PrefsCache ([pscustomobject]@{ order = @(); aliases = [pscustomobject]@{} })
+    Eq (Resolve-ProjectName 'pj') 'pj' 'an answer with no aliases clears it'
+  }
+}
+T 'alias e2e: fcode phien <alias> with no cache asks the box once, syncs the real project and saves the cache; the next runs (any case) ask nothing' {
+  $w = New-W2 'al1'; Set-BoxPrefs $w '{"order":["proj","other"],"aliases":{"proj":"my proj"}}'
+  $s = New-Sess $w.LS '11111111-al01' $w.LP @('a')
+  $r = Invoke-Fcode $w @('phien', 'my proj')
+  Eq $r.Code 0 $r.Out
+  Ok ($r.Out -match '== my proj \(proj\): gửi 1 phiên lên box') ("header names alias and real name; out: " + $r.Out)
+  Ok (Test-Path (Join-Path $w.BS (Split-Path $s -Leaf))) 'the real project was synced'
+  Eq (Calls $w 'projects') 1 'one extra call to learn the aliases'
+  Ok ((Get-AliasCache $w) -match '"proj":"my proj"') 'cache saved'
+  $r = Invoke-Fcode $w @('phien', 'MY PROJ')
+  Eq $r.Code 0 $r.Out
+  Ok ($r.Out -match '== my proj \(proj\):') ("upper case alias; out: " + $r.Out)
+  Eq (Calls $w 'projects') 1 'the cache resolved it: no extra call'
+  $r = Invoke-Fcode $w @('phien', 'proj'); Eq $r.Code 0 $r.Out; Eq (Calls $w 'projects') 1 'the real name asks nothing either'
+}
+T 'alias e2e: a real name wins over an alias spelled like it' {
+  $w = New-W2 'al2'; Set-BoxPrefs $w '{"order":[],"aliases":{"other":"proj"}}'
+  $s = New-Sess $w.LS '11111111-al02' $w.LP @('a')
+  $r = Invoke-Fcode $w @('phien', 'proj')
+  Eq $r.Code 0 $r.Out
+  Ok (Test-Path (Join-Path $w.BS (Split-Path $s -Leaf))) ("proj was synced, not other; out: " + $r.Out)
+}
+T 'alias e2e: a missing or broken box prefs file is harmless: sync works, an unknown name gets the usual message' {
+  $n = 0
+  foreach ($c in @($null, '{oops', '[1,2]', '{"aliases":{"proj":5,"":"x"}}')) {
+    $n++; $w = New-W2 "al3-$n"
+    if ($null -ne $c) { Set-BoxPrefs $w $c }
+    $s = New-Sess $w.LS '11111111-al03' $w.LP @('a')
+    $r = Invoke-Fcode $w @('phien', 'proj'); Eq $r.Code 0 "[$c] $($r.Out)"
+    Ok (Test-Path (Join-Path $w.BS (Split-Path $s -Leaf))) "[$c] synced"
+    $r = Invoke-Fcode $w @('phien', 'pj'); Eq $r.Code 1 "[$c] $($r.Out)"
+    Ok ($r.Out -match "Không thấy project 'pj' trong syncRepos. Có: proj, other, notonbox") "[$c] usual message; out: $($r.Out)"
+  }
+}
+T 'alias e2e: when the box cannot be reached the cached copy resolves the alias, and a failed call does not wipe it' {
+  $w = New-W2 'al4'; $cache = '{"order":[],"aliases":{"proj":"pj"}}'; Set-AliasCache $w $cache
+  [void](New-Sess $w.LS '11111111-al04' $w.LP @('a'))
+  $r = Invoke-Fcode $w @('phien', 'pj') @{ FAKE_SSH_FAIL = '1' }
+  Eq $r.Code 1 $r.Out
+  Ok ($r.Out -match 'không nói chuyện được với box') ("got as far as the box: $($r.Out)")
+  Ok ($r.Out -notmatch 'Không thấy project') 'the alias was resolved from the cache'
+  Eq (Get-AliasCache $w) $cache 'the cache is untouched'
+}
+T 'alias e2e: the project list shows "alias (real name)"' {
+  $w = New-W2 'al5'
+  Set-BoxPrefs $w ('{"order":[],"aliases":{"proj":"Dự án","other":"a' + '\u001b[31mb"}}')   # the box drops the second: a control character
+  $r = Invoke-Fcode $w @('phien', 'nope')
+  Eq $r.Code 1 $r.Out
+  Ok ($r.Out -match "Có: Dự án \(proj\), other, notonbox") ("list; out: " + $r.Out)
+  Ok ($r.Out.IndexOf([char]27) -lt 0) 'no escape code reaches the screen'
+}
+# the bare form (fcode <name>) opens an interactive ssh: a stub instabox logs the script it would run and passes everything else to the fake box
+function Use-BareIb($w) {
+  $py = Join-Path $w.W 'ib-bare.py'; $cmd = Join-Path $w.W 'ib-bare.cmd'; $w | Add-Member -NotePropertyName BareLog -NotePropertyValue (Join-Path $w.W 'bare.log') -Force
+  $fake = Join-Path $PSScriptRoot 'fake-instabox.py'
+  # BARE_FAIL=<word>,<word>: a call whose word is one of these exits 78 (the box script found no session of that name); BARE_DROP: exits 255 (the ssh dropped)
+  $src = @'
+import base64, os, re, subprocess, sys
+a = sys.argv[1:]
+if a and a[0] == 'ssh' and 'base64 -d' in a[-1] and 'python3' not in a[-1]:
+    open(os.environ['BARE_LOG'], 'a', encoding='utf-8').write(a[-1] + '\n')
+    t = base64.b64decode(re.search(r'echo (\S+) \|', a[-1]).group(1)).decode('utf-8')
+    w = re.search(r"(?m)^set -- '(.*)'", t).group(1)
+    sys.exit(78 if w in os.environ.get('BARE_FAIL', '').split(',') else 255 if w in os.environ.get('BARE_DROP', '').split(',') else 0)
+sys.exit(subprocess.call([sys.executable, r'@@FAKE@@'] + a))
+'@
+  [IO.File]::WriteAllText($py, $src.Replace('@@FAKE@@', $fake), $utf8)
+  [IO.File]::WriteAllText($cmd, "@echo off`r`npython `"$py`" %*`r`nexit /b %errorlevel%`r`n")
+  [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ instabox = $cmd; box = 'coder'; syncRepos = @($w.LP, (Join-Path $w.U 'Desktop\other'), (Join-Path $w.U 'Desktop\notonbox')) } | ConvertTo-Json -Compress))
+}
+function Get-BareArgs($w) {   # the word each bare call put in `set -- '<word>'` at the head of the script it sent to the box
+  if (-not (Test-Path $w.BareLog)) { return @() }
+  @(Get-Content $w.BareLog | Where-Object { $_ } | ForEach-Object {
+    $b = [regex]::Match($_, 'echo (\S+) \|').Groups[1].Value
+    $t = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b))
+    [regex]::Match($t, "(?m)^set -- '(.*)'").Groups[1].Value })
+}
+T 'alias e2e: the bare form turns an alias into the real name before the script goes to the box; a number, a session name and a real name go through as typed' {
+  $w = New-W2 'al6'; Use-BareIb $w; Set-AliasCache $w '{"order":[],"aliases":{"proj":"my proj"}}'
+  foreach ($a in 'my proj', 'MY PROJ', 'proj', '2', 'omp-1') { $r = Invoke-Fcode $w @($a) @{ BARE_LOG = $w.BareLog }; Eq $r.Code 0 "[$a] $($r.Out)" }
+  Eq ((Get-BareArgs $w) -join '|') 'proj|proj|proj|2|omp-1'
+  Eq (Calls $w 'projects') 0 'the cache was there: no extra call'
+}
+T 'alias e2e: the bare form with no cache asks the box once, then never again' {
+  $w = New-W2 'al7'; Use-BareIb $w; Set-BoxPrefs $w '{"order":[],"aliases":{"proj":"pj"}}'
+  $r = Invoke-Fcode $w @('pj') @{ BARE_LOG = $w.BareLog }; Eq $r.Code 0 $r.Out
+  Eq (Calls $w 'projects') 1 'the first call learns the aliases'
+  $r = Invoke-Fcode $w @('omp-1') @{ BARE_LOG = $w.BareLog }; Eq $r.Code 0 $r.Out
+  Eq (Calls $w 'projects') 1 'the cache exists now'
+  Eq ((Get-BareArgs $w) -join '|') 'proj|omp-1'
+}
+T 'alias e2e: the bare form asks the box once for a word that can only be an alias, then refuses it; no script goes to the box' {
+  $w = New-W2 'al8'; Use-BareIb $w; Set-AliasCache $w '{"order":[],"aliases":{"proj":"pj"}}'
+  $r = Invoke-Fcode $w @('a b') @{ BARE_LOG = $w.BareLog }; Eq $r.Code 1 $r.Out
+  Ok ($r.Out -match "Không hiểu lệnh 'a b'") $r.Out
+  Eq (@(Get-BareArgs $w).Count) 0 'nothing was sent'
+  Eq (Calls $w 'projects') 1 'one ask'
+}
+T 'alias help: fcode help and the phien / vao detail say an alias works' {
+  $w = New-World 'alh'; $o = ((Invoke-Fcode $w @('help')).Out + ' ' + (Invoke-Fcode $w @('help', 'phien')).Out + ' ' + (Invoke-Fcode $w @('help', 'vao')).Out) -replace '\s+', ' '
+  Ok ($o -match 'tên gọi \(alias\) đặt trong app đều được') 'overview'
+  Ok ($o -match '\[project\] là tên project hoặc tên gọi \(alias\)') 'phien'
+  Ok ($o -match 'tên gọi \(alias\) của nó cũng được') 'vao'
+  Ok (@((Invoke-Fcode $w @('help')).Out -split "`r?`n" | Where-Object { $_.Length -gt 80 }).Count -eq 0) 'overview lines stay within 80 chars'
+}
+
+# ---- rework r1: the box reads prefs.json by the server's lenient rules; a laptop folder named differently; `fcode new` and the session list; case-only keys; unknown word; masks
+function Set-BoxCfg($w, [string[]]$Names) {   # the box config.json with exactly these projects, in this order, each in its own absolute folder
+  $b = ($w.W -replace '\\', '/') + '/boxws/'; $i = 0
+  $items = @($Names | ForEach-Object { $i++; '"' + $_ + '":"' + $b + 'd' + $i + '"' })
+  [IO.File]::WriteAllText($w.Cfg, ('{"projects":{' + ($items -join ',') + '}}'), $utf8)
+}
+T 'alias e2e: the box reads prefs.json by the server''s lenient rules: known projects only, NFC, 1..30 characters of letters / marks / digits / space . _ -, no real name of another project, first project wins a duplicate' {
+  $w = New-W2 'al9'; Set-BoxCfg $w @('proj', 'other', 'zeta', 'p4', 'p5', 'p6', 'p7')
+  Set-BoxPrefs $w ('{"order":["zeta","nope","proj","zeta"],"aliases":{"proj":"Same","other":"same","zeta":"proj","p4":"a/b","p5":"' + ('y' * 31) + '","p6":"' + ('x' * 30) + '","p7":"  Aé  ","ghost":"Boo"}}')
+  $r = Invoke-Fcode $w @('phien', 'proj'); Eq $r.Code 0 $r.Out
+  $c = Get-AliasCache $w | ConvertFrom-Json
+  Eq (@($c.aliases.PSObject.Properties.Name | Sort-Object) -join ',') 'p6,p7,proj' 'kept: the first of a duplicate, 30 characters, NFC; dropped: another project''s name, bad character, 31 characters, unknown project'
+  Eq $c.aliases.proj 'Same'
+  Eq $c.aliases.p7 ('A' + [char]0xE9) 'trimmed and NFC'
+  Eq ($c.order -join ',') 'zeta,proj' 'known and unique'
+  Eq ($c.names -join ',') 'proj,other,zeta,p4,p5,p6,p7' 'the real names, in config order'
+}
+T 'alias e2e: a project added later takes a name that was an alias: the real name wins (bare form and phien)' {
+  $w = New-W2 'al10'; Use-BareIb $w; Set-BoxCfg $w @('web', 'beta'); Set-BoxPrefs $w '{"aliases":{"beta":"web"}}'
+  $r = Invoke-Fcode $w @('web') @{ BARE_LOG = $w.BareLog }; Eq $r.Code 0 $r.Out
+  Eq ((Get-BareArgs $w) -join '|') 'web' 'the box dropped the alias: web is web'
+  Ok ((Get-AliasCache $w) -notmatch '"beta":"web"') 'and the cache has none'
+  Set-AliasCache $w '{"order":[],"names":["web","beta"],"aliases":{"beta":"web"},"repos":{}}'   # a cache written before web was added: the cached real names settle it
+  $r = Invoke-Fcode $w @('web') @{ BARE_LOG = $w.BareLog }; Eq $r.Code 0 $r.Out
+  Eq ((Get-BareArgs $w) -join '|') 'web|web'
+  $r = Invoke-Fcode $w @('phien', 'web'); Eq $r.Code 1 $r.Out
+  Ok ($r.Out -match "Không thấy project 'web' trong syncRepos") ("web, not beta; out: " + $r.Out)
+}
+T 'alias: a laptop folder named differently is found through the cached repo (Format-ProjectName with the folder, Get-PhienKeyOf)' {
+  $gd = Join-Path $Root 'ak\FCode'; New-GitDir $gd; & git -C $gd remote add origin https://github.com/Owner/Fcoding.git
+  With-PrefsCache '{"order":[],"names":["fcoding"],"aliases":{"fcoding":"App"},"repos":{"fcoding":"owner/fcoding"}}' {
+    Eq (Format-ProjectName 'FCode' $gd) 'App (FCode)'
+    Eq (Format-ProjectName 'FCode') 'FCode' 'no folder: no link'
+    $pp = [ordered]@{ fcode = $gd; other = (Join-Path $Root 'ak\none') }
+    Eq (Get-PhienKeyOf 'fcoding' $pp) 'fcode'
+    Eq (Get-PhienKeyOf 'FCODING' $pp) 'fcode' 'any case'
+    Eq (Get-PhienKeyOf 'fcode' $pp) 'fcode' 'a folder of that name'
+    Ok ($null -eq (Get-PhienKeyOf 'nope' $pp)) 'unknown'
+  }
+}
+T 'alias e2e: fcode phien <alias> (or the box name) works when the laptop folder has another name but the same GitHub repo; the list shows the alias' {
+  $w = New-World 'al11'
+  $ld = Join-Path $w.U 'Desktop\FCode'; New-GitDir $ld; & git -C $ld remote add origin https://github.com/Owner/Proj.git
+  New-GitDir $w.BP; & git -C $w.BP remote add origin git@github-proj:owner/proj.git
+  [IO.File]::WriteAllText($w.Cfg, (@{ projects = @{ proj = $w.BP } } | ConvertTo-Json -Compress))
+  [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ instabox = $Cmd; box = 'coder'; syncRepos = @($ld) } | ConvertTo-Json -Compress))
+  Set-BoxPrefs $w '{"aliases":{"proj":"App"}}'
+  $lsd = Join-Path $w.U ('.omp\agent\sessions\' + (Get-OmpEncodedDir $ld $w.U (Join-Path $w.U 'AppData\Local\Temp')))
+  $a = New-Sess $lsd 'abcdabcd-al11' $ld @('a')
+  $r = Invoke-Fcode $w @('phien', 'App'); Eq $r.Code 0 $r.Out
+  Ok (Test-Path (Join-Path $w.BS (Split-Path $a -Leaf))) ("synced into the box project; out: " + $r.Out)
+  Ok ($r.Out -match '== App \(proj\): gửi 1 phiên') ("header; out: " + $r.Out)
+  $r = Invoke-Fcode $w @('phien', 'proj'); Eq $r.Code 0 $r.Out
+  Ok ($r.Out -match '== App \(proj\):') ("the box name finds the folder too; out: " + $r.Out)
+  $r = Invoke-Fcode $w @('phien', 'nope'); Eq $r.Code 1 $r.Out
+  Ok ($r.Out -match 'Có: App \(fcode\)') ("list; out: " + $r.Out)
+}
+# the bare-form script runs on the box; here it runs in Git's bash with fake tmux and fcode-new
+$GitBash = Join-Path (Split-Path (Split-Path (Split-Path (((& git --exec-path) | Select-Object -First 1) -replace '/', '\')))) 'bin\bash.exe'
+function Invoke-BareScript([string]$Text, [string]$Stdin, [string]$Tag, [string]$Sessions = '') {
+  $d = Join-Path $Root ('bs-' + $Tag); $bin = Join-Path $d 'bin'; [void](New-Item -ItemType Directory -Path $bin -Force)
+  $log = Join-Path $d 'calls.log'
+  [IO.File]::WriteAllText((Join-Path $bin 'tmux'), @'
+#!/bin/bash
+case "$1" in
+  list-sessions) printf '%s\n' "${FAKE_SESSIONS:-deal-sync-omp|0|deal-sync|omp}" ;;
+  *) echo "tmux $*" >> "$FAKE_LOG" ;;
+esac
+'@.Replace("`r`n", "`n"), $utf8)
+  [IO.File]::WriteAllText((Join-Path $bin 'fcode-new'), @'
+#!/bin/bash
+echo "fcode-new $*" >> "$FAKE_LOG"
+case "$1" in
+  --projects) printf 'deal-sync\nother\n' ;;
+  --harnesses) printf 'omp\nclaude\n' ;;
+  *) echo deal-sync-omp ;;
+esac
+'@.Replace("`r`n", "`n"), $utf8)
+  $sf = Join-Path $d 'script.sh'; [IO.File]::WriteAllText($sf, $Text.Replace("`r`n", "`n"), $utf8)
+  $psi = New-Object Diagnostics.ProcessStartInfo $GitBash
+  $psi.Arguments = '"' + ($sf -replace '\\', '/') + '"'
+  $psi.UseShellExecute = $false; $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
+  $psi.StandardOutputEncoding = $utf8
+  $psi.EnvironmentVariables['PATH'] = $bin + ';' + $env:PATH; $psi.EnvironmentVariables['FAKE_LOG'] = $log; if ($Sessions) { $psi.EnvironmentVariables['FAKE_SESSIONS'] = $Sessions }
+  $p = [Diagnostics.Process]::Start($psi)
+  $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
+  $p.StandardInput.Write($Stdin); $p.StandardInput.Close()
+  if (-not $p.WaitForExit(60000)) { $p.Kill(); throw 'the box script timed out' }
+  [pscustomobject]@{ Code = $p.ExitCode; Out = $o.Result; Err = $e.Result; Log = $(if (Test-Path $log) { [IO.File]::ReadAllText($log) } else { '' }) }
+}
+T 'alias: the box script shows "alias (real name)" in the session list and the `fcode new` project picker; the real name is what is picked and run; alias text is data, never code' {
+  With-PrefsCache '{"order":[],"aliases":{"deal-sync":"Cửa hàng","other":"a$(echo PWNED)b\t;x","bad key":"zzz"}}' {
+    $s = Get-BareScript '--list'
+    Ok ($s.StartsWith("set -- '--list'`naliases_b64='")) 'the word and the aliases lead the script'
+    $r = Invoke-BareScript $s '' 'list'
+    Ok ($r.Out.Contains('dự án: Cửa hàng (deal-sync)')) ("session list; out: " + $r.Out + $r.Err)
+    $r = Invoke-BareScript (Get-BareScript '--new') "1`n1`n" 'new'
+    Ok ($r.Out.Contains('  1) Cửa hàng (deal-sync)')) ("picker; out: " + $r.Out + $r.Err)
+    Ok ($r.Out.Contains('  2) a$(echo PWNED)b?;x (other)')) 'a tab became ?, the text was not run'
+    Ok ($r.Out -notmatch '(?m)^PWNED' -and -not $r.Out.Contains('zzz')) 'nothing ran; a name that is no project name is not sent'
+    Ok ($r.Out.Contains('Đang mở phiên mới (Cửa hàng (deal-sync), omp)')) ("opening line; out: " + $r.Out)
+    Ok ($r.Log.Contains('fcode-new deal-sync omp') -and $r.Log.Contains('tmux -u attach -t =deal-sync-omp')) ("the real name went to fcode-new; log: " + $r.Log)
+  }
+  With-PrefsCache $null {
+    $r = Invoke-BareScript (Get-BareScript '--list') '' 'list0'
+    Ok ($r.Out.Contains('dự án: deal-sync') -and -not $r.Out.Contains('(deal-sync)')) ("no aliases: the real name alone; out: " + $r.Out)
+  }
+}
+T 'alias: the box script finds a session by its project tag (@pc_project), not only by the start of its name: my_app, a renamed session; no session = exit 78' {
+  $ss = "my-app-omp|0|my_app|omp`nrenamed|0|my_app|claude`nother-omp|0|other|omp"
+  $r = Invoke-BareScript (Get-BareScript 'my_app') '' 'proj1' $ss
+  Eq $r.Code 1 $r.Out
+  Ok ($r.Out.Contains('Có nhiều phiên khớp "my_app"') -and $r.Out.Contains('my-app-omp') -and $r.Out.Contains('renamed') -and -not $r.Out.Contains('other-omp')) ("both sessions of the project, not the other; out: " + $r.Out)
+  $r = Invoke-BareScript (Get-BareScript 'MY_APP') '' 'proj2' 'renamed|0|my_app|claude'
+  Eq $r.Code 0 ($r.Out + $r.Err)
+  Ok ($r.Log.Contains('tmux -u attach -t =renamed')) ("one session tagged with the project: attached, any case; log: " + $r.Log)
+  $r = Invoke-BareScript (Get-BareScript 'my-app-omp') '' 'proj3' $ss
+  Eq $r.Code 0 'an exact session name still wins'
+  Ok ($r.Log.Contains('=my-app-omp')) $r.Log
+  $r = Invoke-BareScript (Get-BareScript 'zz') '' 'proj4' $ss
+  Eq $r.Code 78 'no such session: 78'
+  $r = Invoke-BareScript (Get-BareScript 'my_a') '' 'proj5' $ss
+  Eq $r.Code 78 'a prefix of a project name is not a project tag, and my_a starts no session name'
+}
+T 'alias e2e: the box program writes UTF-8 whatever the locale: a Vietnamese alias survives a non-UTF-8 stdout encoding' {
+  $w = New-W2 'al15'; Set-BoxPrefs $w ('{"aliases":{"proj":"D\u1ef1 \u00e1n"}}')
+  $r = Invoke-Fcode $w @('phien', 'proj') @{ PYTHONIOENCODING = 'cp1252'; PYTHONUTF8 = '0' }; Eq $r.Code 0 $r.Out
+  Eq (((Get-AliasCache $w) | ConvertFrom-Json).aliases.proj) ('D' + [char]0x1EF1 + ' ' + [char]0xE1 + 'n') 'bytes are UTF-8, not the locale encoding'
+}
+T 'alias e2e: project names that differ only in case cannot break the scan reply; the CLI keeps working' {
+  $w = New-W2 'al12'; Set-BoxCfg $w @('Alpha', 'alpha', 'proj'); Set-BoxPrefs $w '{"aliases":{"Alpha":"x","alpha":"y","proj":"pj"}}'
+  $r = Invoke-Fcode $w @('phien', 'proj'); Eq $r.Code 0 $r.Out
+  Ok ($r.Out -notmatch 'Cannot convert|keys with different casing') $r.Out
+  Eq (@(((Get-AliasCache $w) | ConvertFrom-Json).aliases.PSObject.Properties.Name | Sort-Object) -join ',') 'Alpha,proj'
+}
+T 'alias e2e: the bare form asks the box once for a word the box does not know, even with a cache; an alias set after the cache is found; a session the box knows asks nothing' {
+  $w = New-W2 'al13'; Use-BareIb $w; Set-AliasCache $w '{"order":[],"names":["proj","other"],"aliases":{},"repos":{}}'
+  Set-BoxPrefs $w '{"aliases":{"proj":"pj"}}'
+  $e = @{ BARE_LOG = $w.BareLog; BARE_FAIL = 'pj,omp-9' }
+  $r = Invoke-Fcode $w @('omp-1') $e; Eq $r.Code 0 $r.Out
+  Eq (Calls $w 'projects') 0 'a session the box knows: no ask'
+  $r = Invoke-Fcode $w @('pj') $e; Eq $r.Code 0 $r.Out
+  Eq (Calls $w 'projects') 1 'one ask after the box refused pj'
+  Eq ((Get-BareArgs $w) -join '|') 'omp-1|pj|proj' 'then the script ran again with the real name'
+  $r = Invoke-Fcode $w @('omp-9') $e; Eq $r.Code 1 $r.Out
+  Eq (Calls $w 'projects') 2 'a word that is nothing: asked once, no loop'
+  Eq ((Get-BareArgs $w) -join '|') 'omp-1|pj|proj|omp-9'
+  Set-BoxPrefs $w '{"aliases":{"proj":"my proj"}}'
+  $r = Invoke-Fcode $w @('my proj') $e; Eq $r.Code 0 $r.Out
+  Eq (@(Get-BareArgs $w) | Select-Object -Last 1) 'proj' 'a word with a space can only be an alias: asked before the first script'
+}
+T 'alias e2e: a dropped ssh (255) or any other failure is not "no such session": the bare form does not wake the box or ask it; the user sees the exit code' {
+  $w = New-W2 'al14'; Use-BareIb $w; Set-AliasCache $w '{"order":[],"names":["proj"],"aliases":{},"repos":{}}'
+  Set-BoxPrefs $w '{"aliases":{"proj":"pj"}}'
+  $r = Invoke-Fcode $w @('pj') @{ BARE_LOG = $w.BareLog; BARE_DROP = 'pj' }
+  Eq $r.Code 255 $r.Out
+  Eq ((Get-BareArgs $w) -join '|') 'pj' 'one script, no retry'
+  Eq (Calls $w 'projects') 0 'the box was not asked'
+  $r = Invoke-Fcode $w @('zz') @{ BARE_LOG = $w.BareLog; BARE_FAIL = 'zz' }
+  Eq $r.Code 1 'no such session: the user still sees exit code 1'
+  Eq (Calls $w 'projects') 1 'asked now'
+}
 if ($env:FCODE_TEST_KEEP) { Write-Host "kept: $Root" } else { for ($i = 0; $i -lt 4 -and (Test-Path -LiteralPath $Root); $i++) { Set-Location -LiteralPath $env:TEMP; Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue; if (Test-Path -LiteralPath $Root) { Start-Sleep -Seconds 3 } } }   # omp may still hold its native addon for a moment
 Write-Host ''
 Write-Host "passed $script:pass, failed $script:fail"

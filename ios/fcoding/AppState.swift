@@ -52,6 +52,7 @@ final class AppState: ObservableObject {
     private func leaveUnsupported(signingOut: Bool) {
         guard let old = unsupportedServer else { return }
         AppState.removeDrafts()
+        AppState.removeSavedCopies()
         UserDefaults.standard.removeObject(forKey: "inbox.seen")
         if signingOut {
             UserDefaults.standard.removeObject(forKey: AppState.serverKey)
@@ -121,6 +122,7 @@ final class AppState: ObservableObject {
         guard Keychain.set(newToken, for: AppState.tokenAccount) else { throw APIError(status: 0, code: "keychain") }
         if !serverURL.isEmpty && serverURL != base.absoluteString {
             AppState.removeDrafts()
+            AppState.removeSavedCopies()
             UserDefaults.standard.removeObject(forKey: "inbox.seen")
         }
         serverURL = base.absoluteString
@@ -195,7 +197,16 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// The box's data saved on this phone: the home / overview replies (ResponseCache) and the
+    /// project order + display names (PrefsModel's "projects.prefs"). Called in the same main
+    /// actor turn as the token change, so the next ProjectsView (`.id(app.token)`) starts empty.
+    static func removeSavedCopies() {
+        ResponseCache.clear()
+        UserDefaults.standard.removeObject(forKey: "projects.prefs")
+    }
+
     func signOutLocally(notice: String?) {
+        AppState.removeSavedCopies()
         Keychain.delete(AppState.tokenAccount)
         self.notice = notice
         token = nil

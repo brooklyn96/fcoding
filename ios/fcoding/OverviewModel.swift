@@ -24,6 +24,10 @@ final class OverviewModel: ObservableObject {
     /// the fetch is repeated.
     private var generation = 0
     private static let seenKey = "inbox.seen"
+    /// `overview` is the copy saved on this phone (ResponseCache), not yet confirmed by the box:
+    /// show "đang cập nhật". Its ages still count from its own `now`. Cleared by the first good reply.
+    @Published private(set) var fromCache = false
+    private var restored = false
 
     init() {
         seen = UserDefaults.standard.dictionary(forKey: OverviewModel.seenKey) as? [String: Double] ?? [:]
@@ -32,6 +36,7 @@ final class OverviewModel: ObservableObject {
     /// One request at a time. A call while one is in flight is not dropped: it schedules one
     /// follow-up load and returns only when that follow-up is done (so callers see fresh data).
     func load(_ app: AppState) async {
+        restore(app)
         if let running = current {
             reloadAfter = true
             await running.value
@@ -50,18 +55,40 @@ final class OverviewModel: ObservableObject {
         current = nil
     }
 
+    /// Once, before the first request: the saved reply for this server and login, if it decodes.
+    /// Read marks, answered prompts and pendingRead wait for a real reply.
+    private func restore(_ app: AppState) {
+        guard !restored else { return }
+        restored = true
+        guard overview == nil, let api = app.api else { return }
+        let key = ResponseCache.key(server: api.base.absoluteString, token: api.token)
+        guard let saved = ResponseCache.load("overview", key: key) else { return }
+        guard let cached = ResponseCache.decode(Overview.self, saved.data) else {
+            ResponseCache.remove("overview", key: key)
+            return
+        }
+        overview = cached
+        fromCache = true
+    }
+
     /// Keeps the last data on failure; a 401 goes back to pairing through `app.report`.
     private func fetchOnce(_ app: AppState) async {
         guard let api = app.api else { return }
         let started = generation
         do {
-            let fresh = try await api.overview()
+            let data = try await api.call("GET", "api/overview")
+            let fresh = try JSONDecoder().decode(Overview.self, from: data)
             if renaming > 0 { return }   // the rename fetches once its PATCH has answered
             guard started == generation else {
                 reloadAfter = true
                 return
             }
             overview = fresh
+            fromCache = false
+            // Not after a sign-out or re-pair that happened while the request was out.
+            if app.token == api.token {
+                ResponseCache.save(data, "overview", key: ResponseCache.key(server: api.base.absoluteString, token: api.token))
+            }
             errorText = nil
             syncSeen(fresh)
             answered = answered.filter { name, sentAt in

@@ -210,7 +210,8 @@ struct QuotaTile: View {
         Button(action: onTap) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
-                    Text(accounts.isEmpty ? "Hạn mức" : "Hạn mức · \(current + 1)/\(accounts.count)")
+                    Text(home.cacheLabel ?? (accounts.isEmpty ? "Hạn mức" : "Hạn mức · \(current + 1)/\(accounts.count)"))
+                        .lineLimit(1)
                     Spacer()
                     Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold)).foregroundColor(.l3)
                 }
@@ -220,6 +221,9 @@ struct QuotaTile: View {
                 ZStack {
                     page.id(current).transition(transition)
                 }
+                // The saved copy from the last launch: dimmed until the live reply lands.
+                .opacity(home.fromCache ? 0.45 : 1)
+                .animation(.easeOut(duration: 0.25), value: home.fromCache)
                 .frame(maxWidth: .infinity)
                 .frame(height: 62)
                 .clipped()
@@ -311,7 +315,8 @@ struct QuotaTile: View {
             detail = w.label + " " + HomeLogic.headline(w, showUsed: showUsed).lowercased() + ", "
                 + HomeLogic.resetText(w, now: now, exact: false).lowercased()
         }
-        return "Hạn mức tài khoản \(current + 1) trên \(accounts.count): \(a.email), \(a.plan ?? "")\(a.org.map { " " + $0 } ?? ""), \(detail). Chạm để xem chi tiết."
+        return (home.cacheLabel.map { ($0.hasPrefix("Cũ") ? "" : "Số liệu cũ, ") + $0 + ". " } ?? "")
+            + "Hạn mức tài khoản \(current + 1) trên \(accounts.count): \(a.email), \(a.plan ?? "")\(a.org.map { " " + $0 } ?? ""), \(detail). Chạm để xem chi tiết."
     }
 }
 
@@ -505,7 +510,7 @@ struct QuotaDetailView: View {
         }
         .scrollIndicators(.hidden)
         .background(Color.black)
-        .refreshable { await home.load(app) }
+        .refreshable { await home.refresh(app) }
         .overlay(alignment: .top) { StatusBarCover() }
         .overlay(alignment: .top) { ToastView(text: $toast) }
         .toolbar(.hidden, for: .navigationBar)
@@ -587,8 +592,13 @@ struct QuotaDetailView: View {
             }
         } else {
             summaryLine.padding(.bottom, 6)
-            SpendDonut(accounts: accounts, totals: home.home?.totals, tip: $tip)
-            ForEach(harnesses, id: \.self) { h in group(h) }
+            // The saved copy from the last launch: dimmed until the live reply lands.
+            Group {
+                SpendDonut(accounts: accounts, totals: home.home?.totals, tip: $tip)
+                ForEach(harnesses, id: \.self) { h in group(h) }
+            }
+            .opacity(home.fromCache ? 0.45 : 1)
+            .animation(.easeOut(duration: 0.25), value: home.fromCache)
             Text(footer)
                 .scaledFont(12).foregroundColor(.paneMuted)
                 .frame(maxWidth: .infinity)
@@ -624,8 +634,14 @@ struct QuotaDetailView: View {
                     .foregroundColor(pace.level == .normal ? .primary : pace.level.color)
                 + Text(" (\(lo.label))")
         }
-        if home.failed || accounts.contains(where: \.stale) {
+        let saved = home.cacheLabel
+        // A failed saved copy already reads "Cũ · <time>": no second "⚠ Cũ".
+        if (home.failed && saved == nil) || (!home.failed && accounts.contains(where: \.stale)) {
             line = line + Text(" · ") + Text("⚠ Cũ").foregroundColor(.paneWarn)
+        }
+        if let saved = saved {
+            line = line + Text(" · ") + Text((home.failed ? "⚠ " : "") + saved)
+                .foregroundColor(home.failed ? .paneWarn : .paneMuted)
         }
         return line.scaledFont(14)
     }

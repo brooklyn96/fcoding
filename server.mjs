@@ -61,6 +61,42 @@ class HttpErr extends Error {
   constructor(status, code, extra = {}) { super(code); this.status = status; this.code = code; Object.assign(this, extra); }
 }
 
+// ---------- project order + display names (GET / PUT /api/prefs, CONTRACT A13) ----------
+const ALIAS_MAX = 30;
+const ALIAS_RE = /^[\p{L}\p{M}\p{N} ._-]+$/u;
+const PREFS_BAD = 'Dữ liệu sắp xếp không đúng dạng.';
+// The body of a PUT or the stored file -> {order, aliases}: only known project names, unique order, NFC trimmed aliases; an alias equal to its
+// own project name is dropped. Strict (PUT): a wrong shape or a refused alias throws HttpErr(400, <Vietnamese sentence>); the app mirrors these
+// rules. Lenient (GET of the stored file): the same checks drop only the entry that no longer fits (the first alias in project order wins), keep the rest.
+function normalizePrefs(v, names, lenient = false) {
+  const bad = (msg) => { if (!lenient) throw new HttpErr(400, msg); };
+  const root = v && typeof v === 'object' ? v : {};
+  const orderIn = Array.isArray(root.order) ? root.order : [];
+  const aliasesIn = root.aliases && typeof root.aliases === 'object' && !Array.isArray(root.aliases) ? root.aliases : {};
+  if (orderIn !== root.order || aliasesIn !== root.aliases) bad(PREFS_BAD);
+  const order = [];
+  for (const n of orderIn) {
+    if (typeof n !== 'string') { bad(PREFS_BAD); continue; }
+    if (names.includes(n) && !order.includes(n)) order.push(n);
+  }
+  const aliases = {}; const used = new Map(); // lower-cased alias -> project
+  for (const name of names) {
+    const raw = Object.hasOwn(aliasesIn, name) ? aliasesIn[name] : undefined; // own keys only: a project called "constructor" has no alias
+    if (raw === undefined || raw === null) continue;
+    if (typeof raw !== 'string') { bad(PREFS_BAD); continue; }
+    const a = raw.normalize('NFC').trim();
+    if (!a || a === name) continue;
+    if ([...a].length > ALIAS_MAX) { bad(`Tên “${[...a].slice(0, ALIAS_MAX).join('')}…” dài quá ${ALIAS_MAX} ký tự.`); continue; }
+    if (!ALIAS_RE.test(a)) { bad(`Tên “${a}” chỉ được có chữ, số, dấu cách và - _ .`); continue; }
+    const key = a.toLowerCase();
+    const other = names.find((n) => n !== name && n.toLowerCase() === key);
+    if (other) { bad(`Tên “${a}” trùng tên dự án ${other}.`); continue; }
+    if (used.has(key)) { bad(`Tên “${a}” đã dùng cho ${used.get(key)}.`); continue; }
+    used.set(key, name); aliases[name] = a;
+  }
+  return { order, aliases };
+}
+
 // ---------- add a project (POST /api/projects, CONTRACT A11) ----------
 const CTRL_RE = /[\x00-\x1f\x7f]/;
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -357,8 +393,10 @@ export function pairPage(appLink) {
 
 // ---------- home screen v2 (CONTRACT.md A8): quota, spend, box timer, projects, updates, Codex reset ----------
 const QUOTA_TTL = 60e3, LISTING_TTL = 300e3, SPEND_TTL = 300e3, PROJECTS_TTL = 120e3, GATE_CONFIG_TTL = 600e3, RUN_WINDOW = 100; // RUN_WINDOW: Actions runs read per project (deploy line and PR checks)
-const LIST_AFTER_RESET_MS = 10e3, STALE_QUOTA_TTL = 15e3; // omp's own listing timeout is 10 s
 const HOME_WAIT_MS = 8000; // a part with no value yet is waited for this long at most, then it is empty and fills in the background
+const FRESH_MIN_MS = 10e3, HOME_FRESH_WAIT_MS = 25e3; // GET /api/home?fresh=1: a part older than 10 s is read again and waited for, 25 s at most
+const WARM_TICK_MS = 5e3; // from boot every home part is checked this often and refreshed once it is past its own TTL (never more than one refresh at a time)
+const OVERVIEW_PAR = 3, OVERVIEW_KEEP = 4; // GET /api/overview: its git and tmux reads run at most this many at a time, each inside one of the MAX_READS slots; it leaves OVERVIEW_KEEP slots free (two screen reads)
 const QUOTA_STALE_MS = 10 * 60e3; // a report omp fetched longer ago than this is stale
 const DEFAULT_TZ = 'Asia/Ho_Chi_Minh';
 export const BOX = { maxRunMinutes: 480, idlePauseMinutes: 30, cooldownMinutes: 10 };
@@ -900,6 +938,14 @@ export function memo(ttl, fn, now, retry = ttl, ttlOf = () => undefined) {
     return p;
   };
   const old = (e) => { if (value === undefined) throw e; return { value, fresh: false, at }; };
+  const settle = async (wait) => { // join the one refresh (start it when none runs) and wait for it at most `wait` ms
+    const p = refresh();
+    let timer;
+    try {
+      const r = await (Number.isFinite(wait) ? Promise.race([p, new Promise((_, rej) => { timer = setTimeout(rej, wait, new Error('timeout')); })]) : p);
+      return r.kept ? { value: r.v, fresh: true, at: r.started } : { value: r.v, fresh: false, at: -Infinity }; // dropped: of no age
+    } catch (e) { return old(e); } finally { clearTimeout(timer); }
+  };
   return {
     async get(wait = Infinity) {
       const t = now();
@@ -907,12 +953,16 @@ export function memo(ttl, fn, now, retry = ttl, ttlOf = () => undefined) {
       const backoff = t - failedAt < retry;
       if (value !== undefined && !cleared) { if (!backoff) refresh(); return { value, fresh: ok && !backoff, at }; }
       if (backoff) return old(new Error('failed recently'));
-      const p = refresh();
-      let timer;
-      try {
-        const r = await (Number.isFinite(wait) ? Promise.race([p, new Promise((_, rej) => { timer = setTimeout(rej, wait, new Error('timeout')); })]) : p);
-        return r.kept ? { value: r.v, fresh: true, at: r.started } : { value: r.v, fresh: false, at: -Infinity }; // dropped: of no age
-      } catch (e) { return old(e); } finally { clearTimeout(timer); }
+      return settle(wait);
+    },
+    // fresh(wait, minAge): like get, but a value older than minAge ms is refreshed now and waited for (at most `wait` ms) instead of served
+    // stale; a refresh that fails or runs past `wait` gives the old value with fresh: false. A value younger than minAge is not redone,
+    // nor is a refresh that failed less than minAge ago: a burst of calls does not hammer the source.
+    async fresh(wait, minAge) {
+      const t = now();
+      if (value !== undefined && ok && t - at < minAge) return { value, fresh: true, at };
+      if (!ok && t - failedAt < minAge) return old(new Error('failed recently'));
+      return settle(wait);
     },
     clear() { at = -Infinity; failedAt = -Infinity; cleared = true; gen++; pending = null; },
     settled: () => Promise.resolve(pending).catch(() => {}), // the refresh running now, if any, has ended
@@ -1256,7 +1306,7 @@ export function createApp(opts = {}) {
     return { text, rows, cols, cursor: { x, y }, hash };
   }
 
-  // --- GET /api/overview: ONE read job holding one read slot; its tmux/git calls run one after another ---
+  // --- GET /api/overview: ONE read job; its tmux/git calls run up to OVERVIEW_PAR at a time, each child inside a read slot the job holds ---
   const gitCache = new Map(); // dir -> {at, value} once done, {pending} while one overview runs git for it
   const gateStop = (e) => e instanceof HttpErr && (e.status === 401 || e.status === 499);
   async function gitRound(dir, ctx) {
@@ -1296,19 +1346,36 @@ export function createApp(opts = {}) {
   async function overview(ctx) {
     if (reads >= MAX_READS) throw new HttpErr(503, 'busy'); // reads never queue
     if (!valid(ctx)) throw gateErr(ctx);
+    // the job holds its own read slot all along. fn over items, results in item order, min(OVERVIEW_PAR, items) at a time: for the length of
+    // one phase it takes the extra slots that are free, never the last OVERVIEW_KEEP (two screen reads), and gives them back at the end of
+    // the phase (listSessions runs on the own slot alone). Every child runs inside a slot, so MAX_READS still bounds the children in all,
+    // and a busy server runs the job one child at a time as before. After an error no new item starts, the running ones end, then it is thrown.
     reads++; ctx.held = true;
+    const each = async (items, fn) => {
+      const out = new Array(items.length), want = Math.min(OVERVIEW_PAR, items.length);
+      let got = 0, next = 0, err;
+      while (1 + got < want && reads < MAX_READS - OVERVIEW_KEEP) { reads++; got++; }
+      try {
+        await Promise.all(Array.from({ length: Math.min(1 + got, items.length) }, async () => {
+          while (!err && next < items.length) {
+            const i = next++;
+            try { out[i] = await fn(items[i]); } catch (e) { err ??= { e }; }
+          }
+        }));
+      } finally { reads -= got; }
+      if (err) throw err.e;
+      return out;
+    };
     try {
-      const projects = [];
-      for (const name of cfg.projectNames) projects.push({ name, ...(await gitInfo(cfg.projects[name], ctx)) });
-      const sessions = [];
-      for (const x of await listSessions(ctx)) {
+      const projects = await each(cfg.projectNames, async (name) => ({ name, ...(await gitInfo(cfg.projects[name], ctx)) }));
+      const sessions = await each(await listSessions(ctx), async (x) => {
         let state = null, preview = null, menu = null; // nulls when this item fails
         try {
           const text = await run(ctx, ['capture-pane', '-p', '-J', '-t', pane(x.name)]); // the visible pane, no escapes
           ({ state, preview, menu } = summarize(text, x.activity, now()));
         } catch (e) { if (gateStop(e)) throw e; }
-        sessions.push({ ...x, state, preview, menu });
-      }
+        return { ...x, state, preview, menu };
+      });
       return { now: Math.floor(now() / 1000), projects, sessions };
     } finally { reads--; ctx.held = false; }
   }
@@ -1504,36 +1571,27 @@ export function createApp(opts = {}) {
   }
 
   // --- GET /api/home (A8): each part cached on its own; a failing part is empty or stale, never a 500 ---
-  const listAfterReset = opts.listAfterResetMs ?? LIST_AFTER_RESET_MS;
+  const freshMin = opts.freshMinMs ?? FRESH_MIN_MS, freshWait = opts.homeFreshWaitMs ?? HOME_FRESH_WAIT_MS; // tests only: shorter bounds
   const homeWait = opts.homeWaitMs ?? HOME_WAIT_MS, resetReplyMs = opts.resetReplyMs ?? RESET_REPLY_MS, resetTimeout = opts.resetTimeoutMs ?? RESET_TIMEOUT;
-  // `omp usage reset --json` (credential ids, reset counts) on its own longer TTL; the last good listing is kept on a failure
-  // A quota built with no listing at all (slow or failed first listing: `~` ids, no reset target) is kept STALE_QUOTA_TTL only,
-  // and the listing that then succeeds drops it, so the next GET is built from that listing at once.
-  let quotaBare = false;
-  const listing = memo(LISTING_TTL, async () => {
-    const v = JSON.parse(await execTool(ompSpec, ['usage', 'reset', '--json'], 30e3));
-    if (quotaBare) { quotaBare = false; quota.clear(); }
-    return v;
-  }, now, QUOTA_TTL);
-  // After a reset the reset counts must come from a listing fetched after it: a kept listing whose refresh started at or after
-  // lastResetAt. While the stored listing is older than the last reset, a quota refresh waits up to LIST_AFTER_RESET_MS (omp's own
-  // listing timeout) for one, not homeWait / 2. Without one (slow, failed, or a refresh dropped by a later reset) the accounts are
-  // stored with stale: true and the quota value only for STALE_QUOTA_TTL, so the next request reads both again. A stored listing
-  // started at or after lastResetAt stays trusted even when a later listing refresh fails (as when no reset ever happened).
-  let lastResetAt = -Infinity;
+  // Two parts, each its own memo: the quota (`omp usage --json`, 60 s) and the reset listing (`omp usage reset --json`: credential ids, reset
+  // counts and targets, 5 min, the last good listing is kept on a failure). The accounts of a reply are built from both when the reply is made
+  // (accountsOf), so a slow or failing listing never holds back or ages the usage numbers, and a listing that lands shows at the next reply.
+  const listing = memo(LISTING_TTL, async () => JSON.parse(await execTool(ompSpec, ['usage', 'reset', '--json'], 30e3)), now, QUOTA_TTL);
   const quota = memo(QUOTA_TTL, async () => {
-    const resetAt = lastResetAt;
-    const needNew = listing.at() < resetAt;
-    quotaBare = false; // this refresh replaces the stored value; it sets the flag again if its own listing wait fails
-    const [u, r] = await Promise.allSettled([execTool(ompSpec, ['usage', '--json'], 30e3), listing.get(needNew ? listAfterReset : homeWait / 2)
-      .catch((e) => { quotaBare = true; throw e; })]); // set now: a listing landing before usage --json ends must drop this quota
-    if (u.status === 'rejected') throw u.reason;
-    const q = parseQuota(JSON.parse(u.value), r.status === 'fulfilled' ? r.value.value : null, now());
-    // by the listing's age only: a later listing failure is the same with or without a past reset
-    if (resetAt > -Infinity && !(r.status === 'fulfilled' && r.value.at >= resetAt)) { for (const a of q.accounts) a.stale = true; q.ttl = STALE_QUOTA_TTL; }
-    if (r.status === 'fulfilled') quotaBare = false; else q.ttl = STALE_QUOTA_TTL;
-    return q;
-  }, now, QUOTA_TTL, (q) => q.ttl);
+    const usage = JSON.parse(await execTool(ompSpec, ['usage', '--json'], 30e3));
+    return { usage, at: now() }; // the raw report and when it was read (its accounts are stale by that clock)
+  }, now, QUOTA_TTL);
+  // After a reset the reset counts must come from a listing fetched after it: a kept listing whose refresh started at or after lastResetAt.
+  // While the stored listing is older (slow, failed, or a refresh dropped by a later reset) the accounts are marked stale: true. A stored
+  // listing started at or after lastResetAt stays trusted even when a later listing refresh fails (as when no reset ever happened).
+  // No listing at all (slow or failed first listing): `~` ids and no reset target.
+  let lastResetAt = -Infinity;
+  // qv, lv: the answers of quota.get / listing.get (lv null: no listing yet) -> {accounts, byAccountId}
+  function accountsOf(qv, lv) {
+    const { accounts, byAccountId } = parseQuota(qv.value.usage, lv?.value ?? null, qv.value.at);
+    const afterReset = lastResetAt > -Infinity && !(lv && lv.at >= lastResetAt);
+    return { accounts: accounts.map((a) => ({ ...a, stale: a.stale || afterReset || !qv.fresh })), byAccountId };
+  }
   const scan = spendScanner(spendRoots, now);
   const spend = memo(SPEND_TTL, scan, now);
   // Generic deploy gate (decision-r4 §4.4). A gate project = its repo is in gate-repos.json (a JSON array of "owner/repo", added the first
@@ -1624,22 +1682,38 @@ export function createApp(opts = {}) {
   tickBox();
   const boxTimer = setInterval(tickBox, BOX_TICK_MS);
   boxTimer.unref();
+  // from boot every part is kept warm: one check per tick, and get(0) starts a refresh only for a part past its own TTL (and not in its
+  // retry wait), through the memo, so a part is never refreshed twice at once; /api/home then answers from memory
+  const warmTick = opts.warmTickMs ?? WARM_TICK_MS;
+  let warmTimer = null;
+  const warmUp = () => {
+    for (const m of [quota, listing, spend, projects, ...(instaboxKey ? [staging] : [])]) m.get(0).catch(() => {});
+  };
+  function startWarm() {
+    if (warmTimer || !(warmTick > 0)) return;
+    warmUp();
+    warmTimer = setInterval(warmUp, warmTick);
+    warmTimer.unref();
+  }
   function boxInfo() {
     tick();
     const at = boxResume + BOX.maxRunMinutes * 60e3;
     return { state: 'running', sleepsAt: at > now() ? iso(at) : null, ...BOX, source: 'estimate' };
   }
-  async function homeView() {
+  // fresh (?fresh=1): each part older than freshMin is read again now and waited for, freshWait at most; else as the cache holds it
+  async function homeView(fresh = false) {
     // each part answers at once from its cache, or within homeWait the first time; a part not ready is empty and fills later
     // right after a project was added or removed the cached list is not waited for (wait 0: the reply is at once, the refresh runs on)
     const projWait = projectsDirty ? 0 : homeWait; projectsDirty = false;
-    const [q, s, p, b, g] = await Promise.allSettled([quota.get(homeWait), spend.get(homeWait), projects.get(projWait),
-      instaboxKey ? staging.get(homeWait) : Promise.reject(new Error('no instabox key')), ompGuard.get(homeWait)]);
+    const part = (m, wait) => (fresh ? m.fresh(freshWait, freshMin) : m.get(wait));
+    // the listing is waited for half as long as the quota when it has no value yet (a slow first listing: `~` ids, filled in at a later reply)
+    const [q, l, s, p, b, g] = await Promise.allSettled([part(quota, homeWait), part(listing, homeWait / 2), part(spend, homeWait), part(projects, projWait),
+      instaboxKey ? part(staging, homeWait) : Promise.reject(new Error('no instabox key')), part(ompGuard, homeWait)]);
     const boxes = b.status === 'fulfilled' ? b.value.value : null; // no key, or instabox failed with nothing cached: every staging is null
     const t = now();
     const qv = q.status === 'fulfilled' ? q.value : null;
-    const accounts = qv ? qv.value.accounts.map((a) => ({ ...a, stale: a.stale || !qv.fresh })) : [];
-    const view = s.status === 'fulfilled' ? spendView(s.value.value, accounts, qv?.value.byAccountId ?? new Map(), t, cfg.timeZone) : null;
+    const { accounts, byAccountId } = qv ? accountsOf(qv, l.status === 'fulfilled' ? l.value : null) : { accounts: [], byAccountId: new Map() };
+    const view = s.status === 'fulfilled' ? spendView(s.value.value, accounts, byAccountId, t, cfg.timeZone) : null;
     let updates = {};
     try { updates = parseUpdates(fs.readFileSync(updatesFile, 'utf8')); } catch {}
     let gits = new Map(); // read once per home reply; the projects part is cached, this is not
@@ -1669,7 +1743,10 @@ export function createApp(opts = {}) {
     if (busy) return busy.requestId === requestId ? busy.promise : Promise.reject(new HttpErr(409, 'in_progress'));
     const job = (async () => { // the lock is taken before the first await
       let acct;
-      try { acct = (await quota.get(homeWait)).value.accounts.find((a) => a.id === accountId); } catch { throw new HttpErr(503, 'unavailable'); }
+      try {
+        const [qv, lv] = await Promise.all([quota.get(homeWait), listing.get(homeWait / 2).catch(() => null)]);
+        acct = accountsOf(qv, lv).accounts.find((a) => a.id === accountId);
+      } catch { throw new HttpErr(503, 'unavailable'); }
       if (!acct) throw new HttpErr(404, 'unknown_account'); // not 'not_found', which an older server gives for the unknown route
       if (acct.harness !== 'codex') throw new HttpErr(400, 'not_allowed');
       if (!acct.resets.target) throw new HttpErr(409, 'no_target');
@@ -2083,7 +2160,7 @@ export function createApp(opts = {}) {
       return json(res, 200, { code: p.code, expiresAt: new Date(p.expiresAt).toISOString(), ...pairLinks() });
     }
     if (pathname === '/api/overview') { want('GET'); return json(res, 200, await overview(ctx)); }
-    if (pathname === '/api/home') { want('GET'); return json(res, 200, await homeView()); }
+    if (pathname === '/api/home') { want('GET'); return json(res, 200, await homeView(url.searchParams.get('fresh') === '1')); }
     if (pathname === '/api/projects') {
       want('POST');
       const { repo, name } = parseAddRequest(parseJson(req, body));
@@ -2121,6 +2198,18 @@ export function createApp(opts = {}) {
     if (pathname === '/api/meta') {
       want('GET');
       return json(res, 200, { projects: cfg.projectNames, harnesses: Object.keys(HARNESSES), keys: KEYS });
+    }
+    if (pathname === '/api/prefs') { // CONTRACT A13: <configDir>/prefs.json, written whole and atomically; the code below is synchronous, so two PUTs never interleave and the last wins
+      const file = path.join(configDir, 'prefs.json');
+      if (method === 'GET') {
+        let prefs = { order: [], aliases: {} };
+        try { prefs = normalizePrefs(JSON.parse(fs.readFileSync(file, 'utf8')), cfg.projectNames, true); } catch {} // no file or not JSON: empty; an entry the project list outgrew is dropped alone
+        return json(res, 200, prefs);
+      }
+      want('PUT');
+      const prefs = normalizePrefs(parseJson(req, body), cfg.projectNames);
+      try { writeFile(file, JSON.stringify(prefs)); } catch (e) { if (!e.committed) throw new HttpErr(500, 'storage'); } // renamed, only the directory fsync failed: saved
+      return json(res, 200, prefs);
     }
     if (pathname === '/api/sessions') {
       if (method === 'GET') return json(res, 200, { sessions: await listSessions(ctx) });
@@ -2283,11 +2372,14 @@ export function createApp(opts = {}) {
   const listen = async (port = Number(process.env.PC_PORT) || cfg.port || 7681, host = '0.0.0.0') => {
     await listenAdmin();
     try {
-      return await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, host, () => resolve(server.address().port)); });
+      const bound = await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, host, () => resolve(server.address().port)); });
+      startWarm();
+      return bound;
     } catch (e) { adminServer.close(); throw e; }
   };
   const close = () => {
     clearInterval(boxTimer);
+    clearInterval(warmTimer); warmTimer = null;
     for (const abort of [...addStops]) abort();
     return Promise.all([
       new Promise((resolve) => { server.close(() => resolve()); server.closeAllConnections(); }),

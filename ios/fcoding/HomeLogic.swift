@@ -427,6 +427,25 @@ private extension KeyedDecodingContainer {
     func date(_ key: Key) -> Date? { value(key).flatMap(HomeLogic.parseDate) }
 }
 
+/// GET / PUT /api/prefs: the user's project order and display names, kept on the server so the
+/// laptop's `fcode` reads the same ones. Keys are the real project names.
+struct ProjectPrefs: Codable, Equatable {
+    var order: [String] = []
+    var aliases: [String: String] = [:]
+
+    init(order: [String] = [], aliases: [String: String] = [:]) {
+        self.order = order
+        self.aliases = aliases
+    }
+
+    private enum K: String, CodingKey { case order, aliases }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        order = c.value(.order) ?? []
+        aliases = c.value(.aliases) ?? [:]
+    }
+}
+
 // MARK: - Pure rules (Pane spec, mockup home.html)
 
 enum HomeLogic {
@@ -1170,6 +1189,63 @@ enum HomeLogic {
         return s
     }
 
+    // MARK: - Project order and display names (GET / PUT /api/prefs, keyed by the real name)
+
+    static let aliasMax = 30
+
+    /// The server's projects in the user's order: the names of `order` that still exist, then
+    /// the others (new ones) in server order. Duplicates are dropped.
+    static func orderedProjects(_ names: [String], order: [String]) -> [String] {
+        let present = Set(names)
+        var seen = Set<String>()
+        let mine = order.filter { present.contains($0) && seen.insert($0).inserted }
+        return mine + names.filter { seen.insert($0).inserted }
+    }
+
+    /// A typed alias: trimmed, at most `aliasMax` characters.
+    static func cleanAlias(_ s: String) -> String {
+        String(s.trimmingCharacters(in: .whitespacesAndNewlines).prefix(aliasMax))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// What the app shows for a project: its alias, or the real name when there is none.
+    static func displayName(_ name: String, aliases: [String: String]) -> String {
+        let a = cleanAlias(aliases[name] ?? "")
+        return a.isEmpty ? name : a
+    }
+
+    /// `aliases` with `name` set to `alias`; an empty alias or the real name itself removes it.
+    static func settingAlias(_ aliases: [String: String], _ name: String, _ alias: String) -> [String: String] {
+        var out = aliases
+        let a = cleanAlias(alias)
+        out[name] = a.isEmpty || a == name ? nil : a
+        return out
+    }
+
+    /// The server's alias rules, checked before the PUT (the server checks again and has the
+    /// last word): letters (Vietnamese too), digits, space, "-", "_", "." only, at most 30
+    /// unicode scalars after NFC (the server's `[...a].length`, so "1️⃣" counts 3);
+    /// unique and never another project's real name, both ignoring case. nil = fine.
+    static func aliasProblem(_ aliases: [String: String], projects: [String]) -> String? {
+        var used: [String: String] = [:]
+        for name in projects {
+            let a = cleanAlias(aliases[name] ?? "")
+            guard !a.isEmpty, a != name else { continue }
+            let raw = (aliases[name] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if raw.precomposedStringWithCanonicalMapping.unicodeScalars.count > aliasMax { return "Tên “\(a)…” dài quá \(aliasMax) ký tự." }
+            if a.range(of: "^[\\p{L}\\p{M}\\p{N} ._-]+$", options: .regularExpression) == nil {
+                return "Tên “\(a)” chỉ được có chữ, số, dấu cách và - _ ."
+            }
+            let key = a.lowercased()
+            if let other = projects.first(where: { $0 != name && $0.lowercased() == key }) {
+                return "Tên “\(a)” trùng tên dự án \(other)."
+            }
+            if let other = used[key] { return "Tên “\(a)” đã dùng cho \(other)." }
+            used[key] = name
+        }
+        return nil
+    }
+
     // MARK: - Self-test
 
     /// Fixed cases; one line per failure (empty = all pass). Run by the CI self-test step.
@@ -1779,6 +1855,53 @@ enum HomeLogic {
            "Máy chủ chưa hỗ trợ thêm dự án, cập nhật máy chủ trước.")
         eq("post other", addReduce(posting, .postFailed(status: 503, code: "", text: "Box đang bận, thử lại sau.")).message,
            "Box đang bận, thử lại sau.")
+
+        // Project order and display names
+        let server = ["api", "web", "vps-scraper", "internal-scraper"]
+        eq("order none", orderedProjects(server, order: []), server)
+        eq("order mine first", orderedProjects(server, order: ["vps-scraper", "api"]),
+           ["vps-scraper", "api", "web", "internal-scraper"])
+        eq("order removed skipped", orderedProjects(server, order: ["gone", "web", "api", "vps-scraper", "internal-scraper"]),
+           ["web", "api", "vps-scraper", "internal-scraper"])
+        eq("order new at end", orderedProjects(server + ["new"], order: server.reversed()),
+           ["internal-scraper", "vps-scraper", "web", "api", "new"])
+        eq("order dup", orderedProjects(["a", "b", "a"], order: ["b", "b"]), ["b", "a"])
+        eq("order no projects", orderedProjects([], order: ["a"]), [])
+        eq("alias trim", cleanAlias("  monitor \n"), "monitor")
+        eq("alias max", cleanAlias(String(repeating: "x", count: 35)), String(repeating: "x", count: 30))
+        eq("alias cut then trim", cleanAlias(String(repeating: "y", count: 29) + "  z"), String(repeating: "y", count: 29))
+        eq("alias vi", cleanAlias("Cơ sở dữ liệu"), "Cơ sở dữ liệu")
+        let names = ["vps-scraper": "monitor", "web": "   "]
+        eq("display alias", displayName("vps-scraper", aliases: names), "monitor")
+        eq("display blank alias", displayName("web", aliases: names), "web")
+        eq("display none", displayName("api", aliases: names), "api")
+        eq("set alias", settingAlias([:], "internal-scraper", " database ")["internal-scraper"], "database")
+        eq("set empty removes", settingAlias(names, "vps-scraper", "  ")["vps-scraper"], nil)
+        eq("set real name removes", settingAlias(names, "vps-scraper", "vps-scraper")["vps-scraper"], nil)
+        eq("set keeps others", settingAlias(names, "api", "x")["vps-scraper"], "monitor")
+        func prefs(_ s: String) -> ProjectPrefs? { try? JSONDecoder().decode(ProjectPrefs.self, from: Data(s.utf8)) }
+        eq("prefs full", prefs("{\"order\":[\"b\",\"a\"],\"aliases\":{\"a\":\"Á\"}}"),
+           ProjectPrefs(order: ["b", "a"], aliases: ["a": "Á"]))
+        eq("prefs empty object", prefs("{}"), ProjectPrefs())
+        eq("prefs bad fields", prefs("{\"order\":7,\"aliases\":null}"), ProjectPrefs())
+        let pre = ProjectPrefs(order: ["web"], aliases: ["vps-scraper": "monitor"])
+        eq("prefs round trip", (try? JSONEncoder().encode(pre)).flatMap { prefs(String(decoding: $0, as: UTF8.self)) }, pre)
+        eq("rule ok", aliasProblem(["vps-scraper": "Monitor", "internal-scraper": "Cơ sở dữ liệu", "api": "a_b-c.d 2"],
+                                   projects: server), nil)
+        eq("rule own name ok", aliasProblem(["web": "web"], projects: server), nil)
+        eq("rule own name case ok", aliasProblem(["web": "Web"], projects: server), nil)
+        eq("rule blank ok", aliasProblem(["web": "  "], projects: server), nil)
+        eq("rule chars", aliasProblem(["web": "a/b"], projects: server), "Tên “a/b” chỉ được có chữ, số, dấu cách và - _ .")
+        eq("rule emoji", aliasProblem(["web": "web 🚀"], projects: server) != nil, true)
+        eq("rule long", aliasProblem(["web": String(repeating: "x", count: 31)], projects: server) != nil, true)
+        eq("rule 30 ok", aliasProblem(["web": String(repeating: "x", count: 30)], projects: server), nil)
+        // "1️⃣" = U+0031 U+FE0F U+20E3: one Character, three scalars; the server counts 33 here.
+        eq("rule keycap long", aliasProblem(["web": String(repeating: "1\u{FE0F}\u{20E3}", count: 11)], projects: server)?.hasSuffix("dài quá 30 ký tự.") == true, true)
+        eq("rule keycap 30 ok", aliasProblem(["web": String(repeating: "1\u{FE0F}\u{20E3}", count: 10)], projects: server), nil)
+        eq("rule NFC counts precomposed", aliasProblem(["web": String(repeating: "e\u{301}", count: 30)], projects: server), nil)
+        eq("rule other real name", aliasProblem(["web": "API"], projects: server), "Tên “API” trùng tên dự án api.")
+        eq("rule unique", aliasProblem(["web": "monitor", "api": "Monitor"], projects: server) != nil, true)
+        eq("rule unknown project ignored", aliasProblem(["gone": "a/b"], projects: server), nil)
         return failures
     }
 }
