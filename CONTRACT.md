@@ -18,7 +18,7 @@ S4 CSRF: every POST requires header `X-PC: 1` and, when an Origin header is pres
 S5 Commands only through child_process.execFile('tmux', [...args]) — never a shell. Session names must match ^[a-z0-9][a-z0-9-]{0,31}$. Key names only from the KEYS whitelist below. Projects and harnesses only from config / HARNESSES.
 S6 Body size limit 64 KB; text field max 32 KB; JSON only.
 S7 Security headers on every response: Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'", X-Content-Type-Options nosniff, Referrer-Policy no-referrer, Cache-Control no-store on /api/*.
-S8 Never log passwords, cookies or sent text; log only method, path, status, ms.
+S8 Never log passwords, cookies or sent text; log only method, path, status, ms, and numbers: `at=HH:MM:SS.mmm sock=<id>#<n> conn=<ms>ms lag=<ms>ms` (lag = arrival minus the app's `X-PC-Sent` epoch-ms header, only when it is a plain integer within a day; header text is never logged), plus `event loop blocked <ms>ms until=HH:MM:SS.mmm` when the loop stalls over 200 ms.
 
 HARNESSES (command run inside the tmux session, cwd = project dir): omp -> `omp`, claude -> `claude`, codex -> `codex`, shell -> `bash -l`. tmux sessions get env LANG=C.UTF-8 LC_ALL=C.UTF-8.
 KEYS whitelist (tmux send-keys names): Enter, Escape, Tab, BTab, Up, Down, Left, Right, PageUp, PageDown, Home, End, BSpace, C-c, C-d, C-l, C-o, C-r, C-u, C-z, M-a, y, n, Space. (M-a = Alt+A opens the omp agent hub; C-o expands tool output (e.g. in an agent opened from the hub).)

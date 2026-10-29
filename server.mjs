@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { performance } from 'node:perf_hooks';
 
 export const HARNESSES = { omp: 'omp', claude: 'claude', codex: 'codex', shell: 'bash -l' };
 export const KEYS = ['Enter', 'Escape', 'Tab', 'BTab', 'Up', 'Down', 'Left', 'Right', 'PageUp', 'PageDown',
@@ -2344,7 +2345,12 @@ export function createApp(opts = {}) {
     let target = '(bad-target)';
     try {
       for (const [k, v] of Object.entries(SEC_HEADERS)) res.setHeader(k, v);
-      res.on('finish', () => log(`${req.method} ${target} ${res.statusCode} ${Date.now() - t0}ms`));
+      // numbers only: at = arrival (UTC), sock = connection id # request number on it (#1 = new socket), conn = socket age at arrival, lag = arrival
+      // minus the phone's X-PC-Sent (only a plain integer within a day is believed; the header text is never logged).
+      const c = conns.get(req.socket) || { id: 0, at: t0, n: 0 };
+      const sent = /^\d{10,16}$/.test(req.headers['x-pc-sent'] || '') ? t0 - Number(req.headers['x-pc-sent']) : NaN;
+      const tail = ` at=${new Date(t0).toISOString().slice(11, 23)} sock=${c.id}#${++c.n} conn=${t0 - c.at}ms${Math.abs(sent) < 86400000 ? ` lag=${sent}ms` : ''}`;
+      res.on('finish', () => log(`${req.method} ${target} ${res.statusCode} ${Date.now() - t0}ms${tail}`));
       let url;
       try { url = new URL(req.url, 'http://x'); } catch { throw new HttpErr(400, 'invalid'); }
       target = url.pathname;
@@ -2362,6 +2368,15 @@ export function createApp(opts = {}) {
       } catch {}
     }
   });
+  const conns = new WeakMap(); let connSeq = 0;
+  server.on('connection', (sock) => conns.set(sock, { id: ++connSeq, at: Date.now(), n: 0 }));
+  // permanent: a blocked event loop shows up in the journal (a request line only counts from the moment the handler runs).
+  let stallAt = performance.now();
+  const stallTimer = setInterval(() => {
+    const now = performance.now(); const drift = now - stallAt - 250; stallAt = now;
+    if (drift > 200) log(`event loop blocked ${Math.round(drift)}ms until=${new Date().toISOString().slice(11, 23)}`);
+  }, 250);
+  stallTimer.unref();
   server.on('clientError', (err, socket) => {
     log('clientError');
     if (socket.writable && !socket.destroyed) socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
@@ -2379,6 +2394,7 @@ export function createApp(opts = {}) {
   };
   const close = () => {
     clearInterval(boxTimer);
+    clearInterval(stallTimer);
     clearInterval(warmTimer); warmTimer = null;
     for (const abort of [...addStops]) abort();
     return Promise.all([

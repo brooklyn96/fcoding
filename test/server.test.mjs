@@ -378,7 +378,46 @@ test('logs hold method, path, status, ms only', () => withApp(async (c) => {
   const all = c.logs.join('\n');
   for (const s of [secret, p.code, 'SENT-TEXT', 'MULTI-xyz', VN, cookie.slice(7), json.token, 'pc_sid']) assert.ok(!all.includes(s), s);
   assert.ok(c.logs.length >= 5);
-  for (const l of c.logs) assert.match(l, /^(GET|POST|DELETE) \/\S* \d{3} \d+ms$/);
+  for (const l of c.logs) assert.match(l, LOG_LINE);
+}));
+
+// a request line is numbers only; the event-loop stall line is the other line the server writes on its own
+const LOG_LINE = /^(?:(?:GET|POST|DELETE) \/\S* \d{3} \d+ms at=\d\d:\d\d:\d\d\.\d{3} sock=\d+#\d+ conn=\d+ms(?: lag=-?\d+ms)?|event loop blocked \d+ms until=\d\d:\d\d:\d\d\.\d{3})$/;
+const reqLines = (c) => c.logs.filter((l) => /^GET \/ /.test(l));
+
+test('request log: sock id and request number per connection', () => withApp(async (c) => {
+  const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  const get = () => new Promise((resolve, reject) => http.get({ host: '127.0.0.1', port: c.port, path: '/', agent }, (res) => { res.resume(); res.on('end', resolve); }).on('error', reject));
+  try { await get(); await get(); } finally { agent.destroy(); }
+  await get(); // a new socket
+  const socks = reqLines(c).map((l) => l.match(/sock=(\d+)#(\d+)/).slice(1));
+  assert.equal(socks.length, 3);
+  assert.equal(socks[0][0], socks[1][0]);
+  assert.deepEqual([socks[0][1], socks[1][1]], ['1', '2']);
+  assert.notEqual(socks[2][0], socks[0][0]);
+  assert.equal(socks[2][1], '1');
+}));
+
+test('request log: lag from X-PC-Sent, only for a plain number', () => withApp(async (c) => {
+  await c.req('GET', '/', { headers: { 'X-PC-Sent': String(Date.now() - 500) } });
+  const lag = Number(reqLines(c)[0].match(/lag=(-?\d+)ms/)[1]);
+  assert.ok(lag >= 500 && lag <= 2000, lag);
+  for (const bad of ['abc', '1e99', '', '1700000000000x', '1', String(Date.now() + 2 * 86400000), String(Date.now() - 2 * 86400000)]) {
+    c.logs.length = 0;
+    await c.req('GET', '/', { headers: { 'X-PC-Sent': bad } });
+    assert.equal(c.logs.length, 1);
+    assert.match(c.logs[0], LOG_LINE);
+    assert.ok(!c.logs[0].includes('lag='), `${bad}: ${c.logs[0]}`);
+    if (/[a-z]/.test(bad)) assert.ok(!c.logs[0].includes(bad), bad); // the numeric ones share digits with the timestamps
+  }
+}));
+
+test('a blocked event loop is logged as a stall line', () => withApp(async (c) => {
+  // 600 ms, not 400: the 250 ms timer fires at the end of the block, so its drift is block - (250 - phase), phase 0..250 ms; 400 ms could give 150
+  const end = Date.now() + 600; while (Date.now() < end);
+  assert.ok(await until(() => c.logs.some((l) => /^event loop blocked \d+ms until=/.test(l))), c.logs.join('\n'));
+  const ms = Number(c.logs.find((l) => l.startsWith('event loop blocked')).match(/blocked (\d+)ms/)[1]);
+  assert.ok(ms >= 300, ms);
 }));
 
 // every config.json that must be refused at startup and ignored at reload (A3 + round 4 item 1)

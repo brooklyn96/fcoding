@@ -173,6 +173,8 @@ struct API {
         req.setValue("1", forHTTPHeaderField: "X-PC")
         req.setValue("ios", forHTTPHeaderField: "X-PC-Client")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
+        // phone clock, ms; the server logs arrival minus this (log only)
+        req.setValue(String(Int64(Date().timeIntervalSince1970 * 1000)), forHTTPHeaderField: "X-PC-Sent")
         // Bearer only: keep the pc_sid Set-Cookie from /api/pair out of HTTPCookieStorage (on disk).
         req.httpShouldHandleCookies = false
         if !token.isEmpty { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
