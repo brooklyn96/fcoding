@@ -1884,7 +1884,7 @@ function Confirm-MoveYes([string]$Question) {
 function New-MoveAnswer { [pscustomobject][ordered]@{ a = 'yes'; ts = (Format-MoveTs (Get-MoveNow)) } }
 
 # ---- the re-run table (CONTRACT section 8): what a command does in the phase / mark of the state ----
-# @{ Do = refuse | plan-new | replan | copy | cutover | cutover-resume | rollback-finish | chores | finish | abandon | done | back-start | back-copy-cutover; Msg }
+# @{ Do = refuse | plan-new | replan | copy | cutover | cutover-continue | chores | finish | abandon | abandon-rollback | done | back-start | back-copy-cutover; Msg }
 function Resolve-MoveAction([string]$Cmd, $S) {
   $phase = if ($S) { [string]$S.phase } else { 'none' }
   $mark = if ($S) { [string]$S.mark } else { '' }
@@ -1896,9 +1896,12 @@ function Resolve-MoveAction([string]$Cmd, $S) {
     if ($Cmd -ceq 'plan') { return @{ Do = 'plan-new' } }
     return @{ Do = 'refuse'; Msg = "lệnh '$Cmd': chưa có lần chuyển nào; chạy  fcode move plan <máy mới>  trước." }
   }
-  if ($mark -ceq 'rolling-back') {
-    if ($Cmd -ceq 'cutover' -or ($Cmd -ceq 'back' -and $isBack)) { return @{ Do = 'rollback-finish' } }
-    return $ref
+  if ($mark) {   # a cutover is in flight (cutting / switching / rolling-back), in any phase: the mark decides, never answers or dst_started
+    $srcA = if ([string]$S.dir -ceq 'fwd') { [string]$S.old.alias } else { [string]$S.new.alias }; $dstA = if ([string]$S.dir -ceq 'fwd') { [string]$S.new.alias } else { [string]$S.old.alias }
+    if ($Cmd -ceq 'cutover' -or ($Cmd -ceq 'back' -and $isBack)) { return @{ Do = 'cutover-continue' } }
+    if ($Cmd -ceq 'finish' -and $mark -cne 'switching') { return @{ Do = 'abandon-rollback' } }
+    if ($mark -ceq 'switching') { return @{ Do = 'refuse'; Msg = "lệnh '$Cmd' không dùng được: cutover đang ở bước switch (mark 'switching'); ứng dụng có thể đã chạy ở máy '$dstA' và đang nhận truy cập. Chỉ có một đường đi: chạy  fcode move cutover  (lần quay lại: fcode move back) để làm nốt; sau khi xong, muốn về lại máy '$srcA' thì dùng  fcode move back  (dữ liệu được chép về)." } }
+    return @{ Do = 'refuse'; Msg = "lệnh '$Cmd' không dùng được: một cutover đang dở (mark '$mark'; ứng dụng có thể đang tạm dừng ở máy '$srcA'). Hai cách đi tiếp: chạy  fcode move cutover  (lần quay lại: fcode move back) để làm nốt, hoặc  fcode move finish  để cho ứng dụng chạy lại ở máy '$srcA' rồi huỷ lần chuyển." }
   }
   switch -CaseSensitive ($phase) {
     'finished' {
@@ -1913,11 +1916,7 @@ function Resolve-MoveAction([string]$Cmd, $S) {
       if ($Cmd -ceq 'back') { if ($isBack) { return @{ Do = 'back-copy-cutover' } }; return $viaPlan }
       return $ref
     }
-    { $_ -ceq 'copied' -or $_ -ceq 'rolled-back' } {
-      if ($mark -ceq 'switching') {
-        if ($Cmd -ceq 'cutover' -or ($Cmd -ceq 'back' -and $isBack)) { return @{ Do = 'cutover-resume' } }
-        return $ref
-      }
+    { $_ -ceq 'copied' -or $_ -ceq 'rolled-back' } {   # mark null: the apps run on src and the move has stopped nothing
       if ($Cmd -ceq 'plan') { if ($isBack) { return $viaBack }; return @{ Do = 'replan' } }
       if ($Cmd -ceq 'copy') { return @{ Do = 'copy' } }
       if ($Cmd -ceq 'cutover') { return @{ Do = 'cutover' } }
@@ -1944,8 +1943,8 @@ function Get-MoveItemRoots($Obj, [string]$Id) { foreach ($it in @($Obj.items)) {
 function Get-MoveCap($Obj) { $c = 1800; foreach ($a in @($Obj.apps)) { if ([int]$a.guard_cap_s -gt $c) { $c = [int]$a.guard_cap_s } }; $c }
 function ConvertTo-MoveJsonStr([string]$s) { ConvertTo-Json -InputObject $s -Compress }
 # stdin of `init`: the manifest goes in byte for byte (its sha256 is manifest_sha); pub only for old, peer_* only for new
-function New-MoveInitJson([string]$Machine, [string]$Peer, [string]$Sha, [string]$ManifestText, [string]$Pub, [string]$PeerAddr, [int]$PeerPort, [string]$PeerHostKey) {
-  $j = '{"schema":1,"machine":' + (ConvertTo-MoveJsonStr $Machine) + ',"peer":' + (ConvertTo-MoveJsonStr $Peer) + ',"manifest_sha":"' + $Sha + '","manifest":' + $ManifestText.Trim()
+function New-MoveInitJson([string]$Machine, [string]$Peer, [string]$Sha, [string]$ManifestText, [string]$Pub, [string]$PeerAddr, [int]$PeerPort, [string]$PeerHostKey, [string]$NewKind = 'vps') {
+  $j = '{"schema":1,"machine":' + (ConvertTo-MoveJsonStr $Machine) + ',"peer":' + (ConvertTo-MoveJsonStr $Peer) + ',"new_kind":' + (ConvertTo-MoveJsonStr $NewKind) + ',"manifest_sha":"' + $Sha + '","manifest":' + $ManifestText.Trim()   # A30: new_kind on both machines
   if ($Pub) { $j += ',"pub":' + (ConvertTo-MoveJsonStr $Pub) }
   if ($PeerAddr) { $j += ',"peer_addr":' + (ConvertTo-MoveJsonStr $PeerAddr) + ',"peer_port":' + $PeerPort + ',"peer_hostkey":' + (ConvertTo-MoveJsonStr $PeerHostKey) }
   $j + '}'
@@ -2092,8 +2091,9 @@ function Test-MoveHoldIdle([string]$HostName) {
   $r = Invoke-MoveGate $HostName 'status' ''
   if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
   foreach ($l in $r.Lines) {
-    if ("$l" -match '\AMOVE state .*\bhold_active=([0-9]+)') {
-      if ([int]$Matches[1] -eq 0) { return 0 }
+    if ("$l" -match '\AMOVE state .*\bhold_active=(\S+)') {
+      if ($Matches[1] -ceq '0') { return 0 }
+      if ($Matches[1] -ceq '-') { Write-Host "dừng: máy '$HostName' không đếm được ứng dụng đang chạy (hold_active=-); chưa coi là rảnh. Kiểm tra máy đó rồi chạy lại."; return 65 }
       Write-Host "dừng: máy '$HostName' đang chạy ứng dụng hoặc connector (dst-running). Kiểm tra máy đó rồi chạy lại."
       return 65
     }
@@ -2123,7 +2123,7 @@ function Invoke-MoveCopy($S) {
   if ($m2.Code -ne 0) { return (ConvertTo-MoveExit $m2.Code) }
   Save-MoveManifest $m2.Text; Set-MoveProp $S 'manifest_sha' $m2.Sha; Save-MoveState $S
   Write-Host "copy (c): init trên máy cũ '$oldH'..."
-  $ij = New-MoveInitJson 'old' ([string]$S.new.alias) $m2.Sha $m2.Text $pub '' 0 ''
+  $ij = New-MoveInitJson 'old' ([string]$S.new.alias) $m2.Sha $m2.Text $pub '' 0 '' ([string]$S.new.kind)
   $r = Invoke-MoveGate $oldH 'init' $id @($(if ($fwd) { 'src' } else { 'dst' })) ([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($ij)))
   if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
   Write-Host "copy (d): chép cổng deploy sang '$newH' khi chưa có..."
@@ -2133,7 +2133,7 @@ function Invoke-MoveCopy($S) {
   $g = Invoke-MoveScript $newH (Get-MoveBootstrapGateScript) (@([string]$S.old.addr, [string]$oi.Port, $entry[0], $lib[0]) + $units)
   if ($g.Code -ne 0) { return (ConvertTo-MoveExit $g.Code) }
   Write-Host "copy (e): init trên máy mới '$newH'..."
-  $nj = New-MoveInitJson 'new' ([string]$S.old.alias) $m2.Sha $m2.Text '' ([string]$S.old.addr) ([int]$oi.Port) ([string]$S.old.hostkey_line)
+  $nj = New-MoveInitJson 'new' ([string]$S.old.alias) $m2.Sha $m2.Text '' ([string]$S.old.addr) ([int]$oi.Port) ([string]$S.old.hostkey_line) ([string]$S.new.kind)
   $r = Invoke-MoveGate $newH 'init' $id @($(if ($fwd) { 'dst' } else { 'src' })) ([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($nj)))
   if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
   Write-Host "copy (f, g): prepare trên '$dst'..."
@@ -2200,10 +2200,10 @@ function Invoke-MoveTry3([scriptblock]$Do) {
   for ($i = 1; $i -le 3; $i++) { $r = & $Do; if ($r.Code -eq 0) { return $true }; if ($i -lt 3) { Wait-Move 5 } }
   $false
 }
-# steps (2)-(11); @{ Code; Why; NoRollback }. Code 0 = phase cut reached. $Resume: mark switching = resume at step (10).
-function Invoke-MoveCutSteps($S, [bool]$Resume) {
+# steps (2)-(11); @{ Code; Why; NoRollback }. Code 0 = phase cut reached. $Resume: mark switching = resume at step (10); $Resume9: a kill inside step 9 = resume at step (9).
+function Invoke-MoveCutSteps($S, [bool]$Resume, [bool]$Resume9 = $false) {
   $id = [string]$S.move_id; $src = Get-MoveSrcHost $S; $dst = Get-MoveDstHost $S; $newH = Get-MoveNewHost $S
-  if (-not $Resume) {
+  if (-not $Resume -and -not $Resume9) {
     Write-Host '(2) tắt workflow deploy thẳng vào máy cũ qua SSH (nếu có)...'
     $w = Set-MoveWorkflows $S $false
     if ($w -eq 0) { $w = Wait-MoveRunsIdle $S }
@@ -2228,10 +2228,13 @@ function Invoke-MoveCutSteps($S, [bool]$Resume) {
     Write-Host '(7) chép nốt (transfer --final)...'
     $x = Invoke-MoveTransfer $newH $id $true
     if ($x -ne 0) { return @{ Code = $x; Why = 'transfer --final lỗi' } }
-    Write-Host "(8) adopt, restore trên '$dst'; verify --strict..."
-    foreach ($v in 'adopt', 'restore') { $r = Invoke-MoveGate $dst $v $id; if ($r.Code -ne 0) { return @{ Code = (ConvertTo-MoveExit $r.Code); Why = "$v lỗi" } } }
+    Write-Host "(8) adopt, restore --final trên '$dst'; verify --strict..."
+    $r = Invoke-MoveGate $dst 'adopt' $id; if ($r.Code -ne 0) { return @{ Code = (ConvertTo-MoveExit $r.Code); Why = 'adopt lỗi' } }
+    $r = Invoke-MoveGate $dst 'restore' $id @('--final'); if ($r.Code -ne 0) { return @{ Code = (ConvertTo-MoveExit $r.Code); Why = 'restore --final lỗi' } }   # A32: a failed sqlite integrity_check is restore-failed here
     $r = Invoke-MoveGate $newH 'verify' $id @('--strict')
     if ($r.Code -ne 0) { return @{ Code = (ConvertTo-MoveExit $r.Code); Why = 'verify --strict lỗi' } }
+  }
+  if (-not $Resume) {
     Write-Host "(9) start và health trên '$dst'..."
     Set-MoveProp $S 'dst_started' $true; Save-MoveState $S
     $r = Invoke-MoveGate $dst 'start' $id
@@ -2246,7 +2249,9 @@ function Invoke-MoveCutSteps($S, [bool]$Resume) {
   Write-Host "(11) unfreeze trên '$dst'..."
   $r = Invoke-MoveGate $dst 'unfreeze' $id
   if ($r.Code -ne 0) { return @{ Code = (ConvertTo-MoveExit $r.Code); Why = 'unfreeze lỗi'; NoRollback = $true } }
-  Set-MoveProp $S 'mark' $null; Set-MoveProp $S 'cut_at' (Format-MoveTs (Get-MoveNow)); Set-MoveProp $S 'phase' 'cut'; Save-MoveState $S
+  Set-MoveProp $S 'mark' $null; Set-MoveProp $S 'cut_at' (Format-MoveTs (Get-MoveNow)); Set-MoveProp $S 'phase' 'cut'
+  Set-MoveProp $S.answers 'finish' $null; Set-MoveProp $S.answers 'finish_early' $null   # a new cut needs a new finish answer
+  Save-MoveState $S
   @{ Code = 0 }
 }
 # the rollback: dst stop, src start --connectors, src unfreeze, workflows (src is old), phase rolled-back, src health. Each step is tried 3 times;
@@ -2296,8 +2301,9 @@ function Invoke-MoveCutover($S) {
   $mark = [string]$S.mark
   if ($mark -ceq 'rolling-back') { return (Invoke-MoveRollback $S 1 'làm nốt lần quay lại đang dở') }
   if ([string]$S.phase -ceq 'cut') { return (Invoke-MoveChores $S) }
-  $resume = ($mark -ceq 'switching')
-  if (-not $resume) {
+  if ($mark -ceq 'switching') { $f = Invoke-MoveCutSteps $S $true }   # resume at step (10)
+  elseif ($mark -ceq 'cutting') { $f = Invoke-MoveCutSteps $S $false ([bool]($S.dst_started -eq $true)) }   # step (1) never runs again; A31: dst_started true = continue at step (9)
+  else {
     $nb = ConvertTo-MoveTime $S.cut_not_before; $now = Get-MoveNow
     if ($nb -and $now -lt $nb) {
       Write-Host "Chưa chuyển được: bản ghi DNS cũ còn trong thời gian TTL, cần chờ thêm khoảng $([int][Math]::Ceiling(($nb - $now).TotalMinutes)) phút (đến $(Format-MoveTs $nb)). Chưa chạy gì."
@@ -2306,10 +2312,11 @@ function Invoke-MoveCutover($S) {
     $key = if ([string]$S.via -ceq 'back') { 'back' } else { 'cut' }
     if (-not $S.answers.$key) {
       if (-not (Confirm-MoveYes (Get-MoveQuestion $key $S))) { Write-Host 'Đã huỷ, chưa đổi gì.'; return 65 }
-      Set-MoveProp $S.answers $key (New-MoveAnswer); Save-MoveState $S
+      Set-MoveProp $S.answers $key (New-MoveAnswer)
     }
+    Set-MoveProp $S 'mark' 'cutting'; Save-MoveState $S   # ONE write: the answer and the mark that says a cutover is in flight
+    $f = Invoke-MoveCutSteps $S $false $false
   }
-  $f = Invoke-MoveCutSteps $S $resume
   if ($f.Code -eq 0) { return (Invoke-MoveChores $S) }
   if ($f.NoRollback) { Write-Host "lỗi ở bước cuối ($($f.Why)); chạy lại  fcode move cutover  để làm tiếp (mark switching giữ nguyên)."; return $f.Code }
   Invoke-MoveRollback $S ([int]$f.Code) ([string]$f.Why)
@@ -2318,15 +2325,24 @@ function Invoke-MoveCutover($S) {
 # ---- finish (sequence 5) and back (sequence 4) ----
 function Invoke-MoveFinish($S, [string]$Do) {
   if ($Do -ceq 'done') { Write-Host 'Lần chuyển này đã xong (finished).'; return 0 }
-  $abandon = ($Do -ceq 'abandon')
+  $abandon = ($Do -ceq 'abandon' -or $Do -ceq 'abandon-rollback')
   $ca = ConvertTo-MoveTime $S.cut_at
   $needEarly = [bool]($ca -and (Get-MoveNow) -lt $ca.AddHours(72) -and -not $S.answers.finish_early)
   $needMain = [bool](-not $S.answers.finish)
+  if ($Do -ceq 'abandon-rollback') {   # said BEFORE the question(s): the rollback follows a YES
+    $srcA = if ([string]$S.dir -ceq 'fwd') { [string]$S.old.alias } else { [string]$S.new.alias }; $dstA = if ([string]$S.dir -ceq 'fwd') { [string]$S.new.alias } else { [string]$S.old.alias }
+    Write-Host "Một cutover đang dở (mark '$($S.mark)'). Nếu đồng ý huỷ, ứng dụng sẽ được cho chạy lại ở máy '$srcA' trước (rollback), rồi mới huỷ lần chuyển."
+    if ($S.dst_started -eq $true) { Write-Host "Dữ liệu các ứng dụng đã ghi ở máy '$dstA' từ lúc cutover bị ngắt sẽ không được chép về." }
+  }
   if ($needMain -and -not (Confirm-MoveYes (Get-MoveQuestion $(if ($abandon) { 'abandon' } else { 'finish' }) $S))) { Write-Host 'Đã huỷ, chưa đổi gì.'; return 65 }
   if ($needEarly -and -not (Confirm-MoveYes (Get-MoveQuestion 'finish-early' $S))) { Write-Host 'Đã huỷ, chưa đổi gì.'; return 65 }
   if ($needMain) { Set-MoveProp $S.answers 'finish' (New-MoveAnswer) }
   if ($needEarly) { Set-MoveProp $S.answers 'finish_early' (New-MoveAnswer) }
   if ($needMain -or $needEarly) { Save-MoveState $S }
+  if ($Do -ceq 'abandon-rollback') {   # mark cutting / rolling-back: put the apps back on src (idempotent), then abandon
+    $rb = @(Invoke-MoveRollback $S 1 'huỷ lần chuyển khi một cutover đang dở')
+    if ([int]$rb[-1] -ne 1) { return [int]$rb[-1] }   # 70 = needs a human: mark rolling-back kept, nothing is finished
+  }
   $id = [string]$S.move_id; $fwd = ([string]$S.dir -ceq 'fwd')
   $order = if ($abandon) { @('old', 'new') } elseif ($fwd) { @('old', 'new') } else { @('new', 'old') }   # phase cut: src first, then dst
   foreach ($m in $order) {
@@ -2384,8 +2400,8 @@ function Invoke-MoveDispatch($Act, $S, [string]$Alias, [string]$MapFile) {
     'plan-new' { Invoke-MovePlan $null $Alias $MapFile $true }
     'replan' { Invoke-MovePlan $S $Alias $MapFile $false }
     'copy' { Invoke-MoveCopy $S }
-    { $_ -in 'cutover', 'cutover-resume', 'rollback-finish', 'chores' } { Invoke-MoveCutover $S }
-    { $_ -in 'finish', 'abandon', 'done' } { Invoke-MoveFinish $S $Act.Do }
+    { $_ -in 'cutover', 'cutover-continue', 'chores' } { Invoke-MoveCutover $S }
+    { $_ -in 'finish', 'abandon', 'abandon-rollback', 'done' } { Invoke-MoveFinish $S $Act.Do }
     'back-start' { Invoke-MoveBackStart $S }
     'back-copy-cutover' { $c = Invoke-MoveCopy $S; if ([int]@($c)[-1] -ne 0) { [int]@($c)[-1] } else { Invoke-MoveCutover $S } }
     default { Write-Host "lỗi: việc '$($Act.Do)' không biết."; 1 }

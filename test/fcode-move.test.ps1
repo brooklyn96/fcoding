@@ -297,8 +297,9 @@ T 'move.lock: a held lock refuses the second run (exit 1, no call); released loc
   $lk2 = Open-MoveLock; Ok ($null -ne $lk2) 'free again'; $lk2.Dispose()
 }
 T 're-run table: every phase x mark x via x command' {
-  $t = @(
-    # phase, mark, via, then plan / copy / cutover / finish / back
+  $t = New-Object Collections.ArrayList
+  # phase, mark, via, then plan / copy / cutover / finish / back (then flags: dst_started, answers_cut, answers_back)
+  foreach ($row in @(
     , @('none', '', '', 'plan-new', 'refuse', 'refuse', 'refuse', 'refuse')
     , @('planned', '', 'plan', 'replan', 'copy', 'refuse', 'abandon', 'refuse')
     , @('planned', '', 'back', 'refuse', 'copy', 'refuse', 'abandon', 'back-copy-cutover')
@@ -306,18 +307,29 @@ T 're-run table: every phase x mark x via x command' {
     , @('rolled-back', '', 'plan', 'replan', 'copy', 'cutover', 'abandon', 'refuse')
     , @('copied', '', 'back', 'refuse', 'copy', 'cutover', 'abandon', 'cutover')
     , @('rolled-back', '', 'back', 'refuse', 'copy', 'cutover', 'abandon', 'cutover')
-    , @('copied', 'switching', 'plan', 'refuse', 'refuse', 'cutover-resume', 'refuse', 'refuse')
-    , @('copied', 'switching', 'back', 'refuse', 'refuse', 'cutover-resume', 'refuse', 'cutover-resume')
-    , @('copied', 'rolling-back', 'plan', 'refuse', 'refuse', 'rollback-finish', 'refuse', 'refuse')
-    , @('rolled-back', 'rolling-back', 'back', 'refuse', 'refuse', 'rollback-finish', 'refuse', 'rollback-finish')
-    , @('planned', 'rolling-back', 'plan', 'refuse', 'refuse', 'rollback-finish', 'refuse', 'refuse')
     , @('cut', '', 'plan', 'refuse', 'refuse', 'chores', 'finish', 'back-start')
     , @('cut', '', 'back', 'refuse', 'refuse', 'chores', 'finish', 'back-start')
     , @('finished', '', 'plan', 'plan-new', 'refuse', 'refuse', 'done', 'refuse')
-  )
+    # mark null: neither answers nor dst_started change anything (they are not "in flight")
+    , @('copied', '', 'plan', 'replan', 'copy', 'cutover', 'abandon', 'refuse', 'answers_cut')
+    , @('copied', '', 'back', 'refuse', 'copy', 'cutover', 'abandon', 'cutover', 'answers_back')
+    , @('copied', '', 'plan', 'replan', 'copy', 'cutover', 'abandon', 'refuse', 'dst_started')
+    , @('planned', '', 'back', 'refuse', 'copy', 'refuse', 'abandon', 'back-copy-cutover', 'answers_back')
+  )) { [void]$t.Add($row) }
+  # a mark set, in every phase (CONTRACT section 8, one row): cutting and rolling-back roll back before an abandon, switching refuses it
+  foreach ($ph in 'copied', 'rolled-back', 'planned') {
+    foreach ($mk in 'cutting', 'rolling-back') {
+      [void]$t.Add(@($ph, $mk, 'plan', 'refuse', 'refuse', 'cutover-continue', 'abandon-rollback', 'refuse'))
+      [void]$t.Add(@($ph, $mk, 'back', 'refuse', 'refuse', 'cutover-continue', 'abandon-rollback', 'cutover-continue'))
+    }
+    [void]$t.Add(@($ph, 'switching', 'plan', 'refuse', 'refuse', 'cutover-continue', 'refuse', 'refuse'))
+    [void]$t.Add(@($ph, 'switching', 'back', 'refuse', 'refuse', 'cutover-continue', 'refuse', 'cutover-continue'))
+  }
+  [void]$t.Add(@('copied', 'cutting', 'plan', 'refuse', 'refuse', 'cutover-continue', 'abandon-rollback', 'refuse', 'dst_started', 'answers_cut'))   # side fields do not matter under a mark either
   $cmds = 'plan', 'copy', 'cutover', 'finish', 'back'
   foreach ($row in $t) {
-    $s = if ($row[0] -ceq 'none') { $null } else { [pscustomobject]@{ phase = $row[0]; mark = $(if ($row[1]) { $row[1] } else { $null }); via = $row[2] } }
+    $fl = @($row | Select-Object -Skip 8)
+    $s = if ($row[0] -ceq 'none') { $null } else { [pscustomobject]@{ phase = $row[0]; mark = $(if ($row[1]) { $row[1] } else { $null }); via = $row[2]; dst_started = ($fl -contains 'dst_started'); answers = [pscustomobject]@{ cut = $(if ($fl -contains 'answers_cut') { 1 } else { $null }); back = $(if ($fl -contains 'answers_back') { 1 } else { $null }) } } }
     for ($i = 0; $i -lt 5; $i++) {
       $a = Resolve-MoveAction $cmds[$i] $s
       Eq $a.Do $row[3 + $i] "phase=$($row[0]) mark=$($row[1]) via=$($row[2]) cmd=$($cmds[$i])"
@@ -547,12 +559,18 @@ T 'cutover: the happy path = the normative sequence; one YES; marks and dst_star
   Add-Rule 'newbox' ' start' -Do { $st = State; $script:Seen.StartStarted = $st.dst_started; $script:Seen.StartMark = $st.mark }
   Add-Rule 'newbox' ' switch' -Do { $st = State; $script:Seen.SwitchMark = $st.mark; $script:Seen.SwitchStarted = $st.dst_started }
   Add-Rule 'newbox' ' stop' -Do { $st = State; $script:Seen.StopStarted = $st.dst_started }
-  $r = Run-Move @('cutover'); Eq $r.Code 0 $r.Text
+  Add-Rule 'contabo' ' freeze' -Do { $st = State; $script:Seen.FreezeMark = $st.mark }
+  $global:MoveSaves = New-Object Collections.ArrayList; $origSave = (Get-Item function:Save-MoveState).ScriptBlock
+  Set-Item function:Save-MoveState -Value ({ param($S) [void]$global:MoveSaves.Add(@{ Mark = $S.mark; Cut = [bool]$S.answers.cut; Phase = $S.phase }); & $origSave $S }.GetNewClosure())
+  try { $r = Run-Move @('cutover') } finally { Set-Item function:Save-MoveState -Value $origSave }
+  Eq $r.Code 0 $r.Text
   Ordered @('gh workflow disable deploy.yml -R brooklyn96/autoshopee', '^contabo freeze', '^contabo stop --guards', '^newbox stop', '^newbox prepare', '^newbox status', '^contabo dump', '^newbox transfer --final', '^newbox status', '^newbox adopt', '^newbox restore', '^newbox verify --strict', '^newbox start', '^newbox health', '^newbox switch', '^newbox unfreeze', 'gh secret set DEPLOY_KNOWN_HOSTS -R brooklyn96/BD-Team-Project', 'box:coder ssh config \(read\)', 'box:coder ssh config \(write\)')
   Eq (Count 'gh workflow disable') 1 'only the workflow that was enabled at plan is disabled'; Ok ((Names 'gh workflow') -join ' ' -notmatch 'old\.yml') 'old.yml (disabled by the user) is never touched'
   Eq (Count 'gh workflow enable') 0 'a forward cut leaves the ssh-push workflows disabled'
   Eq $script:Prompts.Count 1 'one YES'
-  Eq $script:Seen.StopStarted $false 'dst_started false after the dst stop'; Eq $script:Seen.StartStarted $true 'dst_started true before start'; Eq $script:Seen.SwitchMark 'switching' 'mark switching before switch'; Eq $script:Seen.StartMark $null 'no mark before the switch step'
+  Eq $script:Seen.StopStarted $false 'dst_started false after the dst stop'; Eq $script:Seen.StartStarted $true 'dst_started true before start'; Eq $script:Seen.SwitchMark 'switching' 'mark switching before switch'; Eq $script:Seen.StartMark 'cutting' 'mark cutting while the apps are being started'; Eq $script:Seen.FreezeMark 'cutting' 'mark cutting at the first step that changes src'
+  Eq @($global:MoveSaves | Where-Object { $_.Cut -and -not $_.Mark -and $_.Phase -cne 'cut' }).Count 0 'no saved state has the cut answer with no mark before phase cut (one write)'
+  Ok (@($global:MoveSaves | Where-Object { $_.Mark -ceq 'cutting' }).Count -ge 1) 'cutting was saved'; Eq (State).answers.finish $null 'answers.finish reset at the cut'; Eq (State).answers.finish_early $null
   $n = State; Eq $n.phase 'cut'; Eq $n.mark $null; Ok ($n.cut_at -cmatch '\A2026-10-29T10:0\d:\d\dZ\z') 'cut_at'; Eq $n.answers.cut.a 'yes'; Eq $n.dst_started $true
   Ok ($r.Text -match 'MOVE done cutover') 'MOVE done cutover'; Ok ($r.Text -match 'brooklyn96/autoshopee \(deploy.yml\)') 'final report names the disabled workflow'; Ok ($r.Text -notmatch 'old\.yml') 'not the user-disabled one'
   Ok ($r.Text.Contains('Chuyển tất cả ứng dụng sang máy mới bây giờ? Mọi ứng dụng sẽ cùng tạm dừng một lần, khoảng 2 phút. Nếu có lỗi trước khi chuyển xong, máy cũ tự chạy lại như cũ. Các workflow GitHub deploy thẳng vào máy cũ qua SSH sẽ bị tắt. (Có/Không)')) 'Q-cut verbatim'
@@ -893,6 +911,130 @@ T 'scripts: the bootstrap gate script brackets an IPv6 old address in the rsync 
     Eq $rc 0 ($o -join ' | '); $l = [IO.File]::ReadAllText($log); Ok ($l.Contains($c[1])) "source spec for $($c[0]): $l"
     foreach ($x in $l -split "`n") { if ($x -match 'root@\S+:/etc/systemd') { Ok ($x -match $(if ($c[0] -match ':') { 'root@\[2001:db8::1\]:/etc' } else { 'root@203\.0\.113\.10:/etc' })) "unit spec: $x" } }
   }
+}
+# ============================== round 3 (decisions A30-A33) ==============================
+T 'A30: init stdin carries new_kind on both machines (vps and home), after the other keys are unchanged' {
+  Reset-World; [void](Seed 'planned'); $r = Run-Move @('copy'); Eq $r.Code 0 $r.Text
+  foreach ($g in $script:GateIn | Where-Object { $_.Verb -ceq 'init' }) { $j = $g.Stdin | ConvertFrom-Json; Eq $j.new_kind 'vps' "new_kind on $($g.Host)"; Eq $j.schema 1 }
+  Eq (@($script:GateIn | Where-Object { $_.Verb -ceq 'init' }).Count) 2
+  Reset-World; $s = Seed 'planned'; Set-MoveProp $s.new 'kind' 'home'; Save-MoveState $s; $r = Run-Move @('copy'); Eq $r.Code 0 $r.Text
+  foreach ($g in $script:GateIn | Where-Object { $_.Verb -ceq 'init' }) { Eq ($g.Stdin | ConvertFrom-Json).new_kind 'home' "home on $($g.Host)" }
+  # a back run keeps the kind of the new machine
+  Reset-World; $script:Tunneled = $true; $s = Seed 'cut'; Set-MoveProp $s.new 'kind' 'home'; Save-MoveState $s; Yes; $r = Run-Move @('back'); Eq $r.Code 0 $r.Text
+  foreach ($g in $script:GateIn | Where-Object { $_.Verb -ceq 'init' }) { Eq ($g.Stdin | ConvertFrom-Json).new_kind 'home' "back: home on $($g.Host)" }
+}
+T 'state: a mark `cutting` round-trips like the others (schema stays 1)' {
+  Reset-World; $s = Seed 'copied' 'fwd' 'plan' 'cutting'; Set-MoveProp $s.answers 'cut' (New-MoveAnswer); Save-MoveState $s
+  $r = State; Eq $r.mark 'cutting'; Eq $r.schema 1; Eq $r.phase 'copied'; Eq ([bool]$r.answers.cut) $true
+  Save-MoveState $r; Eq (State).mark 'cutting'
+}
+T 'A32: cutover step 8 runs `restore <id> --final`; copy (j) runs plain `restore`; a failing restore --final rolls back' {
+  Reset-World; [void](Seed 'planned'); $r = Run-Move @('copy'); Eq $r.Code 0 $r.Text; Eq (Count '^newbox restore$') 1; Eq (Count 'restore --final') 0
+  $s = Cut-State; Yes; $r = Run-Move @('cutover'); Eq $r.Code 0 $r.Text; Eq (Count '^newbox restore --final$') 1; Eq (Count '^newbox restore$') 0
+  Ordered @('^newbox adopt$', '^newbox restore --final$', '^newbox verify --strict$', '^newbox start$')
+  $s = Cut-State; Yes; Add-Rule 'newbox' ' restore --final' -Code 1 -Out @('MOVE error restore-failed item=x')
+  $r = Run-Move @('cutover'); Eq $r.Code 1; Eq (State).phase 'rolled-back'; Eq (Count '^newbox verify') 0; Ordered @('^newbox restore --final', '^newbox stop', '^contabo start --connectors')
+}
+T 'A33: hold_active=- (cannot be counted) is not 0: copy (g) stops with 65, cutover step (5) rolls back with 65' {
+  $dash = @{ Out = @('MOVE state move_id=x role=dst machine=new finished=no frozen=0 hold_active=- transfer=idle manifest_sha=-'); Code = 0 }
+  Reset-World; [void](Seed 'planned'); Add-Rule 'newbox' ' status' -Seq @($dash)
+  $r = Run-Move @('copy'); Eq $r.Code 65; Ok ($r.Text -match 'hold_active=-') 'says it'; Eq (Count ' dump') 0; Eq (State).phase 'planned'
+  $s = Cut-State; Yes; Add-Rule 'newbox' ' status' -Seq @($dash)
+  $r = Run-Move @('cutover'); Eq $r.Code 65 $r.Text; Eq (State).phase 'rolled-back'; Eq (Count ' dump') 0; Ordered @('^newbox status', '^newbox stop', '^contabo start --connectors')
+  # a missing hold_active field is still a failure (1), a 0 passes
+  Reset-World; [void](Seed 'planned'); Add-Rule 'newbox' ' status' -Seq @(@{ Out = @('MOVE state move_id=x role=dst'); Code = 0 })
+  Eq (Run-Move @('copy')).Code 1
+}
+# ============================== round 5 (arbitration: a cutover in flight is a mark) ==============================
+function Seed-Mark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan', [string]$Phase = 'copied') {
+  $s = Seed $Phase $Dir $Via $Mark
+  if ($Mark -ceq 'cutting') { Set-MoveProp $s.answers $(if ($Via -ceq 'back') { 'back' } else { 'cut' }) (New-MoveAnswer) }
+  Save-MoveState $s; $s
+}
+T 'a mark set: plan, copy and back (via=plan) are refused (65, no call, no prompt, state unchanged): cutting / rolling-back name cutover AND finish and the src alias; switching names cutover and the dst alias and never finish; status runs and shows the mark' {
+  foreach ($ph in 'copied', 'rolled-back') {
+    foreach ($mk in 'cutting', 'rolling-back', 'switching') {
+      Reset-World; $s = Seed-Mark $mk 'fwd' 'plan' $ph; Set-MoveProp $s 'dst_started' $true; Save-MoveState $s
+      $words = @(@('plan', 'newbox'), @('copy'), @('back'))
+      if ($mk -ceq 'switching') { $words += , @('finish') }
+      foreach ($w in $words) {
+        $r = Run-Move $w; Eq $r.Code 65 "$ph $mk $($w -join ' ')"; Eq $script:Log.Count 0 'no call'; Eq $script:Prompts.Count 0 'no prompt'
+        Ok ($r.Text -match 'fcode move cutover') "names cutover: $($r.Text)"
+        if ($mk -ceq 'switching') { Ok ($r.Text -match "máy 'newbox'" -and $r.Text -notmatch 'fcode move finish' -and $r.Text -match 'fcode move back') "switching line: $($r.Text)" }
+        else { Ok ($r.Text -match 'fcode move finish' -and $r.Text -match "máy 'contabo'") "mark line: $($r.Text)" }
+        $n = State; Eq $n.phase $ph; Eq $n.mark $mk; Eq $n.dst_started $true
+      }
+      $r = Run-Move @('status'); Eq $r.Code 0 "status under $mk"; Ok ($r.Text -match "mark=$mk")
+    }
+  }
+  # a back run: the lines name the other machines (src = new, dst = old)
+  Reset-World; [void](Seed-Mark 'cutting' 'back' 'back'); $r = Run-Move @('plan', 'newbox'); Eq $r.Code 65; Ok ($r.Text -match "máy 'newbox'" -and $r.Text -match 'fcode move finish') 'src of a back run is new'
+  Reset-World; [void](Seed-Mark 'switching' 'back' 'back'); $r = Run-Move @('copy'); Eq $r.Code 65; Ok ($r.Text -match "máy 'contabo'" -and $r.Text -notmatch 'fcode move finish') 'dst of a back run is old'
+}
+T 'cutting: cutover continues from step (2) with no question and no cut_not_before check' {
+  Reset-World; $s = Seed-Mark 'cutting'; Set-MoveProp $s 'cut_not_before' '2026-10-30T00:00:00Z'; Save-MoveState $s
+  $r = Run-Move @('cutover'); Eq $r.Code 0 $r.Text; Eq $script:Prompts.Count 0
+  Ordered @('gh workflow disable deploy.yml -R brooklyn96/autoshopee', '^contabo freeze', '^contabo stop --guards', '^newbox stop', '^newbox prepare', '^newbox status', '^contabo dump', '^newbox transfer --final', '^newbox adopt', '^newbox restore --final', '^newbox verify --strict', '^newbox start', '^newbox health', '^newbox switch', '^newbox unfreeze')
+  $n = State; Eq $n.phase 'cut'; Eq $n.mark $null
+}
+T 'cutting + dst_started true (a kill inside step 9): cutover continues at step 9 (start, health, switch, unfreeze); nothing is re-copied; a failing resume rolls back; via=back: `back` continues' {
+  Reset-World; $s = Seed-Mark 'cutting'; Set-MoveProp $s 'dst_started' $true; Set-MoveProp $s 'cut_not_before' '2026-10-30T00:00:00Z'; Save-MoveState $s
+  $r = Run-Move @('cutover'); Eq $r.Code 0 $r.Text
+  Ordered @('^newbox start$', '^newbox health$', '^newbox switch$', '^newbox unfreeze$', 'gh secret set')
+  Eq (Count '^(contabo|newbox) (freeze|stop|dump|transfer|adopt|restore|prepare|verify)') 0 'nothing is re-copied over the started dst'; Eq (Count 'gh workflow disable') 0 'workflows are not touched again'; Eq $script:Prompts.Count 0
+  $n = State; Eq $n.phase 'cut'; Eq $n.mark $null
+  Reset-World; $s = Seed-Mark 'cutting' 'fwd' 'plan' 'rolled-back'; Set-MoveProp $s 'dst_started' $true; Save-MoveState $s; Add-Rule 'newbox' ' health' -Code 69 -Out @('MOVE error health app=x')
+  $r = Run-Move @('cutover'); Eq $r.Code 69 $r.Text; $n = State; Eq $n.phase 'rolled-back'; Eq $n.mark $null; Eq $n.dst_started $false
+  Ordered @('^newbox start$', '^newbox health$', '^newbox stop$', '^contabo start --connectors', '^contabo unfreeze', '^contabo health'); Eq $script:Prompts.Count 0
+  Reset-World; $s = Seed-Mark 'cutting' 'back' 'back'; Set-MoveProp $s 'dst_started' $true; Save-MoveState $s
+  $r = Run-Move @('back'); Eq $r.Code 0 $r.Text; Ordered @('^contabo start$', '^contabo health$', '^contabo switch$'); Eq (Count ' freeze') 0
+}
+T 'via=back run: cutting is written at step (1) although answers.back was set before the plan; `back` with cutting continues at the freeze' {
+  Reset-World; $script:Tunneled = $true; [void](Seed 'cut'); Yes; $script:Seen = @{}
+  Add-Rule 'newbox' ' freeze' -Do { $script:Seen.Mark = (State).mark; $script:Seen.Ans = [bool](State).answers.back }
+  $r = Run-Move @('back'); Eq $r.Code 0 $r.Text; Eq $script:Seen.Mark 'cutting' 'mark at the freeze of the back run'; Ok $script:Seen.Ans 'answer set in the same state'
+  Reset-World; [void](Seed-Mark 'cutting' 'back' 'back'); $r = Run-Move @('back'); Eq $r.Code 0 $r.Text; Eq $script:Prompts.Count 0; Ordered @('^newbox freeze', '^newbox stop --guards')
+}
+T 'abandon (finish) under cutting / rolling-back: the dst-data and rollback line come BEFORE the question; no YES = nothing runs; YES = rollback to its end, then both finish calls; answers cleared, phase finished' {
+  Reset-World; [void](Seed-Mark 'cutting')
+  $r = Run-Move @('finish'); Eq $r.Code 65 'no YES'; Eq $script:Log.Count 0; Eq $script:Prompts.Count 1
+  $iLine = $r.Text.IndexOf("Một cutover đang dở (mark 'cutting')"); $iQ = $r.Text.IndexOf('Huỷ lần chuyển này?'); Ok ($iLine -ge 0 -and $iQ -gt $iLine) 'the line precedes the question'; Ok ($r.Text -match "máy 'contabo'") 'names src'
+  Yes; $r = Run-Move @('finish'); Eq $r.Code 0 $r.Text
+  Ordered @('^newbox stop$', '^contabo start --connectors$', '^contabo unfreeze$', 'gh workflow enable deploy.yml -R brooklyn96/autoshopee', '^contabo health$', '^contabo finish newbox$', '^newbox finish contabo$')
+  $n = State; Eq $n.phase 'finished'; Eq $n.mark $null; Eq $n.answers.cut $null; Eq $n.dst_started $false
+  Reset-World; [void](Seed-Mark 'cutting' 'back' 'back'); Yes; $r = Run-Move @('finish'); Eq $r.Code 0 $r.Text
+  Ordered @('^contabo stop$', '^newbox start --connectors$', '^newbox unfreeze$', '^newbox health$', '^contabo finish newbox$', '^newbox finish contabo$'); Eq (Count 'gh workflow enable') 0
+  Reset-World; $s = Seed-Mark 'cutting'; Set-MoveProp $s 'dst_started' $true; Save-MoveState $s; Yes; $r = Run-Move @('finish'); Eq $r.Code 0 $r.Text
+  Ok ($r.Text -match "Dữ liệu các ứng dụng đã ghi ở máy 'newbox'") 'dst data sentence'; Ordered @('^newbox stop$', '^contabo start --connectors$', '^contabo finish newbox$')
+  Reset-World; $s = Seed-Mark 'cutting'; Set-MoveProp $s 'dst_started' $true; Save-MoveState $s; Yes; Add-Rule 'newbox' ' stop$' -Code 255 -N 3
+  $r = Run-Move @('finish'); Eq $r.Code 70; $n = State; Eq $n.mark 'rolling-back'; Eq (Count ' finish') 0; Eq $n.dst_started $true
+  Reset-World; [void](Seed-Mark 'rolling-back' 'fwd' 'plan' 'rolled-back'); Yes; $r = Run-Move @('finish'); Eq $r.Code 0 $r.Text
+  Ordered @('^newbox stop$', '^contabo start --connectors$', '^contabo finish newbox$', '^newbox finish contabo$'); Eq (State).phase 'finished'
+  Reset-World; [void](Seed-Mark 'cutting'); Yes; Add-Rule 'contabo' ' start --connectors' -Code 1
+  $r = Run-Move @('finish'); Eq $r.Code 70; Eq (State).mark 'rolling-back'; Eq (Count ' finish') 0
+  # negatives: mark null never rolls back, whatever the side fields say
+  Reset-World; $s = Seed 'copied'; Set-MoveProp $s.answers 'cut' (New-MoveAnswer); Set-MoveProp $s 'dst_started' $true; Save-MoveState $s; Yes; $r = Run-Move @('finish'); Eq $r.Code 0; Eq (Count ' start --connectors') 0
+  Reset-World; [void](Seed 'rolled-back'); Yes; $r = Run-Move @('finish'); Eq $r.Code 0; Eq (Count ' start --connectors') 0
+  Reset-World; $s = Seed 'copied' 'back' 'back'; Set-MoveProp $s.answers 'back' (New-MoveAnswer); Save-MoveState $s; Yes; $r = Run-Move @('finish'); Eq $r.Code 0; Eq (Count ' start --connectors') 0 'a back run with the answer set but no cutover started'
+}
+T 'the r5 reproduction: a cutover cut off under cutting: plan and copy are refused, finish rolls back first, then both finish calls (none before src is started)' {
+  Reset-World; [void](Seed-Mark 'cutting')
+  $r = Run-Move @('plan', 'newbox'); Eq $r.Code 65; Eq $script:Log.Count 0; Eq (State).phase 'copied'; Eq (State).mark 'cutting'
+  $r = Run-Move @('copy'); Eq $r.Code 65; Eq $script:Log.Count 0
+  Yes; $r = Run-Move @('finish'); Eq $r.Code 0 $r.Text
+  Ordered @('^newbox stop$', '^contabo start --connectors$', '^contabo unfreeze$', '^contabo health$', '^contabo finish newbox$', '^newbox finish contabo$'); Eq (State).phase 'finished'
+  Ok ((Idx '^(contabo|newbox) finish') -gt (Idx '^contabo start --connectors')) 'no finish call before src is started'
+}
+T 'switching: cutover resumes at step (10) and finishes the cut; a failing switch on resume rolls back; answers.finish does not leak into a later finish (reset at the cut), also after an abandon that ended in 70' {
+  Reset-World; [void](Seed-Mark 'switching'); $r = Run-Move @('cutover'); Eq $r.Code 0 $r.Text; Ordered @('^newbox switch$', '^newbox unfreeze$'); Eq (Count '^(contabo|newbox) (freeze|stop|dump)') 0
+  Reset-World; $s = Seed-Mark 'switching'; Add-Rule 'newbox' ' switch' -Code 1 -Out @('MOVE error switch-failed host=a'); $r = Run-Move @('cutover'); Eq $r.Code 1; Eq (State).phase 'rolled-back'; Eq (State).mark $null
+  Reset-World; $s = Seed 'copied'; Set-MoveProp $s.answers 'finish' (New-MoveAnswer); Save-MoveState $s; Yes
+  $r = Run-Move @('cutover'); Eq $r.Code 0 $r.Text; $n = State; Eq $n.phase 'cut'; Eq $n.answers.finish $null
+  $script:Answers.Clear(); $r = Run-Move @('finish'); Eq $r.Code 65; Ok ($r.Text.Contains('Máy cũ có thể bỏ được chưa?')) 'Q-finish asked again'; Eq $script:Log.Count 0
+  Reset-World; [void](Seed-Mark 'cutting'); Yes; Add-Rule 'contabo' ' health' -Code 69 -Out @('MOVE error health')
+  $r = Run-Move @('finish'); Eq $r.Code 70 $r.Text; Eq (State).phase 'rolled-back'; Ok ($null -ne (State).answers.finish) 'answers.finish set by the abandon'
+  $script:Rules.Clear(); Yes; $r = Run-Move @('cutover'); Eq $r.Code 0 $r.Text; Eq (State).phase 'cut'; Eq (State).answers.finish $null
+  $script:Clock = $script:Clock.AddHours(80); $script:Answers.Clear(); $script:Log.Clear(); $r = Run-Move @('finish'); Eq $r.Code 65; Eq $script:Prompts.Count 1 'Q-finish asked'; Eq $script:Log.Count 0
 }
 # ============================== transport and scripts ==============================
 T 'Invoke-DeploySsh -HostName: ssh -n <alias> <cmd> without stdin, ssh <alias> <cmd> with stdin; an unsafe alias is refused with no call; default unchanged' {
