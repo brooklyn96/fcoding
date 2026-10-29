@@ -3038,19 +3038,23 @@ test('GET /api/home: a full 100-run window without a deploy run reads the deploy
   const old = [GH.runs.find((r) => r.workflowDatabaseId === 13)];
   const ci = GH.workflows.filter((w) => w.id === 12);
   const wfCalls = () => c.toolCalls('--workflow').length;
-  c.setRules([['--workflow 13', { stdout: JSON.stringify(old) }], ['run list', { stdout: JSON.stringify(full) }], ...baseRules()]);
+  const rel = ['release list', { stdout: RELEASES }], relCalls = () => c.toolCalls('release list').length;
+  c.setRules([rel, ['--workflow 13', { stdout: JSON.stringify(old) }], ['run list', { stdout: JSON.stringify(full) }], ...baseRules()]);
   let h = await c.homeUntil((x) => x.projects[0].lastRun && x.projects[1].lastRun);
   assert.deepEqual(h.projects.map((p) => p.lastRun.workflow), ['Ship it', 'Ship it']);
   await c.app.homeIdle();
   assert.equal(wfCalls(), 2); // two projects, the one deploy workflow each
   assert.ok(c.toolCalls('--workflow 13').every((l) => l.includes('--limit 1 ')));
-  // the window full and no deploy workflow at all: no extra call, none
-  c.setRules([['workflow list', { stdout: JSON.stringify(ci) }], ['run list', { stdout: JSON.stringify(full) }], ...baseRules()]);
-  c.clock.t += 121e3;
-  await c.home();
-  await c.app.homeIdle();
-  h = await c.home();
-  assert.deepEqual([h.projects[0].lastRun, wfCalls()], [null, 2]);
+  assert.equal(relCalls(), 0); // the fallback found an old deploy run: that run, no release
+  // the fallback finds nothing (the deploy workflow has no run): there is a deploy workflow, so still no release
+  c.setRules([rel, ['--workflow 13', { stdout: '[]' }], ['run list', { stdout: JSON.stringify(full) }], ...baseRules()]);
+  h = await ghRefresh(c);
+  assert.deepEqual([h.projects[0].lastRun, relCalls()], [null, 0]);
+  // the window full and no deploy workflow at all: no extra call; the release is the line
+  c.setRules([rel, ['workflow list', { stdout: JSON.stringify(ci) }], ['run list', { stdout: JSON.stringify(full) }], ...baseRules()]);
+  const wf = wfCalls();
+  h = await ghRefresh(c);
+  assert.deepEqual([h.projects[0].lastRun, wfCalls() - wf, relCalls()], [V139, 0, 2]);
 }));
 
 // ---------- generic deploy gate (decision-r4 §4.4): the deploy line of a gate project is the commit status fcode/deploy ----------
@@ -3273,13 +3277,39 @@ test('GET /api/home: the release line is never read for a project with a deploy 
   }, seedGate(JSON.stringify(['owner/repo'])));
 });
 
+test('GET /api/home: a failed run list or workflow list, or a deploy workflow known only by its file path, never gives the release', async () => {
+  const rel = ['release list', { stdout: RELEASES }];
+  const gh502 = { code: 1, stderr: 'HTTP 502' };
+  // the deploy workflow ("Ship it", deploy.yml) exists but its runs cannot be read: unknown (null), never a green release
+  await homeApp(async (c) => {
+    c.setRules([rel, ['run list', gh502], ['commits/HEAD', NO_CONFIG], ...baseRules()]);
+    await c.homeUntil((x) => !x.projects[0].loading && !x.projects[1].loading);
+    await c.app.homeIdle();
+    assert.deepEqual([(await c.home()).projects.map((p) => p.lastRun), c.toolCalls('release list').length], [[null, null], 0]);
+  });
+  // the workflow list cannot be read (a deploy workflow known only by path would be missed), the runs have no deploy run
+  await homeApp(async (c) => {
+    c.setRules([rel, ['workflow list', gh502], ...NO_DEPLOY().slice(1), ['commits/HEAD', NO_CONFIG], ...baseRules()]);
+    await c.homeUntil((x) => !x.projects[0].loading && !x.projects[1].loading);
+    await c.app.homeIdle();
+    assert.deepEqual([(await c.home()).projects.map((p) => p.lastRun), c.toolCalls('release list').length], [[null, null], 0]);
+  });
+  // the deploy workflow is known only by its path (deploy.yml, the name says nothing) and has no run in the list: no release
+  await homeApp(async (c) => {
+    c.setRules([rel, ...NO_DEPLOY().slice(1), ['commits/HEAD', NO_CONFIG], ...baseRules()]); // workflow list: gh.json (Ship it, deploy.yml)
+    await c.homeUntil((x) => !x.projects[0].loading && !x.projects[1].loading);
+    await c.app.homeIdle();
+    assert.deepEqual([(await c.home()).projects.map((p) => p.lastRun), c.toolCalls('release list').length], [[null, null], 0]);
+  });
+});
+
 test('GET /api/home: a failing gh call never makes a 500 or a wrong line (gate project: null; other repo: the Actions line)', async () => {
   // a gate project (sticky): head unreadable or not a sha, statuses failing or not the expected lines -> lastRun null, the reply is still 200
   await homeApp(async (c) => {
     const sets = [gateRules({ head: GH_FAIL }), gateRules({ head: { stdout: 'oops\n' } }), gateRules({ statuses: GH_FAIL }), gateRules({ statuses: 'not json at all\n' }),
       gateRules({ statuses: stLine('fcode/deploy', 'deployed') })];
     c.setRules(sets[0]);
-    let h = await c.homeUntil((x) => x.projects[0].repo && x.projects[1].repo);
+    let h = await c.homeUntil((x) => !x.projects[0].loading && !x.projects[1].loading);
     await c.app.homeIdle();
     h = await c.home();
     assert.deepEqual(h.projects.map((p) => p.lastRun), [null, null]);
