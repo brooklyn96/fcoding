@@ -64,7 +64,7 @@ final class HomeModel: ObservableObject {
         currentForced = force
         // Cleared inside the task, so a waiter never sees a finished task as still running.
         let task = Task {
-            await self.fetch(app, force: force)
+            await self.fetch(app, fresh: fresh, force: force)
             if self.currentIndex == index { self.current = nil }
         }
         current = task
@@ -90,16 +90,16 @@ final class HomeModel: ObservableObject {
         fromCache = true
     }
 
-    private func fetch(_ app: AppState, force: Bool) async {
+    private func fetch(_ app: AppState, fresh: Bool, force: Bool) async {
         guard let api = app.api else { return }
         loading = true
         defer { loading = false }
         do {
             // ?fresh=1 may wait up to the server's HOME_FRESH_WAIT_MS (25 s) before the reply.
-            let data = try await app.get(api, "api/home", query: force ? [URLQueryItem(name: "fresh", value: "1")] : [],
-                                         timeout: force ? 35 : 20)
+            // A caller that needs a reply from a request started after its call never takes a prefetch.
+            let (data, received) = try await app.get(api, "api/home", query: force ? [URLQueryItem(name: "fresh", value: "1")] : [],
+                                                     timeout: force ? 35 : 20, reuse: !fresh && !force)
             let reply = try JSONDecoder().decode(HomeData.self, from: data)
-            let received = Date()
             if reply.generatedAt != nil {
                 offset = HomeLogic.clockOffset(generatedAt: reply.generatedAt, received: received)
             }

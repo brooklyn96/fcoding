@@ -42,14 +42,26 @@ final class AppState: ObservableObject {
     /// home and prefs replies before the home screen asks for them. Nothing while unpaired.
     func prefetch() {
         guard let api = api else { return }
-        launch.start(key: loginKey(api), ["api/home", "api/prefs"]) { try await api.call("GET", $0) }
+        begin(api, ["api/home", "api/prefs"])
     }
 
-    /// GET `path`: the reply prefetch() started a moment ago (once) when there is one, else a new
-    /// request. A request with a query (?fresh=1) is always new.
-    func get(_ api: API, _ path: String, query: [URLQueryItem] = [], timeout: TimeInterval = 20) async throws -> Data {
-        if query.isEmpty, let early = launch.take(path, key: loginKey(api)) { return try await early.value }
-        return try await api.call("GET", path, query: query, timeout: timeout)
+    private func begin(_ api: API, _ paths: [String]) {
+        launch.start(key: loginKey(api), paths) { try await api.call("GET", $0) }
+    }
+
+    /// GET `path` and when the reply arrived. Unless `reuse` is false (a caller that needs a reply
+    /// from a request started after its call) or there is a query (?fresh=1), it starts the
+    /// request itself when prefetch() has not (one per activation either way) and takes it, but
+    /// only when it began at or after `since`. A prefetch that failed is not an error here: the
+    /// caller's own request goes out.
+    func get(_ api: API, _ path: String, query: [URLQueryItem] = [], timeout: TimeInterval = 20,
+             reuse: Bool = true, since: Date = .distantPast) async throws -> (data: Data, at: Date) {
+        if reuse && query.isEmpty {
+            begin(api, [path])
+            if let early = launch.take(path, key: loginKey(api), since: since), let reply = try? await early.value { return reply }
+        }
+        let data = try await api.call("GET", path, query: query, timeout: timeout)
+        return (data, Date())
     }
 
     static func oldBoxLine(_ address: String) -> String {
