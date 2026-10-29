@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import { createApp, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, strictOrigin, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock,
-  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, parseUpdates, resetReply, RESET_MSG, BOX, memo, codexChildMeta, parseGitSync, ompDirName, ompHead, parseStaging, KNOWN_VERSIONS, repoOfLink } from '../server.mjs';
+  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, parseUpdates, gateStatusOf, gateRunOf, resetReply, RESET_MSG, BOX, memo, codexChildMeta, parseGitSync, ompDirName, ompHead, parseStaging, KNOWN_VERSIONS, repoOfLink } from '../server.mjs';
 
 process.env.TZ = 'America/Los_Angeles'; // spend days follow config.json timeZone, never the process zone: a third zone proves it
 
@@ -30,6 +30,7 @@ async function boot(opts = {}) {
     cookieSecret: Buffer.alloc(32, 7).toString('base64'),
     projects: { alpha: ABS, 'my.proj': ABS }, port: 7681, ...opts.config,
   }));
+  opts.seedConfig?.(configDir); // tests only: files the server finds at start (gate-repos.json)
   process.env.FAKE_TMUX_DIR = fakeDir;
   const logs = [];
   // home v2 sources default to nothing real: no scan of this machine's logs, no omp/gh on PATH
@@ -3051,6 +3052,229 @@ test('GET /api/home: a full 100-run window without a deploy run reads the deploy
   h = await c.home();
   assert.deepEqual([h.projects[0].lastRun, wfCalls()], [null, 2]);
 }));
+
+// ---------- generic deploy gate (decision-r4 §4.4): the deploy line of a gate project is the commit status fcode/deploy ----------
+const HEAD_SHA = 'a'.repeat(40);
+const GATE_URL = 'https://github.com/owner/repo/actions/runs/9';
+const SHIP = { workflow: 'Ship it', status: 'success', at: '2026-10-25T19:10:00Z', url: 'https://github.com/owner/repo/actions/runs/7' }; // the Actions deploy line of gh.json
+// one statuses entry as the gh --jq line: [context, description, created_at, target_url]
+const stLine = (context, description, at = '2026-10-26T01:02:03Z', url = GATE_URL) => JSON.stringify([context, description, at, url]) + '\n';
+const NO_CONFIG = { code: 1, stderr: 'gh: Not Found (HTTP 404)' };
+const GH_FAIL = { code: 1, stderr: 'gh: HTTP 502: Bad Gateway https://token-in-url.example/secret' };
+// head, .fcode/deploy.json and the statuses answer first; the Actions rules stay for the PR checks and the old deploy line
+const gateRules = ({ statuses = '', config = { stdout: '' }, head = { stdout: HEAD_SHA + '\n' } } = {}) => [
+  ['commits/HEAD', head], ['contents/.fcode/deploy.json', config], ['/statuses', typeof statuses === 'string' ? { stdout: statuses } : statuses], ...baseRules()];
+const gateRun = (status, kind, at = '2026-10-26T01:02:03Z', url = GATE_URL) => ({ workflow: 'fcode/deploy', status, kind, at: at && at.replace('Z', '.000Z'), url }); // at: ISO, as Date.toISOString
+const WAITING = gateRun('in_progress', 'waiting', null, null);
+const gateCalls = (c, sub) => c.toolCalls('api ').filter((l) => l.includes(sub));
+// past PROJECTS_TTL, then wait until both projects have been read again (one run list each); returns the new reply
+async function ghRefresh(c) {
+  await c.app.homeIdle();
+  const n = c.toolCalls('run list').length;
+  c.clock.t += 121e3;
+  await waitFor(async () => { await c.home(); return c.toolCalls('run list').length >= n + 2; });
+  await c.app.homeIdle();
+  return c.home();
+}
+// files the server finds at start: gate-repos.json from an earlier run
+const seedGate = (text) => ({ seedConfig: (dir) => fs.writeFileSync(path.join(dir, 'gate-repos.json'), text, { mode: 0o600 }) });
+
+test('gate status: the keyword (first word, any case, ended by space : ;) maps to a fixed (status, kind); anything else is waiting', () => {
+  const kind = (d) => { const r = gateRunOf(['FCode/Deploy', d, '2026-10-26T01:02:03Z', null]); return [r.status, r.kind]; };
+  const table = [
+    ['deployed', ['success', 'deployed']], ['skipped', ['success', 'skipped']], ['superseded', ['success', 'superseded']],
+    ...['queued', 'waiting', 'building', 'activating', 'deferred', 'paused'].map((k) => [k, ['in_progress', 'waiting']]),
+    ...['refused', 'rolled', 'config'].map((k) => [k, ['failure', 'failed']]), ['needs', ['failure', 'needs_human']],
+  ];
+  for (const [k, want] of table) {
+    assert.deepEqual(kind(k), want, k);
+    assert.deepEqual(kind(k.toUpperCase()), want, k);
+    for (const sep of [' abc1234', ': abc1234', '; abc1234', ':abc', '\t:x']) assert.deepEqual(kind(k + sep), want, k + sep);
+  }
+  assert.deepEqual(kind('needs human: register-failed'), ['failure', 'needs_human']);
+  assert.deepEqual(kind('rolled back interrupted'), ['failure', 'failed']);
+  // unknown, empty, missing, not a string, a leading blank (the first word is then empty), a longer or shorter word: waiting
+  for (const d of ['weird', 'deployedX', 'redeployed', '', '   ', null, undefined, 42, ' deployed', '\ndeployed', 'needsx', 'need']) assert.deepEqual(kind(d), ['in_progress', 'waiting'], String(d));
+  // the time and the URL are carried, the URL only when it is on github.com
+  assert.deepEqual(gateRunOf(['fcode/deploy', 'deployed x', '2026-10-26T01:02:03Z', GATE_URL]), gateRun('success', 'deployed'));
+  for (const u of ['http://github.com/o/r/x', 'https://evil.example/https://github.com/o/r', 'javascript:alert(1)', 'https://github.com/a b', null, 5]) assert.equal(gateRunOf(['fcode/deploy', 'deployed', 'x', u]).url, null, String(u));
+  assert.equal(gateRunOf(['fcode/deploy', 'deployed', 'not a date', null]).at, null);
+  // no status on the head yet
+  assert.deepEqual(gateRunOf(null), WAITING);
+  // the status text is never copied: only the fixed fields come out
+  const r = gateRunOf(['fcode/deploy', 'deployed \u001b[31mEVIL\nsecret', '2026-10-26T01:02:03Z', null]);
+  assert.ok(!JSON.stringify(r).includes('EVIL') && !JSON.stringify(r).includes('secret'));
+});
+
+test('gate status: the first fcode/deploy entry of the newest-first list, found past 100 other statuses (page 2), in any case', () => {
+  const page1 = Array.from({ length: 100 }, (_, i) => stLine(`ci/job-${i}`, 'deployed ok')).join(''); // 100 other statuses, with a deploy-like text
+  const list = page1 + stLine('continuous-integration/x', 'x') + stLine('FCode/Deploy', 'needs human: x') + stLine('fcode/deploy', 'deployed old');
+  assert.deepEqual(gateStatusOf(list)?.[1], 'needs human: x'); // the newer one, from page 2; the older one is ignored
+  assert.equal(gateStatusOf(page1), null);
+  assert.equal(gateStatusOf(''), null);
+  assert.equal(gateStatusOf(stLine('fcode/deploy-x', 'deployed') + stLine('xfcode/deploy', 'deployed') + stLine('fcode', 'deployed')), null); // the context is the whole name
+  assert.throws(() => gateStatusOf('not json\n'));
+});
+
+test('GET /api/home: a gate project (.fcode/deploy.json on the head) shows the fcode/deploy status, found on page 2 in any case, newest first', () => homeApp(async (c) => {
+  const page1 = Array.from({ length: 100 }, (_, i) => stLine(`ci/job-${i}`, 'deployed ok')).join('');
+  c.setRules(gateRules({ statuses: page1 + stLine('FCODE/Deploy', 'Deployed: abc1234 at 2026-10-26') + stLine('fcode/deploy', 'refused old') }));
+  const h = await c.homeUntil((x) => x.projects[0].lastRun?.workflow === 'fcode/deploy' && x.projects[1].lastRun?.workflow === 'fcode/deploy');
+  assert.deepEqual(h.projects.map((p) => p.lastRun), [gateRun('success', 'deployed'), gateRun('success', 'deployed')]);
+  assert.deepEqual(h.projects[0].prs, prsOf(GH.prs)); // the PR checks still come from the Actions runs
+  // the head is resolved once per project and refresh; the config read and the statuses (paginated, 100 a page) use that sha
+  assert.deepEqual(gateCalls(c, 'commits/HEAD'), Array(2).fill('api repos/owner/repo/commits/HEAD --jq .sha'));
+  assert.deepEqual(gateCalls(c, 'contents/'), Array(2).fill(`api repos/owner/repo/contents/.fcode/deploy.json?ref=${HEAD_SHA} --silent`));
+  const st = gateCalls(c, '/statuses');
+  assert.equal(st.length, 2);
+  assert.ok(st.every((l) => l.startsWith(`api repos/owner/repo/commits/${HEAD_SHA}/statuses?per_page=100 --paginate --jq `)));
+  assert.equal(c.toolCalls('run list').length, 2); // the Actions reads stay (PR checks)
+  assert.ok(!JSON.stringify(h).includes('abc1234')); // the status text is not passed on
+  assert.equal(c.logs.filter((l) => /abc1234|Deployed/.test(l)).length, 0);
+}));
+
+test('GET /api/home: every keyword kind through the home view; the status text never reaches the reply or the log', () => homeApp(async (c) => {
+  const cases = [
+    ['deployed abc', 'success', 'deployed'], ['skipped no change', 'success', 'skipped'], ['superseded by x', 'success', 'superseded'],
+    ['queued', 'in_progress', 'waiting'], ['building abc', 'in_progress', 'waiting'], ['paused', 'in_progress', 'waiting'],
+    ['refused no-head', 'failure', 'failed'], ['rolled back x', 'failure', 'failed'], ['config invalid', 'failure', 'failed'],
+    ['needs human: x', 'failure', 'needs_human'], ['something new', 'in_progress', 'waiting'], ['deployed \u001b[31mEVIL_TEXT\nline2', 'success', 'deployed'],
+  ];
+  for (const [i, [desc, status, kind]] of cases.entries()) {
+    const at = `2026-10-26T01:02:${String(10 + i)}Z`;
+    c.setRules(gateRules({ statuses: stLine('fcode/deploy', desc, at) }));
+    const h = i === 0 ? await c.homeUntil((x) => x.projects[0].lastRun) : await ghRefresh(c);
+    assert.deepEqual(h.projects[0].lastRun, gateRun(status, kind, at), desc);
+    assert.ok(!JSON.stringify(h).includes('EVIL_TEXT'));
+  }
+  assert.equal(c.logs.filter((l) => /EVIL_TEXT/.test(l)).length, 0);
+}));
+
+test('GET /api/home: a gate project with no status on the head (or only other contexts) is waiting; the repo is not sticky yet', () => homeApp(async (c) => {
+  c.setRules(gateRules({ statuses: '' }));
+  let h = await c.homeUntil((x) => x.projects[0].lastRun && x.projects[1].lastRun);
+  assert.deepEqual(h.projects.map((p) => p.lastRun), [WAITING, WAITING]);
+  assert.ok(!fs.existsSync(path.join(c.configDir, 'gate-repos.json'))); // the context was never seen
+  c.setRules(gateRules({ statuses: stLine('ci/x', 'deployed') }));
+  h = await ghRefresh(c);
+  assert.deepEqual(h.projects[0].lastRun, WAITING);
+  assert.ok(!fs.existsSync(path.join(c.configDir, 'gate-repos.json')));
+}));
+
+test('GET /api/home: not a gate project (no config on the head, not in gate-repos.json) keeps the Actions deploy line; the no-config answer is kept 10 minutes', () => homeApp(async (c) => {
+  c.setRules(gateRules({ config: NO_CONFIG, statuses: stLine('fcode/deploy', 'needs human') })); // a status that would show if the repo were read as a gate project
+  let h = await c.homeUntil((x) => x.projects[0].lastRun && x.projects[1].lastRun);
+  assert.deepEqual(h.projects.map((p) => p.lastRun), [SHIP, SHIP]);
+  assert.deepEqual(h.projects.map((p) => p.lastRun.kind), [undefined, undefined]); // the Actions line has exactly its four fields
+  assert.equal(gateCalls(c, '/statuses').length, 0);
+  assert.ok(!fs.existsSync(path.join(c.configDir, 'gate-repos.json')));
+  const heads = gateCalls(c, 'commits/HEAD').length;
+  assert.ok(heads >= 1);
+  // 2 minutes later: the "no config" answer is still fresh, no gh api call at all
+  h = await ghRefresh(c);
+  assert.deepEqual([h.projects[0].lastRun, gateCalls(c, 'commits/HEAD').length], [SHIP, heads]);
+  // after 10 minutes the config is looked at again; the repo has it now: a gate project
+  c.clock.t += 600e3;
+  c.setRules(gateRules({ statuses: stLine('fcode/deploy', 'deployed abc') }));
+  h = await ghRefresh(c);
+  assert.deepEqual(h.projects[0].lastRun, gateRun('success', 'deployed'));
+  assert.ok(gateCalls(c, 'commits/HEAD').length > heads);
+}));
+
+test('GET /api/home: gate-repos.json is written once when the context is first seen and kept; config deleted afterwards -> still a gate project', () => {
+  const writes = [];
+  return homeApp(async (c) => {
+    const gateFile = path.join(c.configDir, 'gate-repos.json');
+    const gateWrites = () => writes.filter((w) => w === 'gate-repos.json').length;
+    c.setRules(gateRules({ statuses: stLine('fcode/deploy', 'deployed abc') }));
+    await c.homeUntil((x) => x.projects[0].lastRun?.workflow === 'fcode/deploy' && x.projects[1].lastRun?.workflow === 'fcode/deploy');
+    await c.app.homeIdle();
+    assert.deepEqual(JSON.parse(fs.readFileSync(gateFile, 'utf8')), ['owner/repo']);
+    if (process.platform !== 'win32') assert.equal(fs.statSync(gateFile).mode & 0o777, 0o600);
+    assert.equal(gateWrites(), 1); // two projects on one repo: one write
+    // .fcode/deploy.json gone from the head and no status on it: still a gate project (waiting), never the Actions line, and no config read any more
+    const reads = gateCalls(c, 'contents/').length;
+    c.setRules(gateRules({ config: NO_CONFIG, statuses: '' }));
+    let h = await ghRefresh(c);
+    assert.deepEqual(h.projects.map((p) => p.lastRun), [WAITING, WAITING]);
+    assert.equal(gateCalls(c, 'contents/').length, reads);
+    // a later status of another kind is shown; the file is not written again, 10 minutes later either
+    c.setRules(gateRules({ config: NO_CONFIG, statuses: stLine('fcode/deploy', 'refused x') }));
+    c.clock.t += 600e3;
+    h = await ghRefresh(c);
+    assert.deepEqual(h.projects[0].lastRun, gateRun('failure', 'failed'));
+    assert.equal(gateWrites(), 1);
+    assert.deepEqual(JSON.parse(fs.readFileSync(gateFile, 'utf8')), ['owner/repo']);
+    assert.ok(!fs.readdirSync(c.configDir).some((f) => f.endsWith('.tmp'))); // atomic write: no temp file left
+  }, { writePrivate: (f, d) => { writes.push(path.basename(f)); return writePrivate(f, d); } });
+});
+
+test('GET /api/home: gate-repos.json from an earlier run: no config on the head -> still a gate project (no config read); a bad file is an empty list', async () => {
+  await homeApp(async (c) => {
+    c.setRules(gateRules({ config: NO_CONFIG, statuses: stLine('fcode/deploy', 'needs human') }));
+    const h = await c.homeUntil((x) => x.projects[0].lastRun && x.projects[1].lastRun);
+    assert.deepEqual(h.projects.map((p) => p.lastRun), [gateRun('failure', 'needs_human'), gateRun('failure', 'needs_human')]);
+    assert.equal(gateCalls(c, 'contents/').length, 0);
+  }, seedGate(JSON.stringify(['Owner/Repo', 7, null]))); // case-insensitive; an entry that is not a string is ignored
+  await homeApp(async (c) => {
+    c.setRules(gateRules({ config: NO_CONFIG, statuses: stLine('fcode/deploy', 'needs human') }));
+    const h = await c.homeUntil((x) => x.projects[0].lastRun && x.projects[1].lastRun);
+    assert.deepEqual(h.projects.map((p) => p.lastRun), [SHIP, SHIP]); // not a gate project
+  }, seedGate('{not json'));
+});
+
+test('GET /api/home: a failing gh call never makes a 500 or a wrong line (gate project: null; other repo: the Actions line)', async () => {
+  // a gate project (sticky): head unreadable or not a sha, statuses failing or not the expected lines -> lastRun null, the reply is still 200
+  await homeApp(async (c) => {
+    const sets = [gateRules({ head: GH_FAIL }), gateRules({ head: { stdout: 'oops\n' } }), gateRules({ statuses: GH_FAIL }), gateRules({ statuses: 'not json at all\n' }),
+      gateRules({ statuses: stLine('fcode/deploy', 'deployed') })];
+    c.setRules(sets[0]);
+    let h = await c.homeUntil((x) => x.projects[0].repo && x.projects[1].repo);
+    await c.app.homeIdle();
+    h = await c.home();
+    assert.deepEqual(h.projects.map((p) => p.lastRun), [null, null]);
+    for (const rules of sets.slice(1, 4)) {
+      c.setRules(rules);
+      h = await ghRefresh(c);
+      assert.deepEqual(h.projects.map((p) => p.lastRun), [null, null]);
+      assert.deepEqual(h.projects[0].prs, prsOf(GH.prs));
+    }
+    c.setRules(sets[4]); // and it recovers on the next read
+    h = await ghRefresh(c);
+    assert.deepEqual(h.projects[0].lastRun, gateRun('success', 'deployed'));
+    assert.equal(c.logs.filter((l) => /token-in-url|Bad Gateway/.test(l)).length, 0);
+  }, seedGate(JSON.stringify(['owner/repo'])));
+  // not known to be a gate project: a config read failing with something that is not a 404 -> the Actions line, and the question is asked again
+  await homeApp(async (c) => {
+    c.setRules(gateRules({ config: GH_FAIL }));
+    let h = await c.homeUntil((x) => x.projects[0].lastRun && x.projects[1].lastRun);
+    assert.deepEqual(h.projects.map((p) => p.lastRun), [SHIP, SHIP]);
+    c.setRules(gateRules({ head: GH_FAIL }));
+    h = await ghRefresh(c);
+    assert.deepEqual(h.projects[0].lastRun, SHIP);
+    const reads = gateCalls(c, 'contents/').length;
+    c.setRules(gateRules({ statuses: stLine('fcode/deploy', 'deployed') })); // a failure is not remembered as "no config": the very next refresh reads it again
+    h = await ghRefresh(c);
+    assert.deepEqual(h.projects[0].lastRun, gateRun('success', 'deployed'));
+    assert.ok(gateCalls(c, 'contents/').length > reads);
+    assert.equal(c.logs.filter((l) => /token-in-url|Bad Gateway/.test(l)).length, 0);
+  });
+});
+
+test('GET /api/home: a failed gate-repos.json write is not fatal and is retried at the next refresh; the line is still the status', () => {
+  let attempts = 0;
+  return homeApp(async (c) => {
+    c.setRules(gateRules({ statuses: stLine('fcode/deploy', 'deployed abc') }));
+    await c.homeUntil((x) => x.projects[0].lastRun?.kind === 'deployed' && x.projects[1].lastRun?.kind === 'deployed');
+    await c.app.homeIdle();
+    assert.ok(attempts >= 1);
+    assert.ok(!fs.existsSync(path.join(c.configDir, 'gate-repos.json')));
+    const before = attempts;
+    const h = await ghRefresh(c);
+    assert.ok(attempts > before); // retried
+    assert.deepEqual(h.projects[0].lastRun, gateRun('success', 'deployed'));
+  }, { writePrivate: (f, d) => { if (path.basename(f) === 'gate-repos.json') { attempts++; throw new Error('disk full'); } return writePrivate(f, d); } });
+});
 
 test('GET /api/home never waits long: a slow part is empty the first time, then served from the cache while it refreshes', () => homeApp(async (c) => {
   c.setRules([['usage --json', { file: FIX('omp-usage.json'), delay: 1500 }], ['pr list', { stdout: '[]', delay: 1500 }], ...baseRules()]);

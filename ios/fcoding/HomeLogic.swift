@@ -235,16 +235,19 @@ struct HomeRun: Decodable {
     var status: String
     var at: Date?
     var url: String?
+    /// Deploy-gate projects only (workflow "fcode/deploy"): "deployed" | "skipped" | "superseded" | "waiting" | "failed" | "needs_human". Nil on a GitHub Actions line.
+    var kind: String?
 
-    init(status: String, at: Date?) { workflow = ""; self.status = status; self.at = at }
+    init(status: String, at: Date?, kind: String? = nil) { workflow = ""; self.status = status; self.at = at; self.kind = kind }
 
-    private enum K: String, CodingKey { case workflow, status, at, url }
+    private enum K: String, CodingKey { case workflow, status, at, url, kind }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: K.self)
         workflow = c.value(.workflow) ?? ""
         status = c.value(.status) ?? ""
         at = c.date(.at)
         url = c.value(.url)
+        kind = c.value(.kind)
     }
 }
 
@@ -634,6 +637,13 @@ enum HomeLogic {
     static func deployLine(_ run: HomeRun?, now: Date) -> (text: String, tone: Tone) {
         guard let run = run else { return ("deploy: chưa có", .none) }
         let when = run.at.map { ago(now.timeIntervalSince($0)) }
+        switch run.kind ?? "" {
+        case "deployed": return ("✓ đã deploy" + (when.map { " " + $0 } ?? ""), .ok)
+        case "skipped": return ("– deploy bỏ qua", .none)
+        case "superseded": return ("– deploy thay bằng bản mới", .none)
+        case "needs_human": return ("⚠ deploy cần người xử lý", .warn)
+        default: break // "waiting" and "failed" read like the status below; an Actions line has no kind
+        }
         switch run.status {
         case "success": return ("✓ deploy " + (when ?? ""), .ok)
         case "failure": return ("✗ deploy lỗi" + (when.map { " · " + $0 } ?? ""), .fail)
@@ -1263,6 +1273,16 @@ enum HomeLogic {
         // Projects
         eq("deploy ok", deployLine(HomeRun(status: "success", at: now.addingTimeInterval(-3 * hr)), now: now).text, "✓ deploy 3 giờ trước")
         eq("deploy none", deployLine(nil, now: now).text, "deploy: chưa có")
+        // Deploy gate (commit status fcode/deploy): kind refines the status
+        eq("gate deployed", deployLine(HomeRun(status: "success", at: now.addingTimeInterval(-3 * hr), kind: "deployed"), now: now).text, "✓ đã deploy 3 giờ trước")
+        eq("gate deployed no time", deployLine(HomeRun(status: "success", at: nil, kind: "deployed"), now: now).text, "✓ đã deploy")
+        eq("gate skipped", deployLine(HomeRun(status: "success", at: now, kind: "skipped"), now: now).text, "– deploy bỏ qua")
+        eq("gate superseded", deployLine(HomeRun(status: "success", at: now, kind: "superseded"), now: now).text, "– deploy thay bằng bản mới")
+        eq("gate waiting", deployLine(HomeRun(status: "in_progress", at: nil, kind: "waiting"), now: now).text, "◷ đang deploy")
+        eq("gate failed", deployLine(HomeRun(status: "failure", at: now.addingTimeInterval(-3 * hr), kind: "failed"), now: now).text, "✗ deploy lỗi · 3 giờ trước")
+        eq("gate needs human", deployLine(HomeRun(status: "failure", at: now, kind: "needs_human"), now: now).text, "⚠ deploy cần người xử lý")
+        eq("gate needs human tone", deployLine(HomeRun(status: "failure", at: now, kind: "needs_human"), now: now).tone, .warn)
+        eq("gate unknown kind", deployLine(HomeRun(status: "success", at: now.addingTimeInterval(-3 * hr), kind: "later-kind"), now: now).text, "✓ deploy 3 giờ trước")
         eq("ago", ago(55 * 60), "55 phút trước")
 
         // Donut
@@ -1290,7 +1310,7 @@ enum HomeLogic {
         {"box":{"state":"running","sleepsAt":"2027-01-15T10:00:00.000Z","maxRunMinutes":480},
          "accounts":[{"id":"x","harness":"Codex","email":"e@x","windows":[{"key":"5h","label":"5 giờ","usedPercent":18,"resetsAt":"2027-01-15T09:00:00Z","periodSeconds":18000},{"key":"7d","label":"7 ngày","usedPercent":null}],"resets":{"available":1,"target":"openai-codex/4"},"spend":{"today":{"usd":3.1,"tokens":8200000},"daily30":[{"date":"2027-01-02","usd":1,"tokens":2},{"date":"2027-01-01","usd":1,"tokens":1}]}},
                      {"harness":5}],
-         "projects":[{"name":"deal-sync","prs":null,"lastRun":null},{"name":"c","repo":null,"branch":null,"prs":null,"lastRun":null,"loading":true},{"name":"b","prs":[{"number":6,"checks":"failure"}]}],
+         "projects":[{"name":"deal-sync","prs":null,"lastRun":null},{"name":"c","repo":null,"branch":null,"prs":null,"lastRun":null,"loading":true},{"name":"b","prs":[{"number":6,"checks":"failure"}],"lastRun":{"workflow":"fcode/deploy","status":"failure","kind":"needs_human","at":"2027-01-15T08:00:00.000Z","url":null}}],
          "totals":"broken"}
         """
         if let h = try? JSONDecoder().decode(HomeData.self, from: Data(json.utf8)) {
@@ -1306,6 +1326,7 @@ enum HomeLogic {
             eq("pr line failed", prLine(h.projects.first), "chưa đọc được GitHub")
             eq("pr line count", prLine(h.projects.last), "**1** PR đang mở")
             eq("pr line loading", prLine(h.projects.dropFirst().first), "đang đọc…")
+            eq("decode gate kind", h.projects.last?.lastRun?.kind, "needs_human")
             eq("decode checks", checksLine(h.projects.last?.prs, branch: nil).text, "✗ checks PR lỗi")
             eq("decode sleeps", h.box?.sleepsAt, now.addingTimeInterval(2 * hr))
         } else {
