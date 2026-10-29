@@ -12,9 +12,23 @@ final class HomeModel: ObservableObject {
     @Published private(set) var loading = false
     /// Server clock minus this phone's clock, from `generatedAt` (0 until a reply has one).
     @Published private(set) var offset: TimeInterval = 0
+    /// `home` is the copy saved on this phone (ResponseCache), not yet confirmed by the box: the
+    /// quota is dimmed and labelled "đang cập nhật · <loadedAt>". `loadedAt` is then when that
+    /// copy arrived. Cleared by the first good reply.
+    @Published private(set) var fromCache = false
+    private var restored = false
 
     /// Now on the server's clock: compare server times (sleepsAt, resetsAt, run times) with this.
     func serverNow(_ date: Date = Date()) -> Date { date.addingTimeInterval(offset) }
+
+    /// "đang cập nhật · 14:05" (the day too when older than today) while `home` is the saved copy.
+    var cacheLabel: String? {
+        guard fromCache, let at = loadedAt else { return nil }
+        let time = Calendar.current.isDateInToday(at)
+            ? at.formatted(date: .omitted, time: .shortened)
+            : at.formatted(.dateTime.day().month(.twoDigits).hour().minute())
+        return "đang cập nhật · " + time
+    }
 
     private var current: Task<Void, Never>?
     /// Requests started so far, and the number of the one in flight.
@@ -24,6 +38,17 @@ final class HomeModel: ObservableObject {
     /// One request at a time; a call during one waits for it. `fresh`: the reply must come from
     /// a request started after this call (one already in flight may carry older server state).
     func load(_ app: AppState, fresh: Bool = false) async {
+        await run(app, fresh: fresh, force: false)
+    }
+
+    /// Pull to refresh: GET api/home?fresh=1, so the box redoes every part older than 10 s and
+    /// waits for it (contract T20 §2). Started after this call, never shared with a running load.
+    func refresh(_ app: AppState) async {
+        await run(app, fresh: true, force: true)
+    }
+
+    private func run(_ app: AppState, fresh: Bool, force: Bool) async {
+        restore(app)
         let needed = starts + 1
         while let running = current {
             if !fresh || currentIndex >= needed { await running.value; return }
@@ -34,19 +59,39 @@ final class HomeModel: ObservableObject {
         currentIndex = index
         // Cleared inside the task, so a waiter never sees a finished task as still running.
         let task = Task {
-            await self.fetch(app)
+            await self.fetch(app, force: force)
             if self.currentIndex == index { self.current = nil }
         }
         current = task
         await task.value
     }
 
-    private func fetch(_ app: AppState) async {
+    /// Once, before the first request: the saved reply for this server and login, if it decodes.
+    private func restore(_ app: AppState) {
+        guard !restored else { return }
+        restored = true
+        guard home == nil, let api = app.api else { return }
+        let key = ResponseCache.key(server: api.base.absoluteString, token: api.token)
+        guard let saved = ResponseCache.load("home", key: key) else { return }
+        guard let reply = ResponseCache.decode(HomeData.self, saved.data) else {
+            ResponseCache.remove("home", key: key)
+            return
+        }
+        if reply.generatedAt != nil {
+            offset = HomeLogic.clockOffset(generatedAt: reply.generatedAt, received: saved.savedAt)
+        }
+        home = reply
+        loadedAt = saved.savedAt
+        fromCache = true
+    }
+
+    private func fetch(_ app: AppState, force: Bool) async {
         guard let api = app.api else { return }
         loading = true
         defer { loading = false }
         do {
-            let reply = try await api.get("api/home", as: HomeData.self)
+            let data = try await api.call("GET", "api/home", query: force ? [URLQueryItem(name: "fresh", value: "1")] : [])
+            let reply = try JSONDecoder().decode(HomeData.self, from: data)
             let received = Date()
             if reply.generatedAt != nil {
                 offset = HomeLogic.clockOffset(generatedAt: reply.generatedAt, received: received)
@@ -54,9 +99,15 @@ final class HomeModel: ObservableObject {
             home = reply
             loadedAt = received
             failed = false
+            fromCache = false
+            // Not after a sign-out or re-pair that happened while the request was out.
+            if app.token == api.token {
+                ResponseCache.save(data, "home", key: ResponseCache.key(server: api.base.absoluteString, token: api.token))
+            }
         } catch {
             // A 401 goes back to pairing; anything else keeps the last data, marked old.
             _ = app.report(error)
+            if app.token == nil { ResponseCache.clear() }
             if !(error is CancellationError) { failed = true }
         }
     }
