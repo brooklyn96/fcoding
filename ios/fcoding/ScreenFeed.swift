@@ -535,7 +535,7 @@ enum ScreenFeed {
         let dupSaved = dup.position(firstVisible: 2, col: 0, lines: s2, atBottom: false, time: 2)
         if dupSaved.fromEnd != 14 || topLine(dupSaved, in: s2) != 2 { failures.append("reading duplicate save: \(dupSaved.fromEnd)") }
         // Follow helper: land on `first`, then apply each later screen in its own layout pass.
-        func follow(_ first: [String], top: Int, _ later: [[String]]) -> (Reading, [Goal]) {
+        func follow(_ first: [String], top: Int, _ later: [[String]]) -> (Reading, [Reading.Goal]) {
             var r = Reading(record: anchor(first, top: top, time: 1))
             r.screen(first)
             var goals = [r.layout()]
@@ -558,7 +558,8 @@ enum ScreenFeed {
         let ttCut = Array(tt.dropFirst(4))
         let ttMore = ttCut + ["p", "q", "r"]
         let ttBoth = Array(ttCut.dropLast())
-        for (name, s, want) in [("top trim", ttCut, 4), ("top trim + copy", ttMore, 7), ("both ends", ttBoth, 3)] {
+        let trims: [(String, [String], Int)] = [("top trim", ttCut, 4), ("top trim + copy", ttMore, 7), ("both ends", ttBoth, 3)]
+        for (name, s, want) in trims {
             let (r, goals) = follow(tt, top: 6, [s])
             if goals != [.line(6, col: 0), .line(2, col: 0)] || savedEnd(r, s) != want {
                 failures.append("reading \(name): \(goals) \(savedEnd(r, s))")
@@ -572,7 +573,7 @@ enum ScreenFeed {
         }
         // The anchor gone after landing: free, comparison state cleared.
         let (lost, lostGoals) = follow(tt, top: 6, [["start", "zz", "end"]])
-        if lostGoals.last != Goal.none || lost.target != .free || lost.applied != nil { failures.append("reading lost: \(lost.target)") }
+        if lostGoals.last != Reading.Goal.none || lost.target != .free || lost.applied != nil { failures.append("reading lost: \(lost.target)") }
         // The loading line resolves nothing; the landed line and baseline stay.
         var ld = follow(tt, top: 6, []).0
         ld.screen(nil)
@@ -588,7 +589,7 @@ enum ScreenFeed {
         geoR.screen(old)
         let geoGoals = [geoR.layout(), geoR.layout(), geoR.layout()]
         geoR.screen(old)
-        if geoGoals != Array(repeating: .line(2, col: 7), count: 3) || geoR.layout() != .line(2, col: 7) {
+        if geoGoals != [Reading.Goal](repeating: .line(2, col: 7), count: 3) || geoR.layout() != .line(2, col: 7) {
             failures.append("reading geometry/restyle: \(geoGoals) \(geoR.goal)")
         }
         // A drag or a jump ends following and clears the baseline.
