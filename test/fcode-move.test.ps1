@@ -990,6 +990,48 @@ T 'A33: hold_active=- (cannot be counted) is not 0: copy (g) stops with 65, cuto
   Reset-World; [void](Seed 'planned'); Add-Rule 'newbox' ' status' -Seq @(@{ Out = @('MOVE state move_id=x role=dst'); Code = 0 })
   Eq (Run-Move @('copy')).Code 1
 }
+# ============================== E3: measured cutover estimate ==============================
+function StMs([string]$Transfer, [string]$Ms) { @{ Out = @("MOVE state move_id=x role=dst machine=new finished=no frozen=0 hold_active=0 transfer=$Transfer$(if ($Ms) { ' transfer_ms=' + $Ms }) manifest_sha=-"); Code = 0 } }
+T 'E3 est_cut_s = 60 + transfer_s + ceil(db_mb / 30), db_mb = pgdb + pgroles + LOCAL image items only (files, sqlite, non-local images do not count)' {
+  $o = [pscustomobject]@{ items = @(
+      [pscustomobject]@{ kind = 'pgdb'; size_mb = 300; meta = [pscustomobject]@{} }, [pscustomobject]@{ kind = 'pgroles'; size_mb = 1; meta = [pscustomobject]@{} },
+      [pscustomobject]@{ kind = 'image'; size_mb = 90; meta = [pscustomobject]@{ local = $true } }, [pscustomobject]@{ kind = 'image'; size_mb = 5000; meta = [pscustomobject]@{ local = $false } },
+      [pscustomobject]@{ kind = 'files'; size_mb = 9000; meta = [pscustomobject]@{} }, [pscustomobject]@{ kind = 'sqlite'; size_mb = 700; meta = [pscustomobject]@{} }) }
+  Eq (Get-MoveEstCut $o 126) (60 + 126 + [Math]::Ceiling(391 / 30)) 'formula'; Eq (Get-MoveEstCut $o 0) 74 'no transfer time: 60 + 14'
+  Eq (Get-MoveEstCut ([pscustomobject]@{ items = @() }) 5) 65 'no db'
+}
+T 'E3 copy: transfer_ms on new''s status line -> transfer_s and est_cut_s saved (ceil seconds), the summary prints both figures and says a copy re-run gives the truest figure' {
+  Reset-World; [void](Seed 'planned'); Add-Rule 'newbox' ' status' -Seq @((StMs 'idle'), (StMs 'running'), (StMs 'done' '125400'))
+  $r = Run-Move @('copy'); Eq $r.Code 0 $r.Text
+  $n = State; Eq $n.transfer_s 126; Eq $n.est_cut_s 196; Eq $n.est_downtime_s 120
+  Ok ($r.Text -match 'ước tính lúc plan: khoảng 2 phút' -and $r.Text -match 'chép mất 126 giây\): khoảng 4 phút') "both figures: $($r.Text)"; Ok ($r.Text -match 'Chạy lại fcode move copy cho số sát nhất') 'says a re-run is truest'
+  Ok ($r.Text -match 'cận trên' -and $r.Text -match 'lần chép đầu tiên') 'a measured figure is called an upper bound'
+  # a re-run uses the new measurement
+  Add-Rule 'newbox' ' status' -Seq @((StMs 'idle'), (StMs 'done' '30000')); $r = Run-Move @('copy'); Eq $r.Code 0; $n = State; Eq $n.transfer_s 30; Eq $n.est_cut_s 100
+  # a re-plan forgets the measurement
+  $r = Run-Move @('plan', 'newbox'); Eq $r.Code 0 $r.Text; $n = State; Eq $n.est_cut_s $null; Eq $n.transfer_s $null; Eq $n.phase 'planned'
+}
+T 'E3 copy: no transfer_ms (absent, or `-`) = no measurement: est_cut_s stays null, the plan figure is used and the summary says so' {
+  foreach ($ms in $null, '-') {
+    Reset-World; [void](Seed 'planned'); Add-Rule 'newbox' ' status' -Seq @((StMs 'idle'), (StMs 'running'), @{ Out = @("MOVE state move_id=x role=dst machine=new finished=no frozen=0 hold_active=0 transfer=done$(if ($ms) { ' transfer_ms=' + $ms }) manifest_sha=-"); Code = 0 })
+    $r = Run-Move @('copy'); Eq $r.Code 0 $r.Text; $n = State; Eq $n.est_cut_s $null; Eq $n.transfer_s $null; Eq $n.phase 'copied'
+    Ok ($r.Text -match 'chưa có số đo' -and $r.Text -match 'khoảng 2 phút') "fallback summary: $($r.Text)"
+  }
+}
+T 'E3 Q-cut and Q-back use est_cut_s when the state has it (ceil minutes) and est_downtime_s otherwise; an old state file without the fields loads and works' {
+  Reset-World; $s = Seed 'copied'; Set-MoveProp $s 'est_cut_s' 196; Set-MoveProp $s 'transfer_s' 126; Save-MoveState $s
+  $r = Run-Move @('cutover'); Ok ($r.Text.Contains('khoảng 4 phút')) "Q-cut uses est_cut_s: $($r.Text)"; Ok (-not $r.Text.Contains('khoảng 2 phút')) 'not the plan figure'
+  Reset-World; $s = Seed 'cut' 'fwd' 'plan'; Set-MoveProp $s 'est_cut_s' 301; Save-MoveState $s; $script:Tunneled = $true
+  $r = Run-Move @('back'); Ok ($r.Text.Contains('khoảng 6 phút')) "Q-back: $($r.Text)"
+  # est_cut_s 0 or absent -> est_downtime_s
+  Reset-World; $s = Seed 'copied'; Set-MoveProp $s 'est_cut_s' 0; Save-MoveState $s; $r = Run-Move @('cutover'); Ok ($r.Text.Contains('khoảng 2 phút')) 'zero = no figure'
+  # an old state file: the two fields are not in the JSON at all
+  Reset-World; $s = Seed 'copied'; $j = [IO.File]::ReadAllText((Get-MovePath 'state.json')) | ConvertFrom-Json; $j.PSObject.Properties.Remove('est_cut_s'); $j.PSObject.Properties.Remove('transfer_s'); [IO.File]::WriteAllText((Get-MovePath 'state.json'), ($j | ConvertTo-Json -Depth 8), $utf8)
+  $o = State; Ok ($null -eq $o.est_cut_s -and $null -eq $o.transfer_s) 'fields really absent'; Eq $o.phase 'copied'
+  $r = Run-Move @('status'); Eq $r.Code 0; $r = Run-Move @('cutover'); Ok ($r.Text.Contains('khoảng 2 phút')) 'old file: plan figure'; Eq (Count 'x-never') 0
+  Reset-World; [void](Seed 'planned'); $j = [IO.File]::ReadAllText((Get-MovePath 'state.json')) | ConvertFrom-Json; $j.PSObject.Properties.Remove('est_cut_s'); [IO.File]::WriteAllText((Get-MovePath 'state.json'), ($j | ConvertTo-Json -Depth 8), $utf8)
+  Add-Rule 'newbox' ' status' -Seq @((StMs 'idle'), (StMs 'done' '1000')); $r = Run-Move @('copy'); Eq $r.Code 0 $r.Text; Eq (State).est_cut_s 71 'an old file gets the fields at the next copy'
+}
 # ============================== round 5 (arbitration: a cutover in flight is a mark) ==============================
 function Seed-Mark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan', [string]$Phase = 'copied') {
   $s = Seed $Phase $Dir $Via $Mark

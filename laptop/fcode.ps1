@@ -1299,7 +1299,7 @@ function Save-MoveState($S) { Write-PhienText (Get-MovePath 'state.json') (Conve
 function New-MoveState([string]$Id, [string]$Dir, [string]$Via, $Old, $New) {
   [pscustomobject][ordered]@{
     schema = 1; move_id = $Id; dir = $Dir; via = $Via; old = $Old; new = $New
-    manifest_sha = ''; est_downtime_s = 0; cap_s = 1800
+    manifest_sha = ''; est_downtime_s = 0; est_cut_s = $null; transfer_s = $null; cap_s = 1800
     phase = 'planned'; mark = $null; cut_at = $null; cut_not_before = $null; dst_started = $false
     answers = [pscustomobject][ordered]@{ cut = $null; back = $null; finish = $null; finish_early = $null }
     repos = @()
@@ -1863,7 +1863,14 @@ function Get-MovePushScan($Apps, [string]$OldAddr) {
 
 
 # ---- questions (DESIGN.md section 1, verbatim). The agent asks in chat; the CLI also needs the typed word YES, as `deploy add` does ----
-function Get-MoveMinutes($S) { [int][Math]::Max(1, [Math]::Ceiling([double]$S.est_downtime_s / 60)) }
+# est_cut_s = 60 + transfer_s + ceil(db_mb / 30) (CONTRACT section 2 gains it; db_mb = pgdb, pgroles and local image items), from a manifest object
+function Get-MoveEstCut($Obj, [int]$TransferS) {
+  $db = 0.0
+  foreach ($it in @($Obj.items)) { if ((@('pgdb', 'pgroles') -ccontains [string]$it.kind) -or ([string]$it.kind -ceq 'image' -and $it.meta.local -eq $true)) { $db += [double]$it.size_mb } }
+  [int](60 + $TransferS + [Math]::Ceiling($db / 30))
+}
+# the "<N> phút" of Q-cut / Q-back and the copy summary: the measured est_cut_s when the state has it (old state files do not), else the plan-time est_downtime_s
+function Get-MoveMinutes($S) { $sec = if ($null -ne $S.est_cut_s -and [double]$S.est_cut_s -gt 0) { [double]$S.est_cut_s } else { [double]$S.est_downtime_s }; [int][Math]::Max(1, [Math]::Ceiling($sec / 60)) }
 function Get-MoveQuestion([string]$Kind, $S) {
   $n = Get-MoveMinutes $S
   switch -CaseSensitive ($Kind) {
@@ -2045,6 +2052,7 @@ function Invoke-MovePlan($S0, [string]$Alias, [string]$MapFile, [bool]$New) {
   $merged = @(foreach ($n in @($r.Repos)) { $e = @(@($S.repos) | Where-Object { $_.repo -ceq $n.repo -and $_.workflow -ceq $n.workflow })[0]; if ($e) { $n.enabled = [bool]$e.enabled }; $n })
   Set-MoveProp $S 'repos' $merged
   Set-MoveProp $S 'manifest_sha' $r.Sha; Set-MoveProp $S 'est_downtime_s' ([int]$r.Obj.est_downtime_s); Set-MoveProp $S 'cap_s' (Get-MoveCap $r.Obj)
+  Set-MoveProp $S 'est_cut_s' $null; Set-MoveProp $S 'transfer_s' $null   # a new plan: the copy has to be measured again
   Set-MoveProp $S 'phase' 'planned'; Set-MoveProp $S 'mark' $null
   Save-MoveManifest $r.Text
   $mp = Get-MovePath 'move-map.json'
@@ -2073,7 +2081,7 @@ function Wait-MoveTransferEnd([string]$NewHost) {
     $st = Invoke-MoveGate $NewHost 'status' '' @() -Quiet
     if ($st.Code -ne 0) { $bad++; if ($bad -ge 12) { Write-Host "lỗi: mất liên lạc với máy mới '$NewHost' khi đang chép."; return 1 }; continue }
     $bad = 0; $v = ''
-    foreach ($l in $st.Lines) { if ("$l" -match '\AMOVE state .*\btransfer=([a-z]+)') { $v = $Matches[1] } }
+    foreach ($l in $st.Lines) { if ("$l" -match '\AMOVE state .*\btransfer=([a-z]+)') { $v = $Matches[1]; $script:MoveTransferMs = $(if ("$l" -match '\btransfer_ms=([0-9]+)') { [long]$Matches[1] } else { $null }) } }
     if ($v -cne $last) { Write-Host "transfer: $(if ($v) { $v } else { '?' })"; $last = $v }
     if ($v -ceq 'done') { return 0 }
     if ($v -ceq 'failed') { Write-Host "lỗi: transfer thất bại trên máy mới (xem /var/lib/fcode-move/transfer.out trên đó); chạy lại lệnh để thử lại."; return 1 }
@@ -2153,14 +2161,22 @@ function Invoke-MoveCopy($S) {
   $r = Invoke-MoveGate $src 'dump' $id
   if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
   Write-Host "copy (i): chép dữ liệu (máy mới kéo / đẩy trực tiếp)..."
+  $script:MoveTransferMs = $null
   $x = Invoke-MoveTransfer $newH $id $false; if ($x -ne 0) { return $x }
+  $copyMs = $script:MoveTransferMs   # transfer_ms of new's `MOVE state` line once the transfer is done ('-' / absent = null)
   Write-Host "copy (j): adopt và restore trên '$dst'..."
   foreach ($v in 'adopt', 'restore') { $r = Invoke-MoveGate $dst $v $id; if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) } }
   Write-Host "copy (k): verify (chỉ báo cáo)..."
   $r = Invoke-MoveGate $newH 'verify' $id
   if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
+  # E3: the cutover's final transfer takes about as long as this copy's last transfer (same roots, same link, rsync delta): the measured figure replaces the plan-time guess
+  $ms = $copyMs
+  Set-MoveProp $S 'transfer_s' $(if ($null -ne $ms) { [int][Math]::Ceiling($ms / 1000.0) } else { $null })
+  Set-MoveProp $S 'est_cut_s' $(if ($null -ne $ms) { Get-MoveEstCut $m2.Obj ([int]$S.transfer_s) } else { $null })
   Set-MoveProp $S 'phase' 'copied'; Save-MoveState $S
-  Write-Host "Copy xong (giai đoạn: copied). Chạy lại fcode move copy để làm mới bất cứ lúc nào. Khi sẵn sàng:  fcode move cutover"
+  $figs = if ($null -ne $S.est_cut_s) { "ước tính lúc plan: khoảng $([int][Math]::Ceiling([double]$S.est_downtime_s / 60)) phút; theo lần chép vừa xong (chép mất $($S.transfer_s) giây): khoảng $(Get-MoveMinutes $S) phút" } else { "ước tính lúc plan: khoảng $(Get-MoveMinutes $S) phút (máy mới chưa báo thời gian chép nên chưa có số đo)" }
+  $ub = if ($null -ne $S.est_cut_s) { " Số đo của lần chép đầu tiên là cận trên: nó chép gần hết dữ liệu, còn cutover chỉ chép phần đã thay đổi nên thường ngắn hơn." } else { '' }
+  Write-Host "Copy xong (giai đoạn: copied). Thời gian tạm dừng của cutover: $figs.$ub Chạy lại fcode move copy cho số sát nhất và để làm mới bất cứ lúc nào. Khi sẵn sàng:  fcode move cutover"
   0
 }
 
@@ -2372,7 +2388,7 @@ function Invoke-MoveFinish($S, [string]$Do) {
 # phase cut: Q-back, then a new run with src and dst swapped (plan on its src with the saved move-map and manifest), then its copy and cutover
 function Invoke-MoveBackStart($S, [string]$MapFile = '') {
   $N = New-MoveState ([guid]::NewGuid().ToString()) $(if ([string]$S.dir -ceq 'fwd') { 'back' } else { 'fwd' }) 'back' $S.old $S.new
-  Set-MoveProp $N 'est_downtime_s' $S.est_downtime_s; Set-MoveProp $N 'cap_s' $S.cap_s; Set-MoveProp $N 'cut_at' $S.cut_at
+  Set-MoveProp $N 'est_downtime_s' $S.est_downtime_s; Set-MoveProp $N 'est_cut_s' $S.est_cut_s; Set-MoveProp $N 'transfer_s' $S.transfer_s; Set-MoveProp $N 'cap_s' $S.cap_s; Set-MoveProp $N 'cut_at' $S.cut_at   # the forward run's measured figure is the best one for Q-back; the back run's own copy measures again
   Set-MoveProp $N 'repos' @($S.repos); Set-MoveProp $N 'backups' $S.backups
   $mapText = $null; $newMap = $false
   if ($MapFile) { $m = Read-MoveMapFile $MapFile; if ($m.Err) { return 65 }; $mapText = $m.Text; $newMap = $true }   # a bad map is refused before the question
