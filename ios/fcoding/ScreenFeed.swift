@@ -168,6 +168,12 @@ enum ScreenFeed {
         return (y, number, count)
     }
 
+    /// The scroll offset that shows the last line at the bottom of a `view` tall scroll view, or the
+    /// top when the content fits (UIScrollView offsets start at -insetTop).
+    static func bottomOffset(content: Double, view: Double, insetTop: Double, insetBottom: Double) -> Double {
+        Swift.max(-insetTop, content + insetBottom - view)
+    }
+
     /// Fixed cases for the splitter and the patch apply; one line per failure (empty = all pass).
     static func selfTest() -> [String] {
         var failures: [String] = []
@@ -271,6 +277,12 @@ enum ScreenFeed {
                      pg(100, true, max: 200), pg(0, true, max: 0), pg(0, true, by: 0)]
         let wantPages = ["100.0 2 3", "120.0 3 3", "nil", "20.0 1 3", "0.0 1 3", "nil", "200.0 3 3", "nil", "nil"]
         if pages != wantPages { failures.append("page: \(pages)") }
+        // Bottom jump: a tall screen ends at the view's bottom edge (also under a bottom inset); a
+        // short one stays at the top.
+        let bottoms = [bottomOffset(content: 4800, view: 700, insetTop: 0, insetBottom: 0),
+                       bottomOffset(content: 4800, view: 700, insetTop: 10, insetBottom: 34),
+                       bottomOffset(content: 300, view: 700, insetTop: 10, insetBottom: 0)]
+        if bottoms != [4100, 4134, -10] { failures.append("bottom offset: \(bottoms)") }
         return failures
     }
 }

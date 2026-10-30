@@ -430,22 +430,29 @@ struct TerminalView: View {
     @StateObject private var scroll = ScrollState()
     @Environment(\.scenePhase) private var scenePhase
 
-    private static func jump(_ scroll: ScrollState, _ proxy: ScrollViewProxy, animated: Bool = false) {
+    /// To the bottom, after this update. Set on the scroll view itself from the measured content
+    /// height: a `proxy.scrollTo` can be dropped (the first screen laid out during the push), and a
+    /// jump that moves nothing changes no content frame, so in an idle session nothing ever asked
+    /// again and the view stayed at the top of the capture. `setContentOffset` always lands.
+    private static func jump(_ scroll: ScrollState, _ proxy: ScrollViewProxy, _ model: SessionModel, animated: Bool = false) {
         scroll.restore = nil
         if !scroll.atBottom { scroll.atBottom = true }
         DispatchQueue.main.async {
-            if animated {
-                withAnimation { proxy.scrollTo("bottom", anchor: .bottom) }
-            } else {
-                proxy.scrollTo("bottom", anchor: .bottom)
+            guard let s = model.scrollView else {
+                // Not attached yet (only the loading line is laid out): SwiftUI's own scroll.
+                return proxy.scrollTo("bottom", anchor: .bottom)
             }
+            let inset = s.adjustedContentInset
+            let y = ScreenFeed.bottomOffset(content: scroll.contentHeight, view: s.bounds.height,
+                                            insetTop: inset.top, insetBottom: inset.bottom)
+            s.setContentOffset(CGPoint(x: s.contentOffset.x, y: y), animated: animated)
         }
     }
 
     /// Open / return at the bottom: atBottom on and pinned until the user's first scroll.
-    private static func pin(_ scroll: ScrollState, _ proxy: ScrollViewProxy) {
+    private static func pin(_ scroll: ScrollState, _ proxy: ScrollViewProxy, _ model: SessionModel) {
         scroll.pinned = true
-        jump(scroll, proxy)
+        jump(scroll, proxy, model)
     }
 
     /// The finger drags the scroll view or its fling runs. Not `isTracking` alone: that is a resting
@@ -506,7 +513,7 @@ struct TerminalView: View {
 
     /// Open / return: the bottom (no record, or the user was there), else wait for the next screen.
     private static func reopen(_ scroll: ScrollState, _ proxy: ScrollViewProxy, _ model: SessionModel, _ key: String) {
-        guard let p = positions[key], !p.bottom else { return pin(scroll, proxy) }
+        guard let p = positions[key], !p.bottom else { return pin(scroll, proxy, model) }
         scroll.pinned = false
         scroll.restore = p
         scroll.restoreAfter = model.screens
@@ -521,11 +528,13 @@ struct TerminalView: View {
         guard let p = scroll.restore, scroll.screen > scroll.restoreAfter, scroll.screen == model.screens,
               let lines = plainLines(model), let s = model.scrollView else { return }
         scroll.restore = nil
-        guard let top = ScreenFeed.topLine(p, in: lines) else { return pin(scroll, proxy) }
+        guard let top = ScreenFeed.topLine(p, in: lines) else { return pin(scroll, proxy, model) }
         let inset = s.adjustedContentInset
         let lineH = (scroll.contentHeight - 2 * SessionModel.vPad - 1) / CGFloat(lines.count)
         let y = SessionModel.vPad + CGFloat(top) * lineH - inset.top
-        guard y < scroll.contentHeight + inset.bottom - s.bounds.height else { return pin(scroll, proxy) }
+        let bottom = ScreenFeed.bottomOffset(content: scroll.contentHeight, view: s.bounds.height,
+                                             insetTop: inset.top, insetBottom: inset.bottom)
+        guard y < bottom else { return pin(scroll, proxy, model) }
         // After this layout pass, like the jumps.
         DispatchQueue.main.async { s.setContentOffset(CGPoint(x: s.contentOffset.x, y: y), animated: false) }
     }
@@ -558,8 +567,11 @@ struct TerminalView: View {
                 .background(ScrollProbe { [model, scroll, proxy] in
                     $0.scrollsToTop = false
                     model.scrollView = $0
-                    // A restore that waited for the scroll view: after this update, like the jumps.
-                    DispatchQueue.main.async { TerminalView.restore(scroll, proxy, model) }
+                    // What waited for the scroll view, after this update like the jumps: a pinned
+                    // view's bottom jump (an earlier one may have been a dropped scrollTo), or a restore.
+                    DispatchQueue.main.async {
+                        if scroll.pinned { TerminalView.jump(scroll, proxy, model) } else { TerminalView.restore(scroll, proxy, model) }
+                    }
                 })
             }
             .coordinateSpace(name: "term")
@@ -593,18 +605,18 @@ struct TerminalView: View {
                 if scroll.pinned {
                     // Any size change, or a landing short of the bottom: jump (again).
                     if grew || !nearBottom {
-                        TerminalView.jump(scroll, proxy)
+                        TerminalView.jump(scroll, proxy, model)
                     }
                 } else if grew, scroll.atBottom {
                     // Decided by the state from before this update; scrolled up = never moved.
-                    TerminalView.jump(scroll, proxy)
+                    TerminalView.jump(scroll, proxy, model)
                 }
                 TerminalView.restore(scroll, proxy, model)
             }
             .onChange(of: viewportHeight) { _ in
-                if scroll.atBottom { TerminalView.jump(scroll, proxy) }
+                if scroll.atBottom { TerminalView.jump(scroll, proxy, model) }
             }
-            .onChange(of: bottomRequest) { _ in TerminalView.jump(scroll, proxy) }
+            .onChange(of: bottomRequest) { _ in TerminalView.jump(scroll, proxy, model) }
             .onChange(of: restoreRequest) { _ in TerminalView.reopen(scroll, proxy, model, positionKey) }
             .onChange(of: scenePhase) { phase in
                 // .inactive too: the app switcher can kill the app before it ever reaches .background.
@@ -620,7 +632,7 @@ struct TerminalView: View {
             .overlay(alignment: jumpOnLeft ? .bottomLeading : .bottomTrailing) {
                 // Only content taller than the viewport can be away from the bottom.
                 if !scroll.atBottom, scroll.contentHeight > viewportHeight {
-                    Button { TerminalView.jump(scroll, proxy, animated: true) } label: {
+                    Button { TerminalView.jump(scroll, proxy, model, animated: true) } label: {
                         Image(systemName: "arrow.down")
                             .font(.system(size: 15, weight: .bold))
                             .foregroundColor(.white)
