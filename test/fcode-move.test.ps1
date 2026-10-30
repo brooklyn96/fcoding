@@ -801,6 +801,23 @@ T 'back: Q-back, a new run (new move_id, dir flipped, via back, repos/backups/cu
   Eq (Get-MoveReachOld 'contabo') 'contabo' 'the reverse alias rewrite ran'; Ok ($script:Coder.Config -notmatch 'contabo-old') 'and the coder one'
   Eq (Count '^(contabo|contabo-old) tunnels') 0
 }
+T 'back --map <file>: the given map is validated before the question, sent as the plan map, and replaces the saved move-map only after the plan passed; without --map the saved one is used; --map is refused outside the start of a back' {
+  $mp = Join-Path $Root 'backmap.json'; $new = '{"schema":1,"map":[],"exclude":[{"match":{"cron":"abcdef01"},"reason":"added on new"}]}'; [IO.File]::WriteAllText($mp, $new, $utf8)
+  Reset-World; $script:Tunneled = $true; [void](Seed 'cut'); [IO.File]::WriteAllText((Get-MovePath 'move-map.json'), '{"schema":1,"map":[],"exclude":[]}', $utf8); Yes
+  $r = Run-Move @('back', '--map', $mp); Eq $r.Code 0 $r.Text
+  $pi = $script:GateIn | Where-Object { $_.Verb -ceq 'plan' }; Ok ($pi.Stdin.Contains('"abcdef01"')) 'the new map is in the plan stdin'
+  Eq ([IO.File]::ReadAllText((Get-MovePath 'move-map.json'))) $new 'saved map replaced'
+  # a refused plan keeps the saved map; a bad map file is refused before the question (no prompt, no call, state unchanged)
+  Reset-World; $script:Tunneled = $true; [void](Seed 'cut'); $old = '{"schema":1,"map":[],"exclude":[]}'; [IO.File]::WriteAllText((Get-MovePath 'move-map.json'), $old, $utf8); $bytes = [IO.File]::ReadAllText((Get-MovePath 'state.json'))
+  Yes; Add-Rule 'newbox' ' plan$' -Code 65 -Out @('INV refuse unmapped', 'GATE_EXIT 65'); $r = Run-Move @('back', '--map', $mp); Eq $r.Code 65; Eq ([IO.File]::ReadAllText((Get-MovePath 'move-map.json'))) $old 'saved map kept after a refused plan'; Eq ([IO.File]::ReadAllText((Get-MovePath 'state.json'))) $bytes
+  foreach ($bad in 'not json', ('{"a":"' + ('x' * 17000) + '"}')) { Reset-World; [void](Seed 'cut'); $bf = Join-Path $Root 'badback.json'; [IO.File]::WriteAllText($bf, $bad, $utf8); Yes; $r = Run-Move @('back', '--map', $bf); Eq $r.Code 65; Ok ($r.Text -match 'INV refuse map-invalid') 'map-invalid'; Eq $script:Log.Count 0 'no call'; Eq $script:Prompts.Count 0 'before the question' }
+  Reset-World; [void](Seed 'cut'); $r = Run-Move @('back', '--map', (Join-Path $Root 'nope.json')); Eq $r.Code 65; Eq $script:Log.Count 0
+  # usage: --map needs a file, only once
+  Reset-World; [void](Seed 'cut'); foreach ($w in @(@('back', '--map'), @('back', '--map', $mp, '--map', $mp), @('back', 'x'))) { $r = Run-Move $w; Eq $r.Code 65 ($w -join ' '); Eq $script:Log.Count 0 }
+  # outside the start of a back: refused with one line, nothing runs
+  Reset-World; [void](Seed 'copied' 'back' 'back'); Yes; $r = Run-Move @('back', '--map', $mp); Eq $r.Code 65; Eq $script:Log.Count 0; Eq $script:Prompts.Count 0; Ok ($r.Text -match '--map')
+  Reset-World; [void](Seed 'planned'); $r = Run-Move @('back', '--map', $mp); Eq $r.Code 65; Eq $script:Log.Count 0
+}
 T 'back: a refused plan leaves the cut run exactly as it was; no YES = nothing' {
   Reset-World; $script:Tunneled = $true; $s = Seed 'cut'; $bytes = [IO.File]::ReadAllText((Get-MovePath 'state.json'))
   $r = Run-Move @('back'); Eq $r.Code 65; Eq $script:Log.Count 0
@@ -889,8 +906,15 @@ T 'cutover: transfer --final that finds a copy transfer still RUNNING waits for 
 }
 T 'plan: the dst disk check counts only the dump space when dst holds this peer''s copy (re-plan after copy) or is old in a back run; a foreign dst keeps the full formula' {
   $own = @('INV host os=ubuntu-24.04 arch=x86_64 cpus=2 mem_mb=4000 swap_mb=0 tz=UTC node_major=22', 'INV disk mount=/ used_mb=1 free_mb=4695', 'INV target moveid=11111111-2222-3333-4444-555555555555 peer=contabo projects=6')
-  Reset-World; $script:Pf['newbox'] = $own; $r = Run-Move @('plan', 'newbox'); Eq $r.Code 65; Ok ($r.Text.Contains('INV refuse disk side=dst need_mb=4696 free_mb=4695')) "own: $($r.Text)"
-  Reset-World; $script:Pf['newbox'] = @($own | ForEach-Object { $_ -replace 'free_mb=4695', 'free_mb=4696' }); $r = Run-Move @('plan', 'newbox'); Eq $r.Code 0 $r.Text
+  foreach ($ph in 'copied', 'rolled-back') {
+    Reset-World; [void](Seed $ph); $script:Pf['newbox'] = $own; $r = Run-Move @('plan', 'newbox'); Eq $r.Code 65; Ok ($r.Text.Contains('INV refuse disk side=dst need_mb=4696 free_mb=4695')) "re-plan in $($ph): $($r.Text)"
+    Reset-World; [void](Seed $ph); $script:Pf['newbox'] = @($own | ForEach-Object { $_ -replace 'free_mb=4695', 'free_mb=4696' }); $r = Run-Move @('plan', 'newbox'); Eq $r.Code 0 $r.Text
+  }
+  # a copy cut off between init and transfer leaves the peer's move-id on dst with phase planned (or a fresh plan on such a target): the full formula applies
+  foreach ($ph in 'planned', 'none') {
+    Reset-World; if ($ph -ceq 'planned') { [void](Seed 'planned') }; $script:Pf['newbox'] = @($own | ForEach-Object { $_ -replace 'free_mb=4695', 'free_mb=4696' })
+    $r = Run-Move @('plan', 'newbox'); Eq $r.Code 65 "phase $ph"; Ok ($r.Text.Contains('INV refuse disk side=dst need_mb=7462 free_mb=4696')) "phase $($ph): full formula: $($r.Text)"
+  }
   Reset-World; $script:Pf['newbox'] = @('INV host os=ubuntu-24.04 arch=x86_64 cpus=2 mem_mb=4000 swap_mb=0 tz=UTC node_major=22', 'INV disk mount=/ used_mb=1 free_mb=4696', 'INV target moveid=- peer=- projects=0')
   $r = Run-Move @('plan', 'newbox'); Eq $r.Code 65; Ok ($r.Text.Contains('need_mb=7462')) 'foreign dst: full formula'
   Reset-World; $script:Tunneled = $true; [void](Seed 'cut'); Yes
@@ -1111,11 +1135,12 @@ T 'scripts: the bootstrap key script run for real (stub tools, throw-away FCM_RO
   [IO.File]::WriteAllText((Join-Path $bin 'node'), "#!/bin/bash`necho 22`n"); & chmod +x (Get-ChildItem $bin | ForEach-Object { $_.FullName })
   if (-not (Get-Command ssh-keygen -CommandType Application -ErrorAction SilentlyContinue)) { Write-Host '  (no ssh-keygen here: skipped)'; return }
   $f = Join-Path $Root 'bk.sh'; [IO.File]::WriteAllText($f, (Get-MoveBootstrapKeyScript) + "`n", $utf8)
-  $savedPath = $env:PATH; $env:PATH = "$bin$([IO.Path]::PathSeparator)$env:PATH"; $env:FCM_ROOT = $R
+  $stubNode = Join-Path $bin 'node'
+  $savedPath = $env:PATH; $env:PATH = "$bin$([IO.Path]::PathSeparator)$env:PATH"; $env:FCM_ROOT = $R; $env:FCM_NODE = $stubNode
   try {
     $o1 = @(& bash $f newbox "$OldAddr ssh-ed25519 $KeyOld" 22 2>&1 | ForEach-Object { "$_" }); Eq $LASTEXITCODE 0 ($o1 -join ' | ')
     $o2 = @(& bash $f newbox "$OldAddr ssh-ed25519 $KeyOld" 22 2>&1 | ForEach-Object { "$_" }); Eq $LASTEXITCODE 0
-  } finally { $env:PATH = $savedPath; $env:FCM_ROOT = $null }
+  } finally { $env:PATH = $savedPath; $env:FCM_ROOT = $null; $env:FCM_NODE = $null }
   Ok ($o1[-1] -match '^MOVE key created name=newbox pub_b64=\S+$') "first run: $($o1 -join ' | ')"; Ok ($o2[-1] -match '^MOVE key exists name=newbox pub_b64=\S+$') 'second run: exists'
   $p1 = ($o1[-1] -replace '^.*pub_b64=', ''); $p2 = ($o2[-1] -replace '^.*pub_b64=', ''); Eq $p1 $p2 'same key'; Ok ($p1 -notmatch '=') 'no padding'
   while ($p1.Length % 4) { $p1 += '=' }; $pub = $utf8.GetString([Convert]::FromBase64String($p1)); Ok ($pub -cmatch '\Assh-ed25519 [A-Za-z0-9+/=]+\z') "public key: $pub"
@@ -1125,9 +1150,19 @@ T 'scripts: the bootstrap key script run for real (stub tools, throw-away FCM_RO
   if (-not $IsWindows -and $PSVersionTable.PSEdition -eq 'Core') { Eq ((& stat -c '%a' (Join-Path $R 'root/.ssh/fcode-move'))) '600' 'private key 0600'; Eq ((& stat -c '%a' (Join-Path $R 'var/lib/fcode-move'))) '700' 'move dir 0700' }
   # a missing tool the stub dir cannot satisfy: exit 70 with MOVE error tool-missing (no apt in the way: apt-get stubbed to fail)
   Remove-Item (Join-Path $bin 'flock'); [IO.File]::WriteAllText((Join-Path $bin 'apt-get'), "#!/bin/bash`nexit 1`n"); & chmod +x (Join-Path $bin 'apt-get')
-  $savedPath = $env:PATH; $env:PATH = "$bin$([IO.Path]::PathSeparator)/usr/bin$([IO.Path]::PathSeparator)/bin"; $env:FCM_ROOT = $R
-  try { $o3 = @(& bash $f newbox - 22 2>&1 | ForEach-Object { "$_" }); $rc3 = $LASTEXITCODE } finally { $env:PATH = $savedPath; $env:FCM_ROOT = $null }
+  $savedPath = $env:PATH; $env:PATH = "$bin$([IO.Path]::PathSeparator)/usr/bin$([IO.Path]::PathSeparator)/bin"; $env:FCM_ROOT = $R; $env:FCM_NODE = $stubNode
+  try { $o3 = @(& bash $f newbox - 22 2>&1 | ForEach-Object { "$_" }); $rc3 = $LASTEXITCODE } finally { $env:PATH = $savedPath; $env:FCM_ROOT = $null; $env:FCM_NODE = $null }
   if (Test-Path /usr/bin/flock) { Write-Host '  (flock is a real tool here: the missing-tool leg is skipped)' } else { Eq $rc3 70; Ok ($o3 -match 'MOVE error tool-missing') 'tool-missing' }
+  # node that is only first on PATH, not at the gate's /usr/bin/node: not accepted (the stub apt-get fails, so it ends in tool-missing, exit 70)
+  $R2 = Join-Path $Root 'fcmroot2b'; [void](New-Item -ItemType Directory -Force -Path $R2)
+  $bin2 = Join-Path $Root 'fakebin2b'; [void](New-Item -ItemType Directory -Force -Path $bin2)
+  foreach ($t in 'rsync', 'git', 'curl', 'flock', 'fallocate', 'mkfs.ext4', 'mountpoint', 'mount', 'losetup', 'systemd-run', 'systemctl') { [IO.File]::WriteAllText((Join-Path $bin2 $t), "#!/bin/bash`nexit 0`n") }
+  [IO.File]::WriteAllText((Join-Path $bin2 'node'), "#!/bin/bash`necho 22`n"); [IO.File]::WriteAllText((Join-Path $bin2 'apt-get'), "#!/bin/bash`nexit 1`n"); & chmod +x (Get-ChildItem $bin2 | ForEach-Object { $_.FullName })
+  $savedPath = $env:PATH; $env:PATH = "$bin2$([IO.Path]::PathSeparator)$env:PATH"; $env:FCM_ROOT = $R2; $env:FCM_NODE = (Join-Path $Root 'no-such-node')
+  try { $o4 = @(& bash $f newbox - 22 2>&1 | ForEach-Object { "$_" }); $rc4 = $LASTEXITCODE } finally { $env:PATH = $savedPath; $env:FCM_ROOT = $null; $env:FCM_NODE = $null }
+  Eq $rc4 70 ($o4 -join ' | '); Ok ([bool]($o4 -match 'MOVE error tool-missing')) 'PATH-only node is not the gate''s node'
+  # the default path is the gate's: the script text names /usr/bin/node
+  Ok ((Get-MoveBootstrapKeyScript).Contains('/usr/bin/node')) 'default NODE is /usr/bin/node'
 }
 
 # ============================== source checks ==============================

@@ -682,8 +682,8 @@ function Show-Help([string]$Topic = '') {
       '>fcode deploy allow <tên> [root]',
       '    Duyệt project cho khoá của box (chạy trên laptop, không hỏi lại).',
       '    "root" thêm quyền trust on i-understand-root: in một dòng cảnh báo',
-      '    vàng rồi gửi. Cổng từ chối tên dành riêng, deal-sync, vps-scraper',
-      '    (mã 65).',
+      '    vàng rồi gửi. Cổng từ chối tên dành riêng, và deal-sync, vps-scraper',
+      '    khi chưa đăng ký vào cổng (mã 65).',
       '>fcode deploy disallow <tên>',
       '    Thu hồi quyền đó. Project vẫn nằm trong cổng và vẫn deploy; muốn',
       '    bỏ root thì chạy thêm  fcode deploy <tên> trust off.',
@@ -709,7 +709,7 @@ function Show-Help([string]$Topic = '') {
       'copy@@Cài công cụ, chép trước (chạy lại = làm mới)',
       'cutover@@Tạm dừng, chép nốt, bật bên máy mới, chuyển tunnel',
       'finish@@Bỏ máy cũ (hoặc huỷ lần chuyển chưa xong)',
-      'back@@Chuyển ngược lại (thêm một lần tạm dừng)',
+      'back [--map f]@@Chuyển ngược lại (thêm một lần tạm dừng)',
       'status@@Xem giai đoạn và trạng thái hai máy',
       '',
       '#Lưu ý',
@@ -1152,7 +1152,7 @@ function Confirm-DeployKey([string]$Repo, [string]$Name) {
 
 # fcode deploy add <chu/repo> <ten> <draft.json>: dang ky mot project vao cong (khoa chi doc -> kiem tra Actions -> xem hien trang -> go YES -> register)
 function Invoke-DeployAdd([string[]]$AddArgs) {
-  $reserved = 'deal-sync', 'vps-scraper', 'all', 'admin', 'gate', 'gen', 'src', 'build', 'poll', 'report', 'slot', 'legacy'   # contract C1: khong bao gio dang ky duoc
+  $reserved = 'all', 'admin', 'gate', 'gen', 'src', 'build', 'poll', 'report', 'slot', 'legacy', 'registry'   # the gate's RE_RESERVED / jsontool RESERVED_NAMES: never registrable (deal-sync and vps-scraper are registrable since M8)
   $repo = if ($AddArgs.Count -gt 0) { [string]$AddArgs[0] } else { '' }; $name = if ($AddArgs.Count -gt 1) { [string]$AddArgs[1] } else { '' }
   if ($AddArgs.Count -ne 3 -or -not (Test-DeployRepo $repo) -or -not (Test-DeployName $name) -or $name -cin $reserved) {
     Write-Host 'Cách dùng: fcode deploy add <chủ/repo> <tên> <draft.json>'
@@ -1421,7 +1421,8 @@ alias=$1; known=$2; need=$3
 R=${FCM_ROOT:-}
 MV=$R/var/lib/fcode-move
 key=$R/root/.ssh/fcode-move
-nodemajor() { node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0; }
+NODE=${FCM_NODE:-/usr/bin/node}   # the gate runs /usr/bin/node (fcode-deploy-gate.sh NODE_BIN), not whatever `node` is first on PATH; FCM_NODE is a test hook
+nodemajor() { "$NODE" -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0; }
 missing=
 for t in rsync git curl flock fallocate mkfs.ext4 mountpoint mount losetup systemd-run systemctl ssh-keygen; do command -v "$t" >/dev/null 2>&1 || missing="$missing $t"; done
 have=$(nodemajor)
@@ -1437,9 +1438,10 @@ if [ -n "$missing" ] || [ "${have:-0}" -lt "$need" ]; then
     apt-get install -y -q nodejs >/dev/null 2>&1 || { echo "MOVE error tool-missing name=nodejs"; exit 70; }
   fi
 fi
-for t in rsync git curl flock fallocate mkfs.ext4 mountpoint mount losetup systemd-run systemctl ssh-keygen node; do
+for t in rsync git curl flock fallocate mkfs.ext4 mountpoint mount losetup systemd-run systemctl ssh-keygen; do
   command -v "$t" >/dev/null 2>&1 || { echo "MOVE error tool-missing name=$t"; exit 70; }
 done
+[ -x "$NODE" ] || { echo "MOVE error tool-missing name=node"; exit 70; }
 mkdir -p "$MV" "$R/root/.ssh" && chmod 700 "$MV" "$R/root/.ssh" || { echo "MOVE error bad-request what=dirs"; exit 1; }
 state=exists
 if [ ! -e "$key" ]; then
@@ -1788,7 +1790,7 @@ function Get-MoveDiskFree($Lines) {
 function Get-MoveOsKey([string]$Os) { $p = @("$Os" -split '-', 2); $mj = (@("$($p[1])" -split '\.'))[0]; "$($p[0])-$mj" }
 # the refusals of plan step (6) as `INV refuse ...` lines. $M = manifest, $D = preflight facts of dst, $SrcFree = src `/` free MB, $Repos = state repos.
 # `target-not-empty` and `target-access-path` are not checked in a `back` run ($Back).
-function Get-MoveRefusals($M, $D, [double]$SrcFree, [bool]$ReachOk, $Repos, [string]$OldAlias, [bool]$Back, [bool]$DstHome) {
+function Get-MoveRefusals($M, $D, [double]$SrcFree, [bool]$ReachOk, $Repos, [string]$OldAlias, [bool]$Back, [bool]$DstHome, [bool]$OwnCopy = $false) {
   $r = New-Object 'System.Collections.Generic.List[string]'
   $sumAll = 0.0; $db = 0.0
   foreach ($it in @($M.items)) {
@@ -1798,8 +1800,9 @@ function Get-MoveRefusals($M, $D, [double]$SrcFree, [bool]$ReachOk, $Repos, [str
   if ([string]$M.host.arch -cne $D.Arch) { $r.Add("INV refuse arch src=$($M.host.arch) dst=$($D.Arch)") }
   if ((Get-MoveOsKey ([string]$M.host.os)) -cne (Get-MoveOsKey $D.Os)) { $r.Add("INV refuse os src=$($M.host.os) dst=$($D.Os)") }
   $foreign = ($D.MoveId -ceq '-' -or $D.Peer -cne $OldAlias)
-  # dst already holds this peer's copy (a re-plan after copy) or is old in a back run (it still holds everything): only the dump space is still needed
-  $needDst = $(if ($Back -or -not $foreign) { 2 * $db + 4096 } else { [Math]::Ceiling(1.2 * $sumAll) + 2 * $db + 4096 })
+  # dst already holds this run's finished copy (a re-plan in phase copied / rolled-back) or is old in a back run (it still holds everything): only the dump space is still needed.
+  # A target that holds this peer's move-id but whose copy never finished (phase planned: a copy cut off before transfer) keeps the full formula.
+  $needDst = $(if ($Back -or ($OwnCopy -and -not $foreign)) { 2 * $db + 4096 } else { [Math]::Ceiling(1.2 * $sumAll) + 2 * $db + 4096 })
   if ($D.FreeMb -lt 0 -or $D.FreeMb -lt $needDst) { $r.Add("INV refuse disk side=dst need_mb=$([int64]$needDst) free_mb=$(if ($D.FreeMb -lt 0) { 'unknown' } else { [int64]$D.FreeMb })") }
   $needSrc = $db + 4096
   if ($SrcFree -lt 0 -or $SrcFree -lt $needSrc) { $r.Add("INV refuse disk side=src need_mb=$([int64]$needSrc) free_mb=$(if ($SrcFree -lt 0) { 'unknown' } else { [int64]$SrcFree })") }
@@ -1984,11 +1987,17 @@ function Invoke-MovePlanSteps($S, [string]$MapText, [string]$FromText, [bool]$Ba
     $repos = @($sc.Repos)
   }
   $dstHome = [bool](-not $Back -and [string]$S.new.kind -ceq 'home')
-  $ref = @(Get-MoveRefusals $mf.Obj $D (Get-MoveDiskFree $pr.Lines) $reachOk $repos ([string]$S.old.alias) $Back $dstHome)
+  $ownCopy = [bool]([string]$S.phase -ceq 'copied' -or [string]$S.phase -ceq 'rolled-back')   # only a run whose copy finished can rely on dst already holding its data
+  $ref = @(Get-MoveRefusals $mf.Obj $D (Get-MoveDiskFree $pr.Lines) $reachOk $repos ([string]$S.old.alias) $Back $dstHome $ownCopy)
   foreach ($l in $ref) { Write-Host $l }
   if ("$($S.new.addr)" -cmatch '\A[A-Za-z0-9._:-]{1,255}\z') { $cb = Invoke-MoveBox (Get-MoveTcpScript) @([string]$S.new.addr, [string]$ni.Port); if ($cb.Code -ne 0) { Write-Host 'INV warn coder-unreachable' } }
   if ($serverRefused -or $ref.Count) { return @{ Code = 65 } }
   @{ Code = 0; Obj = $mf.Obj; Text = $mf.Text; Sha = $mf.Sha; Repos = $repos }
+}
+# the move-map file of `plan --map` / `back --map`: <= 16 KiB, JSON. @{ Text } or @{ Err } (the refusal lines are printed here)
+function Read-MoveMapFile([string]$Path) {
+  try { $mb = [IO.File]::ReadAllBytes($Path); $t = [Text.Encoding]::UTF8.GetString($mb).TrimStart([char]0xFEFF); if ($mb.Length -gt 16384) { throw 'quá 16 KiB' }; [void](ConvertFrom-Json $t); @{ Text = $t } }
+  catch { Write-Host "lỗi: move-map không đọc được ($($_.Exception.Message))."; Write-Host 'INV refuse map-invalid'; @{ Err = $true } }
 }
 # fcode move plan <new alias> [--map f]: a new move ($New) or a re-plan of the move in $S0. Returns the exit code.
 function Invoke-MovePlan($S0, [string]$Alias, [string]$MapFile, [bool]$New) {
@@ -2001,10 +2010,8 @@ function Invoke-MovePlan($S0, [string]$Alias, [string]$MapFile, [bool]$New) {
   if (-not $New -and $Alias -cne [string]$S0.new.alias) { Write-Host "lỗi: lần chuyển này nhắm máy '$($S0.new.alias)'. Muốn đổi máy: fcode move finish (huỷ lần này) rồi plan lại."; return 65 }
   if ($New -and (Get-MoveReachOld $oldAlias) -cne $oldAlias) { Write-Host "lỗi: ~/.ssh/config đã có 'Host $oldAlias-old' (lần chuyển trước chưa dọn). Xoá khối đó khi máy cũ đã bỏ, rồi plan lại."; return 65 }
   $mapText = $null
-  if ($MapFile) {
-    try { $mb = [IO.File]::ReadAllBytes($MapFile); $mapText = [Text.Encoding]::UTF8.GetString($mb).TrimStart([char]0xFEFF); if ($mb.Length -gt 16384) { throw 'quá 16 KiB' }; [void](ConvertFrom-Json $mapText) }
-    catch { Write-Host "lỗi: move-map không đọc được ($($_.Exception.Message))."; Write-Host 'INV refuse map-invalid'; return 65 }
-  } elseif (-not $New -and [IO.File]::Exists((Get-MovePath 'move-map.json'))) { $mapText = [IO.File]::ReadAllText((Get-MovePath 'move-map.json')) }
+  if ($MapFile) { $m = Read-MoveMapFile $MapFile; if ($m.Err) { return 65 }; $mapText = $m.Text }
+  elseif (-not $New -and [IO.File]::Exists((Get-MovePath 'move-map.json'))) { $mapText = [IO.File]::ReadAllText((Get-MovePath 'move-map.json')) }
   $oldHost = if ($New) { $oldAlias } else { Get-MoveOldHost $S0 }
   $oi = Get-MoveSshInfo $oldHost; $ni = Get-MoveSshInfo $Alias
   if (-not $oi -or -not $ni) { Write-Host "lỗi: ssh -G không đọc được cấu hình của '$oldHost' hoặc '$Alias'."; return 1 }
@@ -2363,20 +2370,24 @@ function Invoke-MoveFinish($S, [string]$Do) {
   0
 }
 # phase cut: Q-back, then a new run with src and dst swapped (plan on its src with the saved move-map and manifest), then its copy and cutover
-function Invoke-MoveBackStart($S) {
+function Invoke-MoveBackStart($S, [string]$MapFile = '') {
   $N = New-MoveState ([guid]::NewGuid().ToString()) $(if ([string]$S.dir -ceq 'fwd') { 'back' } else { 'fwd' }) 'back' $S.old $S.new
   Set-MoveProp $N 'est_downtime_s' $S.est_downtime_s; Set-MoveProp $N 'cap_s' $S.cap_s; Set-MoveProp $N 'cut_at' $S.cut_at
   Set-MoveProp $N 'repos' @($S.repos); Set-MoveProp $N 'backups' $S.backups
+  $mapText = $null; $newMap = $false
+  if ($MapFile) { $m = Read-MoveMapFile $MapFile; if ($m.Err) { return 65 }; $mapText = $m.Text; $newMap = $true }   # a bad map is refused before the question
   if (-not (Confirm-MoveYes (Get-MoveQuestion 'back' $N))) { Write-Host 'Đã huỷ, chưa đổi gì.'; return 65 }
   Set-MoveProp $N.answers 'back' (New-MoveAnswer)
   $from = Read-MoveManifestFile
   if (-not $from) { Write-Host 'lỗi: chưa có manifest đã lưu của lần chuyển trước (manifest.json).'; return 1 }
   $mp = Get-MovePath 'move-map.json'
-  $mapText = if ([IO.File]::Exists($mp)) { [IO.File]::ReadAllText($mp) } else { $null }
+  if (-not $newMap -and [IO.File]::Exists($mp)) { $mapText = [IO.File]::ReadAllText($mp) }
   $r = Invoke-MovePlanSteps $N $mapText $from.Text $true
   if ($r.Code -ne 0) { return $r.Code }
   Set-MoveProp $N 'manifest_sha' $r.Sha; Set-MoveProp $N 'est_downtime_s' ([int]$r.Obj.est_downtime_s); Set-MoveProp $N 'cap_s' (Get-MoveCap $r.Obj)
-  Save-MoveManifest $r.Text; Save-MoveState $N
+  Save-MoveManifest $r.Text
+  if ($newMap) { Write-PhienText (Get-MovePath 'move-map.json') $mapText }   # the given map replaces the saved one only after the plan passed
+  Save-MoveState $N
   Write-Host 'INV ok'
   $c = Invoke-MoveCopy $N; if ($c -ne 0) { return $c }
   Invoke-MoveCutover $N
@@ -2404,7 +2415,7 @@ function Invoke-MoveDispatch($Act, $S, [string]$Alias, [string]$MapFile) {
     'copy' { Invoke-MoveCopy $S }
     { $_ -in 'cutover', 'cutover-continue', 'chores' } { Invoke-MoveCutover $S }
     { $_ -in 'finish', 'abandon', 'abandon-rollback', 'done' } { Invoke-MoveFinish $S $Act.Do }
-    'back-start' { Invoke-MoveBackStart $S }
+    'back-start' { Invoke-MoveBackStart $S $MapFile }
     'back-copy-cutover' { $c = Invoke-MoveCopy $S; if ([int]@($c)[-1] -ne 0) { [int]@($c)[-1] } else { Invoke-MoveCutover $S } }
     default { Write-Host "lỗi: việc '$($Act.Do)' không biết."; 1 }
   }
@@ -2414,16 +2425,16 @@ function Invoke-Move {
   $a = @($Rest | Select-Object -Skip 1)
   $verb = if ($a.Count -gt 0) { [string]$a[0] } else { '' }
   $usage = {
-    Write-Host 'Cách dùng: fcode move plan <máy mới> [--map <file>] | copy | cutover | finish | back | status'
+    Write-Host 'Cách dùng: fcode move plan <máy mới> [--map <file>] | copy | cutover | finish | back [--map <file>] | status'
     Write-Host '  Chi tiết: fcode help move'
   }
   if ($verb -cnotin 'plan', 'copy', 'cutover', 'finish', 'back', 'status') { & $usage; return 65 }
   $alias = ''; $mapFile = ''
-  if ($verb -ceq 'plan') {
+  if ($verb -ceq 'plan' -or $verb -ceq 'back') {   # back [--map <file>] replaces the saved move-map for the reverse run
     $i = 1
     while ($i -lt $a.Count) {
       if ($a[$i] -ceq '--map') { if ($i + 1 -ge $a.Count -or $mapFile) { & $usage; return 65 }; $mapFile = [string]$a[$i + 1]; $i += 2 }
-      elseif (-not $alias -and ([string]$a[$i]) -notmatch '\A-') { $alias = [string]$a[$i]; $i++ }
+      elseif ($verb -ceq 'plan' -and -not $alias -and ([string]$a[$i]) -notmatch '\A-') { $alias = [string]$a[$i]; $i++ }
       else { & $usage; return 65 }
     }
   } elseif ($a.Count -gt 1) { & $usage; return 65 }
@@ -2433,6 +2444,7 @@ function Invoke-Move {
   try {
     $S = Read-MoveState
     $act = Resolve-MoveAction $verb $S
+    if ($mapFile -and $verb -ceq 'back' -and $act.Do -cne 'back-start' -and $act.Do -cne 'refuse') { Write-Host "lỗi: --map chỉ dùng được khi bắt đầu lần quay lại (lần chuyển đã xong, giai đoạn 'cut'); lần này đã có move-map riêng."; return 65 }
     $res = @(Invoke-MoveDispatch $act $S $alias $mapFile)
     return [int]$res[-1]
   } catch {
