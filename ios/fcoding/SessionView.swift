@@ -440,7 +440,6 @@ struct TerminalText: UIViewRepresentable {
         scroll.coordinator = c
         // The model holds new screens while the finger is on it or it is still moving.
         model.scrollView = v
-        c.model = model
         // .inactive too: the app switcher can kill the app before it ever reaches the background.
         NotificationCenter.default.addObserver(c, selector: #selector(Coordinator.save),
                                                name: UIApplication.willResignActiveNotification, object: nil)
@@ -495,8 +494,6 @@ struct TerminalText: UIViewRepresentable {
         var dirty = false
         var lastGeo: TermTextView.Geo?
         var animateNext = false
-        weak var model: SessionModel?
-        var evidenceShown = false
 
         init(scroll: ScrollState) { self.scroll = scroll }
 
@@ -581,13 +578,6 @@ final class TermTextView: UITextView {
         case .none: break
         }
         c.publish()
-        // Evidence for the device checks (drop this commit after them): the first applied pass of
-        // a real screen, in the error banner.
-        if !c.evidenceShown, c.lines != nil {
-            c.evidenceShown = true
-            c.model?.errorText = "open \(c.reading.target) y=\(Int(contentOffset.y)) bottom=\(Int(bottom)) "
-                + "content=\(Int(geo.contentH)) view=\(Int(bounds.height)) inset=\(Int(geo.inset.top))/\(Int(geo.inset.bottom))"
-        }
     }
 
     override func safeAreaInsetsDidChange() {
