@@ -178,9 +178,22 @@ enum ScreenFeed {
         /// The layout pass that applies the displayed screen: resolve it, then the goal.
         /// Unresolved anchor: found → that line; not found → the bottom (nothing shown to lose).
         /// Landed anchor: found → follow it; not found → free (keep the live offset), never the bottom.
+        /// Each resolve stores the found line's distance from the end. While following, output only
+        /// appends, so a copy at least that far from the end wins over a newer copy below it.
         mutating func layout() -> Goal {
-            if fresh, case .anchor(let p, let line) = target, let lines = shown {
-                if let k = ScreenFeed.topLine(p, in: lines) { target = .anchor(p, line: k) } else { target = line == nil ? .bottom : .free }
+            if fresh, case .anchor(var p, let line) = target, let lines = shown {
+                let hits = lines.indices.filter { ScreenFeed.lineHash(lines, $0) == p.hash }
+                let fromEnd = p.fromEnd
+                func nearest(_ c: [Int]) -> Int? {
+                    c.min { abs(lines.count - $0 - fromEnd) < abs(lines.count - $1 - fromEnd) }
+                }
+                let ahead = line == nil ? [] : hits.filter { lines.count - $0 >= fromEnd }
+                if let at = nearest(ahead) ?? nearest(hits) {
+                    p.fromEnd = lines.count - at
+                    target = .anchor(p, line: max(0, at - p.below))
+                } else {
+                    target = line == nil ? .bottom : .free
+                }
             }
             fresh = false
             return goal
@@ -367,7 +380,7 @@ enum ScreenFeed {
             let r = Reading(record: rec)
             if r.goal != .bottom || !r.pinned { failures.append("reading record \(String(describing: rec)): \(r.target)") }
         }
-        func with(_ p: Position, time: Double) -> Position { var p = p; p.time = time; return p }
+        func with(_ p: Position, time: Double, fromEnd: Int? = nil) -> Position { var p = p; p.time = time; p.fromEnd = fromEnd ?? p.fromEnd; return p }
         // A saved line waits for a screen; the loading line resolves nothing.
         var r = Reading(record: at)
         if r.goal != .none { failures.append("reading pending goal: \(r.goal)") }
@@ -381,7 +394,7 @@ enum ScreenFeed {
         let found = r.layout()
         let again = r.goal
         if found != .line(3, col: 0) || again != found || r.goal != found { failures.append("reading found: \(found) \(r.goal)") }
-        if r.position(firstVisible: 3, col: 0, lines: ["x"] + old + ["f"], atBottom: false, time: 4) != with(at, time: 4) {
+        if r.position(firstVisible: 3, col: 0, lines: ["x"] + old + ["f"], atBottom: false, time: 4) != with(at, time: 4, fromEnd: 4) {
             failures.append("reading landed save")
         }
         // Follow: new lines above move the line down.
@@ -423,7 +436,7 @@ enum ScreenFeed {
             let bottom = bottomOffset(content: 2000, view: view, insetTop: 0, insetBottom: 0)
             let y = Swift.min(1500, bottom)
             let saved = clamp.position(firstVisible: 3, col: 0, lines: lines, atBottom: y >= bottom - 24, time: 6)
-            if view == 300, saved != with(at, time: 6) { failures.append("reading clamp 300: \(saved)") }
+            if view == 300, saved != with(at, time: 6, fromEnd: 4) { failures.append("reading clamp 300: \(saved)") }
             if view == 700 {
                 if !saved.bottom || clamp.goal != .line(3, col: 0) { failures.append("reading clamp 700: \(saved) \(clamp.target)") }
                 var reopen = Reading(record: saved)
@@ -462,6 +475,20 @@ enum ScreenFeed {
         if let json = try? JSONEncoder().encode(colAt), (try? JSONDecoder().decode(Position.self, from: json)) != colAt {
             failures.append("position col round trip")
         }
+        // Following keeps the true line when output appends a copy of its window below it, and the
+        // save carries the refreshed distance from the end.
+        let s0 = ["a", "p", "q", "r", "b", "c", "d"]
+        let s1 = s0 + ["e", "f", "g", "h"]
+        let s2 = s1 + ["p", "q", "r", "i", "j"]
+        var dup = Reading(record: anchor(s0, top: 2, time: 1))
+        var dupGoals: [Reading.Goal] = []
+        for s in [s0, s1, s2] {
+            dup.screen(s)
+            dupGoals.append(dup.layout())
+        }
+        if dupGoals != [.line(2, col: 0), .line(2, col: 0), .line(2, col: 0)] { failures.append("reading duplicate follow: \(dupGoals)") }
+        let dupSaved = dup.position(firstVisible: 2, col: 0, lines: s2, atBottom: false, time: 2)
+        if dupSaved.fromEnd != 14 || topLine(dupSaved, in: s2) != 2 { failures.append("reading duplicate save: \(dupSaved.fromEnd)") }
         var colRead = Reading(record: colAt)
         colRead.screen(old)
         if colRead.layout() != .line(2, col: 7) { failures.append("reading col: \(colRead.goal)") }
