@@ -32,7 +32,7 @@ API (JSON; errors as {error:"code"} with HTTP status):
 - POST /api/sessions {name, project, harness} -> 201 {name} | 409 {error:"exists"} | 400 {error:"invalid"}
 - DELETE /api/sessions/:name -> 200 (kill-session) (needs X-PC header too)
 - GET  /api/screen/:name?lines=N (N 50..2000, default 300) -> {text, rows, cols, cursor:{x,y}, hash} ; text = `tmux capture-pane -p -J -S -N` (plain text, no ANSI), trailing blank lines trimmed. Optional `?ansi=1` keeps SGR colours in `text` (see A6); also on /api/stream
-- GET  /api/stream/:name -> text/event-stream; event "screen" with the same JSON whenever hash changes (poll tmux every 700 ms), comment ping every 15 s; ends on logout/session gone (event "gone")
+- GET  /api/stream/:name -> text/event-stream; event "screen" with the same JSON whenever hash changes (poll tmux every 700 ms), comment ping every 15 s; ends on logout/session gone (event "gone"). Optional `?delta=1` (T35, see A6 item 6): after the first full "screen" event the stream may send event "patch" {base, hash, rows, cols, cursor, len, lines:[[i,text],...]} instead
 - POST /api/send/:name {text, enter:boolean} -> 200; multi-line or long text uses `tmux load-buffer -b pc -` (stdin) + `tmux paste-buffer -p -d -b pc -t name` (bracketed paste); single line uses `send-keys -l -t name -- text`; then `send-keys Enter` if enter
 - POST /api/key/:name {key, repeat?:1..20} -> 200 | 400 {error:"bad_key"}
 - POST /api/resize/:name {cols, rows} (cols 20..300, rows 10..200) -> resize-window
@@ -144,6 +144,13 @@ Applies to `GET /api/screen/:name` and `GET /api/stream/:name` (the SSE `screen`
 3. Server-side text matching never sees escapes: prompt detection, the preview and the inbox/overview state work on text with escapes removed. (`/api/overview` reads the pane without `-e` and also strips any escape it meets.)
 4. `hash` covers exactly the `text` that is sent (plus size and cursor, as before). With `ansi=1` a colour-only change gives a new hash, so the stream sends a new event. Trailing lines that hold only SGR and blanks count as blank and are trimmed, like trailing blank lines today.
 5. tmux targets: a call that needs a pane (`capture-pane`, `display-message`, `send-keys`, `paste-buffer`, `resize-window`, `set-option`) uses `-t =<name>:`; a bare `=<name>` does not resolve a pane ("can't find pane"). Calls that need only a session (`has-session`, `kill-session`) use `-t =<name>`.
+
+6. (T35, 2026-10-30) Optional query `delta=1` on `GET /api/stream/:name` only (`/api/screen` ignores it; any other value = off, and then the bytes are exactly as before).
+   - The first event is always a full `event: screen`.
+   - After that the server MAY send `event: patch` instead of `screen`: `data: {"base": "<hash of the last event sent>", "hash": "<new hash>", "rows": R, "cols": C, "cursor": {"x":..,"y":..}, "len": N, "lines": [[i, "line text"], ...]}`. `len` is the new line count (lines are `text.split('\n')`); `lines` holds every index i < len whose line differs from the last SENT screen, with its new text (same SGR form as `text`); lines at index >= len are dropped.
+   - Applying: `new = base.lines[0..<len]` padded with "", set each `[i, s]`, join with "\n". The result equals the full `text` byte for byte, so `hash` stays valid. `hash` semantics are unchanged (it also covers size and cursor: a cursor-only change is a patch with empty `lines`).
+   - The server sends a full `screen` instead when there is no base yet, or when the patch event is at least half the size of the full event.
+   - The base is the last event handed to the socket by this stream. A client whose current hash differs from `base` must drop the stream and reconnect (a new stream starts with a full screen).
 
 ## Amendment A7 (2026-10-26, QR pairing for a new device; r2 after review)
 

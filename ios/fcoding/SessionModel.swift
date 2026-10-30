@@ -3,6 +3,8 @@ import UIKit
 
 /// Live screen of one tmux session: SSE stream with reconnect + backoff,
 /// polling GET /api/screen every 1.5 s while the stream is down.
+/// Reading, decoding, patching and styling run off the main actor (`readStream`, `ScreenRender`);
+/// the main actor only receives the finished styled screen, and holds it while the user scrolls.
 @MainActor
 final class SessionModel: ObservableObject {
     enum Link { case connecting, live, polling, offline }
@@ -12,7 +14,8 @@ final class SessionModel: ObservableObject {
     /// Ask for SGR colour escapes in the screen text (an older server ignores it).
     static let ansi = [URLQueryItem(name: "ansi", value: "1")]
 
-    @Published private(set) var text = ""
+    /// The screen text with its SGR colours and tappable links (or the loading line).
+    @Published private(set) var styled = ScreenRender.loading
     @Published private(set) var link: Link = .connecting
     @Published private(set) var gone = false
     @Published var errorText: String?
@@ -24,29 +27,51 @@ final class SessionModel: ObservableObject {
     /// Generation of the resize whose request is on the wire (past its sleep), if any.
     private var resizeGen = 0
     private var inFlightGen: Int?
-    private var lastHash: String?
     private var sentCols = 0
     private var sentRows = 0
 
     init(name: String) { self.name = name }
 
-    private var styledCache: (text: String, fontSize: Double, cols: Int, joinWraps: Bool, value: AttributedString)?
-    /// Width of the screen in cells (from the server, else the last size sent), for joining
-    /// hard-wrapped links.
-    private var screenCols = 0
+    private lazy var render = ScreenRender { [weak self] value in await self?.show(value) }
+    /// The terminal's scroll view (set by TerminalView): a new screen waits while the finger is on
+    /// it or it is still moving, so a swipe never pays for a re-layout.
+    weak var scrollView: UIScrollView?
+    private var pending: AttributedString?
+    private var flushTask: Task<Void, Never>?
 
-    /// The screen text with its SGR colours and tappable links, built once per screen update
-    /// (text, font size, width), not per frame.
-    /// `joinWraps`: join URLs hard-wrapped across lines (omp sessions only).
-    func styled(fontSize: Double, joinWraps: Bool) -> AttributedString {
-        if let c = styledCache, c.fontSize == fontSize, c.cols == screenCols, c.joinWraps == joinWraps, c.text == text {
-            return c.value
+    /// Font size and wrap joining for the styled screen (`joinWraps`: join URLs hard-wrapped across
+    /// lines, omp sessions only); a change rebuilds it off the main actor.
+    func style(fontSize: Double, joinWraps: Bool) {
+        let render = render
+        Task { await render.style(fontSize: fontSize, joinWraps: joinWraps) }
+    }
+
+    private func show(_ value: AttributedString) {
+        pending = value
+        flush()
+    }
+
+    /// Publishes the newest built screen, or checks again in 0.1 s while the user scrolls.
+    private func flush() {
+        guard let value = pending, flushTask == nil else { return }
+        if let s = scrollView, s.isTracking || s.isDragging || s.isDecelerating {
+            flushTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                self?.flushTask = nil
+                self?.flush()
+            }
+            return
         }
-        let runs = ANSI.runs(text)
-        var value = ANSI.attributed(runs, fonts: ANSI.Fonts(size: CGFloat(fontSize)))
-        Links.apply(Links.find(in: runs.map(\.text).joined(), cols: screenCols, joinWraps: joinWraps), to: &value)
-        styledCache = (text, fontSize, screenCols, joinWraps, value)
-        return value
+        pending = nil
+        screens += 1
+        styled = value
+    }
+
+    /// Bumped with every published screen: a cheap change signal for the view (no text compare).
+    private(set) var screens = 0
+
+    private func setLink(_ value: Link) {
+        if link != value { link = value }
     }
 
     func start(app: AppState) {
@@ -73,8 +98,13 @@ final class SessionModel: ObservableObject {
         while !Task.isCancelled && !gone {
             guard let api = app?.api else { return }
             do {
-                try await readStream(api)
+                try await readStream(api, render)
                 failures = 0
+            } catch is ScreenFeed.Mismatch {
+                // The first in a row reconnects at once (the new stream starts with a full
+                // screen); a repeat takes the backoff and polling path below.
+                if await render.mismatch() { continue }
+                failures += 1
             } catch {
                 if Task.isCancelled || isTerminal(error) { return }
                 failures += 1
@@ -90,9 +120,12 @@ final class SessionModel: ObservableObject {
         }
     }
 
-    private func readStream(_ api: API) async throws {
-        link = .connecting
-        var req = try api.request("GET", "api/stream/\(name)", query: SessionModel.ansi, timeout: 45)
+    /// Off the main actor: the bytes are read and split here, decoded and patched in `render`; the
+    /// main actor only sees link changes, `gone`, and finished screens.
+    private nonisolated func readStream(_ api: API, _ render: ScreenRender) async throws {
+        await setLink(.connecting)
+        let delta = await render.delta
+        var req = try api.request("GET", "api/stream/\(name)", query: ScreenFeed.streamQuery(delta: delta), timeout: 45)
         req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         let (bytes, resp) = try await URLSession.shared.bytes(for: req)
         if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
@@ -104,27 +137,28 @@ final class SessionModel: ObservableObject {
             try API.check(resp, body, token: api.token)
             throw APIError(status: http.statusCode, code: "", token: api.token)
         }
-        link = .live
-        // Split on LF (0x0A) only, dropping a trailing CR. Foundation's `bytes.lines` also ends a
-        // line at U+0085 / U+2028 / U+2029, which JSON leaves unescaped and would cut a data line.
-        // An event is dispatched on its "data:" line (the server sends one data line per event).
+        await setLink(.live)
+        // Lines split on LF only (ScreenFeed.Lines). An event is dispatched on its "data:" line
+        // (the server sends one data line per event).
         var event = ""
-        var buffer: [UInt8] = []
+        var lines = ScreenFeed.Lines()
         for try await byte in bytes {
-            guard byte == 0x0A else {
-                buffer.append(byte)
-                // A runaway line (no LF): give up on the stream; run() falls back to polling.
-                if buffer.count > 4 * 1024 * 1024 { throw URLError(.dataLengthExceedsMaximum) }
-                continue
-            }
-            if buffer.last == 0x0D { buffer.removeLast() }
-            let line = String(decoding: buffer, as: UTF8.self)
-            buffer.removeAll(keepingCapacity: true)
+            guard let line = try lines.push(byte) else { continue }
             if line.hasPrefix("event:") {
-                event = SessionModel.field(line, "event:")
+                event = ScreenFeed.field(line, "event:")
             } else if line.hasPrefix("data:") {
-                if event == "gone" { await handleGone(SessionModel.field(line, "data:"), api); return }
-                if event.isEmpty || event == "screen" { apply(Data(SessionModel.field(line, "data:").utf8)) }
+                let data = ScreenFeed.field(line, "data:")
+                switch event {
+                case "gone":
+                    await handleGone(data, api)
+                    return
+                case "", "screen":
+                    await render.screen(Data(data.utf8))
+                case "patch":
+                    guard await render.patch(Data(data.utf8)) else { throw ScreenFeed.Mismatch() }
+                default:
+                    break
+                }
                 event = ""
             } else if line.isEmpty {
                 event = ""
@@ -135,12 +169,13 @@ final class SessionModel: ObservableObject {
     /// Returns false when the loop must stop (session gone or logged out).
     private func pollOnce(_ api: API) async -> Bool {
         do {
-            apply(try await api.call("GET", "api/screen/\(name)", query: SessionModel.ansi))
-            link = .polling
+            let data = try await api.call("GET", "api/screen/\(name)", query: SessionModel.ansi)
+            await render.screen(data)
+            setLink(.polling)
             return true
         } catch {
             if Task.isCancelled || isTerminal(error) { return false }
-            link = .offline
+            setLink(.offline)
             return true
         }
     }
@@ -163,21 +198,6 @@ final class SessionModel: ObservableObject {
                 _ = isTerminal(error)
             }
         }
-    }
-
-    private func apply(_ data: Data) {
-        guard let screen = try? JSONDecoder().decode(Screen.self, from: data) else { return }
-        if screen.hash == nil || screen.hash != lastHash {
-            lastHash = screen.hash
-            screenCols = screen.cols ?? sentCols
-            if text != screen.text { text = screen.text }
-        }
-    }
-
-    private static func field(_ line: String, _ prefix: String) -> String {
-        var value = line.dropFirst(prefix.count)
-        if value.first == " " { value = value.dropFirst() }
-        return String(value)
     }
 
     /// 404 = session gone, 401 = back to login; both end the loop.
@@ -375,6 +395,97 @@ final class SessionModel: ObservableObject {
             }
             if self.inFlightGen == gen { self.inFlightGen = nil }
         }
+    }
+}
+
+/// Off the main actor: holds the screen (full screens and patches), builds its styled text for the
+/// current font, and hands each finished build to `publish`, rebuilding only for the newest input.
+/// Memory only, for the open screen.
+actor ScreenRender {
+    static let loading = AttributedString("Đang tải màn hình…")
+
+    private struct Input {
+        var text = ""
+        /// Width in cells, for joining hard-wrapped links.
+        var cols = 0
+        /// Nil until the view sets it: nothing is built before.
+        var fontSize: Double?
+        var joinWraps = false
+    }
+
+    private var state = ScreenFeed.State()
+    private var mismatches = ScreenFeed.Mismatches()
+    private var input = Input()
+    private var version = 0
+    private var running = false
+    private let publish: @Sendable (AttributedString) async -> Void
+
+    init(publish: @escaping @Sendable (AttributedString) async -> Void) { self.publish = publish }
+
+    /// A full screen ({text, rows, cols, cursor, hash}), from the stream or the polling fallback.
+    func screen(_ data: Data) {
+        guard let s = try? JSONDecoder().decode(Screen.self, from: data) else { return }
+        state.set(s.text, hash: s.hash)
+        update(s.text, cols: s.cols)
+    }
+
+    /// An `event: patch`; false when it does not apply to the screen held here.
+    func patch(_ data: Data) -> Bool {
+        guard let p = try? JSONDecoder().decode(ScreenFeed.Patch.self, from: data),
+              let text = state.apply(p) else { return false }
+        mismatches.applied()
+        update(text, cols: p.cols)
+        return true
+    }
+
+    /// Records a patch that did not apply; true = reconnect at once (see ScreenFeed.Mismatches).
+    func mismatch() -> Bool { mismatches.record() }
+
+    /// Ask the stream for patches (false after repeated mismatches).
+    var delta: Bool { mismatches.delta }
+
+    func style(fontSize: Double, joinWraps: Bool) {
+        guard fontSize != input.fontSize || joinWraps != input.joinWraps else { return }
+        input.fontSize = fontSize
+        input.joinWraps = joinWraps
+        rebuild()
+    }
+
+    private func update(_ text: String, cols: Int?) {
+        let cols = cols ?? input.cols
+        guard text != input.text || cols != input.cols else { return }
+        input.text = text
+        input.cols = cols
+        rebuild()
+    }
+
+    private func rebuild() {
+        version += 1
+        guard !running, input.fontSize != nil else { return }
+        running = true
+        Task { await self.drain() }
+    }
+
+    /// Builds until a build matches the newest input. One build at a time, so every finished build
+    /// is newer than the one shown and is published; inputs that arrive during a build collapse into
+    /// one next build for the newest input. Slow builds never starve the screen.
+    private func drain() async {
+        var built = -1
+        while built != version {
+            built = version
+            let input = self.input
+            let value = await Task.detached(priority: .userInitiated) { ScreenRender.build(input) }.value
+            await publish(value)
+        }
+        running = false
+    }
+
+    private static func build(_ i: Input) -> AttributedString {
+        guard !i.text.isEmpty else { return loading }
+        let runs = ANSI.runs(i.text)
+        var value = ANSI.attributed(runs, fonts: ANSI.Fonts(size: CGFloat(i.fontSize ?? 13)))
+        Links.apply(Links.find(in: runs.map(\.text).joined(), cols: i.cols, joinWraps: i.joinWraps), to: &value)
+        return value
     }
 }
 
