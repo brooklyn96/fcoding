@@ -2077,11 +2077,12 @@ export function createApp(opts = {}) {
 
   // --- SSE ---
   let streams = 0;
-  async function stream(req, res, name, lines, ctx, ansi) {
+  // delta: after the first (full) event, send `patch` (changed lines vs the last SENT screen) when it is clearly smaller
+  async function stream(req, res, name, lines, ctx, ansi, delta = false) {
     if (streams >= MAX_STREAMS) throw new HttpErr(503, 'busy');
     streams++; // reserved before any await
     let closed = false; let paused = false; let inflight = false;
-    let timer = null; let pingTimer = null; let drainTimer = null; let last = null;
+    let timer = null; let pingTimer = null; let drainTimer = null; let last = null; let lastLines = null;
     const cleanup = () => { // exactly once on every path
       if (closed) return;
       closed = true; streams--;
@@ -2119,7 +2120,17 @@ export function createApp(opts = {}) {
           if (!snap) snap = await getScreen(name, lines, ctx, ansi);
           if (closed) return;
           if (!valid(ctx)) return end('auth');
-          if (snap.hash !== last && send(`event: screen\ndata: ${sseJson(snap)}\n\n`)) last = snap.hash;
+          if (snap.hash !== last) {
+            let chunk = `event: screen\ndata: ${sseJson(snap)}\n\n`;
+            const next = delta ? snap.text.split('\n') : null;
+            if (next && last !== null) {
+              const diff = [];
+              next.forEach((s, i) => { if (s !== lastLines[i]) diff.push([i, s]); });
+              const p = `event: patch\ndata: ${sseJson({ base: last, hash: snap.hash, rows: snap.rows, cols: snap.cols, cursor: snap.cursor, len: next.length, lines: diff })}\n\n`;
+              if (p.length * 2 < chunk.length) chunk = p; // else the patch is not clearly smaller: full screen
+            }
+            if (send(chunk)) { last = snap.hash; lastLines = next; }
+          }
         } catch (e) {
           if (e.status === 404) return end('session');
           if (e.status === 401) return end('auth');
@@ -2342,7 +2353,7 @@ export function createApp(opts = {}) {
         }
         const ansi = url.searchParams.get('ansi') === '1'; // anything else = plain text, as before
         if (verb === 'screen') return json(res, 200, await getScreen(name, lines, ctx, ansi));
-        return stream(req, res, name, lines, ctx, ansi);
+        return stream(req, res, name, lines, ctx, ansi, url.searchParams.get('delta') === '1');
       }
       want('POST');
       const b = parseJson(req, body);
