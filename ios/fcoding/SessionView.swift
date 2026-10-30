@@ -446,12 +446,14 @@ struct TerminalView: View {
         jump(scroll, proxy)
     }
 
-    /// The finger is on the scroll view or its fling is running. With VoiceOver on (its three-finger
-    /// scroll moves the view without a touch on it) or without the scroll view (not found yet) every
-    /// move counts as the user's, so a scroll up is never fought.
-    private static func userScrolling(_ model: SessionModel) -> Bool {
-        guard let s = model.scrollView, !UIAccessibility.isVoiceOverRunning else { return true }
-        return s.isTracking || s.isDragging || s.isDecelerating
+    /// The finger is on the scroll view or its fling is running. With VoiceOver on, also a move of
+    /// more than half the viewport (`by`): its three-finger scroll moves about a page with no touch on
+    /// the view, a layout shift far less. Without the scroll view (not found yet) every move counts
+    /// as the user's, so a scroll up is never fought.
+    private static func userScrolling(_ model: SessionModel, by: CGFloat, viewport: CGFloat) -> Bool {
+        guard let s = model.scrollView else { return true }
+        if s.isTracking || s.isDragging || s.isDecelerating { return true }
+        return UIAccessibility.isVoiceOverRunning && abs(by) > viewport / 2
     }
 
     /// Reading positions by "server|session": in memory while the app runs, mirrored to UserDefaults
@@ -528,7 +530,12 @@ struct TerminalView: View {
                                            value: ContentFrame(minY: f.minY, maxY: f.maxY, height: f.height,
                                                                screen: model.screens))
                 })
-                .background(ScrollProbe { [model] in model.scrollView = $0 })
+                // No status-bar scroll to top here: a move without a drag is never the user's (see
+                // the content-frame handler), so it would fight the bottom pin.
+                .background(ScrollProbe { [model] in
+                    $0.scrollsToTop = false
+                    model.scrollView = $0
+                })
             }
             .coordinateSpace(name: "term")
             .scrollDismissesKeyboard(.interactively)
@@ -540,14 +547,11 @@ struct TerminalView: View {
                 scroll.minY = frame.minY
                 scroll.contentHeight = frame.height
                 let nearBottom = frame.maxY <= viewportHeight + 24
-                let movedDown = moved && frame.minY > oldMinY && !shrank
                 if moved {
-                    // Told by the finger (or VoiceOver), not by geometry alone: a layout shift (a new
-                    // screen laid out, an inset change in the push) must never unpin the view
-                    // mid-screen. A move without a drag that ends at the very top is the status-bar
-                    // tap (scroll to top): the user's too.
-                    let user = TerminalView.userScrolling(model)
-                        || (movedDown && frame.minY >= -0.5 && frame.height > viewportHeight)
+                    // Told by the finger (or a VoiceOver page scroll), not by geometry alone: a layout
+                    // shift (a new screen laid out, an inset change in the push) must never unpin the
+                    // view mid-screen.
+                    let user = TerminalView.userScrolling(model, by: frame.minY - oldMinY, viewport: viewportHeight)
                     if user { scroll.restore = nil } // the user's own place wins over a saved one
                     // Content moving down under the finger = the user scrolling up: off at once, so a
                     // streaming jump never fights the finger. Not when the content shrank (the clamp
@@ -561,11 +565,8 @@ struct TerminalView: View {
                     }
                 }
                 if scroll.pinned {
-                    // Any size change, or a landing short of the bottom: jump (again). Not while the
-                    // content moves down without a drag: a status-bar scroll on its way to the top
-                    // (it counts once it lands there) is never fought. Anything else that left the
-                    // view short is caught by the next frame or screen (`screen` is in the frame).
-                    if grew || (!nearBottom && !movedDown) {
+                    // Any size change, or a landing short of the bottom: jump (again).
+                    if grew || !nearBottom {
                         TerminalView.jump(scroll, proxy)
                     }
                 } else if grew, scroll.atBottom {
