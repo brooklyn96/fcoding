@@ -171,6 +171,10 @@ enum ANSI {
         Color(red: Double((v >> 16) & 0xFF) / 255, green: Double((v >> 8) & 0xFF) / 255, blue: Double(v & 0xFF) / 255)
     }
 
+    static func uiColor(_ v: UInt32) -> UIColor {
+        UIColor(red: CGFloat((v >> 16) & 0xFF) / 255, green: CGFloat((v >> 8) & 0xFF) / 255, blue: CGFloat(v & 0xFF) / 255, alpha: 1)
+    }
+
     // MARK: - Fonts
 
     /// The monospaced system font, with the Nerd Font symbols as a fallback for icon glyphs.
@@ -221,23 +225,23 @@ enum ANSI {
     static func iconFontSize(forBase size: CGFloat) -> CGFloat { cellWidth(size: size) }
 
     struct Fonts {
-        let regular: Font
-        let bold: Font
-        let italic: Font
-        let boldItalic: Font
+        let regular: UIFont
+        let bold: UIFont
+        let italic: UIFont
+        let boldItalic: UIFont
         /// The Nerd font itself (not through the cascade), sized to one cell.
-        let icon: Font
+        let icon: UIFont
         /// Raises the smaller icon so its centre sits on the centre of the text line.
         let iconBaselineOffset: CGFloat
 
         init(size: CGFloat) {
             let base = ANSI.terminalFont(size: size)
-            regular = Font(base as CTFont)
-            bold = Font(ANSI.terminalFont(size: size, bold: true) as CTFont)
-            italic = Font(ANSI.terminalFont(size: size, italic: true) as CTFont)
-            boldItalic = Font(ANSI.terminalFont(size: size, bold: true, italic: true) as CTFont)
+            regular = base
+            bold = ANSI.terminalFont(size: size, bold: true)
+            italic = ANSI.terminalFont(size: size, italic: true)
+            boldItalic = ANSI.terminalFont(size: size, bold: true, italic: true)
             if let nerd = UIFont(name: ANSI.nerdFontName, size: ANSI.iconFontSize(forBase: size)) {
-                icon = Font(nerd as CTFont)
+                icon = nerd
                 iconBaselineOffset = (base.ascender + base.descender) / 2 - (nerd.ascender + nerd.descender) / 2
                 #if DEBUG
                 let iconW = ("\u{F017}" as NSString).size(withAttributes: [.font: nerd]).width
@@ -254,22 +258,23 @@ enum ANSI {
 
     // MARK: - AttributedString
 
+    /// UIKit-scoped runs, for the terminal's UITextView (`NSAttributedString(_, including: \.uiKit)`).
     static func attributed(_ runs: [Run], fonts: Fonts) -> AttributedString {
-        typealias A = AttributeScopes.SwiftUIAttributes
+        typealias A = AttributeScopes.UIKitAttributes
         var out = AttributedString()
         for run in runs {
             let st = run.style
             let (fg, bg) = colors(st)
             var c = AttributeContainer()
-            c[A.ForegroundColorAttribute.self] = color(fg).opacity(st.dim ? 0.6 : 1)
-            if let bg = bg { c[A.BackgroundColorAttribute.self] = color(bg) }
+            c[A.ForegroundColorAttribute.self] = uiColor(fg).withAlphaComponent(st.dim ? 0.6 : 1)
+            if let bg = bg { c[A.BackgroundColorAttribute.self] = uiColor(bg) }
             if st.underline { c[A.UnderlineStyleAttribute.self] = .single }
             var text = c
             text[A.FontAttribute.self] = st.bold ? (st.italic ? fonts.boldItalic : fonts.bold)
                                                  : (st.italic ? fonts.italic : fonts.regular)
             var icon = c
             icon[A.FontAttribute.self] = fonts.icon
-            icon[A.BaselineOffsetAttribute.self] = fonts.iconBaselineOffset
+            icon[A.BaselineOffsetAttribute.self] = Double(fonts.iconBaselineOffset)
 
             // Icons get their own pieces, in the icon font; everything else keeps the text font.
             var piece = String.UnicodeScalarView()

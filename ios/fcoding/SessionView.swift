@@ -22,8 +22,6 @@ struct SessionView: View {
     @AppStorage("kbButtonY") private var kbY: Double = 1
     /// Bumped on every send: the terminal jumps to the bottom and follows again.
     @State private var bottomRequest = 0
-    /// Bumped when the app comes back to the foreground: back to the saved reading position.
-    @State private var restoreRequest = 0
     @State private var stoppedInBackground = false
     /// "Trả lời" from the inbox: open and focus the composer when the view appears.
     private let focusComposer: Bool
@@ -42,15 +40,12 @@ struct SessionView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            GeometryReader { geo in
-                TerminalView(model: model, fontSize: fontSize, viewportHeight: geo.size.height,
-                             bottomRequest: bottomRequest,
-                             restoreRequest: restoreRequest,
-                             positionKey: "\(app.serverURL)|\(name)",
-                             joinWraps: chipHarness == "omp",
-                             // Never under the keyboard button: the opposite edge while it shows.
-                             jumpOnLeft: !composerShown && !kbLeft)
-            }
+            TerminalView(model: model, fontSize: fontSize,
+                         bottomRequest: bottomRequest,
+                         positionKey: "\(app.serverURL)|\(name)",
+                         joinWraps: chipHarness == "omp",
+                         // Never under the keyboard button: the opposite edge while it shows.
+                         jumpOnLeft: !composerShown && !kbLeft)
             .background(Color.black)
             .overlay {
                 if !composerShown {
@@ -166,16 +161,15 @@ struct SessionView: View {
         .onDisappear { model.stop() }
         .onChange(of: scenePhase) { phase in
             // Background: close the stream and polling so the server frees its slot.
-            // Back to active from the background: restart and go back to the reading position saved
-            // on the way out (TerminalView). Not after .inactive alone (Control Center, app switcher
-            // peek, paste prompt, Face ID): the view never moves.
+            // Back to active from the background: restart. The terminal keeps its own offset across
+            // the background (TerminalText), so nothing is put back. Not after .inactive alone
+            // (Control Center, app switcher peek, paste prompt, Face ID).
             if phase == .background {
                 model.stop()
                 stoppedInBackground = true
             }
             if phase == .active, stoppedInBackground {
                 stoppedInBackground = false
-                restoreRequest += 1
                 model.restart()
             }
         }
@@ -340,87 +334,30 @@ private struct KeyboardButton: View {
 
 // MARK: - Terminal screen
 
-private struct ContentFrame: Equatable {
-    var minY: CGFloat
-    var maxY: CGFloat
-    var height: CGFloat
-    /// `SessionModel.screens` of the screen this layout measured.
-    var screen = 0
-}
-
-private struct ContentFrameKey: PreferenceKey {
-    static let defaultValue = ContentFrame(minY: 0, maxY: 0, height: 0)
-    static func reduce(value: inout ContentFrame, nextValue: () -> ContentFrame) { value = nextValue() }
-}
-
-/// Hands over the UIScrollView it sits in (iOS 16 has no scroll-phase API), so the model can hold
-/// new screens while the finger is down or the view is decelerating.
-private struct ScrollProbe: UIViewRepresentable {
-    let found: @MainActor (UIScrollView) -> Void
-
-    func makeUIView(context: Context) -> Probe { Probe(found: found) }
-    func updateUIView(_ view: Probe, context: Context) {}
-
-    final class Probe: UIView {
-        let found: @MainActor (UIScrollView) -> Void
-
-        init(found: @escaping @MainActor (UIScrollView) -> Void) {
-            self.found = found
-            super.init(frame: .zero)
-            isUserInteractionEnabled = false
-        }
-
-        required init?(coder: NSCoder) { nil }
-
-        override func didMoveToWindow() {
-            super.didMoveToWindow()
-            var view = superview
-            while let v = view, !(v is UIScrollView) { view = v.superview }
-            if let scroll = view as? UIScrollView { found(scroll) }
-        }
-    }
-}
-
-/// Scroll bookkeeping kept in a plain class so the preference closure (which Xcode 16 marks
-/// @Sendable) can update it through a captured reference instead of the view's @State.
+/// The arrow's state, published by the terminal text view only when it changes.
 final class ScrollState: ObservableObject {
-    /// Auto-scroll is on: the content bottom was within 24 pt of the viewport bottom.
+    /// The view shows (or follows) the bottom: no arrow.
     @Published var atBottom = true
-    var contentHeight: CGFloat = 0
-    var minY: CGFloat = 0
-    /// After opening or returning to the session at the bottom: held there until the user's first
-    /// scroll. While pinned, every size change and every frame that is not at the bottom jumps
-    /// again, so a jump that landed short (layout still settling) is corrected.
-    var pinned = true
-    /// A saved reading position waiting for the next published screen (open or return while the
-    /// user was reading above the bottom). Cleared by a user scroll or a jump.
-    var restore: ScreenFeed.Position?
-    /// `SessionModel.screens` when the restore was asked: it applies to a later screen only.
-    var restoreAfter = 0
-    /// `SessionModel.screens` of the last measured content frame.
-    var screen = 0
+    /// Only content taller than the viewport can be away from the bottom.
+    @Published var canScroll = false
+    /// The arrow's jump goes through the text view's coordinator.
+    weak var coordinator: TerminalText.Coordinator?
 }
 
-/// Monospaced, selectable, coloured screen text.
+/// Monospaced, selectable, coloured screen text, with the jump-to-bottom arrow.
 ///
-/// Auto-scroll: new output scrolls to the bottom only if the view was at the bottom BEFORE the
-/// update. The user's position is read from the content's top edge (minY): new text grows the
-/// content downward without moving minY, so a minY change is a scroll. A user scroll sets
-/// atBottom from where it lands (back at the bottom turns auto-scroll on again). A move is the
-/// user's only when the scroll view reports a drag or fling, or when the app performs it (jump
-/// button, send, the assistive page scroll); everything else is geometry and changes no state.
+/// Follow and restore rules live in `ScreenFeed.Reading` (pure, self-tested): new output follows
+/// only a view that is at the bottom; a saved line is put back at the top once a layout pass shows
+/// a screen that has it; a user move or a jump changes the target. `TerminalText` only measures
+/// and writes the offset, in one place (`layoutSubviews`).
 ///
-/// Reading position: saved when the screen goes away or the app goes to the background, per server
-/// + session (`positionKey`); on open or return the view goes back to the bottom (follow on) or to
-/// the same top line (follow off), found in the next published screen.
+/// Reading position: saved when the screen goes away or the app resigns active, per server +
+/// session (`positionKey`); on open the view goes to the bottom or to the saved top line.
 struct TerminalView: View {
     @ObservedObject var model: SessionModel
     let fontSize: Double
-    let viewportHeight: CGFloat
     /// Changes on every send: jump to the bottom and follow again.
     var bottomRequest = 0
-    /// Changes when the app returns to the foreground: back to the saved reading position.
-    var restoreRequest = 0
     /// "server|session": the reading position's key.
     var positionKey = ""
     /// omp session: join URLs that omp hard-wraps across lines.
@@ -428,211 +365,15 @@ struct TerminalView: View {
     /// Put the jump button on the left (the keyboard button is on the right).
     var jumpOnLeft = false
     @StateObject private var scroll = ScrollState()
-    @Environment(\.scenePhase) private var scenePhase
-
-    /// To the bottom, after this update. Set on the scroll view itself from the measured content
-    /// height: a `proxy.scrollTo` can be dropped (the first screen laid out during the push), and a
-    /// jump that moves nothing changes no content frame, so in an idle session nothing ever asked
-    /// again and the view stayed at the top of the capture. `setContentOffset` always lands.
-    private static func jump(_ scroll: ScrollState, _ proxy: ScrollViewProxy, _ model: SessionModel, animated: Bool = false) {
-        scroll.restore = nil
-        if !scroll.atBottom { scroll.atBottom = true }
-        DispatchQueue.main.async {
-            guard let s = model.scrollView else {
-                // Not attached yet (only the loading line is laid out): SwiftUI's own scroll.
-                return proxy.scrollTo("bottom", anchor: .bottom)
-            }
-            let inset = s.adjustedContentInset
-            let y = ScreenFeed.bottomOffset(content: scroll.contentHeight, view: s.bounds.height,
-                                            insetTop: inset.top, insetBottom: inset.bottom)
-            s.setContentOffset(CGPoint(x: s.contentOffset.x, y: y), animated: animated)
-        }
-    }
-
-    /// Open / return at the bottom: atBottom on and pinned until the user's first scroll.
-    private static func pin(_ scroll: ScrollState, _ proxy: ScrollViewProxy, _ model: SessionModel) {
-        scroll.pinned = true
-        jump(scroll, proxy, model)
-    }
-
-    /// The finger drags the scroll view or its fling runs. Not `isTracking` alone: that is a resting
-    /// touch, not a scroll. Without the scroll view (not attached yet) no move is the user's: a touch
-    /// cannot reach a view that is not in a window, and the probe sets it on attach.
-    private static func userScrolling(_ model: SessionModel) -> Bool {
-        guard let s = model.scrollView else { return false }
-        return s.isDragging || s.isDecelerating
-    }
-
-    /// VoiceOver's three-finger scroll, and other assistive scroll actions sent to this element,
-    /// arrive here instead of paging the scroll view: the app pages it itself and sets the scroll
-    /// state first, so the content-frame handler never has to guess. On the Text because UIKit asks
-    /// the focused element before its parents; whether SwiftUI routes it here inside a ScrollView on
-    /// iOS 16 is verified on a device (fallback: the same modifier on the ScrollView).
-    private static func pageScroll(_ scroll: ScrollState, _ model: SessionModel, toward edge: Edge) {
-        guard let s = model.scrollView, edge == .top || edge == .bottom else { return }
-        let inset = s.adjustedContentInset
-        let visible = s.bounds.height - inset.top - inset.bottom
-        let minOff = -inset.top
-        let maxOff = max(minOff, s.contentSize.height + inset.bottom - s.bounds.height)
-        let down = edge == .bottom // reveal the lines below; the Edge mapping is unconfirmed, see the device test
-        guard let page = ScreenFeed.page(offset: s.contentOffset.y, by: visible, min: minOff, max: maxOff, down: down) else { return }
-        scroll.pinned = false
-        scroll.restore = nil
-        let atBottom = page.offset >= maxOff - 24
-        if scroll.atBottom != atBottom { scroll.atBottom = atBottom }
-        s.setContentOffset(CGPoint(x: s.contentOffset.x, y: page.offset), animated: false)
-        UIAccessibility.post(notification: .pageScrolled, argument: "Trang \(page.number) trên \(page.count)")
-    }
-
-    /// Reading positions by "server|session": in memory while the app runs, mirrored to UserDefaults
-    /// (a few numbers per session, the 100 most recent).
-    private static let positionsKey = "readingPositions"
-    private static var positions: [String: ScreenFeed.Position] = {
-        guard let data = UserDefaults.standard.data(forKey: positionsKey) else { return [:] }
-        return (try? JSONDecoder().decode([String: ScreenFeed.Position].self, from: data)) ?? [:]
-    }()
-
-    /// The shown screen as plain lines, nil while it is still the loading line.
-    private static func plainLines(_ model: SessionModel) -> [String]? {
-        model.styled == ScreenRender.loading ? nil : String(model.styled.characters).components(separatedBy: "\n")
-    }
-
-    /// Leaving the screen or going to the background. Nothing is saved before the first screen.
-    private static func save(_ scroll: ScrollState, _ model: SessionModel, _ key: String) {
-        guard let lines = plainLines(model) else { return }
-        let now = Date().timeIntervalSince1970
-        var p = ScreenFeed.Position(bottom: true, time: now)
-        if !scroll.atBottom, let s = model.scrollView, s.contentSize.height > 2 * SessionModel.vPad + 1 {
-            let lineH = (s.contentSize.height - 2 * SessionModel.vPad - 1) / CGFloat(lines.count)
-            let top = Int(((s.contentOffset.y + s.adjustedContentInset.top - SessionModel.vPad) / lineH).rounded())
-            p = ScreenFeed.anchor(lines, top: min(lines.count - 1, max(0, top)), time: now)
-        }
-        positions = ScreenFeed.storing(p, at: key, in: positions)
-        if let data = try? JSONEncoder().encode(positions) { UserDefaults.standard.set(data, forKey: positionsKey) }
-    }
-
-    /// Open / return: the bottom (no record, or the user was there), else wait for the next screen.
-    private static func reopen(_ scroll: ScrollState, _ proxy: ScrollViewProxy, _ model: SessionModel, _ key: String) {
-        guard let p = positions[key], !p.bottom else { return pin(scroll, proxy, model) }
-        scroll.pinned = false
-        scroll.restore = p
-        scroll.restoreAfter = model.screens
-        if scroll.atBottom { scroll.atBottom = false }
-    }
-
-    /// Once the content frame measured a screen published after the reopen (`scroll.screen`), put
-    /// the saved top line back at the top. Until then (the loading line, an older screen, no scroll
-    /// view yet) the restore waits and is tried again by the next frame and by the probe's attach. A
-    /// line that is gone, or a place at the very bottom, goes to the bottom with follow on.
-    private static func restore(_ scroll: ScrollState, _ proxy: ScrollViewProxy, _ model: SessionModel) {
-        guard let p = scroll.restore, scroll.screen > scroll.restoreAfter, scroll.screen == model.screens,
-              let lines = plainLines(model), let s = model.scrollView else { return }
-        scroll.restore = nil
-        guard let top = ScreenFeed.topLine(p, in: lines) else { return pin(scroll, proxy, model) }
-        let inset = s.adjustedContentInset
-        let lineH = (scroll.contentHeight - 2 * SessionModel.vPad - 1) / CGFloat(lines.count)
-        let y = SessionModel.vPad + CGFloat(top) * lineH - inset.top
-        let bottom = ScreenFeed.bottomOffset(content: scroll.contentHeight, view: s.bounds.height,
-                                             insetTop: inset.top, insetBottom: inset.bottom)
-        guard y < bottom else { return pin(scroll, proxy, model) }
-        // After this layout pass, like the jumps.
-        DispatchQueue.main.async { s.setContentOffset(CGPoint(x: s.contentOffset.x, y: y), animated: false) }
-    }
 
     var body: some View {
-        ScrollViewReader { proxy in
-            ScrollView(.vertical) {
-                VStack(alignment: .leading, spacing: 0) {
-                    // Built off the main actor (ScreenRender). Every run of the styled text carries
-                    // its own font and colour; these two modifiers only style the loading line.
-                    Text(model.styled)
-                        .font(.system(size: CGFloat(fontSize), design: .monospaced))
-                        .foregroundColor(.gray)
-                        .textSelection(.enabled)
-                        .accessibilityScrollAction { edge in TerminalView.pageScroll(scroll, model, toward: edge) }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, SessionModel.hPad)
-                        .padding(.vertical, SessionModel.vPad)
-                    Color.clear.frame(height: 1).id("bottom")
-                }
-                .background(GeometryReader { g in
-                    let f = g.frame(in: .named("term"))
-                    Color.clear.preference(key: ContentFrameKey.self,
-                                           value: ContentFrame(minY: f.minY, maxY: f.maxY, height: f.height,
-                                                               screen: model.screens))
-                })
-                // No status-bar scroll to top here: a move the scroll view does not report as a drag
-                // or fling is never the user's (see the content-frame handler), so it would fight the
-                // bottom pin.
-                .background(ScrollProbe { [model, scroll, proxy] in
-                    $0.scrollsToTop = false
-                    model.scrollView = $0
-                    // What waited for the scroll view, after this update like the jumps: a pinned
-                    // view's bottom jump (an earlier one may have been a dropped scrollTo), or a restore.
-                    DispatchQueue.main.async {
-                        if scroll.pinned { TerminalView.jump(scroll, proxy, model) } else { TerminalView.restore(scroll, proxy, model) }
-                    }
-                })
-            }
-            .coordinateSpace(name: "term")
-            .scrollDismissesKeyboard(.interactively)
-            .onPreferenceChange(ContentFrameKey.self) { [scroll, viewportHeight, proxy, model] frame in
-                let moved = frame.minY != scroll.minY
-                let grew = frame.height != scroll.contentHeight
-                let oldMinY = scroll.minY
-                let shrank = frame.height < scroll.contentHeight
-                scroll.minY = frame.minY
-                scroll.contentHeight = frame.height
-                scroll.screen = frame.screen
-                let nearBottom = frame.maxY <= viewportHeight + 24
-                if moved {
-                    // A move is the user's only when the scroll view reports a drag or fling; the
-                    // app's own moves set the state themselves. Any other move (a new screen laid
-                    // out, an inset change in the push) is geometry and changes no state.
-                    let user = TerminalView.userScrolling(model)
-                    if user { scroll.restore = nil } // the user's own place wins over a saved one
-                    // Content moving down under a drag = the user scrolling up: off at once, so a
-                    // streaming jump never fights the finger. Not when the content shrank (the clamp
-                    // moves it) or while the bottom is still inside the viewport (the bounce).
-                    if user, frame.minY > oldMinY, !shrank, frame.height > viewportHeight,
-                       frame.maxY > viewportHeight + 0.5 {
-                        scroll.pinned = false // the user's first scroll ends the pinned phase
-                        if scroll.atBottom { scroll.atBottom = false }
-                    } else if user, nearBottom, !scroll.atBottom {
-                        scroll.atBottom = true // the user landed back at the bottom
-                    }
-                }
-                if scroll.pinned {
-                    // Any size change, or a landing short of the bottom: jump (again).
-                    if grew || !nearBottom {
-                        TerminalView.jump(scroll, proxy, model)
-                    }
-                } else if grew, scroll.atBottom {
-                    // Decided by the state from before this update; scrolled up = never moved.
-                    TerminalView.jump(scroll, proxy, model)
-                }
-                TerminalView.restore(scroll, proxy, model)
-            }
-            .onChange(of: viewportHeight) { _ in
-                if scroll.atBottom { TerminalView.jump(scroll, proxy, model) }
-            }
-            .onChange(of: bottomRequest) { _ in TerminalView.jump(scroll, proxy, model) }
-            .onChange(of: restoreRequest) { _ in TerminalView.reopen(scroll, proxy, model, positionKey) }
-            .onChange(of: scenePhase) { phase in
-                // .inactive too: the app switcher can kill the app before it ever reaches .background.
-                if phase != .active { TerminalView.save(scroll, model, positionKey) }
-            }
+        TerminalText(model: model, bottomRequest: bottomRequest, positionKey: positionKey, scroll: scroll)
             .onChange(of: fontSize) { size in model.style(fontSize: size, joinWraps: joinWraps) }
             .onChange(of: joinWraps) { join in model.style(fontSize: fontSize, joinWraps: join) }
-            .onAppear {
-                model.style(fontSize: fontSize, joinWraps: joinWraps)
-                TerminalView.reopen(scroll, proxy, model, positionKey)
-            }
-            .onDisappear { TerminalView.save(scroll, model, positionKey) }
+            .onAppear { model.style(fontSize: fontSize, joinWraps: joinWraps) }
             .overlay(alignment: jumpOnLeft ? .bottomLeading : .bottomTrailing) {
-                // Only content taller than the viewport can be away from the bottom.
-                if !scroll.atBottom, scroll.contentHeight > viewportHeight {
-                    Button { TerminalView.jump(scroll, proxy, model, animated: true) } label: {
+                if !scroll.atBottom, scroll.canScroll {
+                    Button { scroll.coordinator?.jump(animated: true) } label: {
                         Image(systemName: "arrow.down")
                             .font(.system(size: 15, weight: .bold))
                             .foregroundColor(.white)
@@ -647,7 +388,260 @@ struct TerminalView: View {
                     .padding(.bottom, 8)
                 }
             }
+    }
+}
+
+/// The screen text in a TextKit 1 UITextView (links tap, long-press selects). `updateUIView` only
+/// installs text and marks; the offset is written in `TermTextView.layoutSubviews`, after the text
+/// is laid out, from the reading goal.
+struct TerminalText: UIViewRepresentable {
+    @ObservedObject var model: SessionModel
+    let bottomRequest: Int
+    let positionKey: String
+    let scroll: ScrollState
+
+    /// Reading positions by "server|session": in memory while the app runs, mirrored to UserDefaults
+    /// (a few numbers per session, the 100 most recent). A new key: the older records are dropped.
+    private static let positionsKey = "readingPositions2"
+    private static var positions: [String: ScreenFeed.Position] = {
+        UserDefaults.standard.removeObject(forKey: "readingPositions")
+        guard let data = UserDefaults.standard.data(forKey: positionsKey) else { return [:] }
+        return (try? JSONDecoder().decode([String: ScreenFeed.Position].self, from: data)) ?? [:]
+    }()
+
+    /// The shown screen as plain lines, nil while it is still the loading line.
+    private static func plainLines(_ model: SessionModel) -> [String]? {
+        model.styled == ScreenRender.loading ? nil : String(model.styled.characters).components(separatedBy: "\n")
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(scroll: scroll) }
+
+    func makeUIView(context: Context) -> TermTextView {
+        let v = TermTextView(usingTextLayoutManager: false)
+        let c = context.coordinator
+        v.isEditable = false
+        v.isSelectable = true
+        v.isScrollEnabled = true
+        v.alwaysBounceVertical = true
+        // No status-bar scroll to top: only a drag, a page, a send or the arrow moves the view.
+        v.scrollsToTop = false
+        v.keyboardDismissMode = .interactive
+        v.backgroundColor = .black
+        v.textContainerInset = UIEdgeInsets(top: SessionModel.vPad, left: SessionModel.hPad,
+                                            bottom: SessionModel.vPad, right: SessionModel.hPad)
+        v.textContainer.lineFragmentPadding = 0
+        v.linkTextAttributes = [.foregroundColor: UIColor.tintColor, .underlineStyle: NSUnderlineStyle.single.rawValue]
+        v.delegate = c
+        v.coordinator = c
+        c.view = v
+        c.positionKey = positionKey
+        c.bottomRequest = bottomRequest
+        c.reading = ScreenFeed.Reading(record: TerminalText.positions[positionKey])
+        scroll.coordinator = c
+        // The model holds new screens while the finger is on it or it is still moving.
+        model.scrollView = v
+        // .inactive too: the app switcher can kill the app before it ever reaches the background.
+        NotificationCenter.default.addObserver(c, selector: #selector(Coordinator.save),
+                                               name: UIApplication.willResignActiveNotification, object: nil)
+        return v
+    }
+
+    func updateUIView(_ v: TermTextView, context: Context) {
+        let c = context.coordinator
+        var dirty = false
+        if model.screens != c.screens {
+            c.screens = model.screens
+            if model.styled == ScreenRender.loading {
+                v.attributedText = NSAttributedString(string: String(model.styled.characters),
+                                                      attributes: [.font: ANSI.terminalFont(size: 13), .foregroundColor: UIColor.gray])
+            } else {
+                // Every run carries its own font and colour (ANSI.attributed, UIKit scope).
+                v.attributedText = (try? NSAttributedString(model.styled, including: \.uiKit))
+                    ?? NSAttributedString(string: String(model.styled.characters),
+                                          attributes: [.font: ANSI.terminalFont(size: 13), .foregroundColor: UIColor.white])
+            }
+            c.lines = TerminalText.plainLines(model)
+            c.reading.screen(c.lines)
+            dirty = true
         }
+        if bottomRequest != c.bottomRequest {
+            c.bottomRequest = bottomRequest
+            c.reading.jump()
+            dirty = true
+        }
+        if dirty {
+            c.dirty = true
+            v.setNeedsLayout()
+        }
+    }
+
+    static func dismantleUIView(_ v: TermTextView, coordinator c: Coordinator) {
+        c.save()
+        NotificationCenter.default.removeObserver(c)
+    }
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        let scroll: ScrollState
+        weak var view: TermTextView?
+        var reading = ScreenFeed.Reading(record: nil)
+        var positionKey = ""
+        var bottomRequest = 0
+        /// `SessionModel.screens` of the installed text (-1: none yet).
+        var screens = -1
+        /// The installed text as plain lines, nil for the loading line.
+        var lines: [String]?
+        /// The next layout pass applies the goal (new text or a jump), whatever the geometry.
+        var dirty = false
+        var lastGeo: TermTextView.Geo?
+        var animateNext = false
+
+        init(scroll: ScrollState) { self.scroll = scroll }
+
+        /// The arrow (animated) and send: to the bottom, following.
+        func jump(animated: Bool) {
+            animateNext = animated
+            reading.jump()
+            dirty = true
+            view?.setNeedsLayout()
+        }
+
+        /// The arrow's state, only when it changes.
+        func publish() {
+            guard let v = view else { return }
+            let atBottom = reading.pinned || v.contentOffset.y >= v.bottom - 24
+            let canScroll = v.contentH + v.adjustedContentInset.top + v.adjustedContentInset.bottom > v.bounds.height + 0.5
+            if scroll.atBottom != atBottom { scroll.atBottom = atBottom }
+            if scroll.canScroll != canScroll { scroll.canScroll = canScroll }
+        }
+
+        /// Leaving the screen or resigning active. Nothing is saved before the first screen.
+        @objc func save() {
+            guard let p = view?.position(time: Date().timeIntervalSince1970) else { return }
+            TerminalText.positions = ScreenFeed.storing(p, at: positionKey, in: TerminalText.positions)
+            if let data = try? JSONEncoder().encode(TerminalText.positions) {
+                UserDefaults.standard.set(data, forKey: TerminalText.positionsKey)
+            }
+        }
+
+        /// A user move finished where it is.
+        private func landed() {
+            guard let v = view else { return }
+            reading.moved(atBottom: v.contentOffset.y >= v.bottom - 24)
+            publish()
+        }
+
+        func scrollViewWillBeginDragging(_ s: UIScrollView) { reading.moveBegan() }
+        func scrollViewDidEndDragging(_ s: UIScrollView, willDecelerate: Bool) { if !willDecelerate { landed() } }
+        func scrollViewDidEndDecelerating(_ s: UIScrollView) { landed() }
+        /// The arrow follows a drag; no state change.
+        func scrollViewDidScroll(_ s: UIScrollView) { if !reading.pinned { publish() } }
+        func scrollViewDidChangeAdjustedContentInset(_ s: UIScrollView) { s.setNeedsLayout() }
+    }
+}
+
+final class TermTextView: UITextView {
+    struct Geo: Equatable {
+        var size: CGSize
+        var inset: UIEdgeInsets
+        var contentH: CGFloat
+    }
+
+    weak var coordinator: TerminalText.Coordinator?
+
+    /// The laid-out text's height with its insets, read from the layout itself (`contentSize` can
+    /// lag behind it).
+    var contentH: CGFloat {
+        layoutManager.usedRect(for: textContainer).height + textContainerInset.top + textContainerInset.bottom
+    }
+
+    /// The offset that shows the last line at the bottom edge.
+    var bottom: CGFloat {
+        let inset = adjustedContentInset
+        return CGFloat(ScreenFeed.bottomOffset(content: Double(contentH), view: Double(bounds.height),
+                                               insetTop: Double(inset.top), insetBottom: Double(inset.bottom)))
+    }
+
+    /// The single write point: text, its layout, the measurements and the write in one pass. A pass
+    /// with the same geometry and nothing new returns at once (our own write moves only the origin).
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard bounds.height > 0, let c = coordinator else { return }
+        layoutManager.ensureLayout(for: textContainer)
+        let geo = Geo(size: bounds.size, inset: adjustedContentInset, contentH: contentH)
+        guard c.dirty || geo != c.lastGeo else { return }
+        c.lastGeo = geo
+        c.dirty = false
+        let bottom = self.bottom
+        switch c.reading.layout() {
+        case .bottom: write(bottom, c)
+        case .line(let k, let col): write(min(lineY(k, col, c), bottom), c)
+        case .none: break
+        }
+        c.publish()
+    }
+
+    override func safeAreaInsetsDidChange() {
+        super.safeAreaInsetsDidChange()
+        setNeedsLayout()
+    }
+
+    private func write(_ y: CGFloat, _ c: TerminalText.Coordinator) {
+        let animated = c.animateNext
+        c.animateNext = false
+        guard abs(contentOffset.y - y) >= 0.5 else { return }
+        setContentOffset(CGPoint(x: contentOffset.x, y: y), animated: animated)
+    }
+
+    /// UTF-16 offset of line `k` in the text (lines joined by "\n").
+    private static func utf16Start(_ k: Int, _ lines: [String]) -> Int {
+        lines.prefix(k).reduce(0) { $0 + $1.utf16.count + 1 }
+    }
+
+    /// The offset that puts the row holding character `col` of line `k` at the top edge.
+    private func lineY(_ k: Int, _ col: Int, _ c: TerminalText.Coordinator) -> CGFloat {
+        let n = textStorage.length
+        guard n > 0, let lines = c.lines else { return -adjustedContentInset.top }
+        let g = layoutManager.glyphIndexForCharacter(at: min(n - 1, TermTextView.utf16Start(k, lines) + col))
+        return layoutManager.lineFragmentRect(forGlyphAt: g, effectiveRange: nil).minY
+            + textContainerInset.top - adjustedContentInset.top
+    }
+
+    /// The record to save: the top visible row's line and its offset inside that line, or the
+    /// bottom; nil while the loading line shows.
+    func position(time: Double) -> ScreenFeed.Position? {
+        guard let c = coordinator, let lines = c.lines else { return nil }
+        var k = 0, col = 0
+        let n = textStorage.length
+        if n > 0 {
+            let y = max(0, contentOffset.y + adjustedContentInset.top - textContainerInset.top + 1)
+            let ch = min(n, layoutManager.characterIndexForGlyph(at: layoutManager.glyphIndex(for: CGPoint(x: 0, y: y), in: textContainer)))
+            k = (textStorage.string as NSString).substring(to: ch).utf16.reduce(0) { $1 == 0x0A ? $0 + 1 : $0 }
+            col = max(0, ch - TermTextView.utf16Start(k, lines))
+        }
+        return c.reading.position(firstVisible: min(k, lines.count - 1), col: col, lines: lines,
+                                  atBottom: contentOffset.y >= bottom - 24, time: time)
+    }
+
+    /// VoiceOver's three-finger scroll: the view pages itself (the documented contract: return true
+    /// and post pageScrolled) and sets the reading target from the computed offset first. At a
+    /// boundary it returns false and the target is untouched.
+    override func accessibilityScroll(_ direction: UIAccessibilityScrollDirection) -> Bool {
+        guard let c = coordinator else { return false }
+        let down: Bool
+        switch direction {
+        case .down, .next: down = true // reveal the lines below; the mapping is confirmed on a device (D7)
+        case .up, .previous: down = false
+        default: return false
+        }
+        let inset = adjustedContentInset
+        let maxOff = Double(bottom)
+        guard let page = ScreenFeed.page(offset: Double(contentOffset.y), by: Double(bounds.height - inset.top - inset.bottom),
+                                         min: Double(-inset.top), max: maxOff, down: down) else { return false }
+        c.reading.moved(atBottom: page.offset >= maxOff - 24)
+        setContentOffset(CGPoint(x: contentOffset.x, y: CGFloat(page.offset)), animated: false)
+        c.publish()
+        UIAccessibility.post(notification: .pageScrolled, argument: "Trang \(page.number) trên \(page.count)")
+        return true
     }
 }
 
