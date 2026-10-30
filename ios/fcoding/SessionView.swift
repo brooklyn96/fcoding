@@ -344,6 +344,8 @@ private struct ContentFrame: Equatable {
     var minY: CGFloat
     var maxY: CGFloat
     var height: CGFloat
+    /// `SessionModel.screens` of the screen this layout measured.
+    var screen = 0
 }
 
 private struct ContentFrameKey: PreferenceKey {
@@ -393,6 +395,8 @@ final class ScrollState: ObservableObject {
     /// A saved reading position waiting for the next published screen (open or return while the
     /// user was reading above the bottom). Cleared by a user scroll or a jump.
     var restore: ScreenFeed.Position?
+    /// `SessionModel.screens` when the restore was asked: it applies to a later screen only.
+    var restoreAfter = 0
 }
 
 /// Monospaced, selectable, coloured screen text.
@@ -442,10 +446,11 @@ struct TerminalView: View {
         jump(scroll, proxy)
     }
 
-    /// The finger is on the scroll view or its fling is running. Without the scroll view (not found
-    /// yet) every move counts as the user's, so a scroll up is never fought.
+    /// The finger is on the scroll view or its fling is running. With VoiceOver on (its three-finger
+    /// scroll moves the view without a touch on it) or without the scroll view (not found yet) every
+    /// move counts as the user's, so a scroll up is never fought.
     private static func userScrolling(_ model: SessionModel) -> Bool {
-        guard let s = model.scrollView else { return true }
+        guard let s = model.scrollView, !UIAccessibility.isVoiceOverRunning else { return true }
         return s.isTracking || s.isDragging || s.isDecelerating
     }
 
@@ -477,24 +482,29 @@ struct TerminalView: View {
     }
 
     /// Open / return: the bottom (no record, or the user was there), else wait for the next screen.
-    private static func reopen(_ scroll: ScrollState, _ proxy: ScrollViewProxy, _ key: String) {
+    private static func reopen(_ scroll: ScrollState, _ proxy: ScrollViewProxy, _ model: SessionModel, _ key: String) {
         guard let p = positions[key], !p.bottom else { return pin(scroll, proxy) }
         scroll.pinned = false
         scroll.restore = p
+        scroll.restoreAfter = model.screens
         if scroll.atBottom { scroll.atBottom = false }
     }
 
-    /// After a published screen is laid out: put the saved top line back at the top. A line that is
-    /// gone, or a place at the very bottom, goes to the bottom with follow on.
-    private static func restore(_ scroll: ScrollState, _ proxy: ScrollViewProxy, _ model: SessionModel) {
-        guard let p = scroll.restore, let lines = plainLines(model) else { return }
+    /// From the content frame: once it measures a screen published after the reopen (`frame.screen`),
+    /// put the saved top line back at the top. Until then (the loading line, an older screen still
+    /// laid out) the restore waits. A line that is gone, or a place at the very bottom, goes to the
+    /// bottom with follow on.
+    private static func restore(_ scroll: ScrollState, _ proxy: ScrollViewProxy, _ model: SessionModel, _ frame: ContentFrame) {
+        guard let p = scroll.restore, frame.screen > scroll.restoreAfter, frame.screen == model.screens,
+              let lines = plainLines(model) else { return }
         scroll.restore = nil
         guard let s = model.scrollView, let top = ScreenFeed.topLine(p, in: lines) else { return pin(scroll, proxy) }
         let inset = s.adjustedContentInset
-        let lineH = (s.contentSize.height - 2 * SessionModel.vPad - 1) / CGFloat(lines.count)
+        let lineH = (frame.height - 2 * SessionModel.vPad - 1) / CGFloat(lines.count)
         let y = SessionModel.vPad + CGFloat(top) * lineH - inset.top
-        guard y < s.contentSize.height + inset.bottom - s.bounds.height else { return pin(scroll, proxy) }
-        s.setContentOffset(CGPoint(x: s.contentOffset.x, y: y), animated: false)
+        guard y < frame.height + inset.bottom - s.bounds.height else { return pin(scroll, proxy) }
+        // After this layout pass, like the jumps.
+        DispatchQueue.main.async { s.setContentOffset(CGPoint(x: s.contentOffset.x, y: y), animated: false) }
     }
 
     var body: some View {
@@ -515,7 +525,8 @@ struct TerminalView: View {
                 .background(GeometryReader { g in
                     let f = g.frame(in: .named("term"))
                     Color.clear.preference(key: ContentFrameKey.self,
-                                           value: ContentFrame(minY: f.minY, maxY: f.maxY, height: f.height))
+                                           value: ContentFrame(minY: f.minY, maxY: f.maxY, height: f.height,
+                                                               screen: model.screens))
                 })
                 .background(ScrollProbe { [model] in model.scrollView = $0 })
             }
@@ -529,10 +540,14 @@ struct TerminalView: View {
                 scroll.minY = frame.minY
                 scroll.contentHeight = frame.height
                 let nearBottom = frame.maxY <= viewportHeight + 24
+                let movedDown = moved && frame.minY > oldMinY && !shrank
                 if moved {
-                    // Told by the finger, not by geometry alone: a layout shift (a new screen laid
-                    // out, an inset change in the push) must never unpin the view mid-screen.
+                    // Told by the finger (or VoiceOver), not by geometry alone: a layout shift (a new
+                    // screen laid out, an inset change in the push) must never unpin the view
+                    // mid-screen. A move without a drag that ends at the very top is the status-bar
+                    // tap (scroll to top): the user's too.
                     let user = TerminalView.userScrolling(model)
+                        || (movedDown && frame.minY >= -0.5 && frame.height > viewportHeight)
                     if user { scroll.restore = nil } // the user's own place wins over a saved one
                     // Content moving down under the finger = the user scrolling up: off at once, so a
                     // streaming jump never fights the finger. Not when the content shrank (the clamp
@@ -546,32 +561,33 @@ struct TerminalView: View {
                     }
                 }
                 if scroll.pinned {
-                    // Any size change, or a landing short of the bottom: jump (again).
-                    if grew || !nearBottom {
+                    // Any size change, or a landing short of the bottom: jump (again). Not while the
+                    // content moves down without a drag: a status-bar scroll on its way to the top
+                    // (it counts once it lands there) is never fought. Anything else that left the
+                    // view short is caught by the next frame or screen (`screen` is in the frame).
+                    if grew || (!nearBottom && !movedDown) {
                         TerminalView.jump(scroll, proxy)
                     }
                 } else if grew, scroll.atBottom {
                     // Decided by the state from before this update; scrolled up = never moved.
                     TerminalView.jump(scroll, proxy)
                 }
+                TerminalView.restore(scroll, proxy, model, frame)
             }
             .onChange(of: viewportHeight) { _ in
                 if scroll.atBottom { TerminalView.jump(scroll, proxy) }
             }
             .onChange(of: bottomRequest) { _ in TerminalView.jump(scroll, proxy) }
-            .onChange(of: restoreRequest) { _ in TerminalView.reopen(scroll, proxy, positionKey) }
-            .onChange(of: model.screens) { _ in
-                // After the new screen's layout, like the jumps.
-                if scroll.restore != nil { DispatchQueue.main.async { TerminalView.restore(scroll, proxy, model) } }
-            }
+            .onChange(of: restoreRequest) { _ in TerminalView.reopen(scroll, proxy, model, positionKey) }
             .onChange(of: scenePhase) { phase in
-                if phase == .background { TerminalView.save(scroll, model, positionKey) }
+                // .inactive too: the app switcher can kill the app before it ever reaches .background.
+                if phase != .active { TerminalView.save(scroll, model, positionKey) }
             }
             .onChange(of: fontSize) { size in model.style(fontSize: size, joinWraps: joinWraps) }
             .onChange(of: joinWraps) { join in model.style(fontSize: fontSize, joinWraps: join) }
             .onAppear {
                 model.style(fontSize: fontSize, joinWraps: joinWraps)
-                TerminalView.reopen(scroll, proxy, positionKey)
+                TerminalView.reopen(scroll, proxy, model, positionKey)
             }
             .onDisappear { TerminalView.save(scroll, model, positionKey) }
             .overlay(alignment: jumpOnLeft ? .bottomLeading : .bottomTrailing) {

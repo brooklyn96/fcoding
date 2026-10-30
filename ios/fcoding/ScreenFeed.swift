@@ -110,7 +110,14 @@ enum ScreenFeed {
         var bottom: Bool
         var hash: Int64 = 0
         var fromEnd = 0
+        /// Rows from the top line down to the hashed line (the first one whose window is not blank).
+        var below = 0
         var time: Double = 0
+    }
+
+    /// Line i-1, i and i+1 are all blank (missing ones count as blank): every such window hashes alike.
+    static func blank(_ lines: [String], _ i: Int) -> Bool {
+        ((i - 1)...(i + 1)).allSatisfy { !lines.indices.contains($0) || lines[$0].allSatisfy(\.isWhitespace) }
     }
 
     /// FNV-1a over line i-1, i and i+1 (missing ones are empty); stable across launches.
@@ -123,8 +130,13 @@ enum ScreenFeed {
         return Int64(bitPattern: h)
     }
 
+    /// The anchor for top line `top`: the first line at or below it whose window is not all blank, so
+    /// a blank stretch never matches another one. Nothing but blank lines below: the bottom.
     static func anchor(_ lines: [String], top: Int, time: Double) -> Position {
-        Position(bottom: false, hash: lineHash(lines, top), fromEnd: lines.count - top, time: time)
+        guard let at = lines.indices.first(where: { $0 >= top && !blank(lines, $0) }) else {
+            return Position(bottom: true, time: time)
+        }
+        return Position(bottom: false, hash: lineHash(lines, at), fromEnd: lines.count - at, below: at - top, time: time)
     }
 
     /// The line to put back at the top of the view, or nil = go to the bottom (the user was at the
@@ -133,6 +145,7 @@ enum ScreenFeed {
         guard !p.bottom else { return nil }
         return lines.indices.filter { lineHash(lines, $0) == p.hash }
             .min { abs(lines.count - $0 - p.fromEnd) < abs(lines.count - $1 - p.fromEnd) }
+            .map { max(0, $0 - p.below) }
     }
 
     /// `all` with `p` stored at `key`, keeping only the `keep` most recent positions.
@@ -221,6 +234,15 @@ enum ScreenFeed {
         if near != 4 || far != 1 { failures.append("anchor duplicate: \(String(describing: near)) \(String(describing: far))") }
         if topLine(at, in: ["z", "b", "c", "y"]) != nil { failures.append("anchor missing") }
         if topLine(Position(bottom: true), in: old) != nil { failures.append("anchor at bottom") }
+        // A blank top line anchors on the first non-blank window below it (2 rows down here), so an
+        // unrelated blank stretch never matches; only blank lines below = the bottom.
+        let gap = ["x", "", "", "", "", "y", "z"]
+        let gapAt = anchor(gap, top: 2, time: 1)
+        let gapTop = topLine(gapAt, in: ["", "", "w"] + gap)
+        let blankElsewhere = topLine(gapAt, in: ["", "", "", "", "q"])
+        if gapAt.below != 2 || gapTop != 5 || blankElsewhere != nil || !anchor(["a", "", "", ""], top: 2, time: 1).bottom {
+            failures.append("anchor blank: \(gapAt.below) \(String(describing: gapTop)) \(String(describing: blankElsewhere))")
+        }
         var store: [String: Position] = [:]
         for i in 0...100 { store = storing(anchor(old, top: 0, time: Double(i)), at: "s|\(i)", in: store) }
         if store.count != 100 || store["s|0"] != nil || store["s|100"] == nil { failures.append("store prune: \(store.count)") }
