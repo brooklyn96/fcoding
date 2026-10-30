@@ -409,9 +409,11 @@ struct TerminalText: UIViewRepresentable {
         return (try? JSONDecoder().decode([String: ScreenFeed.Position].self, from: data)) ?? [:]
     }()
 
-    /// The shown screen as plain lines, nil while it is still the loading line.
+    /// The shown screen as plain lines, nil while it is still the loading line. Compares plain
+    /// text, not the AttributedString: this runs on every spinner patch.
     private static func plainLines(_ model: SessionModel) -> [String]? {
-        model.styled == ScreenRender.loading ? nil : String(model.styled.characters).components(separatedBy: "\n")
+        let text = String(model.styled.characters)
+        return text == String(ScreenRender.loading.characters) ? nil : text.components(separatedBy: "\n")
     }
 
     func makeCoordinator() -> Coordinator { Coordinator(scroll: scroll) }
@@ -451,7 +453,8 @@ struct TerminalText: UIViewRepresentable {
         var dirty = false
         if model.screens != c.screens {
             c.screens = model.screens
-            if model.styled == ScreenRender.loading {
+            c.lines = TerminalText.plainLines(model)
+            if c.lines == nil {
                 v.attributedText = NSAttributedString(string: String(model.styled.characters),
                                                       attributes: [.font: ANSI.terminalFont(size: 13), .foregroundColor: UIColor.gray])
             } else {
@@ -460,7 +463,6 @@ struct TerminalText: UIViewRepresentable {
                     ?? NSAttributedString(string: String(model.styled.characters),
                                           attributes: [.font: ANSI.terminalFont(size: 13), .foregroundColor: UIColor.white])
             }
-            c.lines = TerminalText.plainLines(model)
             c.reading.screen(c.lines)
             dirty = true
         }

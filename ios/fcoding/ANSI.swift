@@ -167,10 +167,6 @@ enum ANSI {
         return (style.bg ?? defaultBG, fg)
     }
 
-    static func color(_ v: UInt32) -> Color {
-        Color(red: Double((v >> 16) & 0xFF) / 255, green: Double((v >> 8) & 0xFF) / 255, blue: Double(v & 0xFF) / 255)
-    }
-
     static func uiColor(_ v: UInt32) -> UIColor {
         UIColor(red: CGFloat((v >> 16) & 0xFF) / 255, green: CGFloat((v >> 8) & 0xFF) / 255, blue: CGFloat(v & 0xFF) / 255, alpha: 1)
     }
