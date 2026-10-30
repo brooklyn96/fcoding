@@ -472,19 +472,40 @@ T 'plan: coder box cannot reach new = INV warn coder-unreachable (a warning, pla
 }
 T 'push scan: gate-push / ssh-push by workflow text, enabled by state, ci workflows ignored, an old-address workflow, gh failures stop' {
   Reset-World
-  $apps = @([pscustomobject]@{ name = 'deal-sync'; repo = 'brooklyn96/BD-Team-Project' }, [pscustomobject]@{ name = 'autoshopee'; repo = 'brooklyn96/autoshopee' }, [pscustomobject]@{ name = 'notes'; repo = $null })
+  $apps = @([pscustomobject]@{ name = 'deal-sync'; kind = 'legacy'; repo = 'brooklyn96/BD-Team-Project' }, [pscustomobject]@{ name = 'autoshopee'; kind = 'gate'; repo = 'brooklyn96/autoshopee' }, [pscustomobject]@{ name = 'notes'; kind = 'unmanaged'; repo = $null })
   $sc = Get-MovePushScan $apps $OldAddr; Eq $sc.Code 0
   Eq @($sc.Repos).Count 3; Eq (@($sc.Repos | Where-Object { $_.workflow -ceq 'ci.yml' }).Count) 0 'a plain ci workflow is no push deploy'
   Eq (@($sc.Repos | Where-Object { $_.workflow -ceq 'old.yml' })[0].enabled) $false; Eq (@($sc.Repos | Where-Object { $_.workflow -ceq 'old.yml' })[0].kind) 'ssh-push'
   $script:Gh['brooklyn96/autoshopee'] = @{ 'host.yml' = @{ Text = "run: ssh root@$OldAddr deploy"; State = 'active' } }
   $sc = Get-MovePushScan @($apps[1]) $OldAddr; Eq @($sc.Repos)[0].kind 'ssh-push' 'old address in the file'
   $script:Gh['brooklyn96/autoshopee'] = @{ 'both.yml' = @{ Text = "`${{ secrets.DEPLOY_KNOWN_HOSTS }} `${{ secrets.DEPLOY_SSH_KEY }}"; State = 'active' } }
-  $sc = Get-MovePushScan @($apps[1]) $OldAddr; Eq @($sc.Repos)[0].kind 'gate-push' 'DEPLOY_KNOWN_HOSTS wins'
+  $sc = Get-MovePushScan @([pscustomobject]@{ name = 'x'; kind = 'legacy'; repo = 'brooklyn96/autoshopee' }) $OldAddr; Eq @($sc.Repos)[0].kind 'gate-push' 'DEPLOY_KNOWN_HOSTS wins (legacy app)'
+  $sc = Get-MovePushScan @($apps[1]) $OldAddr; Eq @($sc.Repos).Count 0 'a gate app ignores it'
   $script:Gh.Remove('brooklyn96/autoshopee')
   $sc = Get-MovePushScan @($apps[1]) $OldAddr; Eq $sc.Code 0 'no workflows dir = no push deploy'; Eq @($sc.Repos).Count 0; Ok ([bool](@($sc.Lines) -match 'unverified')) 'secrets named like push-deploy ones but no workflow: warned'
   $script:GhFail = @{ '^secret list' = 4 }; $sc = Get-MovePushScan @($apps[0]) $OldAddr; Eq $sc.Code 1 'gh secret list failure'
   $script:GhFail = @{ 'workflow list' = 1 }; $sc = Get-MovePushScan @($apps[0]) $OldAddr; Eq $sc.Code 1 'gh workflow list failure'
   Reset-World; $script:GhFail = @{ 'contents/\.github/workflows$' = 1 }; $sc = Get-MovePushScan @($apps[0]) $OldAddr; Eq $sc.Code 1 'a non-404 api failure stops'
+}
+T 'CONTRACT section 8 push deploys: only a `legacy` app has gate-push workflows; a converted (gate / unmanaged) app with a DEPLOY_KNOWN_HOSTS workflow (even a disabled one) is ignored: no INV push, home dst plan not refused, no DEPLOY_KNOWN_HOSTS chore; a legacy app behaves as before' {
+  Reset-World
+  $script:Gh['brooklyn96/BD-Team-Project'] = @{ 'deploy.yml' = @{ Text = "run: ssh with `${{ secrets.DEPLOY_KNOWN_HOSTS }}"; State = 'disabled_manually' } }
+  foreach ($k in 'gate', 'unmanaged') {
+    $sc = Get-MovePushScan @([pscustomobject]@{ name = 'deal-sync'; kind = $k; repo = 'brooklyn96/BD-Team-Project' }) $OldAddr
+    Eq $sc.Code 0; Eq @($sc.Repos).Count 0 "$k app: no entry"; Ok (-not [bool](@($sc.Lines) -match 'INV push')) "$k app: no INV push"
+  }
+  $sc = Get-MovePushScan @([pscustomobject]@{ name = 'deal-sync'; kind = 'legacy'; repo = 'brooklyn96/BD-Team-Project' }) $OldAddr
+  Eq @($sc.Repos).Count 1; Eq $sc.Repos[0].kind 'gate-push'; Eq $sc.Repos[0].enabled $false 'legacy keeps the recorded state'
+  # end to end: the app is a gate app in the manifest, deploy.yml disabled; a home dst is not refused; cutover sets no secret
+  Reset-World; $script:Gh['brooklyn96/BD-Team-Project'] = @{ 'deploy.yml' = @{ Text = "run: ssh with `${{ secrets.DEPLOY_KNOWN_HOSTS }}"; State = 'disabled_manually' } }
+  $script:Mf = { param($m) $m.apps[0].kind = 'gate'; $m.apps[0].guard = 'gate' }
+  $r = Run-Move @('plan', 'homebox'); Eq $r.Code 0 $r.Text; Ok ($r.Text -notmatch 'push-deploy-unreachable') 'not refused'; Ok ($r.Text -notmatch 'INV push brooklyn96/BD-Team-Project') 'no INV push for the converted app'
+  Eq (@((State).repos | Where-Object { $_.kind -ceq 'gate-push' }).Count) 0 'no gate-push in the state'
+  $r = Run-Move @('copy'); Eq $r.Code 0 $r.Text; $script:Clock = $script:Clock.AddMinutes(10); Yes; $r = Run-Move @('cutover'); Eq $r.Code 0 $r.Text
+  Eq (Count 'gh secret set') 0 'no DEPLOY_KNOWN_HOSTS chore'; Eq (State).phase 'cut'
+  # the legacy app, same home dst: refused as before
+  Reset-World; $script:Gh['brooklyn96/BD-Team-Project'] = @{ 'deploy.yml' = @{ Text = "run: ssh with `${{ secrets.DEPLOY_KNOWN_HOSTS }}"; State = 'active' } }
+  $r = Run-Move @('plan', 'homebox'); Eq $r.Code 65; Ok ($r.Text -match 'INV refuse push-deploy-unreachable app=deal-sync') 'legacy: refused as before'
 }
 
 # ============================== copy ==============================

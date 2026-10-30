@@ -1821,6 +1821,7 @@ function Get-MovePushScan($Apps, [string]$OldAddr) {
   foreach ($a in @($Apps)) {
     $repo = [string]$a.repo; $app = [string]$a.name
     if (-not $repo) { continue }
+    $legacy = ([string]$a.kind -ceq 'legacy')
     if (-not (Test-DeployRepo $repo)) { Write-Host "lỗi: repo '$repo' của app $app không đúng dạng chủ/repo."; return @{ Code = 1 } }
     $sec = Invoke-MoveTool 'gh' @('secret', 'list', '-R', $repo)
     if ($sec.Code -ne 0) { Write-Host "lỗi: gh không đọc được tên secret của $repo (mã $($sec.Code)); chưa xác nhận được push deploy. Chạy gh auth login rồi plan lại."; return @{ Code = 1 } }
@@ -1842,7 +1843,7 @@ function Get-MovePushScan($Apps, [string]$OldAddr) {
       if ($tx.Code -ne 0) { Write-Host "lỗi: gh không đọc được workflow $f của $repo (mã $($tx.Code))."; return @{ Code = 1 } }
       $t = $tx.Out -join "`n"
       $kind = ''
-      if ($t -match 'secrets\.DEPLOY_KNOWN_HOSTS\b') { $kind = 'gate-push' }
+      if ($t -match 'secrets\.DEPLOY_KNOWN_HOSTS\b') { if ($legacy) { $kind = 'gate-push' } else { continue } }   # CONTRACT section 8: only a `legacy` app has gate-push workflows; for a gate / unmanaged app the workflow is ignored (the conversion disabled it)
       elseif ($t -match 'secrets\.(VPS_HOST|VPS_SSH_KEY|SSH_PRIVATE_KEY|DEPLOY_SSH_KEY)\b' -or ($OldAddr -and $t.Contains($OldAddr))) { $kind = 'ssh-push' }
       if (-not $kind) { continue }
       $found++
@@ -1851,7 +1852,8 @@ function Get-MovePushScan($Apps, [string]$OldAddr) {
       $lines += "INV push $repo app=$app kind=$kind workflow=$f"
       if ($kind -ceq 'ssh-push') { $lines += "INV warn ssh-push repo=$repo app=$app workflow=$f" }
     }
-    if (-not $found -and @($secNames | Where-Object { $_ -cmatch '\A(VPS_HOST|VPS_SSH_KEY|SSH_PRIVATE_KEY|DEPLOY_SSH_KEY|DEPLOY_KNOWN_HOSTS)\z' }).Count) { $lines += "INV warn ssh-push repo=$repo app=$app unverified" }
+    $unv = if ($legacy) { '\A(VPS_HOST|VPS_SSH_KEY|SSH_PRIVATE_KEY|DEPLOY_SSH_KEY|DEPLOY_KNOWN_HOSTS)\z' } else { '\A(VPS_HOST|VPS_SSH_KEY|SSH_PRIVATE_KEY|DEPLOY_SSH_KEY)\z' }   # a DEPLOY_KNOWN_HOSTS secret alone says nothing about a converted app
+    if (-not $found -and @($secNames | Where-Object { $_ -cmatch $unv }).Count) { $lines += "INV warn ssh-push repo=$repo app=$app unverified" }
   }
   @{ Code = 0; Repos = $repos; Lines = $lines }
 }
