@@ -160,6 +160,10 @@ enum ScreenFeed {
         /// The displayed screen not yet resolved by a layout pass (nil lines = the loading line).
         private var shown: [String]?
         private var fresh = false
+        /// The last screen a layout pass landed the anchor on, and the hashed line's index in it:
+        /// the baseline for following. Memory only (never saved); nil when not following.
+        private(set) var applied: [String]?
+        private var appliedAt = 0
 
         /// No record or a bottom record: the bottom. An anchor record: that line, once resolved.
         init(record: Position?) {
@@ -177,26 +181,58 @@ enum ScreenFeed {
 
         /// The layout pass that applies the displayed screen: resolve it, then the goal.
         /// Unresolved anchor: found → that line; not found → the bottom (nothing shown to lose).
-        /// Landed anchor: found → follow it; not found → free (keep the live offset), never the bottom.
-        /// Each resolve stores the found line's distance from the end. While following, output only
-        /// appends, so a copy at least that far from the end wins over a newer copy below it.
+        /// Landed anchor (following): every copy of the hashed window is extended line by line, up and
+        /// down, against the applied screen; only a unique longest unchanged block is followed. A tie
+        /// or no match: free (keep the live offset), never the bottom. Lines trimmed at the top or
+        /// the bottom, or appended, keep the block, so neither moves the view. Each resolve stores
+        /// the found line's distance from the end, which the save carries.
         mutating func layout() -> Goal {
             if fresh, case .anchor(var p, let line) = target, let lines = shown {
-                let hits = lines.indices.filter { ScreenFeed.lineHash(lines, $0) == p.hash }
-                let fromEnd = p.fromEnd
-                func nearest(_ c: [Int]) -> Int? {
-                    c.min { abs(lines.count - $0 - fromEnd) < abs(lines.count - $1 - fromEnd) }
+                let at: Int?
+                if line == nil {
+                    // Initial restore: the copy nearest the stored distance from the end.
+                    at = lines.indices.filter { ScreenFeed.lineHash(lines, $0) == p.hash }
+                        .min { abs(lines.count - $0 - p.fromEnd) < abs(lines.count - $1 - p.fromEnd) }
+                } else {
+                    at = follow(p.hash, in: lines)
                 }
-                let ahead = line == nil ? [] : hits.filter { lines.count - $0 >= fromEnd }
-                if let at = nearest(ahead) ?? nearest(hits) {
+                if let at = at {
                     p.fromEnd = lines.count - at
                     target = .anchor(p, line: max(0, at - p.below))
+                    applied = lines
+                    appliedAt = at
                 } else {
                     target = line == nil ? .bottom : .free
+                    applied = nil
                 }
             }
             fresh = false
             return goal
+        }
+
+        /// The copy of the hashed window in `lines` with the unique longest block of lines equal to
+        /// the applied screen around its anchor; nil on a tie or no match.
+        private func follow(_ hash: Int64, in lines: [String]) -> Int? {
+            guard let old = applied else { return nil }
+            var best: Int?
+            var bestLen = 0
+            var tie = false
+            for i in lines.indices where ScreenFeed.lineHash(lines, i) == hash && lines[i] == old[appliedAt] {
+                var up = 0
+                while i - up - 1 >= 0, appliedAt - up - 1 >= 0, lines[i - up - 1] == old[appliedAt - up - 1] { up += 1 }
+                var down = 0
+                while i + down + 1 < lines.count, appliedAt + down + 1 < old.count,
+                      lines[i + down + 1] == old[appliedAt + down + 1] { down += 1 }
+                let len = up + 1 + down
+                if len > bestLen {
+                    best = i
+                    bestLen = len
+                    tie = false
+                } else if len == bestLen {
+                    tie = true
+                }
+            }
+            return tie ? nil : best
         }
 
         var goal: Goal {
@@ -208,11 +244,20 @@ enum ScreenFeed {
         }
 
         /// A drag starts.
-        mutating func moveBegan() { target = .free }
+        mutating func moveBegan() {
+            target = .free
+            applied = nil
+        }
         /// A user move finished (drag, fling, assistive page).
-        mutating func moved(atBottom: Bool) { target = atBottom ? .bottom : .free }
+        mutating func moved(atBottom: Bool) {
+            target = atBottom ? .bottom : .free
+            applied = nil
+        }
         /// Send, the arrow: back to the bottom, following.
-        mutating func jump() { target = .bottom }
+        mutating func jump() {
+            target = .bottom
+            applied = nil
+        }
 
         /// The record to save. A pending anchor (not landed yet) is kept as it is, whatever the view
         /// shows. A landed anchor is kept across geometry changes, except when the applied viewport
@@ -489,6 +534,71 @@ enum ScreenFeed {
         if dupGoals != [.line(2, col: 0), .line(2, col: 0), .line(2, col: 0)] { failures.append("reading duplicate follow: \(dupGoals)") }
         let dupSaved = dup.position(firstVisible: 2, col: 0, lines: s2, atBottom: false, time: 2)
         if dupSaved.fromEnd != 14 || topLine(dupSaved, in: s2) != 2 { failures.append("reading duplicate save: \(dupSaved.fromEnd)") }
+        // Follow helper: land on `first`, then apply each later screen in its own layout pass.
+        func follow(_ first: [String], top: Int, _ later: [[String]]) -> (Reading, [Goal]) {
+            var r = Reading(record: anchor(first, top: top, time: 1))
+            r.screen(first)
+            var goals = [r.layout()]
+            for s in later {
+                r.screen(s)
+                goals.append(r.layout())
+            }
+            return (r, goals)
+        }
+        func savedEnd(_ r: Reading, _ s: [String]) -> Int { r.position(firstVisible: 0, col: 0, lines: s, atBottom: false, time: 2).fromEnd }
+        // Trailing lines removed (spinner erased, rows shrink): the true copy stays, not an older one.
+        let tr = ["p", "q", "r", "x", "p", "q", "r", "b", "c", "d"]
+        let (trR, trGoals) = follow(tr, top: 5, [Array(tr.dropLast())])
+        if trGoals != [.line(5, col: 0), .line(5, col: 0)] || savedEnd(trR, Array(tr.dropLast())) != 4 {
+            failures.append("reading trailing removed: \(trGoals) \(savedEnd(trR, Array(tr.dropLast())))")
+        }
+        // Top trim (capture start moves): the block is found 4 lines up, also with a new copy
+        // appended, and with lines removed at both ends at once.
+        let tt = ["start", "p", "q", "r", "middle", "p", "q", "r", "end", "tail"]
+        let ttCut = Array(tt.dropFirst(4))
+        let ttMore = ttCut + ["p", "q", "r"]
+        let ttBoth = Array(ttCut.dropLast())
+        for (name, s, want) in [("top trim", ttCut, 4), ("top trim + copy", ttMore, 7), ("both ends", ttBoth, 3)] {
+            let (r, goals) = follow(tt, top: 6, [s])
+            if goals != [.line(6, col: 0), .line(2, col: 0)] || savedEnd(r, s) != want {
+                failures.append("reading \(name): \(goals) \(savedEnd(r, s))")
+            }
+        }
+        // Indistinguishable repeated blocks: A+A+A → A+A is a tie, so free (the live offset stays).
+        let a3 = ["a", "b", "c"]
+        let (amb, ambGoals) = follow(a3 + a3 + a3, top: 4, [a3 + a3])
+        if ambGoals != [.line(4, col: 0), .none] || amb.target != .free || amb.applied != nil {
+            failures.append("reading ambiguous: \(ambGoals) \(amb.target)")
+        }
+        // The anchor gone after landing: free, comparison state cleared.
+        let (lost, lostGoals) = follow(tt, top: 6, [["start", "zz", "end"]])
+        if lostGoals.last != Goal.none || lost.target != .free || lost.applied != nil { failures.append("reading lost: \(lost.target)") }
+        // The loading line resolves nothing; the landed line and baseline stay.
+        var ld = follow(tt, top: 6, []).0
+        ld.screen(nil)
+        if ld.layout() != .line(6, col: 0) || ld.applied != tt { failures.append("reading loading after landing: \(ld.target)") }
+        // Coalesced screens (two before a layout) compare against the applied baseline (S0), not S1.
+        var co = follow(s0, top: 2, []).0
+        co.screen(s1)
+        co.screen(s2)
+        if co.layout() != .line(2, col: 0) || savedEnd(co, s2) != 14 || co.applied != s2 { failures.append("reading coalesced: \(co.target)") }
+        // Geometry-only passes keep the line and its column; a restyle (rotation, A+/A-: same
+        // logical lines, new wrapping) keeps them too.
+        var geoR = Reading(record: anchor(old, top: 2, col: 7, time: 1))
+        geoR.screen(old)
+        let geoGoals = [geoR.layout(), geoR.layout(), geoR.layout()]
+        geoR.screen(old)
+        if geoGoals != Array(repeating: .line(2, col: 7), count: 3) || geoR.layout() != .line(2, col: 7) {
+            failures.append("reading geometry/restyle: \(geoGoals) \(geoR.goal)")
+        }
+        // A drag or a jump ends following and clears the baseline.
+        var dg = follow(tt, top: 6, []).0
+        dg.moveBegan()
+        var jp = follow(tt, top: 6, []).0
+        jp.jump()
+        if dg.applied != nil || dg.target != .free || jp.applied != nil || jp.target != .bottom {
+            failures.append("reading drag/jump clear: \(dg.target) \(jp.target)")
+        }
         var colRead = Reading(record: colAt)
         colRead.screen(old)
         if colRead.layout() != .line(2, col: 7) { failures.append("reading col: \(colRead.goal)") }
