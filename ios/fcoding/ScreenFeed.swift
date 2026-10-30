@@ -104,6 +104,45 @@ enum ScreenFeed {
         }
     }
 
+    /// Where the user was reading a session (kept per server + session). No screen text: the top
+    /// visible line is a hash of it and its two neighbours, plus its distance from the last line.
+    struct Position: Codable, Equatable {
+        var bottom: Bool
+        var hash: Int64 = 0
+        var fromEnd = 0
+        var time: Double = 0
+    }
+
+    /// FNV-1a over line i-1, i and i+1 (missing ones are empty); stable across launches.
+    static func lineHash(_ lines: [String], _ i: Int) -> Int64 {
+        var h: UInt64 = 0xcbf29ce484222325
+        for j in (i - 1)...(i + 1) {
+            for b in (lines.indices.contains(j) ? lines[j] : "").utf8 { h = (h ^ UInt64(b)) &* 0x100000001b3 }
+            h = (h ^ 0x0A) &* 0x100000001b3
+        }
+        return Int64(bitPattern: h)
+    }
+
+    static func anchor(_ lines: [String], top: Int, time: Double) -> Position {
+        Position(bottom: false, hash: lineHash(lines, top), fromEnd: lines.count - top, time: time)
+    }
+
+    /// The line to put back at the top of the view, or nil = go to the bottom (the user was at the
+    /// bottom, or the line is gone). Equal matches: the one nearest the stored distance from the end.
+    static func topLine(_ p: Position, in lines: [String]) -> Int? {
+        guard !p.bottom else { return nil }
+        return lines.indices.filter { lineHash(lines, $0) == p.hash }
+            .min { abs(lines.count - $0 - p.fromEnd) < abs(lines.count - $1 - p.fromEnd) }
+    }
+
+    /// `all` with `p` stored at `key`, keeping only the `keep` most recent positions.
+    static func storing(_ p: Position, at key: String, in all: [String: Position], keep: Int = 100) -> [String: Position] {
+        var all = all
+        all[key] = p
+        for old in all.sorted(by: { $0.value.time > $1.value.time }).dropFirst(keep) { all[old.key] = nil }
+        return all
+    }
+
     /// Fixed cases for the splitter and the patch apply; one line per failure (empty = all pass).
     static func selfTest() -> [String] {
         var failures: [String] = []
@@ -169,6 +208,24 @@ enum ScreenFeed {
         }
         if streamQuery(delta: true).map(\.name) != ["ansi", "delta"] || streamQuery(delta: false).map(\.name) != ["ansi"] {
             failures.append("stream query")
+        }
+
+        // Reading position: the anchor line is found after new output, a duplicate line is resolved
+        // by its distance from the end, a gone line or a bottom position means the bottom.
+        let old = ["a", "b", "c", "d", "e"]
+        let at = anchor(old, top: 2, time: 1)
+        if topLine(at, in: ["x"] + old + ["f"]) != 3 { failures.append("anchor found: \(String(describing: topLine(at, in: ["x"] + old + ["f"])))") }
+        let rep = ["p", "q", "r", "p", "q", "r", "s"]
+        let near = topLine(anchor(rep, top: 4, time: 1), in: rep + ["t"])
+        let far = topLine(anchor(rep, top: 1, time: 1), in: rep + ["t"])
+        if near != 4 || far != 1 { failures.append("anchor duplicate: \(String(describing: near)) \(String(describing: far))") }
+        if topLine(at, in: ["z", "b", "c", "y"]) != nil { failures.append("anchor missing") }
+        if topLine(Position(bottom: true), in: old) != nil { failures.append("anchor at bottom") }
+        var store: [String: Position] = [:]
+        for i in 0...100 { store = storing(anchor(old, top: 0, time: Double(i)), at: "s|\(i)", in: store) }
+        if store.count != 100 || store["s|0"] != nil || store["s|100"] == nil { failures.append("store prune: \(store.count)") }
+        if let json = try? JSONEncoder().encode(at), String(decoding: json, as: UTF8.self).contains("\"c\"") {
+            failures.append("position stores screen text")
         }
         return failures
     }

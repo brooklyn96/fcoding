@@ -63,8 +63,12 @@ final class SessionModel: ObservableObject {
             return
         }
         pending = nil
+        screens += 1
         styled = value
     }
+
+    /// Bumped with every published screen: a cheap change signal for the view (no text compare).
+    private(set) var screens = 0
 
     private func setLink(_ value: Link) {
         if link != value { link = value }
