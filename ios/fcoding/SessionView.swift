@@ -532,7 +532,9 @@ struct TerminalView: View {
         let inset = s.adjustedContentInset
         let lineH = (scroll.contentHeight - 2 * SessionModel.vPad - 1) / CGFloat(lines.count)
         let y = SessionModel.vPad + CGFloat(top) * lineH - inset.top
-        guard y < scroll.contentHeight + inset.bottom - s.bounds.height else { return pin(scroll, proxy, model) }
+        let bottom = ScreenFeed.bottomOffset(content: scroll.contentHeight, view: s.bounds.height,
+                                             insetTop: inset.top, insetBottom: inset.bottom)
+        guard y < bottom else { return pin(scroll, proxy, model) }
         // After this layout pass, like the jumps.
         DispatchQueue.main.async { s.setContentOffset(CGPoint(x: s.contentOffset.x, y: y), animated: false) }
     }
@@ -565,8 +567,11 @@ struct TerminalView: View {
                 .background(ScrollProbe { [model, scroll, proxy] in
                     $0.scrollsToTop = false
                     model.scrollView = $0
-                    // A restore that waited for the scroll view: after this update, like the jumps.
-                    DispatchQueue.main.async { TerminalView.restore(scroll, proxy, model) }
+                    // What waited for the scroll view, after this update like the jumps: a pinned
+                    // view's bottom jump (an earlier one may have been a dropped scrollTo), or a restore.
+                    DispatchQueue.main.async {
+                        if scroll.pinned { TerminalView.jump(scroll, proxy, model) } else { TerminalView.restore(scroll, proxy, model) }
+                    }
                 })
             }
             .coordinateSpace(name: "term")
