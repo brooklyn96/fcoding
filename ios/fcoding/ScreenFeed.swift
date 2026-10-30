@@ -3,12 +3,34 @@ import Foundation
 /// The pure parts of the live screen feed, run off the main actor and self-tested in CI: the SSE
 /// line splitter and the `event: patch` apply of GET /api/stream with `delta=1` (CONTRACT.md).
 enum ScreenFeed {
-    /// SGR colours (an older server ignores it) and patches (an older server sends full screens only).
-    static let streamQuery = [URLQueryItem(name: "ansi", value: "1"), URLQueryItem(name: "delta", value: "1")]
+    /// SGR colours (an older server ignores it) and, with `delta`, patches (an older server sends
+    /// full screens only).
+    static func streamQuery(delta: Bool) -> [URLQueryItem] {
+        [URLQueryItem(name: "ansi", value: "1")] + (delta ? [URLQueryItem(name: "delta", value: "1")] : [])
+    }
 
-    /// A patch that does not apply to the screen held here: drop the stream and reconnect at once
-    /// (a new stream starts with a full screen), so a patch never lands on the wrong base.
+    /// A patch that does not apply to the screen held here: the stream is dropped (a new stream
+    /// starts with a full screen), so a patch never lands on the wrong base.
     struct Mismatch: Error {}
+
+    /// Patches in a row that did not apply. Only the first reconnects at once; a repeat is a normal
+    /// stream failure (backoff, polling). After `limit` in a row this screen stops asking for
+    /// patches (full screens only, for as long as it is open). Reset only by a patch that applies:
+    /// every reconnect starts with a full screen, so a screen proves nothing about patches.
+    struct Mismatches {
+        static let limit = 3
+        private(set) var count = 0
+        private(set) var delta = true
+
+        /// Records one; true = reconnect at once.
+        mutating func record() -> Bool {
+            count += 1
+            if count >= Mismatches.limit { delta = false }
+            return count == 1
+        }
+
+        mutating func applied() { count = 0 }
+    }
 
     /// SSE lines: split on LF (0x0A) only, dropping a trailing CR. Foundation's `bytes.lines` also
     /// ends a line at U+0085 / U+2028 / U+2029, which JSON leaves unescaped and would cut a data line.
@@ -130,6 +152,24 @@ enum ScreenFeed {
         patch("empty screen", &empty, #"{"base":"e1","hash":"e2","len":1,"lines":[]}"#, "")
         var none = State()
         patch("no base yet", &none, #"{"base":"","hash":"n1","len":1,"lines":[]}"#, nil)
+
+        // Mismatches: at once, then backoff, then full screens only (kept after a later success).
+        var m = Mismatches()
+        let firstRun = [m.record(), m.record()]
+        let deltaAfterTwo = m.delta
+        m.applied()
+        let afterApply = m.record()
+        m.applied()
+        let row = [m.record(), m.record(), m.record()]
+        let deltaAfterThree = m.delta
+        m.applied()
+        if firstRun != [true, false] || !deltaAfterTwo || !afterApply || row != [true, false, false]
+            || deltaAfterThree || m.delta || m.count != 0 {
+            failures.append("mismatches: \(firstRun) \(afterApply) \(row) delta \(m.delta) count \(m.count)")
+        }
+        if streamQuery(delta: true).map(\.name) != ["ansi", "delta"] || streamQuery(delta: false).map(\.name) != ["ansi"] {
+            failures.append("stream query")
+        }
         return failures
     }
 }

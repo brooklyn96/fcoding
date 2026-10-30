@@ -97,7 +97,10 @@ final class SessionModel: ObservableObject {
                 try await readStream(api, render)
                 failures = 0
             } catch is ScreenFeed.Mismatch {
-                continue // reconnect at once: the new stream starts with a full screen
+                // The first in a row reconnects at once (the new stream starts with a full
+                // screen); a repeat takes the backoff and polling path below.
+                if await render.mismatch() { continue }
+                failures += 1
             } catch {
                 if Task.isCancelled || isTerminal(error) { return }
                 failures += 1
@@ -117,7 +120,8 @@ final class SessionModel: ObservableObject {
     /// main actor only sees link changes, `gone`, and finished screens.
     private nonisolated func readStream(_ api: API, _ render: ScreenRender) async throws {
         await setLink(.connecting)
-        var req = try api.request("GET", "api/stream/\(name)", query: ScreenFeed.streamQuery, timeout: 45)
+        let delta = await render.delta
+        var req = try api.request("GET", "api/stream/\(name)", query: ScreenFeed.streamQuery(delta: delta), timeout: 45)
         req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         let (bytes, resp) = try await URLSession.shared.bytes(for: req)
         if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
@@ -391,7 +395,8 @@ final class SessionModel: ObservableObject {
 }
 
 /// Off the main actor: holds the screen (full screens and patches), builds its styled text for the
-/// current font, and hands only the newest build to `publish`. Memory only, for the open screen.
+/// current font, and hands each finished build to `publish`, rebuilding only for the newest input.
+/// Memory only, for the open screen.
 actor ScreenRender {
     static let loading = AttributedString("Đang tải màn hình…")
 
@@ -405,6 +410,7 @@ actor ScreenRender {
     }
 
     private var state = ScreenFeed.State()
+    private var mismatches = ScreenFeed.Mismatches()
     private var input = Input()
     private var version = 0
     private var running = false
@@ -423,9 +429,16 @@ actor ScreenRender {
     func patch(_ data: Data) -> Bool {
         guard let p = try? JSONDecoder().decode(ScreenFeed.Patch.self, from: data),
               let text = state.apply(p) else { return false }
+        mismatches.applied()
         update(text, cols: p.cols)
         return true
     }
+
+    /// Records a patch that did not apply; true = reconnect at once (see ScreenFeed.Mismatches).
+    func mismatch() -> Bool { mismatches.record() }
+
+    /// Ask the stream for patches (false after repeated mismatches).
+    var delta: Bool { mismatches.delta }
 
     func style(fontSize: Double, joinWraps: Bool) {
         guard fontSize != input.fontSize || joinWraps != input.joinWraps else { return }
@@ -449,15 +462,16 @@ actor ScreenRender {
         Task { await self.drain() }
     }
 
-    /// Builds until a build matches the newest input. A build overtaken by newer input while it ran
-    /// is dropped, never published.
+    /// Builds until a build matches the newest input. One build at a time, so every finished build
+    /// is newer than the one shown and is published; inputs that arrive during a build collapse into
+    /// one next build for the newest input. Slow builds never starve the screen.
     private func drain() async {
         var built = -1
         while built != version {
             built = version
             let input = self.input
             let value = await Task.detached(priority: .userInitiated) { ScreenRender.build(input) }.value
-            if built == version { await publish(value) }
+            await publish(value)
         }
         running = false
     }
