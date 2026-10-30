@@ -113,6 +113,9 @@ enum ScreenFeed {
         /// Rows from the top line down to the hashed line (the first one whose window is not blank).
         var below = 0
         var time: Double = 0
+        /// UTF-16 offset of the top visible row's first character inside the top line (a long line
+        /// wraps into several rows); 0 unless the hashed line is the top line itself.
+        var col = 0
     }
 
     /// Line i-1, i and i+1 are all blank (missing ones count as blank): every such window hashes alike.
@@ -132,11 +135,86 @@ enum ScreenFeed {
 
     /// The anchor for top line `top`: the first line at or below it whose window is not all blank, so
     /// a blank stretch never matches another one. Nothing but blank lines below: the bottom.
-    static func anchor(_ lines: [String], top: Int, time: Double) -> Position {
+    static func anchor(_ lines: [String], top: Int, col: Int = 0, time: Double) -> Position {
         guard let at = lines.indices.first(where: { $0 >= top && !blank(lines, $0) }) else {
             return Position(bottom: true, time: time)
         }
-        return Position(bottom: false, hash: lineHash(lines, at), fromEnd: lines.count - at, below: at - top, time: time)
+        return Position(bottom: false, hash: lineHash(lines, at), fromEnd: lines.count - at, below: at - top,
+                        time: time, col: at == top ? col : 0)
+    }
+
+    /// Where the terminal view should be, as a pure state machine (the view only measures and
+    /// writes). One target: follow the bottom, keep a saved line at the top, or stay where the user
+    /// put it. Only a new screen landing in a layout pass, a user move or a jump changes it.
+    struct Reading: Equatable {
+        enum Target: Equatable {
+            case bottom
+            /// A saved line: `line` nil until a layout pass has resolved it on a displayed screen.
+            case anchor(Position, line: Int?)
+            case free
+        }
+        /// What the top edge should show now.
+        enum Goal: Equatable { case bottom, line(Int, col: Int), none }
+
+        private(set) var target: Target
+        /// The displayed screen not yet resolved by a layout pass (nil lines = the loading line).
+        private var shown: [String]?
+        private var fresh = false
+
+        /// No record or a bottom record: the bottom. An anchor record: that line, once resolved.
+        init(record: Position?) {
+            if let p = record, !p.bottom { target = .anchor(p, line: nil) } else { target = .bottom }
+        }
+
+        var pinned: Bool { target == .bottom }
+
+        /// A new screen was installed in the view. Resolved only by the layout pass that applies it
+        /// (`layout`), so two screens before the first usable layout resolve the newest one.
+        mutating func screen(_ lines: [String]?) {
+            shown = lines
+            fresh = true
+        }
+
+        /// The layout pass that applies the displayed screen: resolve it, then the goal.
+        /// Unresolved anchor: found → that line; not found → the bottom (nothing shown to lose).
+        /// Landed anchor: found → follow it; not found → free (keep the live offset), never the bottom.
+        mutating func layout() -> Goal {
+            if fresh, case .anchor(let p, let line) = target, let lines = shown {
+                if let k = ScreenFeed.topLine(p, in: lines) { target = .anchor(p, line: k) } else { target = line == nil ? .bottom : .free }
+            }
+            fresh = false
+            return goal
+        }
+
+        var goal: Goal {
+            switch target {
+            case .bottom: return .bottom
+            case .anchor(let p, let line?): return .line(line, col: p.col)
+            default: return .none
+            }
+        }
+
+        /// A drag starts.
+        mutating func moveBegan() { target = .free }
+        /// A user move finished (drag, fling, assistive page).
+        mutating func moved(atBottom: Bool) { target = atBottom ? .bottom : .free }
+        /// Send, the arrow: back to the bottom, following.
+        mutating func jump() { target = .bottom }
+
+        /// The record to save. A pending anchor (not landed yet) is kept as it is, whatever the view
+        /// shows. A landed anchor is kept across geometry changes, except when the applied viewport
+        /// is at the bottom (`atBottom`): then the bottom, so a reopen shows the newest lines.
+        func position(firstVisible: Int, col: Int, lines: [String], atBottom: Bool, time: Double) -> Position {
+            switch target {
+            case .anchor(var p, let line) where line == nil || !atBottom:
+                p.time = time
+                return p
+            case .free where !atBottom:
+                return ScreenFeed.anchor(lines, top: firstVisible, col: col, time: time)
+            default:
+                return Position(bottom: true, time: time)
+            }
+        }
     }
 
     /// The line to put back at the top of the view, or nil = go to the bottom (the user was at the
@@ -283,6 +361,110 @@ enum ScreenFeed {
                        bottomOffset(content: 4800, view: 700, insetTop: 10, insetBottom: 34),
                        bottomOffset(content: 300, view: 700, insetTop: 10, insetBottom: 0)]
         if bottoms != [4100, 4134, -10] { failures.append("bottom offset: \(bottoms)") }
+
+        // Reading: no record or a bottom record follows the bottom.
+        for rec in [nil, Position(bottom: true)] {
+            let r = Reading(record: rec)
+            if r.goal != .bottom || !r.pinned { failures.append("reading record \(String(describing: rec)): \(r.target)") }
+        }
+        func with(_ p: Position, time: Double) -> Position { var p = p; p.time = time; return p }
+        // A saved line waits for a screen; the loading line resolves nothing.
+        var r = Reading(record: at)
+        if r.goal != .none { failures.append("reading pending goal: \(r.goal)") }
+        r.screen(nil)
+        if r.layout() != .none || r.target != .anchor(at, line: nil) { failures.append("reading loading: \(r.target)") }
+        if r.position(firstVisible: 0, col: 0, lines: old, atBottom: false, time: 9) != with(at, time: 9) {
+            failures.append("reading pending save")
+        }
+        // Found in the screen a layout pass applies; reading the goal again changes nothing.
+        r.screen(["x"] + old + ["f"])
+        let found = r.layout()
+        let again = r.goal
+        if found != .line(3, col: 0) || again != found || r.goal != found { failures.append("reading found: \(found) \(r.goal)") }
+        if r.position(firstVisible: 3, col: 0, lines: ["x"] + old + ["f"], atBottom: false, time: 4) != with(at, time: 4) {
+            failures.append("reading landed save")
+        }
+        // Follow: new lines above move the line down.
+        r.screen(["x", "y"] + old + ["f"])
+        if r.layout() != .line(4, col: 0) { failures.append("reading follow: \(r.target)") }
+        // A changed neighbour after landing: free (keep the live offset), never the bottom.
+        let changed = ["x", "y", "a", "b", "c", "D", "e", "f"]
+        r.screen(changed)
+        if r.layout() != .none || r.target != .free { failures.append("reading neighbour changed: \(r.target)") }
+        if r.position(firstVisible: 5, col: 2, lines: changed, atBottom: false, time: 2) != anchor(changed, top: 5, col: 2, time: 2) {
+            failures.append("reading free save")
+        }
+        // Gone before landing: the bottom.
+        var gone = Reading(record: at)
+        gone.screen(["z", "b", "c", "y"])
+        if gone.layout() != .bottom || !gone.pinned { failures.append("reading gone: \(gone.target)") }
+        // Astra 1: two screens before the first usable layout. Resolving is not landing: the newest
+        // displayed screen is resolved by the pass that applies it, never top / free, and the saved
+        // record is kept until then.
+        var two = Reading(record: at)
+        two.screen(["x"] + old + ["f"])
+        two.screen(["x", "y"] + old + ["f"])
+        if two.position(firstVisible: 0, col: 0, lines: ["x", "y"] + old + ["f"], atBottom: true, time: 3) != with(at, time: 3) {
+            failures.append("reading two screens: pending record overwritten")
+        }
+        if two.layout() != .line(4, col: 0) { failures.append("reading two screens: \(two.target)") }
+        var twoChanged = Reading(record: at)
+        twoChanged.screen(["x"] + old + ["f"])
+        twoChanged.screen(changed)
+        if twoChanged.layout() != .bottom || twoChanged.target == .free { failures.append("reading two screens changed: \(twoChanged.target)") }
+        // Astra 2: content 2000, anchor at 1500. Viewport 300: shown at 1500, the anchor is saved.
+        // Viewport 700: clamped to the bottom (1300), so the save is the bottom while the runtime
+        // target stays the anchor; then new output, and a reopen shows the newest lines.
+        let lines = ["x"] + old + ["f"]
+        var clamp = Reading(record: at)
+        clamp.screen(lines)
+        _ = clamp.layout()
+        for view in [300.0, 700.0] {
+            let bottom = bottomOffset(content: 2000, view: view, insetTop: 0, insetBottom: 0)
+            let y = Swift.min(1500, bottom)
+            let saved = clamp.position(firstVisible: 3, col: 0, lines: lines, atBottom: y >= bottom - 24, time: 6)
+            if view == 300, saved != with(at, time: 6) { failures.append("reading clamp 300: \(saved)") }
+            if view == 700 {
+                if !saved.bottom || clamp.goal != .line(3, col: 0) { failures.append("reading clamp 700: \(saved) \(clamp.target)") }
+                var reopen = Reading(record: saved)
+                reopen.screen(lines + ["new"])
+                if reopen.layout() != .bottom { failures.append("reading clamp reopen: \(reopen.target)") }
+            }
+        }
+        // User moves and jumps.
+        var mv = Reading(record: at)
+        mv.screen(["x"] + old + ["f"])
+        _ = mv.layout()
+        mv.moved(atBottom: false)
+        if mv.target != .free { failures.append("reading moved from anchor: \(mv.target)") }
+        mv = Reading(record: at)
+        mv.screen(["x"] + old + ["f"])
+        _ = mv.layout()
+        mv.moveBegan()
+        let began = (mv.target, mv.goal)
+        mv.moved(atBottom: false)
+        let stayed = mv.target
+        mv.moved(atBottom: true)
+        let back = mv.target
+        mv.moveBegan()
+        mv.jump()
+        if began.0 != .free || began.1 != .none || stayed != .free || back != .bottom || mv.target != .bottom {
+            failures.append("reading moves: \(began) \(stayed) \(back) \(mv.target)")
+        }
+        // A free view at the bottom saves the bottom.
+        mv.moved(atBottom: false)
+        if !mv.position(firstVisible: 1, col: 0, lines: old, atBottom: true, time: 1).bottom { failures.append("reading free at bottom") }
+        // col: kept for the top line itself, 0 when the hashed line is below a blank top line.
+        let colAt = anchor(old, top: 2, col: 7, time: 1)
+        if colAt.col != 7 || anchor(gap, top: 2, col: 5, time: 1).col != 0 {
+            failures.append("anchor col: \(colAt.col) \(anchor(gap, top: 2, col: 5, time: 1).col)")
+        }
+        if let json = try? JSONEncoder().encode(colAt), (try? JSONDecoder().decode(Position.self, from: json)) != colAt {
+            failures.append("position col round trip")
+        }
+        var colRead = Reading(record: colAt)
+        colRead.screen(old)
+        if colRead.layout() != .line(2, col: 7) { failures.append("reading col: \(colRead.goal)") }
         return failures
     }
 }
