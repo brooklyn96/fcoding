@@ -104,6 +104,70 @@ enum ScreenFeed {
         }
     }
 
+    /// Where the user was reading a session (kept per server + session). No screen text: the top
+    /// visible line is a hash of it and its two neighbours, plus its distance from the last line.
+    struct Position: Codable, Equatable {
+        var bottom: Bool
+        var hash: Int64 = 0
+        var fromEnd = 0
+        /// Rows from the top line down to the hashed line (the first one whose window is not blank).
+        var below = 0
+        var time: Double = 0
+    }
+
+    /// Line i-1, i and i+1 are all blank (missing ones count as blank): every such window hashes alike.
+    static func blank(_ lines: [String], _ i: Int) -> Bool {
+        ((i - 1)...(i + 1)).allSatisfy { !lines.indices.contains($0) || lines[$0].allSatisfy(\.isWhitespace) }
+    }
+
+    /// FNV-1a over line i-1, i and i+1 (missing ones are empty); stable across launches.
+    static func lineHash(_ lines: [String], _ i: Int) -> Int64 {
+        var h: UInt64 = 0xcbf29ce484222325
+        for j in (i - 1)...(i + 1) {
+            for b in (lines.indices.contains(j) ? lines[j] : "").utf8 { h = (h ^ UInt64(b)) &* 0x100000001b3 }
+            h = (h ^ 0x0A) &* 0x100000001b3
+        }
+        return Int64(bitPattern: h)
+    }
+
+    /// The anchor for top line `top`: the first line at or below it whose window is not all blank, so
+    /// a blank stretch never matches another one. Nothing but blank lines below: the bottom.
+    static func anchor(_ lines: [String], top: Int, time: Double) -> Position {
+        guard let at = lines.indices.first(where: { $0 >= top && !blank(lines, $0) }) else {
+            return Position(bottom: true, time: time)
+        }
+        return Position(bottom: false, hash: lineHash(lines, at), fromEnd: lines.count - at, below: at - top, time: time)
+    }
+
+    /// The line to put back at the top of the view, or nil = go to the bottom (the user was at the
+    /// bottom, or the line is gone). Equal matches: the one nearest the stored distance from the end.
+    static func topLine(_ p: Position, in lines: [String]) -> Int? {
+        guard !p.bottom else { return nil }
+        return lines.indices.filter { lineHash(lines, $0) == p.hash }
+            .min { abs(lines.count - $0 - p.fromEnd) < abs(lines.count - $1 - p.fromEnd) }
+            .map { max(0, $0 - p.below) }
+    }
+
+    /// `all` with `p` stored at `key`, keeping only the `keep` most recent positions.
+    static func storing(_ p: Position, at key: String, in all: [String: Position], keep: Int = 100) -> [String: Position] {
+        var all = all
+        all[key] = p
+        for old in all.sorted(by: { $0.value.time > $1.value.time }).dropFirst(keep) { all[old.key] = nil }
+        return all
+    }
+
+    /// One page from `offset` toward the bottom (`down`) or the top: the new offset clamped to
+    /// [min, max] and its "page p of n" numbers, n reached exactly at max. Nil when the content fits
+    /// (max <= min), page <= 0, or the view cannot move that way.
+    static func page(offset: Double, by page: Double, min: Double, max: Double, down: Bool) -> (offset: Double, number: Int, count: Int)? {
+        guard page > 0, max > min else { return nil }
+        let y = Swift.min(max, Swift.max(min, offset + (down ? page : -page)))
+        guard y != offset else { return nil }
+        let count = Int(((max - min) / page).rounded(.up)) + 1
+        let number = y >= max ? count : Int(((y - min) / page).rounded(.down)) + 1
+        return (y, number, count)
+    }
+
     /// Fixed cases for the splitter and the patch apply; one line per failure (empty = all pass).
     static func selfTest() -> [String] {
         var failures: [String] = []
@@ -170,6 +234,43 @@ enum ScreenFeed {
         if streamQuery(delta: true).map(\.name) != ["ansi", "delta"] || streamQuery(delta: false).map(\.name) != ["ansi"] {
             failures.append("stream query")
         }
+
+        // Reading position: the anchor line is found after new output, a duplicate line is resolved
+        // by its distance from the end, a gone line or a bottom position means the bottom.
+        let old = ["a", "b", "c", "d", "e"]
+        let at = anchor(old, top: 2, time: 1)
+        if topLine(at, in: ["x"] + old + ["f"]) != 3 { failures.append("anchor found: \(String(describing: topLine(at, in: ["x"] + old + ["f"])))") }
+        let rep = ["p", "q", "r", "p", "q", "r", "s"]
+        let near = topLine(anchor(rep, top: 4, time: 1), in: rep + ["t"])
+        let far = topLine(anchor(rep, top: 1, time: 1), in: rep + ["t"])
+        if near != 4 || far != 1 { failures.append("anchor duplicate: \(String(describing: near)) \(String(describing: far))") }
+        if topLine(at, in: ["z", "b", "c", "y"]) != nil { failures.append("anchor missing") }
+        if topLine(Position(bottom: true), in: old) != nil { failures.append("anchor at bottom") }
+        // A blank top line anchors on the first non-blank window below it (2 rows down here), so an
+        // unrelated blank stretch never matches; only blank lines below = the bottom.
+        let gap = ["x", "", "", "", "", "y", "z"]
+        let gapAt = anchor(gap, top: 2, time: 1)
+        let gapTop = topLine(gapAt, in: ["", "", "w"] + gap)
+        let blankElsewhere = topLine(gapAt, in: ["", "", "", "", "q"])
+        if gapAt.below != 2 || gapTop != 5 || blankElsewhere != nil || !anchor(["a", "", "", ""], top: 2, time: 1).bottom {
+            failures.append("anchor blank: \(gapAt.below) \(String(describing: gapTop)) \(String(describing: blankElsewhere))")
+        }
+        var store: [String: Position] = [:]
+        for i in 0...100 { store = storing(anchor(old, top: 0, time: Double(i)), at: "s|\(i)", in: store) }
+        if store.count != 100 || store["s|0"] != nil || store["s|100"] == nil { failures.append("store prune: \(store.count)") }
+        if let json = try? JSONEncoder().encode(at), String(decoding: json, as: UTF8.self).contains("\"c\"") {
+            failures.append("position stores screen text")
+        }
+
+        // Assistive page scroll: offsets and "page p of n" (min 0, max 120, page 100 unless stated),
+        // with the final partial page numbered n.
+        func pg(_ offset: Double, _ down: Bool, max: Double = 120, by: Double = 100) -> String {
+            page(offset: offset, by: by, min: 0, max: max, down: down).map { "\($0.offset) \($0.number) \($0.count)" } ?? "nil"
+        }
+        let pages = [pg(0, true), pg(100, true), pg(120, true), pg(120, false), pg(20, false), pg(0, false),
+                     pg(100, true, max: 200), pg(0, true, max: 0), pg(0, true, by: 0)]
+        let wantPages = ["100.0 2 3", "120.0 3 3", "nil", "20.0 1 3", "0.0 1 3", "nil", "200.0 3 3", "nil", "nil"]
+        if pages != wantPages { failures.append("page: \(pages)") }
         return failures
     }
 }
