@@ -397,6 +397,8 @@ final class ScrollState: ObservableObject {
     var restore: ScreenFeed.Position?
     /// `SessionModel.screens` when the restore was asked: it applies to a later screen only.
     var restoreAfter = 0
+    /// `SessionModel.screens` of the last measured content frame.
+    var screen = 0
 }
 
 /// Monospaced, selectable, coloured screen text.
@@ -404,9 +406,9 @@ final class ScrollState: ObservableObject {
 /// Auto-scroll: new output scrolls to the bottom only if the view was at the bottom BEFORE the
 /// update. The user's position is read from the content's top edge (minY): new text grows the
 /// content downward without moving minY, so a minY change is a scroll. A user scroll sets
-/// atBottom from where it lands (back at the bottom turns auto-scroll on again). Only a move made
-/// while the finger is on the scroll view or its fling is running counts as the user's: layout
-/// shifts, our own jumps and a restore never read as "the user scrolled up".
+/// atBottom from where it lands (back at the bottom turns auto-scroll on again). A move is the
+/// user's only when the scroll view reports a drag or fling, or when the app performs it (jump
+/// button, send, the assistive page scroll); everything else is geometry and changes no state.
 ///
 /// Reading position: saved when the screen goes away or the app goes to the background, per server
 /// + session (`positionKey`); on open or return the view goes back to the bottom (follow on) or to
@@ -446,14 +448,33 @@ struct TerminalView: View {
         jump(scroll, proxy)
     }
 
-    /// The finger is on the scroll view or its fling is running. With VoiceOver on, also a move of
-    /// more than half the viewport (`by`): its three-finger scroll moves about a page with no touch on
-    /// the view, a layout shift far less. Without the scroll view (not found yet) every move counts
-    /// as the user's, so a scroll up is never fought.
-    private static func userScrolling(_ model: SessionModel, by: CGFloat, viewport: CGFloat) -> Bool {
-        guard let s = model.scrollView else { return true }
-        if s.isTracking || s.isDragging || s.isDecelerating { return true }
-        return UIAccessibility.isVoiceOverRunning && abs(by) > viewport / 2
+    /// The finger drags the scroll view or its fling runs. Not `isTracking` alone: that is a resting
+    /// touch, not a scroll. Without the scroll view (not attached yet) no move is the user's: a touch
+    /// cannot reach a view that is not in a window, and the probe sets it on attach.
+    private static func userScrolling(_ model: SessionModel) -> Bool {
+        guard let s = model.scrollView else { return false }
+        return s.isDragging || s.isDecelerating
+    }
+
+    /// VoiceOver's three-finger scroll, and other assistive scroll actions sent to this element,
+    /// arrive here instead of paging the scroll view: the app pages it itself and sets the scroll
+    /// state first, so the content-frame handler never has to guess. On the Text because UIKit asks
+    /// the focused element before its parents; whether SwiftUI routes it here inside a ScrollView on
+    /// iOS 16 is verified on a device (fallback: the same modifier on the ScrollView).
+    private static func pageScroll(_ scroll: ScrollState, _ model: SessionModel, toward edge: Edge) {
+        guard let s = model.scrollView, edge == .top || edge == .bottom else { return }
+        let inset = s.adjustedContentInset
+        let visible = s.bounds.height - inset.top - inset.bottom
+        let minOff = -inset.top
+        let maxOff = max(minOff, s.contentSize.height + inset.bottom - s.bounds.height)
+        let down = edge == .bottom // reveal the lines below; the Edge mapping is unconfirmed, see the device test
+        guard let page = ScreenFeed.page(offset: s.contentOffset.y, by: visible, min: minOff, max: maxOff, down: down) else { return }
+        scroll.pinned = false
+        scroll.restore = nil
+        let atBottom = page.offset >= maxOff - 24
+        if scroll.atBottom != atBottom { scroll.atBottom = atBottom }
+        s.setContentOffset(CGPoint(x: s.contentOffset.x, y: page.offset), animated: false)
+        UIAccessibility.post(notification: .pageScrolled, argument: "Trang \(page.number) trên \(page.count)")
     }
 
     /// Reading positions by "server|session": in memory while the app runs, mirrored to UserDefaults
@@ -492,19 +513,19 @@ struct TerminalView: View {
         if scroll.atBottom { scroll.atBottom = false }
     }
 
-    /// From the content frame: once it measures a screen published after the reopen (`frame.screen`),
-    /// put the saved top line back at the top. Until then (the loading line, an older screen still
-    /// laid out) the restore waits. A line that is gone, or a place at the very bottom, goes to the
-    /// bottom with follow on.
-    private static func restore(_ scroll: ScrollState, _ proxy: ScrollViewProxy, _ model: SessionModel, _ frame: ContentFrame) {
-        guard let p = scroll.restore, frame.screen > scroll.restoreAfter, frame.screen == model.screens,
-              let lines = plainLines(model) else { return }
+    /// Once the content frame measured a screen published after the reopen (`scroll.screen`), put
+    /// the saved top line back at the top. Until then (the loading line, an older screen, no scroll
+    /// view yet) the restore waits and is tried again by the next frame and by the probe's attach. A
+    /// line that is gone, or a place at the very bottom, goes to the bottom with follow on.
+    private static func restore(_ scroll: ScrollState, _ proxy: ScrollViewProxy, _ model: SessionModel) {
+        guard let p = scroll.restore, scroll.screen > scroll.restoreAfter, scroll.screen == model.screens,
+              let lines = plainLines(model), let s = model.scrollView else { return }
         scroll.restore = nil
-        guard let s = model.scrollView, let top = ScreenFeed.topLine(p, in: lines) else { return pin(scroll, proxy) }
+        guard let top = ScreenFeed.topLine(p, in: lines) else { return pin(scroll, proxy) }
         let inset = s.adjustedContentInset
-        let lineH = (frame.height - 2 * SessionModel.vPad - 1) / CGFloat(lines.count)
+        let lineH = (scroll.contentHeight - 2 * SessionModel.vPad - 1) / CGFloat(lines.count)
         let y = SessionModel.vPad + CGFloat(top) * lineH - inset.top
-        guard y < frame.height + inset.bottom - s.bounds.height else { return pin(scroll, proxy) }
+        guard y < scroll.contentHeight + inset.bottom - s.bounds.height else { return pin(scroll, proxy) }
         // After this layout pass, like the jumps.
         DispatchQueue.main.async { s.setContentOffset(CGPoint(x: s.contentOffset.x, y: y), animated: false) }
     }
@@ -519,6 +540,7 @@ struct TerminalView: View {
                         .font(.system(size: CGFloat(fontSize), design: .monospaced))
                         .foregroundColor(.gray)
                         .textSelection(.enabled)
+                        .accessibilityScrollAction { edge in TerminalView.pageScroll(scroll, model, toward: edge) }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, SessionModel.hPad)
                         .padding(.vertical, SessionModel.vPad)
@@ -530,11 +552,14 @@ struct TerminalView: View {
                                            value: ContentFrame(minY: f.minY, maxY: f.maxY, height: f.height,
                                                                screen: model.screens))
                 })
-                // No status-bar scroll to top here: a move without a drag is never the user's (see
-                // the content-frame handler), so it would fight the bottom pin.
-                .background(ScrollProbe { [model] in
+                // No status-bar scroll to top here: a move the scroll view does not report as a drag
+                // or fling is never the user's (see the content-frame handler), so it would fight the
+                // bottom pin.
+                .background(ScrollProbe { [model, scroll, proxy] in
                     $0.scrollsToTop = false
                     model.scrollView = $0
+                    // A restore that waited for the scroll view: after this update, like the jumps.
+                    DispatchQueue.main.async { TerminalView.restore(scroll, proxy, model) }
                 })
             }
             .coordinateSpace(name: "term")
@@ -546,22 +571,23 @@ struct TerminalView: View {
                 let shrank = frame.height < scroll.contentHeight
                 scroll.minY = frame.minY
                 scroll.contentHeight = frame.height
+                scroll.screen = frame.screen
                 let nearBottom = frame.maxY <= viewportHeight + 24
                 if moved {
-                    // Told by the finger (or a VoiceOver page scroll), not by geometry alone: a layout
-                    // shift (a new screen laid out, an inset change in the push) must never unpin the
-                    // view mid-screen.
-                    let user = TerminalView.userScrolling(model, by: frame.minY - oldMinY, viewport: viewportHeight)
+                    // A move is the user's only when the scroll view reports a drag or fling; the
+                    // app's own moves set the state themselves. Any other move (a new screen laid
+                    // out, an inset change in the push) is geometry and changes no state.
+                    let user = TerminalView.userScrolling(model)
                     if user { scroll.restore = nil } // the user's own place wins over a saved one
-                    // Content moving down under the finger = the user scrolling up: off at once, so a
+                    // Content moving down under a drag = the user scrolling up: off at once, so a
                     // streaming jump never fights the finger. Not when the content shrank (the clamp
                     // moves it) or while the bottom is still inside the viewport (the bounce).
                     if user, frame.minY > oldMinY, !shrank, frame.height > viewportHeight,
                        frame.maxY > viewportHeight + 0.5 {
                         scroll.pinned = false // the user's first scroll ends the pinned phase
                         if scroll.atBottom { scroll.atBottom = false }
-                    } else if nearBottom, !scroll.atBottom, scroll.restore == nil {
-                        scroll.atBottom = true // landed back at the bottom
+                    } else if user, nearBottom, !scroll.atBottom {
+                        scroll.atBottom = true // the user landed back at the bottom
                     }
                 }
                 if scroll.pinned {
@@ -573,7 +599,7 @@ struct TerminalView: View {
                     // Decided by the state from before this update; scrolled up = never moved.
                     TerminalView.jump(scroll, proxy)
                 }
-                TerminalView.restore(scroll, proxy, model, frame)
+                TerminalView.restore(scroll, proxy, model)
             }
             .onChange(of: viewportHeight) { _ in
                 if scroll.atBottom { TerminalView.jump(scroll, proxy) }
