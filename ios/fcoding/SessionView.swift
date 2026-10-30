@@ -1,6 +1,7 @@
 import AVFoundation
 import PhotosUI
 import SwiftUI
+import UIKit
 
 struct SessionView: View {
     let name: String
@@ -349,6 +350,34 @@ private struct ContentFrameKey: PreferenceKey {
     static func reduce(value: inout ContentFrame, nextValue: () -> ContentFrame) { value = nextValue() }
 }
 
+/// Hands over the UIScrollView it sits in (iOS 16 has no scroll-phase API), so the model can hold
+/// new screens while the finger is down or the view is decelerating.
+private struct ScrollProbe: UIViewRepresentable {
+    let found: @MainActor (UIScrollView) -> Void
+
+    func makeUIView(context: Context) -> Probe { Probe(found: found) }
+    func updateUIView(_ view: Probe, context: Context) {}
+
+    final class Probe: UIView {
+        let found: @MainActor (UIScrollView) -> Void
+
+        init(found: @escaping @MainActor (UIScrollView) -> Void) {
+            self.found = found
+            super.init(frame: .zero)
+            isUserInteractionEnabled = false
+        }
+
+        required init?(coder: NSCoder) { nil }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            var view = superview
+            while let v = view, !(v is UIScrollView) { view = v.superview }
+            if let scroll = view as? UIScrollView { found(scroll) }
+        }
+    }
+}
+
 /// Scroll bookkeeping kept in a plain class so the preference closure (which Xcode 16 marks
 /// @Sendable) can update it through a captured reference instead of the view's @State.
 final class ScrollState: ObservableObject {
@@ -392,7 +421,7 @@ struct TerminalView: View {
     @StateObject private var scroll = ScrollState()
 
     private static func jump(_ scroll: ScrollState, _ proxy: ScrollViewProxy, animated: Bool = false) {
-        scroll.atBottom = true
+        if !scroll.atBottom { scroll.atBottom = true }
         // An instant jump lands at the bottom, so it reads as "at bottom" anyway; only the animated
         // one passes through mid-way offsets. A window on every jump would, while output streams,
         // keep renewing and swallow the user's scroll up.
@@ -417,9 +446,9 @@ struct TerminalView: View {
         ScrollViewReader { proxy in
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: 0) {
-                    // Every run of the styled text carries its own font and colour; these two
-                    // modifiers only style the loading line.
-                    Text(model.text.isEmpty ? AttributedString("Đang tải màn hình…") : model.styled(fontSize: fontSize, joinWraps: joinWraps))
+                    // Built off the main actor (ScreenRender). Every run of the styled text carries
+                    // its own font and colour; these two modifiers only style the loading line.
+                    Text(model.styled)
                         .font(.system(size: CGFloat(fontSize), design: .monospaced))
                         .foregroundColor(.gray)
                         .textSelection(.enabled)
@@ -433,6 +462,7 @@ struct TerminalView: View {
                     Color.clear.preference(key: ContentFrameKey.self,
                                            value: ContentFrame(minY: f.minY, maxY: f.maxY, height: f.height))
                 })
+                .background(ScrollProbe { [model] in model.scrollView = $0 })
             }
             .coordinateSpace(name: "term")
             .scrollDismissesKeyboard(.interactively)
@@ -478,7 +508,12 @@ struct TerminalView: View {
             }
             .onChange(of: bottomRequest) { _ in TerminalView.jump(scroll, proxy) }
             .onChange(of: pinRequest) { _ in TerminalView.pin(scroll, proxy) }
-            .onAppear { TerminalView.pin(scroll, proxy) }
+            .onChange(of: fontSize) { size in model.style(fontSize: size, joinWraps: joinWraps) }
+            .onChange(of: joinWraps) { join in model.style(fontSize: fontSize, joinWraps: join) }
+            .onAppear {
+                model.style(fontSize: fontSize, joinWraps: joinWraps)
+                TerminalView.pin(scroll, proxy)
+            }
             .overlay(alignment: jumpOnLeft ? .bottomLeading : .bottomTrailing) {
                 // Only content taller than the viewport can be away from the bottom.
                 if !scroll.atBottom, scroll.contentHeight > viewportHeight {

@@ -188,13 +188,17 @@ enum ANSI {
         let v = c.value
         if v < 0x80 { return false }
         if (0xE000...0xF8FF).contains(v) || v >= 0xF0000 { return true }
+        iconLock.lock()
+        defer { iconLock.unlock() }
         if let known = iconCache[v] { return known }
         let icon = nerdProbe.map { !hasGlyph(baseProbe, c) && hasGlyph($0, c) } ?? false
         iconCache[v] = icon
         return icon
     }
 
-    // Glyph coverage does not depend on size; probes and cache are used on the main thread only.
+    // Glyph coverage does not depend on size. Styling runs off the main actor (ScreenRender), so
+    // the cache is guarded by a lock; the CTFont probes are thread-safe.
+    private static let iconLock = NSLock()
     private static var iconCache: [UInt32: Bool] = [:]
     private static let baseProbe = UIFont.monospacedSystemFont(ofSize: 13, weight: .regular) as CTFont
     private static let nerdProbe: CTFont? = UIFont(name: nerdFontName, size: 13).map { $0 as CTFont }
