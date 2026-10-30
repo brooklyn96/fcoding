@@ -2579,6 +2579,56 @@ test('delta=1: first event is full; later ones are patches that rebuild the exac
   assert.ok(await until(() => c.app.stats().streams === 0));
 }));
 
+test('delta=1: a send refused while paused leaves the base alone (next patch is against the last DELIVERED screen); a cursor-only change is a patch with no lines', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  await mkSession(c, cookie);
+  let sres = null;
+  c.app.server.on('request', (req, res) => { if (req.url.startsWith('/api/stream/')) sres = res; });
+  const t0 = bigScreen(60, ' spin 1');
+  setSession(c, 'work', { screen: t0 + '\n' });
+  const s = await openSse(c, cookie, '?delta=1');
+  assert.ok(await until(() => s.events().length === 1));
+  const h0 = s.events()[0].data.hash;
+  const orig = sres.write.bind(sres);
+  let armed = false, hit = false;
+  sres.write = (chunk, ...rest) => {
+    const r = orig(chunk, ...rest);
+    if (armed && String(chunk).startsWith(': ping')) { armed = false; hit = true; return false; } // socket "full": paused
+    return r;
+  };
+  // T1 (status line + line 10) is captured while the ping pauses the socket: its send is refused, the client never gets it
+  const t1 = bigScreen(60, ' spin 2').split('\n').map((l, i) => (i === 10 ? 'changed' : l)).join('\n');
+  setSession(c, 'work', { screen: t1 + '\n' });
+  await withEnv({ FAKE_TMUX_DELAY_MS: '200' }, async () => {
+    armed = true;
+    assert.ok(await until(() => hit, 3000), 'no ping');
+    await sleep(600);
+  });
+  assert.equal(s.events().length, 1, 'event written while paused');
+  // T2 only moves another line; against the DELIVERED T0 the patch must still carry T1's changes too
+  const t2 = t1.split('\n').map((l, i) => (i === 20 ? 'again' : l)).join('\n');
+  setSession(c, 'work', { screen: t2 + '\n' });
+  sres.emit('drain');
+  assert.ok(await until(() => s.events().length === 2), 'nothing after drain');
+  const e = s.events()[1];
+  assert.equal(e.event, 'patch');
+  assert.equal(e.data.base, h0);
+  const text = applyPatch(t0, e.data);
+  assert.equal(text, t2);
+  assert.equal(screenHash(e.data, text), e.data.hash);
+  // cursor only: same text, new hash, a patch with no lines
+  setSession(c, 'work', { cursor: '7 9' });
+  assert.ok(await until(() => s.events().length === 3), 'a cursor-only change sent nothing');
+  const e3 = s.events()[2];
+  assert.equal(e3.event, 'patch');
+  assert.equal(e3.data.base, e.data.hash);
+  assert.deepEqual(e3.data.lines, []);
+  assert.deepEqual(e3.data.cursor, { x: 7, y: 9 });
+  assert.equal(screenHash(e3.data, text), e3.data.hash);
+  s.req.destroy();
+  assert.ok(await until(() => c.app.stats().streams === 0));
+}, { pollMs: 30, pingMs: 60 }));
+
 test('delta=1: a large change falls back to a full screen event', () => withApp(async (c) => {
   const { cookie } = await c.login();
   await mkSession(c, cookie);

@@ -93,7 +93,7 @@ switch (cmd) {
     }
     break;
   }
-  case 'display-message': needSession(); console.log('80 24 3 5'); break;
+  case 'display-message': needSession(); console.log(`80 24 ${st.sessions[target()].cursor || '3 5'}`); break; // cursor: "x y", set by a test
   case 'send-keys': case 'paste-buffer': case 'resize-window': needSession(); break;
   default: break; // load-buffer, delete-buffer: ok
 }
