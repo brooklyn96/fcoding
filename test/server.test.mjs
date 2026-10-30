@@ -2512,6 +2512,158 @@ test('ansi=1: SSE stream sends SGR text and a colour-only change is a new event'
   assert.ok(await until(() => c.app.stats().streams === 0));
 }));
 
+// ======================= T35: delta=1 (SSE `patch` events) =======================
+const openSse = (c, cookie, query) => new Promise((resolve, reject) => {
+  let buf = '';
+  const req = http.request({ host: '127.0.0.1', port: c.port, path: `/api/stream/work${query}`, headers: { Cookie: cookie } }, (res) => {
+    res.setEncoding('utf8');
+    res.on('data', (d) => { buf += d; });
+    resolve({ req, raw: () => buf, events: () => [...buf.matchAll(/event: (\w+)\ndata: (.*)\n/g)].map((m) => ({ event: m[1], data: JSON.parse(m[2]), size: m[0].length })) });
+  });
+  req.on('error', reject); req.end();
+});
+const applyPatch = (base, p) => { // the client rule from CONTRACT.md T35
+  const a = base.split('\n').slice(0, p.len);
+  while (a.length < p.len) a.push('');
+  for (const [i, s] of p.lines) a[i] = s;
+  return a.join('\n');
+};
+const screenHash = (e, text) => crypto.createHash('sha1').update(`${e.cols}x${e.rows}@${e.cursor.x},${e.cursor.y}\n${text}`).digest('hex').slice(0, 16);
+const bigScreen = (n, tag = '') => Array.from({ length: n }, (_, i) => `line ${i} ${'x'.repeat(50)}${i === n - 1 ? tag : ''}`).join('\n');
+
+test('delta=1: first event is full; later ones are patches that rebuild the exact text and hash (change, shrink, grow, status line)', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  await mkSession(c, cookie);
+  const t0 = bigScreen(60, ' spin 1');
+  setSession(c, 'work', { screen: t0 + '\n' });
+  const s = await openSse(c, cookie, '?ansi=1&delta=1');
+  assert.ok(await until(() => s.events().length === 1));
+  assert.equal(s.events()[0].event, 'screen');
+  assert.equal(s.events()[0].data.text, t0);
+  let text = t0; let hash = s.events()[0].data.hash;
+  const next = async (screen, n) => {
+    setSession(c, 'work', { screen: screen + '\n' });
+    assert.ok(await until(() => s.events().length === n), 'no event ' + n);
+    return s.events()[n - 1];
+  };
+  const check = (e, want) => {
+    assert.equal(e.event, 'patch');
+    assert.equal(e.data.base, hash);
+    text = applyPatch(text, e.data);
+    assert.equal(text, want);
+    assert.equal(screenHash(e.data, text), e.data.hash); // the hash is still valid for the rebuilt text
+    hash = e.data.hash;
+  };
+  // status line only: a tiny patch (one line), far smaller than the full screen
+  const t1 = bigScreen(60, ' spin 2');
+  const e1 = await next(t1, 2);
+  check(e1, t1);
+  assert.deepEqual(e1.data.lines.map((l) => l[0]), [59]);
+  assert.ok(e1.size < 400, `status-line patch is ${e1.size} bytes`);
+  // one line in the middle changed
+  const t2 = t1.split('\n').map((l, i) => (i === 10 ? 'changed' : l)).join('\n');
+  check(await next(t2, 3), t2);
+  // shrink: len smaller, nothing else to send
+  const t3 = t2.split('\n').slice(0, 45).join('\n');
+  const e3 = await next(t3, 4);
+  check(e3, t3);
+  assert.equal(e3.data.len, 45);
+  // grow: the new lines (also an empty one) come as [i, s]
+  const t4 = t3 + '\nnew a\n\nnew c';
+  const e4 = await next(t4, 5);
+  check(e4, t4);
+  assert.equal(e4.data.len, 48);
+  assert.ok(e4.data.lines.some((l) => l[1] === ''));
+  assert.deepEqual([e4.data.rows, e4.data.cols, e4.data.cursor], [24, 80, { x: 3, y: 5 }]);
+  s.req.destroy();
+  assert.ok(await until(() => c.app.stats().streams === 0));
+}));
+
+test('delta=1: a send refused while paused leaves the base alone (next patch is against the last DELIVERED screen); a cursor-only change is a patch with no lines', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  await mkSession(c, cookie);
+  let sres = null;
+  c.app.server.on('request', (req, res) => { if (req.url.startsWith('/api/stream/')) sres = res; });
+  const t0 = bigScreen(60, ' spin 1');
+  setSession(c, 'work', { screen: t0 + '\n' });
+  const s = await openSse(c, cookie, '?delta=1');
+  assert.ok(await until(() => s.events().length === 1));
+  const h0 = s.events()[0].data.hash;
+  const orig = sres.write.bind(sres);
+  let armed = false, hit = false;
+  sres.write = (chunk, ...rest) => {
+    const r = orig(chunk, ...rest);
+    if (armed && String(chunk).startsWith(': ping')) { armed = false; hit = true; return false; } // socket "full": paused
+    return r;
+  };
+  // T1 (status line + line 10) is captured while the ping pauses the socket: its send is refused, the client never gets it
+  const t1 = bigScreen(60, ' spin 2').split('\n').map((l, i) => (i === 10 ? 'changed' : l)).join('\n');
+  setSession(c, 'work', { screen: t1 + '\n' });
+  await withEnv({ FAKE_TMUX_DELAY_MS: '200' }, async () => {
+    armed = true;
+    assert.ok(await until(() => hit, 3000), 'no ping');
+    await sleep(600);
+  });
+  assert.equal(s.events().length, 1, 'event written while paused');
+  // T2 only moves another line; against the DELIVERED T0 the patch must still carry T1's changes too
+  const t2 = t1.split('\n').map((l, i) => (i === 20 ? 'again' : l)).join('\n');
+  setSession(c, 'work', { screen: t2 + '\n' });
+  sres.emit('drain');
+  assert.ok(await until(() => s.events().length === 2), 'nothing after drain');
+  const e = s.events()[1];
+  assert.equal(e.event, 'patch');
+  assert.equal(e.data.base, h0);
+  const text = applyPatch(t0, e.data);
+  assert.equal(text, t2);
+  assert.equal(screenHash(e.data, text), e.data.hash);
+  // cursor only: same text, new hash, a patch with no lines
+  setSession(c, 'work', { cursor: '7 9' });
+  assert.ok(await until(() => s.events().length === 3), 'a cursor-only change sent nothing');
+  const e3 = s.events()[2];
+  assert.equal(e3.event, 'patch');
+  assert.equal(e3.data.base, e.data.hash);
+  assert.deepEqual(e3.data.lines, []);
+  assert.deepEqual(e3.data.cursor, { x: 7, y: 9 });
+  assert.equal(screenHash(e3.data, text), e3.data.hash);
+  s.req.destroy();
+  assert.ok(await until(() => c.app.stats().streams === 0));
+}, { pollMs: 30, pingMs: 60 }));
+
+test('delta=1: a large change falls back to a full screen event', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  await mkSession(c, cookie);
+  const t0 = bigScreen(60);
+  setSession(c, 'work', { screen: t0 + '\n' });
+  const s = await openSse(c, cookie, '?delta=1');
+  assert.ok(await until(() => s.events().length === 1));
+  const t1 = t0.split('\n').map((l, i) => `other ${i}${l.slice(8)}`).join('\n');
+  setSession(c, 'work', { screen: t1 + '\n' });
+  assert.ok(await until(() => s.events().length === 2));
+  assert.equal(s.events()[1].event, 'screen');
+  assert.equal(s.events()[1].data.text, t1);
+  s.req.destroy();
+  assert.ok(await until(() => c.app.stats().streams === 0));
+}));
+
+test('no delta (absent, 0, other value): the stream bytes are exactly the screen events, never a patch', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  await mkSession(c, cookie);
+  const full = (d) => `event: screen\ndata: ${JSON.stringify(d)}\n\n`;
+  for (const [i, q] of ['', '?ansi=1', '?delta=0', '?ansi=1&delta=true'].entries()) { // one at a time: each first getScreen needs free read slots
+    setSession(c, 'work', { screen: bigScreen(60, ` a${i}`) + '\n' });
+    const s = await openSse(c, cookie, q);
+    assert.ok(await until(() => s.events().length === 1), q);
+    const t1 = bigScreen(60, ` b${i}`);
+    setSession(c, 'work', { screen: t1 + '\n' });
+    assert.ok(await until(() => s.events().length === 2), q);
+    const j = (await c.req('GET', `/api/screen/work${q.includes('ansi=1') ? '?ansi=1' : ''}`, { cookie })).json;
+    assert.equal(j.text, t1);
+    assert.equal(s.raw(), `retry: 3000\n\n${full(s.events()[0].data)}${full(j)}`, q);
+    s.req.destroy();
+    assert.ok(await until(() => c.app.stats().streams === 0));
+  }
+}));
+
 test('prompt detection works on coloured text (SGR stripped before matching)', () => withApp(async (c) => {
   const E = ESC, act = 1_700_000_000, t = act * 1000 + 9000;
   const coloured = `${E}[1mDo you${E}[0m ${E}[33mwant${E}[0m to ${E}[4mproceed${E}[24m?\n${E}[7m❯ 1. Yes${E}[0m\n  ${E}[2m2. No${E}[0m\n`;
