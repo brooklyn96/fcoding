@@ -342,6 +342,8 @@ final class ScrollState: ObservableObject {
     @Published var canScroll = false
     /// The arrow's jump goes through the text view's coordinator.
     weak var coordinator: TerminalText.Coordinator?
+    /// Device-check evidence line (temporary); tap hides it.
+    @Published var evidence: String?
 }
 
 /// Monospaced, selectable, coloured screen text, with the jump-to-bottom arrow.
@@ -386,6 +388,18 @@ struct TerminalView: View {
                     .accessibilityLabel("Xuống cuối")
                     .padding(.horizontal, 10)
                     .padding(.bottom, 8)
+                }
+            }
+            .overlay(alignment: .top) {
+                if let e = scroll.evidence {
+                    Text(e)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.white)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(6)
+                        .background(Color.orange.opacity(0.85))
+                        .onTapGesture { scroll.evidence = nil }
+                        .accessibilityHint("Chạm để ẩn")
                 }
             }
     }
@@ -496,6 +510,7 @@ struct TerminalText: UIViewRepresentable {
         var dirty = false
         var lastGeo: TermTextView.Geo?
         var animateNext = false
+        var evidenceShown = false
 
         init(scroll: ScrollState) { self.scroll = scroll }
 
@@ -580,6 +595,14 @@ final class TermTextView: UITextView {
         case .none: break
         }
         c.publish()
+        // Evidence for the device checks (revert this commit before merge): the first applied pass
+        // of a real screen, in its own banner over the text (never model.errorText).
+        if !c.evidenceShown, c.lines != nil {
+            c.evidenceShown = true
+            c.scroll.evidence = "open \(c.reading.target) y=\(Int(contentOffset.y)) bottom=\(Int(bottom)) "
+                + "content=\(Int(geo.contentH)) cs=\(Int(contentSize.height)) view=\(Int(bounds.height)) "
+                + "inset=\(Int(geo.inset.top))/\(Int(geo.inset.bottom))"
+        }
     }
 
     override func safeAreaInsetsDidChange() {
