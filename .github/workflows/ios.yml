@@ -29,16 +29,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The app has no test target: build Links.swift + PairLink.swift + HomeLogic.swift + ResponseCache.swift + LaunchFetch.swift for macOS with a tiny main, run their selfTests and the shared origin vectors.
-      - name: Links + PairLink + HomeLogic + ResponseCache + LaunchFetch self-test
+      # The app has no test target: build Links.swift + PairLink.swift + HomeLogic.swift + ResponseCache.swift + LaunchFetch.swift + ScreenFeed.swift for macOS with a tiny main, run their selfTests and the shared origin vectors.
+      - name: Links + PairLink + HomeLogic + ResponseCache + LaunchFetch + ScreenFeed self-test
         run: |
           T=$(mktemp -d)
-          cp ios/fcoding/Links.swift ios/fcoding/PairLink.swift ios/fcoding/HomeLogic.swift ios/fcoding/ResponseCache.swift ios/fcoding/LaunchFetch.swift "$T/"
+          cp ios/fcoding/Links.swift ios/fcoding/PairLink.swift ios/fcoding/HomeLogic.swift ios/fcoding/ResponseCache.swift ios/fcoding/LaunchFetch.swift ios/fcoding/ScreenFeed.swift "$T/"
           cat > "$T/main.swift" <<'EOF'
           import Foundation
           var failures = Links.selfTest() + PairLink.selfTest().map { "PairLink " + $0 }
             + HomeLogic.selfTest().map { "HomeLogic " + $0 }
             + ResponseCache.selfTest().map { "ResponseCache " + $0 }
+          failures += ScreenFeed.selfTest().map { "ScreenFeed " + $0 }
           failures += await LaunchFetch.selfTest().map { "LaunchFetch " + $0 }
           // The shared origin table (same file as the server tests), path as the first argument.
           if CommandLine.arguments.count > 1, let data = FileManager.default.contents(atPath: CommandLine.arguments[1]) {
@@ -51,7 +52,7 @@ jobs:
           exit(failures.isEmpty ? 0 : 1)
           EOF
           cd "$T"
-          xcrun -sdk macosx swiftc -o linktest Links.swift PairLink.swift HomeLogic.swift ResponseCache.swift LaunchFetch.swift main.swift
+          xcrun -sdk macosx swiftc -o linktest Links.swift PairLink.swift HomeLogic.swift ResponseCache.swift LaunchFetch.swift ScreenFeed.swift main.swift
           ./linktest "$GITHUB_WORKSPACE/test/origin-vectors.json"
 
       - name: Install XcodeGen
