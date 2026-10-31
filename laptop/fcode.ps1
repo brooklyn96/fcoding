@@ -2103,7 +2103,7 @@ function Wait-MoveTransferEnd([string]$NewHost) {
   $last = ''; $idle = 0; $bad = 0
   while ($true) {
     Wait-Move 10
-    $st = Invoke-MoveGate $NewHost 'status' '' @() -Quiet
+    $st = Invoke-MoveGate $NewHost 'status' '' @() -Quiet -TimeoutSec 60   # bounded: a half-open link must not hang the laptop with src stopped; 124 counts as a bad poll (like any failure)
     if ($st.Code -ne 0) { $bad++; if ($bad -ge 12) { Write-Host "lỗi: mất liên lạc với máy mới '$NewHost' khi đang chép."; return 1 }; continue }
     $bad = 0; $v = ''
     foreach ($l in $st.Lines) { if ("$l" -match '\AMOVE state .*\btransfer=([a-z]+)') { $v = $Matches[1]; $script:MoveTransferMs = $(if ("$l" -match '\btransfer_ms=([0-9]+)') { [long]$Matches[1] } else { $null }) } }
@@ -2130,7 +2130,7 @@ function Invoke-MoveTransfer([string]$NewHost, [string]$Id, [bool]$Final) {
 }
 # the machine must run no hold item or connector (`status` shows hold_active=0); 65 = dst-running
 function Test-MoveHoldIdle([string]$HostName) {
-  $r = Invoke-MoveGate $HostName 'status' ''
+  $r = Invoke-MoveGate $HostName 'status' '' @() -TimeoutSec 60   # bounded; 124 = failure (exit 1)
   if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
   foreach ($l in $r.Lines) {
     if ("$l" -match '\AMOVE state .*\bhold_active=(\S+)') {

@@ -1158,6 +1158,20 @@ T 'a run that enters with dst already started never rolls back by itself: switch
   Reset-World; $s = RwMark 'switching'; Add-Rule 'newbox' ' switch$' -Seq @((@{ Out = @('MOVE error switch-failed'); Code = 1 }), (@{ Out = @('MOVE done switch'); Code = 0 }))
   $r = Run-Move @('cutover'); Eq $r.Code 70; $r = Run-Move @('cutover'); Eq $r.Code 0 $r.Text; Eq (State).phase 'cut'
 }
+# ---- RW item 3: the status polls of the transfer wait and of the hold check are bounded ----
+T 'the status polls of Wait-MoveTransferEnd and Test-MoveHoldIdle carry ssh timeouts and a 60 s deadline; a hung poll (124) is a bad poll: the transfer poll goes on after 2 hung polls, 12 in a row stop with exit 1; a hung hold check stops copy (g) with exit 1' {
+  Reset-World; [void](Seed 'planned'); Add-Rule 'newbox' ' transfer$' -Do { $script:HangN = 2 }; Add-Rule 'newbox' ' status' -Seq @((St 'idle'), (St 'running'), (St 'done'))
+  $script:TimedCalls.Clear(); $r = Run-Move @('copy'); Eq $r.Code 0 $r.Text
+  $pollCalls = @($script:TimedCalls | Where-Object { "$($_.Args[-1])" -match '--move status' })
+  Ok ($pollCalls.Count -ge 5) "polls were bounded calls ($($pollCalls.Count))"; foreach ($c in $pollCalls) { $a = $c.Args -join ' '; Ok ($c.T -le 60 -and $a -match 'ConnectTimeout=\d+' -and $a -match 'ServerAliveInterval=5' -and $a -match 'ServerAliveCountMax=2') "poll bounded: T=$($c.T)" }
+  Eq (State).phase 'copied'
+  # 12 hung polls in a row
+  Reset-World; [void](Seed 'planned'); Add-Rule 'newbox' ' transfer$' -Do { $script:HangN = -1 }
+  $r = Run-Move @('copy'); Eq $r.Code 1 $r.Text; Ok ($r.Text -match 'mất liên lạc') 'gives up after 12 bad polls'; Eq (State).phase 'planned'; Eq (Count '^newbox adopt') 0; $script:HangN = 0
+  # the hold check (copy step g) hangs
+  Reset-World; [void](Seed 'planned'); $script:TimedCalls.Clear(); Add-Rule 'newbox' ' prepare$' -Do { $script:HangN = 1 }
+  $r = Run-Move @('copy'); Eq $r.Code 1 $r.Text; Eq (Count ' dump') 0 'stopped before the dump'; $h = @($script:TimedCalls | Where-Object { $_.T -eq 60 -and "$($_.Args[-1])" -match '--move status' }); Ok ($h.Count -ge 1) 'the hold check was a 60 s call'
+}
 # ============================== round 5 (arbitration: a cutover in flight is a mark) ==============================
 function Seed-Mark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan', [string]$Phase = 'copied') {
   $s = Seed $Phase $Dir $Via $Mark
