@@ -1269,6 +1269,17 @@ T 'G1b: finish (abandon-rollback) with dst_started true asks the YES on every ru
   Reset-World; $s = RwMark 'rolling-back'; Set-MoveProp $s 'dst_started' $false; Set-MoveProp $s.answers 'finish' (New-MoveAnswer); Save-MoveState $s
   $r = Run-Move @('finish'); Eq $r.Code 0 $r.Text; Eq $script:Prompts.Count 0 'dst never started + stored answer: no question'
 }
+T 'G6b: the script calls (Invoke-MoveScript: preflight, tcp check, bootstrap key, bootstrap gate) carry -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 in the ssh argv' {
+  $ko = '-o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4'
+  function ScriptCalls { @($script:SshArgv | Where-Object { ($_ -join ' ') -match 'mktemp' }) }
+  Reset-World; $r = Run-Move @('plan', 'newbox'); Eq $r.Code 0 $r.Text
+  $pre = ScriptCalls; Ok ($pre.Count -ge 1) 'plan made a script call (preflight)'; Ok (@($script:ScriptLog | Where-Object { $_.Name -ceq 'preflight' }).Count -ge 1) 'preflight ran'
+  foreach ($a in $pre) { $line = $a -join ' '; Ok ($line.Contains($ko)) "plan: $line" }
+  Reset-World; [void](Seed 'planned'); $r = Run-Move @('copy'); Eq $r.Code 0 $r.Text
+  $names = @($script:ScriptLog | ForEach-Object { $_.Name }); Ok (($names -contains 'bootstrap key') -and ($names -contains 'bootstrap gate')) "bootstrap scripts ran: $($names -join ',')"
+  $calls = ScriptCalls; Eq $calls.Count $names.Count 'one ssh call per script'
+  foreach ($a in $calls) { $line = $a -join ' '; Ok ($line.Contains($ko)) "copy: $line" }
+}
 # ============================== round 5 (arbitration: a cutover in flight is a mark) ==============================
 function Seed-Mark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan', [string]$Phase = 'copied') {
   $s = Seed $Phase $Dir $Via $Mark
