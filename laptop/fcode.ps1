@@ -1735,7 +1735,17 @@ function Invoke-MoveBox([string]$Script, [string[]]$ScriptArgs = @()) {
   @{ Code = $code; Lines = $o }
 }
 # post-cut chore (c): the same rewrite in the coder box's ~/.ssh/config through Invoke-BoxScript. An unreachable coder is a warning, never a failure. Returns 0 or 1.
+# a ProxyCommand that names a Windows program (a drive letter path, a backslash, or .exe) cannot run on the Linux coder box
+function Test-MoveWindowsProxy([string[]]$Lines) {
+  foreach ($l in @($Lines)) { if ("$l" -match '^\s*ProxyCommand(?:\s*=\s*|\s+)(.*)$' -and $Matches[1] -match '(?i)(\b[A-Z]:[\\/]|\\|\.exe\b)') { return $true } }
+  $false
+}
 function Set-MoveCoderAlias($S) {
+  if ([string]$S.dir -ceq 'fwd') {   # R5: the coder gets the laptop's ProxyCommand word for word; a Windows one would break its `Host <old>` after the cut
+    $lt0 = if ([IO.File]::Exists((Get-MoveSshConfigPath))) { [IO.File]::ReadAllText((Get-MoveSshConfigPath)) } else { '' }
+    $nd0 = Get-MoveNewDirectives $lt0 ([string]$S.new.alias) ([string]$S.new.addr)
+    if (-not $nd0.Err -and (Test-MoveWindowsProxy $nd0.Lines)) { Write-Host 'INV warn coder-unreachable why=proxycommand'; Write-Host "coder: ProxyCommand của 'Host $($S.new.alias)' trên máy này là chương trình Windows nên không chép sang coder; ssh config của coder không đổi (alias '$($S.old.alias)' trên coder vẫn trỏ máy cũ, cần sửa tay)."; return 0 }
+  }
   $rd = Invoke-MoveBox (Get-MoveCoderReadScript) @()
   $hit = @($rd.Lines | Where-Object { "$_" -cmatch '\AMOVE coder-config exists=(yes|no) b64=' } | Select-Object -First 1)
   if ($rd.Code -ne 0 -or -not $hit.Count) { Write-Host 'INV warn coder-unreachable'; return 0 }

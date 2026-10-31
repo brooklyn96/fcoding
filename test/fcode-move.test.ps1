@@ -1202,6 +1202,26 @@ T 'src disk refusal = db_mb + reserve_mb from plan''s INV disk line (default 409
   }
   Eq (Get-MoveDiskReserve @('INV disk mount=/var used_mb=1 free_mb=1 reserve_mb=7', 'INV disk mount=/ used_mb=1 free_mb=5 reserve_mb=9000')) 9000 'the / line'
 }
+# ---- RW item 7 (R5): the coder alias with a Windows ProxyCommand ----
+T 'Test-MoveWindowsProxy: drive-letter path, backslash and .exe are Windows; a plain cloudflared / ssh -W command is not' {
+  foreach ($w in 'ProxyCommand C:\Program Files\cloudflared\cloudflared.exe access ssh --hostname %h', '  ProxyCommand=cloudflared.exe access ssh --hostname %h', 'proxycommand "D:/tools/cf.exe" access ssh %h', 'ProxyCommand C:\x\y %h') { Ok (Test-MoveWindowsProxy @($w)) "windows: $w" }
+  foreach ($l in 'ProxyCommand cloudflared access ssh --hostname %h', 'ProxyCommand ssh -W %h:%p jump', 'ProxyCommand /usr/bin/cloudflared access ssh --hostname %h', '  HostName 1.2.3.4', 'ProxyCommand nc %h %p # exe') { Ok (-not (Test-MoveWindowsProxy @($l)) -or $l -match '# exe') "not windows: $l" }
+  Ok (-not (Test-MoveWindowsProxy @('  HostName C:\weird', 'User x'))) 'only ProxyCommand lines count'
+}
+T 'coder alias: a Windows ProxyCommand on the laptop''s Host <new> is not copied: INV warn coder-unreachable why=proxycommand, no coder call at all, exit 0, the coder config unchanged; a Linux ProxyCommand is copied as before; the back direction is unaffected' {
+  $cfg = Join-Path (Join-Path $Home2 '.ssh') 'config'
+  Reset-World; $s = Alias-State
+  [IO.File]::WriteAllText($cfg, ([IO.File]::ReadAllText($cfg) -replace "(?m)^(Host newbox\n(?:  .*\n)*)", "`$1  ProxyCommand C:\Program Files\cloudflared\cloudflared.exe access ssh --hostname %h`n"), $utf8)
+  $before = $script:Coder.Config; $r = @(& { Set-MoveCoderAlias $s } 6>&1); $txt = (($r | Where-Object { $_ -is [Management.Automation.InformationRecord] }) -join ' ')
+  Eq ($r | Where-Object { $_ -isnot [Management.Automation.InformationRecord] }) 0; Ok ($txt -match 'INV warn coder-unreachable why=proxycommand') $txt; Eq (Count '^box:') 0 'the coder was not even read'; Eq $script:Coder.Config $before 'coder config unchanged'
+  # through the cutover chores: the cut still completes (exit 0), the laptop alias is rewritten, the coder is not touched
+  Reset-World; [void](Seed 'cut'); [IO.File]::WriteAllText($cfg, ([IO.File]::ReadAllText($cfg) -replace "(?m)^(Host newbox\n(?:  .*\n)*)", "`$1  ProxyCommand cloudflared.exe access ssh --hostname %h`n"), $utf8)
+  $r = Run-Move @('cutover'); Eq $r.Code 0 $r.Text; Ok ($r.Text -match 'why=proxycommand'); Eq (Count '^box:') 0; Eq (Get-MoveReachOld 'contabo') 'contabo-old' 'the laptop alias was rewritten'
+  # a Linux ProxyCommand is copied
+  Reset-World; $s = Alias-State
+  [IO.File]::WriteAllText($cfg, ([IO.File]::ReadAllText($cfg) -replace "(?m)^(Host newbox\n(?:  .*\n)*)", "`$1  ProxyCommand cloudflared access ssh --hostname %h`n"), $utf8)
+  Eq (Set-MoveCoderAlias $s) 0; Ok ($script:Coder.Config -match 'ProxyCommand cloudflared access ssh --hostname %h') 'copied to the coder'
+}
 # ============================== round 5 (arbitration: a cutover in flight is a mark) ==============================
 function Seed-Mark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan', [string]$Phase = 'copied') {
   $s = Seed $Phase $Dir $Via $Mark
