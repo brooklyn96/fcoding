@@ -1905,6 +1905,7 @@ function Get-MoveQuestion([string]$Kind, $S) {
       else { "Chuyển lại sang máy mới? Dữ liệu ghi ở máy cũ sẽ được chép sang máy mới; mọi ứng dụng cùng tạm dừng một lần, khoảng $n phút. (Có/Không)" }
     }
     'finish' { 'Máy cũ có thể bỏ được chưa? Lệnh sẽ tắt hẳn ứng dụng trên máy cũ và xoá khoá chuyển máy. Sau bước này KHÔNG quay lại được nữa. Huỷ gói VPS cũ ở trang Contabo do bạn tự làm. (Có/Không)' }
+    'new-lost' { "Không kết nối được máy mới $([string]$S.new.alias). Nếu máy mới đã mất hẳn (đã xoá hoặc hỏng), lần chuyển này sẽ được đánh dấu đã xong; máy cũ đã được dọn. Máy mới đã mất hẳn? (Có/Không)" }
     'finish-early' { 'Mới chuyển chưa đủ 72 giờ. Vẫn bỏ máy cũ ngay? (Có/Không)' }
     'abandon' {
       $running = if ([string]$S.dir -ceq 'fwd') { [string]$S.old.alias } else { [string]$S.new.alias }
@@ -2447,6 +2448,15 @@ function Invoke-MoveFinish($S, [string]$Do) {
     $peer = if ($m -ceq 'old') { [string]$S.new.alias } else { [string]$S.old.alias }
     Write-Host "finish trên '$h'..."
     $r = Invoke-MoveGate $h 'finish' $id @($peer)
+    if ($abandon -and $m -ceq 'new') {   # R4: old is already cleaned; a new that never answers (deleted or dead during copy) must not block the abandon for ever
+      for ($try = 2; $try -le 3 -and $r.Code -eq 255; $try++) { Wait-Move 5; $r = Invoke-MoveGate $h 'finish' $id @($peer) }
+      if ($r.Code -eq 255) {
+        if (-not (Confirm-MoveYes (Get-MoveQuestion 'new-lost' $S))) { Write-Host "Chưa huỷ xong: máy mới '$h' chưa nối được. Chạy lại  fcode move finish  khi máy mới nối lại được."; return 1 }
+        Set-MoveProp $S 'new_lost' $true
+        Write-Host "Đã ghi nhận máy mới '$h' mất hẳn; không dọn được nó."
+        break
+      }
+    }
     $lines = @($r.Lines | ForEach-Object { "$_" })
     $done = ($r.Code -eq 0) -or ($abandon -and (($r.Code -eq 65 -and @($lines | Where-Object { $_ -cmatch '\AMOVE error (no-move|move-id-mismatch)\b' }).Count) -or $r.Code -eq 127))   # abandon: `copy`/`init` of this run never reached that machine (nothing, or the move-id of an earlier move)
     if (-not $done) { return (ConvertTo-MoveExit $r.Code) }

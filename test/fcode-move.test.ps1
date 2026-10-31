@@ -1172,6 +1172,27 @@ T 'the status polls of Wait-MoveTransferEnd and Test-MoveHoldIdle carry ssh time
   Reset-World; [void](Seed 'planned'); $script:TimedCalls.Clear(); Add-Rule 'newbox' ' prepare$' -Do { $script:HangN = 1 }
   $r = Run-Move @('copy'); Eq $r.Code 1 $r.Text; Eq (Count ' dump') 0 'stopped before the dump'; $h = @($script:TimedCalls | Where-Object { $_.T -eq 60 -and "$($_.Args[-1])" -match '--move status' }); Ok ($h.Count -ge 1) 'the hold check was a 60 s call'
 }
+# ---- RW item 5 (R4): an abandon whose new machine is lost ----
+T 'abandon with a lost new: finish on old succeeded, new answers 255 three times -> the typed question (verbatim); YES = phase finished, new_lost true, workflows back; anything else = exit 1 and nothing finished; a new that answers on the 2nd try asks nothing; a normal finish (phase cut) never asks' {
+  $Q = 'Không kết nối được máy mới newbox. Nếu máy mới đã mất hẳn (đã xoá hoặc hỏng), lần chuyển này sẽ được đánh dấu đã xong; máy cũ đã được dọn. Máy mới đã mất hẳn? (Có/Không)'
+  Reset-World; [void](Seed 'copied'); Add-Rule 'newbox' ' finish' -Code 255 -Out @('#NOEXIT'); Yes; Yes
+  $r = Run-Move @('finish'); Eq $r.Code 0 $r.Text; Ok ($r.Text.Contains($Q)) "question verbatim: $($r.Text)"; Eq (Count '^newbox finish') 3 'three tries'; Eq (Count '^contabo finish') 1 'old cleaned once'
+  $n = State; Eq $n.phase 'finished'; Eq $n.new_lost $true; Eq $n.mark $null; Eq (Count 'gh workflow enable deploy.yml') 1 'workflows come back (src is old)'
+  Ordered @('^contabo finish newbox$', '^newbox finish contabo$')
+  # a re-run after `finished` just says done
+  $r = Run-Move @('finish'); Eq $r.Code 0
+  # not YES: exit 1, phase unchanged, a later run asks again (old's finish is idempotent)
+  Reset-World; [void](Seed 'copied'); Add-Rule 'newbox' ' finish' -Code 255 -Out @('#NOEXIT'); Yes; $script:Answers.Enqueue('no')
+  $r = Run-Move @('finish'); Eq $r.Code 1; Eq (State).phase 'copied'; Eq (State).new_lost $null; Ok ($r.Text -match 'Chạy lại  fcode move finish') 'says how to go on'
+  $r = Run-Move @('finish'); Eq $r.Code 1 'still lost, no YES queued for the lost question'; Eq $script:Prompts.Count 1 'the abandon answer is remembered: only the lost question is asked'
+  Yes; $r = Run-Move @('finish'); Eq $r.Code 0 $r.Text; Eq (State).phase 'finished'; Eq (State).new_lost $true
+  # new answers on the second try: no question
+  Reset-World; [void](Seed 'copied'); Add-Rule 'newbox' ' finish' -Seq @((@{ Out = @('#NOEXIT'); Code = 255 }), (@{ Out = @('MOVE step finish skipped=no'); Code = 0 })); Yes
+  $r = Run-Move @('finish'); Eq $r.Code 0 $r.Text; Eq $script:Prompts.Count 1 'only the abandon question'; Eq (Count '^newbox finish') 2; Eq (State).new_lost $null
+  # a finish of a cut run (not an abandon) with new down: exit 1 as before, no lost-new question
+  Reset-World; [void](Seed 'cut'); $s = State; Set-MoveProp $s 'cut_at' '2026-10-20T00:00:00Z'; Save-MoveState $s; Add-Rule 'newbox' ' finish' -Code 255 -Out @('#NOEXIT'); Yes
+  $r = Run-Move @('finish'); Eq $r.Code 1; Eq (State).phase 'cut'; Ok (-not $r.Text.Contains($Q)) 'no lost-new question for a cut run'
+}
 # ============================== round 5 (arbitration: a cutover in flight is a mark) ==============================
 function Seed-Mark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan', [string]$Phase = 'copied') {
   $s = Seed $Phase $Dir $Via $Mark
