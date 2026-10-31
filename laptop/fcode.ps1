@@ -2475,6 +2475,7 @@ function Invoke-MoveFinish($S, [string]$Do) {
     $r = Invoke-MoveGate $h 'finish' $id @($peer)
     if ($abandon -and $m -ceq 'new') {   # R4: old is already cleaned; a new that never answers (deleted or dead during copy) must not block the abandon for ever
       for ($try = 2; $try -le 3 -and $r.Code -eq 255; $try++) { Wait-Move 5; $r = Invoke-MoveGate $h 'finish' $id @($peer) }
+      if ($r.Code -eq 255 -and [string]$S.dir -cne 'fwd') { Write-Host "Chưa huỷ xong: máy '$h' chưa nối được. Đây là lần chuyển về (back): các ứng dụng đang chạy ở máy đó, nên không thể coi là mất hẳn. Chạy lại  fcode move finish  khi nối lại được."; return 1 }   # G7: new of a back run is the machine that holds the apps
       if ($r.Code -eq 255) {
         if (-not (Confirm-MoveYes (Get-MoveQuestion 'new-lost' $S))) { Write-Host "Chưa huỷ xong: máy mới '$h' chưa nối được. Chạy lại  fcode move finish  khi máy mới nối lại được."; return 1 }
         Set-MoveProp $S 'new_lost' $true

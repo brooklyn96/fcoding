@@ -1248,6 +1248,14 @@ T 'G6: every Invoke-MoveGate / move script ssh call has -o ConnectTimeout=10 -o 
   Reset-World; [void](Seed 'copied'); Yes; Add-Rule 'newbox' ' switch' -Code 255 -Out @('#NOEXIT'); $r = Run-Move @('cutover'); Eq $r.Code 1 $r.Text; Eq (State).mark 'switching' '255 of switch = unknown outcome, no rollback'
   Eq (Count '^contabo start') 0 'src not started'; [void](KoAll 'switch 255')
 }
+# ---- RW item G7: the lost-new escape is for a forward run only ----
+T 'G7: an abandon of a back run (dir=back) with new answering 255 = no question, exit 1 with the line that the apps were on that machine, phase unchanged, new_lost not set' {
+  foreach ($ph in 'copied', 'rolled-back') {
+    Reset-World; [void](Seed $ph 'back' 'back'); Add-Rule 'newbox' ' finish' -Code 255 -Out @('#NOEXIT'); Yes; Yes
+    $before = (State).phase; $r = Run-Move @('finish'); Eq $r.Code 1 "${ph}: $($r.Text)"; Eq (State).phase $before; Eq (State).new_lost $null
+    Ok ($r.Text -match 'lần chuyển về' -and $r.Text -match 'đang chạy ở máy đó') "${ph}: line about the apps: $($r.Text)"; Ok (-not $r.Text.Contains('mất hẳn? (Có/Không)')) "${ph}: no lost question"
+  }
+}
 # ============================== round 5 (arbitration: a cutover in flight is a mark) ==============================
 function Seed-Mark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan', [string]$Phase = 'copied') {
   $s = Seed $Phase $Dir $Via $Mark
