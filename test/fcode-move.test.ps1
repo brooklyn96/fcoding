@@ -126,7 +126,7 @@ function Fake-Gate([string]$H, [string]$Verb, [string]$Id, [string]$Rest, [strin
     default { @("MOVE step $Verb skipped=no ms=5", "LOG $CANARY") }
   }
   $res = Fake-Result $r $def
-  $o = @($res.Out); if (-not @($o | Where-Object { $_ -match '^GATE_EXIT' }).Count) { $o += "GATE_EXIT $($res.Code)" }
+  $o = @($res.Out); if ($o.Count -and $o[0] -ceq '#NOEXIT') { $o = @($o | Select-Object -Skip 1) } elseif (-not @($o | Where-Object { $_ -match '^GATE_EXIT' }).Count) { $o += "GATE_EXIT $($res.Code)" }   # '#NOEXIT' as the first line = a reply without a GATE_EXIT line
   @{ Out = $o; Code = $res.Code }
 }
 function Get-ScriptName([string]$Text) { if ($Text -match '(?m)^# fcode move: ([a-z ]+(?:\((?:read|write)\))?)') { $Matches[1].Trim() } else { 'unknown' } }
@@ -686,10 +686,11 @@ T 'cutover: resume at step 10 after a kill (mark switching): only switch, unfree
   $r = Run-Move @('cutover'); Eq $r.Code 0 $r.Text
   Ordered @('^newbox switch', '^newbox unfreeze', 'gh secret set'); Eq (Count '^(contabo|newbox) (freeze|stop|dump|transfer|adopt|start)') 0 'nothing earlier re-run'; Eq $script:Prompts.Count 0
   Eq (State).phase 'cut'
-  # a switch failure on resume rolls back
+  # a switch failure on a resume under `switching` (dst may already serve): no rollback, no dst stop, mark kept, exit 70 (decision: no automatic rollback once dst may have served)
   Reset-World; $s = Seed 'copied' 'fwd' 'plan' 'switching'; Set-MoveProp $s 'dst_started' $true; Save-MoveState $s
   Add-Rule 'newbox' ' switch' -Code 1 -Out @('MOVE error switch-failed host=a')
-  $r = Run-Move @('cutover'); Eq $r.Code 1; Eq (State).phase 'rolled-back'; Ordered @('^newbox stop', '^contabo start --connectors')
+  $r = Run-Move @('cutover'); Eq $r.Code 70 $r.Text; Eq (State).phase 'copied'; Eq (State).mark 'switching'; Eq (State).dst_started $true; Eq (Count '^newbox stop') 0 'no dst stop'; Eq (Count '^contabo start') 0 'old not started'
+  Ok ($r.Text -match 'fcode move cutover' -and $r.Text -match 'fcode move back' -and $r.Text -notmatch 'fcode move finish' -and $r.Text -match 'bỏ dữ liệu') 'says why and the ways on (no finish under switching)'
 }
 T 'cutover: 75 waits the smallest retry_s and runs the same step again; past cap_s it rolls back (exit 75)' {
   $s = Cut-State; Yes
@@ -1100,8 +1101,8 @@ T 'F1 automatic rollback: a transfer that never ends = exit 70 at the cap, mark 
   Ok ($r.Text -match 'chưa quay lại được' -and $r.Text -notmatch 'Chưa chạy gì') 'the cap line says what really happened (rollback not done), not "nothing ran"'
   Ok ($r.Text -match "máy 'contabo'" -and $r.Text -match 'fcode move finish' -and $r.Text -match 'fcode move cutover') 'names src and both ways on under the mark cutting'
   Ok ((Elapsed) -ge 1800 -and (Elapsed) -le 1800 + 130) "elapsed $(Elapsed) s = the 1800 s cap of the rollback wait + the 12 failed transfer polls (120 s) before it, no more"
-  # under switching the finish way is not offered
-  Reset-World; F1Mark 'switching'; $script:Rules.Clear(); Add-Rule 'newbox' ' switch' -Code 1 -Out @('MOVE error switch-failed host=a'); $script:IdleSeq.Enqueue((StMs 'done')); 1..400 | ForEach-Object { $script:IdleSeq.Enqueue((StMs 'running')) }
+  # under switching the finish way is not offered (a first-pass definite switch failure rolls back; the wait inside that rollback never ends)
+  Reset-World; [void](Seed 'copied'); Yes; $script:Rules.Clear(); Add-Rule 'newbox' ' switch' -Code 1 -Out @('MOVE error switch-failed host=a'); $script:IdleSeq.Enqueue((StMs 'done')); 1..400 | ForEach-Object { $script:IdleSeq.Enqueue((StMs 'running')) }
   $r = Run-Move @('cutover'); Eq $r.Code 70 $r.Text; Ok ($r.Text -match 'chưa quay lại được' -and $r.Text -match 'fcode move cutover' -and $r.Text -notmatch 'fcode move finish') 'switching: only cutover'; Eq (State).mark 'switching'
 }
 T 'F1 bounded reads: every status read of the wait carries ssh timeouts and a process deadline <= the time left; a hung read (killed at the deadline, code 124) is retried until the cap, then exit 70 with state bytes unchanged' {
@@ -1126,6 +1127,30 @@ T 'Invoke-MoveTimedExe for real: a program that outlives the deadline is killed 
   Eq $x.Code 124; Ok ($el -lt 10) "killed after $([int]$el) s"
   $x = & $script:RealTimedExe 'bash' @('-c', 'cat; echo done; exit 3') "hello`n" 5; Eq $x.Code 3; Eq ($x.Out -join '|') 'hello|done'
   $x = & $script:RealTimedExe 'no-such-program-fcm' @() '' 2; Eq $x.Code -1
+}
+# ---- RW item 1: no automatic rollback once dst may have served ----
+function RwMark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan') { $s = Seed 'copied' $Dir $Via $Mark; if ($Mark -ceq 'cutting') { Set-MoveProp $s.answers $(if ($Via -ceq 'back') { 'back' } else { 'cut' }) (New-MoveAnswer) }; Save-MoveState $s; $s }
+T 'switch answering with a transport failure (255 / 124 / no GATE_EXIT line, even ssh code 0) in the first pass: no dst stop, no rollback, mark `switching` stays, exit 1; a definite refusal (GATE_EXIT 1) in the first pass still rolls back' {
+  foreach ($c in @(@(255, @('#NOEXIT')), @(124, @('#NOEXIT')), @(1, @('#NOEXIT', 'some noise')), @(0, @('#NOEXIT', 'MOVE step switch skipped=no')))) {
+    Reset-World; [void](Seed 'copied'); Yes
+    $code = $c[0]; $out = @($c[1])
+    Add-Rule 'newbox' ' switch' -Seq @(@{ Out = $out; Code = $code })   # Fake-Gate adds GATE_EXIT itself; the Seq answer replaces the whole reply, so give no GATE_EXIT line
+    $r = Run-Move @('cutover'); Eq $r.Code 1 "code $code $($r.Text)"; Eq (State).mark 'switching' "mark ($code)"; Eq (State).phase 'copied'; Eq (State).dst_started $true
+    Eq (Count '^newbox stop') 1 'only step 5''s stop: none from a rollback'; Eq (Count '^contabo start') 0; Ok ($r.Text -match 'không rõ kết quả' -and $r.Text -match 'fcode move cutover') "says it ($code)"
+  }
+  Reset-World; [void](Seed 'copied'); Yes; Add-Rule 'newbox' ' switch' -Code 1 -Out @('MOVE error switch-failed host=a')
+  $r = Run-Move @('cutover'); Eq $r.Code 1; Eq (State).phase 'rolled-back'; Ordered @('^newbox stop$', '^contabo start --connectors', '^contabo unfreeze')
+}
+T 'a run that enters with dst already started never rolls back by itself: switching + switch fails; cutting + dst_started + start or health fails; via=back the same (mark kept, no dst stop, no src start, exit 70)' {
+  foreach ($v in 'start', 'health') {
+    Reset-World; $s = RwMark 'cutting'; Set-MoveProp $s 'dst_started' $true; Save-MoveState $s; Add-Rule 'newbox' " $v$" -Code 1 -Out @("MOVE error $v")
+    $r = Run-Move @('cutover'); Eq $r.Code 70 "$v $($r.Text)"; Eq (State).mark 'cutting'; Eq (State).dst_started $true; Eq (Count ' stop$') 0; Eq (Count 'start --connectors') 0; Eq (Count ' unfreeze') 0
+  }
+  Reset-World; $s = RwMark 'cutting' 'back' 'back'; Set-MoveProp $s 'dst_started' $true; Save-MoveState $s; Add-Rule 'contabo' ' health$' -Code 69 -Out @('MOVE error health')
+  $r = Run-Move @('back'); Eq $r.Code 70 $r.Text; Eq (State).mark 'cutting'; Eq (Count ' stop$') 0
+  # a second run after the first 70 resumes the same way (idempotent)
+  Reset-World; $s = RwMark 'switching'; Add-Rule 'newbox' ' switch$' -Seq @((@{ Out = @('MOVE error switch-failed'); Code = 1 }), (@{ Out = @('MOVE done switch'); Code = 0 }))
+  $r = Run-Move @('cutover'); Eq $r.Code 70; $r = Run-Move @('cutover'); Eq $r.Code 0 $r.Text; Eq (State).phase 'cut'
 }
 # ============================== round 5 (arbitration: a cutover in flight is a mark) ==============================
 function Seed-Mark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan', [string]$Phase = 'copied') {
@@ -1166,8 +1191,9 @@ T 'cutting + dst_started true (a kill inside step 9): cutover continues at step 
   Eq (Count '^(contabo|newbox) (freeze|stop|dump|transfer|adopt|restore|prepare|verify)') 0 'nothing is re-copied over the started dst'; Eq (Count 'gh workflow disable') 0 'workflows are not touched again'; Eq $script:Prompts.Count 0
   $n = State; Eq $n.phase 'cut'; Eq $n.mark $null
   Reset-World; $s = Seed-Mark 'cutting' 'fwd' 'plan' 'rolled-back'; Set-MoveProp $s 'dst_started' $true; Save-MoveState $s; Add-Rule 'newbox' ' health' -Code 69 -Out @('MOVE error health app=x')
-  $r = Run-Move @('cutover'); Eq $r.Code 69 $r.Text; $n = State; Eq $n.phase 'rolled-back'; Eq $n.mark $null; Eq $n.dst_started $false
-  Ordered @('^newbox start$', '^newbox health$', '^newbox stop$', '^contabo start --connectors', '^contabo unfreeze', '^contabo health'); Eq $script:Prompts.Count 0
+  $r = Run-Move @('cutover'); Eq $r.Code 70 $r.Text; $n = State; Eq $n.phase 'rolled-back'; Eq $n.mark 'cutting' 'mark kept'; Eq $n.dst_started $true
+  Ordered @('^newbox start$', '^newbox health$'); Eq (Count '^newbox stop') 0 'no dst stop'; Eq (Count '^contabo start') 0 'old not started'; Eq $script:Prompts.Count 0
+  Ok ($r.Text -match 'fcode move cutover' -and $r.Text -match 'fcode move finish' -and $r.Text -match 'MẤT') 'under cutting: both ways on, finish with the loss warning'
   Reset-World; $s = Seed-Mark 'cutting' 'back' 'back'; Set-MoveProp $s 'dst_started' $true; Save-MoveState $s
   $r = Run-Move @('back'); Eq $r.Code 0 $r.Text; Ordered @('^contabo start$', '^contabo health$', '^contabo switch$'); Eq (Count ' freeze') 0
 }
@@ -1209,7 +1235,7 @@ T 'the r5 reproduction: a cutover cut off under cutting: plan and copy are refus
 }
 T 'switching: cutover resumes at step (10) and finishes the cut; a failing switch on resume rolls back; answers.finish does not leak into a later finish (reset at the cut), also after an abandon that ended in 70' {
   Reset-World; [void](Seed-Mark 'switching'); $r = Run-Move @('cutover'); Eq $r.Code 0 $r.Text; Ordered @('^newbox switch$', '^newbox unfreeze$'); Eq (Count '^(contabo|newbox) (freeze|stop|dump)') 0
-  Reset-World; $s = Seed-Mark 'switching'; Add-Rule 'newbox' ' switch' -Code 1 -Out @('MOVE error switch-failed host=a'); $r = Run-Move @('cutover'); Eq $r.Code 1; Eq (State).phase 'rolled-back'; Eq (State).mark $null
+  Reset-World; $s = Seed-Mark 'switching'; Add-Rule 'newbox' ' switch' -Code 1 -Out @('MOVE error switch-failed host=a'); $r = Run-Move @('cutover'); Eq $r.Code 70; Eq (State).mark 'switching'; Eq (Count '^newbox stop') 0
   Reset-World; $s = Seed 'copied'; Set-MoveProp $s.answers 'finish' (New-MoveAnswer); Save-MoveState $s; Yes
   $r = Run-Move @('cutover'); Eq $r.Code 0 $r.Text; $n = State; Eq $n.phase 'cut'; Eq $n.answers.finish $null
   $script:Answers.Clear(); $r = Run-Move @('finish'); Eq $r.Code 65; Ok ($r.Text.Contains('Máy cũ có thể bỏ được chưa?')) 'Q-finish asked again'; Eq $script:Log.Count 0

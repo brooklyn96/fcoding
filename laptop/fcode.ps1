@@ -2325,7 +2325,11 @@ function Invoke-MoveCutSteps($S, [bool]$Resume, [bool]$Resume9 = $false) {
   Write-Host "(10) switch trên '$dst'..."
   Set-MoveProp $S 'mark' 'switching'; Save-MoveState $S
   $r = Invoke-MoveGate $dst 'switch' $id
-  if ($r.Code -ne 0) { return @{ Code = (ConvertTo-MoveExit $r.Code); Why = 'switch lỗi' } }
+  if ($r.Code -ne 0 -or -not @($r.Lines | Where-Object { "$_" -cmatch '\AGATE_EXIT\s+[0-9]+\s*\z' }).Count) {
+    # a transport failure (255, 124, no GATE_EXIT line) does not say whether the connectors were switched on: dst may serve already, so no rollback; the mark stays `switching` and `cutover` runs again
+    if ($r.Code -in 255, 124 -or -not @($r.Lines | Where-Object { "$_" -cmatch '\AGATE_EXIT\s+[0-9]+\s*\z' }).Count) { return @{ Code = 1; Why = 'switch: không rõ kết quả'; NoRollback = $true } }
+    return @{ Code = (ConvertTo-MoveExit $r.Code); Why = 'switch lỗi' }   # a definite refusal of the gate (GATE_EXIT n): in the first pass it still rolls back
+  }
   Write-Host "(11) unfreeze trên '$dst'..."
   $r = Invoke-MoveGate $dst 'unfreeze' $id
   if ($r.Code -ne 0) { return @{ Code = (ConvertTo-MoveExit $r.Code); Why = 'unfreeze lỗi'; NoRollback = $true } }
@@ -2388,6 +2392,7 @@ function Invoke-MoveCutover($S) {
   $mark = [string]$S.mark
   if ($mark -ceq 'rolling-back') { return (Invoke-MoveRollback $S 1 'làm nốt lần quay lại đang dở') }
   if ([string]$S.phase -ceq 'cut') { return (Invoke-MoveChores $S) }
+  $enteredStarted = [bool]($mark -ceq 'switching' -or ($mark -ceq 'cutting' -and $S.dst_started -eq $true))   # dst already started (or switching) when this run began
   if ($mark -ceq 'switching') { $f = Invoke-MoveCutSteps $S $true }   # resume at step (10)
   elseif ($mark -ceq 'cutting') { $f = Invoke-MoveCutSteps $S $false ([bool]($S.dst_started -eq $true)) }   # step (1) never runs again; A31: dst_started true = continue at step (9)
   else {
@@ -2405,7 +2410,12 @@ function Invoke-MoveCutover($S) {
     $f = Invoke-MoveCutSteps $S $false $false
   }
   if ($f.Code -eq 0) { return (Invoke-MoveChores $S) }
-  if ($f.NoRollback) { Write-Host "lỗi ở bước cuối ($($f.Why)); chạy lại  fcode move cutover  để làm tiếp (mark switching giữ nguyên)."; return $f.Code }
+  if ($f.NoRollback) { Write-Host "lỗi ở bước cuối ($($f.Why)); chạy lại  fcode move cutover  để làm tiếp (mark $([string]$S.mark) giữ nguyên)."; return $f.Code }
+  if ($enteredStarted) {   # dst may have served for any length of time: a rollback would drop every write its apps took since, so it never runs by itself here
+    $dstA = Get-MoveDstHost $S; $srcA = Get-MoveSrcHost $S
+    Write-Host "CẦN NGƯỜI (70): $($f.Why). Máy '$dstA' đã được bật từ lần chạy trước và có thể đã phục vụ; quay lại tự động sẽ bỏ dữ liệu các ứng dụng đã ghi ở đó từ lúc cắt, nên không tự quay lại. Mark '$([string]$S.mark)' giữ nguyên. Cách đi tiếp: sửa máy '$dstA' rồi chạy lại  fcode move cutover$(if ([string]$S.mark -ceq 'cutting') { "; hoặc  fcode move finish  (cho ứng dụng chạy lại ở máy '$srcA' và huỷ lần chuyển, DỮ LIỆU GHI Ở MÁY '$dstA' SẼ MẤT)" } else { " (đang ở bước switch: không huỷ được; sau khi xong, về máy '$srcA' bằng  fcode move back  để dữ liệu được chép về)" })."
+    return 70
+  }
   Invoke-MoveRollback $S ([int]$f.Code) ([string]$f.Why)
 }
 
