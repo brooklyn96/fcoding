@@ -1057,10 +1057,16 @@ T 'F1 the round-F scenario: a back run, laptop killed right after `transfer` sta
   Ordered @('^idle-check newbox$', '^idle-check newbox$', '^idle-check newbox$', '^idle-check newbox$', 'script:bootstrap key', '^newbox manifest', 'init dst', '^newbox init src')
   Eq (Count '^newbox tunnels') 1 'tunnels on src = new runs only after the wait (the call that answered busy in round F)'
 }
-T 'F1 cap = 2 x the last measured transfer_s (1800 s unmeasured): past it exit 70, nothing run, state file unchanged; a read failing (new unreachable) goes on' {
+T 'F1 cap = max(2 x the last measured transfer_s, 300 s) (1800 s unmeasured): past it exit 70, nothing run, state file unchanged; a read failing (new unreachable) goes on' {
   Reset-World; $s = Seed 'planned'; Set-MoveProp $s 'transfer_s' 60; Save-MoveState $s; $bytes = [IO.File]::ReadAllText((Get-MovePath 'state.json'))
-  1..40 | ForEach-Object { $script:IdleSeq.Enqueue((StMs 'running')) }
-  $r = Run-Move @('copy'); Eq $r.Code 70 $r.Text; Ok ($r.Text -match 'CẦN NGƯỜI' -and $r.Text -match 'giới hạn 120 giây') 'names the cap'; Ok ((Elapsed) -le 120 -and (Elapsed) -ge 110) "total elapsed $(Elapsed) s within the 120 s cap"
+  1..100 | ForEach-Object { $script:IdleSeq.Enqueue((StMs 'running')) }
+  $r = Run-Move @('copy'); Eq $r.Code 70 $r.Text; Ok ($r.Text -match 'CẦN NGƯỜI' -and $r.Text -match 'giới hạn 300 giây') 'the 300 s floor, not 2 x 60 = 120'; Ok ((Elapsed) -le 300 -and (Elapsed) -ge 290) "total elapsed $(Elapsed) s within the 300 s cap"
+  # a long measured transfer: 2 x 200 = 400 s
+  Reset-World; $s = Seed 'planned'; Set-MoveProp $s 'transfer_s' 200; Save-MoveState $s; 1..100 | ForEach-Object { $script:IdleSeq.Enqueue((StMs 'running')) }
+  $r = Run-Move @('copy'); Eq $r.Code 70; Ok ($r.Text -match 'giới hạn 400 giây') '2 x transfer_s above the floor'
+  Reset-World; $s = Seed 'planned'; Set-MoveProp $s 'transfer_s' 2; Save-MoveState $s; Run-Idle 'running' 'running' 'done'; $r = Run-Move @('copy'); Eq $r.Code 0 'a 2 s refresh copy no longer gives a 4 s cap: a wait of 20 s is fine'
+  Reset-World; $s = Seed 'planned'; Set-MoveProp $s 'transfer_s' 60; Save-MoveState $s; $bytes = [IO.File]::ReadAllText((Get-MovePath 'state.json'))
+  1..100 | ForEach-Object { $script:IdleSeq.Enqueue((StMs 'running')) }; $r = Run-Move @('copy')
   Eq (Count '^(contabo|newbox)( |$)') 0 'nothing run'; Eq ([IO.File]::ReadAllText((Get-MovePath 'state.json'))) $bytes 'state file unchanged'
   Reset-World; [void](Seed 'planned'); 1..400 | ForEach-Object { $script:IdleSeq.Enqueue((StMs 'running')) }
   $r = Run-Move @('copy'); Eq $r.Code 70; Ok ($r.Text -match 'giới hạn 1800 giây') 'unmeasured: 1800 s'; Ok ((Elapsed) -le 1800 -and (Elapsed) -ge 1790) "elapsed $(Elapsed) s"; Eq (State).phase 'planned'
@@ -1114,9 +1120,9 @@ T 'F1 bounded reads: every status read of the wait carries ssh timeouts and a pr
   Ok (@($script:TimedCalls | Select-Object -Last 1)[0].T -le 60) 'last read bounded'; $script:HangN = 0
   # a read that hangs twice and then answers: the wait goes on and the copy runs
   Reset-World; $script:HangN = 2; [void](Seed 'planned'); $r = Run-Move @('copy'); Eq $r.Code 0 $r.Text; Ok (@($script:Sleeps | Where-Object { $_ -eq 10 }).Count -ge 2) 'waited between hung reads'
-  # the remaining time shrinks the per-read timeout: a transfer_s of 4 (cap 8 s) bounds the first read to 8 s, later ones to what is left
+  # the remaining time shrinks the per-read timeout: the cap (300 s) bounds the reads: 60 s each, the last one only what is left
   Reset-World; $script:TimedCalls.Clear(); $s = Seed 'planned'; Set-MoveProp $s 'transfer_s' 4; Save-MoveState $s; $script:HangN = -1
-  $r = Run-Move @('copy'); Eq $r.Code 70; Eq $script:TimedCalls[0].T 8 'first read: the whole cap'; Eq (Elapsed) 8 'exits the moment the cap is used up: no 10 s sleep past it'; Ok (@($script:TimedCalls | Where-Object { $_.T -gt 8 }).Count -eq 0) 'never above the cap'; $script:HangN = 0
+  $r = Run-Move @('copy'); Eq $r.Code 70; Eq $script:TimedCalls[0].T 60 'first read: 60 s'; Eq @($script:TimedCalls)[-1].T 20 'the last read gets only what is left (300 - 4 x 70)'; Eq (Elapsed) 300 'exits the moment the cap is used up: no 10 s sleep past it'; Ok (@($script:TimedCalls | Where-Object { $_.T -gt 60 }).Count -eq 0) 'never above 60 s'; $script:HangN = 0
   # a hung read inside the rollback's wait: 70, mark `cutting` and answers untouched, no rollback command
   Reset-World; F1Mark 'cutting'; Yes; $script:HangN = -1; $script:IdleSeq.Enqueue((StMs 'done'))
   $r = Run-Move @('finish'); Eq $r.Code 70 $r.Text; Eq (State).mark 'cutting'; Eq (Count ' stop$|start --connectors| finish ') 0 'no command sent'; $script:HangN = 0

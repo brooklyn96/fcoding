@@ -2144,11 +2144,11 @@ function Test-MoveHoldIdle([string]$HostName) {
   1
 }
 # F1: new's transfer unit (fcode-move-transfer) holds the move lock, so every verb answers `busy` while a transfer left by a killed laptop still runs.
-# Before the first remote step of copy / cutover / back / finish: while new's `status` shows transfer=running, wait (poll 10 s); cap = 2 x the last measured transfer_s, 1800 s unmeasured.
+# Before the first remote step of copy / cutover / back / finish: while new's `status` shows transfer=running, wait (poll 10 s); cap = max(2 x the last measured transfer_s, 300 s), 1800 s unmeasured.
 # Past the cap: exit 70, nothing run, phase and mark unchanged. new unreachable or no status line: go on (the step itself reports it).
 function Wait-MoveNewIdle($S, [switch]$InRollback) {
   $newH = Get-MoveNewHost $S
-  $cap = if ($null -ne $S.transfer_s -and [double]$S.transfer_s -gt 0) { 2 * [double]$S.transfer_s } else { 1800 }
+  $cap = if ($null -ne $S.transfer_s -and [double]$S.transfer_s -gt 0) { [Math]::Max(2 * [double]$S.transfer_s, 300) } else { 1800 }   # a 1-5 s refresh copy must not give a 2-10 s cap for a final delta that is days old
   $t0 = Get-MoveNow; $n = 0
   while ($true) {
     $el = [int](((Get-MoveNow) - $t0).TotalSeconds); $left = [int]($cap - $el)
