@@ -1019,12 +1019,19 @@ function Test-DeployRepo([string]$r) { ($r -cmatch '\A[A-Za-z0-9_.-]+/[A-Za-z0-9
 
 # chay mot lenh tren VPS qua ssh, in tung dong ngay khi tien toi (tru khi -Quiet), tra @{ Code; Lines }.
 # $B64 (tuy chon): noi dung (base64, mot dong) gui vao stdin cua lenh tu xa
-# $HostName (tuy chon): ten ssh cua may khac (fcode move); khong co thi deployHost. Cung luat ky tu nhu deployHost.
-function Invoke-DeploySsh([string]$Remote, [string]$B64, [switch]$Quiet, [string]$HostName) {
+function Invoke-DeploySsh([string]$Remote, [string]$B64, [switch]$Quiet, [string]$HostName, [int]$TimeoutSec = 0) {
   $dh = if ($HostName) { if ($HostName -cmatch '\A[A-Za-z0-9][A-Za-z0-9._@-]{0,99}\z') { $HostName } } else { Get-DeployHost }
   $buf = New-Object 'System.Collections.Generic.List[string]'
   $emit = { param($l) $buf.Add([string]$l); if (-not $Quiet) { if ("$l" -cmatch '\AGATE_WARN') { Write-Host $l -ForegroundColor Yellow } else { Write-Host $l } } }   # GATE_WARN = canh bao cua cong: mau vang
   if (-not $dh) { Write-Host $(if ($HostName) { "lỗi: tên ssh '$($HostName -replace '[\x00-\x1f\x7f]', '?')' không dùng được (chỉ chữ, số, dấu . _ @ -)." } else { 'lỗi: deployHost trong file cấu hình không dùng được (chỉ chữ, số, dấu . _ @ -).' }); return @{ Code = 1; Lines = @() } }
+  if ($TimeoutSec -gt 0) {   # a bounded call (fcode move): ssh gives up a stalled connection by itself and the process is killed at the deadline (code 124)
+    $to = [Math]::Max(1, $TimeoutSec)
+    $sa = @('-o', "ConnectTimeout=$([Math]::Min(10, $to))", '-o', 'ServerAliveInterval=5', '-o', 'ServerAliveCountMax=2') + $(if ($B64) { @() } else { @('-n') }) + @($dh, $Remote)
+    $t = Invoke-MoveTimedExe 'ssh' $sa $(if ($B64) { $B64 + "`n" } else { '' }) $to
+    foreach ($l in @($t.Out)) { & $emit $l }
+    if ($t.Code -eq 124) { Write-Host "lỗi: ssh $dh không trả lời trong $to giây (đã dừng)." } elseif ($t.Code -eq 255) { Write-Host "lỗi: không nối được VPS bằng ssh $dh (mã 255). Thử gõ: ssh $dh" }
+    return @{ Code = [int]$t.Code; Lines = @($buf) }
+  }
   $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
   try {
     if ($B64) { $B64 | & ssh $dh $Remote | ForEach-Object { & $emit $_ } }
@@ -1299,7 +1306,7 @@ function Save-MoveState($S) { Write-PhienText (Get-MovePath 'state.json') (Conve
 function New-MoveState([string]$Id, [string]$Dir, [string]$Via, $Old, $New) {
   [pscustomobject][ordered]@{
     schema = 1; move_id = $Id; dir = $Dir; via = $Via; old = $Old; new = $New
-    manifest_sha = ''; est_downtime_s = 0; est_cut_s = $null; transfer_s = $null; cap_s = 1800
+    manifest_sha = ''; est_downtime_s = 0; est_cut_s = $null; dump_s = $null; transfer_s = $null; apply_s = $null; cap_s = 1800
     phase = 'planned'; mark = $null; cut_at = $null; cut_not_before = $null; dst_started = $false
     answers = [pscustomobject][ordered]@{ cut = $null; back = $null; finish = $null; finish_early = $null }
     repos = @()
@@ -1342,14 +1349,37 @@ function Complete-MoveResult($R, [switch]$Quiet) {
   if (-not $Quiet) { Write-MoveLines $R.Lines }
   @{ Code = $code; Lines = @($R.Lines) }
 }
+# run a program with a hard deadline: @{ Code; Out = lines }; Code 124 = killed at the deadline (the whole process tree), -1 = could not start. stdin text is written as UTF-8 and closed.
+function Invoke-MoveTimedExe([string]$Exe, [string[]]$ExeArgs, [string]$StdinText, [int]$TimeoutSec) {
+  $psi = New-Object Diagnostics.ProcessStartInfo
+  $psi.FileName = $Exe; $psi.Arguments = (@($ExeArgs | ForEach-Object { ConvertTo-PhienArg ([string]$_) }) -join ' ')
+  $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+  $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+  $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
+  try { $p = [Diagnostics.Process]::Start($psi) } catch { return @{ Code = -1; Out = @() } }
+  try {
+    try {
+      if ($StdinText) { $sb = [Text.Encoding]::UTF8.GetBytes($StdinText); $p.StandardInput.BaseStream.Write($sb, 0, $sb.Length); $p.StandardInput.BaseStream.Flush() }
+      $p.StandardInput.Close()
+    } catch { }
+    $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
+    $end = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
+    while (-not $p.WaitForExit(100)) { if ([DateTime]::UtcNow -ge $end) { Stop-PhienProc $p; return @{ Code = 124; Out = @() } } }
+    try { [void][Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($o, $e), 3000) } catch { }
+    $lines = New-Object System.Collections.Generic.List[string]
+    if ($o.IsCompleted -and -not $o.IsFaulted) { $lines.AddRange([string[]]@($o.Result -split "`r?`n")) }
+    if ($lines.Count -and $lines[$lines.Count - 1] -eq '') { $lines.RemoveAt($lines.Count - 1) }
+    @{ Code = $p.ExitCode; Out = [string[]]$lines.ToArray() }
+  } finally { $p.Dispose() }
+}
 # `ssh <host> "fcode-deploy-gate --move <verb> <move_id> <args>"`; $B64 = stdin (one base64 line, decoded on the server side)
-function Invoke-MoveGate([string]$HostName, [string]$Verb, [string]$Id, [string[]]$VArgs = @(), [string]$B64 = '', [switch]$Quiet) {
+function Invoke-MoveGate([string]$HostName, [string]$Verb, [string]$Id, [string[]]$VArgs = @(), [string]$B64 = '', [switch]$Quiet, [int]$TimeoutSec = 0) {
   foreach ($w in (@($Verb) + @($Id) + @($VArgs))) { if ($w -and -not (Test-MoveWord ([string]$w))) { Write-Host "lỗi: tham số '$("$w" -replace '[\x00-\x1f\x7f]', '?')' không hợp lệ."; return @{ Code = 65; Lines = @() } } }
   $cmd = '/usr/local/sbin/fcode-deploy-gate --move ' + $Verb
   if ($Id) { $cmd += ' ' + $Id }
   foreach ($a in @($VArgs)) { $cmd += ' ' + $a }
   if ($B64) { $cmd = 'base64 -di | ' + $cmd }
-  Complete-MoveResult (Invoke-DeploySsh $cmd $B64 -Quiet -HostName $HostName) -Quiet:$Quiet
+  Complete-MoveResult (Invoke-DeploySsh $cmd $B64 -Quiet -HostName $HostName -TimeoutSec $TimeoutSec) -Quiet:$Quiet
 }
 # a small bash script over plain ssh (before the gate exists on the machine): the arguments travel in a `set --` line of the payload, never on the ssh command line
 function Invoke-MoveScript([string]$HostName, [string]$Script, [string[]]$ScriptArgs = @(), [switch]$Quiet) {
@@ -1863,13 +1893,8 @@ function Get-MovePushScan($Apps, [string]$OldAddr) {
 
 
 # ---- questions (DESIGN.md section 1, verbatim). The agent asks in chat; the CLI also needs the typed word YES, as `deploy add` does ----
-# est_cut_s = 60 + transfer_s + ceil(db_mb / 30) (CONTRACT section 2 gains it; db_mb = pgdb, pgroles and local image items), from a manifest object
-function Get-MoveEstCut($Obj, [int]$TransferS) {
-  $db = 0.0
-  foreach ($it in @($Obj.items)) { if ((@('pgdb', 'pgroles') -ccontains [string]$it.kind) -or ([string]$it.kind -ceq 'image' -and $it.meta.local -eq $true)) { $db += [double]$it.size_mb } }
-  [int](60 + $TransferS + [Math]::Ceiling($db / 30))
-}
-# the "<N> phút" of Q-cut / Q-back and the copy summary: the measured est_cut_s when the state has it (old state files do not), else the plan-time est_downtime_s
+# est_cut_s = 40 + dump_s + transfer_s + apply_s (decision F2: 40 s = freeze, stop, dst stop/prepare, start, health and switch)
+function Get-MoveEstCut([int]$DumpS, [int]$TransferS, [int]$ApplyS) { [int](40 + $DumpS + $TransferS + $ApplyS) }
 function Get-MoveMinutes($S) { $sec = if ($null -ne $S.est_cut_s -and [double]$S.est_cut_s -gt 0) { [double]$S.est_cut_s } else { [double]$S.est_downtime_s }; [int][Math]::Max(1, [Math]::Ceiling($sec / 60)) }
 function Get-MoveQuestion([string]$Kind, $S) {
   $n = Get-MoveMinutes $S
@@ -2052,7 +2077,7 @@ function Invoke-MovePlan($S0, [string]$Alias, [string]$MapFile, [bool]$New) {
   $merged = @(foreach ($n in @($r.Repos)) { $e = @(@($S.repos) | Where-Object { $_.repo -ceq $n.repo -and $_.workflow -ceq $n.workflow })[0]; if ($e) { $n.enabled = [bool]$e.enabled }; $n })
   Set-MoveProp $S 'repos' $merged
   Set-MoveProp $S 'manifest_sha' $r.Sha; Set-MoveProp $S 'est_downtime_s' ([int]$r.Obj.est_downtime_s); Set-MoveProp $S 'cap_s' (Get-MoveCap $r.Obj)
-  Set-MoveProp $S 'est_cut_s' $null; Set-MoveProp $S 'transfer_s' $null   # a new plan: the copy has to be measured again
+  Set-MoveProp $S 'est_cut_s' $null; Set-MoveProp $S 'dump_s' $null; Set-MoveProp $S 'transfer_s' $null; Set-MoveProp $S 'apply_s' $null   # a new plan: the copy has to be measured again
   Set-MoveProp $S 'phase' 'planned'; Set-MoveProp $S 'mark' $null
   Save-MoveManifest $r.Text
   $mp = Get-MovePath 'move-map.json'
@@ -2118,6 +2143,31 @@ function Test-MoveHoldIdle([string]$HostName) {
   Write-Host "lỗi: status của '$HostName' không có hold_active."
   1
 }
+# F1: new's transfer unit (fcode-move-transfer) holds the move lock, so every verb answers `busy` while a transfer left by a killed laptop still runs.
+# Before the first remote step of copy / cutover / back / finish: while new's `status` shows transfer=running, wait (poll 10 s); cap = 2 x the last measured transfer_s, 1800 s unmeasured.
+# Past the cap: exit 70, nothing run, phase and mark unchanged. new unreachable or no status line: go on (the step itself reports it).
+function Wait-MoveNewIdle($S, [switch]$InRollback) {
+  $newH = Get-MoveNewHost $S
+  $cap = if ($null -ne $S.transfer_s -and [double]$S.transfer_s -gt 0) { 2 * [double]$S.transfer_s } else { 1800 }
+  $t0 = Get-MoveNow; $n = 0
+  while ($true) {
+    $el = [int](((Get-MoveNow) - $t0).TotalSeconds); $left = [int]($cap - $el)
+    if ($left -le 0) {
+      if ($InRollback) { Write-Host "CẦN NGƯỜI (70): máy mới '$newH' chưa báo xong việc chép sau $el giây (giới hạn $([int]$cap) giây), nên chưa quay lại được: chưa gửi lệnh quay lại nào, mark giữ nguyên. Kiểm tra unit fcode-move-transfer trên máy đó." }
+      else { Write-Host "CẦN NGƯỜI (70): máy mới '$newH' chưa báo xong việc chép sau $el giây (giới hạn $([int]$cap) giây). Chưa chạy gì, trạng thái giữ nguyên. Kiểm tra unit fcode-move-transfer trên máy đó rồi chạy lại." }
+      return 70
+    }
+    # every read is bounded by the time left: a stalled connection or a hung remote status cannot outlast the cap
+    $st = Invoke-MoveGate $newH 'status' '' @() -Quiet -TimeoutSec ([Math]::Min($left, 60))
+    $running = $false; $hung = ($st.Code -eq 124)
+    if ($st.Code -eq 0) { foreach ($l in $st.Lines) { if ("$l" -match '\AMOVE state .*\btransfer=running\b') { $running = $true } } }
+    if (-not $running -and -not $hung) { return 0 }   # idle / done / failed, or new unreachable (255 ...): go on, the step itself reports it
+    if ($n % 3 -eq 0) { Write-Host "máy mới '$newH' $(if ($hung) { 'chưa trả lời status' } else { 'đang chép dở từ lần trước (transfer=running)' }): chờ... $el giây (giới hạn $([int]$cap) giây)" }
+    $n++
+    $left = [int]($cap - [int](((Get-MoveNow) - $t0).TotalSeconds))   # the read itself used time: recompute, never sleep past the cap
+    if ($left -gt 0) { Wait-Move ([Math]::Min(10, $left)) }
+  }
+}
 function Invoke-MoveCopy($S) {
   $id = [string]$S.move_id; $fwd = ([string]$S.dir -ceq 'fwd')
   $src = Get-MoveSrcHost $S; $dst = Get-MoveDstHost $S; $newH = Get-MoveNewHost $S; $oldH = Get-MoveOldHost $S
@@ -2158,23 +2208,28 @@ function Invoke-MoveCopy($S) {
   if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
   $h = Test-MoveHoldIdle $dst; if ($h -ne 0) { return $h }
   Write-Host "copy (h): dump trên '$src'..."
+  $tDump = Get-MoveNow
   $r = Invoke-MoveGate $src 'dump' $id
   if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
+  $dumpS = [int][Math]::Ceiling(((Get-MoveNow) - $tDump).TotalSeconds)
   Write-Host "copy (i): chép dữ liệu (máy mới kéo / đẩy trực tiếp)..."
   $script:MoveTransferMs = $null
   $x = Invoke-MoveTransfer $newH $id $false; if ($x -ne 0) { return $x }
   $copyMs = $script:MoveTransferMs   # transfer_ms of new's `MOVE state` line once the transfer is done ('-' / absent = null)
   Write-Host "copy (j): adopt và restore trên '$dst'..."
+  $tApply = Get-MoveNow
   foreach ($v in 'adopt', 'restore') { $r = Invoke-MoveGate $dst $v $id; if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) } }
   Write-Host "copy (k): verify (chỉ báo cáo)..."
   $r = Invoke-MoveGate $newH 'verify' $id
   if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
-  # E3: the cutover's final transfer takes about as long as this copy's last transfer (same roots, same link, rsync delta): the measured figure replaces the plan-time guess
+  # F2: the laptop times its own calls at this copy (dump, transfer, apply = adopt + restore + verify); the cutover repeats them on a smaller delta, so the sum is an upper bound
   $ms = $copyMs
+  $applyS = [int][Math]::Ceiling(((Get-MoveNow) - $tApply).TotalSeconds)
+  Set-MoveProp $S 'dump_s' $dumpS; Set-MoveProp $S 'apply_s' $applyS
   Set-MoveProp $S 'transfer_s' $(if ($null -ne $ms) { [int][Math]::Ceiling($ms / 1000.0) } else { $null })
-  Set-MoveProp $S 'est_cut_s' $(if ($null -ne $ms) { Get-MoveEstCut $m2.Obj ([int]$S.transfer_s) } else { $null })
+  Set-MoveProp $S 'est_cut_s' $(if ($null -ne $ms) { Get-MoveEstCut $dumpS ([int]$S.transfer_s) $applyS } else { $null })
   Set-MoveProp $S 'phase' 'copied'; Save-MoveState $S
-  $figs = if ($null -ne $S.est_cut_s) { "ước tính lúc plan: khoảng $([int][Math]::Ceiling([double]$S.est_downtime_s / 60)) phút; theo lần chép vừa xong (chép mất $($S.transfer_s) giây): khoảng $(Get-MoveMinutes $S) phút" } else { "ước tính lúc plan: khoảng $(Get-MoveMinutes $S) phút (máy mới chưa báo thời gian chép nên chưa có số đo)" }
+  $figs = if ($null -ne $S.est_cut_s) { "ước tính lúc plan: khoảng $([int][Math]::Ceiling([double]$S.est_downtime_s / 60)) phút; theo lần chép vừa xong: khoảng $(Get-MoveMinutes $S) phút (40 giây cố định + dump $($S.dump_s) giây + chép $($S.transfer_s) giây + áp dụng/kiểm tra $($S.apply_s) giây)" } else { "ước tính lúc plan: khoảng $(Get-MoveMinutes $S) phút (máy mới chưa báo thời gian chép nên chưa có số đo)" }
   $ub = if ($null -ne $S.est_cut_s) { " Số đo của lần chép đầu tiên là cận trên: nó chép gần hết dữ liệu, còn cutover chỉ chép phần đã thay đổi nên thường ngắn hơn." } else { '' }
   Write-Host "Copy xong (giai đoạn: copied). Thời gian tạm dừng của cutover: $figs.$ub Chạy lại fcode move copy cho số sát nhất và để làm mới bất cứ lúc nào. Khi sẵn sàng:  fcode move cutover"
   0
@@ -2283,6 +2338,13 @@ function Invoke-MoveCutSteps($S, [bool]$Resume, [bool]$Resume9 = $false) {
 # when dst cannot be reached and has started nothing, dst-unreachable is only a warning. Returns the exit code of the cutover that failed (70 = needs a human).
 function Invoke-MoveRollback($S, [int]$Cause, [string]$Why) {
   $id = [string]$S.move_id
+  # F1: a transfer unit still running on new would race the rollback's commands (and a saved `rolled-back`): wait for it first, with the same cap; nothing is written or sent before that
+  $wi = Wait-MoveNewIdle $S -InRollback
+  if ($wi -ne 0) {
+    $srcA = Get-MoveSrcHost $S; $m = [string]$S.mark
+    Write-Host "Cutover đã dừng ứng dụng ở máy '$srcA' (có thể đang tạm dừng) và chưa quay lại được. $(if ($m -ceq 'switching') { "Mark 'switching': chỉ có một đường đi, chạy  fcode move cutover  để làm nốt (máy mới đã có thể phục vụ)." } else { "Hai cách đi tiếp khi máy mới chép xong: chạy  fcode move finish  (cho ứng dụng chạy lại ở máy '$srcA' rồi huỷ lần chuyển) hoặc  fcode move cutover  (làm nốt việc chuyển)." })"
+    return $wi
+  }
   Write-Host "Quay lại: $Why"
   Set-MoveProp $S 'mark' 'rolling-back'; Set-MoveProp $S.answers 'cut' $null; Set-MoveProp $S.answers 'back' $null; Save-MoveState $S
   $dst = Get-MoveDstHost $S; $src = Get-MoveSrcHost $S
@@ -2388,7 +2450,7 @@ function Invoke-MoveFinish($S, [string]$Do) {
 # phase cut: Q-back, then a new run with src and dst swapped (plan on its src with the saved move-map and manifest), then its copy and cutover
 function Invoke-MoveBackStart($S, [string]$MapFile = '') {
   $N = New-MoveState ([guid]::NewGuid().ToString()) $(if ([string]$S.dir -ceq 'fwd') { 'back' } else { 'fwd' }) 'back' $S.old $S.new
-  Set-MoveProp $N 'est_downtime_s' $S.est_downtime_s; Set-MoveProp $N 'est_cut_s' $S.est_cut_s; Set-MoveProp $N 'transfer_s' $S.transfer_s; Set-MoveProp $N 'cap_s' $S.cap_s; Set-MoveProp $N 'cut_at' $S.cut_at   # the forward run's measured figure is the best one for Q-back; the back run's own copy measures again
+  Set-MoveProp $N 'est_downtime_s' $S.est_downtime_s; Set-MoveProp $N 'est_cut_s' $S.est_cut_s; Set-MoveProp $N 'dump_s' $S.dump_s; Set-MoveProp $N 'transfer_s' $S.transfer_s; Set-MoveProp $N 'apply_s' $S.apply_s; Set-MoveProp $N 'cap_s' $S.cap_s; Set-MoveProp $N 'cut_at' $S.cut_at   # the forward run's measured figures are the best for Q-back; the back run's own copy measures again
   Set-MoveProp $N 'repos' @($S.repos); Set-MoveProp $N 'backups' $S.backups
   $mapText = $null; $newMap = $false
   if ($MapFile) { $m = Read-MoveMapFile $MapFile; if ($m.Err) { return 65 }; $mapText = $m.Text; $newMap = $true }   # a bad map is refused before the question
@@ -2461,6 +2523,10 @@ function Invoke-Move {
     $S = Read-MoveState
     $act = Resolve-MoveAction $verb $S
     if ($mapFile -and $verb -ceq 'back' -and $act.Do -cne 'back-start' -and $act.Do -cne 'refuse') { Write-Host "lỗi: --map chỉ dùng được khi bắt đầu lần quay lại (lần chuyển đã xong, giai đoạn 'cut'); lần này đã có move-map riêng."; return 65 }
+    if ($act.Do -cin 'copy', 'cutover', 'cutover-continue', 'finish', 'abandon', 'abandon-rollback', 'back-start', 'back-copy-cutover') {   # F1: a transfer left running on new (its unit holds the move lock) is waited out before the first remote step
+      $w = Wait-MoveNewIdle $S
+      if ($w -ne 0) { return $w }
+    }
     $res = @(Invoke-MoveDispatch $act $S $alias $mapFile)
     return [int]$res[-1]
   } catch {

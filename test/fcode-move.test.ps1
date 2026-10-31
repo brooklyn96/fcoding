@@ -28,7 +28,7 @@ function Ok([bool]$c, [string]$What) { if (-not $c) { throw $What } }
 $tokens = $null; $errs = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($Fcode, [ref]$tokens, [ref]$errs)
 if ($errs.Count) { throw "fcode.ps1 does not parse: $($errs[0].Message)" }
-$extra = 'Get-DeployHost', 'Test-DeployRepo', 'Invoke-DeploySsh', 'Write-PhienText', 'Clear-PhienPartFiles', 'Test-PhienOwnerGone', 'Write-IpaError'
+$extra = 'Get-DeployHost', 'Test-DeployRepo', 'Invoke-DeploySsh', 'Write-PhienText', 'Clear-PhienPartFiles', 'Test-PhienOwnerGone', 'Write-IpaError', 'ConvertTo-PhienArg', 'Stop-PhienProc'
 $found = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and ($n.Name -match '-Move' -or $n.Name -in $extra) }, $true))
 foreach ($e in $extra) { if (-not @($found | Where-Object { $_.Name -eq $e }).Count) { throw "fcode.ps1 lacks $e" } }
 foreach ($fn in $found) { . ([scriptblock]::Create($fn.Extent.Text)) }
@@ -103,7 +103,15 @@ function Fake-Result($Rule, [string[]]$Default, [int]$DefaultCode = 0) {
   $code = if ($Rule) { $Rule.Code } else { $DefaultCode }
   @{ Out = @($out); Code = $code }
 }
+# F1: Wait-MoveNewIdle (the real one, wrapped) reads new's `status` before every copy / cutover / back / finish. Those reads are invisible here (not logged, no rule consumed,
+# answer = transfer=done) unless a test queues answers in $script:IdleSeq (then each read is logged as "idle-check" and takes the next answer).
+$script:RealWaitIdle = (Get-Item function:Wait-MoveNewIdle).ScriptBlock; $script:InWait = $false; $script:IdleSeq = New-Object Collections.Queue
+function Wait-MoveNewIdle($S, [switch]$InRollback) { $script:InWait = $true; try { & $script:RealWaitIdle $S -InRollback:$InRollback } finally { $script:InWait = $false } }
 function Fake-Gate([string]$H, [string]$Verb, [string]$Id, [string]$Rest, [string]$Stdin) {
+  if ($script:InWait -and $Verb -ceq 'status') {
+    if ($script:IdleSeq.Count) { $a = $script:IdleSeq.Dequeue(); [void]$script:Log.Add("idle-check $H"); $o = @($a.Out); $o += "GATE_EXIT $($a.Code)"; return @{ Out = $o; Code = $a.Code } }
+    return @{ Out = @("MOVE state move_id=$Id role=dst machine=new finished=no frozen=0 hold_active=0 transfer=done manifest_sha=-", 'GATE_EXIT 0'); Code = 0 }
+  }
   $line = "$H $Verb$(if ($Rest) { ' ' + $Rest })"
   [void]$script:Log.Add($line)
   [void]$script:GateIn.Add(@{ Host = $H; Verb = $Verb; Stdin = $Stdin; Id = $Id; Rest = $Rest })
@@ -138,6 +146,13 @@ function Fake-Script([string]$H, [string]$Text, [string[]]$ScriptArgs) {
   if ($name -ceq 'TCP test to $1:$2 (exit 0 = reachable)' -or $name -match '^TCP') { $code = $(if ($script:Tcp.ContainsKey($H)) { $script:Tcp[$H] } else { 0 }) }
   $res = Fake-Result $r $def $code
   @{ Out = @($res.Out); Code = $res.Code }
+}
+# the bounded ssh path of Invoke-DeploySsh (-TimeoutSec) goes through Invoke-MoveTimedExe: here it runs the fake `ssh` function; $script:HangN = n makes the next n `--move status` calls hang (the clock advances by their timeout, code 124; -1 = every one)
+$script:RealTimedExe = (Get-Item function:Invoke-MoveTimedExe).ScriptBlock; $script:TimedCalls = New-Object Collections.ArrayList; $script:HangN = 0
+function Invoke-MoveTimedExe([string]$Exe, [string[]]$ExeArgs, [string]$StdinText, [int]$TimeoutSec) {
+  [void]$script:TimedCalls.Add(@{ Exe = $Exe; Args = @($ExeArgs); T = $TimeoutSec })
+  if ($script:HangN -ne 0 -and "$($ExeArgs[-1])" -match '--move status') { if ($script:HangN -gt 0) { $script:HangN-- }; $script:Clock = $script:Clock.AddSeconds($TimeoutSec); return @{ Code = 124; Out = @() } }
+  $o = @($StdinText | ssh @ExeArgs); @{ Code = [int]$global:LASTEXITCODE; Out = @($o | ForEach-Object { "$_" }) }
 }
 function ssh {
   $in = (@($input) -join "`n"); $a = @($args | ForEach-Object { [string]$_ })
@@ -223,6 +238,7 @@ Host cfbox
   ProxyCommand cloudflared access ssh --hostname %h
 "@ -replace "`r`n", "`n"
 function Reset-World {
+  $script:IdleSeq.Clear(); $script:HangN = 0; $script:TimedCalls.Clear()
   $script:Log.Clear(); $script:Rules.Clear(); $script:Answers.Clear(); $script:Prompts.Clear(); $script:Sleeps.Clear(); $script:GhIn.Clear(); $script:ScriptLog.Clear(); $script:GateIn.Clear()
   $script:Clock = [DateTime]::SpecifyKind([DateTime]'2026-10-29T10:00:00', [DateTimeKind]::Utc)
   $script:Pf = @{}; $script:Tcp = @{}; $script:Mf = $null; $script:Tunneled = $false; $script:Down = $null; $script:GhFail = @{}; $script:DeployHost = $null
@@ -992,24 +1008,19 @@ T 'A33: hold_active=- (cannot be counted) is not 0: copy (g) stops with 65, cuto
 }
 # ============================== E3: measured cutover estimate ==============================
 function StMs([string]$Transfer, [string]$Ms) { @{ Out = @("MOVE state move_id=x role=dst machine=new finished=no frozen=0 hold_active=0 transfer=$Transfer$(if ($Ms) { ' transfer_ms=' + $Ms }) manifest_sha=-"); Code = 0 } }
-T 'E3 est_cut_s = 60 + transfer_s + ceil(db_mb / 30), db_mb = pgdb + pgroles + LOCAL image items only (files, sqlite, non-local images do not count)' {
-  $o = [pscustomobject]@{ items = @(
-      [pscustomobject]@{ kind = 'pgdb'; size_mb = 300; meta = [pscustomobject]@{} }, [pscustomobject]@{ kind = 'pgroles'; size_mb = 1; meta = [pscustomobject]@{} },
-      [pscustomobject]@{ kind = 'image'; size_mb = 90; meta = [pscustomobject]@{ local = $true } }, [pscustomobject]@{ kind = 'image'; size_mb = 5000; meta = [pscustomobject]@{ local = $false } },
-      [pscustomobject]@{ kind = 'files'; size_mb = 9000; meta = [pscustomobject]@{} }, [pscustomobject]@{ kind = 'sqlite'; size_mb = 700; meta = [pscustomobject]@{} }) }
-  Eq (Get-MoveEstCut $o 126) (60 + 126 + [Math]::Ceiling(391 / 30)) 'formula'; Eq (Get-MoveEstCut $o 0) 74 'no transfer time: 60 + 14'
-  Eq (Get-MoveEstCut ([pscustomobject]@{ items = @() }) 5) 65 'no db'
+T 'F2 est_cut_s = 40 + dump_s + transfer_s + apply_s' {
+  Eq (Get-MoveEstCut 20 126 50) 236 'formula'; Eq (Get-MoveEstCut 0 0 0) 40 'fixed part only'
 }
-T 'E3 copy: transfer_ms on new''s status line -> transfer_s and est_cut_s saved (ceil seconds), the summary prints both figures and says a copy re-run gives the truest figure' {
-  Reset-World; [void](Seed 'planned'); Add-Rule 'newbox' ' status' -Seq @((StMs 'idle'), (StMs 'running'), (StMs 'done' '125400'))
+# the copy's own clock: dump on contabo +20 s, adopt +30 s, restore +15 s, verify +5 s (apply = 50 s); transfer_ms from new's status
+function Add-CopyClock { Add-Rule 'contabo' ' dump$' -Do { $script:Clock = $script:Clock.AddSeconds(20) }; Add-Rule 'newbox' ' adopt$' -Do { $script:Clock = $script:Clock.AddSeconds(30) }; Add-Rule 'newbox' ' restore$' -Do { $script:Clock = $script:Clock.AddSeconds(15) }; Add-Rule 'newbox' ' verify$' -Do { $script:Clock = $script:Clock.AddSeconds(5) } }
+T 'F2 copy: dump_s, transfer_s (transfer_ms) and apply_s (adopt + restore + verify) are timed and saved; est_cut_s = 40 + their sum; the summary prints the parts and says a re-run gives the truest figure; a re-run re-measures; a re-plan forgets all three' {
+  Reset-World; [void](Seed 'planned'); Add-CopyClock; Add-Rule 'newbox' ' status' -Seq @((St 'idle'), (StMs 'running'), (StMs 'done' '125400'))
   $r = Run-Move @('copy'); Eq $r.Code 0 $r.Text
-  $n = State; Eq $n.transfer_s 126; Eq $n.est_cut_s 196; Eq $n.est_downtime_s 120
-  Ok ($r.Text -match 'ước tính lúc plan: khoảng 2 phút' -and $r.Text -match 'chép mất 126 giây\): khoảng 4 phút') "both figures: $($r.Text)"; Ok ($r.Text -match 'Chạy lại fcode move copy cho số sát nhất') 'says a re-run is truest'
-  Ok ($r.Text -match 'cận trên' -and $r.Text -match 'lần chép đầu tiên') 'a measured figure is called an upper bound'
-  # a re-run uses the new measurement
-  Add-Rule 'newbox' ' status' -Seq @((StMs 'idle'), (StMs 'done' '30000')); $r = Run-Move @('copy'); Eq $r.Code 0; $n = State; Eq $n.transfer_s 30; Eq $n.est_cut_s 100
-  # a re-plan forgets the measurement
-  $r = Run-Move @('plan', 'newbox'); Eq $r.Code 0 $r.Text; $n = State; Eq $n.est_cut_s $null; Eq $n.transfer_s $null; Eq $n.phase 'planned'
+  $n = State; Eq $n.dump_s 20; Eq $n.transfer_s 126; Eq $n.apply_s 50; Eq $n.est_cut_s 236; Eq $n.est_downtime_s 120
+  Ok ($r.Text -match 'ước tính lúc plan: khoảng 2 phút' -and $r.Text -match 'khoảng 4 phút \(40 giây cố định \+ dump 20 giây \+ chép 126 giây \+ áp dụng/kiểm tra 50 giây\)') "parts: $($r.Text)"
+  Ok ($r.Text -match 'Chạy lại fcode move copy cho số sát nhất') 'says a re-run is truest'; Ok ($r.Text -match 'cận trên' -and $r.Text -match 'lần chép đầu tiên') 'upper bound'
+  $script:Rules.Clear(); Add-CopyClock; Add-Rule 'newbox' ' status' -Seq @((St 'idle'), (StMs 'done' '30000')); $r = Run-Move @('copy'); Eq $r.Code 0; $n = State; Eq $n.transfer_s 30; Eq $n.est_cut_s 140
+  $r = Run-Move @('plan', 'newbox'); Eq $r.Code 0 $r.Text; $n = State; Eq $n.est_cut_s $null; Eq $n.dump_s $null; Eq $n.transfer_s $null; Eq $n.apply_s $null; Eq $n.phase 'planned'
 }
 T 'E3 copy: no transfer_ms (absent, or `-`) = no measurement: est_cut_s stays null, the plan figure is used and the summary says so' {
   foreach ($ms in $null, '-') {
@@ -1030,7 +1041,91 @@ T 'E3 Q-cut and Q-back use est_cut_s when the state has it (ceil minutes) and es
   $o = State; Ok ($null -eq $o.est_cut_s -and $null -eq $o.transfer_s) 'fields really absent'; Eq $o.phase 'copied'
   $r = Run-Move @('status'); Eq $r.Code 0; $r = Run-Move @('cutover'); Ok ($r.Text.Contains('khoảng 2 phút')) 'old file: plan figure'; Eq (Count 'x-never') 0
   Reset-World; [void](Seed 'planned'); $j = [IO.File]::ReadAllText((Get-MovePath 'state.json')) | ConvertFrom-Json; $j.PSObject.Properties.Remove('est_cut_s'); [IO.File]::WriteAllText((Get-MovePath 'state.json'), ($j | ConvertTo-Json -Depth 8), $utf8)
-  Add-Rule 'newbox' ' status' -Seq @((StMs 'idle'), (StMs 'done' '1000')); $r = Run-Move @('copy'); Eq $r.Code 0 $r.Text; Eq (State).est_cut_s 71 'an old file gets the fields at the next copy'
+  Add-Rule 'newbox' ' status' -Seq @((StMs 'idle'), (StMs 'done' '1000')); $r = Run-Move @('copy'); Eq $r.Code 0 $r.Text; Eq (State).est_cut_s 41 'an old file gets the fields at the next copy'; Eq (State).dump_s 0; Eq (State).apply_s 0
+}
+# ============================== F1: a transfer left running on new ==============================
+function F1Mark([string]$Mark, [string]$Phase = 'copied') { $s = Seed $Phase 'fwd' 'plan' $Mark; if ($Mark -ceq 'cutting') { Set-MoveProp $s.answers 'cut' (New-MoveAnswer) }; Save-MoveState $s }
+function Elapsed { [int]($script:Clock - [DateTime]::SpecifyKind([DateTime]'2026-10-29T10:00:00', [DateTimeKind]::Utc)).TotalSeconds }
+function Run-Idle { $script:IdleSeq.Clear(); foreach ($x in $args) { $script:IdleSeq.Enqueue((StMs $x)) } }
+T 'F1 the round-F scenario: a back run, laptop killed right after `transfer` started (phase planned, via back), re-run copy: waits while new shows transfer=running (poll 10 s), then runs from step 1' {
+  Reset-World; $script:Tunneled = $true; [void](Seed 'planned' 'back' 'back'); Run-Idle 'running' 'running' 'running' 'done'
+  $r = Run-Move @('copy'); Eq $r.Code 0 $r.Text
+  Eq (Count '^idle-check newbox$') 4 'four reads'; Ok (@($script:Sleeps | Where-Object { $_ -eq 10 }).Count -ge 3) '10 s polls'
+  Ok ($r.Text -match 'transfer=running' -and $r.Text -match 'chờ') 'says it waits'
+  Ok ((Idx 'script:bootstrap key') -gt 3) 'nothing ran before the last read'; Eq (State).phase 'copied'
+  Ordered @('^idle-check newbox$', '^idle-check newbox$', '^idle-check newbox$', '^idle-check newbox$', 'script:bootstrap key', '^newbox manifest', 'init dst', '^newbox init src')
+  Eq (Count '^newbox tunnels') 1 'tunnels on src = new runs only after the wait (the call that answered busy in round F)'
+}
+T 'F1 cap = 2 x the last measured transfer_s (1800 s unmeasured): past it exit 70, nothing run, state file unchanged; a read failing (new unreachable) goes on' {
+  Reset-World; $s = Seed 'planned'; Set-MoveProp $s 'transfer_s' 60; Save-MoveState $s; $bytes = [IO.File]::ReadAllText((Get-MovePath 'state.json'))
+  1..40 | ForEach-Object { $script:IdleSeq.Enqueue((StMs 'running')) }
+  $r = Run-Move @('copy'); Eq $r.Code 70 $r.Text; Ok ($r.Text -match 'CẦN NGƯỜI' -and $r.Text -match 'giới hạn 120 giây') 'names the cap'; Ok ((Elapsed) -le 120 -and (Elapsed) -ge 110) "total elapsed $(Elapsed) s within the 120 s cap"
+  Eq (Count '^(contabo|newbox)( |$)') 0 'nothing run'; Eq ([IO.File]::ReadAllText((Get-MovePath 'state.json'))) $bytes 'state file unchanged'
+  Reset-World; [void](Seed 'planned'); 1..400 | ForEach-Object { $script:IdleSeq.Enqueue((StMs 'running')) }
+  $r = Run-Move @('copy'); Eq $r.Code 70; Ok ($r.Text -match 'giới hạn 1800 giây') 'unmeasured: 1800 s'; Ok ((Elapsed) -le 1800 -and (Elapsed) -ge 1790) "elapsed $(Elapsed) s"; Eq (State).phase 'planned'
+  Reset-World; [void](Seed 'planned'); $script:IdleSeq.Enqueue(@{ Out = @(); Code = 255 }); $r = Run-Move @('copy'); Eq $r.Code 0 $r.Text
+}
+T 'F1 the wait runs before cutover (also a resume and the rollback), back, finish (abandon, abandon-rollback, a cut finish); not before plan, status or a refused command' {
+  Reset-World; [void](Seed 'copied'); Run-Idle 'running' 'done'; Yes; $r = Run-Move @('cutover'); Eq $r.Code 0 $r.Text; Ok ((Idx '^idle-check newbox$' 1) -lt (Idx '^contabo freeze')) 'cutover: read before the freeze'; Eq (Count '^idle-check') 2
+  Reset-World; F1Mark 'switching'; Run-Idle 'running' 'done'; $r = Run-Move @('cutover'); Eq $r.Code 0 $r.Text; Ok ((Idx '^idle-check newbox$' 1) -lt (Idx '^newbox switch$')) 'resume'
+  Reset-World; F1Mark 'rolling-back' 'rolled-back'; Run-Idle 'running' 'done'; $r = Run-Move @('cutover'); Ok ((Idx '^idle-check newbox$' 1) -lt (Idx '^newbox stop$')) 'rollback'
+  Reset-World; $script:Tunneled = $true; [void](Seed 'cut'); Run-Idle 'running' 'done'; Yes; $r = Run-Move @('back'); Eq $r.Code 0 $r.Text; Ok ((Idx '^idle-check newbox$' 1) -lt (Idx '^newbox plan$')) 'back'
+  Reset-World; [void](Seed 'planned'); Run-Idle 'running' 'done'; Yes; $r = Run-Move @('finish'); Eq $r.Code 0 $r.Text; Ok ((Idx '^idle-check newbox$' 1) -lt (Idx ' finish ')) 'abandon'
+  Reset-World; F1Mark 'cutting'; Run-Idle 'running' 'done'; Yes; $r = Run-Move @('finish'); Eq $r.Code 0 $r.Text; Ok ((Idx '^idle-check newbox$' 1) -lt (Idx '^newbox stop$')) 'abandon-rollback'
+  Reset-World; [void](Seed 'cut'); Run-Idle 'running' 'done'; Yes; Yes; $r = Run-Move @('finish'); Eq $r.Code 0 $r.Text; Ok ((Idx '^idle-check newbox$' 1) -lt (Idx ' finish ')) 'cut finish'
+  foreach ($c in @(@('copied', 'plan', 'newbox'), @('copied', 'status'), @('cut', 'copy'), @('planned', 'cutover'))) {
+    Reset-World; [void](Seed $c[0]); Run-Idle 'running'; $w = @($c | Select-Object -Skip 1); $r = Run-Move $w; Eq (Count '^idle-check') 0 (($c -join ' ') + ': no read')
+  }
+}
+# ---- F1 round 2: the wait also guards an automatic rollback; every read is bounded by the remaining deadline ----
+T 'F1 automatic rollback: status polls fail while new''s transfer unit keeps running, then the rollback waits for it (idle reads before the first rollback command, mark and phase untouched until then)' {
+  Reset-World; [void](Seed 'copied'); Yes
+  Run-Idle 'done' 'running' 'running' 'done'   # read 1 = the entry wait; reads 2-4 = the wait inside the rollback
+  Add-Rule 'newbox' ' status' -Seq @((St 'idle'), (St 'x' 0 255))   # step 5's hold check passes, then every poll of transfer --final fails
+  Add-Rule 'newbox' ' transfer --final' -Out @('MOVE transfer state=started items_done=0 items_total=3 unit=fcode-move-transfer')
+  $script:MarkAtStop = $null; Add-Rule 'newbox' ' stop$' -Do { if (-not $script:MarkAtStop) { $script:MarkAtStop = (State).mark } }
+  $r = Run-Move @('cutover'); Eq $r.Code 1 $r.Text; Eq (State).phase 'rolled-back'
+  Eq (Count '^idle-check') 4 'entry + three reads in the rollback'
+  $i3 = Idx '^idle-check newbox$' (Idx '^newbox transfer --final')   # the first read after the failing transfer
+  Ok ($i3 -gt 0) 'found'; Ok ((Idx '^newbox stop$' $i3) -gt (Idx '^idle-check newbox$' ($i3 + 2))) 'the rollback stop (and everything after it) comes after the last read'
+  Ok ((Idx '^contabo start --connectors') -gt (Idx '^idle-check newbox$' ($i3 + 2))) 'old is started only after new''s unit is done'
+  Ok ($r.Text -match 'transfer=running') 'says it waits'
+}
+T 'F1 automatic rollback: a transfer that never ends = exit 70 at the cap, mark and phase unchanged, nothing sent to either machine by the rollback' {
+  Reset-World; [void](Seed 'copied'); Yes; $script:Rules.Clear()
+  Add-Rule 'newbox' ' status' -Seq @((St 'idle'), (St 'x' 0 255))
+  $script:IdleSeq.Enqueue((StMs 'done')); 1..400 | ForEach-Object { $script:IdleSeq.Enqueue((StMs 'running')) }
+  $r = Run-Move @('cutover'); Eq $r.Code 70 $r.Text; $n = State; Eq $n.mark 'cutting' 'the mark the cutover wrote is untouched'; Eq $n.phase 'copied'
+  Eq (Count '^newbox stop$') 1 'only step 5''s stop, none from the rollback'; Eq (Count '^contabo start') 0; Ok ($r.Text -match 'CẦN NGƯỜI')
+  Ok ($r.Text -match 'chưa quay lại được' -and $r.Text -notmatch 'Chưa chạy gì') 'the cap line says what really happened (rollback not done), not "nothing ran"'
+  Ok ($r.Text -match "máy 'contabo'" -and $r.Text -match 'fcode move finish' -and $r.Text -match 'fcode move cutover') 'names src and both ways on under the mark cutting'
+  Ok ((Elapsed) -ge 1800 -and (Elapsed) -le 1800 + 130) "elapsed $(Elapsed) s = the 1800 s cap of the rollback wait + the 12 failed transfer polls (120 s) before it, no more"
+  # under switching the finish way is not offered
+  Reset-World; F1Mark 'switching'; $script:Rules.Clear(); Add-Rule 'newbox' ' switch' -Code 1 -Out @('MOVE error switch-failed host=a'); $script:IdleSeq.Enqueue((StMs 'done')); 1..400 | ForEach-Object { $script:IdleSeq.Enqueue((StMs 'running')) }
+  $r = Run-Move @('cutover'); Eq $r.Code 70 $r.Text; Ok ($r.Text -match 'chưa quay lại được' -and $r.Text -match 'fcode move cutover' -and $r.Text -notmatch 'fcode move finish') 'switching: only cutover'; Eq (State).mark 'switching'
+}
+T 'F1 bounded reads: every status read of the wait carries ssh timeouts and a process deadline <= the time left; a hung read (killed at the deadline, code 124) is retried until the cap, then exit 70 with state bytes unchanged' {
+  Reset-World; $script:TimedCalls.Clear(); [void](Seed 'planned'); $bytes = [IO.File]::ReadAllText((Get-MovePath 'state.json')); $script:HangN = -1
+  $r = Run-Move @('copy'); Eq $r.Code 70 $r.Text; Ok ($r.Text -match 'CẦN NGƯỜI' -and $r.Text -match 'chưa trả lời status') 'says it hangs and gives up'; Ok ((Elapsed) -le 1800) "hang: elapsed $(Elapsed) s within 1800"
+  Eq ([IO.File]::ReadAllText((Get-MovePath 'state.json'))) $bytes 'state unchanged'; Eq (Count '^(contabo|newbox)( |$)') 0 'nothing sent'
+  Ok ($script:TimedCalls.Count -ge 20) "many bounded reads ($($script:TimedCalls.Count))"
+  foreach ($c in $script:TimedCalls) { $a = $c.Args -join ' '; Ok ($a -match 'ConnectTimeout=\d+' -and $a -match 'ServerAliveInterval=5' -and $a -match 'ServerAliveCountMax=2') "ssh options: $a"; Ok ($c.T -ge 1 -and $c.T -le 60) "timeout $($c.T) within 1..60" }
+  Ok (@($script:TimedCalls | Select-Object -Last 1)[0].T -le 60) 'last read bounded'; $script:HangN = 0
+  # a read that hangs twice and then answers: the wait goes on and the copy runs
+  Reset-World; $script:HangN = 2; [void](Seed 'planned'); $r = Run-Move @('copy'); Eq $r.Code 0 $r.Text; Ok (@($script:Sleeps | Where-Object { $_ -eq 10 }).Count -ge 2) 'waited between hung reads'
+  # the remaining time shrinks the per-read timeout: a transfer_s of 4 (cap 8 s) bounds the first read to 8 s, later ones to what is left
+  Reset-World; $script:TimedCalls.Clear(); $s = Seed 'planned'; Set-MoveProp $s 'transfer_s' 4; Save-MoveState $s; $script:HangN = -1
+  $r = Run-Move @('copy'); Eq $r.Code 70; Eq $script:TimedCalls[0].T 8 'first read: the whole cap'; Eq (Elapsed) 8 'exits the moment the cap is used up: no 10 s sleep past it'; Ok (@($script:TimedCalls | Where-Object { $_.T -gt 8 }).Count -eq 0) 'never above the cap'; $script:HangN = 0
+  # a hung read inside the rollback's wait: 70, mark `cutting` and answers untouched, no rollback command
+  Reset-World; F1Mark 'cutting'; Yes; $script:HangN = -1; $script:IdleSeq.Enqueue((StMs 'done'))
+  $r = Run-Move @('finish'); Eq $r.Code 70 $r.Text; Eq (State).mark 'cutting'; Eq (Count ' stop$|start --connectors| finish ') 0 'no command sent'; $script:HangN = 0
+}
+T 'Invoke-MoveTimedExe for real: a program that outlives the deadline is killed (code 124, within a few seconds); one that ends returns its code and lines; stdin reaches it; a program that does not exist returns -1' {
+  if (-not (Get-Command bash -CommandType Application -ErrorAction SilentlyContinue)) { Write-Host '  (no bash: skipped)'; return }
+  $t0 = [DateTime]::UtcNow; $x = & $script:RealTimedExe 'bash' @('-c', 'sleep 30') '' 2; $el = ([DateTime]::UtcNow - $t0).TotalSeconds
+  Eq $x.Code 124; Ok ($el -lt 10) "killed after $([int]$el) s"
+  $x = & $script:RealTimedExe 'bash' @('-c', 'cat; echo done; exit 3') "hello`n" 5; Eq $x.Code 3; Eq ($x.Out -join '|') 'hello|done'
+  $x = & $script:RealTimedExe 'no-such-program-fcm' @() '' 2; Eq $x.Code -1
 }
 # ============================== round 5 (arbitration: a cutover in flight is a mark) ==============================
 function Seed-Mark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan', [string]$Phase = 'copied') {
