@@ -2362,7 +2362,7 @@ function Invoke-MoveRollback($S, [int]$Cause, [string]$Why) {
   $h = Invoke-MoveGate $src 'health' $id
   if ($h.Code -ne 0) { Write-Host "CẦN NGƯỜI (70): máy cũ '$src' đã được start lại nhưng health lỗi (phase rolled-back)."; return 70 }
   Write-Host "rolled_back: các ứng dụng đã chạy lại ở máy '$src' như cũ."
-  if ($Cause -eq 0) { 1 } else { $Cause }
+  if ($Cause -in 0, 75) { 1 } else { $Cause }   # 75 = "busy, nothing changed, run the same step again" in the gate's table: after a finished rollback (phase rolled-back, answer cleared) it is a plain failure
 }
 # step (12): chores, each idempotent by content. From here nothing is rolled back; a failure is fixed by running `cutover` again.
 function Invoke-MoveChores($S) {

@@ -692,7 +692,7 @@ T 'cutover: resume at step 10 after a kill (mark switching): only switch, unfree
   $r = Run-Move @('cutover'); Eq $r.Code 70 $r.Text; Eq (State).phase 'copied'; Eq (State).mark 'switching'; Eq (State).dst_started $true; Eq (Count '^newbox stop') 0 'no dst stop'; Eq (Count '^contabo start') 0 'old not started'
   Ok ($r.Text -match 'fcode move cutover' -and $r.Text -match 'fcode move back' -and $r.Text -notmatch 'fcode move finish' -and $r.Text -match 'bỏ dữ liệu') 'says why and the ways on (no finish under switching)'
 }
-T 'cutover: 75 waits the smallest retry_s and runs the same step again; past cap_s it rolls back (exit 75)' {
+T 'cutover: 75 waits the smallest retry_s and runs the same step again; past cap_s it rolls back and exits 1 (75 would mean "nothing changed, run again")' {
   $s = Cut-State; Yes
   Add-Rule 'contabo' ' stop --guards' -N 2 -Code 75 -Out @('MOVE wait guard=busy app=a retry_s=30 cap_s=600', 'MOVE wait guard=deploy-running app=b retry_s=10 cap_s=0', 'GATE_EXIT 75')
   $r = Run-Move @('cutover'); Eq $r.Code 0 $r.Text
@@ -700,7 +700,7 @@ T 'cutover: 75 waits the smallest retry_s and runs the same step again; past cap
   # never go: the cap (1800 s) is counted from the first try of freeze
   $s = Cut-State; Yes; Set-MoveProp $s 'cap_s' 100; Save-MoveState $s
   Add-Rule 'contabo' ' stop --guards' -Code 75 -Out @('MOVE wait guard=busy app=a retry_s=40 cap_s=600', 'GATE_EXIT 75')
-  $r = Run-Move @('cutover'); Eq $r.Code 75 $r.Text; Eq (State).phase 'rolled-back'; Eq (Count '^contabo stop --guards') 4 'tries until the cap (0, 40, 80 s, then 120 s is past 100)'
+  $r = Run-Move @('cutover'); Eq $r.Code 1 $r.Text; Eq (State).phase 'rolled-back'; Eq (State).answers.cut $null 'a retry asks Q-cut again'; Eq (Count '^contabo stop --guards') 4 'tries until the cap (0, 40, 80 s, then 120 s is past 100)'
   Ordered @('^newbox stop', '^contabo start --connectors', '^contabo unfreeze'); Ok ($r.Text -match 'quá hạn') 'says the cap'
   # freeze busy (75) too
   $s = Cut-State; Yes
