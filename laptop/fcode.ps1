@@ -1019,7 +1019,7 @@ function Test-DeployRepo([string]$r) { ($r -cmatch '\A[A-Za-z0-9_.-]+/[A-Za-z0-9
 
 # chay mot lenh tren VPS qua ssh, in tung dong ngay khi tien toi (tru khi -Quiet), tra @{ Code; Lines }.
 # $B64 (tuy chon): noi dung (base64, mot dong) gui vao stdin cua lenh tu xa
-function Invoke-DeploySsh([string]$Remote, [string]$B64, [switch]$Quiet, [string]$HostName, [int]$TimeoutSec = 0) {
+function Invoke-DeploySsh([string]$Remote, [string]$B64, [switch]$Quiet, [string]$HostName, [int]$TimeoutSec = 0, [switch]$KeepAlive) {
   $dh = if ($HostName) { if ($HostName -cmatch '\A[A-Za-z0-9][A-Za-z0-9._@-]{0,99}\z') { $HostName } } else { Get-DeployHost }
   $buf = New-Object 'System.Collections.Generic.List[string]'
   $emit = { param($l) $buf.Add([string]$l); if (-not $Quiet) { if ("$l" -cmatch '\AGATE_WARN') { Write-Host $l -ForegroundColor Yellow } else { Write-Host $l } } }   # GATE_WARN = canh bao cua cong: mau vang
@@ -1034,8 +1034,9 @@ function Invoke-DeploySsh([string]$Remote, [string]$B64, [switch]$Quiet, [string
   }
   $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
   try {
-    if ($B64) { $B64 | & ssh $dh $Remote | ForEach-Object { & $emit $_ } }
-    else { & ssh -n $dh $Remote | ForEach-Object { & $emit $_ } }
+    $ko = @(if ($KeepAlive) { '-o', 'ConnectTimeout=10', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=4' })   # fcode move (G6): a half-open link ends in 255 after about 70 s instead of hanging the laptop
+    if ($B64) { $B64 | & ssh @ko $dh $Remote | ForEach-Object { & $emit $_ } }
+    else { & ssh @ko -n $dh $Remote | ForEach-Object { & $emit $_ } }
     $code = [int]$LASTEXITCODE
   } catch { Write-Host "lỗi: không chạy được ssh ($($_.Exception.Message))"; $code = 1 }
   finally { $ErrorActionPreference = $old }
@@ -1379,7 +1380,7 @@ function Invoke-MoveGate([string]$HostName, [string]$Verb, [string]$Id, [string[
   if ($Id) { $cmd += ' ' + $Id }
   foreach ($a in @($VArgs)) { $cmd += ' ' + $a }
   if ($B64) { $cmd = 'base64 -di | ' + $cmd }
-  Complete-MoveResult (Invoke-DeploySsh $cmd $B64 -Quiet -HostName $HostName -TimeoutSec $TimeoutSec) -Quiet:$Quiet
+  Complete-MoveResult (Invoke-DeploySsh $cmd $B64 -Quiet -HostName $HostName -TimeoutSec $TimeoutSec -KeepAlive) -Quiet:$Quiet
 }
 # a small bash script over plain ssh (before the gate exists on the machine): the arguments travel in a `set --` line of the payload, never on the ssh command line
 function Invoke-MoveScript([string]$HostName, [string]$Script, [string[]]$ScriptArgs = @(), [switch]$Quiet) {
@@ -1387,7 +1388,7 @@ function Invoke-MoveScript([string]$HostName, [string]$Script, [string[]]$Script
   $pre = if (@($ScriptArgs).Count) { 'set -- ' + ((@($ScriptArgs) | ForEach-Object { "'" + ("$_" -replace "'", "'\''") + "'" }) -join ' ') + "`n" } else { '' }
   $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($pre + ($Script -replace "`r`n", "`n")))   # a Windows checkout may have CRLF in the here-strings; bash needs LF
   $remote = 'f=$(mktemp) && base64 -di >$f && bash $f </dev/null; rc=$?; rm -f $f; exit $rc'
-  Complete-MoveResult (Invoke-DeploySsh $remote $b64 -Quiet -HostName $HostName) -Quiet:$Quiet
+  Complete-MoveResult (Invoke-DeploySsh $remote $b64 -Quiet -HostName $HostName -KeepAlive) -Quiet:$Quiet
 }
 
 # ---- the scripts sent on stdin (plain ssh, bash, root). FCM_ROOT is a test hook: a prefix for every path ----

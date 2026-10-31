@@ -44,6 +44,7 @@ $script:Sleeps = New-Object Collections.ArrayList
 function Get-MoveNow { $script:Clock }
 function Wait-Move([int]$Sec) { [void]$script:Sleeps.Add($Sec); $script:Clock = $script:Clock.AddSeconds($Sec) }
 $script:Log = New-Object Collections.ArrayList
+$script:SshArgv = New-Object Collections.ArrayList   # the argv of every real ssh call (not ssh -G)
 $script:Rules = New-Object Collections.ArrayList
 $script:GhIn = New-Object Collections.ArrayList     # stdin given to gh calls
 $script:ScriptLog = New-Object Collections.ArrayList # @{ Host; Name; Args; Text }
@@ -162,7 +163,7 @@ function ssh {
     $global:LASTEXITCODE = 0
     return @("host $($a[1])", "hostname $($g.Host)", 'user root', "port $(if ($g.Port) { $g.Port } else { 22 })") + @(if ($g.Proxy) { "proxycommand $($g.Proxy)" })
   }
-  $h = $a[-2]; $remote = $a[-1]
+  [void]$script:SshArgv.Add($a); $h = $a[-2]; $remote = $a[-1]
   if ($script:Down -and $h -match $script:Down) { $global:LASTEXITCODE = 255; return }
   $r = $null
   if ($remote -match '/usr/local/sbin/fcode-deploy-gate --move (\S+)(?: (\S+))?(?: (.*))?$') {
@@ -238,7 +239,7 @@ Host cfbox
   ProxyCommand cloudflared access ssh --hostname %h
 "@ -replace "`r`n", "`n"
 function Reset-World {
-  $script:IdleSeq.Clear(); $script:HangN = 0; $script:TimedCalls.Clear()
+  $script:IdleSeq.Clear(); $script:HangN = 0; $script:TimedCalls.Clear(); $script:SshArgv.Clear()
   $script:Log.Clear(); $script:Rules.Clear(); $script:Answers.Clear(); $script:Prompts.Clear(); $script:Sleeps.Clear(); $script:GhIn.Clear(); $script:ScriptLog.Clear(); $script:GateIn.Clear()
   $script:Clock = [DateTime]::SpecifyKind([DateTime]'2026-10-29T10:00:00', [DateTimeKind]::Utc)
   $script:Pf = @{}; $script:Tcp = @{}; $script:Mf = $null; $script:Tunneled = $false; $script:Down = $null; $script:GhFail = @{}; $script:DeployHost = $null
@@ -1234,6 +1235,18 @@ T 'G1: seeded rolling-back + dst_started true: cutover and back without YES = 65
   }
   Reset-World; $s = RwMark 'rolling-back'; Set-MoveProp $s 'dst_started' $false; Save-MoveState $s
   $r = Run-Move @('cutover'); Eq $r.Code 1 $r.Text; Eq $script:Prompts.Count 0 'dst never started: no question'
+}
+# ---- RW item G6: every move call carries the keep-alive options ----
+T 'G6: every Invoke-MoveGate / move script ssh call has -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 (start, health, switch, stop, the rollback and the rest); a 255 of switch follows the unknown-outcome rule' {
+  $ko = '-o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4'
+  function KoAll([string]$What) { $n = 0; foreach ($a in $script:SshArgv) { $line = $a -join ' '; if ($line -match '--move' -or $line -match 'mktemp') { $n++; Ok ($line.Contains($ko) -or $line -match '^-o ConnectTimeout=\d+ -o ServerAliveInterval=5 -o ServerAliveCountMax=2 ') "${What}: $line" } }; $n }
+  Reset-World; [void](Seed 'copied'); Yes; $r = Run-Move @('cutover'); Eq $r.Code 0 $r.Text
+  foreach ($v in 'freeze', 'stop', 'start', 'health', 'switch') { Ok ([bool]($script:SshArgv | Where-Object { ($_ -join ' ') -match "--move $v\b" })) "a $v call was made" }
+  Ok ((KoAll 'cutover') -ge 10) 'many calls checked'
+  Reset-World; [void](Seed 'copied'); Yes; Add-Rule 'newbox' ' health' -Code 69 -Out @('MOVE error health app=x'); $r = Run-Move @('cutover'); Eq $r.Code 69 $r.Text; Eq (State).phase 'rolled-back'
+  Ok ((KoAll 'rollback') -ge 10) 'rollback calls checked'; Ok ([bool]($script:SshArgv | Where-Object { ($_ -join ' ') -match '--move stop\b' })) 'a stop call'
+  Reset-World; [void](Seed 'copied'); Yes; Add-Rule 'newbox' ' switch' -Code 255 -Out @('#NOEXIT'); $r = Run-Move @('cutover'); Eq $r.Code 1 $r.Text; Eq (State).mark 'switching' '255 of switch = unknown outcome, no rollback'
+  Eq (Count '^contabo start') 0 'src not started'; [void](KoAll 'switch 255')
 }
 # ============================== round 5 (arbitration: a cutover in flight is a mark) ==============================
 function Seed-Mark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan', [string]$Phase = 'copied') {
