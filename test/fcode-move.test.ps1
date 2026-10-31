@@ -667,10 +667,11 @@ T 'rollback: dst_started true and dst unreachable = exit 70, mark rolling-back k
   $r = Run-Move @('cutover'); Eq $r.Code 70 $r.Text
   $n = State; Eq $n.mark 'rolling-back' 'mark kept'; Eq $n.dst_started $true; Eq $n.phase 'copied'
   Eq (Count '^contabo start') 0 'old not started'; Ok ($r.Text -match '70') 'needs a human'
-  # dst is back: cutover finishes the rollback; no question
-  $script:Rules.Clear(); $script:Log.Clear()
-  $r = Run-Move @('cutover'); Eq $r.Code 1 $r.Text; $n = State; Eq $n.phase 'rolled-back'; Eq $n.mark $null; Eq $n.dst_started $false
-  Ordered @('^newbox stop', '^contabo start --connectors', '^contabo unfreeze', '^contabo health'); Eq $script:Prompts.Count 0 'no question at a resume'
+  # dst is back, but dst_started is true: finishing the rollback drops dst's writes, so it asks first (G1); no YES = 65, no call, state unchanged
+  $script:Rules.Clear(); $script:Log.Clear(); $bytes = [IO.File]::ReadAllText((Get-MovePath 'state.json'))
+  $r = Run-Move @('cutover'); Eq $r.Code 65 $r.Text; Eq (Count '^(contabo|newbox) (stop|start)') 0 'no dst stop / src start before the YES'; Eq ([IO.File]::ReadAllText((Get-MovePath 'state.json'))) $bytes 'state unchanged'; Ok ($r.Text -match "máy 'newbox'" -and $r.Text -match 'KHÔNG được chép về') 'names the dst writes that are dropped'
+  Yes; $r = Run-Move @('cutover'); Eq $r.Code 1 $r.Text; $n = State; Eq $n.phase 'rolled-back'; Eq $n.mark $null; Eq $n.dst_started $false
+  Ordered @('^newbox stop', '^contabo start --connectors', '^contabo unfreeze', '^contabo health'); Eq $script:Prompts.Count 1 'one question: the dst-writes line'
 }
 T 'rollback: old cannot be started after 3 tries = exit 70 with the mark kept; a failed health at the end = 70, phase stays rolled-back' {
   $s = Cut-State; Yes
@@ -1221,6 +1222,18 @@ T 'coder alias: a Windows ProxyCommand on the laptop''s Host <new> is not copied
   Reset-World; $s = Alias-State
   [IO.File]::WriteAllText($cfg, ([IO.File]::ReadAllText($cfg) -replace "(?m)^(Host newbox\n(?:  .*\n)*)", "`$1  ProxyCommand cloudflared access ssh --hostname %h`n"), $utf8)
   Eq (Set-MoveCoderAlias $s) 0; Ok ($script:Coder.Config -match 'ProxyCommand cloudflared access ssh --hostname %h') 'copied to the coder'
+}
+# ---- RW item G1: a rollback left under `rolling-back` with dst started needs a typed YES ----
+T 'G1: seeded rolling-back + dst_started true: cutover and back without YES = 65, zero stop / start calls, state file byte-identical; with YES the rollback runs (stop dst, start src); dst_started false needs no question' {
+  foreach ($d in @(@('fwd', 'cutover', 'newbox', 'contabo'), @('back', 'back', 'contabo', 'newbox'))) {
+    Reset-World; $s = RwMark 'rolling-back' $d[0] $(if ($d[0] -ceq 'back') { 'back' } else { 'plan' }); Set-MoveProp $s 'dst_started' $true; Save-MoveState $s
+    $bytes = [IO.File]::ReadAllText((Get-MovePath 'state.json'))
+    $r = Run-Move @($d[1]); Eq $r.Code 65 "$($d[0]): $($r.Text)"; Eq (Count ' (stop|start)') 0 "$($d[0]): no stop / start"; Eq ([IO.File]::ReadAllText((Get-MovePath 'state.json'))) $bytes "$($d[0]): state unchanged"
+    Ok ($r.Text.Contains("máy '$($d[2])'") -and $r.Text.Contains('KHÔNG được chép về')) "$($d[0]): $($r.Text)"
+    Yes; $r = Run-Move @($d[1]); Eq $r.Code 1 "$($d[0]) yes: $($r.Text)"; Ordered @("^$($d[2]) stop", "^$($d[3]) start --connectors"); Eq (State).mark $null
+  }
+  Reset-World; $s = RwMark 'rolling-back'; Set-MoveProp $s 'dst_started' $false; Save-MoveState $s
+  $r = Run-Move @('cutover'); Eq $r.Code 1 $r.Text; Eq $script:Prompts.Count 0 'dst never started: no question'
 }
 # ============================== round 5 (arbitration: a cutover in flight is a mark) ==============================
 function Seed-Mark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan', [string]$Phase = 'copied') {

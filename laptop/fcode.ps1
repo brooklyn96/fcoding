@@ -2408,7 +2408,14 @@ function Invoke-MoveChores($S) {
 }
 function Invoke-MoveCutover($S) {
   $mark = [string]$S.mark
-  if ($mark -ceq 'rolling-back') { return (Invoke-MoveRollback $S 1 'làm nốt lần quay lại đang dở') }
+  if ($mark -ceq 'rolling-back') {
+    if ($S.dst_started -eq $true) {   # G1: dst may have served for any length of time since the cut-off; finishing the rollback drops every write its apps took, so it needs a typed YES first (no dst stop / src start before it)
+      $dstA = Get-MoveDstHost $S; $srcA = Get-MoveSrcHost $S
+      Write-Host "Một lần quay lại đang dở và máy '$dstA' đã được bật: dữ liệu các ứng dụng đã ghi ở máy '$dstA' từ lúc cutover bị ngắt sẽ KHÔNG được chép về, rồi ứng dụng chạy lại ở máy '$srcA'."
+      if (-not (Confirm-MoveYes 'Làm nốt lần quay lại và bỏ dữ liệu đó? (Có/Không)')) { Write-Host 'Đã huỷ, chưa đổi gì.'; return 65 }
+    }
+    return (Invoke-MoveRollback $S 1 'làm nốt lần quay lại đang dở')
+  }
   if ([string]$S.phase -ceq 'cut') { return (Invoke-MoveChores $S) }
   $enteredStarted = [bool]($mark -ceq 'switching' -or ($mark -ceq 'cutting' -and $S.dst_started -eq $true))   # dst already started (or switching) when this run began
   if ($mark -ceq 'switching') { $f = Invoke-MoveCutSteps $S $true }   # resume at step (10)
