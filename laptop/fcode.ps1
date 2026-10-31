@@ -2451,7 +2451,7 @@ function Invoke-MoveFinish($S, [string]$Do) {
   $abandon = ($Do -ceq 'abandon' -or $Do -ceq 'abandon-rollback')
   $ca = ConvertTo-MoveTime $S.cut_at
   $needEarly = [bool]($ca -and (Get-MoveNow) -lt $ca.AddHours(72) -and -not $S.answers.finish_early)
-  $needMain = [bool](-not $S.answers.finish)
+  $needMain = [bool](-not $S.answers.finish -or ($Do -ceq 'abandon-rollback' -and $S.dst_started -eq $true))   # G1: a rollback that drops dst's writes is confirmed on every run; a stored answer.finish never stands in for that YES
   if ($Do -ceq 'abandon-rollback') {   # said BEFORE the question(s): the rollback follows a YES
     $srcA = if ([string]$S.dir -ceq 'fwd') { [string]$S.old.alias } else { [string]$S.new.alias }; $dstA = if ([string]$S.dir -ceq 'fwd') { [string]$S.new.alias } else { [string]$S.old.alias }
     Write-Host "Một cutover đang dở (mark '$($S.mark)'). Nếu đồng ý huỷ, ứng dụng sẽ được cho chạy lại ở máy '$srcA' trước (rollback), rồi mới huỷ lần chuyển."

@@ -1256,6 +1256,19 @@ T 'G7: an abandon of a back run (dir=back) with new answering 255 = no question,
     Ok ($r.Text -match 'lần chuyển về' -and $r.Text -match 'đang chạy ở máy đó') "${ph}: line about the apps: $($r.Text)"; Ok (-not $r.Text.Contains('mất hẳn? (Có/Không)')) "${ph}: no lost question"
   }
 }
+# ---- RW item G1b: `finish` under a mark with dst started asks every run ----
+T 'G1b: finish (abandon-rollback) with dst_started true asks the YES on every run even when answers.finish is stored: a first finish + YES whose dst stop fails 3x = 70 / rolling-back; the next finish without YES = 65 with zero stop / start and the state byte-identical; with YES the rollback runs; dst_started false does not re-ask' {
+  foreach ($mk in 'cutting', 'rolling-back') {
+    Reset-World; $s = RwMark $mk; Set-MoveProp $s 'dst_started' $true; Save-MoveState $s; Yes; Add-Rule 'newbox' ' stop$' -Code 255 -N 3
+    $r = Run-Move @('finish'); Eq $r.Code 70 "${mk}: $($r.Text)"; Eq (State).mark 'rolling-back'; Ok ([bool](State).answers.finish) "${mk}: the answer is stored"
+    $script:Rules.Clear(); $script:Log.Clear(); $script:Prompts.Clear(); $bytes = [IO.File]::ReadAllText((Get-MovePath 'state.json'))
+    $r = Run-Move @('finish'); Eq $r.Code 65 "${mk} no YES: $($r.Text)"; Eq (Count ' (stop|start)') 0 "${mk}: no stop / start"; Eq ([IO.File]::ReadAllText((Get-MovePath 'state.json'))) $bytes "${mk}: state unchanged"; Ok ($script:Prompts.Count -ge 1) "${mk}: it asked"
+    Ok ($r.Text.Contains("sẽ không được chép về")) "${mk}: names the dst writes"
+    Yes; $r = Run-Move @('finish'); Eq $r.Code 0 "${mk} YES: $($r.Text)"; Ordered @('^newbox stop', '^contabo start --connectors'); Eq (State).phase 'finished'
+  }
+  Reset-World; $s = RwMark 'rolling-back'; Set-MoveProp $s 'dst_started' $false; Set-MoveProp $s.answers 'finish' (New-MoveAnswer); Save-MoveState $s
+  $r = Run-Move @('finish'); Eq $r.Code 0 $r.Text; Eq $script:Prompts.Count 0 'dst never started + stored answer: no question'
+}
 # ============================== round 5 (arbitration: a cutover in flight is a mark) ==============================
 function Seed-Mark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan', [string]$Phase = 'copied') {
   $s = Seed $Phase $Dir $Via $Mark
