@@ -1817,10 +1817,17 @@ function Get-MoveDiskFree($Lines) {
   }
   -1.0
 }
+# the dump-space reserve of src (gate.json disk_reserve_mb) as plan prints it in `INV disk mount=/ ... reserve_mb=<n>`; 4096 when the line has none (an older gate)
+function Get-MoveDiskReserve($Lines) {
+  foreach ($l in @($Lines)) {
+    if ("$l" -cmatch '\AINV disk ') { $p = ConvertFrom-MoveLine "$l"; if ($p.Kv['mount'] -ceq '/' -and "$($p.Kv['reserve_mb'])" -match '\A[0-9]+\z') { return [double]$p.Kv['reserve_mb'] } }
+  }
+  4096.0
+}
 function Get-MoveOsKey([string]$Os) { $p = @("$Os" -split '-', 2); $mj = (@("$($p[1])" -split '\.'))[0]; "$($p[0])-$mj" }
 # the refusals of plan step (6) as `INV refuse ...` lines. $M = manifest, $D = preflight facts of dst, $SrcFree = src `/` free MB, $Repos = state repos.
 # `target-not-empty` and `target-access-path` are not checked in a `back` run ($Back).
-function Get-MoveRefusals($M, $D, [double]$SrcFree, [bool]$ReachOk, $Repos, [string]$OldAlias, [bool]$Back, [bool]$DstHome, [bool]$OwnCopy = $false) {
+function Get-MoveRefusals($M, $D, [double]$SrcFree, [bool]$ReachOk, $Repos, [string]$OldAlias, [bool]$Back, [bool]$DstHome, [bool]$OwnCopy = $false, [double]$SrcReserve = 4096) {
   $r = New-Object 'System.Collections.Generic.List[string]'
   $sumAll = 0.0; $db = 0.0
   foreach ($it in @($M.items)) {
@@ -1834,7 +1841,7 @@ function Get-MoveRefusals($M, $D, [double]$SrcFree, [bool]$ReachOk, $Repos, [str
   # A target that holds this peer's move-id but whose copy never finished (phase planned: a copy cut off before transfer) keeps the full formula.
   $needDst = $(if ($Back -or ($OwnCopy -and -not $foreign)) { 2 * $db + 4096 } else { [Math]::Ceiling(1.2 * $sumAll) + 2 * $db + 4096 })
   if ($D.FreeMb -lt 0 -or $D.FreeMb -lt $needDst) { $r.Add("INV refuse disk side=dst need_mb=$([int64]$needDst) free_mb=$(if ($D.FreeMb -lt 0) { 'unknown' } else { [int64]$D.FreeMb })") }
-  $needSrc = $db + 4096
+  $needSrc = $db + $SrcReserve   # db_mb + disk_reserve_mb of src's gate.json (CONTRACT section 8, plan step 6)
   if ($SrcFree -lt 0 -or $SrcFree -lt $needSrc) { $r.Add("INV refuse disk side=src need_mb=$([int64]$needSrc) free_mb=$(if ($SrcFree -lt 0) { 'unknown' } else { [int64]$SrcFree })") }
   if (-not $Back -and $D.Projects -gt 0 -and $foreign) { $r.Add("INV refuse target-not-empty projects=$($D.Projects)") }
   if (-not $Back -and $foreign) {
@@ -2021,7 +2028,7 @@ function Invoke-MovePlanSteps($S, [string]$MapText, [string]$FromText, [bool]$Ba
   }
   $dstHome = [bool](-not $Back -and [string]$S.new.kind -ceq 'home')
   $ownCopy = [bool]([string]$S.phase -ceq 'copied' -or [string]$S.phase -ceq 'rolled-back')   # only a run whose copy finished can rely on dst already holding its data
-  $ref = @(Get-MoveRefusals $mf.Obj $D (Get-MoveDiskFree $pr.Lines) $reachOk $repos ([string]$S.old.alias) $Back $dstHome $ownCopy)
+  $ref = @(Get-MoveRefusals $mf.Obj $D (Get-MoveDiskFree $pr.Lines) $reachOk $repos ([string]$S.old.alias) $Back $dstHome $ownCopy (Get-MoveDiskReserve $pr.Lines))
   foreach ($l in $ref) { Write-Host $l }
   if ("$($S.new.addr)" -cmatch '\A[A-Za-z0-9._:-]{1,255}\z') { $cb = Invoke-MoveBox (Get-MoveTcpScript) @([string]$S.new.addr, [string]$ni.Port); if ($cb.Code -ne 0) { Write-Host 'INV warn coder-unreachable' } }
   if ($serverRefused -or $ref.Count) { return @{ Code = 65 } }

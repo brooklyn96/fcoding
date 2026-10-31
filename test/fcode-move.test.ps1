@@ -1193,6 +1193,15 @@ T 'abandon with a lost new: finish on old succeeded, new answers 255 three times
   Reset-World; [void](Seed 'cut'); $s = State; Set-MoveProp $s 'cut_at' '2026-10-20T00:00:00Z'; Save-MoveState $s; Add-Rule 'newbox' ' finish' -Code 255 -Out @('#NOEXIT'); Yes
   $r = Run-Move @('finish'); Eq $r.Code 1; Eq (State).phase 'cut'; Ok (-not $r.Text.Contains($Q)) 'no lost-new question for a cut run'
 }
+# ---- RW item 6 (R2): the src disk refusal uses the reserve plan prints ----
+T 'src disk refusal = db_mb + reserve_mb from plan''s INV disk line (default 4096 when the line has none); the boundary passes; a malformed reserve falls back to 4096' {
+  $okDst = @('INV host os=ubuntu-24.04 arch=x86_64 cpus=2 mem_mb=4000 swap_mb=0 tz=UTC node_major=22', 'INV disk mount=/ used_mb=1 free_mb=900000', 'INV target moveid=- peer=- projects=0')
+  foreach ($c in @(@('free_mb=10299 reserve_mb=10000', 65, 'INV refuse disk side=src need_mb=10300 free_mb=10299'), @('free_mb=10300 reserve_mb=10000', 0, ''), @('free_mb=4395', 65, 'INV refuse disk side=src need_mb=4396 free_mb=4395'), @('free_mb=4396', 0, ''), @('free_mb=4395 reserve_mb=abc', 65, 'need_mb=4396'), @('free_mb=1000 reserve_mb=0', 0, ''))) {
+    Reset-World; $script:Pf['newbox'] = $okDst; Add-Rule 'contabo' ' plan$' -Out @("INV disk mount=/ used_mb=1 $($c[0])", 'INV ok')
+    $r = Run-Move @('plan', 'newbox'); Eq $r.Code $c[1] "$($c[0]): $($r.Text)"; if ($c[2]) { Ok ($r.Text.Contains($c[2])) "$($c[0]) -> $($c[2]): $($r.Text)" }
+  }
+  Eq (Get-MoveDiskReserve @('INV disk mount=/var used_mb=1 free_mb=1 reserve_mb=7', 'INV disk mount=/ used_mb=1 free_mb=5 reserve_mb=9000')) 9000 'the / line'
+}
 # ============================== round 5 (arbitration: a cutover in flight is a mark) ==============================
 function Seed-Mark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan', [string]$Phase = 'copied') {
   $s = Seed $Phase $Dir $Via $Mark
