@@ -1358,6 +1358,18 @@ T 'G4 F1: laptop alias: a re-run after a kill between the config write and the s
   Reset-World; $s = Alias-State; [IO.File]::AppendAllText((Join-Path (Join-Path $Home2 '.ssh') 'config'), "`nHost contabo-old`n  HostName 10.9.9.9`n", $utf8)
   Eq (Set-MoveLaptopAlias $s) 0; Eq (State).backups.ssh_config $null 'no .bak file = nothing recorded'
 }
+T 'G4 F2: coder alias: a re-run after a kill between the coder write and the state save (config already right, .bak on the coder) records backups.coder_ssh_config; no .bak = not recorded' {
+  Reset-World; $s = Alias-State; Eq (Set-MoveCoderAlias $s) 0
+  $name = '~/.ssh/config.fcode-move.' + $s.move_id + '.bak'; Eq (State).backups.coder_ssh_config $name 'recorded by the first run'
+  Set-MoveProp $s.backups 'coder_ssh_config' $null; Save-MoveState $s; Eq (State).backups.coder_ssh_config $null 'the kill'
+  $cfg = $script:Coder.Config; Eq (Set-MoveCoderAlias (State)) 0; Eq (State).backups.coder_ssh_config $name 'recorded on the re-run'; Eq $script:Coder.Config $cfg 'coder config unchanged'
+  # the read script is asked for this move's copy
+  $rd = Get-MoveCoderReadScript; Ok ($rd -match 'config\.fcode-move\.\$\{1:-x\}\.bak' -and $rd -match 'bak=\$bak') 'read script reports bak='
+  $f = Join-Path $Root 'coder-read.sh'; [IO.File]::WriteAllText($f, ($rd -replace "`r`n", "`n") + "`n", $utf8); $o = & bash -n $f 2>&1; Eq $LASTEXITCODE 0 "bash -n: $o"
+  # no .bak on the coder (an already-right config the user made himself): nothing recorded
+  Reset-World; $s = Alias-State; Eq (Set-MoveCoderAlias $s) 0; Set-MoveProp $s.backups 'coder_ssh_config' $null; Save-MoveState $s; $script:Coder.Bak = $false
+  Eq (Set-MoveCoderAlias (State)) 0; Eq (State).backups.coder_ssh_config $null 'no .bak on the coder = nothing recorded'
+}
 # ============================== round 5 (arbitration: a cutover in flight is a mark) ==============================
 function Seed-Mark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan', [string]$Phase = 'copied') {
   $s = Seed $Phase $Dir $Via $Mark

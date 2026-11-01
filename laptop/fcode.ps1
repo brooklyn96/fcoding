@@ -1524,9 +1524,10 @@ exit 0
 function Get-MoveCoderReadScript {
 @'
 #!/bin/bash
-# fcode move: coder ssh config (read)
+# fcode move: coder ssh config (read). $1 = the move id: bak= says whether this move's safety copy is already there
 f=$HOME/.ssh/config
-if [ -r "$f" ]; then echo "MOVE coder-config exists=yes b64=$(base64 -w0 "$f")"; else echo "MOVE coder-config exists=no b64="; fi
+bak=no; [ -e "$HOME/.ssh/config.fcode-move.${1:-x}.bak" ] && bak=yes
+if [ -r "$f" ]; then echo "MOVE coder-config exists=yes bak=$bak b64=$(base64 -w0 "$f")"; else echo "MOVE coder-config exists=no bak=$bak b64="; fi
 '@
 }
 # post-cut chore (c), on the coder box: $1 = the new ssh config (base64, or - = unchanged), $2 = safety-copy tag, $3 = known_hosts line to add (or -)
@@ -1758,13 +1759,15 @@ function Set-MoveCoderAlias($S) {
     $nd0 = Get-MoveNewDirectives $lt0 ([string]$S.new.alias) ([string]$S.new.addr)
     if (-not $nd0.Err -and (Test-MoveWindowsProxy $nd0.Lines)) { Write-Host 'INV warn coder-unreachable why=proxycommand'; Write-Host "coder: ProxyCommand của 'Host $($S.new.alias)' trên máy này là chương trình Windows nên không chép sang coder; ssh config của coder không đổi (alias '$($S.old.alias)' trên coder vẫn trỏ máy cũ, cần sửa tay)."; return 0 }
   }
-  $rd = Invoke-MoveBox (Get-MoveCoderReadScript) @()
-  $hit = @($rd.Lines | Where-Object { "$_" -cmatch '\AMOVE coder-config exists=(yes|no) b64=' } | Select-Object -First 1)
+  $rd = Invoke-MoveBox (Get-MoveCoderReadScript) @([string]$S.move_id)
+  $hit = @($rd.Lines | Where-Object { "$_" -cmatch '\AMOVE coder-config exists=(yes|no)(?: bak=(?:yes|no))? b64=' } | Select-Object -First 1)
   if ($rd.Code -ne 0 -or -not $hit.Count) { Write-Host 'INV warn coder-unreachable'; return 0 }
   $b64 = ("$($hit[0])" -replace '\A.*\bb64=', '').Trim()
   try { $ctext = if ($b64) { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64)) } else { '' } } catch { Write-Host 'INV warn coder-unreachable'; return 0 }
   $old = [string]$S.old.alias; $newCfg = '-'; $kh = '-'
   if ([string]$S.dir -ceq 'fwd') {
+    # a run killed after the coder's write but before the state save: the .bak is on the coder but the state does not name it (F2)
+    if ("$($hit[0])" -cmatch '\bbak=yes\b' -and [string]$S.backups.coder_ssh_config -cne ('~/.ssh/config.fcode-move.' + $S.move_id + '.bak')) { Set-MoveProp $S.backups 'coder_ssh_config' ('~/.ssh/config.fcode-move.' + $S.move_id + '.bak'); Save-MoveState $S }
     $lt = if ([IO.File]::Exists((Get-MoveSshConfigPath))) { [IO.File]::ReadAllText((Get-MoveSshConfigPath)) } else { '' }
     $nd = Get-MoveNewDirectives $lt ([string]$S.new.alias) ([string]$S.new.addr)
     if ($nd.Err) { Write-Host "lỗi: $($nd.Err)"; return 1 }
