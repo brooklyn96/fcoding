@@ -1935,6 +1935,8 @@ function Get-MovePushScan($Apps, [string]$OldAddr) {
 # est_cut_s = 40 + dump_s + transfer_s + apply_s (decision F2: 40 s = freeze, stop, dst stop/prepare, start, health and switch)
 function Get-MoveEstCut([int]$DumpS, [int]$TransferS, [int]$ApplyS) { [int](40 + $DumpS + $TransferS + $ApplyS) }
 function Get-MoveMinutes($S) { $sec = if ($null -ne $S.est_cut_s -and [double]$S.est_cut_s -gt 0) { [double]$S.est_cut_s } else { [double]$S.est_downtime_s }; [int][Math]::Max(1, [Math]::Ceiling($sec / 60)) }
+# the alias of the machine `finish` shuts down: the one the apps left (old in a forward run, new in a back run)
+function Get-MoveShutAlias($S) { if ([string]$S.dir -ceq 'fwd') { [string]$S.old.alias } else { [string]$S.new.alias } }
 function Get-MoveQuestion([string]$Kind, $S) {
   $n = Get-MoveMinutes $S
   switch -CaseSensitive ($Kind) {
@@ -1943,9 +1945,9 @@ function Get-MoveQuestion([string]$Kind, $S) {
       if ([string]$S.dir -ceq 'back') { "Quay lại máy cũ? Dữ liệu ghi ở máy mới sẽ được chép ngược về máy cũ; mọi ứng dụng cùng tạm dừng một lần, khoảng $n phút. (Có/Không)" }
       else { "Chuyển lại sang máy mới? Dữ liệu ghi ở máy cũ sẽ được chép sang máy mới; mọi ứng dụng cùng tạm dừng một lần, khoảng $n phút. (Có/Không)" }
     }
-    'finish' { 'Máy cũ có thể bỏ được chưa? Lệnh sẽ tắt hẳn ứng dụng trên máy cũ và xoá khoá chuyển máy. Sau bước này KHÔNG quay lại được nữa. Huỷ gói VPS cũ ở trang Contabo do bạn tự làm. (Có/Không)' }
+    'finish' { $shut = Get-MoveShutAlias $S; "Máy $shut có thể bỏ được chưa? Lệnh sẽ tắt hẳn ứng dụng trên máy $shut và xoá khoá chuyển máy. Sau bước này KHÔNG quay lại được nữa. Huỷ gói VPS của máy $shut ở nhà cung cấp (ví dụ trang Contabo) do bạn tự làm. (Có/Không)" }
     'new-lost' { "Không kết nối được máy mới $([string]$S.new.alias). Nếu máy mới đã mất hẳn (đã xoá hoặc hỏng), lần chuyển này sẽ được đánh dấu đã xong; máy cũ đã được dọn. Máy mới đã mất hẳn? (Có/Không)" }
-    'finish-early' { 'Mới chuyển chưa đủ 72 giờ. Vẫn bỏ máy cũ ngay? (Có/Không)' }
+    'finish-early' { "Mới chuyển chưa đủ 72 giờ. Vẫn bỏ máy $(Get-MoveShutAlias $S) ngay? (Có/Không)" }
     'abandon' {
       $running = if ([string]$S.dir -ceq 'fwd') { [string]$S.old.alias } else { [string]$S.new.alias }
       "Huỷ lần chuyển này? Ứng dụng vẫn chạy ở máy $running; khoá chuyển máy và file tạm bị xoá. Máy mới vẫn giữ bản sao dữ liệu và mật khẩu của các ứng dụng (đã tắt). Nếu không dùng máy mới nữa, hãy xoá hoặc cài lại máy đó. (Có/Không)"
@@ -2552,7 +2554,7 @@ function Invoke-MoveFinish($S, [string]$Do) {
   $reenable = if ($abandon) { $fwd } else { -not $fwd }   # workflows come back when the apps run on old
   if ($reenable -and (Set-MoveWorkflows $S $true) -ne 0) { Write-Host 'lỗi: không bật lại được workflow; chạy lại fcode move finish.'; return 1 }
   Set-MoveProp $S 'phase' 'finished'; Set-MoveProp $S 'mark' $null; Save-MoveState $S
-  Write-Host $(if ($abandon) { 'Đã huỷ lần chuyển (finished). Máy mới vẫn giữ bản sao dữ liệu và mật khẩu (đã tắt): nếu không dùng nữa, hãy xoá hoặc cài lại máy đó.' } else { 'Đã bỏ máy cũ (finished): ứng dụng trên máy đó đã tắt, khoá chuyển máy đã xoá. Huỷ gói VPS cũ ở trang Contabo là việc của bạn.' })
+  Write-Host $(if ($abandon) { 'Đã huỷ lần chuyển (finished). Máy mới vẫn giữ bản sao dữ liệu và mật khẩu (đã tắt): nếu không dùng nữa, hãy xoá hoặc cài lại máy đó.' } else { "Đã bỏ máy $(Get-MoveShutAlias $S) (finished): ứng dụng trên máy đó đã tắt, khoá chuyển máy đã xoá. Huỷ gói VPS của máy $(Get-MoveShutAlias $S) ở nhà cung cấp là việc của bạn." })
   0
 }
 # phase cut: Q-back, then a new run with src and dst swapped (plan on its src with the saved move-map and manifest), then its copy and cutover

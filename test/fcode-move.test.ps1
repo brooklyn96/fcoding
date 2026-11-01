@@ -876,9 +876,9 @@ T 'back: a second back (phase cut, dir back) starts a forward run: dir fwd, via 
 T 'finish (phase cut): Q-finish verbatim, 72 h second question, src then dst with the peer alias, phase finished' {
   Reset-World; $s = Seed 'cut'; Set-MoveProp $s 'cut_at' '2026-10-29T08:00:00Z'; Save-MoveState $s; [void](Set-MoveLaptopAlias $s)
   Yes; $r = Run-Move @('finish'); Eq $r.Code 65 'the second question is not answered'; Eq $script:Log.Count 0 'nothing ran'; Eq $script:Prompts.Count 2
-  Ok ($r.Text.Contains('Máy cũ có thể bỏ được chưa? Lệnh sẽ tắt hẳn ứng dụng trên máy cũ và xoá khoá chuyển máy. Sau bước này KHÔNG quay lại được nữa. Huỷ gói VPS cũ ở trang Contabo do bạn tự làm. (Có/Không)')) 'Q-finish'
+  Ok ($r.Text.Contains('Máy contabo có thể bỏ được chưa? Lệnh sẽ tắt hẳn ứng dụng trên máy contabo và xoá khoá chuyển máy. Sau bước này KHÔNG quay lại được nữa. Huỷ gói VPS của máy contabo ở nhà cung cấp (ví dụ trang Contabo) do bạn tự làm. (Có/Không)')) 'Q-finish'
   Yes; Yes; $r = Run-Move @('finish'); Eq $r.Code 0 $r.Text
-  Ok ($r.Text.Contains('Mới chuyển chưa đủ 72 giờ. Vẫn bỏ máy cũ ngay? (Có/Không)')) 'second question'
+  Ok ($r.Text.Contains('Mới chuyển chưa đủ 72 giờ. Vẫn bỏ máy contabo ngay? (Có/Không)')) 'second question'
   Ordered @("^contabo-old finish newbox$", '^newbox finish contabo$')   # old via Reach-Old, with the new alias; new with the old alias
   $n = State; Eq $n.phase 'finished'; Eq $n.answers.finish.a 'yes'; Eq $n.answers.finish_early.a 'yes'
   $r = Run-Move @('finish'); Eq $r.Code 0 'finished: prints done'; Ok ($r.Text -match 'finished'); Eq $script:Log.Count 0
@@ -1390,6 +1390,18 @@ T 'G4 F3: ssh-keygen -F gets -f = the alias block''s UserKnownHostsFile (from ss
   Reset-World; $script:SshG['contabo'] = @{ Host = $OldAddr; Ukh = 'none' }; $script:KnownByFile = @{ $def = @{ $OldAddr = $KeyOld; $NewAddr = $KeyNew } }
   $r = Run-Move @('plan', 'newbox'); Eq $r.Code 0 $r.Text
 }
+# ---- G4 F4: the finish texts name the machine that is shut down ----
+T 'G4 F4: Q-finish, the second question and the done line name the alias of the machine shut down: old in a forward run, new in a back run' {
+  foreach ($c in @(@('fwd', 'plan', 'contabo'), @('back', 'back', 'newbox'))) {
+    Reset-World; $s = Seed 'cut' $c[0] $c[1]; Set-MoveProp $s 'cut_at' '2026-10-29T08:00:00Z'; Save-MoveState $s; [void](Set-MoveLaptopAlias $s)
+    $a = $c[2]; Yes; Yes; $r = Run-Move @('finish'); Eq $r.Code 0 "$($c[0]): $($r.Text)"
+    Ok ($r.Text.Contains("Máy $a có thể bỏ được chưa? Lệnh sẽ tắt hẳn ứng dụng trên máy $a và xoá khoá chuyển máy.")) "$($c[0]): Q-finish: $($r.Text)"
+    Ok ($r.Text.Contains("Huỷ gói VPS của máy $a ở nhà cung cấp (ví dụ trang Contabo) do bạn tự làm. (Có/Không)")) "$($c[0]): VPS line"
+    Ok ($r.Text.Contains("Vẫn bỏ máy $a ngay? (Có/Không)")) "$($c[0]): 72 h question"
+    Ok ($r.Text.Contains("Đã bỏ máy $a (finished): ứng dụng trên máy đó đã tắt, khoá chuyển máy đã xoá. Huỷ gói VPS của máy $a ở nhà cung cấp là việc của bạn.")) "$($c[0]): done line: $($r.Text)"
+    Ok (-not $r.Text.Contains('máy cũ có thể')) "$($c[0]): no generic old-machine text"
+  }
+}
 # ============================== round 5 (arbitration: a cutover in flight is a mark) ==============================
 function Seed-Mark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan', [string]$Phase = 'copied') {
   $s = Seed $Phase $Dir $Via $Mark
@@ -1476,7 +1488,7 @@ T 'switching: cutover resumes at step (10) and finishes the cut; a failing switc
   Reset-World; $s = Seed-Mark 'switching'; Add-Rule 'newbox' ' switch' -Code 1 -Out @('MOVE error switch-failed host=a'); $r = Run-Move @('cutover'); Eq $r.Code 70; Eq (State).mark 'switching'; Eq (Count '^newbox stop') 0
   Reset-World; $s = Seed 'copied'; Set-MoveProp $s.answers 'finish' (New-MoveAnswer); Save-MoveState $s; Yes
   $r = Run-Move @('cutover'); Eq $r.Code 0 $r.Text; $n = State; Eq $n.phase 'cut'; Eq $n.answers.finish $null
-  $script:Answers.Clear(); $r = Run-Move @('finish'); Eq $r.Code 65; Ok ($r.Text.Contains('Máy cũ có thể bỏ được chưa?')) 'Q-finish asked again'; Eq $script:Log.Count 0
+  $script:Answers.Clear(); $r = Run-Move @('finish'); Eq $r.Code 65; Ok ($r.Text.Contains('Máy contabo có thể bỏ được chưa?')) 'Q-finish asked again'; Eq $script:Log.Count 0
   Reset-World; [void](Seed-Mark 'cutting'); Yes; Add-Rule 'contabo' ' health' -Code 69 -Out @('MOVE error health')
   $r = Run-Move @('finish'); Eq $r.Code 70 $r.Text; Eq (State).phase 'rolled-back'; Ok ($null -ne (State).answers.finish) 'answers.finish set by the abandon'
   $script:Rules.Clear(); Yes; $r = Run-Move @('cutover'); Eq $r.Code 0 $r.Text; Eq (State).phase 'cut'; Eq (State).answers.finish $null
