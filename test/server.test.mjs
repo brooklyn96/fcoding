@@ -4786,10 +4786,39 @@ test('/api/tools/update: a hanging systemctl is cut (is-active 4 s, start 8 s): 
       assert.ok(took >= 8e3 && took < 13e3, `took ${took} ms`);
       assert.ok(c.logs.some((l) => /^tools-update: exit /.test(l)));
       const t1 = Date.now();
-      const g = await c.req('GET', '/api/tools/update', { cookie }); // the GET also answers: is-active cut, not running
-      assert.deepEqual([g.status, g.json.running, Date.now() - t1 < 8e3], [200, false, true]);
+      const g = await c.req('GET', '/api/tools/update', { cookie }); // the GET also answers inside the bound: is-active cut -> 503 busy, never "not running"
+      assert.deepEqual([g.status, g.json, Date.now() - t1 < 8e3], [503, { error: 'busy' }, true]);
       fs.rmSync(path.join(s.dir, 'check-hang')); fs.rmSync(path.join(s.dir, 'start-hang'));
       assert.equal((await c.req('POST', '/api/tools/update', { cookie })).status, 202); // flag cleared
+    }, { systemctl: s.systemctl });
+  } finally { s.cleanup(); }
+});
+
+test('GET /api/tools/update: running from the is-active word (active, activating, deactivating, reloading -> true; inactive, failed -> false); empty, unknown or an unrunnable systemctl -> 503 {error:"busy"} and nothing else', async () => {
+  const s = sysctlStub();
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      for (const [word, running] of [['active', true], ['activating', true], ['deactivating', true], ['reloading', true], ['inactive', false], ['failed', false]]) {
+        s.set('state', word);
+        const r = await c.req('GET', '/api/tools/update', { cookie });
+        assert.deepEqual([r.status, r.json.running], [200, running], word);
+      }
+      for (const word of ['', 'unknown', 'maintenance', 'Active', 'active extra', 'SECRET']) { // empty = what a failed check prints
+        s.set('state', word);
+        const r = await c.req('GET', '/api/tools/update', { cookie });
+        assert.deepEqual([r.status, r.json, r.text.includes('SECRET')], [503, { error: 'busy' }, false], JSON.stringify(word));
+      }
+    }, { systemctl: s.systemctl });
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      const r = await c.req('GET', '/api/tools/update', { cookie });
+      assert.deepEqual([r.status, r.json], [503, { error: 'busy' }]);
+    }, { systemctl: [path.join(s.dir, 'no-such-systemctl')] });
+    await withApp(async (c) => { // POST keeps its rule: an unknown state still starts
+      const { cookie } = await c.login();
+      s.set('state', 'weird');
+      assert.equal((await c.req('POST', '/api/tools/update', { cookie })).status, 202);
     }, { systemctl: s.systemctl });
   } finally { s.cleanup(); }
 });

@@ -1589,7 +1589,8 @@ export function createApp(opts = {}) {
   const UPDATE_CHECK_MS = 4e3, UPDATE_START_MS = 8e3; // the client (hermes) gives up at 15 s: is-active + start, 12 s at most, still answer the POST
   let updateStarting = false; // a start in flight (answered 409 like a running unit)
   // is-active prints the state and exits non-zero when it is not active, so the printed state counts, never the exit code
-  const updateRunning = async () => /^(active|activating)$/.test(String(await execTool(systemctlSpec, ['--user', 'is-active', UPDATE_UNIT], UPDATE_CHECK_MS).catch((e) => e.stdout ?? '')).trim());
+  const updateState = async () => String(await execTool(systemctlSpec, ['--user', 'is-active', UPDATE_UNIT], UPDATE_CHECK_MS).catch((e) => e.stdout ?? '')).trim();
+  const updateRunning = async () => /^(active|activating)$/.test(await updateState()); // POST: any other answer (even a cut check) lets the start go on
   // detached and unref'd with its output ignored (--no-block: it returns once the job is queued); true when systemctl exited 0, a failure logs one line
   const startUpdate = () => new Promise((resolve) => {
     let over = false;
@@ -2285,7 +2286,10 @@ export function createApp(opts = {}) {
       if (method === 'GET') {
         let updates = {};
         try { updates = parseUpdates(fs.readFileSync(updatesFile, 'utf8')); } catch {}
-        return json(res, 200, { running: await updateRunning(), ...updateStatusOf(updates) });
+        // GET: only a known state answers; a cut, failed or unknown check is 503, never a guessed "not running" (the client ends its poll on running: false)
+        const st = await updateState();
+        if (!/^(active|activating|deactivating|reloading|inactive|failed)$/.test(st)) return json(res, 503, { error: 'busy' });
+        return json(res, 200, { running: !/^(inactive|failed)$/.test(st), ...updateStatusOf(updates) });
       }
       want('POST');
       if (body.length) { const b = parseJson(req, body); if (Object.keys(b).length) throw new HttpErr(400, 'invalid'); } // empty, or {}: no parameter is read
