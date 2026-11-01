@@ -1416,14 +1416,14 @@ if [ -r "$f" ]; then
   mid=$(sed -n 's/.*"move_id":"\([0-9a-f-]*\)".*/\1/p' "$f" | head -n 1)
   peer=$(sed -n 's/.*"peer":"\([a-z][a-z0-9-]*\)".*/\1/p' "$f" | head -n 1)
 fi
-n=$(ls "$R/etc/fcode-deploy/projects/"*.json 2>/dev/null | wc -l); n=$((n + 0))
-# a machine that serves a legacy project (a forced-command key `command="/usr/local/sbin/fcode-deploy-gate <name>"`, no json yet) or an operator key serves something too
+n=$(ls "$R/etc/fcode-deploy/projects/"*.json 2>/dev/null | wc -l); n=$((n + 0)); opn=0
+# a machine that serves a legacy project (a forced-command key `command="/usr/local/sbin/fcode-deploy-gate <name>"`, no json yet) serves a project too; an operator key is counted apart (operators=): it does not make the machine "not empty" for plan, but a gate refresh would replace the gate that key uses
 ak=$R/root/.ssh/authorized_keys
 if [ -r "$ak" ]; then
   while IFS= read -r nmx; do [ -n "$nmx" ] && [ ! -e "$R/etc/fcode-deploy/projects/$nmx.json" ] && n=$((n + 1)); done < <(grep -oE 'command="/usr/local/sbin/fcode-deploy-gate [A-Za-z0-9][A-Za-z0-9._-]*"' "$ak" 2>/dev/null | sed 's/^.*gate //; s/"$//' | sort -u)
-  opn=$(grep -cE '[[:space:]]fcode-operator-[a-z0-9-]+[[:space:]]*$' "$ak" 2>/dev/null); n=$((n + ${opn:-0}))
+  opn=$(grep -cE '[[:space:]]fcode-operator-[a-z0-9-]+[[:space:]]*$' "$ak" 2>/dev/null)
 fi
-echo "INV target moveid=${mid:--} peer=${peer:--} projects=$n"
+echo "INV target moveid=${mid:--} peer=${peer:--} projects=$n operators=$((${opn:-0} + 0))"
 for d in /root/.cloudflared /etc/cloudflared; do
   [ -d "$R$d" ] || continue
   find "$R$d" \( -type f -o -type l \) 2>/dev/null
@@ -1846,7 +1846,7 @@ function Read-MoveManifestFile {
 }
 # the INV lines of the preflight script
 function ConvertFrom-MovePreflight($Lines) {
-  $f = @{ HasHost = $false; Arch = ''; Os = ''; FreeMb = -1.0; MoveId = '-'; Peer = '-'; Projects = 0; Files = @(); Units = @(); Smtp = 'unknown' }
+  $f = @{ HasHost = $false; Arch = ''; Os = ''; FreeMb = -1.0; MoveId = '-'; Peer = '-'; Projects = 0; Operators = 0; Files = @(); Units = @(); Smtp = 'unknown' }
   foreach ($l in @($Lines)) {
     if ("$l" -cnotmatch '\AINV ') { continue }
     $p = ConvertFrom-MoveLine "$l"; $w = $p.Words; $k = $p.Kv
@@ -1855,7 +1855,7 @@ function ConvertFrom-MovePreflight($Lines) {
       'host' { $f.HasHost = $true; $f.Arch = [string]$k['arch']; $f.Os = [string]$k['os'] }
       'disk' { if ($k['mount'] -ceq '/' -and "$($k['free_mb'])" -match '\A[0-9]+\z') { $f.FreeMb = [double]$k['free_mb'] } }
       'egress' { $f.Smtp = [string]$k['smtp'] }
-      'target' { $f.MoveId = [string]$k['moveid']; $f.Peer = [string]$k['peer']; if ("$($k['projects'])" -match '\A[0-9]+\z') { $f.Projects = [int]$k['projects'] } }
+      'target' { $f.MoveId = [string]$k['moveid']; $f.Peer = [string]$k['peer']; if ("$($k['projects'])" -match '\A[0-9]+\z') { $f.Projects = [int]$k['projects'] }; if ("$($k['operators'])" -match '\A[0-9]+\z') { $f.Operators = [int]$k['operators'] } }
       'target-file' { if ($w.Count -ge 3) { $f.Files += $w[2] } }
       'target-unit' { if ($w.Count -ge 3) { $f.Units += $w[2] } }
     }
@@ -2291,7 +2291,7 @@ function Invoke-MoveCopy($S) {
     $pf = Invoke-MoveScript $newH (Get-MovePreflightScript) @() -Quiet
     if ($pf.Code -ne 0) { return (ConvertTo-MoveExit $pf.Code) }
     $pfv = ConvertFrom-MovePreflight $pf.Lines
-    if ($fwd -and $pfv.Projects -eq 0) {   # Q11: a forward run only (in a back run new is src and serves the apps; old is already dst and refuses a sender); Q12: nothing served = no project and no operator key
+    if ($fwd -and $pfv.Projects -eq 0 -and $pfv.Operators -eq 0) {   # Q11: a forward run only (in a back run new is src and serves the apps; old is already dst and refuses a sender); Q12: nothing served = no project and no operator key
       Write-Host "copy (d): cổng trên '$newH' khác cổng trên '$oldH' và máy mới chưa có project nào: chép lại cổng..."
       $g = Invoke-MoveScript $newH (Get-MoveBootstrapGateScript -Refresh) $gateArgs
       if ($g.Code -ne 0) { return (ConvertTo-MoveExit $g.Code) }

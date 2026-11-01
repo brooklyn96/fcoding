@@ -1457,21 +1457,21 @@ T 'Q6 copy / cutover: a status answered with GATE_EXIT n<>0 (a gate without --mo
   }
 }
 # ---- INT Q7: what counts as "serves something"; the refresh mirrors the lib ----
-T 'Q7 preflight: projects= counts the json files plus forced-command legacy keys (each name once, not twice with its json) plus operator keys; --operator / --move-source / plain keys do not count' {
+T 'Q7 / Q12 preflight: projects= counts the json files plus forced-command legacy keys (each name once, not twice with its json); operators= counts the fcode-operator- keys apart; --operator / --move-source / plain keys are no project' {
   $R = Join-Path $Root 'fcmroot-q7'; [void](New-Item -ItemType Directory -Force -Path (Join-Path $R 'etc/fcode-deploy/projects'), (Join-Path $R 'root/.ssh'), (Join-Path $R 'etc'))
   [IO.File]::WriteAllText((Join-Path $R 'etc/os-release'), "ID=ubuntu`nVERSION_ID=24.04`n")
   $bin = Join-Path $Root 'fakebin-q7'; [void](New-Item -ItemType Directory -Force -Path $bin)
   [IO.File]::WriteAllText((Join-Path $bin 'timeout'), "#!/bin/bash`nexit 1`n"); & chmod +x (Join-Path $bin 'timeout')
   $f = Join-Path $Root 'pf-q7.sh'; [IO.File]::WriteAllText($f, ((Get-MovePreflightScript) -replace "`r`n", "`n") + "`n", $utf8)
-  function PfProjects { $savedPath = $env:PATH; $env:PATH = "$bin$([IO.Path]::PathSeparator)$env:PATH"; $env:FCM_ROOT = $R; try { $o = @(& bash $f 2>&1 | ForEach-Object { "$_" }) } finally { $env:PATH = $savedPath; $env:FCM_ROOT = $null }; (ConvertFrom-MovePreflight $o).Projects }
+  function PfProjects { $savedPath = $env:PATH; $env:PATH = "$bin$([IO.Path]::PathSeparator)$env:PATH"; $env:FCM_ROOT = $R; try { $o = @(& bash $f 2>&1 | ForEach-Object { "$_" }) } finally { $env:PATH = $savedPath; $env:FCM_ROOT = $null }; (ConvertFrom-MovePreflight $o).Projects; $script:PfOps = (ConvertFrom-MovePreflight $o).Operators }
   $ak = Join-Path $R 'root/.ssh/authorized_keys'; $k = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLEKEY'
-  Eq (PfProjects) 0 'empty machine, no authorized_keys'
+  Eq (PfProjects) 0 'empty machine, no authorized_keys'; Eq $script:PfOps 0 'no operators'
   [IO.File]::WriteAllText($ak, "$k just-a-user`nrestrict,command=`"/usr/local/sbin/fcode-deploy-gate --move-source`" $k fcode-move-newbox`n"); Eq (PfProjects) 0 'a user key and the move-source key do not count'
   [IO.File]::WriteAllText($ak, "restrict,command=`"/usr/local/sbin/fcode-deploy-gate deal-sync`" $k fcode-deploy-deal-sync`n"); Eq (PfProjects) 1 'a legacy forced-command key counts'
   [IO.File]::WriteAllText($ak, "restrict,command=`"/usr/local/sbin/fcode-deploy-gate deal-sync`" $k fcode-deploy-deal-sync`nrestrict,command=`"/usr/local/sbin/fcode-deploy-gate deal-sync`" $k fcode-deploy-deal-sync-2`nrestrict,command=`"/usr/local/sbin/fcode-deploy-gate vps-scraper`" $k fcode-deploy-vps-scraper`n"); Eq (PfProjects) 2 'a name counts once however many keys carry it'
   [IO.File]::WriteAllText((Join-Path $R 'etc/fcode-deploy/projects/vps-scraper.json'), '{}'); Eq (PfProjects) 2 'a name that has its json is counted once (json), not twice'
-  [IO.File]::WriteAllText($ak, "restrict,command=`"/usr/local/sbin/fcode-deploy-gate --operator`" $k fcode-operator-coder`n"); Eq (PfProjects) 2 'an operator key counts (1 json + 1 operator)'
-  [IO.File]::WriteAllText($ak, "restrict,command=`"/usr/local/sbin/fcode-deploy-gate deal-sync`" $k fcode-deploy-deal-sync`nrestrict,command=`"/usr/local/sbin/fcode-deploy-gate task`" $k fcode-deploy-task`nrestrict,command=`"/usr/local/sbin/fcode-deploy-gate vps-scraper`" $k fcode-deploy-vps-scraper`nrestrict,command=`"/usr/local/sbin/fcode-deploy-gate --operator`" $k fcode-operator-coder`n$k plain`n"); Eq (PfProjects) 4 'json + two legacy + operator'
+  [IO.File]::WriteAllText($ak, "restrict,command=`"/usr/local/sbin/fcode-deploy-gate --operator`" $k fcode-operator-coder`n"); Eq (PfProjects) 1 'an operator key is not a project (1 json)'; Eq $script:PfOps 1 'it is counted as an operator'
+  [IO.File]::WriteAllText($ak, "restrict,command=`"/usr/local/sbin/fcode-deploy-gate deal-sync`" $k fcode-deploy-deal-sync`nrestrict,command=`"/usr/local/sbin/fcode-deploy-gate task`" $k fcode-deploy-task`nrestrict,command=`"/usr/local/sbin/fcode-deploy-gate vps-scraper`" $k fcode-deploy-vps-scraper`nrestrict,command=`"/usr/local/sbin/fcode-deploy-gate --operator`" $k fcode-operator-coder`n$k plain`n"); Eq (PfProjects) 3 'json + two legacy'; Eq $script:PfOps 1 'one operator'
   # plan's target-not-empty uses the same number: a new machine whose preflight says projects=1 is refused (a legacy box)
   Reset-World; $script:Pf['newbox'] = @('INV host os=ubuntu-24.04 arch=x86_64 cpus=4 mem_mb=8000 swap_mb=0 tz=UTC node_major=22', 'INV disk mount=/ used_mb=1 free_mb=900000', 'INV target moveid=- peer=- projects=1')
   $r = Run-Move @('plan', 'newbox'); Eq $r.Code 65 $r.Text; Ok ($r.Text.Contains('INV refuse target-not-empty projects=1')) $r.Text
@@ -1529,6 +1529,18 @@ T 'Q11 back run: gate ids that differ are never refreshed (new is src and serves
   Reset-World; [void](Seed 'planned'); $script:GateVisible = $true; $script:GateId['contabo'] = 'abcdef012345'; $script:GateId['newbox'] = '111111111111'; $script:Pf['newbox'] = $PfEmpty
   Add-Rule 'newbox' 'script:bootstrap gate' -Do { param($h, $n, $a, $t) if ($t -notmatch 'if \[ -e') { $script:GateId['newbox'] = 'abcdef012345' } }
   $r = Run-Move @('copy'); Eq $r.Code 0 $r.Text; Eq @($script:ScriptLog | Where-Object { $_.Name -ceq 'bootstrap gate' }).Count 2 'forward refresh still runs'
+}
+T 'Q12 an operator-only new: plan does not refuse it as target-not-empty (projects=0 operators=1), but the copy (d) never refreshes it (gate refusal side=new, one bootstrap); a project still refuses plan; operators= is read by the preflight parser' {
+  $line = 'INV target moveid=- peer=- projects=0 operators=1'; $pf = @('INV host os=ubuntu-24.04 arch=x86_64 cpus=4 mem_mb=8000 swap_mb=0 tz=UTC node_major=22', 'INV disk mount=/ used_mb=1 free_mb=900000', $line)
+  $o = ConvertFrom-MovePreflight $pf; Eq $o.Projects 0; Eq $o.Operators 1; Eq (ConvertFrom-MovePreflight @('INV target moveid=- peer=- projects=2')).Operators 0 'an older preflight line has no operators= = 0'
+  Reset-World; $script:Pf['newbox'] = $pf; $r = Run-Move @('plan', 'newbox'); Eq $r.Code 0 $r.Text; Ok (-not $r.Text.Contains('target-not-empty')) 'operator-only new is not "not empty"'
+  Reset-World; $script:Pf['newbox'] = @($pf[0], $pf[1], 'INV target moveid=- peer=- projects=1 operators=1'); $r = Run-Move @('plan', 'newbox'); Eq $r.Code 65 $r.Text; Ok ($r.Text.Contains('INV refuse target-not-empty projects=1')) $r.Text
+  # copy (d): ids differ, new has an operator key only: no refresh
+  Reset-World; [void](Seed 'planned'); $script:GateVisible = $true; $script:GateId['contabo'] = 'abcdef012345'; $script:GateId['newbox'] = '111111111111'; $script:Pf['newbox'] = $pf
+  $r = Run-Move @('copy'); Eq $r.Code 65 $r.Text; Ok ($r.Text.Contains('INV refuse gate-version side=new')) $r.Text; Eq @($script:ScriptLog | Where-Object { $_.Name -ceq 'bootstrap gate' }).Count 1 'not refreshed'; Eq (Count '^newbox init') 0
+  # and with neither a project nor an operator key it is refreshed
+  Reset-World; [void](Seed 'planned'); $script:GateVisible = $true; $script:GateId['contabo'] = 'abcdef012345'; $script:GateId['newbox'] = '111111111111'; $script:Pf['newbox'] = @($pf[0], $pf[1], 'INV target moveid=- peer=- projects=0 operators=0')
+  $r = Run-Move @('copy'); Eq @($script:ScriptLog | Where-Object { $_.Name -ceq 'bootstrap gate' }).Count 2 'refreshed when nothing is served'
 }
 # ============================== round 5 (arbitration: a cutover in flight is a mark) ==============================
 function Seed-Mark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan', [string]$Phase = 'copied') {
