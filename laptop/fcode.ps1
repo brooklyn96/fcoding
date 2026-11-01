@@ -2513,6 +2513,11 @@ function Invoke-MoveCutover($S) {
     $gi = Get-MoveGateIds $dstP $srcP
     if ($gi.Code -ne 0) { Write-MoveUnreachable $gi.Host 'cutover'; Write-Host 'Chưa chạy gì.'; return 1 }
     if (-not $gi.Same) { Write-MoveGateRefusal $(if ([string]$S.dir -ceq 'fwd') { 'new' } else { 'old' }) $dstP $srcP 'cutover'; Write-Host 'Chưa chạy gì.'; return 65 }
+    # Q9 (C16): the GitHub read of step (2) is checked here too: a gh failure there would roll back a src that was never frozen
+    foreach ($rp in @(@($S.repos) | Where-Object { $_.kind -ceq 'ssh-push' -and $_.enabled -eq $true })) {
+      $o = Invoke-MoveTool 'gh' @('run', 'list', '-R', [string]$rp.repo, '--workflow', [string]$rp.workflow, '--status', 'queued', '--json', 'databaseId')
+      if ($o.Code -ne 0) { Write-Host "lỗi: gh không đọc được workflow $($rp.workflow) của $($rp.repo) (mã $($o.Code)). Chạy  gh auth login  (và kiểm tra mạng), rồi chạy lại  fcode move cutover. Chưa chạy gì."; return 1 }
+    }
     $key = if ([string]$S.via -ceq 'back') { 'back' } else { 'cut' }
     if (-not $S.answers.$key) {
       if (-not (Confirm-MoveYes (Get-MoveQuestion $key $S))) { Write-Host 'Đã huỷ, chưa đổi gì.'; return 65 }

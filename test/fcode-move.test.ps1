@@ -646,19 +646,19 @@ T 'cutover: after a rollback the next cutover asks again and is refused without 
   $s = Cut-State; Yes
   Add-Rule 'newbox' ' health' -N 1 -Code 69 -Out @('MOVE error health app=x')
   Eq (Run-Move @('cutover')).Code 69; Eq (State).phase 'rolled-back'
-  $script:Log.Clear(); $r = Run-Move @('cutover'); Eq $r.Code 65 'no answer = refused'; Eq $script:Log.Count 0 'nothing ran'; Eq $script:Prompts.Count 1 'asked again'
+  $script:Log.Clear(); $r = Run-Move @('cutover'); Eq $r.Code 65 'no answer = refused'; Eq (@($script:Log | Where-Object { $_ -notmatch '^gh run list' }).Count) 0 'nothing ran (only the read-only gh checks of Q9)'; Eq $script:Prompts.Count 1 'asked again'
   $script:Answers.Enqueue('yes'); $r = Run-Move @('cutover'); Eq $r.Code 65 'only the typed word YES counts'
   Yes; $r = Run-Move @('cutover'); Eq $r.Code 0 $r.Text; Eq (State).phase 'cut'; Eq (State).answers.cut.a 'yes'
 }
 T 'cutover: a via=back run needs answers.back; after its rollback `back` without YES is refused' {
   Reset-World; $s = Seed 'copied' 'back' 'back'
-  $r = Run-Move @('back'); Eq $r.Code 65; Eq $script:Log.Count 0; Eq $script:Prompts.Count 1
+  $r = Run-Move @('back'); Eq $r.Code 65; Eq (@($script:Log | Where-Object { $_ -notmatch '^gh run list' }).Count) 0; Eq $script:Prompts.Count 1
   Yes; Add-Rule 'contabo' ' health' -N 1 -Code 69 -Out @('MOVE error health app=x')   # dst of a back run is old
   $r = Run-Move @('back'); Eq $r.Code 69 $r.Text; $n = State; Eq $n.phase 'rolled-back'; Eq $n.answers.back $null 'answer cleared'
   Ordered @('^contabo stop', '^newbox start --connectors', '^newbox unfreeze', '^newbox health')   # src of a back run is new
   Eq (Count 'gh workflow') (Count 'gh workflow disable') 'a back run never re-enables the ssh-push workflows on rollback'
-  $script:Log.Clear(); $r = Run-Move @('back'); Eq $r.Code 65 'rolled-back via back: back without YES refused'; Eq $script:Log.Count 0
-  $r = Run-Move @('cutover'); Eq $r.Code 65 'cutover too'; Eq $script:Log.Count 0
+  $script:Log.Clear(); $r = Run-Move @('back'); Eq $r.Code 65 'rolled-back via back: back without YES refused'; Eq (@($script:Log | Where-Object { $_ -notmatch '^gh run list' }).Count) 0
+  $r = Run-Move @('cutover'); Eq $r.Code 65 'cutover too'; Eq (@($script:Log | Where-Object { $_ -notmatch '^gh run list' }).Count) 0
 }
 T 'cutover: Q-back text follows the direction (back: "Quay lại máy cũ?", forward again: "Chuyển lại sang máy mới?")' {
   Reset-World; [void](Seed 'copied' 'back' 'back'); $r = Run-Move @('cutover'); Ok ($r.Text.Contains('Quay lại máy cũ? Dữ liệu ghi ở máy mới sẽ được chép ngược về máy cũ; mọi ứng dụng cùng tạm dừng một lần, khoảng 2 phút. (Có/Không)')) "Q-back: $($r.Text)"
@@ -1505,6 +1505,19 @@ T 'Q8 back run: the copy (d) refusal and the cutover refusal both reinstall OLD 
     $r = Run-Move @('cutover'); Eq $r.Code 65 "$($c[0]) cutover: $($r.Text)"; Ok ($r.Text.Contains("INV refuse gate-version side=$($c[2])")) "$($c[0]) cutover: $($r.Text)"
     Ok ($r.Text.Contains("Cài cổng trên '$($c[3])' từ cùng commit với '$($c[4])' (install.sh), rồi chạy lại  fcode move cutover.")) "$($c[0]) cutover remedy: $($r.Text)"
   }
+}
+# ---- INT Q9: the GitHub read of step (2) is a precondition ----
+T 'Q9 cutover: when a read-only gh call for an enabled ssh-push workflow fails, exit 1 with a gh auth login remedy before the question and the first write: no question, mark null, state.json byte-identical, no gate call, no gh workflow call; a disabled workflow is not read; with gh fine the cutover goes on (the read is the same `gh run list`)' {
+  Reset-World; [void](Seed 'copied'); $script:GhFail = @{ '^run list' = 4 }; $bytes = [IO.File]::ReadAllText((Get-MovePath 'state.json')); Yes
+  $r = Run-Move @('cutover'); Eq $r.Code 1 $r.Text; Ok ($r.Text.Contains('gh auth login') -and $r.Text.Contains('Chưa chạy gì')) $r.Text
+  Eq (Count '^(contabo|newbox) ') 0 'no gate call'; Eq (Count 'gh workflow') 0 'no workflow touched'; Eq $script:Prompts.Count 0 'no question'; Eq (State).mark $null; Eq ([IO.File]::ReadAllText((Get-MovePath 'state.json'))) $bytes 'state unchanged'
+  Eq (@($script:Log | Where-Object { $_ -match '^gh run list' }).Count) 1 'stopped at the first failing read'
+  # workflow disable failing (the write) is still the old rollback path, not this one
+  Reset-World; [void](Seed 'copied'); $script:GhFail = @{ '^workflow disable' = 1 }; Yes; $r = Run-Move @('cutover'); Ok ($r.Code -ne 0) 'the later write failure still fails'; Ok (-not $r.Text.Contains('Chưa chạy gì')) 'that is not the precondition path'
+  # no enabled ssh-push repo: no gh read at all
+  Reset-World; $s = Seed 'copied'; $s.repos = @($s.repos | Where-Object { $_.kind -cne 'ssh-push' }); Save-MoveState $s; $script:GhFail = @{ '^run list' = 4 }; Yes; $r = Run-Move @('cutover'); Eq $r.Code 0 $r.Text; Eq (@($script:Log | Where-Object { $_ -match '^gh run list' }).Count) 0 'no read without a workflow'
+  # healthy gh: one read per enabled workflow, before the first gate verb
+  Reset-World; [void](Seed 'copied'); Yes; $r = Run-Move @('cutover'); Eq $r.Code 0 $r.Text; Ok ((Idx '^gh run list') -ge 0 -and (Idx '^gh run list') -lt (Idx '^contabo freeze')) 'the read comes before the freeze'
 }
 # ============================== round 5 (arbitration: a cutover in flight is a mark) ==============================
 function Seed-Mark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan', [string]$Phase = 'copied') {
