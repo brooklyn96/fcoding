@@ -2229,8 +2229,10 @@ function Get-MoveGateIds([string]$HostA, [string]$HostB) {
   $ids = @()
   foreach ($h in @($HostA, $HostB)) {
     $st = Invoke-MoveGate $h 'status' '' @() -Quiet -TimeoutSec 60
-    if ($st.Code -ne 0) { return @{ Code = 1; Host = $h } }
-    $ids += (Get-MoveGateId $st.Lines)
+    # Q6: only a transport failure (255, 124, no GATE_EXIT line) is "does not answer"; a machine that answered with an error (a gate installed before `--move`) has no gate id = a different gate
+    $answered = [bool](@($st.Lines | Where-Object { "$_" -cmatch '\AGATE_EXIT\s+[0-9]+\s*\z' }).Count)
+    if ($st.Code -in 255, 124, -1 -or -not $answered) { return @{ Code = 1; Host = $h } }
+    $ids += $(if ($st.Code -eq 0) { Get-MoveGateId $st.Lines } else { '' })
   }
   @{ Code = 0; IdA = $ids[0]; IdB = $ids[1]; Same = [bool]($ids[0] -and $ids[0] -ceq $ids[1]) }
 }

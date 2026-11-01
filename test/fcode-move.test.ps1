@@ -1425,6 +1425,37 @@ T 'G4 F4: Q-finish, the second question and the done line name the alias of the 
     Ok (-not $r.Text.Contains('máy cũ có thể')) "$($c[0]): no generic old-machine text"
   }
 }
+# ---- INT Q6: a reachable machine with an unfit gate is a different gate, not an unreachable one ----
+T 'Q6 copy / cutover: a status answered with GATE_EXIT n<>0 (a gate without --move) has no id = different: copy refreshes when new serves nothing and refuses 65 + remedy when it serves a project, the cutover refuses 65 with nothing frozen; 255, 124 and a reply with no GATE_EXIT line stay exit 1 "does not answer"' {
+  $PfEmpty = @('INV host os=ubuntu-24.04 arch=x86_64 cpus=4 mem_mb=8000 swap_mb=0 tz=Asia/Singapore node_major=0', 'INV disk mount=/ used_mb=1 free_mb=900000', 'INV target moveid=- peer=- projects=0')
+  $PfBusy = @('INV host os=ubuntu-24.04 arch=x86_64 cpus=4 mem_mb=8000 swap_mb=0 tz=Asia/Singapore node_major=0', 'INV disk mount=/ used_mb=1 free_mb=900000', 'INV target moveid=- peer=- projects=2')
+  $remedy = "Cài cổng trên 'newbox' từ cùng commit với 'contabo' (install.sh), rồi chạy lại  fcode move copy."
+  # new holds nothing, its first status answers 65: refreshed, then the ids agree
+  Reset-World; [void](Seed 'planned'); $script:GateVisible = $true; $script:Pf['newbox'] = $PfEmpty; Add-Rule 'newbox' ' status$' -N 1 -Code 65 -Out @('GATE_ERROR command not allowed')
+  $r = Run-Move @('copy'); Eq $r.Code 0 $r.Text; Eq @($script:ScriptLog | Where-Object { $_.Name -ceq 'bootstrap gate' }).Count 2 'refreshed'; Eq @($script:ScriptLog | Where-Object { $_.Name -ceq 'preflight' }).Count 1; Ok (-not $r.Text.Contains('không trả lời')) 'not "does not answer"'
+  # new holds a project: refused with the remedy, never refreshed
+  Reset-World; [void](Seed 'planned'); $script:GateVisible = $true; $script:Pf['newbox'] = $PfBusy; Add-Rule 'newbox' ' status$' -Code 65 -Out @('GATE_ERROR command not allowed')
+  $r = Run-Move @('copy'); Eq $r.Code 65 $r.Text; Ok ($r.Text.Contains('INV refuse gate-version side=new') -and $r.Text.Contains($remedy)) $r.Text; Ok (-not $r.Text.Contains('không trả lời')) 'not "does not answer"'
+  Eq @($script:ScriptLog | Where-Object { $_.Name -ceq 'bootstrap gate' }).Count 1 'not refreshed'; Eq (Count '^newbox init') 0
+  # new holds nothing but never becomes fit: one refresh, then the refusal
+  Reset-World; [void](Seed 'planned'); $script:GateVisible = $true; $script:Pf['newbox'] = $PfEmpty; Add-Rule 'newbox' ' status$' -Code 65 -Out @('GATE_ERROR command not allowed')
+  $r = Run-Move @('copy'); Eq $r.Code 65 $r.Text; Eq @($script:ScriptLog | Where-Object { $_.Name -ceq 'bootstrap gate' }).Count 2
+  # src (old) answers 65: the same path
+  Reset-World; [void](Seed 'planned'); $script:GateVisible = $true; $script:Pf['newbox'] = $PfBusy; Add-Rule 'contabo' ' status$' -Code 65 -Out @('GATE_ERROR command not allowed')
+  $r = Run-Move @('copy'); Eq $r.Code 65 $r.Text
+  # transport failures: exit 1 (255, 124 = the bounded call's code, a reply that has no GATE_EXIT line)
+  foreach ($t in @(@(255, @()), @(124, @('#NOEXIT')), @(0, @('#NOEXIT', 'garbage')), @(1, @('#NOEXIT', 'ssh: something')))) {
+    Reset-World; [void](Seed 'planned'); $script:GateVisible = $true; $script:Pf['newbox'] = $PfEmpty; Add-Rule 'newbox' ' status$' -Code $t[0] -Out $t[1]
+    $r = Run-Move @('copy'); Eq $r.Code 1 "$($t[0]): $($r.Text)"; Ok ($r.Text.Contains('ssh newbox')) "$($t[0]): says ssh newbox"; Eq @($script:ScriptLog | Where-Object { $_.Name -ceq 'preflight' }).Count 0 "$($t[0]): no refresh"
+  }
+  # cutover: dst or src answers 65 -> 65 gate-version, nothing frozen, state unchanged; 255 -> 1
+  foreach ($who in 'newbox', 'contabo') {
+    Reset-World; [void](Seed 'copied'); $script:GateVisible = $true; Add-Rule $who ' status$' -Code 65 -Out @('GATE_ERROR command not allowed'); $bytes = [IO.File]::ReadAllText((Get-MovePath 'state.json')); Yes
+    $r = Run-Move @('cutover'); Eq $r.Code 65 "${who}: $($r.Text)"; Ok ($r.Text.Contains('INV refuse gate-version')) "${who}: $($r.Text)"; Ok (-not $r.Text.Contains('không trả lời')) "${who}: not unreachable"
+    Eq (Count ' (freeze|stop|start|dump|prepare)') 0 "${who}: nothing frozen"; Eq (State).mark $null; Eq ([IO.File]::ReadAllText((Get-MovePath 'state.json'))) $bytes "${who}: state unchanged"; Eq $script:Prompts.Count 0 "${who}: no question"
+    Reset-World; [void](Seed 'copied'); $script:GateVisible = $true; Add-Rule $who ' status$' -Code 255; Yes; $r = Run-Move @('cutover'); Eq $r.Code 1 "${who} 255: $($r.Text)"
+  }
+}
 # ============================== round 5 (arbitration: a cutover in flight is a mark) ==============================
 function Seed-Mark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan', [string]$Phase = 'copied') {
   $s = Seed $Phase $Dir $Via $Mark
