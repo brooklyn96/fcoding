@@ -1494,6 +1494,18 @@ T 'Q7 refresh: the refresh script has no skip and mirrors the lib dir (rsync --d
     } else { Ok (-not (Test-Path $log)) 'plain: skipped, no rsync'; Ok ([bool]($o -match 'skipped=yes')) 'skipped=yes' }
   }
 }
+# ---- INT Q8: the remedy names the machine to fix by dir ----
+T 'Q8 back run: the copy (d) refusal and the cutover refusal both reinstall OLD from NEW (side=old); a forward run both reinstall NEW from OLD (side=new)' {
+  foreach ($c in @(@('fwd', 'plan', 'new', 'newbox', 'contabo'), @('back', 'back', 'old', 'contabo', 'newbox'))) {
+    $PfBusy = @('INV host os=ubuntu-24.04 arch=x86_64 cpus=4 mem_mb=8000 swap_mb=0 tz=Asia/Singapore node_major=0', 'INV disk mount=/ used_mb=1 free_mb=900000', 'INV target moveid=- peer=- projects=2')
+    Reset-World; [void](Seed 'planned' $c[0] $c[1]); $script:GateVisible = $true; $script:GateId['contabo'] = 'abcdef012345'; $script:GateId['newbox'] = '111111111111'; $script:Pf['newbox'] = $PfBusy
+    $r = Run-Move @('copy'); Eq $r.Code 65 "$($c[0]) copy: $($r.Text)"; Ok ($r.Text.Contains("INV refuse gate-version side=$($c[2])")) "$($c[0]) copy: $($r.Text)"
+    $want = "Cài cổng trên '$($c[3])' từ cùng commit với '$($c[4])' (install.sh), rồi chạy lại  fcode move copy."; Ok ($r.Text.Contains($want)) "$($c[0]) copy remedy: $($r.Text)"
+    Reset-World; [void](Seed 'copied' $c[0] $c[1]); $script:GateVisible = $true; $script:GateId['contabo'] = 'abcdef012345'; $script:GateId['newbox'] = '111111111111'; Yes
+    $r = Run-Move @('cutover'); Eq $r.Code 65 "$($c[0]) cutover: $($r.Text)"; Ok ($r.Text.Contains("INV refuse gate-version side=$($c[2])")) "$($c[0]) cutover: $($r.Text)"
+    Ok ($r.Text.Contains("Cài cổng trên '$($c[3])' từ cùng commit với '$($c[4])' (install.sh), rồi chạy lại  fcode move cutover.")) "$($c[0]) cutover remedy: $($r.Text)"
+  }
+}
 # ============================== round 5 (arbitration: a cutover in flight is a mark) ==============================
 function Seed-Mark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan', [string]$Phase = 'copied') {
   $s = Seed $Phase $Dir $Via $Mark

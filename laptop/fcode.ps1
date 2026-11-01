@@ -2297,7 +2297,7 @@ function Invoke-MoveCopy($S) {
       $gi = Get-MoveGateIds $oldH $newH
       if ($gi.Code -ne 0) { Write-MoveUnreachable $gi.Host 'copy'; return 1 }
     }
-    if (-not $gi.Same) { Write-MoveGateRefusal 'new' $newH $oldH 'copy'; return 65 }
+    if (-not $gi.Same) { if ($fwd) { Write-MoveGateRefusal 'new' $newH $oldH 'copy' } else { Write-MoveGateRefusal 'old' $oldH $newH 'copy' }; return 65 }   # Q8: the machine to fix by dir, as at the cutover
   }
   Write-Host "copy (e): init trên máy mới '$newH'..."
   $nj = New-MoveInitJson 'new' ([string]$S.old.alias) $m2.Sha $m2.Text '' ([string]$S.old.addr) ([int]$oi.Port) ([string]$S.old.hostkey_line) ([string]$S.new.kind)
