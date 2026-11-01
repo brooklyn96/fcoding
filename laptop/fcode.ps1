@@ -1492,7 +1492,13 @@ exit 0
 '@
 }
 # copy step (d), on new: pull the gate (entry, lib, units) from old with the move key when the entry is missing; the entry comes last, so a cut-off run is redone
-function Get-MoveBootstrapGateScript {
+# $Refresh = copy (d) when new's gate differs from src's and new holds no project: the same script without the "already there" skip, so it pulls the gate again
+function Get-MoveBootstrapGateScript([switch]$Refresh) {
+  $t = Get-MoveBootstrapGateText
+  if ($Refresh) { $t = $t -replace '(?m)^if \[ -e "\$R\$entry" \]; then .*\r?\n', '' }
+  $t
+}
+function Get-MoveBootstrapGateText {
 @'
 #!/bin/bash
 # fcode move: bootstrap gate (copy step d), on the new machine. Idempotent.
@@ -2187,6 +2193,26 @@ function Wait-MoveNewIdle($S, [switch]$InRollback) {
     if ($left -gt 0) { Wait-Move ([Math]::Min(10, $left)) }
   }
 }
+# `gate=<12 hex>` of the `MOVE state` line of a status answer ('' when absent or `-`)
+function Get-MoveGateId($Lines) {
+  foreach ($l in @($Lines)) { if ("$l" -cmatch '\AMOVE state .*\bgate=([0-9a-f]{12})(?:\s|\z)') { return $Matches[1] } }
+  ''
+}
+# the gate ids of two machines (one bounded `status` call each, A first). @{ Code = 0; IdA; IdB; Same } or @{ Code = 1; Host } for the first machine that does not answer
+function Get-MoveGateIds([string]$HostA, [string]$HostB) {
+  $ids = @()
+  foreach ($h in @($HostA, $HostB)) {
+    $st = Invoke-MoveGate $h 'status' '' @() -Quiet -TimeoutSec 60
+    if ($st.Code -ne 0) { return @{ Code = 1; Host = $h } }
+    $ids += (Get-MoveGateId $st.Lines)
+  }
+  @{ Code = 0; IdA = $ids[0]; IdB = $ids[1]; Same = [bool]($ids[0] -and $ids[0] -ceq $ids[1]) }
+}
+function Write-MoveGateRefusal([string]$Side, [string]$Target, [string]$Ref, [string]$Again) {
+  Write-Host "INV refuse gate-version side=$Side"
+  Write-Host "lỗi: cổng deploy trên '$Target' không giống cổng trên '$Ref'. Cài cổng trên '$Target' từ cùng commit với '$Ref' (install.sh), rồi chạy lại  fcode move $Again."
+}
+function Write-MoveUnreachable([string]$Alias, [string]$Again) { Write-Host "lỗi: máy '$Alias' không trả lời. Chạy  ssh $Alias  một lần (có thể nó hỏi đăng nhập), rồi chạy lại  fcode move $Again." }
 function Invoke-MoveCopy($S) {
   $id = [string]$S.move_id; $fwd = ([string]$S.dir -ceq 'fwd')
   $src = Get-MoveSrcHost $S; $dst = Get-MoveDstHost $S; $newH = Get-MoveNewHost $S; $oldH = Get-MoveOldHost $S
@@ -2216,8 +2242,24 @@ function Invoke-MoveCopy($S) {
   $entry = @(Get-MoveItemRoots $m2.Obj 'gate-entry'); $lib = @(Get-MoveItemRoots $m2.Obj 'gate-lib'); $units = @(Get-MoveItemRoots $m2.Obj 'gate-units')
   $roots = @($entry) + @($lib) + @($units)
   if ($entry.Count -ne 1 -or $lib.Count -ne 1 -or @($roots | Where-Object { $_ -cnotmatch '\A/[A-Za-z0-9._/+@=,:-]{1,255}\z' }).Count -or "$($S.old.addr)" -cnotmatch '\A[A-Za-z0-9._:-]{1,255}\z') { Write-Host 'INV refuse gate-missing'; return 65 }
-  $g = Invoke-MoveScript $newH (Get-MoveBootstrapGateScript) (@([string]$S.old.addr, [string]$oi.Port, $entry[0], $lib[0]) + $units)
+  $gateArgs = (@([string]$S.old.addr, [string]$oi.Port, $entry[0], $lib[0]) + $units)
+  $g = Invoke-MoveScript $newH (Get-MoveBootstrapGateScript) $gateArgs
   if ($g.Code -ne 0) { return (ConvertTo-MoveExit $g.Code) }
+  # Q1: new's gate must be the very gate src runs (a gate that was already there is not replaced above); a different one is pulled again only when new holds no project
+  $gi = Get-MoveGateIds $oldH $newH
+  if ($gi.Code -ne 0) { Write-MoveUnreachable $gi.Host 'copy'; return 1 }
+  if (-not $gi.Same) {
+    $pf = Invoke-MoveScript $newH (Get-MovePreflightScript) @() -Quiet
+    if ($pf.Code -ne 0) { return (ConvertTo-MoveExit $pf.Code) }
+    if ((ConvertFrom-MovePreflight $pf.Lines).Projects -eq 0) {
+      Write-Host "copy (d): cổng trên '$newH' khác cổng trên '$oldH' và máy mới chưa có project nào: chép lại cổng..."
+      $g = Invoke-MoveScript $newH (Get-MoveBootstrapGateScript -Refresh) $gateArgs
+      if ($g.Code -ne 0) { return (ConvertTo-MoveExit $g.Code) }
+      $gi = Get-MoveGateIds $oldH $newH
+      if ($gi.Code -ne 0) { Write-MoveUnreachable $gi.Host 'copy'; return 1 }
+    }
+    if (-not $gi.Same) { Write-MoveGateRefusal 'new' $newH $oldH 'copy'; return 65 }
+  }
   Write-Host "copy (e): init trên máy mới '$newH'..."
   $nj = New-MoveInitJson 'new' ([string]$S.old.alias) $m2.Sha $m2.Text '' ([string]$S.old.addr) ([int]$oi.Port) ([string]$S.old.hostkey_line) ([string]$S.new.kind)
   $r = Invoke-MoveGate $newH 'init' $id @($(if ($fwd) { 'dst' } else { 'src' })) ([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($nj)))

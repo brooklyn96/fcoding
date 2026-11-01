@@ -44,6 +44,7 @@ $script:Sleeps = New-Object Collections.ArrayList
 function Get-MoveNow { $script:Clock }
 function Wait-Move([int]$Sec) { [void]$script:Sleeps.Add($Sec); $script:Clock = $script:Clock.AddSeconds($Sec) }
 $script:Log = New-Object Collections.ArrayList
+$script:GateId = @{}   # host -> the 12-hex gate id its fake status prints ('aaaaaaaaaaaa' when unset; '-' = unreadable)
 $script:SshArgv = New-Object Collections.ArrayList   # the argv of every real ssh call (not ssh -G)
 $script:Rules = New-Object Collections.ArrayList
 $script:GhIn = New-Object Collections.ArrayList     # stdin given to gh calls
@@ -108,7 +109,12 @@ function Fake-Result($Rule, [string[]]$Default, [int]$DefaultCode = 0) {
 # answer = transfer=done) unless a test queues answers in $script:IdleSeq (then each read is logged as "idle-check" and takes the next answer).
 $script:RealWaitIdle = (Get-Item function:Wait-MoveNewIdle).ScriptBlock; $script:InWait = $false; $script:IdleSeq = New-Object Collections.Queue
 function Wait-MoveNewIdle($S, [switch]$InRollback) { $script:InWait = $true; try { & $script:RealWaitIdle $S -InRollback:$InRollback } finally { $script:InWait = $false } }
+# Q1 / Q2: Get-MoveGateIds (the real one, wrapped) reads the `status` of two machines before copy (e) and before the cutover's first write. Like the F1 reads they are invisible here
+# (not logged, no rule consumed, no hang) unless a test sets $script:GateVisible = $true (the dedicated gate-identity tests); they answer with $script:GateId[host].
+$script:RealGateIds = (Get-Item function:Get-MoveGateIds).ScriptBlock; $script:InGate = $false; $script:GateVisible = $false
+function Get-MoveGateIds([string]$HostA, [string]$HostB) { $script:InGate = -not $script:GateVisible; try { & $script:RealGateIds $HostA $HostB } finally { $script:InGate = $false } }
 function Fake-Gate([string]$H, [string]$Verb, [string]$Id, [string]$Rest, [string]$Stdin) {
+  if ($script:InGate -and $Verb -ceq 'status') { return @{ Out = @("MOVE state move_id=- role=dst machine=new finished=no frozen=0 hold_active=0 transfer=idle manifest_sha=- gate=$(if ($script:GateId.ContainsKey($H)) { $script:GateId[$H] } else { 'aaaaaaaaaaaa' })", 'GATE_EXIT 0'); Code = 0 } }
   if ($script:InWait -and $Verb -ceq 'status') {
     if ($script:IdleSeq.Count) { $a = $script:IdleSeq.Dequeue(); [void]$script:Log.Add("idle-check $H"); $o = @($a.Out); $o += "GATE_EXIT $($a.Code)"; return @{ Out = $o; Code = $a.Code } }
     return @{ Out = @("MOVE state move_id=$Id role=dst machine=new finished=no frozen=0 hold_active=0 transfer=done manifest_sha=-", 'GATE_EXIT 0'); Code = 0 }
@@ -121,7 +127,7 @@ function Fake-Gate([string]$H, [string]$Verb, [string]$Id, [string]$Rest, [strin
   $def = switch ($Verb) {
     'plan' { @("LOG $CANARY", 'INV disk mount=/ used_mb=1000 free_mb=900000', 'INV downtime est_s=120', 'INV ok') }
     'manifest' { $t = New-FakeManifest $Id; @(('MOVE manifest b64=' + (ConvertTo-NoPad $t)), ('MOVE manifest-sha ' + (Get-MoveSha256Hex ($utf8.GetBytes($t))))) }
-    'status' { @("MOVE state move_id=$Id role=dst machine=new finished=no frozen=3 hold_active=0 transfer=done manifest_sha=-") }
+    'status' { @("MOVE state move_id=$Id role=dst machine=new finished=no frozen=3 hold_active=0 transfer=done manifest_sha=- gate=$(if ($script:GateId.ContainsKey($H)) { $script:GateId[$H] } else { 'aaaaaaaaaaaa' })") }
     'transfer' { @('MOVE transfer state=started items_done=0 items_total=3 unit=fcode-move-transfer') }
     'tunnels' { $script:Tunneled = $true; @('MOVE done tunnels routed=1') }
     default { @("MOVE step $Verb skipped=no ms=5", "LOG $CANARY") }
@@ -152,7 +158,7 @@ function Fake-Script([string]$H, [string]$Text, [string[]]$ScriptArgs) {
 $script:RealTimedExe = (Get-Item function:Invoke-MoveTimedExe).ScriptBlock; $script:TimedCalls = New-Object Collections.ArrayList; $script:HangN = 0
 function Invoke-MoveTimedExe([string]$Exe, [string[]]$ExeArgs, [string]$StdinText, [int]$TimeoutSec) {
   [void]$script:TimedCalls.Add(@{ Exe = $Exe; Args = @($ExeArgs); T = $TimeoutSec })
-  if ($script:HangN -ne 0 -and "$($ExeArgs[-1])" -match '--move status') { if ($script:HangN -gt 0) { $script:HangN-- }; $script:Clock = $script:Clock.AddSeconds($TimeoutSec); return @{ Code = 124; Out = @() } }
+  if ($script:HangN -ne 0 -and -not $script:InGate -and "$($ExeArgs[-1])" -match '--move status') { if ($script:HangN -gt 0) { $script:HangN-- }; $script:Clock = $script:Clock.AddSeconds($TimeoutSec); return @{ Code = 124; Out = @() } }
   $o = @($StdinText | ssh @ExeArgs); @{ Code = [int]$global:LASTEXITCODE; Out = @($o | ForEach-Object { "$_" }) }
 }
 function ssh {
@@ -239,7 +245,7 @@ Host cfbox
   ProxyCommand cloudflared access ssh --hostname %h
 "@ -replace "`r`n", "`n"
 function Reset-World {
-  $script:IdleSeq.Clear(); $script:HangN = 0; $script:TimedCalls.Clear(); $script:SshArgv.Clear()
+  $script:IdleSeq.Clear(); $script:HangN = 0; $script:TimedCalls.Clear(); $script:SshArgv.Clear(); $script:GateId.Clear(); $script:GateVisible = $false
   $script:Log.Clear(); $script:Rules.Clear(); $script:Answers.Clear(); $script:Prompts.Clear(); $script:Sleeps.Clear(); $script:GhIn.Clear(); $script:ScriptLog.Clear(); $script:GateIn.Clear()
   $script:Clock = [DateTime]::SpecifyKind([DateTime]'2026-10-29T10:00:00', [DateTimeKind]::Utc)
   $script:Pf = @{}; $script:Tcp = @{}; $script:Mf = $null; $script:Tunneled = $false; $script:Down = $null; $script:GhFail = @{}; $script:DeployHost = $null
@@ -1279,6 +1285,38 @@ T 'G6b: the script calls (Invoke-MoveScript: preflight, tcp check, bootstrap key
   $names = @($script:ScriptLog | ForEach-Object { $_.Name }); Ok (($names -contains 'bootstrap key') -and ($names -contains 'bootstrap gate')) "bootstrap scripts ran: $($names -join ',')"
   $calls = ScriptCalls; Eq $calls.Count $names.Count 'one ssh call per script'
   foreach ($a in $calls) { $line = $a -join ' '; Ok ($line.Contains($ko)) "copy: $line" }
+}
+# ---- R2 item 1 (Q1): copy compares the gate ids of new and src after bootstrap gate (d) ----
+T 'Q1 copy: equal ids = status of src and of new between (d) and (e), nothing else extra; different ids + new holds no project = the gate is pulled again (refresh script without the skip) and compared once more; still different or new holds projects or no id = INV refuse gate-version side=new, exit 65, nothing after (d); an unanswering machine = exit 1' {
+  $PfEmpty = @('INV host os=ubuntu-24.04 arch=x86_64 cpus=4 mem_mb=8000 swap_mb=0 tz=Asia/Singapore node_major=0', 'INV disk mount=/ used_mb=1 free_mb=900000', 'INV target moveid=- peer=- projects=0')
+  $PfBusy = @('INV host os=ubuntu-24.04 arch=x86_64 cpus=4 mem_mb=8000 swap_mb=0 tz=Asia/Singapore node_major=0', 'INV disk mount=/ used_mb=1 free_mb=900000', 'INV target moveid=- peer=- projects=2')
+  $remedy = "Cài cổng trên 'newbox' từ cùng commit với 'contabo' (install.sh), rồi chạy lại  fcode move copy."
+  # equal: both statuses, in order, between the bootstrap and init dst; no preflight, no second bootstrap
+  Reset-World; [void](Seed 'planned'); $script:GateVisible = $true; $script:GateId['contabo'] = 'abcdef012345'; $script:GateId['newbox'] = 'abcdef012345'
+  $r = Run-Move @('copy'); Eq $r.Code 0 $r.Text; Ordered @('^newbox script:bootstrap gate', '^contabo status', '^newbox status', '^newbox init dst')
+  Eq @($script:ScriptLog | Where-Object { $_.Name -ceq 'bootstrap gate' }).Count 1 'one bootstrap'; Eq @($script:ScriptLog | Where-Object { $_.Name -ceq 'preflight' }).Count 0 'no preflight'
+  # different, new empty: refreshed (script without the skip), then equal
+  Reset-World; [void](Seed 'planned'); $script:GateVisible = $true; $script:GateId['contabo'] = 'abcdef012345'; $script:GateId['newbox'] = '111111111111'; $script:Pf['newbox'] = $PfEmpty
+  Add-Rule 'newbox' 'script:bootstrap gate' -Do { param($h, $n, $a, $t) if ($t -notmatch 'if \[ -e') { $script:GateId['newbox'] = 'abcdef012345' } }
+  $r = Run-Move @('copy'); Eq $r.Code 0 $r.Text; $bg = @($script:ScriptLog | Where-Object { $_.Name -ceq 'bootstrap gate' }); Eq $bg.Count 2 'bootstrap twice'
+  Ok ($bg[0].Text -match 'if \[ -e "\$R\$entry" \]') 'first run keeps the skip'; Ok ($bg[1].Text -notmatch 'if \[ -e "\$R\$entry" \]') 'refresh run has no skip'; Eq ($bg[0].Args -join '|') ($bg[1].Args -join '|') 'same arguments'
+  Ordered @('^newbox script:bootstrap gate', '^contabo status', '^newbox status', '^newbox script:preflight', '^newbox script:bootstrap gate', '^contabo status', '^newbox status', '^newbox init dst'); Eq (State).phase 'copied'
+  # different, new empty, refresh does not help: refused
+  Reset-World; [void](Seed 'planned'); $script:GateVisible = $true; $script:GateId['contabo'] = 'abcdef012345'; $script:GateId['newbox'] = '111111111111'; $script:Pf['newbox'] = $PfEmpty
+  $r = Run-Move @('copy'); Eq $r.Code 65 $r.Text; Ok ($r.Text.Contains('INV refuse gate-version side=new')) $r.Text; Ok ($r.Text.Contains($remedy)) "remedy: $($r.Text)"
+  Eq @($script:ScriptLog | Where-Object { $_.Name -ceq 'bootstrap gate' }).Count 2 'refreshed once, not more'; Eq (Count '^newbox init') 0 'init not run'; Eq (Count ' (prepare|dump|transfer|adopt)') 0 'nothing after (d)'; Eq (State).phase 'planned'
+  # different, new holds projects: never refreshed
+  Reset-World; [void](Seed 'planned'); $script:GateVisible = $true; $script:GateId['contabo'] = 'abcdef012345'; $script:GateId['newbox'] = '111111111111'; $script:Pf['newbox'] = $PfBusy
+  $r = Run-Move @('copy'); Eq $r.Code 65 $r.Text; Ok ($r.Text.Contains('INV refuse gate-version side=new') -and $r.Text.Contains($remedy)) $r.Text
+  Eq @($script:ScriptLog | Where-Object { $_.Name -ceq 'bootstrap gate' }).Count 1 'not refreshed'; Eq (Count '^newbox init') 0; Eq (State).phase 'planned'
+  # no id on new (an old gate prints none) counts as different
+  Reset-World; [void](Seed 'planned'); $script:GateVisible = $true; $script:GateId['contabo'] = 'abcdef012345'; $script:GateId['newbox'] = '-'; $script:Pf['newbox'] = $PfBusy
+  $r = Run-Move @('copy'); Eq $r.Code 65 $r.Text; Eq (Count '^newbox init') 0
+  # status does not answer: exit 1, init not run
+  foreach ($dead in 'newbox', 'contabo') {
+    Reset-World; [void](Seed 'planned'); $script:GateVisible = $true; Add-Rule $dead ' status$' -Code 255
+    $r = Run-Move @('copy'); Eq $r.Code 1 "${dead}: $($r.Text)"; Ok ($r.Text.Contains("ssh $dead")) "${dead}: remedy names ssh: $($r.Text)"; Eq (Count '^newbox init') 0 "${dead}: init not run"
+  }
 }
 # ============================== round 5 (arbitration: a cutover in flight is a mark) ==============================
 function Seed-Mark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan', [string]$Phase = 'copied') {
