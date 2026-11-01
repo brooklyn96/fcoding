@@ -1586,16 +1586,17 @@ export function createApp(opts = {}) {
 
   // POST /api/tools/update starts fcode-update.service, GET reads it: the argv is fixed, no shell, nothing of the request reaches it
   const UPDATE_UNIT = 'fcode-update.service';
+  const UPDATE_CHECK_MS = 4e3, UPDATE_START_MS = 8e3; // the client (hermes) gives up at 15 s: is-active + start, 12 s at most, still answer the POST
   let updateStarting = false; // a start in flight (answered 409 like a running unit)
   // is-active prints the state and exits non-zero when it is not active, so the printed state counts, never the exit code
-  const updateRunning = async () => /^(active|activating)$/.test(String(await execTool(systemctlSpec, ['--user', 'is-active', UPDATE_UNIT], 10e3).catch((e) => e.stdout ?? '')).trim());
+  const updateRunning = async () => /^(active|activating)$/.test(String(await execTool(systemctlSpec, ['--user', 'is-active', UPDATE_UNIT], UPDATE_CHECK_MS).catch((e) => e.stdout ?? '')).trim());
   // detached and unref'd with its output ignored (--no-block: it returns once the job is queued); true when systemctl exited 0, a failure logs one line
   const startUpdate = () => new Promise((resolve) => {
     let over = false;
     const end = (ok, why) => { if (over) return; over = true; if (why) log(`tools-update: ${why}`); resolve(ok); };
     try {
       const [cmd, ...pre] = systemctlSpec;
-      const child = spawn(cmd, [...pre, '--user', 'start', '--no-block', UPDATE_UNIT], { stdio: 'ignore', detached: true, windowsHide: true, timeout: 15e3, env: toolEnv() });
+      const child = spawn(cmd, [...pre, '--user', 'start', '--no-block', UPDATE_UNIT], { stdio: 'ignore', detached: true, windowsHide: true, timeout: UPDATE_START_MS, env: toolEnv() });
       child.on('error', (e) => end(false, e.code === 'ENOENT' ? 'command not found' : 'cannot start'));
       child.on('exit', (code, sig) => end(code === 0, code === 0 ? '' : `exit ${code ?? sig}`));
       child.unref();

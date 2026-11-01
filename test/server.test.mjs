@@ -4666,10 +4666,10 @@ const sysctlStub = () => {
   fs.writeFileSync(path.join(dir, 'systemctl.mjs'), `import fs from 'node:fs';
 const d = ${JSON.stringify(dir)}, a = process.argv.slice(2);
 fs.appendFileSync(d + '/calls.log', JSON.stringify(a) + '\\n');
-if (a[1] === 'is-active') { const s = fs.existsSync(d + '/state') ? fs.readFileSync(d + '/state', 'utf8') : 'inactive'; process.stdout.write(s + '\\n'); process.exit(s === 'active' ? 0 : 3); }
+if (a[1] === 'is-active') setTimeout(() => { const s = fs.existsSync(d + '/state') ? fs.readFileSync(d + '/state', 'utf8') : 'inactive'; process.stdout.write(s + '\\n'); process.exit(s === 'active' ? 0 : 3); }, fs.existsSync(d + '/check-hang') ? 30000 : 0);
 else if (a[1] === 'start') {
   if (fs.existsSync(d + '/start-fail')) { process.stderr.write('SECRET-STDERR /etc/hidden'); process.exit(1); }
-  setTimeout(() => process.exit(0), fs.existsSync(d + '/start-slow') ? 400 : 0);
+  setTimeout(() => process.exit(0), fs.existsSync(d + '/start-hang') ? 30000 : fs.existsSync(d + '/start-slow') ? 400 : 0);
 }\n`);
   return {
     dir, systemctl: [process.execPath, path.join(dir, 'systemctl.mjs')],
@@ -4770,6 +4770,27 @@ test('POST /api/tools/update: systemctl failing or missing answers 500 {error:"s
       assert.deepEqual([r.status, r.json], [500, { error: 'start failed' }]);
       assert.ok(c.logs.includes('tools-update: command not found'));
     }, { systemctl: [path.join(s.dir, 'no-such-systemctl')] });
+  } finally { s.cleanup(); }
+});
+
+test('/api/tools/update: a hanging systemctl is cut (is-active 4 s, start 8 s): the POST still answers inside the client\'s 15 s and the in-flight flag is cleared', async () => {
+  const s = sysctlStub();
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      s.set('check-hang'); s.set('start-hang');
+      const t0 = Date.now();
+      const r = await c.req('POST', '/api/tools/update', { cookie }); // is-active cut at 4 s (read as not running), then start cut at 8 s
+      const took = Date.now() - t0;
+      assert.deepEqual([r.status, r.json], [500, { error: 'start failed' }]);
+      assert.ok(took >= 8e3 && took < 13e3, `took ${took} ms`);
+      assert.ok(c.logs.some((l) => /^tools-update: exit /.test(l)));
+      const t1 = Date.now();
+      const g = await c.req('GET', '/api/tools/update', { cookie }); // the GET also answers: is-active cut, not running
+      assert.deepEqual([g.status, g.json.running, Date.now() - t1 < 8e3], [200, false, true]);
+      fs.rmSync(path.join(s.dir, 'check-hang')); fs.rmSync(path.join(s.dir, 'start-hang'));
+      assert.equal((await c.req('POST', '/api/tools/update', { cookie })).status, 202); // flag cleared
+    }, { systemctl: s.systemctl });
   } finally { s.cleanup(); }
 });
 
