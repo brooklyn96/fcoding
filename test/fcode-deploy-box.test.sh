@@ -301,6 +301,50 @@ eq 'draft file missing: 65' "$RC" 65; eq 'draft missing: nothing sent' "$(sent)"
 reset; : >"$T/d6.json"; fd add acme/shop shop "$T/d6.json" --yes
 eq 'empty draft: 65' "$RC" 65
 
+# ---- G.4 / D.9.7: no `approve` on the coder; the `trust on` hint is unconditional; a busy deploy shows the ask ----
+reset; fd demo approve "$SHA40" now
+eq 'no approve on the coder: refused 65' "$RC" 65
+eq 'no approve on the coder: nothing sent' "$(sent)" no
+has 'no approve on the coder: says the owner answers elsewhere' 'coder không có lệnh trả lời' "$T/out"
+for a in '' "$SHA40" "$SHA40 idle" "$SHA40 skip" "$SHA40 later" "$SHA40;id now" 'x y z'; do
+  reset; fd demo approve $a
+  eq "no approve on the coder: 'approve $a' refused 65" "$RC" 65
+  eq "no approve on the coder: 'approve $a' sends nothing" "$(sent)" no
+done
+reset; fd approve "$SHA40" now
+eq 'no approve on the coder: approve as the first word is no verb either (65)' "$RC" 65
+eq 'no approve on the coder: approve as the first word sends nothing' "$(sent)" no
+reset; fd demo rm
+hasnt 'the usage text lists no approve verb' 'approve' "$T/out"
+reset; bash "$FD" --help >"$T/out" 2>&1
+hasnt '--help lists no approve verb' 'approve' "$T/out"
+reset; fd demo status; fd demo deploy "$SHA40"
+hasnt 'the coder never sets FCODE_FROM on the ssh call' 'FCODE_FROM' "$FAKE/ssh.log"
+hasnt 'the coder never sends approve to the gate' ' approve' "$FAKE/ssh.log"
+
+# the `trust on i-understand-root` next-step hint is printed whatever the inventory says (v2 scripts run as root)
+for inv in 'INV unit ok' 'INV unit ok trusted_needed=no' 'INV unit ok trusted_needed=yes' 'INV dir /opt/shop type=app'; do
+  reset; printf '%s\nINV ok\nGATE_EXIT 0\n' "$inv" >"$FAKE/out.inventory"; fd add acme/shop shop "$DRAFT" --yes
+  eq "add --yes ($inv): exit 0" "$RC" 0
+  has "add --yes ($inv): trust on hint printed" 'fcode-deploy shop trust on i-understand-root' "$T/out"
+  hasnt "add --yes ($inv): hint is not conditional" 'nếu dòng INV' "$T/out"
+  eq "add --yes ($inv): next steps in order" "$(grep -o 'fcode-deploy shop \(status\|trust\|deploy\|resume\)' "$T/out" | tr '\n' ',')" 'fcode-deploy shop status,fcode-deploy shop trust,fcode-deploy shop deploy,fcode-deploy shop resume,'
+done
+
+# a busy app: the gate's GATE_ASK + GATE_PENDING ask (rc 1) reach the agent, with one line telling it to report to the owner
+reset; printf 'GATE_ASK %s busy=đang có 2 phiên live\nGATE_PENDING ask\nGATE_EXIT 1\n' "$SHA40" >"$FAKE/out.deploy"; echo 1 >"$FAKE/rc.deploy"; fd demo deploy "$SHA40"
+eq 'busy deploy: exit 1 passes through' "$RC" 1
+has 'busy deploy: GATE_ASK line shown' "GATE_ASK $SHA40 busy=đang có 2 phiên live" "$T/out"
+has 'busy deploy: GATE_PENDING ask line shown' 'GATE_PENDING ask' "$T/out"
+eq 'busy deploy: exactly one ssh call (the deploy)' "$(cat "$FAKE/ssh.log")" "-n $OPTS demo deploy $SHA40	IN=-"
+eq 'busy deploy: exactly one hint line' "$(grep -c '^Gợi ý' "$T/out")" 1
+has 'busy deploy: the hint tells the agent to report to the owner' 'Báo cho chủ biết' "$T/out"
+hasnt 'busy deploy: the hint names no coder command to answer' 'approve' "$T/out"
+reset; printf 'GATE_RESULT outcome=failed\nGATE_EXIT 1\n' >"$FAKE/out.deploy"; echo 1 >"$FAKE/rc.deploy"; fd demo deploy "$SHA40"
+eq 'deploy exit 1 without an ask: no hint' "$(grep -c '^Gợi ý' "$T/out")" 0
+reset; printf 'GATE_PENDING ask\nGATE_EXIT 0\n' >"$FAKE/out.deploy"; fd demo deploy "$SHA40"
+eq 'GATE_PENDING ask line with exit 0: no hint (the hint is for rc 1 only)' "$(grep -c '^Gợi ý' "$T/out")" 0
+
 echo
-echo "passed $PASS, failed $FAIL"
+echo "fcode-deploy-box.test.sh: passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]

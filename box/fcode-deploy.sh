@@ -12,6 +12,8 @@
 # ~/.config/fcode/deploy-host; the operator key is ~/.ssh/fcode-operator (FCODE_DEPLOY_KEY overrides). No secret lives in this script.
 # Each verb is sent as one remote command `<name> <verb> [args]`; the gate's lines (INV / GATE_RESULT / GATE_EXIT) are printed as they come
 # and the exit code is the gate's. Exit codes of this script itself: 65 = request refused here (nothing was sent), 1 = tool error (config, gh, ssh).
+# There is NO `approve` here (deploy gate v2, door rule A1): a busy `deploy` prints GATE_ASK + GATE_PENDING ask (rc 1) and the agent reports to the
+# owner, who answers on Zalo or on the laptop (`fcode deploy <name> approve <sha40> now|idle|skip`). The coder key can never answer an ask.
 set -u
 export LC_ALL=C
 
@@ -64,6 +66,9 @@ remote() {
     elif grep -q 'is not approved' "$T/seen"; then
       echo "Gợi ý: '$name' chưa được duyệt cho khoá này. Nhờ người dùng chạy trên laptop: fcode deploy allow $name" >&2
     fi
+  fi
+  if [ "$rc" -eq 1 ] && grep -q '^GATE_PENDING ask' "$T/seen"; then
+    echo "Gợi ý: app của '$name' đang bận nên cổng chưa deploy mà đã hỏi chủ (dòng GATE_ASK). Báo cho chủ biết; chủ trả lời trên Zalo hoặc trên laptop. Chưa deploy gì: đừng chạy lại deploy để thử." >&2
   fi
   return "$rc"
 }
@@ -190,7 +195,7 @@ cmd_add() {
     echo
     echo "Xong: '$name' đã đăng ký và đang tạm dừng. Việc tiếp theo, theo thứ tự:"
     echo "  fcode-deploy $name status"
-    echo "  (nếu dòng INV unit ở trên có trusted_needed=yes, hoặc project là compose / script:  fcode-deploy $name trust on i-understand-root)"
+    echo "  fcode-deploy $name trust on i-understand-root   (script của project chạy bằng root nên cần bật chế độ tin cậy trước khi deploy)"
     echo "  fcode-deploy $name deploy <sha của main>"
     echo "  fcode-deploy $name resume"
     exit 0
@@ -235,6 +240,7 @@ case "$verb $*" in
   'status ' | 'recheck ' | 'pause ' | 'resume ' | 'trust off') ;;
   'trust on i-understand-root') cmd_trust_on ;;
   'deploy '*) [[ ${1:-} =~ ^[0-9a-f]{40}$ ]] && [ $# -eq 1 ] || usage ;;
+  'approve '*) die 65 'coder không có lệnh trả lời câu hỏi của cổng (app bận): báo cho chủ, chủ trả lời trên Zalo hoặc trên laptop. Chưa gửi gì.' ;;
   *) usage ;;
 esac
 need_ssh
