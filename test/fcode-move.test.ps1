@@ -1502,7 +1502,9 @@ T 'scripts: the bootstrap key script run for real (stub tools, throw-away FCM_RO
   if (-not $IsWindows -and $PSVersionTable.PSEdition -eq 'Core') { Eq ((& stat -c '%a' (Join-Path $R 'root/.ssh/fcode-move'))) '600' 'private key 0600'; Eq ((& stat -c '%a' (Join-Path $R 'var/lib/fcode-move'))) '700' 'move dir 0700' }
   # a missing tool the stub dir cannot satisfy: exit 70 with MOVE error tool-missing (no apt in the way: apt-get stubbed to fail)
   Remove-Item (Join-Path $bin 'flock'); [IO.File]::WriteAllText((Join-Path $bin 'apt-get'), "#!/bin/bash`nexit 1`n"); & chmod +x (Join-Path $bin 'apt-get')
-  $savedPath = $env:PATH; $env:PATH = "$bin$([IO.Path]::PathSeparator)/usr/bin$([IO.Path]::PathSeparator)/bin"; $env:FCM_ROOT = $R; $env:FCM_NODE = $stubNode
+  # a restricted PATH (stub dir, /usr/bin, /bin) that still finds bash: on Windows bash lives in Git's usr\bin, which a fixed /usr/bin:/bin would hide from pwsh
+  $bashDir = Split-Path -Parent (Get-Command bash -CommandType Application | Select-Object -First 1).Source
+  $savedPath = $env:PATH; $env:PATH = "$bin$([IO.Path]::PathSeparator)/usr/bin$([IO.Path]::PathSeparator)/bin$([IO.Path]::PathSeparator)$bashDir"; $env:FCM_ROOT = $R; $env:FCM_NODE = $stubNode
   try { $o3 = @(& bash $f newbox - 22 2>&1 | ForEach-Object { "$_" }); $rc3 = $LASTEXITCODE } finally { $env:PATH = $savedPath; $env:FCM_ROOT = $null; $env:FCM_NODE = $null }
   if (Test-Path /usr/bin/flock) { Write-Host '  (flock is a real tool here: the missing-tool leg is skipped)' } else { Eq $rc3 70; Ok ($o3 -match 'MOVE error tool-missing') 'tool-missing' }
   # node that is only first on PATH, not at the gate's /usr/bin/node: not accepted (the stub apt-get fails, so it ends in tool-missing, exit 70)
