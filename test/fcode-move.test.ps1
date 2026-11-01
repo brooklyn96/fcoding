@@ -1456,6 +1456,44 @@ T 'Q6 copy / cutover: a status answered with GATE_EXIT n<>0 (a gate without --mo
     Reset-World; [void](Seed 'copied'); $script:GateVisible = $true; Add-Rule $who ' status$' -Code 255; Yes; $r = Run-Move @('cutover'); Eq $r.Code 1 "${who} 255: $($r.Text)"
   }
 }
+# ---- INT Q7: what counts as "serves something"; the refresh mirrors the lib ----
+T 'Q7 preflight: projects= counts the json files plus forced-command legacy keys (each name once, not twice with its json) plus operator keys; --operator / --move-source / plain keys do not count' {
+  $R = Join-Path $Root 'fcmroot-q7'; [void](New-Item -ItemType Directory -Force -Path (Join-Path $R 'etc/fcode-deploy/projects'), (Join-Path $R 'root/.ssh'), (Join-Path $R 'etc'))
+  [IO.File]::WriteAllText((Join-Path $R 'etc/os-release'), "ID=ubuntu`nVERSION_ID=24.04`n")
+  $bin = Join-Path $Root 'fakebin-q7'; [void](New-Item -ItemType Directory -Force -Path $bin)
+  [IO.File]::WriteAllText((Join-Path $bin 'timeout'), "#!/bin/bash`nexit 1`n"); & chmod +x (Join-Path $bin 'timeout')
+  $f = Join-Path $Root 'pf-q7.sh'; [IO.File]::WriteAllText($f, ((Get-MovePreflightScript) -replace "`r`n", "`n") + "`n", $utf8)
+  function PfProjects { $savedPath = $env:PATH; $env:PATH = "$bin$([IO.Path]::PathSeparator)$env:PATH"; $env:FCM_ROOT = $R; try { $o = @(& bash $f 2>&1 | ForEach-Object { "$_" }) } finally { $env:PATH = $savedPath; $env:FCM_ROOT = $null }; (ConvertFrom-MovePreflight $o).Projects }
+  $ak = Join-Path $R 'root/.ssh/authorized_keys'; $k = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLEKEY'
+  Eq (PfProjects) 0 'empty machine, no authorized_keys'
+  [IO.File]::WriteAllText($ak, "$k just-a-user`nrestrict,command=`"/usr/local/sbin/fcode-deploy-gate --move-source`" $k fcode-move-newbox`n"); Eq (PfProjects) 0 'a user key and the move-source key do not count'
+  [IO.File]::WriteAllText($ak, "restrict,command=`"/usr/local/sbin/fcode-deploy-gate deal-sync`" $k fcode-deploy-deal-sync`n"); Eq (PfProjects) 1 'a legacy forced-command key counts'
+  [IO.File]::WriteAllText($ak, "restrict,command=`"/usr/local/sbin/fcode-deploy-gate deal-sync`" $k fcode-deploy-deal-sync`nrestrict,command=`"/usr/local/sbin/fcode-deploy-gate deal-sync`" $k fcode-deploy-deal-sync-2`nrestrict,command=`"/usr/local/sbin/fcode-deploy-gate vps-scraper`" $k fcode-deploy-vps-scraper`n"); Eq (PfProjects) 2 'a name counts once however many keys carry it'
+  [IO.File]::WriteAllText((Join-Path $R 'etc/fcode-deploy/projects/vps-scraper.json'), '{}'); Eq (PfProjects) 2 'a name that has its json is counted once (json), not twice'
+  [IO.File]::WriteAllText($ak, "restrict,command=`"/usr/local/sbin/fcode-deploy-gate --operator`" $k fcode-operator-coder`n"); Eq (PfProjects) 2 'an operator key counts (1 json + 1 operator)'
+  [IO.File]::WriteAllText($ak, "restrict,command=`"/usr/local/sbin/fcode-deploy-gate deal-sync`" $k fcode-deploy-deal-sync`nrestrict,command=`"/usr/local/sbin/fcode-deploy-gate task`" $k fcode-deploy-task`nrestrict,command=`"/usr/local/sbin/fcode-deploy-gate vps-scraper`" $k fcode-deploy-vps-scraper`nrestrict,command=`"/usr/local/sbin/fcode-deploy-gate --operator`" $k fcode-operator-coder`n$k plain`n"); Eq (PfProjects) 4 'json + two legacy + operator'
+  # plan's target-not-empty uses the same number: a new machine whose preflight says projects=1 is refused (a legacy box)
+  Reset-World; $script:Pf['newbox'] = @('INV host os=ubuntu-24.04 arch=x86_64 cpus=4 mem_mb=8000 swap_mb=0 tz=UTC node_major=22', 'INV disk mount=/ used_mb=1 free_mb=900000', 'INV target moveid=- peer=- projects=1')
+  $r = Run-Move @('plan', 'newbox'); Eq $r.Code 65 $r.Text; Ok ($r.Text.Contains('INV refuse target-not-empty projects=1')) $r.Text
+}
+T 'Q7 refresh: the refresh script has no skip and mirrors the lib dir (rsync --delete on the lib only), the plain bootstrap keeps the skip and never deletes; both pass bash -n; run for real over a gate that is already there' {
+  $plain = (Get-MoveBootstrapGateScript) -replace "`r`n", "`n"; $fresh = (Get-MoveBootstrapGateScript -Refresh) -replace "`r`n", "`n"
+  Ok ($plain -match 'if \[ -e "\$R\$entry" \]' -and $plain -notmatch '--delete') 'plain: skip, no --delete'; Ok ($fresh -notmatch 'if \[ -e "\$R\$entry" \]' -and ([regex]::Matches($fresh, '--delete')).Count -eq 1) 'refresh: no skip, one --delete'
+  Ok ($fresh -match 'rsync -aHAX --delete -e "\$ssh" "root@\$ra:\$lib/" "\$R\$lib/"') '--delete is on the lib line'
+  $bin = Join-Path $Root 'fakebin-q7b'; [void](New-Item -ItemType Directory -Force -Path $bin)
+  [IO.File]::WriteAllText((Join-Path $bin 'rsync'), "#!/bin/bash`nprintf '%s\n' `"`$*`" >> `"`$RSYNC_LOG`"`n"); [IO.File]::WriteAllText((Join-Path $bin 'systemctl'), "#!/bin/bash`nexit 0`n"); & chmod +x (Join-Path $bin 'rsync') (Join-Path $bin 'systemctl')
+  foreach ($c in @(@('plain', $plain, 0), @('refresh', $fresh, 1))) {
+    $f = Join-Path $Root "bg-q7-$($c[0]).sh"; [IO.File]::WriteAllText($f, $c[1] + "`n", $utf8); $o = & bash -n $f 2>&1; Eq $LASTEXITCODE 0 "bash -n $($c[0]): $o"
+    $R = Join-Path $Root "fcmroot-q7-$($c[0])"; [void](New-Item -ItemType Directory -Force -Path (Join-Path $R 'usr/local/sbin')); [IO.File]::WriteAllText((Join-Path $R 'usr/local/sbin/fcode-deploy-gate'), 'x'); $log = Join-Path $R 'rsync.log'
+    $savedPath = $env:PATH; $env:PATH = "$bin$([IO.Path]::PathSeparator)$env:PATH"; $env:FCM_ROOT = $R; $env:RSYNC_LOG = $log
+    try { $o = @(& bash $f 203.0.113.10 22 /usr/local/sbin/fcode-deploy-gate /usr/local/lib/fcode-deploy-gate /etc/systemd/system/a.service 2>&1 | ForEach-Object { "$_" }); $rc = $LASTEXITCODE } finally { $env:PATH = $savedPath; $env:FCM_ROOT = $null; $env:RSYNC_LOG = $null }
+    Eq $rc 0 ($o -join ' | ')
+    if ($c[2]) {
+      $l = [IO.File]::ReadAllText($log); $lines = @($l -split "`n" | Where-Object { $_ }); Eq $lines.Count 3 "refresh pulled lib, unit and entry: $l"
+      Eq @($lines | Where-Object { $_ -match '--delete' }).Count 1 'one --delete'; Ok ($lines[0] -match '--delete' -and $lines[0] -match 'fcode-deploy-gate/ ') 'on the lib line'; Ok ([bool]($o -match 'skipped=no')) 'not skipped'
+    } else { Ok (-not (Test-Path $log)) 'plain: skipped, no rsync'; Ok ([bool]($o -match 'skipped=yes')) 'skipped=yes' }
+  }
+}
 # ============================== round 5 (arbitration: a cutover in flight is a mark) ==============================
 function Seed-Mark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan', [string]$Phase = 'copied') {
   $s = Seed $Phase $Dir $Via $Mark

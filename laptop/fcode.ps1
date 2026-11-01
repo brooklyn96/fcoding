@@ -1416,8 +1416,14 @@ if [ -r "$f" ]; then
   mid=$(sed -n 's/.*"move_id":"\([0-9a-f-]*\)".*/\1/p' "$f" | head -n 1)
   peer=$(sed -n 's/.*"peer":"\([a-z][a-z0-9-]*\)".*/\1/p' "$f" | head -n 1)
 fi
-n=$(ls "$R/etc/fcode-deploy/projects/"*.json 2>/dev/null | wc -l)
-echo "INV target moveid=${mid:--} peer=${peer:--} projects=$((n + 0))"
+n=$(ls "$R/etc/fcode-deploy/projects/"*.json 2>/dev/null | wc -l); n=$((n + 0))
+# a machine that serves a legacy project (a forced-command key `command="/usr/local/sbin/fcode-deploy-gate <name>"`, no json yet) or an operator key serves something too
+ak=$R/root/.ssh/authorized_keys
+if [ -r "$ak" ]; then
+  while IFS= read -r nmx; do [ -n "$nmx" ] && [ ! -e "$R/etc/fcode-deploy/projects/$nmx.json" ] && n=$((n + 1)); done < <(grep -oE 'command="/usr/local/sbin/fcode-deploy-gate [A-Za-z0-9][A-Za-z0-9._-]*"' "$ak" 2>/dev/null | sed 's/^.*gate //; s/"$//' | sort -u)
+  opn=$(grep -cE '[[:space:]]fcode-operator-[a-z0-9-]+[[:space:]]*$' "$ak" 2>/dev/null); n=$((n + ${opn:-0}))
+fi
+echo "INV target moveid=${mid:--} peer=${peer:--} projects=$n"
 for d in /root/.cloudflared /etc/cloudflared; do
   [ -d "$R$d" ] || continue
   find "$R$d" \( -type f -o -type l \) 2>/dev/null
@@ -1495,7 +1501,12 @@ exit 0
 # $Refresh = copy (d) when new's gate differs from src's and new holds no project: the same script without the "already there" skip, so it pulls the gate again
 function Get-MoveBootstrapGateScript([switch]$Refresh) {
   $t = Get-MoveBootstrapGateText
-  if ($Refresh) { $t = $t -replace '(?m)^if \[ -e "\$R\$entry" \]; then .*\r?\n', '' }
+  if ($Refresh) {   # no "already there" skip, and the lib dir is mirrored (--delete): a newer gate's extra modules must not survive (new serves nothing, Q7)
+    $t = $t -replace '(?m)^if \[ -e "\$R\$entry" \]; then .*\r?\n', ''
+    $t2 = $t.Replace('rsync -aHAX -e "$ssh" "root@$ra:$lib/" "$R$lib/"', 'rsync -aHAX --delete -e "$ssh" "root@$ra:$lib/" "$R$lib/"')
+    if ($t2 -ceq $t) { throw 'Get-MoveBootstrapGateScript: the lib rsync line changed; update the refresh rewrite' }
+    $t = $t2
+  }
   $t
 }
 function Get-MoveBootstrapGateText {
