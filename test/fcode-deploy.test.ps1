@@ -295,6 +295,67 @@ T 'allow / disallow: no alias resolution (prefs alias map task -> myapp is read 
   } finally { $env:LOCALAPPDATA = $old }
 }
 
+# ============================== approve (G.4, D.9.7: the laptop is a door; the coder is not) ==============================
+T 'approve: `fcode deploy <n> approve <sha40> now|idle|skip` goes to ssh as exactly `--local <n> approve <sha40> <choice>` (one ssh -n call, no stdin); output streamed in order; exit code = the gate code' {
+  foreach ($ch in 'now', 'idle', 'skip') {
+    Reset-World; Add-Rule 'ssh' '.' @(Ans @("GATE_RESULT outcome=answered sha=$SHA choice=$ch repeat=no", 'GATE_EXIT 0') 0)
+    $r = Run-Fcode @('task', 'approve', $SHA, $ch)
+    Eq $r.Code 0 "$ch code"; Eq $r.Calls.Count 1 "$ch calls"
+    $parts = $r.Calls[0].Text -split "$SEP"
+    Eq $parts.Count 3 'ssh argv: -n host command'; Eq $parts[0] '-n'; Eq $parts[1] 'contabo'; Eq $parts[2] "$GATE task approve $SHA $ch" 'remote command'
+    Eq $r.Calls[0].Stdin '' 'no stdin'
+    $i1 = $r.Text.IndexOf('GATE_RESULT outcome=answered'); $i2 = $r.Text.IndexOf('GATE_EXIT 0')
+    Ok ($i1 -ge 0 -and $i2 -gt $i1) ("$ch output in order: " + $r.Text)
+  }
+  Reset-World; Add-Rule 'ssh' '.' @(Ans @('GATE_EXIT 0') 0)
+  $r = Run-Fcode @('shopee-dashboard', 'approve', $SHA, 'now'); Eq (($r.Calls[0].Text -split "$SEP")[2]) "$GATE shopee-dashboard approve $SHA now" 'another project name'
+}
+T 'approve: the gate answers and codes come back unchanged (answered 0, ask-stale 1, approve-owner-only 65, registry-v1 65, ssh down 255)' {
+  $cases = @(
+    @{ O = @("GATE_RESULT outcome=answered sha=$SHA choice=idle repeat=yes", 'GATE_EXIT 0'); C = 0 }
+    @{ O = @("GATE_ERROR refused ask-stale pending=$SHA", 'GATE_EXIT 1'); C = 1 }
+    @{ O = @('GATE_ERROR refused ask-stale pending=none', 'GATE_EXIT 1'); C = 1 }
+    @{ O = @('GATE_ERROR approve-owner-only', 'GATE_EXIT 65'); C = 65 }
+    @{ O = @('GATE_ERROR registry-v1', 'GATE_EXIT 65'); C = 65 }
+    @{ O = @('x'); C = 255 }
+  )
+  foreach ($c in $cases) {
+    Reset-World; Add-Rule 'ssh' '.' @(Ans $c.O $c.C)
+    $r = Run-Fcode @('task', 'approve', $SHA, 'now')
+    Eq $r.Code $c.C ("code " + $c.C); Eq $r.Calls.Count 1 'one call'
+    if ($c.C -ne 255) { foreach ($l in $c.O) { Ok ($r.Text.Contains($l)) "line shown: $l" } }
+  }
+}
+T 'approve: a wrong sha or choice, a missing or extra argument is refused locally (rc 65, usage, no call)' {
+  $bad = @(
+    @('task', 'approve'), @('task', 'approve', $SHA), @('task', 'approve', 'now'), @('task', 'approve', 'now', $SHA),
+    @('task', 'approve', $SHA, 'now', 'idle'), @('task', 'approve', $SHA, ''), @('task', 'approve', $SHA, 'NOW'), @('task', 'approve', $SHA, 'later'), @('task', 'approve', $SHA, 'now;id'),
+    @('task', 'approve', $SHA.Substring(0, 39), 'now'), @('task', 'approve', ($SHA + '0'), 'now'), @('task', 'approve', $SHA.ToUpper(), 'now'), @('task', 'approve', 'abc1234', 'now'),
+    @('task', 'approve', ('g' * 40), 'now'), @('task', 'approve', "$SHA;id", 'now'), @('task', 'approve', "$SHA`n", 'now'), @('task', 'approve', '$(id)', 'now'),
+    @('Task', 'approve', $SHA, 'now'), @('approve', $SHA, 'now'), @('task', 'APPROVE', $SHA, 'now')
+  )
+  foreach ($w in $bad) {
+    Reset-World; Add-Rule 'ssh' '.' @(Ans @('ok') 0)
+    $r = Run-Fcode $w
+    Eq $r.Code 65 ('[' + ($w -join '|') + '] code'); Eq $r.Calls.Count 0 ('[' + ($w -join '|') + '] no call')
+    Ok ($r.Text.Trim().Length -gt 0) ('[' + ($w -join '|') + '] a message is shown')
+  }
+  Reset-World; $r = Run-Fcode @('task', 'approve', $SHA, 'later')
+  Ok ($r.Text.Contains('Cách dùng: fcode deploy task approve <sha đủ 40 ký tự> now|idle|skip')) ('approve usage: ' + $r.Text)
+}
+T 'approve: the usage of an unknown verb lists approve <sha> now|idle|skip' {
+  Reset-World; $r = Run-Fcode @('task', 'nope'); Eq $r.Code 65
+  Ok ($r.Text.Contains('approve <sha> now|idle|skip')) ('usage line: ' + $r.Text)
+}
+T 'busy app: the gate lines GATE_ASK <sha40> busy=<text> and GATE_PENDING ask (rc 1) of deploy / retry come back unchanged' {
+  foreach ($v in @(@('deploy', $SHA), @('retry'))) {
+    Reset-World; Add-Rule 'ssh' '.' @(Ans @("GATE_ASK $SHA busy=đang có 2 phiên live", 'GATE_PENDING ask', 'GATE_EXIT 1') 1)
+    $r = Run-Fcode (@('task') + $v)
+    Eq $r.Code 1 'rc 1'; Eq $r.Calls.Count 1 'one call'
+    Ok ($r.Text.Contains("GATE_ASK $SHA busy=đang có 2 phiên live") -and $r.Text.Contains('GATE_PENDING ask')) ('ask lines shown: ' + $r.Text)
+  }
+}
+
 # ============================== inventory / register with a draft file ==============================
 T 'inventory and register by hand: the draft file goes to the gate as base64 on stdin (exact bytes), never in the arguments' {
   Reset-World; Add-Rule 'ssh' '.' @(Ans @('INV ok') 0)
@@ -373,6 +434,17 @@ T 'add (existing key listed on GitHub): runs check, key reuse, alias, inventory,
   foreach ($x in $runs) { Ok ($x.Text -match '^run list -R brooklyn96/task --status (in_progress|queued) --json databaseId$') ('gh run list argv: ' + $x.Text) }
   $ps = $r.Text.IndexOf('<<PROMPT>>'); $ir = $r.Text.IndexOf('<<ssh base64 -di | /usr/local/sbin/fcode-deploy-gate --local task register')
   Ok ($ps -ge 0 -and $ir -gt $ps) 'the YES prompt comes before register'
+}
+T 'add: the `trust on i-understand-root` next step is printed whatever the inventory says, between status and deploy (v2 scripts run as root)' {
+  foreach ($inv in @('INV unit ok', 'INV unit ok trusted_needed=no', 'INV unit ok trusted_needed=yes', 'INV dir /opt/task type=app')) {
+    New-AddWorld
+    Add-Rule 'ssh' '--local task inventory' @(Ans @($inv, 'INV ok') 0)
+    $r = Add-Run
+    Eq $r.Code 0 ("[$inv] code: " + $r.Text)
+    $i0 = $r.Text.IndexOf('  fcode deploy task status'); $i1 = $r.Text.IndexOf('  fcode deploy task trust on i-understand-root'); $i2 = $r.Text.IndexOf('  fcode deploy task deploy <sha'); $i3 = $r.Text.IndexOf('  fcode deploy task resume')
+    Ok ($i0 -ge 0 -and $i1 -gt $i0 -and $i2 -gt $i1 -and $i3 -gt $i2) ("[$inv] next steps in order: " + $r.Text)
+    Ok ($r.Text -notmatch 'nếu dòng INV') "[$inv] the hint is not conditional"
+  }
 }
 T 'add: no secret in any argument; stdin only on inventory and register' {
   New-AddWorld; $r = Add-Run
@@ -606,12 +678,16 @@ $line = $tool + ' ' + ($rest -join [char]1) + ' STDIN=' + ($stdin.Trim())
 if ($env:STUB_OUT) { $env:STUB_OUT -split ';' | ForEach-Object { Write-Output $_ } }
 exit ([int]$env:STUB_RC)
 '@, $utf8)
-foreach ($t in 'ssh', 'gh') { [IO.File]::WriteAllText((Join-Path $Bin "$t.cmd"), "@echo off`r`n`"$hostExe`" -NoProfile -File `"%~dp0stub.ps1`" $t %*`r`nexit /b %errorlevel%`r`n", $utf8) }
+$isWinHost = [IO.Path]::DirectorySeparatorChar -eq '\'
+foreach ($t in 'ssh', 'gh') {
+  if ($isWinHost) { [IO.File]::WriteAllText((Join-Path $Bin "$t.cmd"), "@echo off`r`n`"$hostExe`" -NoProfile -File `"%~dp0stub.ps1`" $t %*`r`nexit /b %errorlevel%`r`n", $utf8) }
+  else { $sh = Join-Path $Bin $t; [IO.File]::WriteAllText($sh, "#!/bin/sh`nexec `"$hostExe`" -NoProfile -File `"$Bin/stub.ps1`" $t `"`$@`"`n", $utf8); & chmod +x $sh }   # off Windows: the same stub as an executable `ssh` / `gh`, so no real ssh is ever started
+}
 $Home2 = Join-Path $Root 'home'; [void](New-Item -ItemType Directory -Path (Join-Path $Home2 '.fcode'))
 [IO.File]::WriteAllText((Join-Path $Home2 '.fcode\config.json'), '{"deployHost":"vps-e2e"}', $utf8)
 function Run-E2E([string[]]$Words, [string]$Out = '', [int]$Rc = 0) {
   $savedPath = $env:PATH; $savedUp = $env:USERPROFILE
-  $env:PATH = "$Bin;$env:PATH"; $env:USERPROFILE = $Home2; $env:STUB_LOG = $StubLog; $env:STUB_OUT = $Out; $env:STUB_RC = "$Rc"
+  $env:PATH = "$Bin$([IO.Path]::PathSeparator)$env:PATH"; $env:USERPROFILE = $Home2; $env:STUB_LOG = $StubLog; $env:STUB_OUT = $Out; $env:STUB_RC = "$Rc"
   try {
     if (Test-Path $StubLog) { Remove-Item $StubLog }
     $o = @(& $hostExe -NoProfile -File $Fcode @Words 2>&1)
@@ -645,6 +721,27 @@ T 'e2e: trust on i-understand-root through the real script: status first, warnin
   Eq $r.Code 0 $r.Out; Eq $r.Log.Count 2
   Ok ($r.Out.Contains((Expected-Warning 'brooklyn96/task' 'main'))) ('warning: ' + $r.Out)
   Ok ($r.Log[1] -match 'trust on i-understand-root') 'second call is the trust'
+}
+T 'e2e: approve through the real script: one ssh -n call `--local <n> approve <sha40> <choice>`, the gate lines shown, exit code = the gate code; a bad argument never starts ssh' {
+  foreach ($ch in 'now', 'idle', 'skip') {
+    $r = Run-E2E @('deploy', 'task', 'approve', $SHA, $ch) "GATE_RESULT outcome=answered sha=$SHA choice=$ch repeat=no;GATE_EXIT 0" 0
+    Eq $r.Code 0 ("$ch code: " + $r.Out); Eq $r.Log.Count 1 "$ch one ssh call"
+    Eq ($r.Log[0] -replace ' STDIN=.*$', '') ("ssh -n${SEP}vps-e2e${SEP}$GATE task approve $SHA $ch") "$ch argv"
+    Ok ($r.Out -match "outcome=answered sha=$SHA choice=$ch" -and $r.Out -match 'GATE_EXIT 0') ("$ch output: " + $r.Out)
+  }
+  $r = Run-E2E @('deploy', 'task', 'approve', $SHA, 'now') "GATE_ERROR refused ask-stale pending=none;GATE_EXIT 1" 1
+  Eq $r.Code 1 $r.Out; Ok ($r.Out -match 'ask-stale pending=none') 'ask-stale shown'
+  foreach ($w in @(@('deploy', 'task', 'approve'), @('deploy', 'task', 'approve', $SHA), @('deploy', 'task', 'approve', $SHA, 'later'), @('deploy', 'task', 'approve', 'abc1234', 'now'), @('deploy', 'task', 'approve', $SHA, 'now', 'idle'))) {
+    $r = Run-E2E $w; Eq $r.Code 65 ($w -join ' '); Eq $r.Log.Count 0 'no ssh'; Ok ($r.Out.Trim().Length -gt 0) 'a message is shown'
+  }
+}
+T 'e2e: a busy deploy through the real script shows GATE_ASK and GATE_PENDING ask, exit code 1' {
+  $r = Run-E2E @('deploy', 'task', 'deploy', $SHA) "GATE_ASK $SHA busy=worker đang chạy;GATE_PENDING ask;GATE_EXIT 1" 1
+  Eq $r.Code 1 $r.Out; Ok ($r.Out -match "GATE_ASK $SHA busy=" -and $r.Out -match 'GATE_PENDING ask') ('ask lines: ' + $r.Out)
+}
+T 'help: fcode help deploy documents approve (usage, the three answers, laptop only)' {
+  $r = Run-E2E @('help', 'deploy'); Eq $r.Code 0
+  foreach ($s in 'approve <sha> now|idle|skip', 'now = deploy ngay', 'idle = đợi lúc app rảnh', 'skip = bỏ qua bản này', 'Máy coder không có lệnh này') { Ok ($r.Out.Contains($s)) "help deploy lacks: $s" }
 }
 T 'e2e: allow root / disallow through the real script: one ssh -n call, the gate lines shown, exit code = the gate code; a bad name never starts ssh' {
   $r = Run-E2E @('deploy', 'allow', 'task', 'root') 'GATE_WARN root stays;GATE_RESULT outcome=allowed name=task root=yes;GATE_EXIT 0' 0
@@ -686,6 +783,6 @@ T 'help: fcode help <lệnh> prints the detail of every command (lines <= 78 cha
 Set-Location $env:TEMP
 Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host ''
-Write-Host "passed $script:pass, failed $script:fail"
+Write-Host "fcode-deploy.test.ps1: passed $script:pass, failed $script:fail"
 if ($script:fail) { exit 1 }
 exit 0

@@ -662,6 +662,7 @@ function Show-Help([string]$Topic = '') {
       'compact@@Dọn gọn nhật ký của cổng',
       'inventory <draft.json>@@In hiện trạng VPS theo bản nháp',
       'register <sha256> <draft.json>@@Đăng ký tay (sha256 của file nháp)',
+      'approve <sha> now|idle|skip@@Trả lời khi cổng hỏi (app đang bận)',
       '',
       '  deploy <sha> cũng tạm dừng deploy tự động; gõ resume để bật lại.',
       '',
@@ -684,6 +685,14 @@ function Show-Help([string]$Topic = '') {
       '>fcode deploy disallow <tên>',
       '    Thu hồi quyền đó. Project vẫn nằm trong cổng và vẫn deploy; muốn',
       '    bỏ root thì chạy thêm  fcode deploy <tên> trust off.',
+      '',
+      '#Trả lời khi app đang bận',
+      '>fcode deploy <tên> approve <sha> now|idle|skip',
+      '    App đang bận thì cổng không tự deploy mà hỏi bạn (deploy báo dòng',
+      '    GATE_ASK, status có dòng ASK). Trả lời: now = deploy ngay (chấp',
+      '    nhận bị gián đoạn), idle = đợi lúc app rảnh, skip = bỏ qua bản này.',
+      '    <sha> là đủ 40 ký tự ghi ở dòng ASK. Chỉ gõ khi chủ đã nói rõ câu',
+      '    trả lời. Máy coder không có lệnh này.',
       '',
       '#Cảnh báo',
       '  "trust on" in cảnh báo trước khi gửi: ai merge được vào nhánh đó đều',
@@ -1156,7 +1165,7 @@ function Invoke-DeployAdd([string[]]$AddArgs) {
     Write-Host ''
     Write-Host "Xong: '$name' đã đăng ký và đang tạm dừng. Việc tiếp theo, theo thứ tự:"
     Write-Host "  fcode deploy $name status"
-    Write-Host "  (nếu dòng INV unit ở trên có trusted_needed=yes, hoặc project là compose / script:  fcode deploy $name trust on i-understand-root)"
+    Write-Host "  fcode deploy $name trust on i-understand-root   (script của project chạy bằng root nên cần bật chế độ tin cậy trước khi deploy)"
     Write-Host "  fcode deploy $name deploy <sha của main>"
     Write-Host "  fcode deploy $name resume"
     return 0
@@ -1186,14 +1195,14 @@ function Invoke-DeployAllow([string]$Verb, [string[]]$AllowArgs) {
 
 function Invoke-Deploy {
   $a = @($Rest | Select-Object -Skip 1)
-  $verbs = 'status', 'deploy', 'retry', 'pause', 'resume', 'trust', 'logs', 'recheck', 'inventory', 'register', 'compact'
+  $verbs = 'status', 'deploy', 'retry', 'pause', 'resume', 'trust', 'logs', 'recheck', 'inventory', 'register', 'compact', 'approve'
   if ($a.Count -gt 0 -and $a[0] -ceq 'add') { return (Invoke-DeployAdd @($a | Select-Object -Skip 1)) }
   if ($a.Count -gt 0 -and ($a[0] -ceq 'allow' -or $a[0] -ceq 'disallow')) { return (Invoke-DeployAllow ([string]$a[0]) @($a | Select-Object -Skip 1)) }
   $name = if ($a.Count -gt 0) { [string]$a[0] } else { '' }; $verb = if ($a.Count -gt 1) { [string]$a[1] } else { '' }
   $rest = @($a | Select-Object -Skip 2)
   if (-not (Test-DeployName $name) -or $verbs -cnotcontains $verb) {
     Write-Host 'Cách dùng: fcode deploy <tên> <lệnh> [đối số]'
-    Write-Host '  lệnh: status [id] · deploy <sha> · retry [sha] · pause · resume · trust on i-understand-root | off · logs [id] [số dòng] · recheck · compact · inventory <draft.json> · register <sha256> <draft.json>'
+    Write-Host '  lệnh: status [id] · deploy <sha> · retry [sha] · approve <sha> now|idle|skip · pause · resume · trust on i-understand-root | off · logs [id] [số dòng] · recheck · compact · inventory <draft.json> · register <sha256> <draft.json>'
     Write-Host '  Đăng ký project mới: fcode deploy add <chủ/repo> <tên> <draft.json>'
     Write-Host '  Duyệt / thu hồi quyền của khoá box: fcode deploy allow <tên> [root] · fcode deploy disallow <tên>'
     return 65
@@ -1205,6 +1214,14 @@ function Invoke-Deploy {
     $d = Read-DeployDraft ([string]$rest[-1])
     if ($d.Err) { Write-Host "lỗi: $($d.Err)"; return 65 }
     $b64 = $d.B64; $gateArgs = @($rest | Select-Object -First ($rest.Count - 1))
+  }
+  if ($verb -ceq 'approve') {
+    # tra loi cau hoi cua cong khi app ban: <sha 40 ky tu> now|idle|skip; chi laptop co lenh nay (coder khong co)
+    if ($rest.Count -ne 2 -or ([string]$rest[0]) -cnotmatch '\A[0-9a-f]{40}\z' -or ([string]$rest[1]) -cnotin 'now', 'idle', 'skip') {
+      Write-Host "Cách dùng: fcode deploy $name approve <sha đủ 40 ký tự> now|idle|skip"
+      Write-Host '  now = deploy ngay (chấp nhận bị gián đoạn) · idle = đợi lúc app rảnh · skip = bỏ qua bản này'
+      return 65
+    }
   }
   foreach ($w in $gateArgs) { if (-not (Test-DeployWord ([string]$w))) { Write-Host "lỗi: đối số '$("$w" -replace '[\x00-\x1f\x7f]', '?')' không hợp lệ (chỉ chữ, số, dấu . _ / -)."; return 65 } }
   if ($verb -ceq 'register') {
