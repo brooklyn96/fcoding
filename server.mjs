@@ -785,6 +785,22 @@ export function parseUpdates(text) {
   }
   return out;
 }
+// GET /api/tools/update: the tool versions, when the last run was and whether it was ok, from the parsed status.json. Nothing else of the
+// file (no error text) is passed on; a version that is not a plain version string, or an unknown field, is null.
+const VERSION_RE = /^[0-9A-Za-z.+-]{1,64}$/;
+export function updateStatusOf(updates) {
+  const versions = {}; const ats = []; const results = [];
+  for (const tool of ['omp', 'claude', 'codex']) {
+    const u = updates?.[tool];
+    // a failed tool did not move: what it runs now is `from`; otherwise `to` is what it runs after the run
+    const v = u ? (u.result === 'failed' ? u.from : u.to || u.from) : null;
+    versions[tool] = typeof v === 'string' && VERSION_RE.test(v) ? v : null;
+    const at = u ? Date.parse(u.at) : NaN;
+    if (Number.isFinite(at)) ats.push(at);
+    if (u?.result) results.push(u.result);
+  }
+  return { versions, last_run: iso(ats.length ? Math.max(...ats) : NaN), last_ok: results.length ? !results.includes('failed') : null };
+}
 // `omp usage reset <target>` prints one line (stdout on success, stderr otherwise); first matching rule wins
 export const RESET_MSG = {
   reset: 'Đã reset hạn mức Codex.',
@@ -1009,6 +1025,7 @@ export function createApp(opts = {}) {
   const gitSyncMs = opts.gitSyncMs ?? GIT_SYNC_MS;
   const ompRoot = opts.ompSessionsRoot ?? path.join(process.env.PI_CODING_AGENT_DIR || path.join(home, '.omp', 'agent'), 'sessions');
   const instaboxSpec = specOf(opts.instabox ?? process.env.PC_INSTABOX ?? 'instabox');
+  const systemctlSpec = specOf(opts.systemctl ?? ['systemctl']); // tests only: a stub; never from the environment or a request
   const instaboxKey = opts.instaboxKey !== undefined ? opts.instaboxKey : takeInstaboxKey(); // null: no key, staging is off
 
   secureConfigDir(configDir);
@@ -1566,6 +1583,24 @@ export function createApp(opts = {}) {
       child.unref();
     } catch { end('cannot start'); }
   }
+
+  // POST /api/tools/update starts fcode-update.service, GET reads it: the argv is fixed, no shell, nothing of the request reaches it
+  const UPDATE_UNIT = 'fcode-update.service';
+  let updateStarting = false; // a start in flight (answered 409 like a running unit)
+  // is-active prints the state and exits non-zero when it is not active, so the printed state counts, never the exit code
+  const updateRunning = async () => /^(active|activating)$/.test(String(await execTool(systemctlSpec, ['--user', 'is-active', UPDATE_UNIT], 10e3).catch((e) => e.stdout ?? '')).trim());
+  // detached and unref'd with its output ignored (--no-block: it returns once the job is queued); true when systemctl exited 0, a failure logs one line
+  const startUpdate = () => new Promise((resolve) => {
+    let over = false;
+    const end = (ok, why) => { if (over) return; over = true; if (why) log(`tools-update: ${why}`); resolve(ok); };
+    try {
+      const [cmd, ...pre] = systemctlSpec;
+      const child = spawn(cmd, [...pre, '--user', 'start', '--no-block', UPDATE_UNIT], { stdio: 'ignore', detached: true, windowsHide: true, timeout: 15e3, env: toolEnv() });
+      child.on('error', (e) => end(false, e.code === 'ENOENT' ? 'command not found' : 'cannot start'));
+      child.on('exit', (code, sig) => end(code === 0, code === 0 ? '' : `exit ${code ?? sig}`));
+      child.unref();
+    } catch { end(false, 'cannot start'); }
+  });
 
   // bracketed paste into the session's input (tmux buffer "pc"); runs inside a mutation job
   async function pasteText(name, text, ctx) {
@@ -2244,6 +2279,21 @@ export function createApp(opts = {}) {
       let timer;
       const reply = await Promise.race([job, new Promise((r) => { timer = setTimeout(r, resetReplyMs, null); })]).finally(() => clearTimeout(timer));
       return reply ? json(res, 200, reply) : json(res, 202, { result: 'pending', message: RESET_MSG.pending });
+    }
+    if (pathname === '/api/tools/update') {
+      if (method === 'GET') {
+        let updates = {};
+        try { updates = parseUpdates(fs.readFileSync(updatesFile, 'utf8')); } catch {}
+        return json(res, 200, { running: await updateRunning(), ...updateStatusOf(updates) });
+      }
+      want('POST');
+      if (body.length) { const b = parseJson(req, body); if (Object.keys(b).length) throw new HttpErr(400, 'invalid'); } // empty, or {}: no parameter is read
+      if (updateStarting) return json(res, 409, { error: 'running' });
+      updateStarting = true;
+      try {
+        if (await updateRunning()) return json(res, 409, { error: 'running' });
+        return await startUpdate() ? json(res, 202, { started: true }) : json(res, 500, { error: 'start failed' });
+      } finally { updateStarting = false; }
     }
     if (pathname === '/api/meta') {
       want('GET');

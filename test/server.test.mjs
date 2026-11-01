@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import { createApp, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, strictOrigin, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock,
-  boxOf, parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, releaseRunOf, parseUpdates, gateStatusOf, gateRunOf, resetReply, RESET_MSG, BOX, memo, codexChildMeta, parseGitSync, ompDirName, ompHead, parseStaging, KNOWN_VERSIONS, repoOfLink } from '../server.mjs';
+  boxOf, parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, releaseRunOf, parseUpdates, updateStatusOf, gateStatusOf, gateRunOf, resetReply, RESET_MSG, BOX, memo, codexChildMeta, parseGitSync, ompDirName, ompHead, parseStaging, KNOWN_VERSIONS, repoOfLink } from '../server.mjs';
 
 process.env.TZ = 'America/Los_Angeles'; // spend days follow config.json timeZone, never the process zone: a third zone proves it
 
@@ -4658,6 +4658,156 @@ test('POST staging/start: a failing start logs one line (no key); ls down with n
       assert.equal(s.calls().filter((x) => x.argv[0] === 'start').length, 1); // only the first app's
     }, { instabox: s.instabox, instaboxKey: 'ibk_test' });
   } finally { s.cleanup(); }
+});
+
+// tool update: POST/GET /api/tools/update; systemctl is a stub that logs its argv (the real one is never run)
+const sysctlStub = () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-sysctl-'));
+  fs.writeFileSync(path.join(dir, 'systemctl.mjs'), `import fs from 'node:fs';
+const d = ${JSON.stringify(dir)}, a = process.argv.slice(2);
+fs.appendFileSync(d + '/calls.log', JSON.stringify(a) + '\\n');
+if (a[1] === 'is-active') { const s = fs.existsSync(d + '/state') ? fs.readFileSync(d + '/state', 'utf8') : 'inactive'; process.stdout.write(s + '\\n'); process.exit(s === 'active' ? 0 : 3); }
+else if (a[1] === 'start') {
+  if (fs.existsSync(d + '/start-fail')) { process.stderr.write('SECRET-STDERR /etc/hidden'); process.exit(1); }
+  setTimeout(() => process.exit(0), fs.existsSync(d + '/start-slow') ? 400 : 0);
+}\n`);
+  return {
+    dir, systemctl: [process.execPath, path.join(dir, 'systemctl.mjs')],
+    set: (name, text = '') => fs.writeFileSync(path.join(dir, name), text),
+    calls: () => { try { return fs.readFileSync(path.join(dir, 'calls.log'), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } },
+    cleanup: () => fs.rmSync(dir, { recursive: true, force: true }),
+  };
+};
+const IS_ACTIVE = ['--user', 'is-active', 'fcode-update.service'];
+const START_UNIT = ['--user', 'start', '--no-block', 'fcode-update.service'];
+
+test('/api/tools/update: a session and the X-PC header are needed, only GET and POST; nothing reaches systemctl without them', async () => {
+  const s = sysctlStub();
+  try {
+    await withApp(async (c) => {
+      for (const m of ['GET', 'POST']) assert.equal((await c.req(m, '/api/tools/update', { body: m === 'POST' ? {} : undefined })).status, 401, m);
+      assert.equal((await c.req('GET', '/api/tools/update', { headers: { Authorization: 'Bearer forged' } })).status, 401);
+      const { cookie } = await c.login();
+      assert.equal((await c.req('POST', '/api/tools/update', { cookie, pc: false })).status, 403);
+      assert.equal((await c.req('POST', '/api/tools/update', { cookie, headers: { Origin: 'https://evil.example' } })).status, 403);
+      for (const m of ['PUT', 'DELETE', 'PATCH']) assert.equal((await c.req(m, '/api/tools/update', { cookie })).status, 405, m);
+      assert.deepEqual(s.calls(), []);
+    }, { systemctl: s.systemctl });
+  } finally { s.cleanup(); }
+});
+
+test('POST /api/tools/update: 202 {started:true}, the fixed argv is-active then start --no-block; a bearer token works too', async () => {
+  const s = sysctlStub();
+  try {
+    await withApp(async (c) => {
+      const { cookie, token } = await c.login();
+      const r = await c.req('POST', '/api/tools/update', { cookie });
+      assert.deepEqual([r.status, r.json], [202, { started: true }]);
+      assert.deepEqual(s.calls(), [IS_ACTIVE, START_UNIT]);
+      for (const state of ['inactive', 'failed']) { // a finished unit is started again
+        s.set('state', state);
+        assert.equal((await c.req('POST', '/api/tools/update', { headers: { Authorization: `Bearer ${token}` }, body: {} })).status, 202, state);
+      }
+      assert.equal(s.calls().length, 6);
+    }, { systemctl: s.systemctl });
+  } finally { s.cleanup(); }
+});
+
+test('POST /api/tools/update: nothing of the request changes the argv (body fields refused, query ignored, empty body and {} fine)', async () => {
+  const s = sysctlStub();
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      for (const body of [{ unit: 'other.service' }, { args: ['--version'] }, { tool: 'omp' }, { harness: 'claude' }, { cmd: 'rm -rf /' }]) {
+        const r = await c.req('POST', '/api/tools/update', { cookie, body });
+        assert.deepEqual([r.status, r.json?.started], [400, undefined], JSON.stringify(body));
+      }
+      assert.equal((await c.req('POST', '/api/tools/update', { cookie, raw: '[1]', headers: JSON_CT })).status, 400);
+      assert.equal((await c.req('POST', '/api/tools/update', { cookie, raw: '{bad', headers: JSON_CT })).status, 400);
+      assert.deepEqual(s.calls(), []); // refused before systemctl ran
+      assert.equal((await c.req('POST', '/api/tools/update?unit=ssh.service&x=--now', { cookie, body: {} })).status, 202);
+      assert.equal((await c.req('POST', '/api/tools/update', { cookie })).status, 202); // empty body
+      assert.deepEqual(s.calls(), [IS_ACTIVE, START_UNIT, IS_ACTIVE, START_UNIT]);
+    }, { systemctl: s.systemctl });
+  } finally { s.cleanup(); }
+});
+
+test('POST /api/tools/update: a unit that is active or activating answers 409 running and is not started; two taps at once start once', async () => {
+  const s = sysctlStub();
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      for (const state of ['active', 'activating']) {
+        s.set('state', state);
+        const r = await c.req('POST', '/api/tools/update', { cookie });
+        assert.deepEqual([r.status, r.json], [409, { error: 'running' }], state);
+      }
+      assert.deepEqual(s.calls(), [IS_ACTIVE, IS_ACTIVE]); // never a start
+      s.set('state', 'inactive'); s.set('start-slow');
+      const two = await Promise.all([1, 2].map(() => c.req('POST', '/api/tools/update', { cookie })));
+      assert.deepEqual(two.map((r) => r.status).sort(), [202, 409]);
+      assert.equal(s.calls().filter((a) => a[1] === 'start').length, 1);
+    }, { systemctl: s.systemctl });
+  } finally { s.cleanup(); }
+});
+
+test('POST /api/tools/update: systemctl failing or missing answers 500 {error:"start failed"} with no stderr in the body; one log line', async () => {
+  const s = sysctlStub();
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      s.set('start-fail');
+      const r = await c.req('POST', '/api/tools/update', { cookie });
+      assert.deepEqual([r.status, r.json], [500, { error: 'start failed' }]);
+      assert.ok(!r.text.includes('SECRET') && !r.text.includes('hidden'));
+      assert.deepEqual(c.logs.filter((l) => l.startsWith('tools-update')), ['tools-update: exit 1']);
+      assert.ok(!c.logs.join('\n').includes('SECRET'));
+      assert.equal((await c.req('POST', '/api/tools/update', { cookie })).status, 500); // the in-flight flag is cleared by a failure
+    }, { systemctl: s.systemctl });
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      const r = await c.req('POST', '/api/tools/update', { cookie });
+      assert.deepEqual([r.status, r.json], [500, { error: 'start failed' }]);
+      assert.ok(c.logs.includes('tools-update: command not found'));
+    }, { systemctl: [path.join(s.dir, 'no-such-systemctl')] });
+  } finally { s.cleanup(); }
+});
+
+test('GET /api/tools/update: {running, versions, last_run, last_ok} from status.json and is-active; unknown is null; no other field, no error text', async () => {
+  const s = sysctlStub();
+  const status = path.join(s.dir, 'status.json');
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      let r = await c.req('GET', '/api/tools/update', { cookie }); // no status file yet
+      assert.deepEqual([r.status, r.json], [200, { running: false, versions: { omp: null, claude: null, codex: null }, last_run: null, last_ok: null }]);
+      fs.writeFileSync(status, JSON.stringify({
+        omp: { from: '18.12.5', to: '18.12.6', at: '2026-10-31T06:00:10Z', result: 'updated', error: null },
+        claude: { from: '2.1.0', to: '2.1.0', at: '2026-10-31T06:01:00Z', result: 'current', error: null },
+        codex: { from: '0.164.0', to: '', at: '2026-10-31T05:59:00Z', result: 'failed', error: 'update failed: SECRET-LOG-LINE' }, extra: { to: '9' },
+      }));
+      s.set('state', 'activating');
+      r = await c.req('GET', '/api/tools/update', { cookie });
+      assert.deepEqual([r.status, r.json], [200, { running: true, versions: { omp: '18.12.6', claude: '2.1.0', codex: '0.164.0' }, last_run: '2026-10-31T06:01:00.000Z', last_ok: false }]);
+      assert.deepEqual(Object.keys(r.json), ['running', 'versions', 'last_run', 'last_ok']);
+      assert.ok(!r.text.includes('SECRET') && !r.text.includes('extra'));
+      fs.writeFileSync(status, JSON.stringify({ omp: { from: '18.12.6', to: '18.12.6', at: 'junk', result: 'current' } }));
+      s.set('state', 'inactive');
+      r = await c.req('GET', '/api/tools/update', { cookie });
+      assert.deepEqual(r.json, { running: false, versions: { omp: '18.12.6', claude: null, codex: null }, last_run: null, last_ok: true });
+      fs.writeFileSync(status, 'not json');
+      assert.deepEqual((await c.req('GET', '/api/tools/update', { cookie })).json.versions, { omp: null, claude: null, codex: null });
+      assert.ok(s.calls().every((a) => a.join(' ') === IS_ACTIVE.join(' '))); // a GET never starts anything
+    }, { systemctl: s.systemctl, updatesFile: status });
+  } finally { s.cleanup(); }
+});
+
+test('updateStatusOf: a failed tool keeps its `from`; a version that is not a plain version string, or no entry, is null; last_run is the newest at', () => {
+  assert.deepEqual(updateStatusOf({}), { versions: { omp: null, claude: null, codex: null }, last_run: null, last_ok: null });
+  assert.deepEqual(updateStatusOf(undefined).versions, { omp: null, claude: null, codex: null });
+  const u = updateStatusOf({ omp: { from: '1.0.0', to: '1.1.0', at: '2026-10-31T01:00:00Z', result: 'updated' }, claude: { from: '2.0.0', to: '2.1.0', at: '2026-10-31T03:00:00Z', result: 'failed' },
+    codex: { from: 'x y; rm', to: '', at: null, result: null } });
+  assert.deepEqual(u, { versions: { omp: '1.1.0', claude: '2.0.0', codex: null }, last_run: '2026-10-31T03:00:00.000Z', last_ok: false });
 });
 
 // box ring: GET /api/home box from the box's own instabox record (hostname instabox-<name>), the estimate otherwise

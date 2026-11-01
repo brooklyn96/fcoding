@@ -44,6 +44,8 @@ Tiến trình đang chạy giữ nguyên thư mục phiên bản nó khởi đ�
 
 Chạy tay: `systemctl --user start fcode-update.service` hoặc `fcode-update [công_cụ ...]`. Mọi lệnh đều có timeout; chỉ một lượt chạy tại một thời điểm (`flock`).
 
+Từ server qua HTTPS: `POST /api/tools/update` (thân rỗng hoặc `{}`) chạy đúng `systemctl --user start --no-block fcode-update.service` (202 `{"started":true}`; 409 `{"error":"running"}` nếu đang chạy; 500 `{"error":"start failed"}`), `GET /api/tools/update` trả `{running, versions:{omp,claude,codex}, last_run, last_ok}` đọc từ `status.json`. Lệnh cố định, không nhận tham số nào từ yêu cầu.
+
 ### Quay lại bản cũ (rollback)
 
 ```bash
