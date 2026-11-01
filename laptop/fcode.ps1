@@ -1566,7 +1566,10 @@ function Get-MoveSshInfo([string]$Alias) {
   foreach ($l in $r.Out) { if ($l -match '\A(\S+)\s+(.*)\z') { $k = $Matches[1].ToLowerInvariant(); if (-not $h.ContainsKey($k)) { $h[$k] = $Matches[2].Trim() } } }
   if (-not $h.ContainsKey('hostname')) { return $null }
   $px = [bool](($h['proxycommand'] -and $h['proxycommand'] -ne 'none') -or ($h['proxyjump'] -and $h['proxyjump'] -ne 'none'))
-  @{ Addr = [string]$h['hostname']; Port = $(if ("$($h['port'])" -match '\A[0-9]+\z') { [int]$h['port'] } else { 22 }); Proxy = $px; HostKeyAlias = [string]$h['hostkeyalias'] }
+  # UserKnownHostsFile of the alias block (`ssh -G` prints it expanded, a list separated by blanks; `none` = no file): the host-key lookup must read the files ssh itself reads
+  $kf = @(); $ukh = [string]$h['userknownhostsfile']
+  if ($ukh -and $ukh -cne 'none') { if ([IO.File]::Exists($ukh)) { $kf = @($ukh) } else { $kf = @($ukh -split '\s+' | Where-Object { $_ -and $_ -cne 'none' }) } }
+  @{ Addr = [string]$h['hostname']; Port = $(if ("$($h['port'])" -match '\A[0-9]+\z') { [int]$h['port'] } else { 22 }); Proxy = $px; HostKeyAlias = [string]$h['hostkeyalias']; KnownHosts = $kf }
 }
 # a machine behind a ProxyCommand / ProxyJump, or at a private, CGNAT (100.64/10), link-local, .local or .lan address, is `home`
 function Test-MoveHome($Info) {
@@ -1588,8 +1591,10 @@ function Get-MoveHostKey($Info) {
   $spec = if ($Info.Port -ne 22) { "[$($Info.Addr)]:$($Info.Port)" } else { [string]$Info.Addr }
   $names = @($spec); if ($Info.HostKeyAlias -and $Info.HostKeyAlias -cne $spec) { $names += $Info.HostKeyAlias }
   $best = $null
+  $files = @($Info.KnownHosts | Where-Object { $_ }); if (-not $files.Count) { $files = @(Get-MoveKnownHostsPath) }   # F3: -f = the alias block's UserKnownHostsFile, the default file otherwise
   foreach ($n in $names) {
-    $r = Invoke-MoveTool 'ssh-keygen' @('-F', $n)
+   foreach ($kf in $files) {
+    $r = Invoke-MoveTool 'ssh-keygen' @('-F', $n, '-f', $kf)
     if ($r.Code -ne 0) { continue }
     foreach ($l in $r.Out) {
       if ("$l" -match '\A#' -or -not ("$l" -match '\A\S+\s+(\S+)\s+([A-Za-z0-9+/=]+)')) { continue }
@@ -1598,6 +1603,8 @@ function Get-MoveHostKey($Info) {
       if (-not $best -or ($type -ceq 'ssh-ed25519' -and $best.Type -cne 'ssh-ed25519')) { $best = @{ Type = $type; Key = $key; Kb = $kb } }
     }
     if ($best) { break }
+   }
+   if ($best) { break }
   }
   if (-not $best) { return $null }
   @{ Line = "$spec $($best.Type) $($best.Key)"; Fp = 'SHA256:' + [Convert]::ToBase64String(([Security.Cryptography.SHA256]::Create()).ComputeHash($best.Kb)).TrimEnd('=') }

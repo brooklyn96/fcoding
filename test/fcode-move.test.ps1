@@ -1370,6 +1370,26 @@ T 'G4 F2: coder alias: a re-run after a kill between the coder write and the sta
   Reset-World; $s = Alias-State; Eq (Set-MoveCoderAlias $s) 0; Set-MoveProp $s.backups 'coder_ssh_config' $null; Save-MoveState $s; $script:Coder.Bak = $false
   Eq (Set-MoveCoderAlias (State)) 0; Eq (State).backups.coder_ssh_config $null 'no .bak on the coder = nothing recorded'
 }
+# ---- G4 F3: the host-key lookup reads the file ssh itself reads ----
+T 'G4 F3: ssh-keygen -F gets -f = the alias block''s UserKnownHostsFile (from ssh -G), the default known_hosts otherwise; a key that is only in the default file is not found through the alias file' {
+  $def = Get-MoveKnownHostsPath
+  # default: no UserKnownHostsFile line
+  Reset-World; $script:KnownByFile = @{ $def = @{ $OldAddr = $KeyOld; $NewAddr = $KeyNew } }
+  $r = Run-Move @('plan', 'newbox'); Eq $r.Code 0 $r.Text; Ok ($script:KeygenCalls.Count -ge 2) 'keygen was called'
+  foreach ($c in $script:KeygenCalls) { Eq $c[2] '-f' "-f given: $($c -join ' ')"; Eq $c[3] $def "default file: $($c -join ' ')" }
+  # the alias block names its own file: the lookup reads that file
+  Reset-World; $alt = Join-Path $Root 'alias-known-hosts'; $script:SshG['contabo'] = @{ Host = $OldAddr; Ukh = $alt }
+  $script:KnownByFile = @{ $alt = @{ $OldAddr = $KeyOld }; $def = @{ $NewAddr = $KeyNew } }
+  $r = Run-Move @('plan', 'newbox'); Eq $r.Code 0 $r.Text
+  $oldCalls = @($script:KeygenCalls | Where-Object { $_[1] -ceq $OldAddr }); Ok ($oldCalls.Count -ge 1) 'old looked up'; foreach ($c in $oldCalls) { Eq $c[3] $alt "old: the alias file: $($c -join ' ')" }
+  $newCalls = @($script:KeygenCalls | Where-Object { $_[1] -ceq $NewAddr }); foreach ($c in $newCalls) { Eq $c[3] $def "new: the default file: $($c -join ' ')" }
+  # the key is only in the default file, the alias file does not have it: ssh would not accept the host either, so plan refuses
+  Reset-World; $script:SshG['contabo'] = @{ Host = $OldAddr; Ukh = $alt }; $script:KnownByFile = @{ $alt = @{}; $def = @{ $OldAddr = $KeyOld; $NewAddr = $KeyNew } }
+  $r = Run-Move @('plan', 'newbox'); Eq $r.Code 65 $r.Text; Ok ($r.Text -match 'INV refuse old-unreachable') 'refused: the alias file has no key'
+  # UserKnownHostsFile none: the default file is used
+  Reset-World; $script:SshG['contabo'] = @{ Host = $OldAddr; Ukh = 'none' }; $script:KnownByFile = @{ $def = @{ $OldAddr = $KeyOld; $NewAddr = $KeyNew } }
+  $r = Run-Move @('plan', 'newbox'); Eq $r.Code 0 $r.Text
+}
 # ============================== round 5 (arbitration: a cutover in flight is a mark) ==============================
 function Seed-Mark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan', [string]$Phase = 'copied') {
   $s = Seed $Phase $Dir $Via $Mark
