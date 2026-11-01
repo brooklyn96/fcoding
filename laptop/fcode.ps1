@@ -1716,7 +1716,12 @@ function Set-MoveLaptopAlias($S) {
     $nd = Get-MoveNewDirectives $text ([string]$S.new.alias) ([string]$S.new.addr)
     if ($nd.Err) { Write-Host "lỗi: $($nd.Err)"; return 1 }
     $r = Convert-MoveSshFwd $text $old $nd.Lines ([string]$S.new.alias) $false
-    if ($r.Why -ceq 'old-exists') { Write-Host "ssh config của máy này: đã có 'Host $old-old', giữ nguyên."; return 0 }
+    if ($r.Why -ceq 'old-exists') {
+      # a run killed between the file write and the state save: the safety copy is on disk but the state does not name it (F1)
+      $bak0 = Get-MovePath ('ssh_config.' + $S.move_id + '.bak')
+      if ([IO.File]::Exists($bak0) -and [string]$S.backups.ssh_config -cne $bak0) { Set-MoveProp $S.backups 'ssh_config' $bak0; Save-MoveState $S }
+      Write-Host "ssh config của máy này: đã có 'Host $old-old', giữ nguyên."; return 0
+    }
     if ($r.Why -ceq 'no-block') { Write-Host "lỗi: ~/.ssh/config của máy này không có khối 'Host $old' để chuyển sang máy mới (nó có nằm trong file Include không?)."; return 1 }
     if ($r.Why -ceq 'shared-block') { Write-Host "lỗi: khối 'Host $old' dùng chung dòng Host với tên khác; tách riêng ra rồi chạy lại cutover."; return 1 }
     $kh = Get-MoveAliasKnownLine $S.new

@@ -44,6 +44,7 @@ $script:Sleeps = New-Object Collections.ArrayList
 function Get-MoveNow { $script:Clock }
 function Wait-Move([int]$Sec) { [void]$script:Sleeps.Add($Sec); $script:Clock = $script:Clock.AddSeconds($Sec) }
 $script:Log = New-Object Collections.ArrayList
+$script:KeygenCalls = New-Object Collections.ArrayList; $script:KnownByFile = @{}   # every ssh-keygen argv; file -> @{ name = key } (empty = the default $script:Known answers whatever -f says)
 $script:GateId = @{}   # host -> the 12-hex gate id its fake status prints ('aaaaaaaaaaaa' when unset; '-' = unreadable)
 $script:SshArgv = New-Object Collections.ArrayList   # the argv of every real ssh call (not ssh -G)
 $script:Rules = New-Object Collections.ArrayList
@@ -167,7 +168,7 @@ function ssh {
     $g = $script:SshG[$a[1]]
     if (-not $g) { $global:LASTEXITCODE = 255; return }
     $global:LASTEXITCODE = 0
-    return @("host $($a[1])", "hostname $($g.Host)", 'user root', "port $(if ($g.Port) { $g.Port } else { 22 })") + @(if ($g.Proxy) { "proxycommand $($g.Proxy)" })
+    return @("host $($a[1])", "hostname $($g.Host)", 'user root', "port $(if ($g.Port) { $g.Port } else { 22 })") + @(if ($g.Proxy) { "proxycommand $($g.Proxy)" }) + @(if ($g.Ukh) { "userknownhostsfile $($g.Ukh)" })
   }
   [void]$script:SshArgv.Add($a); $h = $a[-2]; $remote = $a[-1]
   if ($script:Down -and $h -match $script:Down) { $global:LASTEXITCODE = 255; return }
@@ -189,6 +190,11 @@ function ssh {
 }
 function ssh-keygen {
   $a = @($args | ForEach-Object { [string]$_ })
+  [void]$script:KeygenCalls.Add($a)
+  if ($a[0] -ceq '-F' -and $a.Count -ge 4 -and $a[2] -ceq '-f' -and $script:KnownByFile.Count) {   # a lookup in a named file: only $script:KnownByFile[file][name] exists
+    $kf = $script:KnownByFile[$a[3]]; if ($kf -and $kf.ContainsKey($a[1])) { $global:LASTEXITCODE = 0; return @("# Host $($a[1]) found: line 1", "$($a[1]) ssh-ed25519 $($kf[$a[1]])") }
+    $global:LASTEXITCODE = 1; return
+  }
   if ($a[0] -ceq '-F' -and $script:Known.ContainsKey($a[1])) { $global:LASTEXITCODE = 0; return @("# Host $($a[1]) found: line 1", "$($a[1]) ssh-ed25519 $($script:Known[$a[1]])") }
   $global:LASTEXITCODE = 1
 }
@@ -214,9 +220,9 @@ function Invoke-BoxScript([string]$Script, [string[]]$ScriptArgs) {
   [void]$script:Log.Add("box:$name")
   if (-not $script:Coder.Up) { $global:LASTEXITCODE = 255; return }
   $global:LASTEXITCODE = 0
-  if ($name -like '*read*') { return @("MOVE coder-config exists=yes b64=$([Convert]::ToBase64String($utf8.GetBytes($script:Coder.Config)))") }
+  if ($name -like '*read*') { return @("MOVE coder-config exists=yes bak=$(if ($script:Coder.Bak) { 'yes' } else { 'no' }) b64=$([Convert]::ToBase64String($utf8.GetBytes($script:Coder.Config)))") }
   if ($name -like '*write*') {
-    if ($ScriptArgs[0] -cne '-') { $script:Coder.Config = $utf8.GetString([Convert]::FromBase64String($ScriptArgs[0])) }
+    if ($ScriptArgs[0] -cne '-') { $script:Coder.Bak = $true; $script:Coder.Config = $utf8.GetString([Convert]::FromBase64String($ScriptArgs[0])) }
     if ($ScriptArgs[2] -cne '-' -and $script:Coder.Known -notmatch [regex]::Escape($ScriptArgs[2])) { $script:Coder.Known += $ScriptArgs[2] + "`n" }
     return @('MOVE alias coder done')
   }
@@ -245,7 +251,7 @@ Host cfbox
   ProxyCommand cloudflared access ssh --hostname %h
 "@ -replace "`r`n", "`n"
 function Reset-World {
-  $script:IdleSeq.Clear(); $script:HangN = 0; $script:TimedCalls.Clear(); $script:SshArgv.Clear(); $script:GateId.Clear(); $script:GateVisible = $false
+  $script:IdleSeq.Clear(); $script:HangN = 0; $script:TimedCalls.Clear(); $script:SshArgv.Clear(); $script:GateId.Clear(); $script:GateVisible = $false; $script:KeygenCalls.Clear(); $script:KnownByFile = @{}
   $script:Log.Clear(); $script:Rules.Clear(); $script:Answers.Clear(); $script:Prompts.Clear(); $script:Sleeps.Clear(); $script:GhIn.Clear(); $script:ScriptLog.Clear(); $script:GateIn.Clear()
   $script:Clock = [DateTime]::SpecifyKind([DateTime]'2026-10-29T10:00:00', [DateTimeKind]::Utc)
   $script:Pf = @{}; $script:Tcp = @{}; $script:Mf = $null; $script:Tunneled = $false; $script:Down = $null; $script:GhFail = @{}; $script:DeployHost = $null
@@ -1340,6 +1346,17 @@ T 'Q2 cutover: before the first write dst and src answer `status` with equal gat
   # a resume (mark cutting, dst not started) does not run the check: no status call before the first step
   Reset-World; [void](RwMark 'cutting'); $script:GateVisible = $true; $script:GateId['newbox'] = '111111111111'; $r = Run-Move @('cutover')
   Ok ($script:Log.Count -gt 0 -and $script:Log[0] -notmatch ' status') "resume: first call is not a status: $($script:Log[0])"; Ok (-not $r.Text.Contains('gate-version')) 'resume ignores gate ids'
+}
+# ---- G4 F1 / F2: a kill between the alias write and the state save ----
+T 'G4 F1: laptop alias: a re-run after a kill between the config write and the state save (old block exists, .bak exists) records backups.ssh_config; without a .bak nothing is recorded' {
+  Reset-World; $s = Alias-State; Eq (Set-MoveLaptopAlias $s) 0
+  $bak = Get-MovePath ('ssh_config.' + $s.move_id + '.bak'); Ok ([IO.File]::Exists($bak)) 'the safety copy exists'
+  Set-MoveProp $s.backups 'ssh_config' $null; Save-MoveState $s; Eq (State).backups.ssh_config $null 'the kill: state does not name the copy'
+  $once = Cfg-Text; Eq (Set-MoveLaptopAlias (State)) 0; Eq (State).backups.ssh_config $bak 'recorded on the re-run'; Eq (Cfg-Text) $once 'config unchanged'
+  $s2 = State; Eq (Set-MoveLaptopAlias $s2) 0; Eq (State).backups.ssh_config $bak 'a third run keeps it'
+  # a config that already had Host contabo-old and no copy of ours: nothing to record
+  Reset-World; $s = Alias-State; [IO.File]::AppendAllText((Join-Path (Join-Path $Home2 '.ssh') 'config'), "`nHost contabo-old`n  HostName 10.9.9.9`n", $utf8)
+  Eq (Set-MoveLaptopAlias $s) 0; Eq (State).backups.ssh_config $null 'no .bak file = nothing recorded'
 }
 # ============================== round 5 (arbitration: a cutover in flight is a mark) ==============================
 function Seed-Mark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan', [string]$Phase = 'copied') {
