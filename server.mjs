@@ -2284,11 +2284,12 @@ export function createApp(opts = {}) {
     }
     if (pathname === '/api/tools/update') {
       if (method === 'GET') {
-        let updates = {};
-        try { updates = parseUpdates(fs.readFileSync(updatesFile, 'utf8')); } catch {}
         // GET: only a known state answers; a cut, failed or unknown check is 503, never a guessed "not running" (the client ends its poll on running: false)
         const st = await updateState();
         if (!/^(active|activating|deactivating|reloading|inactive|failed)$/.test(st)) return json(res, 503, { error: 'busy' });
+        // status.json is read after the state: a run that ends between the two would otherwise answer running: false with the pre-end file
+        let updates = {};
+        try { updates = parseUpdates(fs.readFileSync(updatesFile, 'utf8')); } catch {}
         return json(res, 200, { running: !/^(inactive|failed)$/.test(st), ...updateStatusOf(updates) });
       }
       want('POST');

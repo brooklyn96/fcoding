@@ -4666,7 +4666,7 @@ const sysctlStub = () => {
   fs.writeFileSync(path.join(dir, 'systemctl.mjs'), `import fs from 'node:fs';
 const d = ${JSON.stringify(dir)}, a = process.argv.slice(2);
 fs.appendFileSync(d + '/calls.log', JSON.stringify(a) + '\\n');
-if (a[1] === 'is-active') setTimeout(() => { const s = fs.existsSync(d + '/state') ? fs.readFileSync(d + '/state', 'utf8') : 'inactive'; process.stdout.write(s + '\\n'); process.exit(s === 'active' ? 0 : 3); }, fs.existsSync(d + '/check-hang') ? 30000 : 0);
+if (a[1] === 'is-active') setTimeout(() => { if (fs.existsSync(d + '/status-after')) fs.renameSync(d + '/status-after', d + '/status.json'); const s = fs.existsSync(d + '/state') ? fs.readFileSync(d + '/state', 'utf8') : 'inactive'; process.stdout.write(s + '\\n'); process.exit(s === 'active' ? 0 : 3); }, fs.existsSync(d + '/check-hang') ? 30000 : 0);
 else if (a[1] === 'start') {
   if (fs.existsSync(d + '/start-fail')) { process.stderr.write('SECRET-STDERR /etc/hidden'); process.exit(1); }
   setTimeout(() => process.exit(0), fs.existsSync(d + '/start-hang') ? 30000 : fs.existsSync(d + '/start-slow') ? 400 : 0);
@@ -4848,6 +4848,21 @@ test('GET /api/tools/update: {running, versions, last_run, last_ok} from status.
       fs.writeFileSync(status, 'not json');
       assert.deepEqual((await c.req('GET', '/api/tools/update', { cookie })).json.versions, { omp: null, claude: null, codex: null });
       assert.ok(s.calls().every((a) => a.join(' ') === IS_ACTIVE.join(' '))); // a GET never starts anything
+    }, { systemctl: s.systemctl, updatesFile: status });
+  } finally { s.cleanup(); }
+});
+
+test('GET /api/tools/update: status.json is read after is-active, so a run that ends between the two reads answers the post-end file', async () => {
+  const s = sysctlStub();
+  const status = path.join(s.dir, 'status.json');
+  const run = (v) => JSON.stringify({ omp: { from: '1.0.0', to: v, at: '2026-11-01T01:00:00Z', result: 'updated' } });
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      fs.writeFileSync(status, run('1.1.0')); // the file as it is while the run is still going
+      fs.writeFileSync(path.join(s.dir, 'status-after'), run('1.2.0')); // the stub's is-active swaps it in: the run ends during the check
+      const r = await c.req('GET', '/api/tools/update', { cookie });
+      assert.deepEqual([r.status, r.json.running, r.json.versions.omp], [200, false, '1.2.0']);
     }, { systemctl: s.systemctl, updatesFile: status });
   } finally { s.cleanup(); }
 });

@@ -337,4 +337,5 @@ Shared with the iOS worker in `add-project-contract.md` and `add-project-contrac
   - `last_run`: the newest valid `at` of the three tools as an ISO-8601 string (milliseconds, `Z`); null when none.
   - `last_ok`: false when any tool's latest `result` is `failed`; true when there are results and none failed; null when there is no result. `status.json` keeps the latest entry per tool, so this is the latest known per tool, not one run.
   - A missing or broken file: `versions` all null, `last_run` and `last_ok` null.
+  - `status.json` is read after `is-active`, and only on a known state, so a run that ends between the two reads never answers `running: false` with the pre-end file.
 - Tests: `test/server.test.mjs`, tests named `/api/tools/update ...`, `POST /api/tools/update ...`, `GET /api/tools/update ...` and `updateStatusOf ...` (a stub `systemctl` that logs its argv; the real one is never run).
