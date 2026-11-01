@@ -1372,13 +1372,13 @@ T 'G4 F2: coder alias: a re-run after a kill between the coder write and the sta
 }
 # ---- G4 F3: the host-key lookup reads the file ssh itself reads ----
 T 'G4 F3: ssh-keygen -F gets -f = the alias block''s UserKnownHostsFile (from ssh -G), the default known_hosts otherwise; a key that is only in the default file is not found through the alias file' {
-  $def = Get-MoveKnownHostsPath
+  Reset-World; $def = Get-MoveKnownHostsPath
   # default: no UserKnownHostsFile line
   Reset-World; $script:KnownByFile = @{ $def = @{ $OldAddr = $KeyOld; $NewAddr = $KeyNew } }
   $r = Run-Move @('plan', 'newbox'); Eq $r.Code 0 $r.Text; Ok ($script:KeygenCalls.Count -ge 2) 'keygen was called'
   foreach ($c in $script:KeygenCalls) { Eq $c[2] '-f' "-f given: $($c -join ' ')"; Eq $c[3] $def "default file: $($c -join ' ')" }
   # the alias block names its own file: the lookup reads that file
-  Reset-World; $alt = Join-Path $Root 'alias-known-hosts'; $script:SshG['contabo'] = @{ Host = $OldAddr; Ukh = $alt }
+  Reset-World; $alt = Join-Path $Root 'alias-known-hosts'; [IO.File]::WriteAllText($alt, ''); $script:SshG['contabo'] = @{ Host = $OldAddr; Ukh = $alt }
   $script:KnownByFile = @{ $alt = @{ $OldAddr = $KeyOld }; $def = @{ $NewAddr = $KeyNew } }
   $r = Run-Move @('plan', 'newbox'); Eq $r.Code 0 $r.Text
   $oldCalls = @($script:KeygenCalls | Where-Object { $_[1] -ceq $OldAddr }); Ok ($oldCalls.Count -ge 1) 'old looked up'; foreach ($c in $oldCalls) { Eq $c[3] $alt "old: the alias file: $($c -join ' ')" }
@@ -1389,6 +1389,29 @@ T 'G4 F3: ssh-keygen -F gets -f = the alias block''s UserKnownHostsFile (from ss
   # UserKnownHostsFile none: the default file is used
   Reset-World; $script:SshG['contabo'] = @{ Host = $OldAddr; Ukh = 'none' }; $script:KnownByFile = @{ $def = @{ $OldAddr = $KeyOld; $NewAddr = $KeyNew } }
   $r = Run-Move @('plan', 'newbox'); Eq $r.Code 0 $r.Text
+}
+T 'G4 F3b: ssh -G prints blank-separated files (two by default) and paths with blanks (a Windows profile): every existing file is searched (a key in the second one is found), a spaced path is rebuilt from its tokens, the fragments are never passed to ssh-keygen; no existing file = the default known_hosts' {
+  Reset-World; $def = Get-MoveKnownHostsPath
+  $d1 = Join-Path $Root 'kh dir one'; $d2 = Join-Path $Root 'kh2'; [void](New-Item -ItemType Directory -Force -Path $d1, $d2)
+  $a1 = Join-Path $Root 'known_hosts_a'; $a2 = Join-Path $Root 'known_hosts_b'; $s1 = Join-Path $d1 'kh'; $s2 = Join-Path $d1 'kh two'; $p3 = Join-Path $d2 'plain'
+  foreach ($f in $a1, $a2, $s1, $s2, $p3) { [IO.File]::WriteAllText($f, '') }
+  # two files, the key only in the second (OpenSSH prints `known_hosts known_hosts2` by default)
+  Reset-World; $script:SshG['contabo'] = @{ Host = $OldAddr; Ukh = "$a1 $a2" }; $script:KnownByFile = @{ $a1 = @{}; $a2 = @{ $OldAddr = $KeyOld }; $def = @{ $NewAddr = $KeyNew } }
+  $r = Run-Move @('plan', 'newbox'); Eq $r.Code 0 $r.Text
+  $oc = @($script:KeygenCalls | Where-Object { $_[1] -ceq $OldAddr } | ForEach-Object { $_[3] }); Eq ($oc -join '|') "$a1|$a2" 'both files searched, in order'
+  # two files whose paths hold blanks, the key only in the second
+  Reset-World; $script:SshG['contabo'] = @{ Host = $OldAddr; Ukh = "$s1 $s2" }; $script:KnownByFile = @{ $s1 = @{}; $s2 = @{ $OldAddr = $KeyOld }; $def = @{ $NewAddr = $KeyNew } }
+  $r = Run-Move @('plan', 'newbox'); Eq $r.Code 0 $r.Text
+  $oc = @($script:KeygenCalls | Where-Object { $_[1] -ceq $OldAddr } | ForEach-Object { $_[3] }); Eq ($oc -join '|') "$s1|$s2" 'spaced paths rebuilt whole'
+  foreach ($c in $script:KeygenCalls) { Ok ($c[3] -notmatch '\A(kh|dir|one|two)\z' -and [IO.File]::Exists($c[3]) -or $c[3] -ceq $def) "no fragment: $($c -join ' ')" }
+  # a spaced path next to a plain one; a quoted form; a missing file is skipped
+  Reset-World; $script:SshG['contabo'] = @{ Host = $OldAddr; Ukh = "$s2 $p3 /nonexistent/x y" }; $script:KnownByFile = @{ $s2 = @{}; $p3 = @{ $OldAddr = $KeyOld }; $def = @{ $NewAddr = $KeyNew } }
+  $r = Run-Move @('plan', 'newbox'); Eq $r.Code 0 $r.Text; $oc = @($script:KeygenCalls | Where-Object { $_[1] -ceq $OldAddr } | ForEach-Object { $_[3] }); Eq ($oc -join '|') "$s2|$p3"
+  Reset-World; $script:SshG['contabo'] = @{ Host = $OldAddr; Ukh = "`"$s2`" `"$p3`"" }; $script:KnownByFile = @{ $s2 = @{ $OldAddr = $KeyOld }; $p3 = @{}; $def = @{ $NewAddr = $KeyNew } }
+  $r = Run-Move @('plan', 'newbox'); Eq $r.Code 0 $r.Text; $oc = @($script:KeygenCalls | Where-Object { $_[1] -ceq $OldAddr } | ForEach-Object { $_[3] }); Eq ($oc -join '|') "$s2" 'quotes stripped; the search stops at the first file that has the key'
+  # none of the listed files exists: the default file
+  Reset-World; $script:SshG['contabo'] = @{ Host = $OldAddr; Ukh = '/nonexistent/a /nonexistent/b c' }; $script:KnownByFile = @{ $def = @{ $OldAddr = $KeyOld; $NewAddr = $KeyNew } }
+  $r = Run-Move @('plan', 'newbox'); Eq $r.Code 0 $r.Text; $oc = @($script:KeygenCalls | Where-Object { $_[1] -ceq $OldAddr } | ForEach-Object { $_[3] }); Eq ($oc -join '|') $def 'default file'
 }
 # ---- G4 F4: the finish texts name the machine that is shut down ----
 T 'G4 F4: Q-finish, the second question and the done line name the alias of the machine shut down: old in a forward run, new in a back run' {

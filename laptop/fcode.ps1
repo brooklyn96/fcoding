@@ -1566,9 +1566,18 @@ function Get-MoveSshInfo([string]$Alias) {
   foreach ($l in $r.Out) { if ($l -match '\A(\S+)\s+(.*)\z') { $k = $Matches[1].ToLowerInvariant(); if (-not $h.ContainsKey($k)) { $h[$k] = $Matches[2].Trim() } } }
   if (-not $h.ContainsKey('hostname')) { return $null }
   $px = [bool](($h['proxycommand'] -and $h['proxycommand'] -ne 'none') -or ($h['proxyjump'] -and $h['proxyjump'] -ne 'none'))
-  # UserKnownHostsFile of the alias block (`ssh -G` prints it expanded, a list separated by blanks; `none` = no file): the host-key lookup must read the files ssh itself reads
+  # UserKnownHostsFile of the alias block: `ssh -G` prints it expanded, unquoted and blank-separated (two files by default, and a path may hold a blank: a Windows profile).
+  # Keep the files that exist, rebuilding a path from consecutive tokens (longest existing first); `none` = no file. No existing file = the default known_hosts is used by Get-MoveHostKey.
   $kf = @(); $ukh = [string]$h['userknownhostsfile']
-  if ($ukh -and $ukh -cne 'none') { if ([IO.File]::Exists($ukh)) { $kf = @($ukh) } else { $kf = @($ukh -split '\s+' | Where-Object { $_ -and $_ -cne 'none' }) } }
+  if ($ukh -and $ukh -cne 'none') {
+    $tk = @([regex]::Matches($ukh, '"([^"]*)"|(\S+)') | ForEach-Object { if ($_.Groups[1].Success) { $_.Groups[1].Value } else { $_.Groups[2].Value } })
+    for ($i = 0; $i -lt $tk.Count; $i++) {
+      for ($j = $tk.Count - 1; $j -ge $i; $j--) {   # longest first: "kh" and "kh two" (a blank in the name) are two different files
+        $c = ($tk[$i..$j] -join ' ')
+        if ([IO.File]::Exists($c)) { $kf += $c; $i = $j; break }
+      }
+    }
+  }
   @{ Addr = [string]$h['hostname']; Port = $(if ("$($h['port'])" -match '\A[0-9]+\z') { [int]$h['port'] } else { 22 }); Proxy = $px; HostKeyAlias = [string]$h['hostkeyalias']; KnownHosts = $kf }
 }
 # a machine behind a ProxyCommand / ProxyJump, or at a private, CGNAT (100.64/10), link-local, .local or .lan address, is `home`
