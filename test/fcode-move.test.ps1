@@ -1525,6 +1525,10 @@ T 'Q11 back run: gate ids that differ are never refreshed (new is src and serves
   Reset-World; [void](Seed 'planned' 'back' 'back'); $script:GateVisible = $true; $script:GateId['contabo'] = 'abcdef012345'; $script:GateId['newbox'] = '111111111111'; $script:Pf['newbox'] = $PfEmpty
   $r = Run-Move @('copy'); Eq $r.Code 65 $r.Text; Ok ($r.Text.Contains('INV refuse gate-version side=old')) $r.Text; Ok ($r.Text.Contains("Cài cổng trên 'contabo' từ cùng commit với 'newbox' (install.sh), rồi chạy lại  fcode move copy.")) $r.Text
   Eq @($script:ScriptLog | Where-Object { $_.Name -ceq 'bootstrap gate' }).Count 1 'one bootstrap, no refresh'; Eq @($script:ScriptLog | Where-Object { $_.Text -notmatch 'if \[ -e' -and $_.Name -ceq 'bootstrap gate' }).Count 0 'no script without the skip'; Eq (Count '^newbox init') 0; Eq (State).phase 'planned'
+  # no preflight at all in a back run, and a failing one cannot change the answer
+  Eq @($script:ScriptLog | Where-Object { $_.Name -ceq 'preflight' }).Count 0 'back run: no preflight on new'
+  Reset-World; [void](Seed 'planned' 'back' 'back'); $script:GateVisible = $true; $script:GateId['contabo'] = 'abcdef012345'; $script:GateId['newbox'] = '111111111111'; Add-Rule 'newbox' 'script:preflight' -Code 1 -Out @('MOVE error no-space')
+  $r = Run-Move @('copy'); Eq $r.Code 65 $r.Text; Ok ($r.Text.Contains('INV refuse gate-version side=old')) $r.Text; Eq @($script:ScriptLog | Where-Object { $_.Name -ceq 'preflight' }).Count 0 'a failing preflight is never reached'
   # forward: the same ids and an empty new are refreshed (the refresh fixes it)
   Reset-World; [void](Seed 'planned'); $script:GateVisible = $true; $script:GateId['contabo'] = 'abcdef012345'; $script:GateId['newbox'] = '111111111111'; $script:Pf['newbox'] = $PfEmpty
   Add-Rule 'newbox' 'script:bootstrap gate' -Do { param($h, $n, $a, $t) if ($t -notmatch 'if \[ -e') { $script:GateId['newbox'] = 'abcdef012345' } }
