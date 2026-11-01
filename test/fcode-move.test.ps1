@@ -1318,6 +1318,29 @@ T 'Q1 copy: equal ids = status of src and of new between (d) and (e), nothing el
     $r = Run-Move @('copy'); Eq $r.Code 1 "${dead}: $($r.Text)"; Ok ($r.Text.Contains("ssh $dead")) "${dead}: remedy names ssh: $($r.Text)"; Eq (Count '^newbox init') 0 "${dead}: init not run"
   }
 }
+# ---- R2 item 2 (Q2): the cutover checks dst and src before its first write ----
+T 'Q2 cutover: before the first write dst and src answer `status` with equal gate ids; different = exit 65 + INV refuse gate-version (side new in fwd, old in back) + remedy, an unanswering machine = exit 1 + `ssh <alias>` remedy; nothing frozen or stopped, no question, mark null, state.json byte-identical; a resume does not do it' {
+  foreach ($c in @(@('fwd', 'plan', 'newbox', 'contabo', 'new'), @('back', 'back', 'contabo', 'newbox', 'old'))) {
+    $d = $c[0]; $dst = $c[2]; $src = $c[3]
+    Reset-World; [void](Seed 'copied' $d $c[1]); $script:GateVisible = $true; $script:GateId[$dst] = '111111111111'; $script:GateId[$src] = 'abcdef012345'
+    $bytes = [IO.File]::ReadAllText((Get-MovePath 'state.json')); Yes
+    $r = Run-Move @('cutover'); Eq $r.Code 65 "${d}: $($r.Text)"
+    Ok ($r.Text.Contains("INV refuse gate-version side=$($c[4])")) "${d}: $($r.Text)"; Ok ($r.Text.Contains("Cài cổng trên '$dst' từ cùng commit với '$src' (install.sh), rồi chạy lại  fcode move cutover.")) "${d}: remedy: $($r.Text)"
+    Eq (Count ' (freeze|stop|start|dump|prepare)') 0 "${d}: nothing frozen or stopped"; Eq $script:Prompts.Count 0 "${d}: no question"; Eq (State).mark $null; Eq ([IO.File]::ReadAllText((Get-MovePath 'state.json'))) $bytes "${d}: state unchanged"
+    Eq (Count 'gh workflow') 0 "${d}: no workflow touched"
+    foreach ($dead in $dst, $src) {
+      Reset-World; [void](Seed 'copied' $d $c[1]); $script:GateVisible = $true; Add-Rule $dead ' status$' -Code 255; $bytes = [IO.File]::ReadAllText((Get-MovePath 'state.json')); Yes
+      $r = Run-Move @('cutover'); Eq $r.Code 1 "${d} ${dead}: $($r.Text)"; Ok ($r.Text.Contains("ssh $dead")) "${d} ${dead}: $($r.Text)"
+      Eq (Count ' (freeze|stop|start|dump|prepare)') 0 "${d} ${dead}: nothing frozen or stopped"; Eq (State).mark $null; Eq ([IO.File]::ReadAllText((Get-MovePath 'state.json'))) $bytes "${d} ${dead}: state unchanged"; Eq $script:Prompts.Count 0 "${d} ${dead}: no question"
+    }
+  }
+  # equal ids: both statuses are the first calls (dst, then src), before the freeze
+  Reset-World; [void](Seed 'copied'); $script:GateVisible = $true; Yes; $r = Run-Move @('cutover'); Eq $r.Code 0 $r.Text
+  Eq $script:Log[0] 'newbox status' 'dst first'; Eq $script:Log[1] 'contabo status' 'then src'; Ordered @('^newbox status', '^contabo status', '^contabo freeze')
+  # a resume (mark cutting, dst not started) does not run the check: no status call before the first step
+  Reset-World; [void](RwMark 'cutting'); $script:GateVisible = $true; $script:GateId['newbox'] = '111111111111'; $r = Run-Move @('cutover')
+  Ok ($script:Log.Count -gt 0 -and $script:Log[0] -notmatch ' status') "resume: first call is not a status: $($script:Log[0])"; Ok (-not $r.Text.Contains('gate-version')) 'resume ignores gate ids'
+}
 # ============================== round 5 (arbitration: a cutover in flight is a mark) ==============================
 function Seed-Mark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan', [string]$Phase = 'copied') {
   $s = Seed $Phase $Dir $Via $Mark

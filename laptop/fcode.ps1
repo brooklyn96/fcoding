@@ -2469,6 +2469,11 @@ function Invoke-MoveCutover($S) {
       Write-Host "Chưa chuyển được: bản ghi DNS cũ còn trong thời gian TTL, cần chờ thêm khoảng $([int][Math]::Ceiling(($nb - $now).TotalMinutes)) phút (đến $(Format-MoveTs $nb)). Chưa chạy gì."
       return 65
     }
+    # Q2 (C16): everything whose failure would roll the cutover back is checked before the first write: dst and src answer, and run the same gate
+    $dstP = Get-MoveDstHost $S; $srcP = Get-MoveSrcHost $S
+    $gi = Get-MoveGateIds $dstP $srcP
+    if ($gi.Code -ne 0) { Write-MoveUnreachable $gi.Host 'cutover'; Write-Host 'Chưa chạy gì.'; return 1 }
+    if (-not $gi.Same) { Write-MoveGateRefusal $(if ([string]$S.dir -ceq 'fwd') { 'new' } else { 'old' }) $dstP $srcP 'cutover'; Write-Host 'Chưa chạy gì.'; return 65 }
     $key = if ([string]$S.via -ceq 'back') { 'back' } else { 'cut' }
     if (-not $S.answers.$key) {
       if (-not (Confirm-MoveYes (Get-MoveQuestion $key $S))) { Write-Host 'Đã huỷ, chưa đổi gì.'; return 65 }
