@@ -2290,7 +2290,8 @@ function Invoke-MoveCopy($S) {
   if (-not $gi.Same) {
     $pf = Invoke-MoveScript $newH (Get-MovePreflightScript) @() -Quiet
     if ($pf.Code -ne 0) { return (ConvertTo-MoveExit $pf.Code) }
-    if ((ConvertFrom-MovePreflight $pf.Lines).Projects -eq 0) {
+    $pfv = ConvertFrom-MovePreflight $pf.Lines
+    if ($fwd -and $pfv.Projects -eq 0) {   # Q11: a forward run only (in a back run new is src and serves the apps; old is already dst and refuses a sender); Q12: nothing served = no project and no operator key
       Write-Host "copy (d): cổng trên '$newH' khác cổng trên '$oldH' và máy mới chưa có project nào: chép lại cổng..."
       $g = Invoke-MoveScript $newH (Get-MoveBootstrapGateScript -Refresh) $gateArgs
       if ($g.Code -ne 0) { return (ConvertTo-MoveExit $g.Code) }

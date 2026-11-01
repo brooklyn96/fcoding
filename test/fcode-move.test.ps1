@@ -1519,6 +1519,17 @@ T 'Q9 cutover: when a read-only gh call for an enabled ssh-push workflow fails, 
   # healthy gh: one read per enabled workflow, before the first gate verb
   Reset-World; [void](Seed 'copied'); Yes; $r = Run-Move @('cutover'); Eq $r.Code 0 $r.Text; Ok ((Idx '^gh run list') -ge 0 -and (Idx '^gh run list') -lt (Idx '^contabo freeze')) 'the read comes before the freeze'
 }
+# ---- INT-2 Q11 / Q12 ----
+T 'Q11 back run: gate ids that differ are never refreshed (new is src and serves the apps): one bootstrap, INV refuse gate-version side=old with the remedy, exit 65, even when new serves nothing; a forward run still refreshes an empty new' {
+  $PfEmpty = @('INV host os=ubuntu-24.04 arch=x86_64 cpus=4 mem_mb=8000 swap_mb=0 tz=Asia/Singapore node_major=0', 'INV disk mount=/ used_mb=1 free_mb=900000', 'INV target moveid=- peer=- projects=0 operators=0')
+  Reset-World; [void](Seed 'planned' 'back' 'back'); $script:GateVisible = $true; $script:GateId['contabo'] = 'abcdef012345'; $script:GateId['newbox'] = '111111111111'; $script:Pf['newbox'] = $PfEmpty
+  $r = Run-Move @('copy'); Eq $r.Code 65 $r.Text; Ok ($r.Text.Contains('INV refuse gate-version side=old')) $r.Text; Ok ($r.Text.Contains("Cài cổng trên 'contabo' từ cùng commit với 'newbox' (install.sh), rồi chạy lại  fcode move copy.")) $r.Text
+  Eq @($script:ScriptLog | Where-Object { $_.Name -ceq 'bootstrap gate' }).Count 1 'one bootstrap, no refresh'; Eq @($script:ScriptLog | Where-Object { $_.Text -notmatch 'if \[ -e' -and $_.Name -ceq 'bootstrap gate' }).Count 0 'no script without the skip'; Eq (Count '^newbox init') 0; Eq (State).phase 'planned'
+  # forward: the same ids and an empty new are refreshed (the refresh fixes it)
+  Reset-World; [void](Seed 'planned'); $script:GateVisible = $true; $script:GateId['contabo'] = 'abcdef012345'; $script:GateId['newbox'] = '111111111111'; $script:Pf['newbox'] = $PfEmpty
+  Add-Rule 'newbox' 'script:bootstrap gate' -Do { param($h, $n, $a, $t) if ($t -notmatch 'if \[ -e') { $script:GateId['newbox'] = 'abcdef012345' } }
+  $r = Run-Move @('copy'); Eq $r.Code 0 $r.Text; Eq @($script:ScriptLog | Where-Object { $_.Name -ceq 'bootstrap gate' }).Count 2 'forward refresh still runs'
+}
 # ============================== round 5 (arbitration: a cutover in flight is a mark) ==============================
 function Seed-Mark([string]$Mark, [string]$Dir = 'fwd', [string]$Via = 'plan', [string]$Phase = 'copied') {
   $s = Seed $Phase $Dir $Via $Mark
