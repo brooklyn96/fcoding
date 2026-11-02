@@ -2512,6 +2512,37 @@ test('ansi=1: SSE stream sends SGR text and a colour-only change is a new event'
   assert.ok(await until(() => c.app.stats().streams === 0));
 }));
 
+test('SSE: a key or text sent to the session shows its new screen at once, not on the next poll tick', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  await mkSession(c, cookie);
+  await mkSession(c, cookie, 'other');
+  setSession(c, 'work', { screen: 'one\n' }); setSession(c, 'other', { screen: 'other one\n' });
+  const open = (name) => new Promise((resolve, reject) => {
+    let buf = '';
+    const req = http.request({ host: '127.0.0.1', port: c.port, path: `/api/stream/${name}`, headers: { Cookie: cookie } }, (res) => {
+      res.setEncoding('utf8'); res.on('data', (d) => { buf += d; });
+      resolve({ req, texts: () => [...buf.matchAll(/event: screen\ndata: (.*)\n/g)].map((m) => JSON.parse(m[1]).text) });
+    });
+    req.on('error', reject); req.end();
+  });
+  const s = await open('work'), o = await open('other');
+  assert.ok(await until(() => s.texts().length === 1 && o.texts().length === 1));
+  await new Promise((r) => setTimeout(r, 100)); // the first poll tick (5 s away) has not run
+  setSession(c, 'work', { screen: 'two\n' }); setSession(c, 'other', { screen: 'other two\n' });
+  const t0 = Date.now();
+  assert.equal((await c.req('POST', '/api/key/work', { cookie, body: { key: 'M-a' } })).status, 200);
+  assert.ok(await until(() => s.texts().length === 2, 1500), 'a key did not wake the stream');
+  assert.ok(Date.now() - t0 < 1500);
+  assert.deepEqual(s.texts()[1], 'two');
+  assert.equal(o.texts().length, 1, 'a key to one session woke the stream of another');
+  setSession(c, 'work', { screen: 'three\n' });
+  assert.equal((await c.req('POST', '/api/send/work', { cookie, body: { text: 'hi', enter: true } })).status, 200);
+  assert.ok(await until(() => s.texts().length === 3, 1500), 'text did not wake the stream');
+  s.req.destroy(); o.req.destroy();
+  assert.ok(await until(() => c.app.stats().streams === 0));
+  assert.equal((await c.req('POST', '/api/key/work', { cookie, body: { key: 'Escape' } })).status, 200); // no stream left to wake: nothing breaks
+}, { pollMs: 5000 }));
+
 // ======================= T35: delta=1 (SSE `patch` events) =======================
 const openSse = (c, cookie, query) => new Promise((resolve, reject) => {
   let buf = '';

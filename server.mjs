@@ -19,6 +19,7 @@ const COOKIE_MAX_AGE = 30 * 24 * 3600;
 const BODY_LIMIT = 64 * 1024;
 const TEXT_LIMIT = 32 * 1024;
 const LONG_TEXT = 500; // bytes; longer single lines are pasted, not typed
+const POKE_MS = [0, 100, 250]; // after a key or text: when the session's streams look at the screen again (omp needs ~90 ms to close the hub on Esc)
 // v1.3.3 image upload (CONTRACT A12): POST /api/projects/<name>/upload. Content-Type -> file extension and the magic bytes the body must start with
 const UPLOAD_LIMIT = 10 * 1024 * 1024;
 const UPLOAD_KEEP_MS = 7 * 24 * 3600e3; // a file in .fcode/uploads older than this is deleted by the next upload
@@ -2114,16 +2115,25 @@ export function createApp(opts = {}) {
 
   // --- SSE ---
   let streams = 0;
+  // A key or text just reached the session: its streams look at the screen now and twice more while the harness redraws,
+  // instead of waiting for their next poll tick (up to pollMs). Streams register a wake function under the session name.
+  const wakers = new Map();
+  const poke = (name) => {
+    for (const ms of POKE_MS) setTimeout(() => wakers.get(name)?.forEach((w) => w()), ms).unref();
+  };
   // delta: after the first (full) event, send `patch` (changed lines vs the last SENT screen) when it is clearly smaller
   async function stream(req, res, name, lines, ctx, ansi, delta = false) {
     if (streams >= MAX_STREAMS) throw new HttpErr(503, 'busy');
     streams++; // reserved before any await
-    let closed = false; let paused = false; let inflight = false;
+    let closed = false; let paused = false; let inflight = false; let again = false;
     let timer = null; let pingTimer = null; let drainTimer = null; let last = null; let lastLines = null;
+    let wake = null; // set once tick exists
     const cleanup = () => { // exactly once on every path
       if (closed) return;
       closed = true; streams--;
       clearTimeout(timer); clearInterval(pingTimer); clearTimeout(drainTimer);
+      wakers.get(name)?.delete(wake);
+      if (!wakers.get(name)?.size) wakers.delete(name);
     };
     res.on('close', cleanup); // registered before the first await
     try {
@@ -2147,7 +2157,7 @@ export function createApp(opts = {}) {
         res.end(`event: gone\ndata: ${JSON.stringify({ reason })}\n\n`);
         cleanup();
       };
-      const schedule = () => { if (!closed && !paused && !timer && !inflight) timer = setTimeout(tick, pollMs); };
+      const schedule = () => { if (!closed && !paused && !timer && !inflight) { timer = setTimeout(tick, again ? 0 : pollMs); again = false; } };
       const tick = async () => {
         timer = null;
         if (closed || paused) return; // no polling while paused; 'drain' reschedules
@@ -2175,7 +2185,14 @@ export function createApp(opts = {}) {
         } finally { inflight = false; snap = null; }
         schedule();
       };
+      wake = () => {
+        if (closed || paused) return;
+        if (inflight) { again = true; return; } // that capture may predate the key: look once more right after it
+        clearTimeout(timer); timer = null; tick();
+      };
       pingTimer = setInterval(() => send(': ping\n\n'), pingMs);
+      if (!wakers.has(name)) wakers.set(name, new Set());
+      wakers.get(name).add(wake);
       send('retry: 3000\n\n');
       tick();
     } catch (e) {
@@ -2419,6 +2436,7 @@ export function createApp(opts = {}) {
         if (Buffer.byteLength(text) > TEXT_LIMIT) throw new HttpErr(413, 'too_large');
         if (text.includes('\0') || (!text && !enter)) throw new HttpErr(400, 'invalid');
         await mutate(ctx, () => sendText(name, text, enter === true, ctx));
+        poke(name);
         return json(res, 200, { ok: true });
       }
       if (verb === 'key') {
@@ -2426,6 +2444,7 @@ export function createApp(opts = {}) {
         if (typeof k !== 'string' || !KEYS.includes(k)) throw new HttpErr(400, 'bad_key');
         if (!Number.isInteger(repeat) || repeat < 1 || repeat > 20) throw new HttpErr(400, 'invalid');
         await mutate(ctx, () => run(ctx, ['send-keys', '-t', pane(name), ...Array(repeat).fill(k)]));
+        poke(name);
         return json(res, 200, { ok: true });
       }
       const { cols, rows } = b; // resize
