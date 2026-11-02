@@ -2187,6 +2187,7 @@ export function createApp(opts = {}) {
       };
       wake = () => {
         if (closed) return;
+        if (paused) { clearTimeout(timer); timer = null; } // 'drain' then schedules the look at once, not after the rest of a pending poll
         if (paused || inflight) { again = true; return; } // paused: the first look after 'drain' comes at once; in flight: that capture may predate the key: look once more right after it
         clearTimeout(timer); timer = null; tick();
       };

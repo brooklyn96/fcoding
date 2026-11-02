@@ -2570,8 +2570,13 @@ test('SSE: a wake while a capture is in flight gets one follow-up look (the capt
   await sleep(100);
   // capture-pane reads the screen at once, display-message answers 800 ms later: a capture started by the key is in flight until then
   await withEnv({ FAKE_TMUX_DELAYS: JSON.stringify({ 'display-message': 800 }) }, async () => {
+    const count = (cmd) => c.calls().filter((x) => x.argv[0] === cmd).length;
+    const caps0 = count('capture-pane'), dms0 = count('display-message');
     assert.equal((await c.req('POST', '/api/key/work', { cookie, body: { key: 'Enter' } })).status, 200);
-    await sleep(450); // that capture has read 'before'; the pokes at +100 and +250 found it in flight
+    // the key's capture has read 'before' (its process exited) while its display-message is still waiting: the capture is in flight
+    assert.ok(await until(() => count('capture-pane') > caps0, 700), 'the key started no capture');
+    assert.equal(count('display-message'), dms0, 'the capture finished before the screen changed (slow runner): not in flight');
+    await sleep(300); // the pokes at +100 and +250 found it in flight
     setSession(c, 'work', { screen: 'after\n' });
     assert.ok(await until(() => s.texts().length === 2, 4000), 'no follow-up look after the capture that was in flight');
     assert.deepEqual(s.texts()[1], 'after');
@@ -2580,6 +2585,34 @@ test('SSE: a wake while a capture is in flight gets one follow-up look (the capt
   assert.ok(await until(() => c.app.stats().streams === 0));
   assert.equal(c.app.stats().wakers, 0);
 }, { pollMs: 5000 }));
+
+test('SSE: a key while the stream is paused by a ping waits for drain, then the first look comes at once (not after the poll tick)', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  await mkSession(c, cookie);
+  setSession(c, 'work', { screen: 'one\n' });
+  let sres = null;
+  c.app.server.on('request', (req, res) => { if (req.url.startsWith('/api/stream/')) sres = res; });
+  const s = await openTexts(c, cookie, 'work');
+  assert.ok(await until(() => s.texts().length === 1));
+  const orig = sres.write.bind(sres);
+  let hit = false;
+  sres.write = (chunk, ...rest) => {
+    const r = orig(chunk, ...rest);
+    if (!hit && String(chunk).startsWith(': ping')) { hit = true; return false; } // socket "full": paused, the poll timer (5 s) is pending
+    return r;
+  };
+  assert.ok(await until(() => hit, 3000), 'no ping');
+  setSession(c, 'work', { screen: 'two\n' });
+  assert.equal((await c.req('POST', '/api/key/work', { cookie, body: { key: 'Escape' } })).status, 200);
+  await sleep(400); // past the last poke (250 ms)
+  assert.equal(s.texts().length, 1, 'event written while paused');
+  sres.emit('drain'); // the phone reads again
+  assert.ok(await until(() => s.texts().length === 2, 1500), 'no look right after drain');
+  assert.deepEqual(s.texts()[1], 'two');
+  s.req.destroy();
+  assert.ok(await until(() => c.app.stats().streams === 0));
+  assert.equal(c.app.stats().wakers, 0);
+}, { pollMs: 5000, pingMs: 100 }));
 
 // ======================= T35: delta=1 (SSE `patch` events) =======================
 const openSse = (c, cookie, query) => new Promise((resolve, reject) => {
