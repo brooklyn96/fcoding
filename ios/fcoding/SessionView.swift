@@ -109,7 +109,7 @@ struct SessionView: View {
                     },
                     onKey: { key in model.key(key) },
                     focused: $composerFocused,
-                    isOmp: chipHarness == "omp",
+                    harness: chipHarness,
                     pinned: $composerPinned,
                     onHide: hideComposer,
                     onSent: { if !composerPinned { hideComposer() } },
@@ -656,12 +656,17 @@ private struct QuickKey {
     var symbol: String? = nil
     /// Only for omp: in bash C-o runs the line, in claude it toggles the transcript.
     var ompOnly = false
+    /// The Agents key: omp gets the key itself, claude and codex get a slash command (`agentCommands`).
+    var agents = false
 }
+
+/// What the Agents key sends as text (with Enter) where the harness has no key for it.
+private let agentCommands = ["claude": "/tasks", "codex": "/subagents"]
 
 private let quickKeys: [QuickKey] = [
     QuickKey(title: "Esc", key: "Escape", label: "Phím Escape"),
-    // omp agent hub (Alt+A): ↑/↓ chọn, Enter mở, Esc đóng.
-    QuickKey(title: "Agents", key: "M-a", label: "Mở danh sách agent của omp", symbol: "person.2", ompOnly: true),
+    // omp agent hub (Alt+A): ↑/↓ chọn, Enter mở, Esc đóng. claude /tasks, codex /subagents.
+    QuickKey(title: "Agents", key: "M-a", label: "Mở danh sách agent", symbol: "person.2", agents: true),
     QuickKey(title: "Ctrl+C", key: "C-c", label: "Control C, dừng"),
     QuickKey(title: "↑", key: "Up", label: "Mũi tên lên"),
     QuickKey(title: "↓", key: "Down", label: "Mũi tên xuống"),
@@ -689,8 +694,11 @@ struct ComposerView: View {
     let onSend: (String, Bool) -> Task<Bool, Never>
     let onKey: (String) -> Void
     var focused: FocusState<Bool>.Binding
-    /// omp session: show the agent-hub keys (Agents, ^O) and /hub.
-    var isOmp = false
+    /// The session's harness (nil when unknown). omp shows the agent-hub keys (Agents, ^O) and /hub;
+    /// claude and codex show Agents too, as a slash command.
+    var harness: String? = nil
+    private var isOmp: Bool { harness == "omp" }
+    private var agentCommand: String? { harness.flatMap { agentCommands[$0] } }
     @Binding var pinned: Bool
     let onHide: () -> Void
     /// After a successful send that emptied the draft.
@@ -933,8 +941,10 @@ struct ComposerView: View {
                     keyLabel("/")
                 }
                 .accessibilityLabel("Lệnh gạch chéo")
-                ForEach(quickKeys.filter { isOmp || !$0.ompOnly }, id: \.key) { k in
-                    Button { onKey(k.key) } label: { keyLabel(k.title, symbol: k.symbol) }
+                ForEach(quickKeys.filter { $0.agents ? (isOmp || agentCommand != nil) : (isOmp || !$0.ompOnly) }, id: \.key) { k in
+                    Button {
+                        if k.agents, let cmd = agentCommand { _ = onSend(cmd, true) } else { onKey(k.key) }
+                    } label: { keyLabel(k.title, symbol: k.symbol) }
                         .accessibilityLabel(k.label)
                 }
             }
