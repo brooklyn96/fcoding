@@ -78,7 +78,7 @@ Các bước chi tiết có trong app: bấm nút **?** (Hướng dẫn) ở gó
   - Hàng phím nhanh: Esc, Ctrl+C, mũi tên, Tab, ⇧Tab, Enter, y, n. Nút **/** chèn các lệnh hay dùng (/model, /clear, …). Các phím được gửi đúng thứ tự bạn bấm.
   - Phím **Agents** có trong phiên omp, Claude Code và Codex: omp nhận phím Alt+A, Claude Code nhận `/tasks` + Enter, Codex nhận `/subagents` + Enter (gửi qua đường gửi chữ thường).
     - omp: mở Agent Hub; chọn bằng ↑ / ↓, bấm **Enter** để mở, **Esc** để đóng.
-    - Claude Code: `/tasks` chạy ngay cả khi Claude đang làm; bấm **Enter** để mở một subagent; các phím khác xem trên màn hình.
+    - Claude Code: `/tasks` chạy ngay cả khi Claude đang làm; bấm **Enter** để mở một subagent; các phím khác xem trên màn hình. Bấm **Esc** đóng danh sách trước khi gửi chữ: trong danh sách, `x` dừng subagent đang chọn (`f` đưa nó lên trước).
     - Codex: `/subagents` dùng được khi Codex đang làm; các phím xem trên màn hình.
     - Ở Claude Code và Codex, lệnh được gõ vào dòng nhập: thứ đang có sẵn ở đó (đường dẫn ảnh đã gắn, chữ gửi bằng "Gửi không Enter") sẽ bị gửi kèm. Phím mờ đi trong lúc đang gửi ảnh hay gửi chữ.
   - Chỉ trong phiên omp: thêm phím **^O** (mở rộng một mục) và lệnh **/hub**.

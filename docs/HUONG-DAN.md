@@ -297,7 +297,7 @@ Hướng dẫn đầy đủ cho app nằm ở [ios/README.md, mục 4](../ios/RE
 - Hàng phím nhanh: Esc, **Agents**, Ctrl+C, mũi tên, Tab, ⇧Tab, Enter, y, n, **^O**. Nút `/` chèn các lệnh hay dùng như `/model`, `/clear`. Phím được gửi đúng thứ tự bạn bấm.
 - **Agents**: mở danh sách agent con. Phím **Agents** không hiện ở phiên shell hay phiên không rõ chương trình.
   - Phiên omp: gửi Alt+A, mở Agent Hub. Dùng ↑↓ chọn, Enter mở, Esc đóng.
-  - Phiên Claude Code: gõ lệnh `/tasks` rồi Enter. Lệnh chạy ngay cả khi Claude đang làm. Bấm Enter để mở một subagent; các phím khác xem trên màn hình.
+  - Phiên Claude Code: gõ lệnh `/tasks` rồi Enter. Lệnh chạy ngay cả khi Claude đang làm. Bấm Enter để mở một subagent; các phím khác xem trên màn hình. Bấm Esc đóng danh sách trước khi gửi chữ: trong danh sách, phím `x` dừng subagent đang chọn (`f` đưa nó lên trước).
   - Phiên Codex: gõ lệnh `/subagents` rồi Enter. Dùng được khi Codex đang làm; các phím xem trên màn hình.
   - Trong Claude Code và Codex, phím này gõ vào dòng nhập của chương trình, nên thứ đang có sẵn ở đó (đường dẫn ảnh vừa gắn, chữ đã gửi bằng "Gửi không Enter") sẽ bị gửi kèm. Phím mờ đi trong lúc đang gửi ảnh hay đang gửi chữ.
 - **^O** (Ctrl+O) mở rộng nội dung và chỉ hiện trong phiên omp.

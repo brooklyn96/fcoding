@@ -942,11 +942,12 @@ struct ComposerView: View {
                 }
                 .accessibilityLabel("Lệnh gạch chéo")
                 ForEach(quickKeys.filter { $0.agents ? (isOmp || agentCommand != nil) : (isOmp || !$0.ompOnly) }, id: \.key) { k in
+                    // A typed command would be sent after an image path or draft text still in flight.
+                    let off = k.agents && agentCommand != nil && (imageBusy || sending)
                     Button {
                         if k.agents, let cmd = agentCommand { _ = onSend(cmd, true) } else { onKey(k.key) }
-                    } label: { keyLabel(k.title, symbol: k.symbol) }
-                        // A typed command would be sent after an image path or draft text still in flight.
-                        .disabled(k.agents && agentCommand != nil && (imageBusy || sending))
+                    } label: { keyLabel(k.title, symbol: k.symbol).opacity(off ? 0.4 : 1) }
+                        .disabled(off)
                         .accessibilityLabel(k.label)
                 }
             }
