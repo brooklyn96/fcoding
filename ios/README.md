@@ -76,7 +76,12 @@ Các bước chi tiết có trong app: bấm nút **?** (Hướng dẫn) ở gó
   - Nút tròn **↑** bên phải ô nhập = **Gửi** (gửi rồi nhấn Enter). Bấm khi ô trống = chỉ nhấn Enter. **Giữ lâu** nút này để chọn **Gửi không Enter**.
   - Nội dung đang soạn được giữ lại cho từng phiên (kể cả khi ẩn khung gõ, hay khi iPhone bị gỡ khỏi box và phải ghép lại). Nó bị xoá khi gửi thành công, khi bạn xoá phiên đó, hoặc khi bạn tự gỡ máy (**Gỡ iPhone này** / **Gỡ mọi thiết bị**).
   - Hàng phím nhanh: Esc, Ctrl+C, mũi tên, Tab, ⇧Tab, Enter, y, n. Nút **/** chèn các lệnh hay dùng (/model, /clear, …). Các phím được gửi đúng thứ tự bạn bấm.
-  - Phím **Agents** có trong phiên omp, Claude Code và Codex: omp nhận phím Alt+A, Claude Code nhận `/tasks` + Enter, Codex nhận `/subagents` + Enter (gửi qua đường gửi chữ thường). Chọn bằng ↑ / ↓, bấm **Enter** để mở, **Esc** để quay ra. Chỉ trong phiên omp: thêm phím **^O** (mở rộng một mục) và lệnh **/hub**.
+  - Phím **Agents** có trong phiên omp, Claude Code và Codex: omp nhận phím Alt+A, Claude Code nhận `/tasks` + Enter, Codex nhận `/subagents` + Enter (gửi qua đường gửi chữ thường).
+    - omp: mở Agent Hub; chọn bằng ↑ / ↓, bấm **Enter** để mở, **Esc** để đóng.
+    - Claude Code: `/tasks` chạy ngay cả khi Claude đang làm; bấm **Enter** để mở một subagent; các phím khác xem trên màn hình.
+    - Codex: `/subagents` dùng được khi Codex đang làm; các phím xem trên màn hình.
+    - Ở Claude Code và Codex, lệnh được gõ vào dòng nhập: thứ đang có sẵn ở đó (đường dẫn ảnh đã gắn, chữ gửi bằng "Gửi không Enter") sẽ bị gửi kèm. Phím mờ đi trong lúc đang gửi ảnh hay gửi chữ.
+  - Chỉ trong phiên omp: thêm phím **^O** (mở rộng một mục) và lệnh **/hub**.
   - Khi xoay ngang: ô nhập thấp lại để màn hình còn chỗ; nút ghim và **⌄** nằm cạnh ô nhập; bấm nút **phím nhanh** bên trái ô nhập để hiện / ẩn hàng phím nhanh.
   - Khi bạn chuyển sang ứng dụng khác, kết nối tạm dừng; mở lại ứng dụng là tự kết nối lại.
 - **Cài đặt** (bánh răng):

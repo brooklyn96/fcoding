@@ -945,6 +945,8 @@ struct ComposerView: View {
                     Button {
                         if k.agents, let cmd = agentCommand { _ = onSend(cmd, true) } else { onKey(k.key) }
                     } label: { keyLabel(k.title, symbol: k.symbol) }
+                        // A typed command would be sent after an image path or draft text still in flight.
+                        .disabled(k.agents && agentCommand != nil && (imageBusy || sending))
                         .accessibilityLabel(k.label)
                 }
             }
