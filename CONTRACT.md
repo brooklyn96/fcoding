@@ -21,7 +21,8 @@ S7 Security headers on every response: Content-Security-Policy "default-src 'sel
 S8 Never log passwords, cookies or sent text; log only method, path, status, ms, and numbers: `at=HH:MM:SS.mmm sock=<id>#<n> conn=<ms>ms lag=<ms>ms` (lag = arrival minus the app's `X-PC-Sent` epoch-ms header, only when it is a plain integer within a day; header text is never logged), plus `event loop blocked <ms>ms until=HH:MM:SS.mmm` when the loop stalls over 200 ms.
 
 HARNESSES (command run inside the tmux session, cwd = project dir): omp -> `omp`, claude -> `claude`, codex -> `codex`, shell -> `bash -l`. tmux sessions get env LANG=C.UTF-8 LC_ALL=C.UTF-8.
-KEYS whitelist (tmux send-keys names): Enter, Escape, Tab, BTab, Up, Down, Left, Right, PageUp, PageDown, Home, End, BSpace, C-c, C-d, C-l, C-o, C-r, C-u, C-z, M-a, y, n, Space. (M-a = Alt+A opens the omp agent hub; C-o expands tool output (e.g. in an agent opened from the hub).)
+KEYS whitelist (tmux send-keys names): Enter, Escape, Tab, BTab, Up, Down, Left, Right, PageUp, PageDown, Home, End, BSpace, C-c, C-d, C-l, C-o, C-r, C-u, C-z, M-a, y, n, Space. (M-a = Alt+A opens the omp agent hub; C-o expands tool output (e.g. in an agent opened from the hub). The app's Agents key sends M-a only in omp sessions; in claude sessions it sends the text `/tasks` and in codex sessions `/subagents`, with Enter, through POST /api/send.)
+After a successful POST /api/key or /api/send, every open stream of that session captures the screen again at once and twice more (+100 ms, +250 ms), instead of waiting for the next 700 ms poll tick (unless paused: the first look comes at once after drain; an in-flight capture gets one follow-up); the event format is unchanged.
 
 API (JSON; errors as {error:"code"} with HTTP status):
 - POST /api/login {password} -> 200 {ok:true} + Set-Cookie | 401 {error:"bad_password"} | 429 {error:"rate_limited", retryAfter:s}

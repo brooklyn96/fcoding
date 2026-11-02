@@ -2512,6 +2512,108 @@ test('ansi=1: SSE stream sends SGR text and a colour-only change is a new event'
   assert.ok(await until(() => c.app.stats().streams === 0));
 }));
 
+const openTexts = (c, cookie, name) => new Promise((resolve, reject) => { // an SSE stream of one session; texts() = the screen events so far
+  let buf = '';
+  const req = http.request({ host: '127.0.0.1', port: c.port, path: `/api/stream/${name}`, headers: { Cookie: cookie } }, (res) => {
+    res.setEncoding('utf8'); res.on('data', (d) => { buf += d; });
+    resolve({ req, texts: () => [...buf.matchAll(/event: screen\ndata: (.*)\n/g)].map((m) => JSON.parse(m[1]).text) });
+  });
+  req.on('error', reject); req.end();
+});
+
+test('SSE: a key or text sent to the session shows its new screen at once, not on the next poll tick', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  await mkSession(c, cookie);
+  await mkSession(c, cookie, 'other');
+  setSession(c, 'work', { screen: 'one\n' }); setSession(c, 'other', { screen: 'other one\n' });
+  const s = await openTexts(c, cookie, 'work'), o = await openTexts(c, cookie, 'other');
+  assert.ok(await until(() => s.texts().length === 1 && o.texts().length === 1));
+  await sleep(100); // the first poll tick (5 s away) has not run
+  setSession(c, 'work', { screen: 'two\n' }); setSession(c, 'other', { screen: 'other two\n' });
+  assert.equal((await c.req('POST', '/api/key/work', { cookie, body: { key: 'M-a' } })).status, 200);
+  assert.ok(await until(() => s.texts().length === 2, 1500), 'a key did not wake the stream');
+  assert.deepEqual(s.texts()[1], 'two');
+  await sleep(400); // past the last poke (250 ms): a wake of the other session's stream would have landed by now
+  assert.equal(o.texts().length, 1, 'a key to one session woke the stream of another');
+  setSession(c, 'work', { screen: 'three\n' });
+  assert.equal((await c.req('POST', '/api/send/work', { cookie, body: { text: 'hi', enter: true } })).status, 200);
+  assert.ok(await until(() => s.texts().length === 3, 1500), 'text did not wake the stream');
+  s.req.destroy(); o.req.destroy();
+  assert.ok(await until(() => c.app.stats().streams === 0));
+  assert.equal(c.app.stats().wakers, 0, 'a closed stream left its wake function registered');
+  assert.equal((await c.req('POST', '/api/key/work', { cookie, body: { key: 'Escape' } })).status, 200); // no stream left to wake: nothing breaks
+}, { pollMs: 5000 }));
+
+test('SSE: a screen that redraws after the key (omp closing its hub) arrives with the follow-up looks, long before the next poll tick', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  await mkSession(c, cookie);
+  setSession(c, 'work', { screen: 'hub\n' });
+  const s = await openTexts(c, cookie, 'work');
+  assert.ok(await until(() => s.texts().length === 1));
+  await sleep(100);
+  assert.equal((await c.req('POST', '/api/key/work', { cookie, body: { key: 'Escape' } })).status, 200);
+  await sleep(150); // the redraw lands after the first look (+0) and before the last (+250)
+  setSession(c, 'work', { screen: 'closed\n' });
+  assert.ok(await until(() => s.texts().length === 2, 1500), 'the follow-up looks missed the redraw');
+  assert.deepEqual(s.texts()[1], 'closed');
+  s.req.destroy();
+  assert.ok(await until(() => c.app.stats().streams === 0));
+  assert.equal(c.app.stats().wakers, 0);
+}, { pollMs: 5000 }));
+
+test('SSE: a wake while a capture is in flight gets one follow-up look (the capture may predate the key)', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  await mkSession(c, cookie);
+  setSession(c, 'work', { screen: 'before\n' });
+  const s = await openTexts(c, cookie, 'work');
+  assert.ok(await until(() => s.texts().length === 1));
+  await sleep(100);
+  // capture-pane reads the screen at once, display-message answers 800 ms later: a capture started by the key is in flight until then
+  await withEnv({ FAKE_TMUX_DELAYS: JSON.stringify({ 'display-message': 800 }) }, async () => {
+    const count = (cmd) => c.calls().filter((x) => x.argv[0] === cmd).length;
+    const caps0 = count('capture-pane'), dms0 = count('display-message');
+    assert.equal((await c.req('POST', '/api/key/work', { cookie, body: { key: 'Enter' } })).status, 200);
+    // the key's capture has read 'before' (its process exited) while its display-message is still waiting: the capture is in flight
+    assert.ok(await until(() => count('capture-pane') > caps0, 700), 'the key started no capture');
+    assert.equal(count('display-message'), dms0, 'the capture finished before the screen changed (slow runner): not in flight');
+    await sleep(300); // the pokes at +100 and +250 found it in flight
+    setSession(c, 'work', { screen: 'after\n' });
+    assert.ok(await until(() => s.texts().length === 2, 4000), 'no follow-up look after the capture that was in flight');
+    assert.deepEqual(s.texts()[1], 'after');
+  });
+  s.req.destroy();
+  assert.ok(await until(() => c.app.stats().streams === 0));
+  assert.equal(c.app.stats().wakers, 0);
+}, { pollMs: 5000 }));
+
+test('SSE: a key while the stream is paused by a ping waits for drain, then the first look comes at once (not after the poll tick)', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  await mkSession(c, cookie);
+  setSession(c, 'work', { screen: 'one\n' });
+  let sres = null;
+  c.app.server.on('request', (req, res) => { if (req.url.startsWith('/api/stream/')) sres = res; });
+  const s = await openTexts(c, cookie, 'work');
+  assert.ok(await until(() => s.texts().length === 1));
+  const orig = sres.write.bind(sres);
+  let hit = false;
+  sres.write = (chunk, ...rest) => {
+    const r = orig(chunk, ...rest);
+    if (!hit && String(chunk).startsWith(': ping')) { hit = true; return false; } // socket "full": paused, the poll timer (5 s) is pending
+    return r;
+  };
+  assert.ok(await until(() => hit, 3000), 'no ping');
+  setSession(c, 'work', { screen: 'two\n' });
+  assert.equal((await c.req('POST', '/api/key/work', { cookie, body: { key: 'Escape' } })).status, 200);
+  await sleep(400); // past the last poke (250 ms)
+  assert.equal(s.texts().length, 1, 'event written while paused');
+  sres.emit('drain'); // the phone reads again
+  assert.ok(await until(() => s.texts().length === 2, 1500), 'no look right after drain');
+  assert.deepEqual(s.texts()[1], 'two');
+  s.req.destroy();
+  assert.ok(await until(() => c.app.stats().streams === 0));
+  assert.equal(c.app.stats().wakers, 0);
+}, { pollMs: 5000, pingMs: 100 }));
+
 // ======================= T35: delta=1 (SSE `patch` events) =======================
 const openSse = (c, cookie, query) => new Promise((resolve, reject) => {
   let buf = '';
