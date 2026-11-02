@@ -2186,8 +2186,8 @@ export function createApp(opts = {}) {
         schedule();
       };
       wake = () => {
-        if (closed || paused) return;
-        if (inflight) { again = true; return; } // that capture may predate the key: look once more right after it
+        if (closed) return;
+        if (paused || inflight) { again = true; return; } // paused: the first look after 'drain' comes at once; in flight: that capture may predate the key: look once more right after it
         clearTimeout(timer); timer = null; tick();
       };
       pingTimer = setInterval(() => send(': ping\n\n'), pingMs);
@@ -2527,7 +2527,7 @@ export function createApp(opts = {}) {
     ]);
   };
   const homeIdle = () => Promise.all([quota, listing, spend, projects, staging, ompGuard].map((m) => m.settled())); // tests: no refresh still running
-  return { server, listen, close, devices, tickBox, homeIdle, stats: () => ({ streams, running, reads, waiting: queue.length, active: !!active, addJobs: addJobs.size }) };
+  return { server, listen, close, devices, tickBox, homeIdle, stats: () => ({ streams, wakers: wakers.size, running, reads, waiting: queue.length, active: !!active, addJobs: addJobs.size }) };
 }
 
 // ---------- CLI ----------

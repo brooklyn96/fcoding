@@ -2512,35 +2512,73 @@ test('ansi=1: SSE stream sends SGR text and a colour-only change is a new event'
   assert.ok(await until(() => c.app.stats().streams === 0));
 }));
 
+const openTexts = (c, cookie, name) => new Promise((resolve, reject) => { // an SSE stream of one session; texts() = the screen events so far
+  let buf = '';
+  const req = http.request({ host: '127.0.0.1', port: c.port, path: `/api/stream/${name}`, headers: { Cookie: cookie } }, (res) => {
+    res.setEncoding('utf8'); res.on('data', (d) => { buf += d; });
+    resolve({ req, texts: () => [...buf.matchAll(/event: screen\ndata: (.*)\n/g)].map((m) => JSON.parse(m[1]).text) });
+  });
+  req.on('error', reject); req.end();
+});
+
 test('SSE: a key or text sent to the session shows its new screen at once, not on the next poll tick', () => withApp(async (c) => {
   const { cookie } = await c.login();
   await mkSession(c, cookie);
   await mkSession(c, cookie, 'other');
   setSession(c, 'work', { screen: 'one\n' }); setSession(c, 'other', { screen: 'other one\n' });
-  const open = (name) => new Promise((resolve, reject) => {
-    let buf = '';
-    const req = http.request({ host: '127.0.0.1', port: c.port, path: `/api/stream/${name}`, headers: { Cookie: cookie } }, (res) => {
-      res.setEncoding('utf8'); res.on('data', (d) => { buf += d; });
-      resolve({ req, texts: () => [...buf.matchAll(/event: screen\ndata: (.*)\n/g)].map((m) => JSON.parse(m[1]).text) });
-    });
-    req.on('error', reject); req.end();
-  });
-  const s = await open('work'), o = await open('other');
+  const s = await openTexts(c, cookie, 'work'), o = await openTexts(c, cookie, 'other');
   assert.ok(await until(() => s.texts().length === 1 && o.texts().length === 1));
-  await new Promise((r) => setTimeout(r, 100)); // the first poll tick (5 s away) has not run
+  await sleep(100); // the first poll tick (5 s away) has not run
   setSession(c, 'work', { screen: 'two\n' }); setSession(c, 'other', { screen: 'other two\n' });
-  const t0 = Date.now();
   assert.equal((await c.req('POST', '/api/key/work', { cookie, body: { key: 'M-a' } })).status, 200);
   assert.ok(await until(() => s.texts().length === 2, 1500), 'a key did not wake the stream');
-  assert.ok(Date.now() - t0 < 1500);
   assert.deepEqual(s.texts()[1], 'two');
+  await sleep(400); // past the last poke (250 ms): a wake of the other session's stream would have landed by now
   assert.equal(o.texts().length, 1, 'a key to one session woke the stream of another');
   setSession(c, 'work', { screen: 'three\n' });
   assert.equal((await c.req('POST', '/api/send/work', { cookie, body: { text: 'hi', enter: true } })).status, 200);
   assert.ok(await until(() => s.texts().length === 3, 1500), 'text did not wake the stream');
   s.req.destroy(); o.req.destroy();
   assert.ok(await until(() => c.app.stats().streams === 0));
+  assert.equal(c.app.stats().wakers, 0, 'a closed stream left its wake function registered');
   assert.equal((await c.req('POST', '/api/key/work', { cookie, body: { key: 'Escape' } })).status, 200); // no stream left to wake: nothing breaks
+}, { pollMs: 5000 }));
+
+test('SSE: a screen that redraws after the key (omp closing its hub) arrives with the follow-up looks, long before the next poll tick', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  await mkSession(c, cookie);
+  setSession(c, 'work', { screen: 'hub\n' });
+  const s = await openTexts(c, cookie, 'work');
+  assert.ok(await until(() => s.texts().length === 1));
+  await sleep(100);
+  assert.equal((await c.req('POST', '/api/key/work', { cookie, body: { key: 'Escape' } })).status, 200);
+  await sleep(150); // the redraw lands after the first look (+0) and before the last (+250)
+  setSession(c, 'work', { screen: 'closed\n' });
+  assert.ok(await until(() => s.texts().length === 2, 1500), 'the follow-up looks missed the redraw');
+  assert.deepEqual(s.texts()[1], 'closed');
+  s.req.destroy();
+  assert.ok(await until(() => c.app.stats().streams === 0));
+  assert.equal(c.app.stats().wakers, 0);
+}, { pollMs: 5000 }));
+
+test('SSE: a wake while a capture is in flight gets one follow-up look (the capture may predate the key)', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  await mkSession(c, cookie);
+  setSession(c, 'work', { screen: 'before\n' });
+  const s = await openTexts(c, cookie, 'work');
+  assert.ok(await until(() => s.texts().length === 1));
+  await sleep(100);
+  // capture-pane reads the screen at once, display-message answers 800 ms later: a capture started by the key is in flight until then
+  await withEnv({ FAKE_TMUX_DELAYS: JSON.stringify({ 'display-message': 800 }) }, async () => {
+    assert.equal((await c.req('POST', '/api/key/work', { cookie, body: { key: 'Enter' } })).status, 200);
+    await sleep(450); // that capture has read 'before'; the pokes at +100 and +250 found it in flight
+    setSession(c, 'work', { screen: 'after\n' });
+    assert.ok(await until(() => s.texts().length === 2, 4000), 'no follow-up look after the capture that was in flight');
+    assert.deepEqual(s.texts()[1], 'after');
+  });
+  s.req.destroy();
+  assert.ok(await until(() => c.app.stats().streams === 0));
+  assert.equal(c.app.stats().wakers, 0);
 }, { pollMs: 5000 }));
 
 // ======================= T35: delta=1 (SSE `patch` events) =======================
