@@ -54,8 +54,9 @@ struct TopCard: View {
 }
 
 /// 88 pt ring in the old box ring's place: the session working now and how long it has been
-/// working (ticks every second, server clock). With several, the next one every 5 s; a tap moves
-/// on at once. None: "Rảnh".
+/// working (h:mm:ss, ticks every second, server clock). With several, the next one every 5 s; a
+/// tap moves on at once. None: "Rảnh". A list that is not live (saved copy, failed or old
+/// refresh: HomeLogic.timerLive) shows a dimmed "—" with no count and no roll.
 struct SessionTimer: View {
     @ObservedObject var home: HomeModel
     let visible: Bool
@@ -67,17 +68,35 @@ struct SessionTimer: View {
 
     private var list: [WorkingSession] { home.home?.working ?? [] }
     private var rolling: Bool { visible && scenePhase == .active && list.count > 1 }
+    private func live(_ now: Date) -> Bool {
+        HomeLogic.timerLive(fromCache: home.fromCache, failed: home.failed, loadedAt: home.loadedAt, now: now)
+    }
+
+    /// The widest time, "88:88:88", fits the 62 pt column at this size (19 pt or less).
+    private static let timeFont: UIFont = {
+        let base = UIFont.monospacedDigitSystemFont(ofSize: 19, weight: .semibold)
+        let width = ("88:88:88" as NSString).size(withAttributes: [.font: base]).width
+        return UIFont.monospacedDigitSystemFont(ofSize: 19 * min(1, 60 / max(1, width)), weight: .semibold)
+    }()
 
     var body: some View {
         TimelineView(.periodic(from: Date(), by: 1)) { ctx in
+            let isLive = live(ctx.date)
             let i = HomeLogic.timerIndex(current, in: list)
             let shown: WorkingSession? = list.isEmpty ? nil : list[i]
             let secs = shown.map { HomeLogic.workingSeconds($0, now: home.serverNow(ctx.date)) } ?? 0
-            Button(action: next) { ring(shown, index: i, seconds: secs) }
-                .buttonStyle(.plain)
-                .accessibilityLabel(label(shown, index: i, seconds: secs))
-                .accessibilityHint(list.count > 1 ? "Chạm để xem phiên kế tiếp." : "")
-                .accessibilityAddTraits(.updatesFrequently)
+            let face = ring(isLive ? shown : nil, live: isLive, index: i, seconds: secs)
+            Group {
+                if isLive && list.count > 1 {
+                    Button(action: next) { face }
+                        .buttonStyle(.plain)
+                        .accessibilityHint("Chạm để xem phiên kế tiếp.")
+                } else {
+                    face.accessibilityElement(children: .ignore)
+                }
+            }
+            .accessibilityLabel(label(isLive ? shown : nil, live: isLive, index: i, seconds: secs))
+            .accessibilityAddTraits(.updatesFrequently)
         }
         // The list changed and the shown session left it: start again from the first.
         .onChange(of: list.map(\.name)) { names in
@@ -87,13 +106,13 @@ struct SessionTimer: View {
             }
         }
         // As QuotaTile: one loop tied to the view's place on screen; it ends off screen, in the
-        // background and with fewer than two sessions.
+        // background and with fewer than two sessions, and does not move while the list is stale.
         .task(id: rolling) {
             guard rolling else { return }
             lastMove = Date()
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 250_000_000)
-                guard !Task.isCancelled, Date().timeIntervalSince(lastMove) >= HomeLogic.timerStep else { continue }
+                guard !Task.isCancelled, live(Date()), Date().timeIntervalSince(lastMove) >= HomeLogic.timerStep else { continue }
                 next()
             }
         }
@@ -105,7 +124,7 @@ struct SessionTimer: View {
         withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.3)) { current = HomeLogic.timerNext(current, in: list) }
     }
 
-    private func ring(_ s: WorkingSession?, index: Int, seconds: Int) -> some View {
+    private func ring(_ s: WorkingSession?, live: Bool, index: Int, seconds: Int) -> some View {
         let tint = s.map { HarnessStyle.color($0.harness) } ?? Color.l3
         return ZStack {
             Circle().stroke(Color(hex: 0x767680, alpha: 0.22), lineWidth: 6).padding(3)
@@ -121,18 +140,22 @@ struct SessionTimer: View {
                         .minimumScaleFactor(0.75)
                         .truncationMode(.middle)
                     Text(HomeLogic.elapsed(seconds))
-                        .font(.system(size: 19, weight: .semibold).monospacedDigit())
+                        .font(Font(SessionTimer.timeFont as CTFont))
                         .foregroundColor(.white)
                         .lineLimit(1)
                         .minimumScaleFactor(0.6)
                     if list.count > 1 {
                         Text("\(index + 1)/\(list.count)")
                             .font(.system(size: 9.5, weight: .medium).monospacedDigit())
-                            .foregroundColor(.l3)
+                            .foregroundColor(.l2)
                     }
-                } else {
+                } else if live {
                     Text("Rảnh")
                         .font(.system(size: 17, weight: .semibold))
+                        .foregroundColor(.l2)
+                } else {
+                    Text("—")
+                        .font(.system(size: 22, weight: .semibold))
                         .foregroundColor(.l2)
                 }
             }
@@ -140,11 +163,13 @@ struct SessionTimer: View {
             .id(s?.name)
             .transition(.opacity)
         }
+        .opacity(live ? 1 : 0.45)
         .frame(width: 88, height: 88)
         .contentShape(Circle())
     }
 
-    private func label(_ s: WorkingSession?, index: Int, seconds: Int) -> String {
+    private func label(_ s: WorkingSession?, live: Bool, index: Int, seconds: Int) -> String {
+        guard live else { return "Đồng hồ phiên: chưa có số liệu mới từ box." }
         guard let s = s else { return "Rảnh: không có phiên nào đang làm." }
         let pos = list.count > 1 ? " Phiên \(index + 1) trên \(list.count)." : ""
         return "Phiên \(s.name) đang làm được \(HomeLogic.elapsedSpoken(seconds))." + pos

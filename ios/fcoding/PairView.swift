@@ -223,7 +223,7 @@ struct UnsupportedServerView: View {
             (Text("Địa chỉ máy chủ đã lưu không còn được hỗ trợ (") + Text(address).font(.body.monospaced())
                 + Text("). Ghép lại để tiếp tục."))
                 .multilineTextAlignment(.center)
-            Text("Chỉ dùng được tên miền chữ thường không dấu, có dấu chấm (ví dụ box.instabox.tech), hoặc địa chỉ IP.")
+            Text("Chỉ dùng được tên miền chữ thường không dấu, có dấu chấm (ví dụ fcode.example.com), hoặc địa chỉ IP.")
                 .font(.subheadline)
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)

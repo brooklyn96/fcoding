@@ -796,6 +796,16 @@ enum HomeLogic {
 
     /// Seconds each working session stays on the top card before the next one.
     static let timerStep: TimeInterval = 5
+    /// GET /api/home period while the project list is on screen (it carries `working`).
+    static let homePoll: TimeInterval = 15
+
+    /// The `working` list may be shown as live: a reply from this launch (not the saved copy),
+    /// the last refresh did not fail, and it arrived within two home polls. `now` and `loadedAt`
+    /// are phone clock.
+    static func timerLive(fromCache: Bool, failed: Bool, loadedAt: Date?, now: Date) -> Bool {
+        guard !fromCache, !failed, let at = loadedAt else { return false }
+        return now.timeIntervalSince(at) <= 2 * homePoll
+    }
 
     /// The session shown: `current` while it is still in the list, else the first (0 when empty).
     static func timerIndex(_ current: String?, in list: [WorkingSession]) -> Int {
@@ -813,10 +823,10 @@ enum HomeLogic {
         max(0, Int(now.timeIntervalSince1970 - s.since))
     }
 
-    /// "m:ss" under an hour, "h:mm:ss" from one hour.
+    /// Always "h:mm:ss" ("0:12:30").
     static func elapsed(_ seconds: Int) -> String {
         let s = max(0, seconds)
-        return s < 3600 ? "\(s / 60):\(pad2(s % 60))" : "\(s / 3600):\(pad2(s % 3600 / 60)):\(pad2(s % 60))"
+        return "\(s / 3600):\(pad2(s % 3600 / 60)):\(pad2(s % 60))"
     }
 
     /// VoiceOver: "1 giờ 5 phút 3 giây" (zero leading units left out).
@@ -1276,10 +1286,20 @@ enum HomeLogic {
         eq("timer list kept", timerIndex("b", in: [wk[2], wk[1]]), 1)
         eq("timer list dropped", timerIndex("c", in: [wk[0], wk[1]]), 0)
         eq("elapsed h", elapsed(workingSeconds(wk[0], now: now)), "1:02:05")
-        eq("elapsed m", elapsed(workingSeconds(wk[1], now: now)), "1:05")
-        eq("elapsed s", elapsed(5), "0:05")
-        eq("elapsed 59:59", elapsed(3599), "59:59")
+        eq("elapsed m", elapsed(workingSeconds(wk[1], now: now)), "0:01:05")
+        eq("elapsed s", elapsed(5), "0:00:05")
+        eq("elapsed zero", elapsed(0), "0:00:00")
+        eq("elapsed 12:30", elapsed(12 * 60 + 30), "0:12:30")
+        eq("elapsed 59:59", elapsed(3599), "0:59:59")
         eq("elapsed 1h", elapsed(3600), "1:00:00")
+        eq("elapsed 99h", elapsed(100 * 3600 - 1), "99:59:59")
+        // Stale list: the saved copy, a failed refresh, or older than two home polls is not live.
+        eq("live fresh", timerLive(fromCache: false, failed: false, loadedAt: now.addingTimeInterval(-10), now: now), true)
+        eq("live two polls", timerLive(fromCache: false, failed: false, loadedAt: now.addingTimeInterval(-30), now: now), true)
+        eq("live too old", timerLive(fromCache: false, failed: false, loadedAt: now.addingTimeInterval(-31), now: now), false)
+        eq("live cache", timerLive(fromCache: true, failed: false, loadedAt: now, now: now), false)
+        eq("live failed", timerLive(fromCache: false, failed: true, loadedAt: now, now: now), false)
+        eq("live no reply", timerLive(fromCache: false, failed: false, loadedAt: nil, now: now), false)
         eq("elapsed long", elapsed(30 * 3600 + 61), "30:01:01")
         eq("elapsed future", workingSeconds(WorkingSession(name: "f", since: t0 + 30), now: now), 0)
         // Phone 4 min fast: phone + offset is the server clock, so the count is unchanged.

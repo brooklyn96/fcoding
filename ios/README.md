@@ -46,7 +46,7 @@ Các bước chi tiết có trong app: bấm nút **?** (Hướng dẫn) ở gó
 
 ## 4. Cách dùng
 
-- **Màn hình chính** (thanh trên cùng cuộn theo danh sách; chỉ có nút **?** Hướng dẫn và **⚙** Cài đặt). Phiên tự cập nhật mỗi 5 giây, hạn mức và dự án mỗi phút; kéo xuống để cập nhật ngay.
+- **Màn hình chính** (thanh trên cùng cuộn theo danh sách; chỉ có nút **?** Hướng dẫn và **⚙** Cài đặt). Phiên tự cập nhật mỗi 5 giây, hạn mức, dự án và đồng hồ phiên mỗi 15 giây; kéo xuống để cập nhật ngay.
   - **Đồng hồ phiên** (bên trái thẻ trên cùng): tên phiên đang làm và đã làm được bao lâu (giờ:phút:giây). Nhiều phiên thì tự chuyển sang phiên kế mỗi 5 giây; chạm để chuyển ngay. Không phiên nào đang làm thì hiện **Rảnh**.
   - **Ô hạn mức** (bên phải): mỗi lần một tài khoản, tự chuyển sang tài khoản kế mỗi 4 giây (giữ ngón tay trên ô để dừng). Chạm để mở màn hình **Hạn mức**.
   - Dòng **đang chạy · chờ bạn**: chạm để nhảy tới phiên tương ứng.
