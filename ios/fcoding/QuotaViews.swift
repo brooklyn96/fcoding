@@ -34,19 +34,120 @@ enum QuotaLinks {
 
 // MARK: - Top card
 
-/// One quota account at a time, rolling to the next every 4 s (tap = Hạn mức detail).
+/// Left: the session timer (tap = next session). Right: one quota account at a time, rolling to
+/// the next every 4 s (tap = Hạn mức detail).
 struct TopCard: View {
     @ObservedObject var home: HomeModel
-    /// The main screen is on top and the app active: the tile may roll.
+    /// The main screen is on top and the app active: the tile and the timer may roll.
     let visible: Bool
     let onQuota: () -> Void
 
     var body: some View {
         HStack(spacing: 14) {
+            SessionTimer(home: home, visible: visible)
+            Rectangle().fill(Color.hair).frame(width: 0.5, height: 88).accessibilityHidden(true)
             QuotaTile(home: home, visible: visible, onTap: onQuota)
         }
         .padding(16)
         .background(Color.grp, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+}
+
+/// 88 pt ring in the old box ring's place: the session working now and how long it has been
+/// working (ticks every second, server clock). With several, the next one every 5 s; a tap moves
+/// on at once. None: "Rảnh".
+struct SessionTimer: View {
+    @ObservedObject var home: HomeModel
+    let visible: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
+    /// The name shown; a name that left the list falls back to the first (HomeLogic.timerIndex).
+    @State private var current: String?
+    @State private var lastMove = Date()
+
+    private var list: [WorkingSession] { home.home?.working ?? [] }
+    private var rolling: Bool { visible && scenePhase == .active && list.count > 1 }
+
+    var body: some View {
+        TimelineView(.periodic(from: Date(), by: 1)) { ctx in
+            let i = HomeLogic.timerIndex(current, in: list)
+            let shown: WorkingSession? = list.isEmpty ? nil : list[i]
+            let secs = shown.map { HomeLogic.workingSeconds($0, now: home.serverNow(ctx.date)) } ?? 0
+            Button(action: next) { ring(shown, index: i, seconds: secs) }
+                .buttonStyle(.plain)
+                .accessibilityLabel(label(shown, index: i, seconds: secs))
+                .accessibilityHint(list.count > 1 ? "Chạm để xem phiên kế tiếp." : "")
+                .accessibilityAddTraits(.updatesFrequently)
+        }
+        // The list changed and the shown session left it: start again from the first.
+        .onChange(of: list.map(\.name)) { names in
+            if let c = current, !names.contains(c) {
+                current = names.first
+                lastMove = Date()
+            }
+        }
+        // As QuotaTile: one loop tied to the view's place on screen; it ends off screen, in the
+        // background and with fewer than two sessions.
+        .task(id: rolling) {
+            guard rolling else { return }
+            lastMove = Date()
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                guard !Task.isCancelled, Date().timeIntervalSince(lastMove) >= HomeLogic.timerStep else { continue }
+                next()
+            }
+        }
+    }
+
+    private func next() {
+        guard list.count > 1 else { return }
+        lastMove = Date()
+        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.3)) { current = HomeLogic.timerNext(current, in: list) }
+    }
+
+    private func ring(_ s: WorkingSession?, index: Int, seconds: Int) -> some View {
+        let tint = s.map { HarnessStyle.color($0.harness) } ?? Color.l3
+        return ZStack {
+            Circle().stroke(Color(hex: 0x767680, alpha: 0.22), lineWidth: 6).padding(3)
+            if s != nil {
+                Circle().stroke(tint.opacity(0.85), lineWidth: 6).padding(3)
+            }
+            VStack(spacing: 2) {
+                if let s = s {
+                    Text(s.name)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.l2)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                        .truncationMode(.middle)
+                    Text(HomeLogic.elapsed(seconds))
+                        .font(.system(size: 19, weight: .semibold).monospacedDigit())
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.6)
+                    if list.count > 1 {
+                        Text("\(index + 1)/\(list.count)")
+                            .font(.system(size: 9.5, weight: .medium).monospacedDigit())
+                            .foregroundColor(.l3)
+                    }
+                } else {
+                    Text("Rảnh")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundColor(.l2)
+                }
+            }
+            .frame(width: 62)
+            .id(s?.name)
+            .transition(.opacity)
+        }
+        .frame(width: 88, height: 88)
+        .contentShape(Circle())
+    }
+
+    private func label(_ s: WorkingSession?, index: Int, seconds: Int) -> String {
+        guard let s = s else { return "Rảnh: không có phiên nào đang làm." }
+        let pos = list.count > 1 ? " Phiên \(index + 1) trên \(list.count)." : ""
+        return "Phiên \(s.name) đang làm được \(HomeLogic.elapsedSpoken(seconds))." + pos
     }
 }
 

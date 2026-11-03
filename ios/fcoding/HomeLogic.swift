@@ -11,10 +11,12 @@ struct HomeData: Decodable {
     var projects: [HomeProject] = []
     /// The box's omp format check; nil on an older server.
     var omp: HomeOmp?
+    /// Sessions working now, longest first; empty when idle or on an older server.
+    var working: [WorkingSession] = []
 
     init() {}
 
-    private enum K: String, CodingKey { case generatedAt, accounts, totals, projects, omp }
+    private enum K: String, CodingKey { case generatedAt, accounts, totals, projects, omp, working }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: K.self)
         generatedAt = c.date(.generatedAt)
@@ -23,6 +25,36 @@ struct HomeData: Decodable {
         totals = c.value(.totals)
         projects = c.list(.projects)
         omp = c.value(.omp)
+        working = c.list(.working)
+    }
+}
+
+/// `working[]`: a tmux session whose output has moved within the last minute. An entry without
+/// a name or a numeric `since` is dropped.
+struct WorkingSession: Decodable, Equatable {
+    var name: String
+    var project: String?
+    var harness: String?
+    /// When the current working streak began: epoch seconds, server clock.
+    var since: Double
+
+    init(name: String, since: Double, project: String? = nil, harness: String? = nil) {
+        self.name = name
+        self.since = since
+        self.project = project
+        self.harness = harness
+    }
+
+    private enum K: String, CodingKey { case name, project, harness, since }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: K.self)
+        name = try c.decode(String.self, forKey: .name)
+        since = try c.decode(Double.self, forKey: .since)
+        guard !name.isEmpty else {
+            throw DecodingError.dataCorruptedError(forKey: .name, in: c, debugDescription: "empty name")
+        }
+        project = c.value(.project)
+        harness = c.value(.harness)
     }
 }
 
@@ -760,6 +792,39 @@ enum HomeLogic {
         s.range(of: "^[a-z0-9][a-z0-9-]{0,31}$", options: .regularExpression) != nil
     }
 
+    // MARK: Session timer (top card)
+
+    /// Seconds each working session stays on the top card before the next one.
+    static let timerStep: TimeInterval = 5
+
+    /// The session shown: `current` while it is still in the list, else the first (0 when empty).
+    static func timerIndex(_ current: String?, in list: [WorkingSession]) -> Int {
+        current.flatMap { c in list.firstIndex { $0.name == c } } ?? 0
+    }
+
+    /// The session after the shown one, wrapping around; nil for an empty list.
+    static func timerNext(_ current: String?, in list: [WorkingSession]) -> String? {
+        guard !list.isEmpty else { return nil }
+        return list[(timerIndex(current, in: list) + 1) % list.count].name
+    }
+
+    /// Whole seconds a session has been working at `now` (server clock); never negative.
+    static func workingSeconds(_ s: WorkingSession, now: Date) -> Int {
+        max(0, Int(now.timeIntervalSince1970 - s.since))
+    }
+
+    /// "m:ss" under an hour, "h:mm:ss" from one hour.
+    static func elapsed(_ seconds: Int) -> String {
+        let s = max(0, seconds)
+        return s < 3600 ? "\(s / 60):\(pad2(s % 60))" : "\(s / 3600):\(pad2(s % 3600 / 60)):\(pad2(s % 60))"
+    }
+
+    /// VoiceOver: "1 giờ 5 phút 3 giây" (zero leading units left out).
+    static func elapsedSpoken(_ seconds: Int) -> String {
+        let s = max(0, seconds), h = s / 3600, m = s % 3600 / 60
+        return (h > 0 ? "\(h) giờ " : "") + (h > 0 || m > 0 ? "\(m) phút " : "") + "\(s % 60) giây"
+    }
+
     // MARK: Recent omp sessions
 
     /// Home banner when the box found an omp session format it does not know; nil otherwise
@@ -1194,6 +1259,37 @@ enum HomeLogic {
         eq("clock slow reply", clockOffset(generatedAt: now.addingTimeInterval(30), received: now.addingTimeInterval(30)), 0)
         eq("clock no date", clockOffset(generatedAt: nil, received: now), 0)
 
+        // Session timer
+        let t0 = now.timeIntervalSince1970
+        let wk = [WorkingSession(name: "a", since: t0 - 3725), WorkingSession(name: "b", since: t0 - 65),
+                  WorkingSession(name: "c", since: t0 - 5)]
+        eq("timer first", timerIndex(nil, in: wk), 0)
+        eq("timer keeps", timerIndex("b", in: wk), 1)
+        eq("timer gone resets", timerIndex("x", in: wk), 0)
+        eq("timer empty", timerIndex("a", in: []), 0)
+        eq("timer next", timerNext("a", in: wk), "b")
+        eq("timer wraps", timerNext("c", in: wk), "a")
+        eq("timer next after gone", timerNext("x", in: wk), "b")
+        eq("timer next one", timerNext("a", in: [wk[0]]), "a")
+        eq("timer next empty", timerNext(nil, in: []), nil)
+        // List changed: "b" still there keeps its place; "c" gone goes back to the first.
+        eq("timer list kept", timerIndex("b", in: [wk[2], wk[1]]), 1)
+        eq("timer list dropped", timerIndex("c", in: [wk[0], wk[1]]), 0)
+        eq("elapsed h", elapsed(workingSeconds(wk[0], now: now)), "1:02:05")
+        eq("elapsed m", elapsed(workingSeconds(wk[1], now: now)), "1:05")
+        eq("elapsed s", elapsed(5), "0:05")
+        eq("elapsed 59:59", elapsed(3599), "59:59")
+        eq("elapsed 1h", elapsed(3600), "1:00:00")
+        eq("elapsed long", elapsed(30 * 3600 + 61), "30:01:01")
+        eq("elapsed future", workingSeconds(WorkingSession(name: "f", since: t0 + 30), now: now), 0)
+        // Phone 4 min fast: phone + offset is the server clock, so the count is unchanged.
+        eq("elapsed skew", workingSeconds(wk[1], now: phone.addingTimeInterval(off)), 65)
+        eq("elapsed ticks", workingSeconds(wk[1], now: now.addingTimeInterval(1)), 66)
+        eq("spoken h", elapsedSpoken(3725), "1 giờ 2 phút 5 giây")
+        eq("spoken m", elapsedSpoken(65), "1 phút 5 giây")
+        eq("spoken s", elapsedSpoken(5), "5 giây")
+        eq("spoken h0m", elapsedSpoken(3605), "1 giờ 0 phút 5 giây")
+
         // Projects
         eq("deploy ok", deployLine(HomeRun(status: "success", at: now.addingTimeInterval(-3 * hr)), now: now).text, "✓ deploy 3 giờ trước")
         eq("deploy none", deployLine(nil, now: now).text, "deploy: chưa có")
@@ -1252,9 +1348,23 @@ enum HomeLogic {
             eq("pr line loading", prLine(h.projects.dropFirst().first), "đang đọc…")
             eq("decode gate kind", h.projects.last?.lastRun?.kind, "needs_human")
             eq("decode checks", checksLine(h.projects.last?.prs, branch: nil).text, "✗ checks PR lỗi")
+            eq("decode no working", h.working.isEmpty, true)
         } else {
             failures.append("decode: lenient JSON failed")
         }
+        let workingJSON = """
+        {"working":[{"name":"deal-sync-omp","project":"deal-sync","harness":"omp","since":1799996275},
+                    {"name":"x","project":null,"harness":null,"since":1799999935.5},
+                    {"name":"no-since"},{"name":"","since":1},{"since":5},{"name":"bad","since":"soon"},7],
+         "projects":[{"name":"a"}]}
+        """
+        let wd = try? JSONDecoder().decode(HomeData.self, from: Data(workingJSON.utf8))
+        eq("working names", wd?.working.map(\.name), ["deal-sync-omp", "x"])
+        eq("working fields", wd?.working.first, WorkingSession(name: "deal-sync-omp", since: 1_799_996_275, project: "deal-sync", harness: "omp"))
+        eq("working null fields", wd?.working.last?.project == nil && wd?.working.last?.harness == nil, true)
+        eq("working keeps rest", wd?.projects.count, 1)
+        eq("working null", (try? JSONDecoder().decode(HomeData.self, from: Data("{\"working\":null}".utf8)))?.working.count, 0)
+        eq("working bad type", (try? JSONDecoder().decode(HomeData.self, from: Data("{\"working\":\"x\"}".utf8)))?.working.count, 0)
         let noTarget = """
         {"accounts":[{"id":"openai-codex/~1a2b3c4d","harness":"codex","email":"e@x","resets":{"available":2,"target":null}},
                      {"id":"openai-codex/4","harness":"codex","email":"f@x","resets":{"available":0,"target":"openai-codex/4"}}]}

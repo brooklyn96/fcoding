@@ -138,6 +138,11 @@ struct HomeGuideView: View {
             "Vuốt một phiên sang trái để **Đổi tên** hoặc **Đóng**.",
             "Kéo danh sách xuống để làm mới.",
         ]),
+        ("Đồng hồ phiên", 0x64D2FF, [
+            "Vòng bên trái thẻ trên cùng cho biết phiên nào đang làm và đã làm được bao lâu.",
+            "Có nhiều phiên đang làm: vòng tự chuyển sang phiên kế mỗi 5 giây. Chạm vào vòng để chuyển ngay.",
+            "Không phiên nào đang làm: vòng hiện **Rảnh**.",
+        ]),
         ("Hạn mức", 0xD97757, [
             "Ô hạn mức tự chuyển qua từng tài khoản mỗi 4 giây. Giữ ngón tay trên ô để dừng.",
             "Chạm vào ô để xem chi tiết từng tài khoản.",
