@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import { createApp, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, strictOrigin, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock,
-  boxOf, parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, releaseRunOf, parseUpdates, updateStatusOf, gateStatusOf, gateRunOf, resetReply, RESET_MSG, BOX, memo, codexChildMeta, parseGitSync, ompDirName, ompHead, parseStaging, KNOWN_VERSIONS, repoOfLink } from '../server.mjs';
+  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, releaseRunOf, parseUpdates, updateStatusOf, gateStatusOf, gateRunOf, resetReply, RESET_MSG, memo, codexChildMeta, parseGitSync, ompDirName, ompHead, KNOWN_VERSIONS, repoOfLink } from '../server.mjs';
 
 process.env.TZ = 'America/Los_Angeles'; // spend days follow config.json timeZone, never the process zone: a third zone proves it
 
@@ -36,7 +36,7 @@ async function boot(opts = {}) {
   // home v2 sources default to nothing real: no scan of this machine's logs, no omp/gh on PATH
   const app = createApp({ configDir, tmux: [process.execPath, FAKE], log: (l) => logs.push(l), pollMs: 40, pasteEnterDelayMs: 0,
     spendRoots: {}, updatesFile: path.join(root, 'no-status.json'), gitSync: null, gitSyncFile: path.join(root, 'no-git-sync.json'), omp: [process.execPath, '-e', 'process.exit(1)'], gh: [process.execPath, '-e', 'process.exit(1)'],
-    ompSessionsRoot: path.join(root, 'omp-sessions'), instabox: [process.execPath, '-e', 'process.exit(1)'], instaboxKey: null, warmTickMs: 0, ...opts }); // warmTickMs 0: no warm-up from boot, so the tests that count tool calls stay as they are
+    ompSessionsRoot: path.join(root, 'omp-sessions'), warmTickMs: 0, workTickMs: 0, ...opts }); // warmTickMs / workTickMs 0: no warm-up and no session poll from boot, so the tests that count tool calls stay as they are
   const port = await app.listen(0, '127.0.0.1');
   const ctx = { app, port, logs, root, configDir };
   ctx.req = (method, p, o = {}) => request(port, method, p, o);
@@ -797,12 +797,20 @@ test('mixed traffic: mutations run in FIFO order, <= 20 wait, <= 8 children, rea
     let peakWait = 0, peakRun = 0;
     const iv = setInterval(() => { const s = c.app.stats(); peakWait = Math.max(peakWait, s.waiting); peakRun = Math.max(peakRun, s.running); }, 2);
     const muts = []; const reads = [];
+    // "arrival order" is the order the SERVER gets the requests: each client request opens its own socket, and under load two of them can
+    // connect out of order. So the next mutation is sent only once the server has seen the previous one.
+    let arrived = 0;
+    const onReq = (req) => { if (req.method === 'POST' && req.url === '/api/send/work') arrived++; };
+    c.app.server.on('request', onReq);
     for (let i = 0; i < 30; i++) {
       muts.push(c.req('POST', '/api/send/work', { cookie, body: { text: `q${i}`, enter: false } }));
+      for (const end = Date.now() + 10000; arrived < i + 1 && Date.now() < end;) await sleep(1);
+      assert.equal(arrived, i + 1, `request q${i} never reached the server`);
       reads.push(c.req('GET', i % 3 ? '/api/screen/work' : '/api/sessions', { cookie }));
       await sleep(8);
     }
     const mr = await Promise.all(muts); const rr = await Promise.all(reads);
+    c.app.server.off('request', onReq);
     clearInterval(iv);
     assert.ok(peakWait <= 20, `peakWait=${peakWait}`);
     assert.ok(peakRun <= 8, `peakRun=${peakRun}`);
@@ -852,9 +860,13 @@ test('SSE: a ping that hits backpressure during a capture, then drain -> the lat
 
 test('screen trim is linear: 2000 lines x 300 spaces < 50 ms and correct', () => {
   const blank = `${' '.repeat(300)}\n`.repeat(2000);
-  const t0 = performance.now();
-  const out = trimScreen(`top  \n${blank}`);
-  const dt = performance.now() - t0;
+  // best of 5: one cold or descheduled run (a loaded box, a JIT warm-up) says nothing about linear versus quadratic; the best run must still be < 50 ms, which a quadratic trim never reaches
+  let out, dt = Infinity;
+  for (let i = 0; i < 5; i++) {
+    const t0 = performance.now();
+    out = trimScreen(`top  \n${blank}`);
+    dt = Math.min(dt, performance.now() - t0);
+  }
   assert.equal(out, 'top  ');
   assert.ok(dt < 50, `${dt} ms`);
   assert.equal(trimScreen(blank), '');
@@ -2892,13 +2904,13 @@ async function homeApp(fn, extra = {}) {
   c.reset = (body, o = {}) => c.req('POST', '/api/codex-reset', { cookie: c.cookie, body, ...o });
   c.homeUntil = (ok) => waitFor(async () => { const h = await c.home(); return ok(h) && h; }); // a background refresh landed
   // warm: the first listing has landed and the quota is built from it. A cold spawn can be slower than homeWait / 2, and the
-  // quota built without it is cached 60 s on the frozen clock, so each miss lets the listing land and moves past QUOTA_TTL (with a
-  // regular box tick, so the box run goes on). `ok` can also wait for the other parts; the reply that passed it is returned.
+  // quota built without it is cached 60 s on the frozen clock, so each miss lets the listing land and moves past QUOTA_TTL.
+  // `ok` can also wait for the other parts; the reply that passed it is returned.
   c.warm = async (ok = (h) => h.accounts[3]?.resets.target) => {
     let h;
     await waitFor(async () => {
       if (ok(h = await c.home())) return true;
-      await c.app.homeIdle(); c.clock.t += 61e3; c.app.tickBox(); await c.home(); await c.app.homeIdle(); // the next read is built from the listing
+      await c.app.homeIdle(); c.clock.t += 61e3; await c.home(); await c.app.homeIdle(); // the next read is built from the listing
       return false;
     });
     await c.app.homeIdle();
@@ -3209,11 +3221,10 @@ test('codex reset: every omp answer maps to a result and a Vietnamese message', 
   for (const [text, result, message = RESET_MSG[result]] of cases) assert.deepEqual(resetReply(text), { result, message }, text);
 });
 
-test('GET /api/home: the whole shape from omp, logs, gh and status.json; box timer estimate', () => homeApp(async (c) => {
+test('GET /api/home: the whole shape from omp, logs, gh and status.json; no box ring, no staging', () => homeApp(async (c) => {
   const h = await c.warm((x) => x.accounts[3]?.resets.target && x.totals.spend && !x.projects[0].loading); // every part has landed
-  assert.deepEqual(Object.keys(h), ['generatedAt', 'box', 'accounts', 'totals', 'projects', 'updates', 'omp']);
+  assert.deepEqual(Object.keys(h), ['generatedAt', 'accounts', 'totals', 'projects', 'updates', 'omp', 'working']);
   assert.equal(h.generatedAt, new Date(c.clock.t).toISOString());
-  assert.deepEqual(h.box, { state: 'running', sleepsAt: new Date(T0 + 480 * 60e3).toISOString(), ...BOX, source: 'estimate' });
   assert.deepEqual(h.accounts.map((a) => a.id), ['anthropic/1', 'anthropic/2', 'anthropic/3', 'openai-codex/4']);
   const cx = h.accounts[3];
   assert.deepEqual(Object.keys(cx), ['id', 'harness', 'email', 'org', 'plan', 'fetchedAt', 'stale', 'rateLimited', 'windows', 'resets', 'spend']);
@@ -3223,16 +3234,10 @@ test('GET /api/home: the whole shape from omp, logs, gh and status.json; box tim
   assert.deepEqual(h.totals.byHarness.map((x) => x.harness), ['claude', 'codex']);
   // the newest run is a failed PR gate: the deploy line is the newest run of the workflow whose FILE is deploy.yml ("Ship it")
   const ship = { workflow: 'Ship it', status: 'success', at: '2026-10-25T19:10:00Z', url: 'https://github.com/owner/repo/actions/runs/7' };
-  assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: 'owner/repo', branch: 'main', prs: prsOf(GH.prs), lastRun: ship, git: GIT_NULL, staging: null })));
+  assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: 'owner/repo', branch: 'main', prs: prsOf(GH.prs), lastRun: ship, git: GIT_NULL })));
   assert.deepEqual(Object.keys(h.updates), ['omp', 'claude', 'codex']);
   assert.ok(!JSON.stringify(h).includes('github-work')); // the remote URL never leaves the server
-  // box: a tick more than 90 s late is a resume; regular ticks are not
-  c.clock.t += 30e3; c.app.tickBox();
-  assert.equal((await c.home()).box.sleepsAt, new Date(T0 + 480 * 60e3).toISOString());
-  c.clock.t += 120e3; c.app.tickBox();
-  assert.equal((await c.home()).box.sleepsAt, new Date(c.clock.t + 480 * 60e3).toISOString());
-  for (let i = 0; i < 962; i++) { c.clock.t += 30e3; c.app.tickBox(); } // ran 481 minutes without a gap: past the estimate
-  assert.equal((await c.home()).box.sleepsAt, null);
+  assert.ok(h.projects.every((p) => !('staging' in p)));
 }));
 
 test('GET /api/home caches: quota 60 s, projects 2 min, spend 5 min; one refresh shared by concurrent requests', () => homeApp(async (c) => {
@@ -3265,9 +3270,9 @@ test('GET /api/home partial failure: omp, gh or the logs down -> that part empty
   fs.rmSync(c.roots.dirs.claude, { recursive: true }); // one log source gone
   let h = await c.homeUntil((x) => x.totals.spend && !x.projects[0].loading); // the spend scan and gh have answered
   assert.deepEqual(h.accounts, []);
-  assert.deepEqual(h.projects[0], { name: 'alpha', repo: 'owner/repo', branch: 'main', prs: null, lastRun: null, git: GIT_NULL, staging: null });
+  assert.deepEqual(h.projects[0], { name: 'alpha', repo: 'owner/repo', branch: 'main', prs: null, lastRun: null, git: GIT_NULL });
   assert.equal(h.totals.spend.last30.usd, 0.2897); // omp + Codex logs; Claude Code logs gone
-  assert.ok(h.box.sleepsAt && h.updates.omp);
+  assert.ok(h.updates.omp);
   // omp back: fresh; omp down again after the TTL: the last accounts, marked stale
   c.setRules(rules);
   c.clock.t += 61e3;
@@ -3662,9 +3667,9 @@ test('GET /api/home never waits long: a slow part is empty the first time, then 
   let t0 = Date.now();
   let h = await c.home();
   assert.ok(Date.now() - t0 < 1200, `took ${Date.now() - t0} ms`); // homeWaitMs 300 per part, in parallel
-  assert.deepEqual(h.accounts, []); // not ready yet: empty, the rest answers (box, updates; spend if its scan was quick)
-  assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: null, branch: null, prs: null, lastRun: null, loading: true, git: GIT_NULL, staging: null })));
-  assert.ok('spend' in h.totals && Array.isArray(h.totals.byHarness) && h.box && h.updates.omp);
+  assert.deepEqual(h.accounts, []); // not ready yet: empty, the rest answers (updates; spend if its scan was quick)
+  assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: null, branch: null, prs: null, lastRun: null, loading: true, git: GIT_NULL })));
+  assert.ok('spend' in h.totals && Array.isArray(h.totals.byHarness) && h.updates.omp);
   h = await c.homeUntil((x) => x.accounts.length === 4 && x.projects[0].repo && x.totals.spend);
   c.clock.t += 121e3; // both TTLs over, both tools still slow: the cached parts at once
   t0 = Date.now();
@@ -3860,56 +3865,6 @@ test('cold start: the first listing fails: ~ ids until the listing is asked agai
   await c.home(); await c.app.homeIdle();
   assert.equal((await c.home()).accounts[3].resets.target, 'openai-codex/4'); // built from the listing as it landed
 }, { homeWaitMs: 600 }));
-
-test('box timer: kept across a server restart within 90 s of the last tick on the same boot (box-timer.json); a longer gap or a reboot is a new run', async () => {
-  const clock = { t: T0 };
-  const bootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-boot-'));
-  const bootIdFile = path.join(bootDir, 'boot_id');
-  fs.writeFileSync(bootIdFile, 'boot-aaaa\n');
-  const start = (o = {}) => boot({ bootIdFile, ...o });
-  const a = await start({ now: () => clock.t });
-  const sleeps = async (c) => { const { cookie } = await c.login(); return (await c.req('GET', '/api/home', { cookie })).json.box.sleepsAt; };
-  try {
-    clock.t += 30e3; a.app.tickBox();
-    clock.t += 30e3; a.app.tickBox(); // an hour into the run, ticking regularly
-    const before = await sleeps(a);
-    assert.equal(before, new Date(T0 + 480 * 60e3).toISOString());
-    const stored = JSON.parse(fs.readFileSync(path.join(a.configDir, 'box-timer.json'), 'utf8'));
-    assert.deepEqual(stored, { resume: T0, tick: T0 + 60e3, boot: 'boot-aaaa' });
-    if (process.platform !== 'win32') assert.equal(fs.statSync(path.join(a.configDir, 'box-timer.json')).mode & 0o777, 0o600);
-    await a.app.close(); // the config dir (and box-timer.json) stays
-    clock.t += 45e3; // restarted 45 s after the last tick (reinstall, crash, systemctl restart)
-    const b = await start({ now: () => clock.t, configDir: a.configDir });
-    try { assert.equal(await sleeps(b), before); } finally { await b.close(); }
-    clock.t += 91e3; // stopped longer than 90 s (b ticked once at its start): the box slept, a new run
-    const c = await start({ now: () => clock.t, configDir: a.configDir });
-    try { assert.equal(await sleeps(c), new Date(clock.t + 480 * 60e3).toISOString()); } finally { await c.close(); }
-    fs.writeFileSync(path.join(a.configDir, 'box-timer.json'), 'not json');
-    clock.t += 1e3;
-    const d = await start({ now: () => clock.t, configDir: a.configDir });
-    try { assert.equal(await sleeps(d), new Date(clock.t + 480 * 60e3).toISOString()); } finally { await d.close(); }
-    // d left a fresh run in the file; a restart 10 s later on another boot (the box rebooted): a new run, not d's resume
-    const dRun = JSON.parse(fs.readFileSync(path.join(a.configDir, 'box-timer.json'), 'utf8')).resume;
-    clock.t += 10e3;
-    fs.writeFileSync(bootIdFile, 'boot-bbbb\n');
-    const e = await start({ now: () => clock.t, configDir: a.configDir });
-    try {
-      assert.equal(await sleeps(e), new Date(clock.t + 480 * 60e3).toISOString());
-      assert.notEqual(clock.t, dRun);
-    } finally { await e.close(); }
-    // no boot_id at all (not Linux): null on both sides still matches
-    clock.t += 10e3;
-    const noBoot = path.join(bootDir, 'missing');
-    const f = await start({ now: () => clock.t, configDir: a.configDir, bootIdFile: noBoot });
-    const fRun = clock.t;
-    await f.app.close();
-    assert.equal(JSON.parse(fs.readFileSync(path.join(a.configDir, 'box-timer.json'), 'utf8')).boot, null);
-    clock.t += 20e3;
-    const g = await start({ now: () => clock.t, configDir: a.configDir, bootIdFile: noBoot });
-    try { assert.equal(await sleeps(g), new Date(fRun + 480 * 60e3).toISOString()); } finally { await g.close(); }
-    await f.close();
-  } finally { await a.close(); fs.rmSync(bootDir, { recursive: true, force: true }); }
-});
 
 test('POST /api/codex-reset: a slow reset is answered 202 pending; it finishes in the background and clears the quota cache', () => homeApp(async (c) => {
   const body = { accountId: 'openai-codex/4', requestId: '0f8f7a6e-1111-4222-8333-000000000088' };
@@ -4387,7 +4342,7 @@ test('open fresh: an open while a sync still runs (even past an earlier open\'s 
   } finally { s.cleanup(); }
 });
 
-// ======================= v1.3.2: omp sessions of a project, format guard, staging box =======================
+// ======================= v1.3.2: omp sessions of a project, format guard =======================
 const OMPFIX = path.join(here, 'fixtures', 'omp-sessions');
 const ID = { a: 'aaaaaaaa-1111-7000-8000-000000000001', b: 'bbbbbbbb-2222-7000-8000-000000000002', c: 'cccccccc-3333-7000-8000-000000000003', d: 'dddddddd-4444-7000-8000-000000000004', e: 'eeeeeeee-5555-7000-8000-000000000005' };
 const ompDirOf = (c, dir = ABS) => path.join(c.root, 'omp-sessions', ompDirName(dir));
@@ -4510,7 +4465,7 @@ test('POST resume: a long project name is shortened, the id part never; the name
   }, { config: { projects: { [long]: ABS } } });
 });
 
-test('a project named "jobs": its omp-sessions list, resume and staging routes are not taken by GET /api/projects/jobs/<id>; the job route still answers', () => withApp(async (c) => {
+test('a project named "jobs": its omp-sessions list and resume routes are not taken by GET /api/projects/jobs/<id>; the job route still answers', () => withApp(async (c) => {
   const { cookie } = await c.login();
   ompTree(c);
   const r = await ompGet(c, cookie, 'jobs');
@@ -4519,10 +4474,18 @@ test('a project named "jobs": its omp-sessions list, resume and staging routes a
   assert.equal((await c.req('POST', '/api/projects/jobs/omp-sessions', { cookie, body: {} })).status, 405);
   const rs = await resumeReq(c, cookie, ID.a, 'jobs');
   assert.equal(rs.status, 200, rs.text);
-  assert.equal((await c.req('POST', '/api/projects/jobs/staging/start', { cookie })).json.error, 'no_instabox_key');
-  const j = await c.req('GET', `/api/projects/jobs/${'0'.repeat(32)}`, { cookie });
+  const j =await c.req('GET', `/api/projects/jobs/${'0'.repeat(32)}`, { cookie });
   assert.deepEqual([j.status, j.json], [404, { error: 'no_job' }]);
 }, { config: { projects: { jobs: ABS } } }));
+
+test('the staging start route is gone: an old app that still calls it gets the normal 404', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  for (const p of ['alpha', 'nope']) {
+    const r = await c.req('POST', `/api/projects/${p}/staging/start`, { cookie });
+    assert.deepEqual([r.status, r.json], [404, { error: 'not_found' }], p);
+  }
+  assert.equal(c.calls().length, 0); // nothing reached tmux
+}));
 
 test('POST resume: unknown or malformed ids and traversal attempts -> 404 unknown_session, nothing is started', () => withApp(async (c) => {
   const { cookie } = await c.login();
@@ -4559,16 +4522,8 @@ const stubDir = () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-stub-'));
   fs.writeFileSync(path.join(dir, 'omp.mjs'), `import fs from 'node:fs'; fs.appendFileSync(${JSON.stringify(path.join(dir, 'omp.log'))}, process.argv.slice(2).join(' ') + '\\n');
 if (process.argv[2] === '--version') console.log('omp/18.12.6'); else process.exit(1);\n`);
-  fs.writeFileSync(path.join(dir, 'instabox.mjs'), `import fs from 'node:fs';
-const d = ${JSON.stringify(dir)}, a = process.argv.slice(2);
-fs.appendFileSync(d + '/instabox.log', JSON.stringify({ argv: a, key: process.env.INSTABOX_API_KEY ?? null }) + '\\n');
-if (a[0] === 'ls') setTimeout(() => { if (fs.existsSync(d + '/ls-fail')) process.exit(2); process.stdout.write(fs.readFileSync(d + '/ls.json', 'utf8')); }, fs.existsSync(d + '/ls-slow') ? 1500 : 0)
-else if (a[0] === 'start') setTimeout(() => process.exit(fs.existsSync(d + '/start-fail') ? 3 : 0), 400); // a start takes a moment\n`);
-  fs.writeFileSync(path.join(dir, 'ls.json'), '[]');
   return {
-    dir, omp: [process.execPath, path.join(dir, 'omp.mjs')], instabox: [process.execPath, path.join(dir, 'instabox.mjs')],
-    ls: (boxes) => fs.writeFileSync(path.join(dir, 'ls.json'), JSON.stringify(boxes)),
-    calls: () => { try { return fs.readFileSync(path.join(dir, 'instabox.log'), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } },
+    dir, omp: [process.execPath, path.join(dir, 'omp.mjs')],
     ompCalls: () => { try { return fs.readFileSync(path.join(dir, 'omp.log'), 'utf8').trim().split('\n').filter(Boolean); } catch { return []; } },
     cleanup: () => fs.rmSync(dir, { recursive: true, force: true }),
   };
@@ -4584,7 +4539,7 @@ test('omp format guard: known versions -> formatOk true with the omp version; a 
     await withApp(async (c) => {
       const { cookie } = await c.login();
       assert.deepEqual(await homeOmp(c, cookie), { version: '18.12.6', formatOk: true, reason: null }); // no sessions at all
-      assert.deepEqual(Object.keys((await c.req('GET', '/api/home', { cookie })).json).slice(-2), ['updates', 'omp']);
+      assert.deepEqual(Object.keys((await c.req('GET', '/api/home', { cookie })).json).slice(-3), ['updates', 'omp', 'working']);
     }, { omp: s.omp });
     await withApp(async (c) => {
       const { cookie } = await c.login();
@@ -4640,125 +4595,6 @@ test('omp format guard: checked at most every 10 min (one omp --version per wind
       clock.t += 2 * 60e3; await homeOmp(c, cookie); await c.app.homeIdle(); await homeOmp(c, cookie);
       assert.equal(s.ompCalls().filter((x) => x === '--version').length, 2);
     }, { omp: s.omp, now: () => clock.t });
-  } finally { s.cleanup(); }
-});
-
-// staging box: projects[].staging and POST /api/projects/<name>/staging/start
-const BOXES = [
-  { name: 'alpha', desiredState: 'suspended', state: 'suspended', updatedAt: '2026-10-26T07:40:41.143075Z', extra: { token: 'x' } },
-  { name: 'my.proj', desiredState: 'running', state: 'suspended', updatedAt: '2026-10-26T07:41:00Z' },
-  { name: 'other', desiredState: 'running', state: 'running', updatedAt: '2026-10-26T03:18:19.3925Z' },
-];
-const stagingOf = async (c, cookie) => { await c.app.homeIdle(); return (await c.req('GET', '/api/home', { cookie })).json.projects.map((p) => p.staging); };
-
-test('parseStaging: states from instabox ls --json; unknown values, a box asked to run but not running, bad rows', () => {
-  const m = parseStaging([
-    { name: 'a', state: 'running', desiredState: 'running', updatedAt: '2026-10-26T03:18:19.3925Z' }, { name: 'b', state: 'suspended', desiredState: 'suspended' },
-    { name: 'c', state: 'stopped', desiredState: 'stopped' }, { name: 'd', state: 'suspended', desiredState: 'running' }, { name: 'e', state: 'weird', desiredState: 'weird' },
-    { name: 'f', state: 'starting' }, { state: 'running' }, null, 'x', { name: 'g' },
-  ]);
-  assert.deepEqual([...m], [
-    ['a', { state: 'running', updatedAt: '2026-10-26T03:18:19.392Z' }], ['b', { state: 'suspended', updatedAt: null }], ['c', { state: 'stopped', updatedAt: null }],
-    ['d', { state: 'starting', updatedAt: null }], ['e', { state: 'unknown', updatedAt: null }], ['f', { state: 'starting', updatedAt: null }], ['g', { state: 'unknown', updatedAt: null }],
-  ]);
-  assert.equal(parseStaging('nope').size, 0);
-});
-
-test('GET /api/home projects[].staging: {state, updatedAt} from instabox ls --json (30 s cache); a missing box is null; nothing else of the box leaks', async () => {
-  const s = stubDir();
-  const clock = { t: 1_700_000_000_000 };
-  try {
-    s.ls(BOXES);
-    await withApp(async (c) => {
-      const { cookie } = await c.login();
-      const st = await stagingOf(c, cookie);
-      assert.deepEqual(st, [{ state: 'suspended', updatedAt: '2026-10-26T07:40:41.143Z' }, { state: 'starting', updatedAt: '2026-10-26T07:41:00.000Z' }]);
-      assert.ok(!JSON.stringify((await c.req('GET', '/api/home', { cookie })).json).includes('"extra"'));
-      assert.deepEqual(s.calls().map((x) => [x.argv.join(' '), x.key]), [['ls --json', 'ibk_test']]);
-      await stagingOf(c, cookie);
-      assert.equal(s.calls().length, 1); // cached
-      s.ls([{ name: 'alpha', desiredState: 'running', state: 'running', updatedAt: '2026-10-26T08:00:00Z' }]);
-      clock.t += 31e3; await c.req('GET', '/api/home', { cookie }); // a stale value is served at once and refreshed behind
-      await c.app.homeIdle();
-      assert.equal(s.calls().length, 2);
-      assert.deepEqual(await stagingOf(c, cookie), [{ state: 'running', updatedAt: '2026-10-26T08:00:00.000Z' }, null]);
-      fs.writeFileSync(path.join(s.dir, 'ls-fail'), '');
-      clock.t += 31e3; await c.req('GET', '/api/home', { cookie }); await c.app.homeIdle();
-      assert.equal(s.calls().length, 3);
-      assert.deepEqual((await stagingOf(c, cookie))[0].state, 'running'); // ls failing: the last good answer stays
-    }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t });
-    fs.rmSync(path.join(s.dir, 'ls-fail'), { force: true });
-    await withApp(async (c) => { // ls fails from the start: every staging is null, no error
-      const { cookie } = await c.login();
-      fs.writeFileSync(path.join(s.dir, 'ls-fail'), '');
-      assert.deepEqual(await stagingOf(c, cookie), [null, null]);
-    }, { instabox: s.instabox, instaboxKey: 'ibk_test' });
-  } finally { s.cleanup(); }
-});
-
-test('staging without a key: every staging is null and instabox is never run; start answers 409 no_instabox_key', async () => {
-  const s = stubDir();
-  try {
-    s.ls(BOXES);
-    await withApp(async (c) => {
-      const { cookie } = await c.login();
-      assert.deepEqual(await stagingOf(c, cookie), [null, null]);
-      const r = await c.req('POST', '/api/projects/alpha/staging/start', { cookie });
-      assert.deepEqual([r.status, r.json], [409, { ok: false, error: 'no_instabox_key' }]);
-      assert.equal((await c.req('POST', '/api/projects/nope/staging/start', { cookie })).json.error, 'unknown_project');
-      assert.equal(s.calls().length, 0);
-    }, { instabox: s.instabox, instaboxKey: null });
-  } finally { s.cleanup(); }
-});
-
-test('POST staging/start: instabox start <box> --no-wait, detached, answered at once; a running or missing box is not started; never stop/rm/create/snapshot/fork', async () => {
-  const s = stubDir();
-  try {
-    s.ls(BOXES);
-    await withApp(async (c) => {
-      const { cookie } = await c.login();
-      assert.equal((await c.req('POST', '/api/projects/alpha/staging/start', { pc: false, cookie })).status, 403);
-      assert.equal((await c.req('GET', '/api/projects/alpha/staging/start', { cookie })).status, 405);
-      const r = await c.req('POST', '/api/projects/alpha/staging/start', { cookie });
-      assert.deepEqual([r.status, r.json], [200, { ok: true, state: 'starting' }]);
-      assert.ok(await until(() => s.calls().some((x) => x.argv[0] === 'start')));
-      const start = s.calls().find((x) => x.argv[0] === 'start');
-      assert.deepEqual(start, { argv: ['start', 'alpha', '--no-wait'], key: 'ibk_test' });
-      // already starting (desired state running): left alone
-      const before = s.calls().filter((x) => x.argv[0] === 'start').length;
-      assert.deepEqual((await c.req('POST', '/api/projects/my.proj/staging/start', { cookie })).json, { ok: true, state: 'starting' });
-      s.ls([{ name: 'alpha', desiredState: 'running', state: 'running', updatedAt: '2026-10-26T08:00:00Z' }]);
-      assert.deepEqual((await c.req('POST', '/api/projects/alpha/staging/start', { cookie })).json, { ok: true, state: 'running' });
-      assert.equal(s.calls().filter((x) => x.argv[0] === 'start').length, before);
-      const none = await c.req('POST', '/api/projects/my.proj/staging/start', { cookie }); // not in the listing any more
-      assert.deepEqual([none.status, none.json], [404, { ok: false, error: 'no_staging_box' }]);
-      assert.ok(s.calls().every((x) => ['ls', 'start'].includes(x.argv[0])));
-      assert.ok(!c.logs.join('\n').includes('ibk_test'));
-    }, { instabox: s.instabox, instaboxKey: 'ibk_test' });
-  } finally { s.cleanup(); }
-});
-
-test('POST staging/start: a failing start logs one line (no key); ls down with nothing known -> 503 staging_unavailable; two taps at once start once', async () => {
-  const s = stubDir();
-  try {
-    s.ls(BOXES);
-    await withApp(async (c) => {
-      const { cookie } = await c.login();
-      fs.writeFileSync(path.join(s.dir, 'start-fail'), '');
-      const two = await Promise.all([1, 2].map(() => c.req('POST', '/api/projects/alpha/staging/start', { cookie })));
-      assert.deepEqual(two.map((r) => [r.status, r.json.state]), [[200, 'starting'], [200, 'starting']]);
-      assert.ok(await until(() => c.logs.includes('staging-start alpha: exit 3')));
-      assert.equal(s.calls().filter((x) => x.argv[0] === 'start').length, 1);
-      assert.deepEqual(c.logs.filter((l) => l.startsWith('staging-start')), ['staging-start alpha: exit 3']);
-      assert.ok(!c.logs.join('\n').includes('ibk_test'));
-    }, { instabox: s.instabox, instaboxKey: 'ibk_test' });
-    fs.writeFileSync(path.join(s.dir, 'ls-fail'), '');
-    await withApp(async (c) => {
-      const { cookie } = await c.login();
-      const r = await c.req('POST', '/api/projects/alpha/staging/start', { cookie });
-      assert.deepEqual([r.status, r.json], [503, { ok: false, error: 'staging_unavailable' }]);
-      assert.equal(s.calls().filter((x) => x.argv[0] === 'start').length, 1); // only the first app's
-    }, { instabox: s.instabox, instaboxKey: 'ibk_test' });
   } finally { s.cleanup(); }
 });
 
@@ -4977,194 +4813,6 @@ test('updateStatusOf: a failed tool keeps its `from`; a version that is not a pl
   assert.deepEqual(u, { versions: { omp: '1.1.0', claude: '2.0.0', codex: null }, last_run: '2026-10-31T03:00:00.000Z', last_ok: false });
 });
 
-// box ring: GET /api/home box from the box's own instabox record (hostname instabox-<name>), the estimate otherwise
-const HOUR = 3600e3;
-const boxRec = (clock, o = {}) => ({ name: 'coder', desiredState: 'running', state: 'running', maxRunMinutes: 240, runStartedAt: new Date(clock.t - HOUR).toISOString(), cooldownUntil: '2026-10-26T19:53:20.620244Z', ...o });
-const homeBox = async (c, cookie) => (await c.req('GET', '/api/home', { cookie })).json.box;
-
-test('boxOf: the box by name or id; no run, an unlimited max run or an unknown box -> null; cooldownMinutes defaults to 10', () => {
-  const r = { id: 'm_1', name: 'coder', state: 'running', maxRunMinutes: 480, runStartedAt: '2026-10-29T14:40:04.056599Z', cooldownUntil: '2026-10-26T19:53:20.620244Z' };
-  const want = { state: 'running', runStartedAt: Date.parse('2026-10-29T14:40:04.056Z'), maxRunMinutes: 480, cooldownUntil: Date.parse('2026-10-26T19:53:20.620Z'), cooldownMinutes: 10, idlePauseMinutes: 30 };
-  assert.deepEqual(boxOf([{ name: 'other' }, r], ['coder']), want);
-  assert.deepEqual(boxOf([r], ['nope', 'm_1']), want);
-  assert.deepEqual(boxOf([{ ...r, cooldownMinutes: 15, cooldownUntil: 'x' }], ['coder']), { ...want, cooldownUntil: null, cooldownMinutes: 15 });
-  assert.equal(boxOf([{ ...r, autoSuspendAfterSeconds: 1800 }], ['coder']).idlePauseMinutes, 30); // the idle pause from the record, in minutes
-  assert.equal(boxOf([{ ...r, autoSuspendAfterSeconds: 900 }], ['coder']).idlePauseMinutes, 15);
-  assert.equal(boxOf([{ ...r, autoSuspendAfterSeconds: 0 }], ['coder']).idlePauseMinutes, 30); // 0 = off, or bad: the default
-  assert.equal(boxOf([r], ['zzz']), null);
-  for (const bad of [[{ ...r, maxRunMinutes: -1 }], [{ ...r, runStartedAt: null }], [{ ...r, maxRunMinutes: '480' }], 'nope', null, [null, 'x']]) assert.equal(boxOf(bad, ['coder']), null);
-});
-
-test('GET /api/home box: from the box\'s own instabox record (runStartedAt + maxRunMinutes), not the tick estimate; a paused record uses cooldownUntil; the key stays secret', async () => {
-  const s = stubDir();
-  const clock = { t: 1_700_000_000_000 };
-  try {
-    s.ls([{ name: 'alpha', state: 'running' }, boxRec(clock, { cooldownMinutes: 15, autoSuspendAfterSeconds: 900 })]);
-    for (const boxName of ['coder', 'instabox-coder']) { // the plain name or the hostname
-      await withApp(async (c) => {
-        const { cookie } = await c.login();
-        await stagingOf(c, cookie); // the first listing has landed
-        assert.deepEqual(await homeBox(c, cookie), { state: 'running', sleepsAt: new Date(clock.t + 3 * HOUR).toISOString(), maxRunMinutes: 240, idlePauseMinutes: 15, cooldownMinutes: 15, source: 'instabox' });
-        assert.ok(!JSON.stringify(c.logs).includes('ibk_test'));
-      }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t, boxName });
-    }
-    // paused (not running, cooldown ahead): the wake is cooldownUntil, which the app reads as sleepsAt + cooldown
-    s.ls([boxRec(clock, { state: 'suspended', cooldownUntil: new Date(clock.t + 5 * 60e3).toISOString() })]);
-    await withApp(async (c) => {
-      const { cookie } = await c.login();
-      await stagingOf(c, cookie);
-      const b = await homeBox(c, cookie);
-      assert.deepEqual([b.source, b.sleepsAt], ['instabox', new Date(clock.t - 5 * 60e3).toISOString()]);
-    }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t, boxName: 'coder' });
-  } finally { s.cleanup(); }
-});
-
-test('GET /api/home box: a failing CLI, an unlisted box, an unlimited max run or no key -> the estimate, unchanged', async () => {
-  const s = stubDir();
-  const clock = { t: 1_700_000_000_000 };
-  const est = () => ({ state: 'running', sleepsAt: new Date(clock.t + 480 * 60e3).toISOString(), ...BOX, source: 'estimate' });
-  try {
-    for (const [ls, key, fail] of [[[boxRec(clock)], 'ibk_test', true], [[boxRec(clock, { name: 'elsewhere' })], 'ibk_test'], [[boxRec(clock, { maxRunMinutes: -1 })], 'ibk_test'], [[boxRec(clock)], null], [[], 'ibk_test']]) {
-      s.ls(ls);
-      if (fail) fs.writeFileSync(path.join(s.dir, 'ls-fail'), ''); else fs.rmSync(path.join(s.dir, 'ls-fail'), { force: true });
-      await withApp(async (c) => {
-        const { cookie } = await c.login();
-        await stagingOf(c, cookie);
-        assert.deepEqual(await homeBox(c, cookie), est());
-      }, { instabox: s.instabox, instaboxKey: key, now: () => clock.t, boxName: 'coder' });
-    }
-  } finally { s.cleanup(); }
-});
-
-test('GET /api/home box: a record read before the last resume is not used; the fresh one is, once it lands', async () => {
-  const s = stubDir();
-  const clock = { t: 1_700_000_000_000 };
-  try {
-    s.ls([boxRec(clock)]);
-    await withApp(async (c) => {
-      const { cookie } = await c.login();
-      await stagingOf(c, cookie);
-      assert.equal((await homeBox(c, cookie)).source, 'instabox');
-      clock.t += 120e3; c.app.tickBox(); // a tick gap: the box slept and woke, a new run
-      s.ls([boxRec(clock, { runStartedAt: new Date(clock.t).toISOString() })]);
-      const b = await homeBox(c, cookie); // the old record is served stale by the staging part, but dated before the resume
-      assert.deepEqual([b.source, b.sleepsAt], ['estimate', new Date(clock.t + 4 * HOUR).toISOString()]); // the estimate runs on the last record's max run (240 min)
-      await c.app.homeIdle();
-      assert.deepEqual(await homeBox(c, cookie), { state: 'running', sleepsAt: new Date(clock.t + 4 * HOUR).toISOString(), maxRunMinutes: 240, idlePauseMinutes: 30, cooldownMinutes: 10, source: 'instabox' });
-    }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t, boxName: 'coder' });
-  } finally { s.cleanup(); }
-});
-
-test('GET /api/home box: a slow instabox CLI never holds /api/home back: the estimate answers within homeWait, the record is used once it lands', async () => {
-  const s = stubDir();
-  const clock = { t: 1_700_000_000_000 };
-  try {
-    s.ls([boxRec(clock)]);
-    fs.writeFileSync(path.join(s.dir, 'ls-slow'), ''); // ls takes 1.5 s
-    await withApp(async (c) => {
-      const { cookie } = await c.login();
-      const t0 = Date.now();
-      const r = await c.req('GET', '/api/home', { cookie });
-      assert.ok(Date.now() - t0 < 1200, `answered in ${Date.now() - t0} ms`);
-      assert.equal(r.status, 200);
-      assert.equal(r.json.box.source, 'estimate');
-      await c.app.homeIdle(); // the slow listing lands behind the reply
-      assert.equal((await homeBox(c, cookie)).source, 'instabox');
-    }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t, boxName: 'coder', homeWaitMs: 150 });
-  } finally { s.cleanup(); }
-});
-
-test('GET /api/home box estimate: more than a cooldown past its sleep time while we answer = a missed pause: the run restarts now (never --:-- for good)', () => homeApp(async (c) => {
-  const maxMs = BOX.maxRunMinutes * 60e3;
-  for (let i = 0; i < 962; i++) { c.clock.t += 30e3; c.app.tickBox(); } // 481 min with no tick gap: inside the cooldown, still null
-  assert.equal((await c.home()).box.sleepsAt, null);
-  for (let i = 0; i < 19; i++) { c.clock.t += 30e3; c.app.tickBox(); } // 490.5 min: past sleep time + cooldown
-  assert.equal((await c.home()).box.sleepsAt, new Date(c.clock.t + maxMs).toISOString());
-  c.clock.t += 30e3; c.app.tickBox(); // the restarted run goes on from now, and is stored
-  assert.equal((await c.home()).box.sleepsAt, new Date(c.clock.t - 30e3 + maxMs).toISOString());
-  assert.equal(JSON.parse(fs.readFileSync(path.join(c.configDir, 'box-timer.json'), 'utf8')).resume, c.clock.t - 30e3);
-}));
-
-test('GET /api/home box: a record not paused, more than a cooldown past runStartedAt + max run, is not used (the estimate answers, in the future, on the record\'s own max run 240); inside the cooldown it still is', async () => {
-  const s = stubDir();
-  const clock = { t: 1_700_000_000_000 };
-  try {
-    for (const [ago, state, source, sleeps] of [[5 * HOUR, 'running', 'estimate', clock.t + 4 * HOUR], [4 * HOUR + 5 * 60e3, 'running', 'instabox', null], [5 * HOUR, 'starting', 'estimate', clock.t + 4 * HOUR]]) {
-      // max run 240 min, not the default 480; cooldownUntil in the past (the default one is ahead of this test's clock)
-      s.ls([boxRec(clock, { state, runStartedAt: new Date(clock.t - ago).toISOString(), cooldownUntil: new Date(clock.t - HOUR).toISOString() })]);
-      await withApp(async (c) => {
-        const { cookie } = await c.login();
-        await stagingOf(c, cookie);
-        const b = await homeBox(c, cookie);
-        assert.deepEqual([b.source, b.sleepsAt, b.maxRunMinutes], [source, sleeps && new Date(sleeps).toISOString(), 240]);
-      }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t, boxName: 'coder' });
-    }
-  } finally { s.cleanup(); }
-});
-
-test('GET /api/home box: the restart rule never fights a known run: the estimate follows the record, so when ls then fails past 10 min it keeps runStartedAt + max run (no restart, no jump)', async () => {
-  const s = stubDir();
-  const clock = { t: 1_700_000_000_000 };
-  const t0 = clock.t;
-  try {
-    s.ls([boxRec(clock)]); // the run started 1 h ago, max run 240 min (not the default 480)
-    await withApp(async (c) => {
-      const { cookie } = await c.login();
-      await stagingOf(c, cookie);
-      const b = await homeBox(c, cookie); // the stored estimate is 491 min old (past sleep + cooldown), the record is right
-      assert.deepEqual([b.source, b.sleepsAt], ['instabox', new Date(t0 + 3 * HOUR).toISOString()]);
-      fs.writeFileSync(path.join(s.dir, 'ls-fail'), '');
-      for (let i = 0; i < 22; i++) { clock.t += 30e3; c.app.tickBox(); } // 11 min with regular ticks: the record is past BOX_REC_MS
-      const e = await homeBox(c, cookie);
-      assert.deepEqual([e.source, e.sleepsAt, e.maxRunMinutes], ['estimate', new Date(t0 + 3 * HOUR).toISOString(), 240]); // the same moment and max run, not 480 / now + 8 h
-      assert.equal(JSON.parse(fs.readFileSync(path.join(c.configDir, 'box-timer.json'), 'utf8')).resume, t0 - HOUR); // and stored as the true run start
-    }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t, boxName: 'coder', bootIdFile: path.join(s.dir, 'no-boot-id'),
-      seedConfig: (d) => fs.writeFileSync(path.join(d, 'box-timer.json'), JSON.stringify({ resume: t0 - 491 * 60e3, tick: t0 - 10e3, boot: null })) });
-  } finally { s.cleanup(); }
-});
-
-test('the instabox key is taken out of the server\'s environment (tmux and the harnesses never inherit it) and still works for instabox', async () => {
-  const s = stubDir();
-  try {
-    s.ls(BOXES);
-    await withEnv({ INSTABOX_API_KEY: 'ibk_env' }, async () => {
-      await withApp(async (c) => {
-        assert.equal(process.env.INSTABOX_API_KEY, undefined);
-        const { cookie } = await c.login();
-        assert.deepEqual((await stagingOf(c, cookie))[0].state, 'suspended');
-        assert.equal(s.calls()[0].key, 'ibk_env');
-        await c.req('POST', '/api/projects/alpha/staging/start', { cookie });
-        assert.ok(await until(() => s.calls().some((x) => x.argv[0] === 'start')));
-        assert.equal(s.calls().find((x) => x.argv[0] === 'start').key, 'ibk_env');
-      }, { instabox: s.instabox, instaboxKey: undefined });
-    });
-  } finally { s.cleanup(); }
-});
-
-test('install.sh start.sh: INSTABOX_API_KEY alone is read, as text, from instabox.env; nothing is sourced', { skip: process.platform === 'win32' && 'POSIX sh' }, () => {
-  const install = fs.readFileSync(path.join(here, '..', 'install.sh'), 'utf8');
-  const m = /cat > "\$APP\/start\.sh" <<'START'\r?\n([\s\S]*?)\r?\nSTART\r?\n/.exec(install);
-  assert.ok(m, 'start.sh not found in install.sh');
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-start-'));
-  try {
-    fs.writeFileSync(path.join(dir, 'start.sh'), `${m[1]}\n`);
-    const probe = [process.execPath, '-e', 'console.log(JSON.stringify([process.env.INSTABOX_API_KEY ?? null, process.env.OTHER_SECRET ?? null, process.env.GH_TOKEN ?? null]))'];
-    const env = { PATH: process.env.PATH, FCODE_SECRETS_ENV: path.join(dir, 'none'), FCODE_INSTABOX_ENV: path.join(dir, 'instabox.env') };
-    const run = (file, e = env) => { if (file !== null) fs.writeFileSync(path.join(dir, 'instabox.env'), file); return spawnSync('/bin/sh', [path.join(dir, 'start.sh'), ...probe], { encoding: 'utf8', env: e }).stdout.trim(); };
-    assert.equal(run('export INSTABOX_API_KEY=ibk_abc-123.x_y\n'), '["ibk_abc-123.x_y",null,null]');
-    assert.equal(run('export OTHER_SECRET=zz\nexport INSTABOX_API_KEY=ibk_abc\necho noise\n'), '["ibk_abc",null,null]'); // only that variable
-    assert.equal(run('export INSTABOX_API_KEY="ibk_q"\r\n'), '["ibk_q",null,null]');
-    assert.equal(run("export INSTABOX_API_KEY='ibk_s'\n"), '["ibk_s",null,null]');
-    assert.equal(run('# no key here\nexport OTHER_SECRET=zz\n'), '[null,null,null]');
-    assert.equal(run(`export INSTABOX_API_KEY=$(touch ${path.join(dir, 'pwned')})\n`), '[null,null,null]'); // not a key: dropped, and never run
-    assert.equal(run('export INSTABOX_API_KEY=ibk_a;touch pwned2\n'), '[null,null,null]');
-    assert.equal(run('export INSTABOX_API_KEY=`touch x`\n'), '[null,null,null]');
-    assert.equal(run('export INSTABOX_API_KEY=\n'), '[null,null,null]');
-    assert.ok(!fs.existsSync(path.join(dir, 'pwned')) && !fs.existsSync(path.join(dir, 'pwned2')) && !fs.existsSync(path.join(dir, 'x')));
-    assert.equal(run(null, { ...env, FCODE_INSTABOX_ENV: path.join(dir, 'missing') }), '[null,null,null]'); // no file: starts without it
-    assert.equal(run('export INSTABOX_API_KEY=ibk_file\n', { ...env, INSTABOX_API_KEY: 'mine' }), '["mine",null,null]'); // one already set wins
-  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
-});
 // ---- review round 1 ----
 test('POST resume: ids that share their first 8 digits (UUIDv7 timestamp) get different tmux names; the name ends in the last 8', () => withApp(async (c) => {
   const { cookie } = await c.login();
@@ -5191,24 +4839,6 @@ test('POST resume: a session of an unknown format (header version 4, no header) 
   assert.equal((await resumeReq(c, cookie, ID.c)).status, 200); // empty but a known header: it exists, omp decides
 }));
 
-test('POST staging/start decides on a FRESH ls: ls failing after a good cached answer -> 503 staging_unavailable, no start', async () => {
-  const s = stubDir();
-  try {
-    s.ls(BOXES);
-    await withApp(async (c) => {
-      const { cookie } = await c.login();
-      assert.equal((await stagingOf(c, cookie))[0].state, 'suspended'); // cached
-      fs.writeFileSync(path.join(s.dir, 'ls-fail'), '');
-      const r = await c.req('POST', '/api/projects/alpha/staging/start', { cookie });
-      assert.deepEqual([r.status, r.json], [503, { ok: false, error: 'staging_unavailable' }]);
-      assert.equal(s.calls().filter((x) => x.argv[0] === 'start').length, 0);
-      assert.equal((await stagingOf(c, cookie))[0].state, 'suspended'); // the card keeps its last good value
-      fs.rmSync(path.join(s.dir, 'ls-fail'));
-      assert.equal((await c.req('POST', '/api/projects/alpha/staging/start', { cookie })).status, 200);
-    }, { instabox: s.instabox, instaboxKey: 'ibk_test' });
-  } finally { s.cleanup(); }
-});
-
 test('omp format guard: an empty or title-only file, and a header-less file younger than 30 s, are being created (no alarm); a complete old one with a bad header is', async () => {
   const s = stubDir();
   const clock = { t: Date.now() };
@@ -5229,6 +4859,187 @@ test('omp format guard: an empty or title-only file, and a header-less file youn
       fs.writeFileSync(path.join(d, `2026-10-25T10-00-00-000Z_${ID.a}.jsonl`), '{"type":"title","title":"x"}\n{"type":"session","version":4,"cwd":"/x"}\n');
       assert.deepEqual(await homeOmp(c, cookie), { version: '18.12.6', formatOk: false, reason: 'unknown_version:4' });
     }, { omp: s.omp });
+  } finally { s.cleanup(); }
+});
+
+// ---------- GET /api/home `working`: the sessions whose tmux activity moved within WORK_GAP (60 s), polled from tmux list-sessions ----------
+// A stub tmux: list-sessions prints the rows the test wrote ([name, activity, project, harness, created]; no rows = "no server running"), or fails.
+const T_SEC = 1_700_000_000;
+function workStub() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-work-'));
+  fs.writeFileSync(path.join(dir, 'tmux.mjs'), `import fs from 'node:fs';
+const d = ${JSON.stringify(dir)}, a = process.argv.slice(2);
+fs.appendFileSync(d + '/calls.log', a.join(' ') + '\\n');
+if (fs.existsSync(d + '/fail')) { process.stderr.write('boom'); process.exit(1); }
+if (a[0] === 'list-sessions') setTimeout(() => { // a file named "slow" makes every answer take 400 ms
+  const rows = JSON.parse(fs.readFileSync(d + '/rows.json', 'utf8'));
+  if (!rows.length) { process.stderr.write('no server running on /tmp/tmux-1000/default'); process.exit(1); }
+  for (const [n, act, proj = 'alpha', harness = 'omp', created = 1] of rows) console.log([n, created, 0, act, 0, harness, proj].join('|'));
+}, fs.existsSync(d + '/slow') ? 400 : 0);\n`);
+  const s = {
+    dir, tmux: [process.execPath, path.join(dir, 'tmux.mjs')],
+    set: (rows) => fs.writeFileSync(path.join(dir, 'rows.json'), JSON.stringify(rows)),
+    calls: () => { try { return fs.readFileSync(path.join(dir, 'calls.log'), 'utf8').trim().split('\n').filter(Boolean); } catch { return []; } },
+    cleanup: () => fs.rmSync(dir, { recursive: true, force: true }),
+  };
+  s.set([]);
+  return s;
+}
+// runs fn with an app whose clock is `clock` (ms) and whose tmux is the stub; poll(rows) writes the rows and runs one poll, home() reads `working`
+async function withWork(fn) {
+  const s = workStub();
+  const clock = { t: T_SEC * 1000 };
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      const home = async () => (await c.req('GET', '/api/home', { cookie })).json;
+      const poll = async (rows) => { if (rows) s.set(rows); await c.app.tickWork(); return (await home()).working; };
+      await fn({ c, s, clock, home, poll, at: (sec) => { clock.t = (T_SEC + sec) * 1000; } });
+    }, { tmux: s.tmux, now: () => clock.t });
+  } finally { s.cleanup(); }
+}
+const W = (name, since, project = 'alpha', harness = 'omp') => ({ name, project, harness, since: T_SEC + since });
+
+test('working: always an array in the contract shape; no sessions -> []; box and staging are gone from /api/home', () => withWork(async ({ home, poll }) => {
+  assert.deepEqual(await poll([]), []);
+  const h = await home();
+  assert.deepEqual(Object.keys(h), ['generatedAt', 'accounts', 'totals', 'projects', 'updates', 'omp', 'working']);
+  assert.ok(!('box' in h) && h.projects.every((p) => !('staging' in p)));
+}));
+
+test('working: a session whose activity is inside the 60 s gap is working, since = that activity; its project and harness come from tmux', () => withWork(async ({ poll, at }) => {
+  at(0);
+  assert.deepEqual(await poll([['a', T_SEC - 5, 'my.proj', 'claude']]), [W('a', -5, 'my.proj', 'claude')]); // first seen already active
+  at(54); // 59 s after the activity
+  assert.deepEqual(await poll(), [W('a', -5, 'my.proj', 'claude')]);
+  at(55); // exactly 60 s: still inside the gap
+  assert.deepEqual(await poll(), [W('a', -5, 'my.proj', 'claude')]);
+}));
+
+test('working: a session first seen quiet is not working; the first activity after that starts its streak', () => withWork(async ({ poll, at }) => {
+  at(0);
+  assert.deepEqual(await poll([['a', T_SEC - 300]]), []);
+  at(10);
+  assert.deepEqual(await poll([['a', T_SEC + 8], ['b', T_SEC - 100]]), [W('a', 8)]);
+  at(12); // b was seen quiet, so it is not in a streak: activity inside 60 s of its old one is still a new streak, from that activity
+  assert.deepEqual(await poll([['a', T_SEC + 11], ['b', T_SEC - 45]]), [W('b', -45), W('a', 8)]);
+}));
+
+test('working: a streak continues while activity keeps advancing inside the gap, however long it runs', () => withWork(async ({ poll, at }) => {
+  at(0);
+  assert.deepEqual(await poll([['a', T_SEC]]), [W('a', 0)]);
+  for (let s = 20; s <= 300; s += 20) { at(s); assert.deepEqual(await poll([['a', T_SEC + s - 3]]), [W('a', 0)], `at ${s}`); }
+  // a poll that sees no new activity still holds the streak while the last activity is inside the gap
+  at(300 + 50);
+  assert.deepEqual(await poll(), [W('a', 0)]);
+}));
+
+test('working: the streak ends after 60 s with no activity advance, and the session drops out; new activity then starts a new streak', () => withWork(async ({ poll, at }) => {
+  at(0);
+  assert.deepEqual(await poll([['a', T_SEC]]), [W('a', 0)]);
+  at(61); // 61 s of quiet
+  assert.deepEqual(await poll(), []);
+  at(200);
+  assert.deepEqual(await poll(), []); // still quiet
+  at(210);
+  assert.deepEqual(await poll([['a', T_SEC + 205]]), [W('a', 205)]); // a new streak, not the old since
+  at(250);
+  assert.deepEqual(await poll([['a', T_SEC + 245]]), [W('a', 205)]); // and it continues
+}));
+
+test('working: quiet for more than the gap between two activity readings (no poll in between saw it end) is a new streak', () => withWork(async ({ poll, at }) => {
+  at(0);
+  assert.deepEqual(await poll([['a', T_SEC]]), [W('a', 0)]);
+  at(100); // the next reading: activity moved, but 100 s after the last one
+  assert.deepEqual(await poll([['a', T_SEC + 99]]), [W('a', 99)]);
+}));
+
+test('working: /api/home does not report a streak whose gap has passed before the next poll; the poll then drops it', () => withWork(async ({ poll, home, at }) => {
+  at(0);
+  assert.deepEqual(await poll([['a', T_SEC]]), [W('a', 0)]);
+  at(61); // no poll yet
+  assert.deepEqual((await home()).working, []);
+}));
+
+test('working: a session that disappears is dropped; one with the same name that comes back later starts a new streak', () => withWork(async ({ poll, at }) => {
+  at(0);
+  assert.deepEqual(await poll([['a', T_SEC], ['b', T_SEC - 2]]), [W('b', -2), W('a', 0)]);
+  at(10);
+  assert.deepEqual(await poll([['b', T_SEC + 8]]), [W('b', -2)]); // a is gone
+  at(20);
+  assert.deepEqual(await poll([['a', T_SEC + 18], ['b', T_SEC + 18]]), [W('b', -2), W('a', 18)]); // a is back: a new streak
+  // the same name killed and made again between two polls (a new created time) is a new session, never the old streak
+  at(30);
+  assert.deepEqual(await poll([['a', T_SEC + 28, 'alpha', 'omp', 99], ['b', T_SEC + 28]]), [W('b', -2), W('a', 28)]);
+  // every session gone (tmux has no server): nothing is working and nothing is kept
+  at(31);
+  assert.deepEqual(await poll([]), []);
+  at(32);
+  assert.deepEqual(await poll([['b', T_SEC + 31]]), [W('b', 31)]);
+}));
+
+test('working: ordered by since ascending (longest first); equal since by name', () => withWork(async ({ poll, at }) => {
+  at(0);
+  assert.deepEqual(await poll([['c', T_SEC - 30], ['b', T_SEC - 10], ['a', T_SEC - 30], ['d', T_SEC - 50]]), [W('d', -50), W('a', -30), W('c', -30), W('b', -10)]);
+  at(15);
+  assert.deepEqual(await poll([['c', T_SEC + 8], ['b', T_SEC + 8], ['a', T_SEC + 8], ['d', T_SEC + 8]]), [W('d', -50), W('a', -30), W('c', -30), W('b', -10)]);
+}));
+
+test('working: a tmux error (not "no server") leaves the streaks as they are; the clock alone then ends them', () => withWork(async ({ poll, s, at }) => {
+  at(0);
+  assert.deepEqual(await poll([['a', T_SEC]]), [W('a', 0)]);
+  fs.writeFileSync(path.join(s.dir, 'fail'), '');
+  at(10);
+  assert.deepEqual(await poll(), [W('a', 0)]); // the poll failed: nothing changed, the activity of 10 s ago still counts
+  at(70);
+  assert.deepEqual(await poll(), []); // 70 s without an advance
+  fs.rmSync(path.join(s.dir, 'fail'));
+  at(80);
+  assert.deepEqual(await poll([['a', T_SEC + 75]]), [W('a', 75)]);
+}));
+
+test('working: the poll is only list-sessions (no capture-pane, no other tmux call)', () => withWork(async ({ poll, s, at }) => {
+  at(0);
+  await poll([['a', T_SEC]]); await poll(); await poll();
+  const calls = s.calls();
+  assert.ok(calls.length >= 3 && calls.every((l) => l.startsWith('list-sessions')), calls.join('\n'));
+}));
+
+test('working: one poll at a time: a tick (or a tickWork call) while the previous poll runs starts no second tmux child', () => withWork(async ({ s, c, home, at }) => {
+  at(0);
+  s.set([['a', T_SEC]]);
+  fs.writeFileSync(path.join(s.dir, 'slow'), '');
+  const first = c.app.tickWork();
+  await c.app.tickWork(); await c.app.tickWork(); // skipped at once: the first is still running
+  assert.ok(await until(() => s.calls().length === 1));
+  await first;
+  assert.equal(s.calls().length, 1);
+  assert.deepEqual((await home()).working, [W('a', 0)]); // and the one poll did its work
+  await c.app.tickWork(); // the guard is released: the next poll runs
+  assert.equal(s.calls().length, 2);
+  // a poll that failed releases it too
+  fs.writeFileSync(path.join(s.dir, 'fail'), '');
+  await c.app.tickWork(); await c.app.tickWork();
+  assert.equal(s.calls().length, 4);
+}));
+
+test('working: from listen() a timer polls every workTickMs and close() stops it', async () => {
+  const s = workStub();
+  const clock = { t: T_SEC * 1000 };
+  s.set([['a', T_SEC - 1]]);
+  try {
+    await withApp(async (c) => {
+      const { cookie } = await c.login();
+      assert.ok(await until(async () => (await c.req('GET', '/api/home', { cookie })).json.working.length === 1)); // no tickWork call: the timer filled it
+      const n = s.calls().length;
+      assert.ok(await until(() => s.calls().length > n + 2)); // and it keeps polling
+      await c.app.close();
+      assert.ok(await until(() => c.app.stats().running === 0)); // the poll in flight at close() has ended and logged
+      await sleep(100);
+      const after = s.calls().length;
+      await sleep(250);
+      assert.equal(s.calls().length, after); // a timer left running would have polled again
+    }, { tmux: s.tmux, now: () => clock.t, workTickMs: 30 });
   } finally { s.cleanup(); }
 });
 
@@ -6813,32 +6624,13 @@ test('warm-up: a part past its TTL is refreshed by the timer with no request, on
   assert.equal(c.toolCalls('pr list').length, 4);
 }, { warmTickMs: 30, homeWaitMs: 3000 }));
 
-test('warm-up: the staging box list is kept warm too (only with a key), and close() stops the timer', async () => {
-  const s = stubDir();
-  const clock = { t: 1_700_000_000_000 };
-  try {
-    s.ls(BOXES);
-    await withApp(async (c) => {
-      assert.ok(await until(() => s.calls().length === 1)); // no request yet
-      await sleep(150);
-      assert.equal(s.calls().length, 1);
-      clock.t += 31e3; // past the 30 s TTL
-      assert.ok(await until(() => s.calls().length === 2));
-      await c.app.close();
-      clock.t += 61e3;
-      await sleep(200); // a timer left running would have read again
-      assert.equal(s.calls().length, 2);
-    }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t, warmTickMs: 30 });
-  } finally { s.cleanup(); }
-});
-
 test('warm-up: a server that closed leaves nothing running (the process exits on its own)', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-warm-'));
   try {
     fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({ cookieSecret: Buffer.alloc(32, 7).toString('base64'), projects: { alpha: ABS }, port: 7681 }));
     const code = `import { createApp } from ${JSON.stringify(pathToFileURL(SERVER).href)};
 const bad = [process.execPath, '-e', 'process.exit(1)'];
-const app = createApp({ configDir: ${JSON.stringify(dir)}, tmux: bad, omp: bad, gh: bad, git: bad, instabox: bad, instaboxKey: 'k', spendRoots: {}, ompSessionsRoot: ${JSON.stringify(path.join(dir, 'o'))}, warmTickMs: 20, log: () => {} });
+const app = createApp({ configDir: ${JSON.stringify(dir)}, tmux: bad, omp: bad, gh: bad, git: bad, spendRoots: {}, ompSessionsRoot: ${JSON.stringify(path.join(dir, 'o'))}, warmTickMs: 20, log: () => {} });
 await app.listen(0, '127.0.0.1');
 await new Promise((r) => setTimeout(r, 150));
 await app.close();`;

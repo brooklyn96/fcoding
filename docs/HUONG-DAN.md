@@ -28,7 +28,7 @@
 
 ## 1. FCode là gì
 
-FCode là một ứng dụng iPhone kèm một máy chủ nhỏ. Máy chủ chạy trên box (máy Linux đám mây của instabox). Ứng dụng cho bạn trò chuyện với các chương trình đang làm việc trên box mà không cần ngồi trước máy tính. Mỗi chương trình chạy trong một phiên tmux, nên phiên vẫn sống khi bạn khóa điện thoại, và bạn có thể vào lại cùng phiên đó từ laptop.
+FCode là một ứng dụng iPhone kèm một máy chủ nhỏ. Máy chủ chạy trên box (một máy Linux Oracle chạy liên tục, không bao giờ ngủ). Ứng dụng cho bạn trò chuyện với các chương trình đang làm việc trên box mà không cần ngồi trước máy tính. Mỗi chương trình chạy trong một phiên tmux, nên phiên vẫn sống khi bạn khóa điện thoại, và bạn có thể vào lại cùng phiên đó từ laptop.
 
 Tính năng chính:
 
@@ -51,7 +51,7 @@ Tính năng chính:
 iPhone (app FCode)
    │  HTTPS
    ▼
-Link công khai của instabox  (https://7681-<id>.instabox.tech)
+Caddy trên box  (https://fcode-quoc.duckdns.org, cổng 443)
    │
    ▼
 server.mjs trên box  (cổng 7681)
@@ -62,7 +62,7 @@ Các phiên tmux: omp / claude / codex (shell: chỉ từ máy chủ)
 
 - `server.mjs` là một file Node.js duy nhất, chỉ dùng thư viện có sẵn của Node 22. Không có gói ngoài, không có cơ sở dữ liệu.
 - Máy chủ gọi lệnh `tmux` (và `git` ở chế độ chỉ đọc để hiện nhánh và số dòng thay đổi). Cho màn hình chính nó còn gọi `omp usage` (hạn mức) và `gh` (pull request, lần chạy CI); chính hai lệnh này kết nối ra internet, máy chủ thì không. Nó không bao giờ đọc file đăng nhập của omp, Claude hay Codex.
-- Dữ liệu chỉ đi giữa box và điện thoại của bạn, qua đường HTTPS của instabox. FCode không có máy chủ riêng, không gửi thống kê đi đâu.
+- Dữ liệu chỉ đi giữa box và điện thoại của bạn, qua đường HTTPS của Caddy trên box. FCode không có máy chủ riêng, không gửi thống kê đi đâu.
 - Lưu ý: bản thân omp, Claude Code, Codex vẫn nói chuyện với dịch vụ AI của chúng như khi bạn chạy chúng ở bất kỳ nơi nào khác. FCode không can thiệp vào việc đó.
 
 ## 3. Cài máy chủ trên box
@@ -133,38 +133,30 @@ Màn hình chính của app lấy mọi thứ từ một địa chỉ của máy
 | Pull request, CI | `gh` theo kho GitHub của từng dự án trong `config.json` | mỗi 2 phút |
 | Phiên bản công cụ | `~/.local/state/fcode-update/status.json` (omp, claude, codex) | mỗi lần mở |
 | Dự án chậm so với GitHub, cây chưa commit | `~/.local/state/fcode/git-sync.json` (timer `fcode-git-sync` trên box ghi) | mỗi lần mở |
-| Máy staging của dự án (đang chạy / đang nghỉ) | `instabox ls --json` (cần khóa instabox, xem dưới) | mỗi 30 giây |
+| Phiên đang làm việc (tên phiên, làm từ lúc nào) | `tmux list-sessions` (không đọc màn hình) | mỗi 10 giây |
 | Định dạng phiên omp, phiên bản omp | `omp --version` và dòng đầu các file phiên mới nhất trong `~/.omp/agent/sessions` | mỗi 10 phút |
-| Giờ box ngủ | ước tính: lần box thức dậy gần nhất + 8 giờ (vẫn giữ đúng khi máy chủ khởi động lại, nhờ file `~/.fcoding/box-timer.json`; box khởi động lại thì tính lại từ đầu) | luôn |
 
 - Mở phiên mới (nút "+" hoặc `fcode-new`) thì box chạy `fcode-git-sync <dự án>` trước và chờ tối đa 8 giây, để thẻ dự án có số commit "chậm / chưa đẩy" mới nhất. Lệnh này chỉ `fetch` và đếm lại, không bao giờ đổi thư mục làm việc (chỉ timer 5 phút của box mới tự kéo nhánh chính về khi nhánh đó rảnh và sạch; nó không đụng nhánh khác, không stash, không reset, không push). Cập nhật code ở các trường hợp còn lại là việc của agent (luật "Sync first"). Thẻ dự án có thêm `autoUpdated` / `autoSkip` để biết timer đã tự kéo hay vì sao không. Thiếu lệnh, lệnh lỗi hay quá 8 giây thì phiên vẫn được tạo (máy chủ chỉ ghi một dòng nhật ký). Máy chủ không bao giờ tắt tiến trình đồng bộ; nó tự chạy xong, và mở phiên khác cùng dự án lúc đó dùng chung lần đồng bộ đang chạy.
 - Phiên omp gần đây của một dự án (app: "Phiên omp gần đây", nút "Tiếp tục"): `GET /api/projects/<dự án>/omp-sessions` liệt kê tối đa 10 phiên omp mới nhất có nội dung, lấy từ `~/.omp/agent/sessions/<tên thư mục mã hóa>/`. Máy chủ chỉ đọc hai dòng đầu mỗi file (tiêu đề và phần đầu), không bao giờ đọc nội dung tin nhắn. Phiên do laptop đồng bộ sang có file đánh dấu `<tên>.fcode-origin` nên hiện thẻ "laptop". Nút "Tiếp tục" (`POST .../omp-sessions/<id>/resume`) mở phiên tmux `<dự án>-omp-r-<8 ký tự cuối của id>` chạy `omp -r <id>`; bấm lại thì vào lại đúng phiên đó.
-- Máy staging: nút "Bật" trong app chạy `instabox start <tên dự án> --no-wait` trên box (chỉ khi có máy tên trùng tên dự án trong `instabox ls`; không bao giờ dừng, xóa hay tạo máy). Cần khóa instabox: tạo file `~/.config/fcode/instabox.env` (chmod 600) chỉ có một dòng `export INSTABOX_API_KEY=...`, rồi `systemctl --user restart fcoding`. Dịch vụ chỉ đọc đúng dòng đó như chữ (không chạy file), không ghi khóa ra nhật ký, và không để khóa lọt vào các phiên tmux. Không có file thì app không hiện trạng thái staging.
 - Bảo vệ định dạng: máy chủ chỉ hiểu phiên omp có `version` 3 (`KNOWN_VERSIONS` trong `server.mjs`, laptop dùng cùng danh sách). Khi omp cập nhật và đổi định dạng (phiên mới có version khác, header hỏng, hoặc omp đổi cách đặt tên thư mục), `GET /api/home` trả `omp.formatOk: false` kèm `reason`, danh sách phiên bỏ qua các phiên lạ, và app sẽ nhắc cập nhật FCode.
 - Một phần bị lỗi (ví dụ `gh` chưa đăng nhập) thì phần đó trống, các phần khác vẫn hiện. Hạn mức cũ được đánh dấu "cũ" nếu không làm mới được.
 - Màn hình chính luôn trả lời nhanh: phần nào đã có thì hiện ngay và được làm mới ở nền. Lần mở đầu tiên sau khi máy chủ khởi động, phần nào chưa đọc xong trong 8 giây thì tạm trống và hiện ở lần tải sau.
 - Chi phí là giá API niêm yết (bảng giá kèm trong `server.mjs`), không phải số tiền bạn trả theo gói. Chi phí của omp và của Codex được tính vào đúng tài khoản; chi phí từ Claude Code chạy riêng chỉ cộng vào tổng. Mẫu máy (model) không có trong bảng giá thì chỉ đếm token, không đoán tiền.
 - "Ước tính cả tuần" của một tài khoản chỉ tính phần chi phí đã biết là của tài khoản đó. Claude Code chạy riêng (và vài lệnh nhỏ của omp như đặt tên phiên) cũng dùng hạn mức tuần nhưng không biết thuộc tài khoản nào, nên khi có chúng con số ước tính sẽ thấp hơn thực tế.
 - Ngày (Hôm nay, Hôm qua, 30 ngày) tính theo giờ Việt Nam, bất kể box dùng múi giờ nào. Muốn đổi, thêm `"timeZone": "<múi giờ>"` (ví dụ `"Asia/Tokyo"`) vào `~/.fcoding/config.json`; máy chủ tự đọc lại, không cần khởi động lại.
-- `gh` cần `GH_TOKEN` để đọc kho. Trên box instabox, dịch vụ tự lấy `GH_TOKEN` từ kho bí mật của instabox (giống như cửa sổ dòng lệnh), không ghi ra ổ đĩa. Nếu bạn vừa thêm token vào kho bí mật, khởi động lại dịch vụ: `systemctl --user restart fcoding`. Không có token thì phần dự án hiện "chưa đọc được GitHub". Nếu token không có quyền Checks thì kết quả checks của PR lấy từ các lần chạy GitHub Actions của commit đầu PR. "Deploy" trên thẻ dự án là lần chạy mới nhất của workflow có tên hoặc tên file chứa "deploy"; chưa có thì app hiện "deploy: chưa có". Với dự án dùng cổng deploy chung (kho có file `.fcode/deploy.json`), dòng "deploy" lấy từ trạng thái `fcode/deploy` của commit mới nhất trên nhánh chính, không lấy từ GitHub Actions: "đang deploy", "đã deploy", "deploy bỏ qua", "deploy thay bằng bản mới", "deploy lỗi" hoặc "deploy cần người xử lý". Chưa có trạng thái nào thì hiện "đang deploy". Khi máy chủ thấy trạng thái này lần đầu, nó ghi kho đó vào `~/.fcoding/gate-repos.json` và từ đó luôn coi là dự án dùng cổng, kể cả khi file `.fcode/deploy.json` bị xóa sau này (máy chủ không tự xóa; muốn bỏ thì sửa file đó rồi khởi động lại dịch vụ). Dự án khác giữ nguyên cách cũ.
+- `gh` cần `GH_TOKEN` để đọc kho. Dịch vụ tự lấy `GH_TOKEN` từ file bí mật của box (`/run/instabox/secrets/env`; trên máy Oracle đây là liên kết tới `~/.config/fcode/secrets.env`), giống như cửa sổ dòng lệnh, không ghi ra ổ đĩa. Nếu bạn vừa thêm token vào file đó, khởi động lại dịch vụ: `systemctl --user restart fcoding`. Không có token thì phần dự án hiện "chưa đọc được GitHub". Nếu token không có quyền Checks thì kết quả checks của PR lấy từ các lần chạy GitHub Actions của commit đầu PR. "Deploy" trên thẻ dự án là lần chạy mới nhất của workflow có tên hoặc tên file chứa "deploy"; chưa có thì app hiện "deploy: chưa có". Với dự án dùng cổng deploy chung (kho có file `.fcode/deploy.json`), dòng "deploy" lấy từ trạng thái `fcode/deploy` của commit mới nhất trên nhánh chính, không lấy từ GitHub Actions: "đang deploy", "đã deploy", "deploy bỏ qua", "deploy thay bằng bản mới", "deploy lỗi" hoặc "deploy cần người xử lý". Chưa có trạng thái nào thì hiện "đang deploy". Khi máy chủ thấy trạng thái này lần đầu, nó ghi kho đó vào `~/.fcoding/gate-repos.json` và từ đó luôn coi là dự án dùng cổng, kể cả khi file `.fcode/deploy.json` bị xóa sau này (máy chủ không tự xóa; muốn bỏ thì sửa file đó rồi khởi động lại dịch vụ). Dự án khác giữ nguyên cách cũ.
 - Nút Reset của Codex trong app chạy `omp usage reset <tài khoản>` trên box, mỗi tài khoản một lần một. Nếu reset chạy lâu hơn 15 giây, app báo "đang chạy" và bạn xem lại Hạn mức sau ít phút. Reset của Claude chỉ mở trang claude.ai.
 - Đổi tên phiên (vuốt trên một phiên, "Đổi tên") dùng `tmux rename-session`; tên mới theo cùng luật như tên phiên. Tên dạng `<dự án>-<chương trình>` (ví dụ `deal-sync-claude`) dành cho phiên mở từ dự án đó, nên phiên khác không đổi sang tên này được.
 
 ## 4. Mở link công khai
 
-Máy chủ nghe ở cổng 7681 trên box. Để iPhone vào được, hãy công khai cổng này bằng công cụ `instabox` (chạy trên laptop):
-
-```sh
-instabox port publish <tên-box> 7681
-```
-
-Lệnh in ra một địa chỉ dạng:
+Máy chủ nghe ở cổng 7681 trên box, nhưng cổng này đóng với bên ngoài. Từ ngoài vào bằng HTTPS ở cổng 443: Caddy trên box lấy chứng chỉ và chuyển yêu cầu vào cổng 7681. Địa chỉ công khai của box là:
 
 ```
-https://7681-<id>.instabox.tech
+https://fcode-quoc.duckdns.org
 ```
 
-Hãy chép địa chỉ này, bạn sẽ nhập nó vào app ở bước ghép máy. Để kiểm tra, mở địa chỉ trong trình duyệt: nếu thấy dòng chữ `fcoding ok` là máy chủ đang chạy.
+(Trên máy Oracle hiện tại, Caddy, tên miền DuckDNS và tường lửa đã được dựng sẵn khi tạo máy, không cần làm thêm gì khi cài FCode. Với một máy mới, cần dựng một Caddy chuyển HTTPS cổng 443 vào cổng 7681 trước.) Hãy chép địa chỉ này, bạn sẽ nhập nó vào app ở bước ghép máy. Để kiểm tra, mở địa chỉ trong trình duyệt: nếu thấy dòng chữ `fcoding ok` là máy chủ đang chạy.
 
 Địa chỉ công khai thì ai biết cũng mở được trang đó, nhưng mọi chức năng khác đều cần iPhone đã ghép (xem [mục 9](#9-bảo-mật)).
 
@@ -209,7 +201,7 @@ FCode không dùng mật khẩu. Chỉ người đang có quyền vào dòng l�
    Tên trong ngoặc là tên hiển thị của máy trong danh sách thiết bị (bỏ trống cũng được). Lệnh in ra một **mã 6 số**, ví dụ `482913`.
 
 2. Trên iPhone, mở FCode ở màn hình **Ghép máy**:
-   - **Địa chỉ máy chủ**: địa chỉ công khai ở [mục 4](#4-mở-link-công-khai) (bắt đầu bằng `https://`).
+   - **Địa chỉ máy chủ**: địa chỉ công khai ở [mục 4](#4-mở-link-công-khai) (bắt đầu bằng `https://`). Sau này nếu box đổi địa chỉ thì không cần ghép lại: vào **Cài đặt → Địa chỉ máy chủ** (xem [mục 7](#7-dùng-hằng-ngày)).
    - **Mã ghép**: gõ 6 số vừa thấy.
 3. Bấm **Ghép iPhone này**.
 
@@ -219,7 +211,7 @@ Lưu ý về mã:
 - Nhập sai 5 lần thì mã bị hủy; chạy lại `fcode-pair` để lấy mã mới. Mỗi nơi tạo mã (lệnh `fcode-pair` hoặc từng iPhone đã ghép) chỉ có 1 mã đang chờ, tạo mã mới thì thay mã cũ của nơi đó; tổng cộng tối đa 3 mã cùng lúc.
 - Máy chủ phải đang chạy thì lệnh mới in được mã.
 
-Sau khi ghép, iPhone nhớ box trong Keychain. Mở app là vào thẳng danh sách; box khởi động lại cũng không phải ghép lại.
+Sau khi ghép, iPhone nhớ box trong Keychain. Mở app là vào thẳng danh sách; box khởi động lại cũng không phải ghép lại. Box chuyển sang địa chỉ mới (cùng thiết bị đã ghép) thì đổi trong **Cài đặt → Địa chỉ máy chủ**: gõ địa chỉ mới (chỉ `https`; gõ tên miền là đủ) rồi bấm **Lưu**. iPhone thử kết nối bằng đăng nhập hiện tại, được thì đổi luôn, không được thì giữ địa chỉ cũ và báo lý do (báo "chưa ghép" thì gỡ iPhone này rồi ghép lại).
 
 ### Ghép thêm iPhone bằng mã QR
 
@@ -266,9 +258,9 @@ Muốn dùng lại sau khi bị gỡ thì chạy `fcode-pair` trên box và ghé
 
 Hướng dẫn đầy đủ cho app nằm ở [ios/README.md, mục 4](../ios/README.md#4-cách-dùng). Tóm tắt:
 
-**Màn hình chính** (thanh trên cùng chỉ có nút **?** Hướng dẫn và **⚙** Cài đặt). Phiên tự cập nhật mỗi 5 giây, hạn mức và dự án mỗi phút; kéo xuống để cập nhật ngay.
+**Màn hình chính** (thanh trên cùng chỉ có nút **?** Hướng dẫn và **⚙** Cài đặt). Phiên tự cập nhật mỗi 5 giây, hạn mức, dự án và đồng hồ phiên mỗi 15 giây; kéo xuống để cập nhật ngay.
 
-- **Vòng giờ box** (bên trái thẻ trên cùng): **Sleeps in** là thời gian box còn chạy trước khi tự nghỉ (tối đa 8 giờ, hoặc sớm hơn nếu rảnh 30 phút; đây là ước tính của máy chủ). Vòng chuyển vàng khi còn dưới 10 phút. **Wakes in** hiện khi box vừa nghỉ vì đã chạy đủ 8 giờ: lúc đó box chưa đánh thức lại được trong khoảng 10 phút. Chạm vào vòng để xem giờ chính xác. Về giờ nghỉ của box: box tự nghỉ khi 30 phút không ai dùng, và một box đang nghỉ tự dậy khi có thứ gì dùng tới nó (một lệnh, file, SSH, hoặc mở link công khai của nó, tức là app); đo thực tế, lần gửi đầu tiên tới link khi box đang nghỉ được trả lời sau khoảng 4 giây, không báo lỗi. Một lần chạy liền tối đa 8 giờ, hết thì box nghỉ. Box nghỉ bằng tay (`instabox suspend`) thì nằm yên cho tới khi bạn bật lại bằng tay. Box nghỉ chỉ tính tiền chỗ lưu trữ.
+- **Đồng hồ phiên** (bên trái thẻ trên cùng): tên phiên đang làm và đã làm được bao lâu (giờ:phút:giây). Nhiều phiên thì tự chuyển sang phiên kế mỗi 5 giây; chạm để chuyển ngay. Không phiên nào đang làm thì hiện **Rảnh**. Vòng mờ với dấu **—**: app chưa có số liệu mới từ box (vừa mở app, mất mạng); chờ vài giây hoặc kéo xuống để cập nhật. Một phiên được tính là "đang làm" khi màn hình của nó vừa có thay đổi trong 60 giây gần nhất; máy chủ hỏi tmux mỗi 10 giây (không đọc nội dung màn hình), nên số này có thể chậm tới vài giây.
 - **Ô hạn mức** (bên phải): mỗi lần một tài khoản, tự chuyển sang tài khoản kế mỗi 4 giây (giữ ngón tay trên ô để dừng). Chạm để mở màn hình **Hạn mức**.
 - Dòng **đang chạy · chờ bạn**: chạm để nhảy tới phiên tương ứng.
 - **Dự án** (trượt ngang): mỗi thẻ cho biết số PR đang mở, kết quả checks và lần deploy gần nhất ("đang đọc…" khi máy chủ vừa khởi động, "chưa đọc được GitHub" khi `gh` lỗi). Chạm thẻ để chỉ xem phiên của dự án đó; bấm **…** để mở phiên mới trong dự án đó. Giữ lâu trên thẻ để mở menu: **Mở phiên mới**, **Đổi tên hiển thị…** và **Sắp xếp**.
@@ -280,7 +272,7 @@ Hướng dẫn đầy đủ cho app nằm ở [ios/README.md, mục 4](../ios/RE
 
 **Tạo phiên mới**: bấm nút tròn **+** ở góc dưới bên phải. Chọn dự án, rồi chọn chương trình (omp, claude hoặc codex). Nút này luôn tạo phiên **mới** (tên như `web-claude`, `web-claude-2`, …) và không bao giờ mở lại phiên cũ; muốn vào phiên cũ thì mở từ danh sách. App không còn liệt kê shell, dù máy chủ vẫn chạy được shell. Dự án chưa có trong danh sách thì thêm bằng **Thêm dự án** ([xem bên dưới](#thêm-dự-án-từ-app)).
 
-**Phiên omp gần đây và máy staging** (v1.3.2): trong một dự án, mục **Phiên omp gần đây** liệt kê các phiên omp mới nhất của dự án (cả phiên đồng bộ từ laptop, có thẻ "laptop"); bấm **Tiếp tục** để mở lại đúng phiên đó. Thẻ dự án có máy staging (máy instabox cùng tên dự án) thì có nút **Bật** để đánh thức máy đó. Chi tiết và cách cài khóa instabox nằm ở mục 3, "Màn hình chính".
+**Phiên omp gần đây** (v1.3.2): trong một dự án, mục **Phiên omp gần đây** liệt kê các phiên omp mới nhất của dự án (cả phiên đồng bộ từ laptop, có thẻ "laptop"); bấm **Tiếp tục** để mở lại đúng phiên đó. Chi tiết nằm ở mục 3, "Màn hình chính".
 
 **Hạn mức** (chạm ô hạn mức): tổng chi phí 30 ngày, rồi từng tài khoản: thanh dùng của từng khung giờ, xu hướng 30 ngày, chi phí "Hôm nay / Hôm qua / 30 ngày / Ước tính tuần". **Reset**: Codex dùng lượt reset ngay trong app (có hỏi xác nhận); Claude chỉ mở trang claude.ai. Xem thêm "Màn hình chính: hạn mức, chi phí, dự án" ở mục 3.
 
@@ -644,7 +636,7 @@ node -e 'console.log(require("crypto").randomBytes(32).toString("base64"))'
 ## 10. Phát triển
 
 - Máy chủ dùng **Node 22**, chỉ thư viện có sẵn (không `npm install`). Toàn bộ nằm trong `server.mjs`.
-- Hợp đồng giữa máy chủ và app nằm trong [`CONTRACT.md`](../CONTRACT.md) (các mục A1 trở đi là các thay đổi theo thời gian; ví dụ A4 thay mật khẩu bằng ghép máy, A5 thêm hộp thư tổng quan, A6 thêm màu cho màn hình, A7 ghép thêm máy bằng mã QR, A9 phiên omp của dự án và máy staging, A10 đồng bộ phiên omp giữa laptop và box, A11 thêm dự án từ app).
+- Hợp đồng giữa máy chủ và app nằm trong [`CONTRACT.md`](../CONTRACT.md) (các mục A1 trở đi là các thay đổi theo thời gian; ví dụ A4 thay mật khẩu bằng ghép máy, A5 thêm hộp thư tổng quan, A6 thêm màu cho màn hình, A7 ghép thêm máy bằng mã QR, A9 phiên omp của dự án, A10 đồng bộ phiên omp giữa laptop và box, A11 thêm dự án từ app, A16 bỏ vòng giờ box và đưa vào đồng hồ phiên).
 - Chạy thử trên máy bất kỳ, kể cả Windows (dùng tmux giả, không cần tmux):
 
   ```sh

@@ -24,8 +24,18 @@ struct DeviceSettingsView: View {
                     HeaderTextButton(title: "Đóng", bold: true) { dismiss() }
                 }
                 Section("Máy chủ") {
-                    Text(PairLink.label(app.serverURL)).textSelection(.enabled)
+                    NavigationLink { ServerAddressView() } label: {
+                        HStack {
+                            Text("Địa chỉ máy chủ")
+                            Spacer()
+                            Text(PairLink.label(app.serverURL))
+                                .foregroundColor(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                    }
                 }
+                .disabled(running != nil)
                 Section {
                     NavigationLink { AddDeviceView() } label: {
                         Label("Thêm thiết bị (mã QR)", systemImage: "qrcode")
@@ -80,6 +90,82 @@ struct DeviceSettingsView: View {
             case .all: allError = await app.logoutEverywhere()
             }
             running = nil
+        }
+    }
+}
+
+/// "Địa chỉ máy chủ": edit the address of the same box (https only; a bare host is fine). Saved
+/// only after the box answers there with this phone's login (AppState.moveServer); otherwise the
+/// old address stays and the reason is shown here.
+struct ServerAddressView: View {
+    @EnvironmentObject private var app: AppState
+    @Environment(\.dismiss) private var dismiss
+    @State private var text = ""
+    @State private var saving = false
+    @State private var errorText: String?
+    @FocusState private var focused: Bool
+
+    private var blank: Bool { text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+
+    var body: some View {
+        Form {
+            FormHeader(title: "Địa chỉ máy chủ") {
+                HeaderTextButton(title: "Cài đặt", back: true) { dismiss() }
+            } trailing: {
+                EmptyView()
+            }
+            Section {
+                TextField("fcode.example.com", text: $text)
+                    .keyboardType(.URL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .submitLabel(.done)
+                    .focused($focused)
+                    .onSubmit(save)
+                    .disabled(saving)
+                    .accessibilityLabel("Địa chỉ máy chủ")
+            } footer: {
+                Text("Chỉ dùng https. Gõ tên miền là đủ, ví dụ fcode.example.com. iPhone thử kết nối tới địa chỉ mới bằng đăng nhập hiện tại trước khi đổi; không được thì giữ địa chỉ cũ.")
+            }
+            Section {
+                Button(action: save) {
+                    HStack {
+                        Text("Lưu")
+                        Spacer()
+                        if saving { ProgressView() }
+                    }
+                }
+                .disabled(saving || blank)
+            }
+            if let errorText = errorText {
+                Section { Label(errorText, systemImage: "xmark.octagon").foregroundColor(.red) }
+            }
+        }
+        .navigationTitle("Địa chỉ máy chủ")
+        .toolbar(.hidden, for: .navigationBar)
+        .scrollIndicators(.hidden)
+        .onAppear {
+            if text.isEmpty { text = PairLink.label(app.serverURL) }
+            focused = true
+        }
+    }
+
+    private func save() {
+        guard !saving, !blank else { return }
+        // Unchanged: nothing to check.
+        if HomeLogic.serverAddress(text) == app.serverURL {
+            dismiss()
+            return
+        }
+        saving = true
+        errorText = nil
+        Task {
+            // On success the home screen starts afresh (this sheet closes with it).
+            let failure = await app.moveServer(to: text)
+            errorText = failure
+            saving = false
+            // VoiceOver: the red line appears without focus, so read the reason out.
+            if let failure = failure { UIAccessibility.post(notification: .announcement, argument: failure) }
         }
     }
 }
