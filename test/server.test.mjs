@@ -797,12 +797,20 @@ test('mixed traffic: mutations run in FIFO order, <= 20 wait, <= 8 children, rea
     let peakWait = 0, peakRun = 0;
     const iv = setInterval(() => { const s = c.app.stats(); peakWait = Math.max(peakWait, s.waiting); peakRun = Math.max(peakRun, s.running); }, 2);
     const muts = []; const reads = [];
+    // "arrival order" is the order the SERVER gets the requests: each client request opens its own socket, and under load two of them can
+    // connect out of order. So the next mutation is sent only once the server has seen the previous one.
+    let arrived = 0;
+    const onReq = (req) => { if (req.method === 'POST' && req.url === '/api/send/work') arrived++; };
+    c.app.server.on('request', onReq);
     for (let i = 0; i < 30; i++) {
       muts.push(c.req('POST', '/api/send/work', { cookie, body: { text: `q${i}`, enter: false } }));
+      for (const end = Date.now() + 10000; arrived < i + 1 && Date.now() < end;) await sleep(1);
+      assert.equal(arrived, i + 1, `request q${i} never reached the server`);
       reads.push(c.req('GET', i % 3 ? '/api/screen/work' : '/api/sessions', { cookie }));
       await sleep(8);
     }
     const mr = await Promise.all(muts); const rr = await Promise.all(reads);
+    c.app.server.off('request', onReq);
     clearInterval(iv);
     assert.ok(peakWait <= 20, `peakWait=${peakWait}`);
     assert.ok(peakRun <= 8, `peakRun=${peakRun}`);
