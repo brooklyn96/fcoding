@@ -11,6 +11,8 @@ final class AppState: ObservableObject {
     @Published var pairLink: PairLink?
     /// One-off message shown as an alert over whatever screen is up (link and re-pair results).
     @Published var popup: String?
+    /// The popup's alert title; nil = "Ghép máy" (link and re-pair results). Cleared with it.
+    @Published var popupTitle: String?
     /// Paired by an older build to an address this build rejects (shown escaped). While set,
     /// the app shows only the "pair again" card and sends that server nothing (`api` is nil).
     @Published private(set) var unsupportedServer: String?
@@ -174,8 +176,10 @@ final class AppState: ObservableObject {
     }
 
     /// Cài đặt → "Địa chỉ máy chủ": the same box at a new address (its devices and secrets moved
-    /// with it), so the token is kept. GET api/me at the NEW address with this phone's token; only
-    /// a 2xx switches. Nothing is sent to the old address and a 401 there does not sign out here.
+    /// with it), so the token is kept. First GET / with NO token must answer "fcoding ok" (only an
+    /// FCode server ever sees the token); then GET api/me with this phone's token must answer
+    /// {"ok":true}. Anything else keeps the old address. Nothing is sent to the old address and a
+    /// 401 at the new one does not sign out here.
     /// Returns the error text (the old address stays), nil when switched or unchanged.
     func moveServer(to input: String) async -> String? {
         guard let address = HomeLogic.serverAddress(input), let base = URL(string: address) else {
@@ -183,12 +187,26 @@ final class AppState: ObservableObject {
         }
         guard address != serverURL else { return nil }
         guard unsupportedServer == nil, let token = token, !token.isEmpty else { return unpairedNotice }
+        let label = PairLink.label(address)
+        let root: Data
         do {
-            try await API(base: base, token: token).call("GET", "api/me", timeout: 15)
-        } catch is CancellationError {
-            return nil
+            root = try await API(base: base, token: "").call("GET", "", timeout: 15)
+        } catch let e as APIError where e.status != 0 {
+            return HomeLogic.serverMoveFailure(status: e.status, label: label, notFcode: true)
         } catch {
-            return HomeLogic.serverMoveFailure(status: (error as? APIError)?.status ?? 0, label: PairLink.label(address))
+            return HomeLogic.serverMoveFailure(status: 0, label: label)
+        }
+        guard HomeLogic.isFcodeRoot(root) else {
+            return HomeLogic.serverMoveFailure(status: 200, label: label, notFcode: true)
+        }
+        let me: Data
+        do {
+            me = try await API(base: base, token: token).call("GET", "api/me", timeout: 15)
+        } catch {
+            return HomeLogic.serverMoveFailure(status: (error as? APIError)?.status ?? 0, label: label)
+        }
+        guard HomeLogic.isMeOk(me) else {
+            return HomeLogic.serverMoveFailure(status: 200, label: label, notFcode: true)
         }
         // A pairing or sign-out while the check was out wins.
         guard self.token == token, unsupportedServer == nil else { return nil }
@@ -199,7 +217,8 @@ final class AppState: ObservableObject {
         serverURL = address
         UserDefaults.standard.set(address, forKey: AppState.serverKey)
         prefetch()
-        popup = "Đã chuyển sang máy chủ \(PairLink.label(address))."
+        popupTitle = "FCode"
+        popup = "Đã chuyển sang máy chủ \(label)."
         return nil
     }
 

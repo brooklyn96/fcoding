@@ -844,9 +844,21 @@ enum HomeLogic {
 
     static let serverAddressInvalid = "Địa chỉ phải là tên miền hoặc IP dùng https, ví dụ fcode.example.com."
 
-    /// Why the new address was not taken (GET api/me there with this phone's token failed);
-    /// `status` 0 = no HTTP reply. The old address stays in every case.
-    static func serverMoveFailure(status: Int, label: String) -> String {
+    /// GET / of an FCode server, no login needed (server.mjs route "/"): exactly "fcoding ok".
+    /// Checked before this phone's token is sent to the new address.
+    static func isFcodeRoot(_ body: Data) -> Bool { String(data: body, encoding: .utf8) == "fcoding ok" }
+
+    /// GET api/me with a valid login: the JSON `{"ok":true}`.
+    static func isMeOk(_ body: Data) -> Bool {
+        ((try? JSONSerialization.jsonObject(with: body)) as? [String: Any])?["ok"] as? Bool == true
+    }
+
+    /// Why the new address was not taken; `status` 0 = no HTTP reply, `notFcode` = it answered
+    /// but not as an FCode server. The old address stays in every case.
+    static func serverMoveFailure(status: Int, label: String, notFcode: Bool = false) -> String {
+        if notFcode {
+            return "\(label) không phải máy chủ FCode, nên vẫn giữ địa chỉ cũ. Kiểm tra lại địa chỉ."
+        }
         switch status {
         case 401, 403:
             return "iPhone này chưa ghép với máy chủ \(label), nên vẫn giữ địa chỉ cũ. Muốn dùng máy chủ đó: bấm Gỡ iPhone này, rồi ghép lại bằng mã từ máy chủ đó."
@@ -1351,6 +1363,17 @@ enum HomeLogic {
            "Không kết nối được máy chủ a.example.com, nên vẫn giữ địa chỉ cũ. Kiểm tra lại địa chỉ và mạng.")
         eq("move 502", serverMoveFailure(status: 502, label: "a.example.com"),
            "Máy chủ a.example.com trả lời lỗi (mã 502), nên vẫn giữ địa chỉ cũ.")
+        eq("move not fcode", serverMoveFailure(status: 200, label: "a.example.com", notFcode: true),
+           "a.example.com không phải máy chủ FCode, nên vẫn giữ địa chỉ cũ. Kiểm tra lại địa chỉ.")
+        eq("root ok", isFcodeRoot(Data("fcoding ok".utf8)), true)
+        eq("root other page", isFcodeRoot(Data("<html>parked</html>".utf8)), false)
+        eq("root newline", isFcodeRoot(Data("fcoding ok\n".utf8)), false)
+        eq("root empty", isFcodeRoot(Data()), false)
+        eq("me ok", isMeOk(Data("{\"ok\":true}".utf8)), true)
+        eq("me false", isMeOk(Data("{\"ok\":false}".utf8)), false)
+        eq("me string", isMeOk(Data("{\"ok\":\"true\"}".utf8)), false)
+        eq("me html", isMeOk(Data("<html></html>".utf8)), false)
+        eq("me array", isMeOk(Data("[true]".utf8)), false)
 
         // Projects
         eq("deploy ok", deployLine(HomeRun(status: "success", at: now.addingTimeInterval(-3 * hr)), now: now).text, "✓ deploy 3 giờ trước")

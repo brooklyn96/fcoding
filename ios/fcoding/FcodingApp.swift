@@ -120,11 +120,11 @@ private struct OverlayPresenter: View {
 }
 
 private extension View {
-    /// The "Ghép máy" alert for `app.popup`, shown only where `when` says it is on top.
-    /// Closing it clears `popup`, and RootView's onChange then syncs the overlay.
+    /// The alert for `app.popup` (title `popupTitle`, default "Ghép máy"), shown only where `when`
+    /// says it is on top. Closing it clears both, and RootView's onChange then syncs the overlay.
     func popupAlert(_ app: AppState, when: Bool) -> some View {
-        alert("Ghép máy", isPresented: Binding(get: { when && app.popup != nil },
-                                              set: { if !$0 { app.popup = nil } })) {
+        alert(app.popupTitle ?? "Ghép máy", isPresented: Binding(get: { when && app.popup != nil },
+                                                               set: { if !$0 { app.popup = nil; app.popupTitle = nil } })) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(app.popup ?? "")

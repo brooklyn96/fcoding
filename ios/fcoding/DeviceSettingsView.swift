@@ -161,8 +161,11 @@ struct ServerAddressView: View {
         errorText = nil
         Task {
             // On success the home screen starts afresh (this sheet closes with it).
-            errorText = await app.moveServer(to: text)
+            let failure = await app.moveServer(to: text)
+            errorText = failure
             saving = false
+            // VoiceOver: the red line appears without focus, so read the reason out.
+            if let failure = failure { UIAccessibility.post(notification: .announcement, argument: failure) }
         }
     }
 }
