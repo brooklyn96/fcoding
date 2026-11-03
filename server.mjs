@@ -393,17 +393,15 @@ export function pairPage(appLink) {
   return `<!doctype html><html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Ghép FCode</title><style>body{margin:0;font:17px/1.5 -apple-system,system-ui,sans-serif;background:#111;color:#eee;text-align:center}main{padding:48px 24px}.btn{display:block;max-width:320px;margin:24px auto;padding:16px;border-radius:14px;background:#0a84ff;color:#fff;font-size:20px;font-weight:600;text-decoration:none}.s{color:#999;font-size:15px}</style></head><body><main><h1>Ghép iPhone với FCode</h1>${body}</main></body></html>`;
 }
 
-// ---------- home screen v2 (CONTRACT.md A8): quota, spend, box timer, projects, updates, Codex reset ----------
+// ---------- home screen v2 (CONTRACT.md A8): quota, spend, projects, updates, Codex reset ----------
 const QUOTA_TTL = 60e3, LISTING_TTL = 300e3, SPEND_TTL = 300e3, PROJECTS_TTL = 120e3, GATE_CONFIG_TTL = 600e3, RUN_WINDOW = 100; // RUN_WINDOW: Actions runs read per project (deploy line and PR checks)
 const HOME_WAIT_MS = 8000; // a part with no value yet is waited for this long at most, then it is empty and fills in the background
 const FRESH_MIN_MS = 10e3, HOME_FRESH_WAIT_MS = 25e3; // GET /api/home?fresh=1: a part older than 10 s is read again and waited for, 25 s at most
+const WORK_TICK_MS = 10e3, WORK_GAP_MS = 60e3; // GET /api/home `working`: tmux list-sessions is read every 10 s; a session works while its activity moved within 60 s
 const WARM_TICK_MS = 5e3; // from boot every home part is checked this often and refreshed once it is past its own TTL (never more than one refresh at a time)
 const OVERVIEW_PAR = 3, OVERVIEW_KEEP = 4; // GET /api/overview: its git and tmux reads run at most this many at a time, each inside one of the MAX_READS slots; it leaves OVERVIEW_KEEP slots free (two screen reads)
 const QUOTA_STALE_MS = 10 * 60e3; // a report omp fetched longer ago than this is stale
 const DEFAULT_TZ = 'Asia/Ho_Chi_Minh';
-export const BOX = { maxRunMinutes: 480, idlePauseMinutes: 30, cooldownMinutes: 10 };
-const BOX_REC_MS = 10 * 60e3; // the box's own instabox record is used while it was read less than this ago (staging refreshes it every 30 s)
-const BOX_TICK_MS = 30e3, BOX_GAP_MS = 90e3; // a tick that comes more than 90 s late = the box was asleep and resumed
 const SPEND_DAYS = 30, SCAN_DAYS = 31, SCAN_CHUNK = 8 << 20, MAX_LINE = 4 << 20;
 const RESET_TIMEOUT = 45e3, RESET_KEEP_MS = 15 * 60e3, RESET_REPLY_MS = 15e3; // a reset still running after 15 s is answered 202 pending
 const RESET_FINAL = ['reset', 'already', 'nothing_to_reset', 'no_credit']; // the only answers kept for a retry with the same requestId
@@ -866,7 +864,7 @@ export function parseGitSync(text) {
   }
   return out;
 }
-// --- v1.3.2: omp sessions of a project, instabox staging box ---
+// --- v1.3.2: omp sessions of a project ---
 // omp keeps a project's sessions in <agent dir>/sessions/<encoded cwd> (omp's own rule: under tmpdir "-tmp-<rel>", under home "-<rel>" ("-" for
 // home itself), else "--<abs path>--"; "/", "\" and ":" become "-", nothing else changes). homeDir / tmpDir are parameters for tests.
 export function ompDirName(cwd, homeDir = home, tmpDir = os.tmpdir()) {
@@ -915,35 +913,7 @@ async function readStart(file, n) {
     return buf.subarray(0, bytesRead);
   } catch { return null; } finally { await fh?.close().catch(() => {}); }
 }
-// instabox ls --json -> Map box name -> {state, updatedAt}; state running|suspended|stopped|starting, anything else "unknown".
-// A box asked to run that is not running yet counts as starting.
-const STAGING_STATES = ['running', 'suspended', 'stopped', 'starting'];
-export function parseStaging(list) {
-  const out = new Map();
-  for (const b of Array.isArray(list) ? list : []) {
-    if (typeof b?.name !== 'string') continue;
-    const s = typeof b.state === 'string' ? b.state : '';
-    out.set(b.name, { state: b.desiredState === 'running' && s !== 'running' ? 'starting' : STAGING_STATES.includes(s) ? s : 'unknown', updatedAt: isoOf(b.updatedAt) });
-  }
-  return out;
-}
-// the box's own record in `instabox ls --json` (by name or id) -> the numbers the ring needs, or null: no such box, no run, or no max run (-1 unlimited)
-export function boxOf(list, names) {
-  const r = (Array.isArray(list) ? list : []).find((b) => b && typeof b === 'object' && (names.includes(b.name) || names.includes(b.id)));
-  const run = Date.parse(r?.runStartedAt), cool = Date.parse(r?.cooldownUntil);
-  const pos = (v) => typeof v === 'number' && v > 0;
-  if (!(run > 0) || !pos(r.maxRunMinutes)) return null;
-  return { state: r.state, runStartedAt: run, maxRunMinutes: r.maxRunMinutes, cooldownUntil: cool > 0 ? cool : null, cooldownMinutes: pos(r.cooldownMinutes) ? r.cooldownMinutes : BOX.cooldownMinutes,
-    idlePauseMinutes: pos(r.autoSuspendAfterSeconds) ? r.autoSuspendAfterSeconds / 60 : BOX.idlePauseMinutes };
-}
-// the instabox key reaches the service through start.sh; the server keeps it in memory and takes it out of its own environment, so the
-// tmux server and every harness session it starts never inherit it
-function takeInstaboxKey() {
-  const k = process.env.INSTABOX_API_KEY;
-  delete process.env.INSTABOX_API_KEY;
-  return typeof k === 'string' && k.trim() ? k.trim() : null;
-}
-const STAGING_TTL = 30e3, STAGING_START_MS = 60e3, GUARD_TTL = 10 * 60e3, GUARD_SCAN = 20, GUARD_YOUNG_MS = 30e3;
+const GUARD_TTL = 10 * 60e3, GUARD_SCAN = 20, GUARD_YOUNG_MS = 30e3;
 const GIT_SYNC_MS = 8e3; // openFresh: how long fcode-git-sync may take before the new session is made anyway (fcode-new and the app wait 20 s in all)
 // Stale-while-revalidate, one refresh at a time. get(wait): a value younger than ttl as is; an older one at once while a refresh
 // runs in the background. With no value yet, or after clear(), the refresh is waited for at most `wait` ms; then the old value
@@ -1025,9 +995,7 @@ export function createApp(opts = {}) {
   const gitSyncFile = opts.gitSyncFile ?? path.join(home, '.local', 'state', 'fcode', 'git-sync.json');
   const gitSyncMs = opts.gitSyncMs ?? GIT_SYNC_MS;
   const ompRoot = opts.ompSessionsRoot ?? path.join(process.env.PI_CODING_AGENT_DIR || path.join(home, '.omp', 'agent'), 'sessions');
-  const instaboxSpec = specOf(opts.instabox ?? process.env.PC_INSTABOX ?? 'instabox');
   const systemctlSpec = specOf(opts.systemctl ?? ['systemctl']); // tests only: a stub; never from the environment or a request
-  const instaboxKey = opts.instaboxKey !== undefined ? opts.instaboxKey : takeInstaboxKey(); // null: no key, staging is off
 
   secureConfigDir(configDir);
 
@@ -1559,32 +1527,6 @@ export function createApp(opts = {}) {
     return name;
   }
 
-  // --- staging box: `instabox ls --json` (30 s) and `instabox start <box> --no-wait`, box name = project name ---
-  // The same listing also holds this box's own record (.box: the real run start and max run for the home ring, see boxInfo). The box is
-  // told by its hostname "instabox-<name>" (or the plain name), PC_BOX_NAME / opts.boxName overriding it; not listed: .box is null.
-  const hostName = String(opts.boxName ?? process.env.PC_BOX_NAME ?? os.hostname());
-  const boxNames = [hostName, hostName.replace(/^instabox-/, '')];
-  const lsBoxes = async () => {
-    const list = JSON.parse(await execTool(instaboxSpec, ['ls', '--json'], 15e3, { ...toolEnv(), INSTABOX_API_KEY: instaboxKey }));
-    return Object.assign(parseStaging(list), { box: boxOf(list, boxNames) });
-  };
-  const staging = memo(STAGING_TTL, lsBoxes, now);
-  const startingBoxes = new Set(); // projects whose `instabox start` runs now
-  // detached and unref'd with its output ignored; a failure only logs one line (never the key)
-  function startBox(project) {
-    startingBoxes.add(project);
-    let over = false;
-    const end = (why) => { if (over) return; over = true; startingBoxes.delete(project); staging.clear(); if (why) log(`staging-start ${project}: ${why}`); };
-    try {
-      const [cmd, ...pre] = instaboxSpec;
-      const child = spawn(cmd, [...pre, 'start', project, '--no-wait'], { stdio: 'ignore', detached: true, windowsHide: true, timeout: STAGING_START_MS,
-        env: { ...toolEnv(), INSTABOX_API_KEY: instaboxKey } });
-      child.on('error', (e) => end(e.code === 'ENOENT' ? 'command not found' : 'cannot start'));
-      child.on('exit', (code, sig) => end(code === 0 ? '' : `exit ${code ?? sig}`));
-      child.unref();
-    } catch { end('cannot start'); }
-  }
-
   // POST /api/tools/update starts fcode-update.service, GET reads it: the argv is fixed, no shell, nothing of the request reaches it
   const UPDATE_UNIT = 'fcode-update.service';
   const UPDATE_CHECK_MS = 4e3, UPDATE_START_MS = 8e3; // the client (hermes) gives up at 15 s: is-active + start, 12 s at most, still answer the POST
@@ -1715,67 +1657,53 @@ export function createApp(opts = {}) {
     return out;
   }
   const projects = memo(PROJECTS_TTL, () => Promise.all(cfg.projectNames.map(projectInfo)), now);
-  // box timer (estimate, no API key): the last resume = a 30 s tick that came more than 90 s late, or the start of a box run.
-  // {resume, tick, boot} is kept in box-timer.json on every 30 s tick, so a server restart (reinstall, crash, systemctl restart)
-  // within 90 s of the last tick, on the same boot, keeps the run's resume. An older or missing file means the box was asleep or
-  // stopped; another boot (Linux boot_id; null where there is none) is a reboot: both are a new run (resume = now).
-  // An instabox pause keeps the boot_id, so the 90 s tick gap is what catches it.
-  const boxFile = path.join(configDir, 'box-timer.json');
-  let boot = null;
-  try { boot = fs.readFileSync(opts.bootIdFile ?? '/proc/sys/kernel/random/boot_id', 'utf8').trim() || null; } catch {}
-  let boxResume = now(), boxTick = now();
-  try {
-    const b = JSON.parse(fs.readFileSync(boxFile, 'utf8'));
-    const age = boxTick - b?.tick;
-    if (Number.isFinite(b?.resume) && Number.isFinite(b?.tick) && b.resume <= b.tick && age >= 0 && age < BOX_GAP_MS
-      && (b.boot ?? null) === boot) boxResume = b.resume;
-  } catch {} // no file or a bad one: a new run
-  const tick = () => { const t = now(); if (t - boxTick > BOX_GAP_MS) boxResume = t; boxTick = t; };
-  const tickBox = () => { // the 30 s tick: also stored (a failed write only loses the restart memory)
-    tick();
-    try { writeFile(boxFile, JSON.stringify({ resume: boxResume, tick: boxTick, boot })); } catch {}
-  };
-  tickBox();
-  const boxTimer = setInterval(tickBox, BOX_TICK_MS);
-  boxTimer.unref();
+  // --- GET /api/home `working`: the sessions whose tmux activity moved within WORK_GAP_MS ---
+  // A poll of `tmux list-sessions` (listSessions, no capture-pane) every WORK_TICK_MS keeps one streak per session, in memory only:
+  // last = the newest activity seen (epoch s), since = the activity at which the current streak began (null while quiet). A streak begins
+  // when activity advances after more than WORK_GAP_MS of quiet, or when a session is first seen already active; it ends once WORK_GAP_MS
+  // pass with no advance. A session gone from tmux is dropped; so is a name that came back as a new session (another `created`).
+  const streaks = new Map(); // name -> {created, last, since, project, harness}
+  const workCtx = { cancelled: false, device: null, gen: -1, admin: true }; // like the admin socket's: run() needs a ctx and there is no device here
+  let polling = false; // one poll at a time: a tick is skipped while the previous one still runs (a slow tmux never piles children up)
+  async function tickWork() {
+    if (polling) return;
+    polling = true;
+    let rows;
+    try { refreshConfig(); workCtx.gen = gen; rows = await listSessions(workCtx); } catch { return; } finally { polling = false; } // tmux busy or failing: the streaks stay as they are
+    const t = now(), keep = new Set();
+    for (const r of rows) {
+      keep.add(r.name);
+      let s = streaks.get(r.name);
+      if (!s || s.created !== r.created) s = { created: r.created, last: 0, since: null };
+      if (r.activity > s.last) { if (s.since === null || r.activity - s.last > WORK_GAP_MS / 1e3) s.since = r.activity; s.last = r.activity; }
+      if (t - s.last * 1e3 > WORK_GAP_MS) s.since = null;
+      streaks.set(r.name, Object.assign(s, { project: r.project, harness: r.harness }));
+    }
+    for (const name of streaks.keys()) if (!keep.has(name)) streaks.delete(name);
+  }
+  // longest first; a streak whose gap has passed since the last poll is already over
+  const workingNow = (t) => [...streaks].filter(([, s]) => s.since !== null && t - s.last * 1e3 <= WORK_GAP_MS)
+    .map(([name, s]) => ({ name, project: s.project, harness: s.harness, since: s.since })).sort((a, b) => a.since - b.since || (a.name < b.name ? -1 : 1));
+  const workTick = opts.workTickMs ?? WORK_TICK_MS;
+  let workTimer = null;
+  function startWork() {
+    if (workTimer || !(workTick > 0)) return;
+    tickWork();
+    workTimer = setInterval(tickWork, workTick);
+    workTimer.unref();
+  }
   // from boot every part is kept warm: one check per tick, and get(0) starts a refresh only for a part past its own TTL (and not in its
   // retry wait), through the memo, so a part is never refreshed twice at once; /api/home then answers from memory
   const warmTick = opts.warmTickMs ?? WARM_TICK_MS;
   let warmTimer = null;
   const warmUp = () => {
-    for (const m of [quota, listing, spend, projects, ...(instaboxKey ? [staging] : [])]) m.get(0).catch(() => {});
+    for (const m of [quota, listing, spend, projects]) m.get(0).catch(() => {});
   };
   function startWarm() {
     if (warmTimer || !(warmTick > 0)) return;
     warmUp();
     warmTimer = setInterval(warmUp, warmTick);
     warmTimer.unref();
-  }
-  // rec: this box's record from the cached `instabox ls` (staging part: stale-while-revalidate, never waited for here) with the time it was read.
-  // instabox's own numbers win: sleeps at runStartedAt + maxRunMinutes (a paused box: its cooldownUntil is the wake, which the app reads as
-  // sleepsAt + cooldown). A record read before the last resume (a tick gap) or older than BOX_REC_MS is not used: the estimate answers until a new one lands.
-  let boxNums = BOX; // maxRun / idle pause / cooldown of the estimate: the last record's, so a lapsed record does not change them
-  function boxInfo(rec) {
-    tick();
-    const t = now();
-    const fresh = rec?.box && rec.at >= boxResume && t - rec.at < BOX_REC_MS ? rec.box : null;
-    if (fresh) boxNums = { maxRunMinutes: fresh.maxRunMinutes, idlePauseMinutes: fresh.idlePauseMinutes, cooldownMinutes: fresh.cooldownMinutes }; // also when the record itself is not used
-    const paused = !!fresh && fresh.state !== 'running' && fresh.cooldownUntil > t;
-    // A box not paused more than a cooldown past its own deadline (we are answering, so it runs) is not what the record says: the estimate answers, never a past sleepsAt.
-    const ib = fresh && (paused || t <= fresh.runStartedAt + (fresh.maxRunMinutes + fresh.cooldownMinutes) * 60e3) ? fresh : null;
-    if (ib) {
-      const cool = ib.cooldownMinutes * 60e3;
-      // the estimate follows the known run start (tickBox stores it too): it stays right when the record lapses and never restarts against a live run
-      if (!paused && ib.runStartedAt <= t) boxResume = ib.runStartedAt;
-      const at = paused ? ib.cooldownUntil - cool : ib.runStartedAt + ib.maxRunMinutes * 60e3;
-      return { state: 'running', sleepsAt: paused || at > t ? iso(at) : null, ...boxNums, source: 'instabox' };
-    }
-    const maxMs = boxNums.maxRunMinutes * 60e3;
-    let at = boxResume + maxMs;
-    // We are answering this request, so the box runs. An estimate already past its sleep time plus a whole cooldown is wrong (a pause the
-    // tick gap did not catch): the run starts again now, or the ring stays at "--:--" for good.
-    if (t > at + boxNums.cooldownMinutes * 60e3) { boxResume = t; at = t + maxMs; }
-    return { state: 'running', sleepsAt: at > t ? iso(at) : null, ...boxNums, source: 'estimate' };
   }
   // fresh (?fresh=1): each part older than freshMin is read again now and waited for, freshWait at most; else as the cache holds it
   async function homeView(fresh = false) {
@@ -1784,9 +1712,7 @@ export function createApp(opts = {}) {
     const projWait = projectsDirty ? 0 : homeWait; projectsDirty = false;
     const part = (m, wait) => (fresh ? m.fresh(freshWait, freshMin) : m.get(wait));
     // the listing is waited for half as long as the quota when it has no value yet (a slow first listing: `~` ids, filled in at a later reply)
-    const [q, l, s, p, b, g] = await Promise.allSettled([part(quota, homeWait), part(listing, homeWait / 2), part(spend, homeWait), part(projects, projWait),
-      instaboxKey ? part(staging, homeWait) : Promise.reject(new Error('no instabox key')), part(ompGuard, homeWait)]);
-    const boxes = b.status === 'fulfilled' ? b.value.value : null; // no key, or instabox failed with nothing cached: every staging is null
+    const [q, l, s, p, g] = await Promise.allSettled([part(quota, homeWait), part(listing, homeWait / 2), part(spend, homeWait), part(projects, projWait), part(ompGuard, homeWait)]);
     const t = now();
     const qv = q.status === 'fulfilled' ? q.value : null;
     const { accounts, byAccountId } = qv ? accountsOf(qv, l.status === 'fulfilled' ? l.value : null) : { accounts: [], byAccountId: new Map() };
@@ -1795,10 +1721,10 @@ export function createApp(opts = {}) {
     try { updates = parseUpdates(fs.readFileSync(updatesFile, 'utf8')); } catch {}
     let gits = new Map(); // read once per home reply; the projects part is cached, this is not
     try { gits = parseGitSync(fs.readFileSync(gitSyncFile, 'utf8')); } catch {}
-    const withGit = (list) => list.map((x) => ({ ...x, git: gits.get(x.name) ?? NO_GIT, staging: boxes?.get(x.name) ?? null }));
+    const withGit = (list) => list.map((x) => ({ ...x, git: gits.get(x.name) ?? NO_GIT }));
     const cachedProjects = new Map((p.status === 'fulfilled' ? p.value.value : []).map((x) => [x.name, x]));
     return {
-      generatedAt: iso(t), box: boxInfo(b.status === 'fulfilled' ? { box: b.value.value.box, at: b.value.at } : null),
+      generatedAt: iso(t),
       accounts: accounts.map((a) => ({ ...a, spend: view?.perAccount.get(a.id) ?? null })),
       totals: view?.totals ?? { spend: null, byHarness: [] },
       // not read yet (first request, slow gh): each project with nothing known and loading: true (a gh failure has no loading)
@@ -1806,6 +1732,7 @@ export function createApp(opts = {}) {
       projects: withGit(cfg.projectNames.map((name) => cachedProjects.get(name) ?? { name, repo: null, branch: null, prs: null, lastRun: null, loading: true })),
       updates,
       omp: g.status === 'fulfilled' ? g.value.value : { version: null, formatOk: true, reason: null }, // not scanned yet: no alarm
+      working: workingNow(t),
     };
   }
   // POST /api/codex-reset: one reset per account at a time; the same requestId joins a running reset, and a final answer
@@ -2361,8 +2288,8 @@ export function createApp(opts = {}) {
       return json(res, 200, { name, created });
     }
 
-    // v1.3.2: /api/projects/<name>/omp-sessions, /api/projects/<name>/omp-sessions/<id>/resume, /api/projects/<name>/staging/start
-    const pm = /^\/api\/projects\/([^/]+)\/(?:(omp-sessions)|omp-sessions\/([^/]+)\/(resume)|(staging)\/start)$/.exec(pathname);
+    // v1.3.2: /api/projects/<name>/omp-sessions, /api/projects/<name>/omp-sessions/<id>/resume
+    const pm = /^\/api\/projects\/([^/]+)\/(?:(omp-sessions)|omp-sessions\/([^/]+)\/(resume))$/.exec(pathname);
     if (pm) {
       want(pm[2] ? 'GET' : 'POST');
       const unescape = (s) => { try { return decodeURIComponent(s); } catch { return ''; } };
@@ -2370,24 +2297,15 @@ export function createApp(opts = {}) {
       const refuse = (status, error) => json(res, status, { ok: false, error });
       if (!validProject(project)) return refuse(404, 'unknown_project');
       if (pm[2]) return json(res, 200, { ok: true, sessions: await ompSessions(project) });
-      if (pm[4]) { // resume
-        const id = unescape(pm[3]);
-        const dir = path.join(ompRoot, ompDirName(cfg.projects[project]));
-        const file = OMP_ID_RE.test(id) ? (await ompFiles(dir)).find((f) => f.id === id) : null;
-        const st = file && await fs.promises.stat(path.join(dir, file.name)).catch(() => null);
-        if (!st) return refuse(404, 'unknown_session');
-        const buf = await readStart(path.join(dir, file.name), Math.min(st.size, OMP_HEAD_BYTES));
-        if (!buf || !KNOWN_VERSIONS.includes(ompHead(buf, st.size).version)) return refuse(409, 'unknown_format'); // the list never offers it either
-        return json(res, 200, { ok: true, session: await mutate(ctx, () => resumeOmp(project, id, ctx)) });
-      }
-      // staging/start: only a box that `instabox ls` lists under the project's name; a running or starting one is left alone
-      if (!instaboxKey) return refuse(409, 'no_instabox_key');
-      let box;
-      try { box = (await lsBoxes()).get(project); } catch { return refuse(503, 'staging_unavailable'); } // the state now (a fresh ls), never a cached one
-      if (!box) return refuse(404, 'no_staging_box');
-      if (box.state === 'running' || box.state === 'starting' || startingBoxes.has(project)) return json(res, 200, { ok: true, state: box.state === 'running' ? 'running' : 'starting' });
-      startBox(project);
-      return json(res, 200, { ok: true, state: 'starting' });
+      // resume
+      const id = unescape(pm[3]);
+      const dir = path.join(ompRoot, ompDirName(cfg.projects[project]));
+      const file = OMP_ID_RE.test(id) ? (await ompFiles(dir)).find((f) => f.id === id) : null;
+      const st = file && await fs.promises.stat(path.join(dir, file.name)).catch(() => null);
+      if (!st) return refuse(404, 'unknown_session');
+      const buf = await readStart(path.join(dir, file.name), Math.min(st.size, OMP_HEAD_BYTES));
+      if (!buf || !KNOWN_VERSIONS.includes(ompHead(buf, st.size).version)) return refuse(409, 'unknown_format'); // the list never offers it either
+      return json(res, 200, { ok: true, session: await mutate(ctx, () => resumeOmp(project, id, ctx)) });
     }
 
     // /api/<verb>/<name>
@@ -2514,12 +2432,13 @@ export function createApp(opts = {}) {
     try {
       const bound = await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, host, () => resolve(server.address().port)); });
       startWarm();
+      startWork();
       return bound;
     } catch (e) { adminServer.close(); throw e; }
   };
   const close = () => {
-    clearInterval(boxTimer);
     clearInterval(stallTimer);
+    clearInterval(workTimer); workTimer = null;
     clearInterval(warmTimer); warmTimer = null;
     for (const abort of [...addStops]) abort();
     return Promise.all([
@@ -2527,8 +2446,8 @@ export function createApp(opts = {}) {
       new Promise((resolve) => (adminServer.listening ? adminServer.close(() => resolve()) : resolve())),
     ]);
   };
-  const homeIdle = () => Promise.all([quota, listing, spend, projects, staging, ompGuard].map((m) => m.settled())); // tests: no refresh still running
-  return { server, listen, close, devices, tickBox, homeIdle, stats: () => ({ streams, wakers: wakers.size, running, reads, waiting: queue.length, active: !!active, addJobs: addJobs.size }) };
+  const homeIdle = () => Promise.all([quota, listing, spend, projects, ompGuard].map((m) => m.settled())); // tests: no refresh still running
+  return { server, listen, close, devices, tickWork, homeIdle, stats: () => ({ streams, wakers: wakers.size, running, reads, waiting: queue.length, active: !!active, addJobs: addJobs.size }) };
 }
 
 // ---------- CLI ----------

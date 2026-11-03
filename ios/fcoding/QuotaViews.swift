@@ -34,18 +34,17 @@ enum QuotaLinks {
 
 // MARK: - Top card
 
-/// Left: the box ring (tap = box info). Right: one quota account at a time, rolling to the next
-/// every 4 s (tap = Hạn mức detail).
+/// Left: the session timer (tap = next session). Right: one quota account at a time, rolling to
+/// the next every 4 s (tap = Hạn mức detail).
 struct TopCard: View {
     @ObservedObject var home: HomeModel
-    /// The main screen is on top and the app active: the tile may roll.
+    /// The main screen is on top and the app active: the tile and the timer may roll.
     let visible: Bool
-    let onRing: () -> Void
     let onQuota: () -> Void
 
     var body: some View {
         HStack(spacing: 14) {
-            BoxRing(box: home.home?.box, offset: home.offset, onTap: onRing)
+            SessionTimer(home: home, visible: visible)
             Rectangle().fill(Color.hair).frame(width: 0.5, height: 88).accessibilityHidden(true)
             QuotaTile(home: home, visible: visible, onTap: onQuota)
         }
@@ -54,107 +53,126 @@ struct TopCard: View {
     }
 }
 
-/// 88 pt clock ring, 6 pt stroke: "Sleeps in" hh:mm while the box runs (yellow under 10 min),
-/// "Wakes in" during the cooldown. It drains continuously (1 s linear glide per tick).
-struct BoxRing: View {
-    let box: HomeBox?
-    /// Server clock minus phone clock (HomeModel.offset).
-    let offset: TimeInterval
-    let onTap: () -> Void
+/// 88 pt ring in the old box ring's place: the session working now and how long it has been
+/// working (h:mm:ss, ticks every second, server clock). With several, the next one every 5 s; a
+/// tap moves on at once. None: "Rảnh". A list that is not live (saved copy, failed or old
+/// refresh: HomeLogic.timerLive) shows a dimmed "—" with no count and no roll.
+struct SessionTimer: View {
+    @ObservedObject var home: HomeModel
+    let visible: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
+    /// The name shown; a name that left the list falls back to the first (HomeLogic.timerIndex).
+    @State private var current: String?
+    @State private var lastMove = Date()
+
+    private var list: [WorkingSession] { home.home?.working ?? [] }
+    private var rolling: Bool { visible && scenePhase == .active && list.count > 1 }
+    private func live(_ now: Date) -> Bool {
+        HomeLogic.timerLive(fromCache: home.fromCache, failed: home.failed, loadedAt: home.loadedAt, now: now)
+    }
+
+    /// The widest time, "88:88:88", fits the 62 pt column at this size (19 pt or less).
+    private static let timeFont: UIFont = {
+        let base = UIFont.monospacedDigitSystemFont(ofSize: 19, weight: .semibold)
+        let width = ("88:88:88" as NSString).size(withAttributes: [.font: base]).width
+        return UIFont.monospacedDigitSystemFont(ofSize: 19 * min(1, 60 / max(1, width)), weight: .semibold)
+    }()
 
     var body: some View {
         TimelineView(.periodic(from: Date(), by: 1)) { ctx in
-            let r = HomeLogic.ring(box, now: ctx.date.addingTimeInterval(offset))
-            Button(action: onTap) { ring(r) }
-                .buttonStyle(.plain)
-                .accessibilityLabel(label(r, now: ctx.date))
+            let isLive = live(ctx.date)
+            let i = HomeLogic.timerIndex(current, in: list)
+            let shown: WorkingSession? = list.isEmpty ? nil : list[i]
+            let secs = shown.map { HomeLogic.workingSeconds($0, now: home.serverNow(ctx.date)) } ?? 0
+            let face = ring(isLive ? shown : nil, live: isLive, index: i, seconds: secs)
+            Group {
+                if isLive && list.count > 1 {
+                    Button(action: next) { face }
+                        .buttonStyle(.plain)
+                        .accessibilityHint("Chạm để xem phiên kế tiếp.")
+                } else {
+                    face.accessibilityElement(children: .ignore)
+                }
+            }
+            .accessibilityLabel(label(isLive ? shown : nil, live: isLive, index: i, seconds: secs))
+            .accessibilityAddTraits(.updatesFrequently)
+        }
+        // The list changed and the shown session left it: start again from the first.
+        .onChange(of: list.map(\.name)) { names in
+            if let c = current, !names.contains(c) {
+                current = names.first
+                lastMove = Date()
+            }
+        }
+        // As QuotaTile: one loop tied to the view's place on screen; it ends off screen, in the
+        // background and with fewer than two sessions, and does not move while the list is stale.
+        .task(id: rolling) {
+            guard rolling else { return }
+            lastMove = Date()
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                guard !Task.isCancelled, live(Date()), Date().timeIntervalSince(lastMove) >= HomeLogic.timerStep else { continue }
+                next()
+            }
         }
     }
 
-    private func colors(_ mode: HomeLogic.RingMode) -> (Color, Color, Color, Color) {
-        switch mode {
-        case .warn: return (.orangeTone, .yellowTone, Color(hex: 0xFFF4BF), .yellowTone)
-        case .paused: return (Color(hex: 0x5E5CE6), Color(hex: 0xA5A3FF), Color(hex: 0xE4E3FF), Color(hex: 0xA5A3FF))
-        default: return (.accentBlue, Color(hex: 0x64D2FF), Color(hex: 0xCFF3FF), .white)
-        }
+    private func next() {
+        guard list.count > 1 else { return }
+        lastMove = Date()
+        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.3)) { current = HomeLogic.timerNext(current, in: list) }
     }
 
-    /// "88:88" must fit inside the ring minus 16 % padding on each side.
-    private static let textWidth: CGFloat = 2 * 41 - 6 - 2 * 0.16 * 88
-    /// Mockup layoutRing: the time takes the size at which "88:88" fits `textWidth`; 6 pt from
-    /// the label baseline to the cap top of the digits; the pair is centred on its cap block.
-    private static let labelFont = UIFont.systemFont(ofSize: 11, weight: .medium)
-    private static let timeFont: UIFont = {
-        let base = UIFont.monospacedDigitSystemFont(ofSize: 23, weight: .semibold)
-        let width = ("88:88" as NSString).size(withAttributes: [.font: base]).width
-        return UIFont.monospacedDigitSystemFont(ofSize: 23 * min(1, textWidth / max(1, width)), weight: .semibold)
-    }()
-    /// Text frames run ascender to descender: remove the label descent and the space above the digit caps.
-    private static let textSpacing: CGFloat = 6 + labelFont.descender - (timeFont.ascender - timeFont.capHeight)
-    /// Moves the frames so the label cap top to digit baseline block sits on the ring centre.
-    private static let textOffset: CGFloat = (-timeFont.descender - (labelFont.ascender - labelFont.capHeight)) / 2
-
-    private func ring(_ r: HomeLogic.Ring) -> some View {
-        let c = colors(r.mode)
-        let f: Double = r.mode == .unknown ? 0 : r.fraction
+    private func ring(_ s: WorkingSession?, live: Bool, index: Int, seconds: Int) -> some View {
+        let tint = s.map { HarnessStyle.color($0.harness) } ?? Color.l3
         return ZStack {
             Circle().stroke(Color(hex: 0x767680, alpha: 0.22), lineWidth: 6).padding(3)
-            arc(f, mode: r.mode, g1: c.0, g2: c.1, core: c.2)
-            texts(r, color: c.3)
+            if s != nil {
+                Circle().stroke(tint.opacity(0.85), lineWidth: 6).padding(3)
+            }
+            VStack(spacing: 2) {
+                if let s = s {
+                    Text(s.name)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.l2)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                        .truncationMode(.middle)
+                    Text(HomeLogic.elapsed(seconds))
+                        .font(Font(SessionTimer.timeFont as CTFont))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.6)
+                    if list.count > 1 {
+                        Text("\(index + 1)/\(list.count)")
+                            .font(.system(size: 9.5, weight: .medium).monospacedDigit())
+                            .foregroundColor(.l2)
+                    }
+                } else if live {
+                    Text("Rảnh")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundColor(.l2)
+                } else {
+                    Text("—")
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundColor(.l2)
+                }
+            }
+            .frame(width: 62)
+            .id(s?.name)
+            .transition(.opacity)
         }
+        .opacity(live ? 1 : 0.45)
         .frame(width: 88, height: 88)
         .contentShape(Circle())
     }
 
-    private func arc(_ f: Double, mode: HomeLogic.RingMode, g1: Color, g2: Color, core: Color) -> some View {
-        let gradient = LinearGradient(colors: [g1, g2], startPoint: .topLeading, endPoint: .bottomTrailing)
-        let angle = Angle.degrees(360 * f)
-        return ZStack {
-            Circle()
-                .trim(from: 0, to: CGFloat(f))
-                .stroke(gradient, style: StrokeStyle(lineWidth: 6, lineCap: .round))
-                .rotationEffect(.degrees(-90))
-                .padding(3)
-            if mode != .unknown {
-                ZStack {
-                    Circle().fill(g2).frame(width: 8, height: 8).shadow(color: g2, radius: 2)
-                    Circle().fill(core).frame(width: 3, height: 3)
-                }
-                .offset(y: -41)
-                .rotationEffect(angle)
-            }
-        }
-        // A change of state snaps; inside a state the ring glides 1 s per tick.
-        .animation(reduceMotion ? nil : .linear(duration: 1), value: f)
-        .id(mode)
-    }
-
-    private func texts(_ r: HomeLogic.Ring, color: Color) -> some View {
-        let unknown = r.mode == .unknown
-        let time = unknown ? "--:--" : HomeLogic.hhmm(r.seconds)
-        return VStack(spacing: BoxRing.textSpacing) {
-            Text(r.mode == .paused ? "Wakes in" : "Sleeps in")
-                .font(Font(BoxRing.labelFont as CTFont))
-                .tracking(0.22)
-                .foregroundColor(.l2)
-            Text(time)
-                .font(Font(BoxRing.timeFont as CTFont))
-                .foregroundColor(unknown ? Color.l2 : color)
-                .lineLimit(1)
-                .fixedSize()
-        }
-        .offset(y: BoxRing.textOffset)
-    }
-
-    private func label(_ r: HomeLogic.Ring, now: Date) -> String {
-        let h = r.seconds / 3600, m = r.seconds % 3600 / 60
-        let at = r.changeAt.map { HomeLogic.clock($0) } ?? ""
-        switch r.mode {
-        case .unknown: return "Chưa biết giờ box nghỉ. Chạm để xem giải thích."
-        case .paused: return "Box đang nghỉ, đánh thức lại được sau \(h) giờ \(m) phút, lúc \(at). Chạm để xem giải thích."
-        default: return "Box nghỉ sau \(h) giờ \(m) phút, lúc \(at), hoặc sớm hơn nếu rảnh 30 phút. Chạm để xem giải thích."
-        }
+    private func label(_ s: WorkingSession?, live: Bool, index: Int, seconds: Int) -> String {
+        guard live else { return "Đồng hồ phiên: chưa có số liệu mới từ box." }
+        guard let s = s else { return "Rảnh: không có phiên nào đang làm." }
+        let pos = list.count > 1 ? " Phiên \(index + 1) trên \(list.count)." : ""
+        return "Phiên \(s.name) đang làm được \(HomeLogic.elapsedSpoken(seconds))." + pos
     }
 }
 
