@@ -134,7 +134,6 @@ Màn hình chính của app lấy mọi thứ từ một địa chỉ của máy
 | Pull request, CI | `gh` theo kho GitHub của từng dự án trong `config.json` | mỗi 2 phút |
 | Phiên bản công cụ | `~/.local/state/fcode-update/status.json` (omp, claude, codex) | mỗi lần mở |
 | Dự án chậm so với GitHub, cây chưa commit | `~/.local/state/fcode/git-sync.json` (timer `fcode-git-sync` trên box ghi) | mỗi lần mở |
-| Phiên đang làm việc (tên phiên, làm từ lúc nào) | `tmux list-sessions` (không đọc màn hình) | mỗi 10 giây |
 | Định dạng phiên omp, phiên bản omp | `omp --version` và dòng đầu các file phiên mới nhất trong `~/.omp/agent/sessions` | mỗi 10 phút |
 
 - Mở phiên mới (nút "+" hoặc `fcode-new`) thì box chạy `fcode-git-sync <dự án>` trước và chờ tối đa 8 giây, để thẻ dự án có số commit "chậm / chưa đẩy" mới nhất. Lệnh này chỉ `fetch` và đếm lại, không bao giờ đổi thư mục làm việc (chỉ timer 5 phút của box mới tự kéo nhánh chính về khi nhánh đó rảnh và sạch; nó không đụng nhánh khác, không stash, không reset, không push). Cập nhật code ở các trường hợp còn lại là việc của agent (luật "Sync first"). Thẻ dự án có thêm `autoUpdated` / `autoSkip` để biết timer đã tự kéo hay vì sao không. Thiếu lệnh, lệnh lỗi hay quá 8 giây thì phiên vẫn được tạo (máy chủ chỉ ghi một dòng nhật ký). Máy chủ không bao giờ tắt tiến trình đồng bộ; nó tự chạy xong, và mở phiên khác cùng dự án lúc đó dùng chung lần đồng bộ đang chạy.
@@ -259,9 +258,9 @@ Muốn dùng lại sau khi bị gỡ thì chạy `fcode-pair` trên box và ghé
 
 Hướng dẫn đầy đủ cho app nằm ở [ios/README.md, mục 4](../ios/README.md#4-cách-dùng). Tóm tắt:
 
-**Màn hình chính** (thanh trên cùng chỉ có nút **?** Hướng dẫn và **⚙** Cài đặt). Phiên tự cập nhật mỗi 5 giây, hạn mức, dự án và đồng hồ phiên mỗi 15 giây; kéo xuống để cập nhật ngay.
+**Màn hình chính** (thanh trên cùng chỉ có nút **?** Hướng dẫn và **⚙** Cài đặt). Phiên tự cập nhật mỗi 5 giây, hạn mức và dự án mỗi phút; kéo xuống để cập nhật ngay.
 
-- **Đồng hồ phiên** (bên trái thẻ trên cùng): tên phiên đang làm và đã làm được bao lâu (giờ:phút:giây). Nhiều phiên thì tự chuyển sang phiên kế mỗi 5 giây; chạm để chuyển ngay. Không phiên nào đang làm thì hiện **Rảnh**. Vòng mờ với dấu **—**: app chưa có số liệu mới từ box (vừa mở app, mất mạng); chờ vài giây hoặc kéo xuống để cập nhật. Một phiên được tính là "đang làm" khi màn hình của nó vừa có thay đổi trong 60 giây gần nhất; máy chủ hỏi tmux mỗi 10 giây (không đọc nội dung màn hình), nên số này có thể chậm tới vài giây.
+- **Lời chào và giờ** (bên trái thẻ trên cùng): lời chào theo giờ (Chào buổi sáng, trưa, chiều hoặc tối), giờ hiện tại cỡ lớn (24 giờ, ví dụ 22:05) và thứ, ngày (ví dụ Thứ Ba, 3/11). Luôn là **giờ Việt Nam**, dù điện thoại đặt múi giờ nào. Tự đổi mỗi phút theo đồng hồ điện thoại, đã chỉnh theo đồng hồ của box (độ lệch lấy từ `generatedAt` của `GET /api/home`, như trước). Máy chủ không gửi số liệu riêng nào cho phần này. Chạm vào phần này không có gì xảy ra.
 - **Ô hạn mức** (bên phải): mỗi lần một tài khoản, tự chuyển sang tài khoản kế mỗi 4 giây (giữ ngón tay trên ô để dừng). Chạm để mở màn hình **Hạn mức**.
 - Dòng **đang chạy · chờ bạn**: chạm để nhảy tới phiên tương ứng.
 - **Dự án** (trượt ngang): mỗi thẻ cho biết số PR đang mở, kết quả checks và lần deploy gần nhất ("đang đọc…" khi máy chủ vừa khởi động, "chưa đọc được GitHub" khi `gh` lỗi). Chạm thẻ để chỉ xem phiên của dự án đó; bấm **…** để mở phiên mới trong dự án đó. Giữ lâu trên thẻ để mở menu: **Mở phiên mới**, **Đổi tên hiển thị…** và **Sắp xếp**.
@@ -653,7 +652,7 @@ node -e 'console.log(require("crypto").randomBytes(32).toString("base64"))'
 ## 10. Phát triển
 
 - Máy chủ dùng **Node 22**, chỉ thư viện có sẵn (không `npm install`). Toàn bộ nằm trong `server.mjs`.
-- Hợp đồng giữa máy chủ và app nằm trong [`CONTRACT.md`](../CONTRACT.md) (các mục A1 trở đi là các thay đổi theo thời gian; ví dụ A4 thay mật khẩu bằng ghép máy, A5 thêm hộp thư tổng quan, A6 thêm màu cho màn hình, A7 ghép thêm máy bằng mã QR, A9 phiên omp của dự án, A10 đồng bộ phiên omp giữa laptop và box, A11 thêm dự án từ app, A16 bỏ vòng giờ box và đưa vào đồng hồ phiên).
+- Hợp đồng giữa máy chủ và app nằm trong [`CONTRACT.md`](../CONTRACT.md) (các mục A1 trở đi là các thay đổi theo thời gian; ví dụ A4 thay mật khẩu bằng ghép máy, A5 thêm hộp thư tổng quan, A6 thêm màu cho màn hình, A7 ghép thêm máy bằng mã QR, A9 phiên omp của dự án, A10 đồng bộ phiên omp giữa laptop và box, A11 thêm dự án từ app, A16 bỏ vòng giờ box; sau đó thẻ trên cùng hiện lời chào và giờ Việt Nam).
 - Chạy thử trên máy bất kỳ, kể cả Windows (dùng tmux giả, không cần tmux):
 
   ```sh

@@ -11,12 +11,10 @@ struct HomeData: Decodable {
     var projects: [HomeProject] = []
     /// The box's omp format check; nil on an older server.
     var omp: HomeOmp?
-    /// Sessions working now, longest first; empty when idle or on an older server.
-    var working: [WorkingSession] = []
 
     init() {}
 
-    private enum K: String, CodingKey { case generatedAt, accounts, totals, projects, omp, working }
+    private enum K: String, CodingKey { case generatedAt, accounts, totals, projects, omp }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: K.self)
         generatedAt = c.date(.generatedAt)
@@ -25,36 +23,6 @@ struct HomeData: Decodable {
         totals = c.value(.totals)
         projects = c.list(.projects)
         omp = c.value(.omp)
-        working = c.list(.working)
-    }
-}
-
-/// `working[]`: a tmux session whose output has moved within the last minute. An entry without
-/// a name or a numeric `since` is dropped.
-struct WorkingSession: Decodable, Equatable {
-    var name: String
-    var project: String?
-    var harness: String?
-    /// When the current working streak began: epoch seconds, server clock.
-    var since: Double
-
-    init(name: String, since: Double, project: String? = nil, harness: String? = nil) {
-        self.name = name
-        self.since = since
-        self.project = project
-        self.harness = harness
-    }
-
-    private enum K: String, CodingKey { case name, project, harness, since }
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: K.self)
-        name = try c.decode(String.self, forKey: .name)
-        since = try c.decode(Double.self, forKey: .since)
-        guard !name.isEmpty else {
-            throw DecodingError.dataCorruptedError(forKey: .name, in: c, debugDescription: "empty name")
-        }
-        project = c.value(.project)
-        harness = c.value(.harness)
     }
 }
 
@@ -792,47 +760,64 @@ enum HomeLogic {
         s.range(of: "^[a-z0-9][a-z0-9-]{0,31}$", options: .regularExpression) != nil
     }
 
-    // MARK: Session timer (top card)
+    /// GET /api/home (and the prefs) period while the project list is on screen.
+    static let homePoll: TimeInterval = 60
 
-    /// Seconds each working session stays on the top card before the next one.
-    static let timerStep: TimeInterval = 5
-    /// GET /api/home period while the project list is on screen (it carries `working`).
-    static let homePoll: TimeInterval = 15
+    // MARK: Greeting (top card)
 
-    /// The `working` list may be shown as live: a reply from this launch (not the saved copy),
-    /// the last refresh did not fail, and it arrived within two home polls. `now` and `loadedAt`
-    /// are phone clock.
-    static func timerLive(fromCache: Bool, failed: Bool, loadedAt: Date?, now: Date) -> Bool {
-        guard !fromCache, !failed, let at = loadedAt else { return false }
-        return now.timeIntervalSince(at) <= 2 * homePoll
+    /// Every time on the greeting card is Vietnam time, whatever the phone's zone (owner rule).
+    static let vietnam: Calendar = {
+        var c = Calendar(identifier: .gregorian)
+        c.timeZone = TimeZone(identifier: "Asia/Ho_Chi_Minh") ?? TimeZone(secondsFromGMT: 7 * 3600)!
+        return c
+    }()
+
+    /// The last server-minute boundary at or before `phone`, on the phone clock (`offset` =
+    /// server minus phone): the greeting card's timeline starts here and ticks every 60 s.
+    static func minuteStart(phone: Date, offset: TimeInterval) -> Date {
+        Date(timeIntervalSince1970: ((phone.timeIntervalSince1970 + offset) / 60).rounded(.down) * 60 - offset)
     }
 
-    /// The session shown: `current` while it is still in the list, else the first (0 when empty).
-    static func timerIndex(_ current: String?, in list: [WorkingSession]) -> Int {
-        current.flatMap { c in list.firstIndex { $0.name == c } } ?? 0
+    /// The server instant the card reads, rounded to the whole second. A tick lands on the
+    /// boundary only within Double error (often 1e-7 s before it), and that must not show the
+    /// previous minute.
+    static func shownInstant(_ server: Date) -> Date {
+        Date(timeIntervalSince1970: server.timeIntervalSince1970.rounded())
     }
 
-    /// The session after the shown one, wrapping around; nil for an empty list.
-    static func timerNext(_ current: String?, in list: [WorkingSession]) -> String? {
-        guard !list.isEmpty else { return nil }
-        return list[(timerIndex(current, in: list) + 1) % list.count].name
+    /// By the hour in Vietnam: sáng 04–10, trưa 11–12, chiều 13–17, tối 18–03.
+    static func greeting(_ date: Date) -> String {
+        switch vietnam.component(.hour, from: date) {
+        case 4...10: return "Chào buổi sáng"
+        case 11...12: return "Chào buổi trưa"
+        case 13...17: return "Chào buổi chiều"
+        default: return "Chào buổi tối"
+        }
     }
 
-    /// Whole seconds a session has been working at `now` (server clock); never negative.
-    static func workingSeconds(_ s: WorkingSession, now: Date) -> Int {
-        max(0, Int(now.timeIntervalSince1970 - s.since))
+    /// "22:05", 24 h.
+    static func clockTime(_ date: Date) -> String {
+        let c = vietnam.dateComponents([.hour, .minute], from: date)
+        return "\(pad2(c.hour ?? 0)):\(pad2(c.minute ?? 0))"
     }
 
-    /// Always "h:mm:ss" ("0:12:30").
-    static func elapsed(_ seconds: Int) -> String {
-        let s = max(0, seconds)
-        return "\(s / 3600):\(pad2(s % 3600 / 60)):\(pad2(s % 60))"
+    private static let weekdays = ["Chủ Nhật", "Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy"]
+
+    /// "Chủ Nhật" … "Thứ Bảy".
+    static func weekdayName(_ date: Date) -> String {
+        weekdays[(vietnam.component(.weekday, from: date) + 6) % 7]
     }
 
-    /// VoiceOver: "1 giờ 5 phút 3 giây" (zero leading units left out).
-    static func elapsedSpoken(_ seconds: Int) -> String {
-        let s = max(0, seconds), h = s / 3600, m = s % 3600 / 60
-        return (h > 0 ? "\(h) giờ " : "") + (h > 0 || m > 0 ? "\(m) phút " : "") + "\(s % 60) giây"
+    /// "Thứ Ba, 3/11": day/month with no leading zero.
+    static func dayLine(_ date: Date) -> String {
+        let c = vietnam.dateComponents([.day, .month], from: date)
+        return "\(weekdayName(date)), \(c.day ?? 0)/\(c.month ?? 0)"
+    }
+
+    /// VoiceOver: "Chào buổi tối, 22 giờ 05, Thứ Ba ngày 3 tháng 11".
+    static func greetingSpoken(_ date: Date) -> String {
+        let c = vietnam.dateComponents([.hour, .minute, .day, .month], from: date)
+        return "\(greeting(date)), \(c.hour ?? 0) giờ \(pad2(c.minute ?? 0)), \(weekdayName(date)) ngày \(c.day ?? 0) tháng \(c.month ?? 0)"
     }
 
     // MARK: Server address (Cài đặt)
@@ -1303,46 +1288,52 @@ enum HomeLogic {
         eq("clock slow reply", clockOffset(generatedAt: now.addingTimeInterval(30), received: now.addingTimeInterval(30)), 0)
         eq("clock no date", clockOffset(generatedAt: nil, received: now), 0)
 
-        // Session timer
-        let t0 = now.timeIntervalSince1970
-        let wk = [WorkingSession(name: "a", since: t0 - 3725), WorkingSession(name: "b", since: t0 - 65),
-                  WorkingSession(name: "c", since: t0 - 5)]
-        eq("timer first", timerIndex(nil, in: wk), 0)
-        eq("timer keeps", timerIndex("b", in: wk), 1)
-        eq("timer gone resets", timerIndex("x", in: wk), 0)
-        eq("timer empty", timerIndex("a", in: []), 0)
-        eq("timer next", timerNext("a", in: wk), "b")
-        eq("timer wraps", timerNext("c", in: wk), "a")
-        eq("timer next after gone", timerNext("x", in: wk), "b")
-        eq("timer next one", timerNext("a", in: [wk[0]]), "a")
-        eq("timer next empty", timerNext(nil, in: []), nil)
-        // List changed: "b" still there keeps its place; "c" gone goes back to the first.
-        eq("timer list kept", timerIndex("b", in: [wk[2], wk[1]]), 1)
-        eq("timer list dropped", timerIndex("c", in: [wk[0], wk[1]]), 0)
-        eq("elapsed h", elapsed(workingSeconds(wk[0], now: now)), "1:02:05")
-        eq("elapsed m", elapsed(workingSeconds(wk[1], now: now)), "0:01:05")
-        eq("elapsed s", elapsed(5), "0:00:05")
-        eq("elapsed zero", elapsed(0), "0:00:00")
-        eq("elapsed 12:30", elapsed(12 * 60 + 30), "0:12:30")
-        eq("elapsed 59:59", elapsed(3599), "0:59:59")
-        eq("elapsed 1h", elapsed(3600), "1:00:00")
-        eq("elapsed 99h", elapsed(100 * 3600 - 1), "99:59:59")
-        // Stale list: the saved copy, a failed refresh, or older than two home polls is not live.
-        eq("live fresh", timerLive(fromCache: false, failed: false, loadedAt: now.addingTimeInterval(-10), now: now), true)
-        eq("live two polls", timerLive(fromCache: false, failed: false, loadedAt: now.addingTimeInterval(-30), now: now), true)
-        eq("live too old", timerLive(fromCache: false, failed: false, loadedAt: now.addingTimeInterval(-31), now: now), false)
-        eq("live cache", timerLive(fromCache: true, failed: false, loadedAt: now, now: now), false)
-        eq("live failed", timerLive(fromCache: false, failed: true, loadedAt: now, now: now), false)
-        eq("live no reply", timerLive(fromCache: false, failed: false, loadedAt: nil, now: now), false)
-        eq("elapsed long", elapsed(30 * 3600 + 61), "30:01:01")
-        eq("elapsed future", workingSeconds(WorkingSession(name: "f", since: t0 + 30), now: now), 0)
-        // Phone 4 min fast: phone + offset is the server clock, so the count is unchanged.
-        eq("elapsed skew", workingSeconds(wk[1], now: phone.addingTimeInterval(off)), 65)
-        eq("elapsed ticks", workingSeconds(wk[1], now: now.addingTimeInterval(1)), 66)
-        eq("spoken h", elapsedSpoken(3725), "1 giờ 2 phút 5 giây")
-        eq("spoken m", elapsedSpoken(65), "1 phút 5 giây")
-        eq("spoken s", elapsedSpoken(5), "5 giây")
-        eq("spoken h0m", elapsedSpoken(3605), "1 giờ 0 phút 5 giây")
+        // Greeting: Vietnam time from an absolute instant, whatever the phone's zone.
+        // 1_800_000_000 = 2027-01-15 08:00 UTC = Friday 15:00 in Vietnam.
+        eq("vn zone time", clockTime(now), "15:00")
+        eq("vn zone day", dayLine(now), "Thứ Sáu, 15/1")
+        eq("vn zone greeting", greeting(now), "Chào buổi chiều")
+        // 2026-11-03 is a Tuesday.
+        func vn(_ d: Int, _ h: Int, _ m: Int, month: Int = 11) -> Date {
+            vietnam.date(from: DateComponents(year: 2026, month: month, day: d, hour: h, minute: m)) ?? now
+        }
+        eq("greet 03:59", greeting(vn(3, 3, 59)), "Chào buổi tối")
+        eq("greet 04:00", greeting(vn(3, 4, 0)), "Chào buổi sáng")
+        eq("greet 10:59", greeting(vn(3, 10, 59)), "Chào buổi sáng")
+        eq("greet 11:00", greeting(vn(3, 11, 0)), "Chào buổi trưa")
+        eq("greet 12:59", greeting(vn(3, 12, 59)), "Chào buổi trưa")
+        eq("greet 13:00", greeting(vn(3, 13, 0)), "Chào buổi chiều")
+        eq("greet 17:59", greeting(vn(3, 17, 59)), "Chào buổi chiều")
+        eq("greet 18:00", greeting(vn(3, 18, 0)), "Chào buổi tối")
+        eq("greet 00:00", greeting(vn(3, 0, 0)), "Chào buổi tối")
+        eq("weekdays", (1...7).map { weekdayName(vn($0, 12, 0)) },
+           ["Chủ Nhật", "Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy"])
+        eq("time padded", clockTime(vn(3, 9, 5)), "09:05")
+        eq("time 24h", clockTime(vn(3, 22, 5)), "22:05")
+        eq("time midnight", clockTime(vn(3, 0, 0)), "00:00")
+        eq("day no zero", dayLine(vn(3, 22, 5)), "Thứ Ba, 3/11")
+        eq("day two digits", dayLine(vn(25, 9, 0, month: 12)), "Thứ Sáu, 25/12")
+        eq("day turns at midnight", dayLine(vn(3, 23, 59).addingTimeInterval(60)), "Thứ Tư, 4/11")
+        eq("greet spoken", greetingSpoken(vn(3, 22, 5)), "Chào buổi tối, 22 giờ 05, Thứ Ba ngày 3 tháng 11")
+        // Phone 4 min fast: phone + offset is the server clock, so the shown time is unchanged.
+        eq("time skew", clockTime(phone.addingTimeInterval(off)), "15:00")
+        // A tick a hair before the boundary reads the new minute; mid-minute is unchanged.
+        eq("shown hair before", clockTime(shownInstant(vn(3, 22, 5).addingTimeInterval(-1e-6))), "22:05")
+        eq("shown day hair before", dayLine(shownInstant(vn(4, 0, 0).addingTimeInterval(-1e-6))), "Thứ Tư, 4/11")
+        eq("shown mid minute", clockTime(shownInstant(vn(3, 22, 5).addingTimeInterval(30.4))), "22:05")
+        // Ticks with fractional offsets (phone = reference-date seconds): start + k * 60 + offset,
+        // as shown, reads the minute that just began (1 s later is safely inside it). Case 0 is
+        // the review's float example, which landed 1.19e-7 s before the boundary.
+        let ticks: [(Double, Double)] = [(815_660_938.622738, -8.95476588930691), (815_660_938, 0.1), (815_660_999.999, -0.3),
+                                         (815_661_000.0000001, 12.345678), (815_660_960.5, -240.000001), (815_660_940.25, 3599.9999)]
+        for (i, t) in ticks.enumerated() {
+            let start = minuteStart(phone: Date(timeIntervalSinceReferenceDate: t.0), offset: t.1)
+            for k in 0..<3 {
+                let server = start.addingTimeInterval(Double(k) * 60 + t.1)
+                eq("tick \(i).\(k)", clockTime(shownInstant(server)), clockTime(server.addingTimeInterval(1)))
+                eq("tick \(i).\(k) on boundary", Int(shownInstant(server).timeIntervalSince1970) % 60, 0)
+            }
+        }
 
         // Server address (Cài đặt)
         eq("addr bare host", serverAddress("fcode-quoc.duckdns.org"), "https://fcode-quoc.duckdns.org")
@@ -1433,23 +1424,9 @@ enum HomeLogic {
             eq("pr line loading", prLine(h.projects.dropFirst().first), "đang đọc…")
             eq("decode gate kind", h.projects.last?.lastRun?.kind, "needs_human")
             eq("decode checks", checksLine(h.projects.last?.prs, branch: nil).text, "✗ checks PR lỗi")
-            eq("decode no working", h.working.isEmpty, true)
         } else {
             failures.append("decode: lenient JSON failed")
         }
-        let workingJSON = """
-        {"working":[{"name":"deal-sync-omp","project":"deal-sync","harness":"omp","since":1799996275},
-                    {"name":"x","project":null,"harness":null,"since":1799999935.5},
-                    {"name":"no-since"},{"name":"","since":1},{"since":5},{"name":"bad","since":"soon"},7],
-         "projects":[{"name":"a"}]}
-        """
-        let wd = try? JSONDecoder().decode(HomeData.self, from: Data(workingJSON.utf8))
-        eq("working names", wd?.working.map(\.name), ["deal-sync-omp", "x"])
-        eq("working fields", wd?.working.first, WorkingSession(name: "deal-sync-omp", since: 1_799_996_275, project: "deal-sync", harness: "omp"))
-        eq("working null fields", wd?.working.last?.project == nil && wd?.working.last?.harness == nil, true)
-        eq("working keeps rest", wd?.projects.count, 1)
-        eq("working null", (try? JSONDecoder().decode(HomeData.self, from: Data("{\"working\":null}".utf8)))?.working.count, 0)
-        eq("working bad type", (try? JSONDecoder().decode(HomeData.self, from: Data("{\"working\":\"x\"}".utf8)))?.working.count, 0)
         let noTarget = """
         {"accounts":[{"id":"openai-codex/~1a2b3c4d","harness":"codex","email":"e@x","resets":{"available":2,"target":null}},
                      {"id":"openai-codex/4","harness":"codex","email":"f@x","resets":{"available":0,"target":"openai-codex/4"}}]}
