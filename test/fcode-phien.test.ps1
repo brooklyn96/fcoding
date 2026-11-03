@@ -1000,7 +1000,7 @@ T 'e2e: auto run v2: nothing while the box cannot be reached; one sync the first
   # first reachable run: one sync now
   $r = & $auto; Eq $r.Code 0 $r.Out
   $n1 = SshCount $w; Ok ($n1 -gt 0) 'just started: ssh'
-  Ok ((& $logText) -match 'đồng bộ vì: box vừa chạy') 'reason logged'; Ok (& $onBox 'aut1') 'it synced'
+  Ok ((& $logText) -match 'đồng bộ vì: lần đầu \(chưa có trạng thái\)') 'reason logged'; Ok (& $onBox 'aut1') 'it synced'
   Ok (((ConvertTo-Epoch (Get-Date)) - (Get-AutoState $w).lastSshAt) -lt 180) 'last ssh time recorded'
   # running, last ssh a few minutes ago: no ssh, even with a laptop change
   [void](New-Sess $w.LS '22222222-aut2' $w.LP @('a'))

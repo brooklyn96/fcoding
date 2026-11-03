@@ -3236,7 +3236,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
   }
   $stat = @{ ran = $false; ok = $true; copied = 0; skipped = 0; diverged = 0; unknown = @(); ompL = ''; ompB = ''; noteCopied = 0; noteConf = @(); noteReleased = @(); unfinished = @(); newProjects = @() }
   try {
-    if (-not $DryRun) { Clear-PhienLeftovers @() }   # the lock is held: a killed run's staging goes now, even when this run stops early (box asleep)
+    if (-not $DryRun) { Clear-PhienLeftovers @() }   # the lock is held: a killed run's staging goes now, even when this run stops early (box unreachable)
     $projs = Get-PhienProjects
     if ($projs.Count -eq 0) { Write-PhienOut "Chưa có project nào trong syncRepos ($ConfigFile)."; return 0 }
     $names = @($projs.Keys)
@@ -3926,7 +3926,7 @@ function Invoke-PhienAutoRun {
   if ($bs -ne 'running') { Add-PhienLog @("không vào được box (ssh $box lỗi): bỏ qua lần này, giữ nguyên trạng thái"); return 0 }
   $age = (ConvertTo-Epoch (Get-Date)) - $last
   $mins = [int][Math]::Floor($age / 60)
-  if (-not $as -or -not $as.boxRunning) { $why = 'box vừa chạy (lần đầu trong đợt chạy này)' }
+  if (-not $as) { $why = 'lần đầu (chưa có trạng thái)' }
   elseif ($age -ge $PhienAutoGapSec) { $why = "lần mở ssh trước đã cách $mins phút (từ 40 phút trở lên)" }
   else {
     Add-PhienLog @("box vào được, lần mở ssh trước mới cách $mins phút (dưới 40): bỏ qua lần này")
