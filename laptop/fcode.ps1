@@ -4087,7 +4087,7 @@ function Invoke-Phien {
   if ($quick -and $env:FCODE_PHIEN_WORKER -ne '1') { return (Invoke-PhienBounded $sub $nen) }
   $key = if ($sub) { Get-PhienKeyOf $sub (Get-PhienProjects) }   # ten that tren box -> thu muc tren laptop (cung ten, hoac cung repo GitHub; ten thu muc co the khac)
   $rc = Invoke-PhienSync $(if ($key) { $key } else { $sub }) $false $dry $false $quick
-  # --nhanh (the hook): the screen gets at most one line, the asleep / busy / cap message, or one short line when the sync failed; success prints nothing
+  # --nhanh (the hook): the screen gets at most one line, the busy / cap message, or one short line when the sync failed; success prints nothing
   if ($quick) { if ($script:PhienScreen) { Write-Host $script:PhienScreen } elseif ($rc -ne 0) { Write-Host $PhienFailMsg } }
   $rc
 }
