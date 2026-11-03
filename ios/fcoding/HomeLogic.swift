@@ -6,7 +6,6 @@ import Foundation
 /// an empty or stale state, never a decoding failure of the whole screen.
 struct HomeData: Decodable {
     var generatedAt: Date?
-    var box: HomeBox?
     var accounts: [QuotaAccount] = []
     var totals: HomeTotals?
     var projects: [HomeProject] = []
@@ -15,11 +14,10 @@ struct HomeData: Decodable {
 
     init() {}
 
-    private enum K: String, CodingKey { case generatedAt, box, accounts, totals, projects, omp }
+    private enum K: String, CodingKey { case generatedAt, accounts, totals, projects, omp }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: K.self)
         generatedAt = c.date(.generatedAt)
-        box = c.value(.box)
         let all: [QuotaAccount] = c.list(.accounts)
         accounts = all.filter { !$0.harness.isEmpty }
         totals = c.value(.totals)
@@ -35,33 +33,6 @@ struct HomeOmp: Decodable {
     private enum K: String, CodingKey { case formatOk }
     init(from decoder: Decoder) throws {
         formatOk = try decoder.container(keyedBy: K.self).value(.formatOk)
-    }
-}
-
-struct HomeBox: Decodable {
-    var state: String?
-    var sleepsAt: Date?
-    var maxRunMinutes: Double?
-    var idlePauseMinutes: Double?
-    var cooldownMinutes: Double?
-
-    init(state: String? = "running", sleepsAt: Date?, maxRunMinutes: Double? = 480,
-         idlePauseMinutes: Double? = 30, cooldownMinutes: Double? = 10) {
-        self.state = state
-        self.sleepsAt = sleepsAt
-        self.maxRunMinutes = maxRunMinutes
-        self.idlePauseMinutes = idlePauseMinutes
-        self.cooldownMinutes = cooldownMinutes
-    }
-
-    private enum K: String, CodingKey { case state, sleepsAt, maxRunMinutes, idlePauseMinutes, cooldownMinutes }
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: K.self)
-        state = c.value(.state)
-        sleepsAt = c.date(.sleepsAt)
-        maxRunMinutes = c.value(.maxRunMinutes)
-        idlePauseMinutes = c.value(.idlePauseMinutes)
-        cooldownMinutes = c.value(.cooldownMinutes)
     }
 }
 
@@ -279,10 +250,8 @@ struct HomeProject: Decodable {
     var git: HomeGit?
     /// Placeholder before the server's first gh read (not a failure).
     var loading = false
-    /// The project's instabox staging box; nil = no such box (or an older server): no chip.
-    var staging: HomeStaging?
 
-    private enum K: String, CodingKey { case name, branch, prs, lastRun, git, loading, staging }
+    private enum K: String, CodingKey { case name, branch, prs, lastRun, git, loading }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: K.self)
         name = c.value(.name) ?? ""
@@ -292,20 +261,6 @@ struct HomeProject: Decodable {
         lastRun = c.value(.lastRun)
         git = c.value(.git)
         loading = c.value(.loading) ?? false
-        staging = c.value(.staging)
-    }
-}
-
-/// `projects[].staging`: state running | suspended | stopped | starting | unknown.
-struct HomeStaging: Decodable {
-    var state: String
-    var updatedAt: Date?
-
-    private enum K: String, CodingKey { case state, updatedAt }
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: K.self)
-        state = ((c.value(.state) as String?) ?? "unknown").lowercased()
-        updatedAt = c.date(.updatedAt)
     }
 }
 
@@ -499,23 +454,6 @@ enum HomeLogic {
         return "\(day) lúc \(pad2(c.hour ?? 0)):\(pad2(c.minute ?? 0))"
     }
 
-    /// "HH:MM" for the ring (hours may pass 99 only in theory; then they are just longer).
-    static func hhmm(_ seconds: Int) -> String {
-        let s = max(0, seconds)
-        return "\(pad2(s / 3600)):\(pad2(s % 3600 / 60))"
-    }
-
-    static func hms(_ seconds: Int) -> String {
-        let s = max(0, seconds)
-        return "\(pad2(s / 3600)):\(pad2(s % 3600 / 60)):\(pad2(s % 60))"
-    }
-
-    /// Wall clock "9:41".
-    static func clock(_ date: Date, calendar: Calendar = .current) -> String {
-        let c = calendar.dateComponents([.hour, .minute], from: date)
-        return "\(c.hour ?? 0):\(pad2(c.minute ?? 0))"
-    }
-
     /// "vừa xong" / "N phút trước" / "N giờ trước" / "N ngày trước".
     static func ago(_ seconds: TimeInterval) -> String {
         let m = Int(max(0, seconds) / 60)
@@ -616,36 +554,6 @@ enum HomeLogic {
         guard let at = e.firstIndex(of: "@") else { return e }
         let user = e[..<at]
         return (user.count > 7 ? String(user.prefix(6)) + "…" : String(user)) + String(e[at...])
-    }
-
-    // MARK: Box ring
-
-    enum RingMode: Hashable { case run, warn, paused, unknown }
-
-    struct Ring: Equatable {
-        var mode: RingMode
-        /// Seconds to the next change (sleep, or wake while paused).
-        var seconds: Int
-        /// Arc length, 0...1.
-        var fraction: Double
-        var changeAt: Date?
-    }
-
-    /// Derived from `sleepsAt` alone (the server only sends state "running"). Before it: counts
-    /// down to sleep (warn under 10 min). After it (the box is asleep and cannot answer): counts
-    /// down to the estimated wake, sleepsAt + cooldown. `now` is the server clock.
-    static func ring(_ box: HomeBox?, now: Date) -> Ring {
-        guard let box = box, let sleeps = box.sleepsAt else { return Ring(mode: .unknown, seconds: 0, fraction: 0) }
-        let maxRun = max(60, (box.maxRunMinutes ?? 480) * 60), cooldown = max(60, (box.cooldownMinutes ?? 10) * 60)
-        let left = sleeps.timeIntervalSince(now)
-        if left > 0 {
-            let s = Int(left.rounded(.up))
-            return Ring(mode: s < 600 ? .warn : .run, seconds: s, fraction: max(0, min(1, left / maxRun)), changeAt: sleeps)
-        }
-        let wake = sleeps.addingTimeInterval(cooldown)
-        let rest = wake.timeIntervalSince(now)
-        guard rest > 0 else { return Ring(mode: .unknown, seconds: 0, fraction: 0) }
-        return Ring(mode: .paused, seconds: Int(rest.rounded(.up)), fraction: max(0, min(1, rest / cooldown)), changeAt: wake)
     }
 
     // MARK: Projects
@@ -850,53 +758,6 @@ enum HomeLogic {
     /// Session names the server accepts (NAME_RE): lowercase letters, digits and "-", 1-32.
     static func validSessionName(_ s: String) -> Bool {
         s.range(of: "^[a-z0-9][a-z0-9-]{0,31}$", options: .regularExpression) != nil
-    }
-
-    // MARK: Staging box
-
-    struct StagingChip: Equatable {
-        var text: String
-        /// StatusDot state: "running" green, "waiting" orange (starting), "idle" grey.
-        var dot: String
-        /// "Bật" is offered.
-        var canStart: Bool
-    }
-
-    /// A tapped "Bật" shows "đang bật…" until the server reports running, for at most this long
-    /// (then the server's state, and the button, come back).
-    static let stagingStartWindow: TimeInterval = 180
-
-    /// nil = no staging box: the chip is hidden. `startedAt` = when "Bật" was tapped on this phone.
-    static func stagingChip(_ s: HomeStaging?, startedAt: Date?, now: Date) -> StagingChip? {
-        guard let s = s else { return nil }
-        var state = s.state
-        if state != "running", let t = startedAt, now.timeIntervalSince(t) < stagingStartWindow { state = "starting" }
-        switch state {
-        case "running": return StagingChip(text: "Staging: đang chạy", dot: "running", canStart: false)
-        case "starting": return StagingChip(text: "Staging: đang bật…", dot: "waiting", canStart: false)
-        case "suspended": return StagingChip(text: "Staging: đang nghỉ", dot: "idle", canStart: true)
-        case "stopped": return StagingChip(text: "Staging: đã tắt", dot: "idle", canStart: true)
-        default: return StagingChip(text: "Staging: chưa rõ", dot: "idle", canStart: false)
-        }
-    }
-
-    /// Seconds after a successful POST staging/start at which GET /api/home is fetched again
-    /// (each a request started after the reply). "running" (already up): at once, then twice more
-    /// in case the server's 30 s cache still says otherwise; "starting": while the box boots.
-    /// The "đang bật…" override is kept until one of these shows running.
-    static func stagingReloads(replyState: String?) -> [Double] {
-        replyState == "running" ? [0, 20, 45] : [20, 45, 90, 150]
-    }
-
-    /// Known failures of POST staging/start (an error status, or a 200 with ok:false); nil = an
-    /// ordinary error, worded by the caller.
-    static func stagingFailure(status: Int, code: String?) -> String? {
-        if code == "no_instabox_key" { return "Box chưa có API key instabox" }
-        if code == "no_staging_box" { return "Dự án này chưa có máy staging" }
-        if code == "staging_unavailable" { return "Chưa đọc được trạng thái máy staging, thử lại sau" }
-        if code == "unknown_project" { return "Dự án này không có trên box." }
-        if [404, 405, 501].contains(status) { return "Máy chủ chưa hỗ trợ, cập nhật máy chủ trước." }
-        return nil
     }
 
     // MARK: Recent omp sessions
@@ -1324,28 +1185,14 @@ enum HomeLogic {
         eq("short mail cut 8", shortMail("data.int@example.vn"), "data.i…@example.vn")
         eq("short mail keep", shortMail("box@x.vn"), "box@x.vn")
 
-        // Ring
-        let r1 = ring(HomeBox(sleepsAt: now.addingTimeInterval(2 * hr + 14 * 60 + 5)), now: now)
-        eq("ring run", r1.mode, .run)
-        eq("ring hhmm", hhmm(r1.seconds), "02:14")
-        eq("ring warn", ring(HomeBox(sleepsAt: now.addingTimeInterval(7 * 60)), now: now).mode, .warn)
-        let r3 = ring(HomeBox(sleepsAt: now.addingTimeInterval(-50)), now: now)
-        eq("ring paused", r3.mode, .paused)
-        eq("ring paused secs", r3.seconds, 550)
-        let paused = HomeBox(state: "paused", sleepsAt: now.addingTimeInterval(-100))
-        eq("ring paused counts", ring(paused, now: now).seconds - ring(paused, now: now.addingTimeInterval(30)).seconds, 30)
-        eq("ring ignores state", ring(HomeBox(state: "paused", sleepsAt: now.addingTimeInterval(hr)), now: now).mode, .run)
-        // Phone 4 min fast: the server clock (phone + offset) still sees 2 h before sleep.
+        // Server clock
+        // Phone 4 min fast: phone + offset gives the server clock.
         let phone = now.addingTimeInterval(240)
         let off = clockOffset(generatedAt: now, received: phone)
         eq("clock offset", off, -240)
         // A slow reply (the server waited on a refresh) does not shift the offset.
         eq("clock slow reply", clockOffset(generatedAt: now.addingTimeInterval(30), received: now.addingTimeInterval(30)), 0)
-        eq("ring skew", ring(HomeBox(sleepsAt: now.addingTimeInterval(2 * hr)), now: phone.addingTimeInterval(off)).seconds, 7200)
         eq("clock no date", clockOffset(generatedAt: nil, received: now), 0)
-        eq("ring woke", ring(HomeBox(sleepsAt: now.addingTimeInterval(-700)), now: now).mode, .unknown)
-        eq("ring no data", ring(nil, now: now).mode, .unknown)
-        eq("hms", hms(9 * 60 + 12), "00:09:12")
 
         // Projects
         eq("deploy ok", deployLine(HomeRun(status: "success", at: now.addingTimeInterval(-3 * hr)), now: now).text, "✓ deploy 3 giờ trước")
@@ -1385,8 +1232,7 @@ enum HomeLogic {
 
         // Lenient decoding
         let json = """
-        {"box":{"state":"running","sleepsAt":"2027-01-15T10:00:00.000Z","maxRunMinutes":480},
-         "accounts":[{"id":"x","harness":"Codex","email":"e@x","windows":[{"key":"5h","label":"5 giờ","usedPercent":18,"resetsAt":"2027-01-15T09:00:00Z","periodSeconds":18000},{"key":"7d","label":"7 ngày","usedPercent":null}],"resets":{"available":1,"target":"openai-codex/4"},"spend":{"today":{"usd":3.1,"tokens":8200000},"daily30":[{"date":"2027-01-02","usd":1,"tokens":2},{"date":"2027-01-01","usd":1,"tokens":1}]}},
+        {"accounts":[{"id":"x","harness":"Codex","email":"e@x","windows":[{"key":"5h","label":"5 giờ","usedPercent":18,"resetsAt":"2027-01-15T09:00:00Z","periodSeconds":18000},{"key":"7d","label":"7 ngày","usedPercent":null}],"resets":{"available":1,"target":"openai-codex/4"},"spend":{"today":{"usd":3.1,"tokens":8200000},"daily30":[{"date":"2027-01-02","usd":1,"tokens":2},{"date":"2027-01-01","usd":1,"tokens":1}]}},
                      {"harness":5}],
          "projects":[{"name":"deal-sync","prs":null,"lastRun":null},{"name":"c","repo":null,"branch":null,"prs":null,"lastRun":null,"loading":true},{"name":"b","prs":[{"number":6,"checks":"failure"}],"lastRun":{"workflow":"fcode/deploy","status":"failure","kind":"needs_human","at":"2027-01-15T08:00:00.000Z","url":null}}],
          "totals":"broken"}
@@ -1406,7 +1252,6 @@ enum HomeLogic {
             eq("pr line loading", prLine(h.projects.dropFirst().first), "đang đọc…")
             eq("decode gate kind", h.projects.last?.lastRun?.kind, "needs_human")
             eq("decode checks", checksLine(h.projects.last?.prs, branch: nil).text, "✗ checks PR lỗi")
-            eq("decode sleeps", h.box?.sleepsAt, now.addingTimeInterval(2 * hr))
         } else {
             failures.append("decode: lenient JSON failed")
         }
@@ -1511,42 +1356,6 @@ enum HomeLogic {
         eq("name upper", validSessionName("Deal"), false)
         eq("name dash first", validSessionName("-a"), false)
 
-        // Staging chip
-        let stg = projects("""
-        {"name":"a","staging":{"state":"suspended","updatedAt":"2027-01-15T07:59:00Z"}},{"name":"b","staging":null},\
-        {"name":"c"},{"name":"d","staging":{"state":"Running"}},{"name":"e","staging":{"state":"stopped"}},\
-        {"name":"f","staging":{"state":"weird"}},{"name":"g","staging":"broken"}
-        """)
-        eq("staging count", stg.count, 7)
-        eq("staging decoded", stg.first?.staging?.state, "suspended")
-        eq("staging updatedAt", stg.first?.staging?.updatedAt, now.addingTimeInterval(-60))
-        eq("staging null hides", stagingChip(stg[1].staging, startedAt: nil, now: now) == nil, true)
-        eq("staging missing hides", stagingChip(stg[2].staging, startedAt: nil, now: now) == nil, true)
-        eq("staging broken hides", stagingChip(stg[6].staging, startedAt: nil, now: now) == nil, true)
-        eq("staging suspended", stagingChip(stg[0].staging, startedAt: nil, now: now),
-           StagingChip(text: "Staging: đang nghỉ", dot: "idle", canStart: true))
-        eq("staging running", stagingChip(stg[3].staging, startedAt: nil, now: now),
-           StagingChip(text: "Staging: đang chạy", dot: "running", canStart: false))
-        eq("staging stopped", stagingChip(stg[4].staging, startedAt: nil, now: now),
-           StagingChip(text: "Staging: đã tắt", dot: "idle", canStart: true))
-        eq("staging unknown", stagingChip(stg[5].staging, startedAt: nil, now: now),
-           StagingChip(text: "Staging: chưa rõ", dot: "idle", canStart: false))
-        eq("staging tapped", stagingChip(stg[0].staging, startedAt: now.addingTimeInterval(-30), now: now),
-           StagingChip(text: "Staging: đang bật…", dot: "waiting", canStart: false))
-        eq("staging tapped then running", stagingChip(stg[3].staging, startedAt: now.addingTimeInterval(-30), now: now)?.text,
-           "Staging: đang chạy")
-        eq("staging tap expires", stagingChip(stg[0].staging, startedAt: now.addingTimeInterval(-200), now: now)?.canStart, true)
-        eq("staging no key", stagingFailure(status: 200, code: "no_instabox_key"), "Box chưa có API key instabox")
-        eq("staging no key 4xx", stagingFailure(status: 400, code: "no_instabox_key"), "Box chưa có API key instabox")
-        eq("staging old server", stagingFailure(status: 404, code: "not_found"), "Máy chủ chưa hỗ trợ, cập nhật máy chủ trước.")
-        eq("staging other", stagingFailure(status: 500, code: "error") == nil, true)
-        eq("staging reloads running", stagingReloads(replyState: "running"), [0, 20, 45])
-        eq("staging reloads starting", stagingReloads(replyState: "starting"), [20, 45, 90, 150])
-        eq("staging reloads no state", stagingReloads(replyState: nil), [20, 45, 90, 150])
-        // Reply "running" but a stale home (cached "suspended") lands: the override still holds.
-        eq("staging stale after running reply", stagingChip(stg[0].staging, startedAt: now.addingTimeInterval(-1), now: now)?.canStart, false)
-        eq("staging no box",stagingFailure(status: 404, code: "no_staging_box"), "Dự án này chưa có máy staging")
-
         // omp format banner
         func banner(_ json: String) -> String? {
             ompFormatBanner(try? JSONDecoder().decode(HomeData.self, from: Data(json.utf8)))
@@ -1593,8 +1402,6 @@ enum HomeLogic {
         eq("omp resume unknown format", ompResumeFailure(status: 409, code: "unknown_format"),
            "Phiên này dùng định dạng omp mới — nhắn Claude để cập nhật FCode")
         eq("omp resume 409 exists generic", ompResumeFailure(status: 409, code: "exists") == nil, true)
-        eq("staging unavailable", stagingFailure(status: 503, code: "staging_unavailable"),
-           "Chưa đọc được trạng thái máy staging, thử lại sau")
         eq("omp resume other",ompResumeFailure(status: 503, code: "busy") == nil, true)
         // Add project: validation (Invoke-Add rules)
         eq("repo clean .git", cleanRepo("  Me/My.Repo.GIT \n"), "Me/My.Repo")

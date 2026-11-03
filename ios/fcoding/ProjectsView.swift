@@ -84,7 +84,7 @@ struct ProjectsView: View {
                             .foregroundColor(.red)
                             .homeRow(top: 0, bottom: 8)
                     }
-                    TopCard(home: home, visible: polling, onRing: { sheet = .box }, onQuota: { path.append(QuotaRoute()) })
+                    TopCard(home: home, visible: polling, onQuota: { path.append(QuotaRoute()) })
                         .homeRow(top: 0, bottom: 0)
                     summary(proxy).homeRow(top: 6, bottom: 2)
                     projectsHeader.homeRow(top: 4, bottom: 0)
@@ -120,9 +120,7 @@ struct ProjectsView: View {
                 }
             }
             .task(id: polling) {
-                let on = polling
-                await MainActor.run { home.visible = on }
-                guard on else { return }
+                guard polling else { return }
                 while !Task.isCancelled {
                     async let names: Void = prefs.load(app)
                     await home.load(app)
@@ -203,8 +201,6 @@ struct ProjectsView: View {
             DeviceSettingsView()
         case .guide:
             HomeGuideView()
-        case .box:
-            BoxInfoSheet(box: home.home?.box, offset: home.offset)
         case .new(let project):
             NewSessionSheet(projects: model.overview == nil ? nil : projectNames,
                             loadError: model.errorText,
@@ -427,17 +423,8 @@ struct ProjectsView: View {
                            onTap: { withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) { project = id } },
                            onMore: { sheet = .new(project: id == "all" ? nil : id) },
                            showMore: id != "all",
-                           staging: id == "all" ? nil
-                               : HomeLogic.stagingChip(info?.staging, startedAt: home.stagingStarted[id], now: Date()),
-                           onStartStaging: { startStaging(id) },
                            onRename: id == "all" ? nil : { sheet = .alias(id) },
                            onArrange: { sheet = .arrange })
-    }
-
-    private func startStaging(_ project: String) {
-        Task {
-            if let failure = await home.startStaging(project, app: app) { toast = failure }
-        }
     }
 
     // MARK: - Sessions
@@ -560,7 +547,7 @@ struct ProjectsView: View {
 
 /// The sheets of the main screen (one at a time).
 enum HomeSheet: Identifiable {
-    case settings, guide, box, arrange
+    case settings, guide, arrange
     case new(project: String?)
     case rename(String)
     case alias(String)
@@ -569,7 +556,6 @@ enum HomeSheet: Identifiable {
         switch self {
         case .settings: return "settings"
         case .guide: return "guide"
-        case .box: return "box"
         case .arrange: return "arrange"
         case .alias(let n): return "alias." + n
         case .new(let p): return "new." + (p ?? "")
@@ -738,8 +724,6 @@ struct ProjectCard: View {
     let onTap: () -> Void
     let onMore: () -> Void
     let showMore: Bool
-    var staging: HomeLogic.StagingChip? = nil
-    var onStartStaging: () -> Void = {}
     /// "Đổi tên hiển thị…" (project cards only).
     var onRename: (() -> Void)? = nil
     var onArrange: () -> Void = {}
@@ -773,7 +757,6 @@ struct ProjectCard: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.85)
             }
-            if let s = staging { stagingRow(s) }
         }
         .padding(.top, 11).padding(.horizontal, 12).padding(.bottom, 10)
         .frame(width: 182, alignment: .topLeading)
@@ -812,39 +795,9 @@ struct ProjectCard: View {
         .accessibilityAction(.default, onTap)
         .accessibilityAction(named: "Mở phiên mới", onMore)
         .accessibilityActions {
-            if staging?.canStart == true { Button("Bật staging", action: onStartStaging) }
             if let onRename = onRename { Button("Đổi tên hiển thị…", action: onRename) }
             Button("Sắp xếp", action: onArrange)
         }
-    }
-
-    /// Bottom line: the staging box state, with "Bật" while it is paused or off.
-    private func stagingRow(_ s: HomeLogic.StagingChip) -> some View {
-        HStack(spacing: 6) {
-            StatusDot(state: s.dot)
-            Text(s.text)
-                .scaledFont(12.5)
-                .foregroundColor(.l2)
-                .lineLimit(1)
-                .minimumScaleFactor(0.85)
-            Spacer(minLength: 0)
-            if s.canStart {
-                Button(action: onStartStaging) {
-                    Text("Bật")
-                        .scaledFont(12.5, weight: .semibold)
-                        .foregroundColor(.accentBlue)
-                        .padding(.horizontal, 10)
-                        .frame(minHeight: 24)
-                        .background(Color.fill3, in: Capsule())
-                        .padding(.vertical, 4)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Bật staging")
-            }
-        }
-        .frame(minHeight: 24)
-        .padding(.top, 3)
     }
 }
 
