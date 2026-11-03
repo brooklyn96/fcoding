@@ -604,7 +604,7 @@ Host oracle
 
 Rồi gõ `ssh oracle` **một lần** trong PowerShell: ssh hỏi có tin khóa của máy chủ không, gõ `yes`, vào được thì gõ `exit`. Từ đó `fcode` chạy không hỏi gì nữa (nó dùng `BatchMode`, nên thiếu bước này `fcode` sẽ báo không vào được box).
 
-Muốn dùng tên khác `oracle`, đặt tên đó vào khóa `host` của `%USERPROFILE%\.fcode\config.json` (hoặc biến `FCODE_HOST` cho một lần chạy). Tên chỉ gồm chữ, số và dấu `.` `_` `-`, và không được bắt đầu bằng dấu `-`; tên sai thì `fcode` dừng ngay và không chạy ssh. Kiểm tra: `ssh -o BatchMode=yes -o ConnectTimeout=8 oracle true` chạy xong, không hiện gì và không báo lỗi là được. Lệnh cài chạy đúng lệnh này ở bước 6 rồi báo kết quả.
+Muốn dùng tên khác `oracle`, đặt tên đó vào khóa `host` của `%USERPROFILE%\.fcode\config.json` (hoặc biến `FCODE_HOST` cho một lần chạy). Tên chỉ gồm chữ, số và dấu `.` `_` `-`, và phải bắt đầu bằng chữ hoặc số; tên sai thì `fcode` dừng ngay và không chạy ssh. Kiểm tra: `ssh -o BatchMode=yes -o ConnectTimeout=8 oracle true` chạy xong, không hiện gì và không báo lỗi là được. Lệnh cài chạy đúng lệnh này ở bước 6 rồi báo kết quả.
 
 **Sửa file cấu hình.** Mở `%USERPROFILE%\.fcode\config.json` bằng Notepad:
 
