@@ -15,6 +15,7 @@
 # Test hooks (not for users):
 #   FCODE_INSTALL_SOURCE  folder or https:// URL that holds fcode.ps1 and fcode.cmd
 #   FCODE_INSTALL_DRYRUN  =1: print the install and login commands instead of running them
+#   FCODE_INSTALL_SSH     ssh program for the box check (default: ssh on the PATH, else the Windows OpenSSH one)
 #   FCODE_INSTALL_HIDE    comma list of tools (gh,winget) hidden from the PATH search
 #   FCODE_INSTALL_ENVKEY  HKCU subkey used instead of "Environment" when editing the user PATH
 #   FCODE_INSTALL_EPFAKE  fake execution policy list, e.g. CurrentUser=Restricted,LocalMachine=Undefined (nothing is set)
@@ -35,7 +36,7 @@ function Invoke-FcodeInstall {
     $ghZipDir = Join-Path $env:LOCALAPPDATA 'Programs\gh'
     $ghManual = 'C\u00e0i tay t\u1eeb https://cli.github.com r\u1ed3i ch\u1ea1y l\u1ea1i l\u1ec7nh c\u00e0i'
     # An item that is not done keeps its "what to do" sentence; $null means done.
-    $todo = [ordered]@{ fcode = $null; gh = $null; ghLogin = $null }
+    $todo = [ordered]@{ fcode = $null; gh = $null; ghLogin = $null; box = $null }
     $cmdName = 'fcode'
 
     function V($s) { [regex]::Unescape($s) }
@@ -296,9 +297,36 @@ function Invoke-FcodeInstall {
         }
     } else { $todo.ghLogin = V 'l\u00e0m sau khi c\u00e0i gh xong' }
 
+    # ---------- 6. box ----------
+    # The coder is an always-on Oracle VM reached over plain ssh (alias in ~/.ssh/config). Nothing here creates or reads a key:
+    # it only asks the box `true` the way fcode does, and says what is missing when that fails.
+    Step 'Ki\u1ec3m tra k\u1ebft n\u1ed1i t\u1edbi box'
+    $boxHost = if ($env:FCODE_HOST) { $env:FCODE_HOST } else { 'oracle' }
+    if (-not $env:FCODE_HOST -and (Test-Path -LiteralPath $cfgFile)) {
+        try { $cv = [IO.File]::ReadAllText($cfgFile) | ConvertFrom-Json; if ($cv.host) { $boxHost = [string]$cv.host } } catch {}
+    }
+    if ($boxHost -notmatch '\A[A-Za-z0-9][A-Za-z0-9._-]*\z') {
+        $todo.box = V 't\u00ean box (kh\u00f3a host trong config.json ho\u1eb7c bi\u1ebfn FCODE_HOST) kh\u00f4ng h\u1ee3p l\u1ec7: ch\u1ec9 d\u00f9ng ch\u1eef, s\u1ed1 v\u00e0 d\u1ea5u . _ - (t\u00ean trong ~/.ssh/config)'
+    } else {
+        $sshExe = if ($env:FCODE_INSTALL_SSH) { $env:FCODE_INSTALL_SSH } else { Find-Tool 'ssh' @((Join-Path $env:SystemRoot 'System32\OpenSSH\ssh.exe')) }
+        if (-not $sshExe) {
+            $todo.box = V 'm\u00e1y ch\u01b0a c\u00f3 ssh. B\u1eadt t\u00ednh n\u0103ng OpenSSH Client c\u1ee7a Windows (Settings > System > Optional features) r\u1ed3i ch\u1ea1y l\u1ea1i l\u1ec7nh c\u00e0i'
+        } elseif ($dry -and -not $env:FCODE_INSTALL_SSH) {   # the test hook runs the check even in a dry run (it is a fake ssh)
+            Say '[ch\u1ea1y th\u1eed] ssh -o BatchMode=yes -o ConnectTimeout=8 {0} true' $boxHost
+        } else {
+            $sshOut = @(& $sshExe -o BatchMode=yes -o ConnectTimeout=8 $boxHost true 2>&1 | ForEach-Object { "$_" })
+            if ($LASTEXITCODE -eq 0) { Say "\u2713 V\u00e0o \u0111\u01b0\u1ee3c box '{0}'" $boxHost }
+            else {
+                $d = ($sshOut | Where-Object { $_.Trim() } | Select-Object -Last 1)
+                Show-Why @{ Cause = ((V "Kh\u00f4ng v\u00e0o \u0111\u01b0\u1ee3c box '{0}'") -f $boxHost); Detail = [string]$d }
+                $todo.box = (V "ch\u01b0a v\u00e0o \u0111\u01b0\u1ee3c box '{0}'. C\u1ea7n: (1) kh\u1ed1i Host {0} trong {1} g\u1ed3m HostName fcode-quoc.duckdns.org, User quoc, IdentityFile <\u0111\u01b0\u1eddng d\u1eabn kh\u00f3a ri\u00eang c\u1ee7a b\u1ea1n>; (2) kh\u00f3a ri\u00eang n\u1eb1m \u0111\u00fang ch\u1ed7 \u0111\u00f3 (FCode kh\u00f4ng t\u1ea1o v\u00e0 kh\u00f4ng \u0111\u1ecdc kh\u00f3a); (3) g\u00f5 ssh {0} m\u1ed9t l\u1ea7n \u0111\u1ec3 ch\u1ea5p nh\u1eadn kh\u00f3a m\u00e1y ch\u1ee7. Chi ti\u1ebft: docs/HUONG-DAN.md, m\u1ee5c K\u1ebft n\u1ed1i box. Xong th\u00ec ch\u1ea1y l\u1ea1i l\u1ec7nh c\u00e0i") -f $boxHost, (Join-Path $env:USERPROFILE '.ssh\config')
+            }
+        }
+    }
+
     # ---------- summary ----------
     Step 'K\u1ebft qu\u1ea3'
-    $names = [ordered]@{ fcode = 'L\u1ec7nh fcode'; gh = 'GitHub CLI (gh)'; ghLogin = '\u0110\u0103ng nh\u1eadp GitHub' }
+    $names = [ordered]@{ fcode = 'L\u1ec7nh fcode'; gh = 'GitHub CLI (gh)'; ghLogin = '\u0110\u0103ng nh\u1eadp GitHub'; box = 'K\u1ebft n\u1ed1i t\u1edbi box' }
     foreach ($k in $names.Keys) {
         if ($todo[$k]) { Write-Host ((V '\u2717 {0}: {1}') -f (V $names[$k]), $todo[$k]) -ForegroundColor Yellow }
         else { Write-Host ((V '\u2713 {0}') -f (V $names[$k])) -ForegroundColor Green }

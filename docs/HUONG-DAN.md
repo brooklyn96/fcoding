@@ -23,6 +23,7 @@
    - [Đồng bộ phiên chat omp giữa laptop và box (`fcode phien`)](#đồng-bộ-phiên-chat-omp-giữa-laptop-và-box-fcode-phien)
    - [Tự đồng bộ khi mở agent (`fcode moc`)](#tự-đồng-bộ-khi-mở-agent-fcode-moc)
    - [Cài lệnh fcode trên máy Windows khác](#cài-lệnh-fcode-trên-máy-windows-khác)
+   - [Kết nối box (ssh)](#kết-nối-box-ssh)
 9. [Bảo mật](#9-bảo-mật)
 10. [Phát triển](#10-phát-triển)
 
@@ -584,14 +585,34 @@ Lệnh cài sẽ lần lượt làm các việc sau, mỗi việc một dòng tr
 3. Tạo file cấu hình `%USERPROFILE%\.fcode\config.json` nếu chưa có (có rồi thì giữ nguyên).
 4. Kiểm tra **GitHub CLI** (`gh`). Máy chưa có thì tự cài. Nếu Windows hỏi quyền, bấm **Yes**; bấm No cũng được, lệnh cài sẽ tự thử cách khác không cần quyền admin.
 5. Hướng dẫn bạn đăng nhập GitHub, **chỉ khi chưa đăng nhập**. Bạn không phải gõ mật khẩu vào cửa sổ này.
+6. Thử vào box bằng `ssh -o BatchMode=yes -o ConnectTimeout=8 oracle true`. Vào được thì dòng "Kết nối tới box" là `✓`. Chưa vào được thì dòng đó là `✗` kèm việc còn thiếu (xem [Kết nối box (ssh)](#kết-nối-box-ssh)).
 
-Lệnh cài không tạo kết nối tới box: máy bạn cần sẵn tên ssh `oracle` trong `%USERPROFILE%\.ssh\config` (kèm khóa của bạn) để `fcode` vào được box.
+Lệnh cài không tạo khóa và không đọc khóa của bạn: khóa ssh và tên `oracle` trong `%USERPROFILE%\.ssh\config` bạn tự có sẵn (xem [Kết nối box (ssh)](#kết-nối-box-ssh)); lệnh cài chỉ thử vào box rồi báo kết quả.
 
 Đăng nhập GitHub: GitHub hiện một mã 8 ký tự (dạng `ABCD-1234`). Chép mã đó, bấm Enter, dán mã vào trang GitHub vừa mở rồi bấm **Authorize**.
 
 Cuối cùng có bảng kết quả, mỗi dòng là `✓` (xong) hoặc `✗` kèm việc cần làm. Gặp `✗` thì làm theo dòng đó rồi chạy lại đúng lệnh trên; chạy lại bao nhiêu lần cũng an toàn và chỉ làm phần còn thiếu. Xong thì **mở cửa sổ PowerShell mới** (Start, gõ `PowerShell`, Enter) rồi gõ `fcode help` để xem danh sách lệnh.
 
 Nếu bạn đã tải kho mã này về máy, chạy `powershell -ExecutionPolicy Bypass -File .\laptop\install.ps1` trong thư mục kho mã cũng được.
+
+### Kết nối box (ssh)
+
+`fcode` vào box bằng `ssh` thường, không qua dịch vụ nào khác. Máy Windows cần ba thứ:
+
+1. **OpenSSH Client** của Windows (Windows 10/11 thường có sẵn; thiếu thì bật ở Settings > System > Optional features).
+2. **Khóa riêng** của bạn (file không có đuôi `.pub`) cất trong `%USERPROFILE%\.ssh`, khóa công khai tương ứng đã nằm trên box. Lệnh cài không tạo, không chép và không đọc khóa.
+3. **Một khối `Host`** trong file `%USERPROFILE%\.ssh\config` (chưa có file thì tạo mới):
+
+```
+Host oracle
+  HostName fcode-quoc.duckdns.org
+  User quoc
+  IdentityFile ~/.ssh/<tên-file-khóa-riêng-của-bạn>
+```
+
+Rồi gõ `ssh oracle` **một lần** trong PowerShell: ssh hỏi có tin khóa của máy chủ không, gõ `yes`, vào được thì gõ `exit`. Từ đó `fcode` chạy không hỏi gì nữa (nó dùng `BatchMode`, nên thiếu bước này `fcode` sẽ báo không vào được box).
+
+Muốn dùng tên khác `oracle`, đặt tên đó vào khóa `host` của `%USERPROFILE%\.fcode\config.json` (hoặc biến `FCODE_HOST` cho một lần chạy). Tên chỉ gồm chữ, số và dấu `.` `_` `-`, và không được bắt đầu bằng dấu `-`; tên sai thì `fcode` dừng ngay và không chạy ssh. Kiểm tra: `ssh -o BatchMode=yes -o ConnectTimeout=8 oracle true` chạy xong, không hiện gì và không báo lỗi là được. Lệnh cài chạy đúng lệnh này ở bước 6 rồi báo kết quả.
 
 **Sửa file cấu hình.** Mở `%USERPROFILE%\.fcode\config.json` bằng Notepad:
 
