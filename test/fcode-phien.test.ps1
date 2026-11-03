@@ -1910,6 +1910,18 @@ T 'nhanh r2: a reachability check that hangs is killed at the cap: exit 0, only 
   Ok ($sec -lt 30) "ended at the cap ($([Math]::Round($sec)) s, the check hangs 60 s)"
   Eq (SshCount $w) 0 'no ssh'
 }
+T 'auto r1: a reachability check that hangs is cut by the auto deadline (not unbounded): exit 0, no sync ssh, state unchanged, one log line' {
+  $w = New-W2 'a1'; Use-LoggedSsh $w 'check'
+  [void](New-Sess $w.LS '77777777-au01' $w.LP @('a'))
+  Set-AutoState $w $true 10
+  $sp = Join-Path $w.U 'AppData\Local\fcode\phien-auto.json'; $before = [IO.File]::ReadAllText($sp)
+  $t0 = Get-Date; $r = Invoke-Fcode $w @('phien', '--tu-dong') @{ FCODE_PHIEN_TIMEOUT = '5' }; $sec = ((Get-Date) - $t0).TotalSeconds
+  Eq $r.Code 0 $r.Out
+  Ok ($sec -lt 40) "cut by the deadline ($([Math]::Round($sec)) s, the check hangs 60 s)"
+  Eq ((SshCalls $w) -join ',') 'true' 'only the reachability check, no sync ssh'
+  Eq ([IO.File]::ReadAllText($sp)) $before 'state unchanged'
+  Eq @([regex]::Matches((Get-Content (Join-Path $w.U '.fcode\phien.log') -Raw), 'không vào được box \(ssh oracle lỗi\)')).Count 1 'one log line'
+}
 foreach ($shim in 'omp', 'git') {
   T "nhanh r2: a hanging `"$shim`" (found first on PATH) is killed at the cap: exit 0, only the cap line, nothing is sent" {
     $w = New-W2 "q8$shim"; Use-LoggedSsh $w

@@ -3215,7 +3215,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
   $capMsg = $PhienCapMsg
   $code = 0; $capHit = $false
   # lan tu dong: MOT han chot cho ca lan chay, tinh tu luc tien trinh bat dau (nhu gioi han 8 phut cua Task Scheduler)
-  $script:PhienDeadline = if ($Auto) { [Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().AddSeconds((Get-PhienLimitSec $true)) } elseif ($Quick) { [Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().AddSeconds((Get-PhienCapSec)) } else { $null }
+  $script:PhienDeadline = if ($Auto) { Get-PhienAutoDeadline } elseif ($Quick) { [Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().AddSeconds((Get-PhienCapSec)) } else { $null }
   $mx = $null; $held = $false
   if (-not $DryRun) {
     try {
@@ -3914,10 +3914,13 @@ function Write-PhienAutoState([hashtable]$S) {
 #  - lan dau (chua co trang thai): dong bo mot lan ngay
 #  - con lai: chi dong bo khi lan mo ssh gan nhat da cach >= 40 phut. Lan loi cung chi cho den moc 40 phut sau, khong thu lai nhanh.
 $PhienAutoGapSec = 2400
+function Get-PhienAutoDeadline { [Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().AddSeconds((Get-PhienLimitSec $true)) }
 function Invoke-PhienAutoRun {
   $as = Read-PhienAutoState
   $last = if ($as) { [double]$as.lastSshAt } else { 0 }
-  $bs = Test-BoxRunning
+  # the reachability check runs under the same one deadline as the sync (ConnectTimeout covers only connect + handshake, not auth, a proxy hop or the remote true); a timeout counts as unreachable
+  $saveDl = $script:PhienDeadline; $script:PhienDeadline = Get-PhienAutoDeadline
+  try { $bs = Test-BoxRunning } finally { $script:PhienDeadline = $saveDl }
   # khong vao duoc box (mang, box tat, alias sai): khong mo ssh dong bo va KHONG doi trang thai
   if ($bs -ne 'running') { Add-PhienLog @("không vào được box (ssh $box lỗi): bỏ qua lần này, giữ nguyên trạng thái"); return 0 }
   $age = (ConvertTo-Epoch (Get-Date)) - $last
