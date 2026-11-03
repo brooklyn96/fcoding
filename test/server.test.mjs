@@ -4859,11 +4859,11 @@ function workStub() {
 const d = ${JSON.stringify(dir)}, a = process.argv.slice(2);
 fs.appendFileSync(d + '/calls.log', a.join(' ') + '\\n');
 if (fs.existsSync(d + '/fail')) { process.stderr.write('boom'); process.exit(1); }
-if (a[0] === 'list-sessions') {
+if (a[0] === 'list-sessions') setTimeout(() => { // a file named "slow" makes every answer take 400 ms
   const rows = JSON.parse(fs.readFileSync(d + '/rows.json', 'utf8'));
   if (!rows.length) { process.stderr.write('no server running on /tmp/tmux-1000/default'); process.exit(1); }
   for (const [n, act, proj = 'alpha', harness = 'omp', created = 1] of rows) console.log([n, created, 0, act, 0, harness, proj].join('|'));
-}\n`);
+}, fs.existsSync(d + '/slow') ? 400 : 0);\n`);
   const s = {
     dir, tmux: [process.execPath, path.join(dir, 'tmux.mjs')],
     set: (rows) => fs.writeFileSync(path.join(dir, 'rows.json'), JSON.stringify(rows)),
@@ -4993,6 +4993,24 @@ test('working: the poll is only list-sessions (no capture-pane, no other tmux ca
   assert.ok(calls.length >= 3 && calls.every((l) => l.startsWith('list-sessions')), calls.join('\n'));
 }));
 
+test('working: one poll at a time: a tick (or a tickWork call) while the previous poll runs starts no second tmux child', () => withWork(async ({ s, c, home, at }) => {
+  at(0);
+  s.set([['a', T_SEC]]);
+  fs.writeFileSync(path.join(s.dir, 'slow'), '');
+  const first = c.app.tickWork();
+  await c.app.tickWork(); await c.app.tickWork(); // skipped at once: the first is still running
+  assert.ok(await until(() => s.calls().length === 1));
+  await first;
+  assert.equal(s.calls().length, 1);
+  assert.deepEqual((await home()).working, [W('a', 0)]); // and the one poll did its work
+  await c.app.tickWork(); // the guard is released: the next poll runs
+  assert.equal(s.calls().length, 2);
+  // a poll that failed releases it too
+  fs.writeFileSync(path.join(s.dir, 'fail'), '');
+  await c.app.tickWork(); await c.app.tickWork();
+  assert.equal(s.calls().length, 4);
+}));
+
 test('working: from listen() a timer polls every workTickMs and close() stops it', async () => {
   const s = workStub();
   const clock = { t: T_SEC * 1000 };
@@ -5004,6 +5022,7 @@ test('working: from listen() a timer polls every workTickMs and close() stops it
       const n = s.calls().length;
       assert.ok(await until(() => s.calls().length > n + 2)); // and it keeps polling
       await c.app.close();
+      assert.ok(await until(() => c.app.stats().running === 0)); // the poll in flight at close() has ended and logged
       await sleep(100);
       const after = s.calls().length;
       await sleep(250);

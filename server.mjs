@@ -1664,9 +1664,12 @@ export function createApp(opts = {}) {
   // pass with no advance. A session gone from tmux is dropped; so is a name that came back as a new session (another `created`).
   const streaks = new Map(); // name -> {created, last, since, project, harness}
   const workCtx = { cancelled: false, device: null, gen: -1, admin: true }; // like the admin socket's: run() needs a ctx and there is no device here
+  let polling = false; // one poll at a time: a tick is skipped while the previous one still runs (a slow tmux never piles children up)
   async function tickWork() {
+    if (polling) return;
+    polling = true;
     let rows;
-    try { refreshConfig(); workCtx.gen = gen; rows = await listSessions(workCtx); } catch { return; } // tmux busy or failing: the streaks stay as they are
+    try { refreshConfig(); workCtx.gen = gen; rows = await listSessions(workCtx); } catch { return; } finally { polling = false; } // tmux busy or failing: the streaks stay as they are
     const t = now(), keep = new Set();
     for (const r of rows) {
       keep.add(r.name);
