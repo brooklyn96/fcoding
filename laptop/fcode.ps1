@@ -15,7 +15,9 @@ function Get-Cfg([string]$Key, $Default) {
   $v = if ($Cfg) { $Cfg.$Key }
   if ($null -ne $v -and "$v" -ne '') { $v } else { $Default }
 }
-$box = if ($env:FCODE_HOST) { $env:FCODE_HOST } else { Get-Cfg 'host' 'oracle' }   # alias ssh den box (ssh $box ...)
+$box = [string]$(if ($env:FCODE_HOST) { $env:FCODE_HOST } else { Get-Cfg 'host' 'oracle' })   # alias ssh den box (ssh $box ...)
+# checked once, here, for every ssh call (-oProxyCommand=... would run a program; a quote would break the hand-built command line of Invoke-BoxPy)
+if ($box -notmatch '\A[A-Za-z0-9][A-Za-z0-9._-]*\z') { Write-Host "lỗi: tên box không hợp lệ ($(($box -replace '[^\x20-\x7e]', '?'))). Dùng tên trong ~/.ssh/config (chữ, số, dấu . _ -), đặt ở khóa host của config.json hoặc biến FCODE_HOST."; exit 1 }
 # fcode sync: cap nhat cac project tu GitHub (chi fetch + merge --ff-only), liet ke nhanh box/* va PR dang mo.
 # Danh sach project lay tu syncRepos trong config (de test: dat FCODE_SYNC_REPOS = cac duong dan cach nhau bang dau ;)
 $SyncRepos = @(Get-Cfg 'syncRepos' @()) | Where-Object { $_ }
@@ -3009,7 +3011,6 @@ function Invoke-PhienExe([string]$Exe, [string[]]$ExeArgs, [string]$StdinText) {
 # chay $PhienPy tren box. Tra ve @{Code; Out = byte[]; Err}. stdin: $InBytes hoac noi dung file $InFile.
 # Han chot tinh tu truoc khi ghi byte stdin dau tien; stdin ghi bat dong bo, nen box dung doc thi den han van dung duoc.
 function Invoke-BoxPy([string]$Cmd, [byte[]]$InBytes, [string]$InFile) {
-  if ($box -notmatch '\A[A-Za-z0-9][A-Za-z0-9._-]*\z') { throw "tên box '$box' không hợp lệ" }
   $sec = if ($script:PhienDeadline) { (Get-PhienChildMs) / 1000 } else { Get-PhienLimitSec $false }
   $end = [DateTime]::UtcNow.AddSeconds($sec)
   # chuong trinh python (deflate + base64) la dong dau cua stdin; dong lenh chi co lenh nap ngan (khong vuong gioi han do dai)

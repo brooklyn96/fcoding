@@ -3771,6 +3771,22 @@ T 'phien: the reachability check is `ssh -o BatchMode=yes -o ConnectTimeout=8 <h
   $r = Invoke-Fcode $w @('phien', '--tu-dong') @{ FAKE_ARGV_LOG = $argv; FCODE_HOST = 'oracle-ubuntu' }; Eq $r.Code 0 $r.Out
   Eq (@(Get-Content $argv)[0]) '-o BatchMode=yes -o ConnectTimeout=8 oracle-ubuntu true' 'FCODE_HOST wins'
 }
+T 'host r1: a host that ssh would read as an option or that holds odd characters is refused once, at the source, for every command: exit 1, message, no ssh at all' {
+  $w = New-W2 'h1'; Use-LoggedSsh $w
+  [void](New-Sess $w.LS '11111111-host' $w.LP @('a'))
+  foreach ($bad in '-oProxyCommand=calc.exe', 'a b', 'a"b', 'oracle;id', '.oracle', 'a/b') {
+    foreach ($cmd in @('phien', '--tu-dong'), @('phien', 'proj', '--nhanh'), @('add', 'owner/repo'), @('omp-1'), @('--list')) {
+      $r = Invoke-Fcode $w $cmd @{ FCODE_HOST = $bad }
+      Eq $r.Code 1 (($cmd -join ' ') + ' with host ' + $bad + ': ' + $r.Out)
+      Ok ($r.Out -match 'tên box không hợp lệ') ('message: ' + $r.Out)
+    }
+  }
+  Eq (SshCalls $w).Count 0 'no ssh was started'
+  $cfg = Join-Path $w.U '.fcode\config.json'; $c = Get-Content $cfg -Raw | ConvertFrom-Json
+  [IO.File]::WriteAllText($cfg, (@{ ssh = $c.ssh; host = '-oProxyCommand=calc.exe'; syncRepos = @($w.LP) } | ConvertTo-Json -Compress))
+  $r = Invoke-Fcode $w @('phien', '--tu-dong'); Eq $r.Code 1 $r.Out; Ok ($r.Out -match 'tên box không hợp lệ') 'the config host is checked too'
+  Eq (SshCalls $w).Count 0 'no ssh from the config host either'
+}
 T 'alias e2e: the bare form with no cache asks the box once, then never again' {
   $w = New-W2 'al7'; Use-BareSsh $w; Set-BoxPrefs $w '{"order":[],"aliases":{"proj":"pj"}}'
   $r = Invoke-Fcode $w @('pj') @{ BARE_LOG = $w.BareLog }; Eq $r.Code 0 $r.Out
