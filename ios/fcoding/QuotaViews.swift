@@ -61,10 +61,8 @@ struct GreetingCard: View {
 
     var body: some View {
         // Server minute boundaries on the phone clock: the offset is rarely a whole minute.
-        let off = home.offset
-        let start = Date(timeIntervalSince1970: ((Date().timeIntervalSince1970 + off) / 60).rounded(.down) * 60 - off)
-        TimelineView(.periodic(from: start, by: 60)) { ctx in
-            let now = home.serverNow(ctx.date)
+        TimelineView(.periodic(from: HomeLogic.minuteStart(phone: Date(), offset: home.offset), by: 60)) { ctx in
+            let now = HomeLogic.shownInstant(home.serverNow(ctx.date))
             VStack(alignment: .leading, spacing: 0) {
                 Text(HomeLogic.greeting(now))
                     .font(.system(size: 13, weight: .medium))

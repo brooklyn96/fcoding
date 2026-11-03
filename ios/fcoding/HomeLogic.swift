@@ -772,6 +772,19 @@ enum HomeLogic {
         return c
     }()
 
+    /// The last server-minute boundary at or before `phone`, on the phone clock (`offset` =
+    /// server minus phone): the greeting card's timeline starts here and ticks every 60 s.
+    static func minuteStart(phone: Date, offset: TimeInterval) -> Date {
+        Date(timeIntervalSince1970: ((phone.timeIntervalSince1970 + offset) / 60).rounded(.down) * 60 - offset)
+    }
+
+    /// The server instant the card reads, rounded to the whole second. A tick lands on the
+    /// boundary only within Double error (often 1e-7 s before it), and that must not show the
+    /// previous minute.
+    static func shownInstant(_ server: Date) -> Date {
+        Date(timeIntervalSince1970: server.timeIntervalSince1970.rounded())
+    }
+
     /// By the hour in Vietnam: sáng 04–10, trưa 11–12, chiều 13–17, tối 18–03.
     static func greeting(_ date: Date) -> String {
         switch vietnam.component(.hour, from: date) {
@@ -1304,6 +1317,23 @@ enum HomeLogic {
         eq("greet spoken", greetingSpoken(vn(3, 22, 5)), "Chào buổi tối, 22 giờ 05, Thứ Ba ngày 3 tháng 11")
         // Phone 4 min fast: phone + offset is the server clock, so the shown time is unchanged.
         eq("time skew", clockTime(phone.addingTimeInterval(off)), "15:00")
+        // A tick a hair before the boundary reads the new minute; mid-minute is unchanged.
+        eq("shown hair before", clockTime(shownInstant(vn(3, 22, 5).addingTimeInterval(-1e-6))), "22:05")
+        eq("shown day hair before", dayLine(shownInstant(vn(4, 0, 0).addingTimeInterval(-1e-6))), "Thứ Tư, 4/11")
+        eq("shown mid minute", clockTime(shownInstant(vn(3, 22, 5).addingTimeInterval(30.4))), "22:05")
+        // Ticks with fractional offsets (phone = reference-date seconds): start + k * 60 + offset,
+        // as shown, reads the minute that just began (1 s later is safely inside it). Case 0 is
+        // the review's float example, which landed 1.19e-7 s before the boundary.
+        let ticks: [(Double, Double)] = [(815_660_938.622738, -8.95476588930691), (815_660_938, 0.1), (815_660_999.999, -0.3),
+                                         (815_661_000.0000001, 12.345678), (815_660_960.5, -240.000001), (815_660_940.25, 3599.9999)]
+        for (i, t) in ticks.enumerated() {
+            let start = minuteStart(phone: Date(timeIntervalSinceReferenceDate: t.0), offset: t.1)
+            for k in 0..<3 {
+                let server = start.addingTimeInterval(Double(k) * 60 + t.1)
+                eq("tick \(i).\(k)", clockTime(shownInstant(server)), clockTime(server.addingTimeInterval(1)))
+                eq("tick \(i).\(k) on boundary", Int(shownInstant(server).timeIntervalSince1970) % 60, 0)
+            }
+        }
 
         // Server address (Cài đặt)
         eq("addr bare host", serverAddress("fcode-quoc.duckdns.org"), "https://fcode-quoc.duckdns.org")
