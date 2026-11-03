@@ -283,6 +283,11 @@ struct PairGuideView: View {
             "Chỉ bấm “Ghép” khi địa chỉ máy chủ đúng là box của bạn.",
             "Ghép sang một box khác thì nội dung đang soạn của box cũ bị xoá.",
         ]),
+        ("Đổi địa chỉ máy chủ", [
+            "Box chuyển sang địa chỉ mới: Cài đặt (bánh răng) → “Địa chỉ máy chủ”, gõ địa chỉ mới (chỉ https; gõ tên miền là đủ), rồi bấm “Lưu”.",
+            "iPhone thử kết nối tới địa chỉ mới bằng đăng nhập hiện tại. Được thì đổi luôn, không cần ghép lại; không được thì giữ địa chỉ cũ và báo lý do.",
+            "Báo “chưa ghép với máy chủ”: bấm “Gỡ iPhone này”, rồi ghép lại bằng mã từ máy chủ mới.",
+        ]),
         ("Gỡ thiết bị", [
             "“Gỡ iPhone này”: gỡ điện thoại này khỏi box. iPhone này luôn được xoá ghép, kể cả khi box không trả lời.",
             "“Gỡ mọi thiết bị”: gỡ mọi thiết bị đã ghép với box. iPhone này chỉ đăng xuất khi box xác nhận.",

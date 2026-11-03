@@ -85,6 +85,7 @@ Các bước chi tiết có trong app: bấm nút **?** (Hướng dẫn) ở gó
   - Khi xoay ngang: ô nhập thấp lại để màn hình còn chỗ; nút ghim và **⌄** nằm cạnh ô nhập; bấm nút **phím nhanh** bên trái ô nhập để hiện / ẩn hàng phím nhanh.
   - Khi bạn chuyển sang ứng dụng khác, kết nối tạm dừng; mở lại ứng dụng là tự kết nối lại.
 - **Cài đặt** (bánh răng):
+  - **Địa chỉ máy chủ**: khi box chuyển sang địa chỉ mới, chạm vào dòng này, gõ địa chỉ mới (chỉ https; gõ tên miền là đủ) rồi bấm **Lưu**. iPhone thử kết nối bằng đăng nhập hiện tại; được thì đổi luôn, không cần ghép lại; không được thì giữ địa chỉ cũ và báo lý do (báo "chưa ghép" thì gỡ iPhone này rồi ghép lại với máy chủ mới).
   - **Gỡ iPhone này**: gỡ điện thoại này khỏi box.
   - **Gỡ mọi thiết bị**: gỡ tất cả thiết bị đã ghép với box (có hỏi xác nhận).
   - **Gỡ iPhone này** xoá ghép trên iPhone này ngay, kể cả khi box không trả lời.

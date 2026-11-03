@@ -26,8 +26,8 @@ struct RootView: View {
             } else if app.token == nil {
                 NavigationStack { PairView() }
             } else {
-                // A new pairing (new token) starts the home screen afresh.
-                ProjectsView().id(app.token)
+                // A new pairing (new token) or a new server address starts the home screen afresh.
+                ProjectsView().id((app.token ?? "") + "\n" + app.serverURL)
             }
         }
         // Every change of what the overlay shows goes through its one sync().

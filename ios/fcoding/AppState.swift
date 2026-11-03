@@ -173,6 +173,36 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Cài đặt → "Địa chỉ máy chủ": the same box at a new address (its devices and secrets moved
+    /// with it), so the token is kept. GET api/me at the NEW address with this phone's token; only
+    /// a 2xx switches. Nothing is sent to the old address and a 401 there does not sign out here.
+    /// Returns the error text (the old address stays), nil when switched or unchanged.
+    func moveServer(to input: String) async -> String? {
+        guard let address = HomeLogic.serverAddress(input), let base = URL(string: address) else {
+            return HomeLogic.serverAddressInvalid
+        }
+        guard address != serverURL else { return nil }
+        guard unsupportedServer == nil, let token = token, !token.isEmpty else { return unpairedNotice }
+        do {
+            try await API(base: base, token: token).call("GET", "api/me", timeout: 15)
+        } catch is CancellationError {
+            return nil
+        } catch {
+            return HomeLogic.serverMoveFailure(status: (error as? APIError)?.status ?? 0, label: PairLink.label(address))
+        }
+        // A pairing or sign-out while the check was out wins.
+        guard self.token == token, unsupportedServer == nil else { return nil }
+        // Saved replies and prefs belong to the old address (ResponseCache and LaunchFetch are
+        // keyed by server + token, so nothing old would be read anyway). Drafts and read marks
+        // stay: it is the same box. The new address starts a fresh home screen (RootView's id).
+        AppState.removeSavedCopies()
+        serverURL = address
+        UserDefaults.standard.set(address, forKey: AppState.serverKey)
+        prefetch()
+        popup = "Đã chuyển sang máy chủ \(PairLink.label(address))."
+        return nil
+    }
+
     /// "Gỡ iPhone này": POST /api/logout. The token is deleted here even if the request fails
     /// (unless a new pairing replaced it meanwhile).
     /// Returns the task so a caller can await it (and show a spinner) or fire and forget.

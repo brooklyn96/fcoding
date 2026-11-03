@@ -835,6 +835,28 @@ enum HomeLogic {
         return (h > 0 ? "\(h) giờ " : "") + (h > 0 || m > 0 ? "\(m) phút " : "") + "\(s % 60) giây"
     }
 
+    // MARK: Server address (Cài đặt)
+
+    /// The new address as typed: the canonical https origin, or nil. A bare host gets https://;
+    /// spaces, a trailing slash and any path go; http:// and invalid hosts are refused
+    /// (PairLink.origin, the pairing screen's rule).
+    static func serverAddress(_ input: String) -> String? { PairLink.origin(input)?.absoluteString }
+
+    static let serverAddressInvalid = "Địa chỉ phải là tên miền hoặc IP dùng https, ví dụ fcode.example.com."
+
+    /// Why the new address was not taken (GET api/me there with this phone's token failed);
+    /// `status` 0 = no HTTP reply. The old address stays in every case.
+    static func serverMoveFailure(status: Int, label: String) -> String {
+        switch status {
+        case 401, 403:
+            return "iPhone này chưa ghép với máy chủ \(label), nên vẫn giữ địa chỉ cũ. Muốn dùng máy chủ đó: bấm Gỡ iPhone này, rồi ghép lại bằng mã từ máy chủ đó."
+        case 0:
+            return "Không kết nối được máy chủ \(label), nên vẫn giữ địa chỉ cũ. Kiểm tra lại địa chỉ và mạng."
+        default:
+            return "Máy chủ \(label) trả lời lỗi (mã \(status)), nên vẫn giữ địa chỉ cũ."
+        }
+    }
+
     // MARK: Recent omp sessions
 
     /// Home banner when the box found an omp session format it does not know; nil otherwise
@@ -1309,6 +1331,26 @@ enum HomeLogic {
         eq("spoken m", elapsedSpoken(65), "1 phút 5 giây")
         eq("spoken s", elapsedSpoken(5), "5 giây")
         eq("spoken h0m", elapsedSpoken(3605), "1 giờ 0 phút 5 giây")
+
+        // Server address (Cài đặt)
+        eq("addr bare host", serverAddress("fcode-quoc.duckdns.org"), "https://fcode-quoc.duckdns.org")
+        eq("addr spaces slash", serverAddress("  fcode-quoc.duckdns.org/ \n"), "https://fcode-quoc.duckdns.org")
+        eq("addr https slash", serverAddress("https://fcode-quoc.duckdns.org/"), "https://fcode-quoc.duckdns.org")
+        eq("addr upper", serverAddress("HTTPS://FCode.Example.com"), "https://fcode.example.com")
+        eq("addr port", serverAddress("fcode.example.com:8443"), "https://fcode.example.com:8443")
+        eq("addr 443 dropped", serverAddress("https://fcode.example.com:443"), "https://fcode.example.com")
+        eq("addr path cut", serverAddress("https://fcode.example.com/api/home"), "https://fcode.example.com")
+        eq("addr http refused", serverAddress("http://fcode.example.com"), nil)
+        eq("addr empty", serverAddress("   "), nil)
+        eq("addr one label", serverAddress("localhost"), nil)
+        eq("addr space inside", serverAddress("fcode example.com"), nil)
+        eq("move 401", serverMoveFailure(status: 401, label: "a.example.com"),
+           "iPhone này chưa ghép với máy chủ a.example.com, nên vẫn giữ địa chỉ cũ. Muốn dùng máy chủ đó: bấm Gỡ iPhone này, rồi ghép lại bằng mã từ máy chủ đó.")
+        eq("move 403 same as 401", serverMoveFailure(status: 403, label: "a"), serverMoveFailure(status: 401, label: "a"))
+        eq("move no reply", serverMoveFailure(status: 0, label: "a.example.com"),
+           "Không kết nối được máy chủ a.example.com, nên vẫn giữ địa chỉ cũ. Kiểm tra lại địa chỉ và mạng.")
+        eq("move 502", serverMoveFailure(status: 502, label: "a.example.com"),
+           "Máy chủ a.example.com trả lời lỗi (mã 502), nên vẫn giữ địa chỉ cũ.")
 
         // Projects
         eq("deploy ok", deployLine(HomeRun(status: "success", at: now.addingTimeInterval(-3 * hr)), now: now).text, "✓ deploy 3 giờ trước")
