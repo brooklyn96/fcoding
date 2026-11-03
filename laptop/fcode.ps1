@@ -1311,12 +1311,12 @@ function New-MoveIdText { 'mv-' + (Get-MoveNow).ToString('yyyyMMddHHmmss', [Glob
 # laptop exit codes (I17): 0 done, 1 failed, 10 rolled back, 65 refused, 70 needs a human, 75 busy
 function ConvertTo-MoveExit([int]$Code) { if ($Code -in 0, 65, 70, 75) { $Code } else { 1 } }
 
-# D.0.6 numbers. DESIGN-GAP (T10-G3): D.0.6 gives no laptop deadline for the unrecorded plan forms and the plain-ssh scripts; plan_s and
-# script_s are this file's reading, kept here only.
+# D.0.6 numbers (W1-T10-G3: the read-only plan forms 3600 s; the plain-ssh scripts preflight, bootstrap key, bootstrap gate and rebuild
+# read 2400 s; facts, the TCP reach test and the `true` login 30 s).
 function Get-MoveConst([string]$Name) {
   switch -CaseSensitive ($Name) {
     'cap_s' { 900 } 'status_s' { 60 } 'plan_s' { 3600 } 'script_s' { 2400 } 'tcp_s' { 30 }
-    'first_transfer_s' { 21600 } 'first_verify_s' { 1800 } 'adopt_s' { 1860 } 'switch_s' { 120 } 'other_s' { 300 }
+    'first_transfer_s' { 21600 } 'first_verify_s' { 1800 } 'adopt_s' { 1860 } 'other_s' { 300 }
     'refresh_min' { 60 } 'back_precopy_min' { 10 } 'clock_s' { 5 } 'drain_wait_min' { 15 } 'retries' { 3 }
     default { throw "Get-MoveConst: $Name" }
   }
@@ -1333,7 +1333,7 @@ function Get-MoveText([string]$Key, [hashtable]$F = @{}) {
     'Q-inbound' { 'Các kết nối vào sau sẽ mất sau khi chuyển cho đến khi bạn trỏ lại phía khách: <danh sách>. Đồng ý? (có / không)' }
     'Q-sshd' { 'Cấu hình sshd của máy mới khác máy cũ (<khóa>). Áp dụng các file sshd của máy cũ lên máy mới? (có / không)' }
     'Q-sshpush' { 'Workflow của repo <repo> deploy thẳng qua ssh. Tắt hẳn workflow đó? (có / không)' }
-    'Q-drain' { 'Máy cũ còn việc deploy đang chạy (<khóa>). đợi = đợi thêm <n> phút; dừng = mở lại máy cũ và dừng. (đợi / dừng)' }
+    'Q-drain' { 'Máy cũ còn việc deploy đang chạy (<khóa hoặc unit>). đợi = đợi thêm <n> phút; dừng = mở lại máy cũ và dừng. (đợi / dừng)' }
     'Q-guard' { 'Ứng dụng <tên> đang bận. tiếp tục = vẫn dừng ứng dụng để chuyển; dừng = quay lại máy cũ. (tiếp tục / dừng)' }
     'Q-finish' { 'Kết thúc chuyển máy: sau bước này không quay lại máy cũ được nữa. Gõ YES để xác nhận.' }
     'Q-back' { 'Chuyển ngược về máy cũ. Những thứ này ở lại máy mới, không chạy trên máy cũ: <danh sách>. Gõ YES để xác nhận.' }
@@ -1479,7 +1479,7 @@ function Format-MoveLine([string]$Line) {
   if ($l -cmatch '\AGATE_ERROR (moving|moved)\z') { return (Get-MoveLabels)["error $($Matches[1])"] }
   # F8a: `GATE_ERROR aborted` has no §8.3.3 label (DESIGN-GAP T10-G38, the Architect may add one): printed as the machine wrote it
   if ($l -cmatch '\AGATE_ERROR aborted\z') { return $l }
-  if ($l -ceq 'INV ok' -or $l -cmatch '\A(MOVE (manifest|key|lst|call|state|facts|record|moveid|hostkey)|GATE_EXIT)\b') { return '' }
+  if ($l -ceq 'INV ok' -or $l -cmatch '\A(MOVE (manifest|key|lst|call|state|facts|record|moveid|hostkey|target)|GATE_EXIT)\b') { return '' }
   if ($l -cmatch '\A(INV|MOVE) ') { return $l }
   ''
 }
@@ -1530,7 +1530,8 @@ function New-MoveState([string]$Id, $OldM, $NewM) {
     est = [pscustomobject][ordered]@{ typical_s = $null; max_s = $null; transfer_s = $null; verify_s = $null; apply_s = $null; prepid_s = $null }
     last_copy_at = $null; old = $OldM; new = $NewM; legacy_known_hosts = [pscustomobject]@{}
     aliases = [pscustomobject][ordered]@{ laptop_backup = $null; coder_backup = $null }
-    sshpush_disabled = @(); window_s = $null; target_users = @()
+    sshpush_disabled = @(); window_s = $null; target_users = @(); target_groups = @(); target_subids = @(); target_addrs = @(); target_stop_budget_s = 0
+    target_platform = 0; idmap = @(); legacy_push = @()
   }
 }
 # $null = no move; throws on a corrupt file (E-L4: the owner rebuilds it, "dựng lại trạng thái")
@@ -1540,7 +1541,7 @@ function Read-MoveState {
   try { $s = [IO.File]::ReadAllText($p) | ConvertFrom-Json } catch { $s = $null }
   if ($null -eq $s -or -not (Test-MoveId ([string](Get-MoveProp $s 'move_id')))) { throw "file trạng thái $p bị hỏng; $(Get-MoveText 'rebuild'): fcode move status --rebuild <máy cũ> <máy mới>" }
   foreach ($k in 'pass', 'dur', 'answers', 'est', 'old', 'new', 'legacy_known_hosts', 'aliases') { if ($null -eq (Get-MoveProp $s $k)) { Set-MoveProp $s $k ([pscustomobject]@{}) } }
-  foreach ($k in 'sshpush_disabled', 'target_users') { Set-MoveProp $s $k @(Get-MoveProp $s $k @()) }
+  foreach ($k in 'sshpush_disabled', 'target_users', 'target_groups', 'target_subids', 'target_addrs', 'idmap', 'legacy_push') { Set-MoveProp $s $k @(Get-MoveProp $s $k @()) }
   $d = @{ dir = 'fwd'; attempt = 1; phase = 'planned'; serving = 'old'; mark = $null; dst_started = $false; carry = $false; enabled = $true; new_lost = $false; new_discarded = $false; chores_done = $false; rebuilt = $false; manifest_sha = ''; gate_id = ''; last_copy_at = $null; window_s = $null }
   foreach ($k in $d.Keys) { if (-not $s.PSObject.Properties[$k]) { Set-MoveProp $s $k $d[$k] } }
   $t = ConvertTo-MoveTime $s.last_copy_at; Set-MoveProp $s 'last_copy_at' $(if ($t) { Format-MoveTs $t } else { $null })
@@ -1709,8 +1710,16 @@ function Get-MoveRsyncShapes {
     }
   }
 }
-# DESIGN-GAP (T10-G21): F.3 keeps `preflight` in the laptop (plain ssh before the gate exists on new, CONTRACT §1.5) while OMP-HANDOFF §13
-# gives T3 "preflight prints every uid ≥ 1000 user"; reading: the laptop ships this script (T3's U.plan.empty-rules rules are copied here).
+# CONTRACT §3.5 (B.5.2; W1-T7-DG-T7-1): the `platform` units (LIST platform-units) and paths (LIST platform-opt + the /usr/local list,
+# each by its exact path; a directory entry covers what lies under it). One copy here: `preflight` and the 3b mixed-pair check read it.
+function Get-MovePlatformUnits { @('instabox-data-init.service', 'instabox-guest-agent.service', 'instabox-guest-reboot.service', 'instabox-identity.service', 'instabox-ssh-hostkeys.service', 'instabox-user.service', 'sshd.service') }
+function Get-MovePlatformPaths {
+  $bin = 'bun bunx cargo cargo-clippy cargo-fmt cargo-miri claude clippy-driver codex corepack go gofmt instabox instabox-computer-use instabox-computer-use-proxy instabox-desktop instabox-mcp instabox-port mkswap node npm npx ocu opencode open-codex-computer-use-mcp open-computer-use open-computer-use-mcp pnpm pnpx rls rust-analyzer rustc rustdoc rustfmt rust-gdb rust-gdbgui rust-lldb rustup swapoff swapon uv uvx yarn yarnpkg'
+  $sbin = 'instabox-data-init instabox-guest-agent instabox-identity instabox-preboot instabox-user'
+  @('/opt/containerd', '/opt/npm', '/opt/rust') + @($bin -split ' ' | ForEach-Object { "/usr/local/bin/$_" }) + @('/usr/local/etc/npmrc') + @($sbin -split ' ' | ForEach-Object { "/usr/local/sbin/$_" }) +
+    @('/usr/local/share/ca-certificates/instabox-proxy.crt', '/usr/local/go', '/usr/local/include/node', '/usr/local/lib/instabox', '/usr/local/lib/node_modules', '/usr/local/share/doc', '/usr/local/share/instabox', '/usr/local/share/man/man1')
+}
+# `preflight` is a bash script the laptop ships and runs on new by plain ssh (B.0.2; W1-T10-G21).
 # DESIGN-GAP (T10-G47, F8i): it does not check the B.0.2/B.14.8 space and inodes rule (that needs the manifest; the server checks space at
 # transfer), and it does not prove that `--addr` itself answers on port 22: the laptop reaches new through its alias with HostKeyAlias=--addr.
 function Get-MovePreflightScript {
@@ -1740,20 +1749,32 @@ oh=${oaddr%%:*}; op=22; case $oaddr in *:*) op=${oaddr##*:};; esac
 case $oh in ''|*[!A-Za-z0-9.-]*) ref old-unreachable addr=-;; *) timeout 10 bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$oh" "$op" 2>/dev/null || ref old-unreachable addr=$oaddr;; esac
 curl -fsS -m 10 -o /dev/null https://github.com 2>/dev/null || ref new-unreachable host=github.com
 curl -fsS -m 10 -o /dev/null -H 'accept: application/dns-json' 'https://1.1.1.1/dns-query?name=github.com&type=A' 2>/dev/null || ref dns why=unreachable
+# B.5.2 / CONTRACT §3.5 scope: the platform list applies only when all seven unit files are in /etc/systemd/system
+punits="@@PUNITS@@"
+platform=1; for u in $punits; do [ -f "$R/etc/systemd/system/$u" ] || platform=0; done
+ppaths=; [ "$platform" = 1 ] && ppaths="@@PPATHS@@"
+inplat() { local q; for q in $ppaths; do case $1 in "$q"|"$q"/*) return 0;; esac; done; return 1; }
 # B.0.3 except its user clause (the laptop applies it at D.2 step 3b)
 [ -e "$MV/move-id" ] && ref target-not-empty path=/var/lib/fcode-move/move-id
-owned=$(mktemp); trap 'rm -f "$owned"' EXIT
+owned=$(mktemp); trap 'rm -f "$owned" "$owned.opt"' EXIT
 cat "$R"/var/lib/dpkg/info/*.list 2>/dev/null | sed 's#^/\(bin\|sbin\|lib\|lib64\)/#/usr/\1/#' | sort -u > "$owned"
+# only a non-directory unowned entry refuses, named by the top-level entry that holds it (W1-T3-GAP-12); platform paths pass in scope
 for d in /opt /srv /usr/local; do
   [ -d "$R$d" ] || continue
   find "$R$d" -xdev \( -type f -o -type l \) 2>/dev/null | while IFS= read -r p; do printf '%s\n' "${p#"$R"}"; done
-done | sort -u | comm -23 - "$owned" | while IFS= read -r p; do echo "INV refuse target-not-empty path=${p// /_}"; done > "$owned.opt"
+done | sort -u | comm -23 - "$owned" | while IFS= read -r p; do
+  inplat "$p" && continue
+  case $p in /usr/local/*) b=/usr/local; r=${p#/usr/local/};; /opt/*) b=/opt; r=${p#/opt/};; /srv/*) b=/srv; r=${p#/srv/};; *) continue;; esac
+  printf '%s\n' "$b/${r%%/*}"
+done | sort -u | while IFS= read -r p; do echo "INV refuse target-not-empty path=${p// /_}"; done > "$owned.opt"
 for p in "$R"/etc/systemd/system/*; do
   [ -f "$p" ] && [ ! -L "$p" ] || continue
-  q=${p#"$R"}; grep -qxF -- "$q" "$owned" || echo "INV refuse target-not-empty path=${q// /_}"
+  q=${p#"$R"}
+  if [ "$platform" = 1 ]; then case " $punits " in *" ${q##*/} "*) continue;; esac; fi
+  grep -qxF -- "$q" "$owned" || echo "INV refuse target-not-empty path=${q// /_}"
 done >> "$owned.opt"
-if command -v docker >/dev/null 2>&1; then docker ps -q 2>/dev/null | while IFS= read -r c; do echo "INV refuse target-not-empty container=$c"; done >> "$owned.opt"; fi
-while IFS= read -r l; do echo "$l"; nref=$((nref + 1)); done < "$owned.opt"; rm -f "$owned.opt"
+if command -v docker >/dev/null 2>&1; then docker ps --format '{{.Names}}' 2>/dev/null | while IFS= read -r c; do [ -n "$c" ] && echo "INV refuse target-not-empty path=container:$c"; done >> "$owned.opt"; fi
+while IFS= read -r l; do echo "$l"; nref=$((nref + 1)); done < "$owned.opt"
 # every uid >= 1000 user with home-nonskel (never refused here, K7)
 getent passwd | awk -F: '$3 >= 1000 && $3 != 65534 { print $1 ":" $3 ":" $6 }' | while IFS=: read -r u uid home; do
   ns=0
@@ -1766,12 +1787,26 @@ getent passwd | awk -F: '$3 >= 1000 && $3 != 65534 { print $1 ":" $3 ":" $6 }' |
   fi
   echo "INV target user=$u uid=$uid home-nonskel=$ns"
 done
+# new's groups (gid >= 1000), subid ranges and global addresses (B.0.2; W1-T11-DG-T11-4), and the platform scope (B.5.2)
+getent group | awk -F: '$3 >= 1000 { print "INV target group=" $1 " gid=" $3 }'
+for k in uid gid; do
+  [ -r "$R/etc/sub$k" ] || continue
+  while IFS=: read -r u s c; do
+    case $u in ''|*[!A-Za-z0-9._-]*) continue;; esac
+    case $s in ''|*[!0-9]*) continue;; esac
+    case $c in ''|*[!0-9]*) continue;; esac
+    echo "INV target subid user=$u kind=$k start=$s count=$c"
+  done < "$R/etc/sub$k"
+done
+ip -o addr show scope global 2>/dev/null | awk '{ split($4, a, "/"); if (a[1] != "") print "INV target addr=" a[1] }'
+echo "INV target platform=$platform"
 # stop_budget_s: B.5.8 over new's active non-infra services
 tsec() { local v=$1 s=0 n u; [ "$v" = infinity ] && { echo 900; return; }
   for w in $v; do n=${w%%[a-z]*}; u=${w#"$n"}; case $u in min) s=$((s + n * 60));; h) s=$((s + n * 3600));; ms|us) ;; *) s=$((s + n));; esac; done; echo "$s"; }
 sum=0
 while IFS= read -r unit; do
   case $unit in systemd-*|dbus*|ssh.service|getty@*|serial-getty@*|console-*|keyboard-setup*|networking*|ifup@*|rsyslog*|apparmor*|kmod*|polkit*|ufw*|nftables*|fcode-deploy-w-*|fcode-deploy-g-*|fcode-move-*) continue;; esac
+  if [ "$platform" = 1 ]; then case " $punits " in *" $unit "*) continue;; esac; fi
   t=$(tsec "$(systemctl show -p TimeoutStopUSec --value "$unit" 2>/dev/null)"); [ "${t:-0}" -gt 900 ] && t=900
   sum=$((sum + ${t:-0} + 30))
 done < <(systemctl list-units --type=service --state=active --no-legend --plain 2>/dev/null | awk '{ print $1 }')
@@ -1795,7 +1830,7 @@ rm -rf "$w" "$out" "$tmpd" "$lst"
 [ "$nref" -eq 0 ] || exit 65
 echo "INV ok"
 exit 0
-'@.Replace('@@SHAPES@@', $shapes)
+'@.Replace('@@SHAPES@@', $shapes).Replace('@@PUNITS@@', (@(Get-MovePlatformUnits) -join ' ')).Replace('@@PPATHS@@', (@(Get-MovePlatformPaths) -join ' '))
 }
 # D.3 step 2 (plain ssh on new): tools, the move key, MV_DIR/known_hosts in the OpenSSH form (DG-3, DG-5), own-keys; prints `MOVE key`.
 # DESIGN-GAP (T10-G30): the NodeSource major comes as an extra `--node-major <n>` (CONTRACT §1.5 lists `--old-addr` and the key line only).
@@ -1902,8 +1937,8 @@ function Get-MoveTcpScript {
 timeout 8 bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$1" "$2" 2>/dev/null
 '@
 }
-# DESIGN-GAP (T10-G4): D.0.10 reads both move-id files, the call records and the manifest, but no gate verb prints them
-# (status has no old_addr/new_addr, no record times, no manifest). Reading: this read-only plain-ssh script.
+# D.0.10 (W1-T10-G4, W1-T11-DG-T11-6): `rebuild read`, the read-only plain-ssh script on each machine; `MOVE target` on new only, when
+# MV_DIR/target.json exists (W1-T11-DG-R11-2).
 function Get-MoveRebuildScript {
 @'
 #!/bin/bash
@@ -1913,14 +1948,17 @@ R=${FCM_ROOT:-}
 MV=$R/var/lib/fcode-move
 [ -r "$MV/move-id" ] || exit 1
 echo "MOVE moveid $(grep -E '^[a-z_]+=[A-Za-z0-9._:-]*$' "$MV/move-id" | tr '\n' ' ' | sed 's/ $//')"
-k=$(cut -d' ' -f2 "$R/etc/ssh/ssh_host_ed25519_key.pub" 2>/dev/null); [ -n "$k" ] && echo "MOVE hostkey type=ssh-ed25519 pub=$k"
+k=$(head -n1 "$R/etc/ssh/ssh_host_ed25519_key.pub" 2>/dev/null); [ -n "$k" ] && echo "MOVE hostkey $k"
 for d in "$MV"/run/*/; do
   [ -d "$d" ] || continue
   id=$(basename "$d"); rc=$(cat "$d/rc" 2>/dev/null); st=$(cat "$d/start" 2>/dev/null); en=$(cat "$d/end" 2>/dev/null)
-  echo "MOVE record id=$id rc=${rc:--} start=${st:--} end=${en:--}"
+  echo "MOVE record id=$id start=${st:--} end=${en:--} rc=${rc:--}"
 done
 if [ -r "$MV/manifest.json" ] && [ -r "$MV/manifest.json.sha256" ]; then
   echo "MOVE manifest sha=$(cut -c1-64 "$MV/manifest.json.sha256") gz64=$(gzip -c -n "$MV/manifest.json" | base64 -w0)"
+fi
+if [ -r "$MV/target.json" ]; then
+  echo "MOVE target $(tr -d '\r\n' < "$MV/target.json")"
 fi
 exit 0
 '@
@@ -1984,21 +2022,65 @@ function Get-MoveSetBudget($M, [string]$Set, [string]$Field) {
   foreach ($h in @(Get-MoveProp $M 'holds' @())) { if ($ids -ccontains [string]$h.id) { $sum += [int](Get-MoveProp $h $Field 0) } }
   $sum
 }
-# --budget of a step on a machine: the D.0.6 first-run table, then max(table, 3 x the last measured dur_s of that step there)
-# DESIGN-GAP (T10-G27): x.check's table value when 0c's duration is unknown (a resume in another run): 300.
-# DESIGN-GAP (T10-G29): later c.transfer.N "the laptop's estimate": 2 × transfer_s + 300 (first copy 21600).
+# the holds of a set of the manifest (hold objects whose id is in hold_sets.<set>)
+function Get-MoveSetHolds($M, [string]$Set) {
+  $ids = @(Get-MoveProp (Get-MoveProp $M 'hold_sets') $Set @())
+  @(@(Get-MoveProp $M 'holds' @()) | Where-Object { $_ -and $ids -ccontains [string]$_.id })
+}
+# K1 freeze row (DECISION-1k6-K1budget, D.0.6): Σ stop_budget_s over the periodic sources (kind `unit`, in hold_sets.stop, id
+# cron.service, *.timer or *.path) and over every hold of the same scope (no `user`, as the server's _mvh_followers_of) whose
+# triggered_by[] names one of them; the union, each hold once
+function Get-MovePeriodicBudget($M) {
+  $src = @(Get-MoveSetHolds $M 'stop' | Where-Object { [string]$_.kind -ceq 'unit' -and [string]$_.id -cmatch '\A(cron\.service|.+\.timer|.+\.path)\z' })
+  $sid = @($src | ForEach-Object { [string]$_.id }); $seen = @{}; $sum = 0
+  foreach ($h in $src) { $seen[[string]$h.id] = $true; $sum += [int](Get-MoveProp $h 'stop_budget_s' 0) }
+  foreach ($h in @(Get-MoveProp $M 'holds' @())) {
+    if (-not $h -or $seen.ContainsKey([string]$h.id) -or [string](Get-MoveProp $h 'user' '')) { continue }
+    if (@(@(Get-MoveProp $h 'triggered_by' @()) | Where-Object { $sid -ccontains [string]$_ }).Count) { $seen[[string]$h.id] = $true; $sum += [int](Get-MoveProp $h 'stop_budget_s' 0) }
+  }
+  $sum
+}
+# the manifest's `tunnel` names (hostnames[] class tunnel)
+function Get-MoveTunnelCount($M) { @(@(Get-MoveProp $M 'hostnames' @()) | Where-Object { $_ -and [string]$_.class -ceq 'tunnel' }).Count }
+# K1 health row (x.baseline, x.health, r.health-src): 300 + 10 × (|redis[]| + |pg[]|) + 20 × tunnel names + 60 × container holds of
+# hold_sets.start + 40 × linger holds of hold_sets.start + 60 × the user-container holds of those users + 20 × |health[]| + Σ health_budget_s
+function Get-MoveHealthBudget($M) {
+  $st = @(Get-MoveSetHolds $M 'start')
+  $lu = @($st | Where-Object { [string]$_.kind -ceq 'linger' } | ForEach-Object { $u = [string](Get-MoveProp $_ 'user' ''); if (-not $u) { $u = ([string]$_.id) -replace '\Alinger:', '' }; $u })
+  $uc = @(@(Get-MoveProp $M 'holds' @()) | Where-Object { $_ -and [string]$_.kind -ceq 'user-container' -and $lu -ccontains [string](Get-MoveProp $_ 'user' '') }).Count
+  $hl = @(@(Get-MoveProp $M 'health' @()) | Where-Object { $_ }); $hs = 0; foreach ($x in $hl) { $hs += [int](Get-MoveProp $x 'health_budget_s' 0) }
+  300 + 10 * (@(Get-MoveProp $M 'redis' @()).Count + @(Get-MoveProp $M 'pg' @()).Count) + 20 * (Get-MoveTunnelCount $M) + 60 * @($st | Where-Object { [string]$_.kind -ceq 'container' }).Count +
+    40 * $lu.Count + 60 * $uc + 20 * $hl.Count + $hs
+}
+# K1 switch row: 60 + 140 × unit connectors + 140 × container connectors + 20 × tunnel names
+function Get-MoveSwitchBudget($M) {
+  $c = @(@(Get-MoveProp $M 'connectors' @()) | Where-Object { $_ -and [string]$_.kind -cin 'unit', 'container' }).Count
+  60 + 140 * $c + 20 * (Get-MoveTunnelCount $M)
+}
+# K1 stop row (x.stop-src, x.stop-dst, r.stop-dst): Σ stop_budget_s of hold_sets.stop + 30 + 600 per Redis hold (counted as the redis[]
+# entries, D.0.6) + 60 per pm2 hold (pm2-*.service, B.5.9) + 120 per container/user-container hold of the stop set
+function Get-MoveStopBudget($M) {
+  $st = @(Get-MoveSetHolds $M 'stop')
+  (Get-MoveSetBudget $M 'stop' 'stop_budget_s') + 30 + 600 * @(Get-MoveProp $M 'redis' @()).Count + 60 * @($st | Where-Object { [string]$_.id -cmatch '\Apm2-.+\.service\z' }).Count +
+    120 * @($st | Where-Object { [string]$_.kind -cin 'container', 'user-container' }).Count
+}
+# --budget of a step on a machine: the D.0.6 first-run table (K1 as amended by DECISION-1k6-K1budget), then max(table, 3 x the last
+# measured dur_s of that step there). x.check 300 when 0c's duration is unknown (W1-T10-G27); a later c.transfer.N 2 × transfer_s + 300
+# (first copy 6 h, W1-T10-G29).
 function Get-MoveBudget($S, [string]$Step, [string]$Machine) {
   $M = Get-MoveManifestObj; $e = $S.est
   $ts = Get-MoveProp $e 'transfer_s'; $vs = Get-MoveProp $e 'verify_s'
   $t = switch -CaseSensitive ($Step) {
-    { $_ -in 'x.freeze', 'x.guards' } { Get-MoveConst 'cap_s'; break }
-    { $_ -in 'x.stop-src', 'x.stop-dst', 'r.stop-dst' } { (Get-MoveSetBudget $M 'stop' 'stop_budget_s') + 30; break }
+    'x.freeze' { (Get-MoveConst 'cap_s') + (Get-MovePeriodicBudget $M) + 30; break }
+    'x.guards' { $g = 0; foreach ($x in @(Get-MoveProp $M 'guards' @())) { if ($x) { $g += [int](Get-MoveProp $x 'run_s' 0) } }; (Get-MoveConst 'cap_s') + $g + 30; break }
+    { $_ -in 'x.baseline', 'x.health', 'r.health-src' } { Get-MoveHealthBudget $M; break }
+    { $_ -in 'x.stop-src', 'x.stop-dst', 'r.stop-dst' } { Get-MoveStopBudget $M; break }
     'c.transfer.N' { if ($null -ne $ts) { 2 * [int]$ts + 300 } else { Get-MoveConst 'first_transfer_s' }; break }   # "the laptop's estimate (first copy 6 h)"
     'x.final' { if ($null -ne $ts) { 2 * [int]$ts + 300 } else { Get-MoveConst 'first_transfer_s' }; break }
     { $_ -in 'c.verify.N', 'x.verify' } { if ($null -ne $vs) { 2 * [int]$vs + 120 } else { Get-MoveConst 'first_verify_s' }; break }
     { $_ -in 'c.adopt.N', 'x.adopt' } { Get-MoveConst 'adopt_s'; break }
     { $_ -in 'x.start', 'x.enable.N', 'r.start-src' } { (Get-MoveSetBudget $M 'start' 'start_budget_s') + 60; break }
-    'x.switch' { Get-MoveConst 'switch_s'; break }
+    'x.switch' { Get-MoveSwitchBudget $M; break }
     'c.init-new' { [int](Get-MoveTargetStopBudget $S) + 60; break }
     'x.check' { if ($script:MoveCheckOnlyS) { 3 * [int]$script:MoveCheckOnlyS + 60 } else { Get-MoveConst 'other_s' }; break }
     default { Get-MoveConst 'other_s' }
@@ -2007,8 +2089,7 @@ function Get-MoveBudget($S, [string]$Step, [string]$Machine) {
   if ($null -ne $d -and 3 * [int]$d -gt [int]$t) { $t = 3 * [int]$d }
   [int]$t
 }
-# DESIGN-GAP (T10-G6): D.0.6 budgets `c.init-new` from preflight's stop_budget_s, and D.0.9's closed state list has no field for it.
-# Reading: the state keeps it as target_stop_budget_s (0 when unknown, e.g. after a rebuild).
+# D.0.6 `c.init-new` = preflight's stop_budget_s + 60, kept as state target_stop_budget_s (W1-T10-G6; 0 when unknown)
 function Get-MoveTargetStopBudget($S) { [int](Get-MoveProp $S 'target_stop_budget_s' 0) }
 # the call id of a step under the state's dir and attempt (p.*: attempt 0); .N raised (and saved) before the call, never reset in an attempt.
 # DESIGN-GAP (T10-G19): D.0.3 raises N "before each call", while c.repin.N and c.verify.N run on both machines in one pass; reading: one
@@ -2119,10 +2200,31 @@ function Invoke-MoveInit($S, [string]$M) {
       $r = Invoke-MoveCall $S 'old' 'c.init-old' @() $j
     } else { $r = Invoke-MoveCall $S 'old' 'b.init-old' @() ($j + '}') }
   } else {
-    if ($fwd) { $r = Invoke-MoveCall $S 'new' 'c.init-new' @() ($j + '}') } else { $r = Invoke-MoveCall $S 'new' 'b.init-new' @() ($j + '}') }
+    if ($fwd) {
+      $r = Invoke-MoveCall $S 'new' 'c.init-new' @() ($j + ',"target":' + (Get-MoveTargetJson $S) + '}')
+      if ($r.Code -eq 0) {
+        # D.5.3 (W1-T10-O1): a later attempt's c.init-new rc 0 re-initialises new quiet as a fresh dst, so the fence flags clear
+        Set-MoveProp $S 'new_lost' $false; Set-MoveProp $S 'new_discarded' $false
+        # B.5.11 (W1-T3-DG-R3-5): its `INV warn dst-own-unit` / `INV warn new-only` lines are kept in answers{} for Q-cut.
+        # DESIGN-GAP (T10c-W1, the key name is not given): answers{'init-new-warn'}, replaced at each c.init-new rc 0
+        Set-MoveAnswer $S 'init-new-warn' @($r.Lines | Where-Object { "$_" -cmatch '\AINV warn (dst-own-unit|new-only) ' })
+        Save-MoveState $S
+      }
+    } else { $r = Invoke-MoveCall $S 'new' 'b.init-new' @() ($j + '}') }
   }
   if ($r.Code -eq 0) { return 0 }
   ConvertTo-MoveExit $r.Code
+}
+# c.init-new's `"target"` stdin key (D.0.9 Formats, target.json): the state's target_* values
+function Get-MoveTargetJson($S) {
+  $o = [ordered]@{
+    users = @(@($S.target_users) | Where-Object { $_ } | ForEach-Object { [ordered]@{ name = [string]$_.name; uid = [int]$_.uid } })
+    groups = @(@(Get-MoveProp $S 'target_groups' @()) | Where-Object { $_ } | ForEach-Object { [ordered]@{ name = [string]$_.name; gid = [int]$_.gid } })
+    subids = @(@(Get-MoveProp $S 'target_subids' @()) | Where-Object { $_ } | ForEach-Object { [ordered]@{ user = [string]$_.user; kind = [string]$_.kind; start = [long]$_.start; count = [long]$_.count } })
+    addrs = @(@(Get-MoveProp $S 'target_addrs' @()) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    stop_budget_s = [int](Get-MoveTargetStopBudget $S)
+  }
+  ConvertTo-Json -InputObject $o -Compress -Depth 5
 }
 # the move key's public line from new (bootstrap key is idempotent: it prints the existing key)
 function Get-MovePub($S) {
@@ -2239,21 +2341,49 @@ function Get-MoveDefaultMap { @('exclude user dino', 'exclude unit velh-pilot-ho
 function Read-MoveMapLines([string]$Path) {
   try { $t = [IO.File]::ReadAllText($Path).TrimStart([char]0xFEFF) } catch { Write-Host "lỗi: không đọc được file map $Path."; return $null }
   $l = @($t -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })
-  foreach ($x in $l) { if ($x -cmatch '\Atarget-user\b' -or $x -match '[\x00-\x1f\x7f]') { Write-MoveLines @("INV refuse map-invalid ref=$(($x -split ' ')[0])"); return $null } }   # D.0.9: a map file holding one is map-invalid
+  foreach ($x in $l) { if ($x -cmatch '\A(target-user|dial|target-addr|idmap)\b' -or $x -match '[\x00-\x1f\x7f]') { Write-MoveLines @("INV refuse map-invalid ref=$(($x -split ' ')[0])"); return $null } }   # D.0.9: the laptop's stdin lines are no map lines; a map file holding one is map-invalid
   , $l
 }
 function Get-MoveMapText { $p = Get-MovePath 'map.txt'; if ([IO.File]::Exists($p)) { @([IO.File]::ReadAllText($p) -split "`r?`n" | Where-Object { $_ }) } else { @(Get-MoveDefaultMap) } }
-# `plan <id>` on old (unrecorded, no side flags): stdin = map lines, then `target-user <name> <uid>` (D.0.9 Formats). @{ Code; Lines; Mf }
+# `plan <id>` on old (unrecorded, no side flags): stdin = the map lines, then one `target-user <name> <uid>` per target_users[], one
+# `dial <old addr> <new addr>`, one `target-addr <a>` per target_addrs[] and one `idmap <user|group> <name> <src_id> <dst_id>` per idmap[]
+# (D.0.9 Formats; B.14.1, B.12.5, B.6.2); `plan <id> --check-only` and `x.check` read the same stdin. @{ Code; Lines; Mf }
+function Get-MovePlanStdin($S, [string[]]$Map) {
+  $in = @($Map) + @(@($S.target_users) | Where-Object { $_ } | ForEach-Object { "target-user $($_.name) $($_.uid)" }) + @("dial $($S.old.addr) $($S.new.addr)") +
+    @(@(Get-MoveProp $S 'target_addrs' @()) | Where-Object { $_ } | ForEach-Object { "target-addr $_" }) +
+    @(@(Get-MoveProp $S 'idmap' @()) | Where-Object { $_ } | ForEach-Object { "idmap $($_.kind) $($_.name) $($_.src_id) $($_.dst_id)" })
+  ($in -join "`n") + "`n"
+}
 function Invoke-MovePlanOld($S, [string[]]$Map) {
-  $in = @($Map) + @(@($S.target_users) | ForEach-Object { "target-user $($_.name) $($_.uid)" })
-  $r = Invoke-MoveGate (Get-MoveMachine $S 'old') @('plan', [string]$S.move_id) (($in -join "`n") + "`n") (Get-MoveConst 'plan_s') -Quiet
+  $r = Invoke-MoveGate (Get-MoveMachine $S 'old') @('plan', [string]$S.move_id) (Get-MovePlanStdin $S $Map) (Get-MoveConst 'plan_s') -Quiet
   $mf = ConvertFrom-MoveManifestLine $r.Lines
   @{ Code = $r.Code; Known = $r.Known; Lines = $r.Lines; Mf = $mf }
 }
-# D.2 step 3b: the B.0.3 user clause and the B.6.2 compare against preflight's users. Refusal lines.
-# DESIGN-GAP (T10-G11): `INV target user` carries no home path; the refusal names /home/<user>.
-# DESIGN-GAP (T10-G25): preflight prints users only, so the laptop compares users (name, uid); groups and the subid overlap of E-P22 are
-# not compared here.
+# DESIGN-GAP (DG-R1, CONTRACT §4.1 OPEN): a rebuilt state has no source for target_platform (target.json and D.0.10 name none); this one
+# spot reads the stored value; a rebuilt state keeps New-MoveState's 0, and a state without the field counts as 0.
+function Get-MoveTargetPlatform($S) { [int](Get-MoveProp $S 'target_platform' 0) }
+# D.2 step 3b and the D.3 re-plan's 3b: the B.5.2 mixed-pair check against the stored target_platform (GAP-RULINGS-3 §16.5, §16.7 T-4).
+# With platform=1 on new: every item root or `files` name that is a platform path or lies under one, and every unit file
+# /etc/systemd/system/<u> of a platform unit, refuses target-not-empty path=<p>. Refusal lines.
+function Get-MovePlatformRefusals($S, $M) {
+  if ((Get-MoveTargetPlatform $S) -ne 1) { return @() }
+  $pp = @(Get-MovePlatformPaths); $pu = @(Get-MovePlatformUnits | ForEach-Object { "/etc/systemd/system/$_" }); $out = @()
+  foreach ($it in @(Get-MoveProp $M 'items' @())) {
+    if (-not $it) { continue }
+    $root = ([string]$it.root).TrimEnd('/'); $paths = @($root)
+    if ([string]$it.kind -ceq 'files') { $paths += @(@(Get-MoveProp $it 'files_from' @()) | ForEach-Object { "$root/$(([string]$_).TrimEnd('/'))" }) }
+    foreach ($p in $paths) {
+      $hit = ($pu -ccontains $p) -or @($pp | Where-Object { $p -ceq $_ -or $p.StartsWith("$_/", [StringComparison]::Ordinal) }).Count
+      if ($hit -and $out -cnotcontains "INV refuse target-not-empty path=$p") { $out += "INV refuse target-not-empty path=$p" }
+    }
+  }
+  $out
+}
+# D.2 step 3b: the B.0.3 user clause and the B.6.2 / K7 compare (users, groups, subid ranges; W1-T11-DG-T11-4, W1-T10-G25) against
+# preflight's stored target_* values. Refusal lines. `<home>` = /home/<user> (W1-T10-G11).
+# DESIGN-GAP (T10c-UC): no line form is given for a gid collision or the subid overlap; reading: a gid collision uses K7's one form
+# (`user=<group> uid=<gid> holder=<h>`); a subid overlap with another user's range of the same kind (subuid or subgid) is
+# `uid-collision what=subuid user=<u> holder=<h>` (B.6.5, E-P22).
 function Get-MoveUserRefusals($S, $M) {
   $out = @(); $users = @(Get-MoveProp $M 'users' @())
   foreach ($t in @($S.target_users)) {
@@ -2267,13 +2397,30 @@ function Get-MoveUserRefusals($S, $M) {
       if ($nm -ne $id) { $out += "INV refuse uid-collision user=$($u.name) uid=$($u.uid) holder=$($t.name)" }
     }
   }
+  foreach ($g in @(Get-MoveProp $M 'groups' @())) {
+    if (-not $g -or [int]$g.gid -lt 1000) { continue }
+    foreach ($t in @(Get-MoveProp $S 'target_groups' @())) {
+      if (-not $t) { continue }
+      $nm = [string]$t.name -ceq [string]$g.name; $id = [int]$t.gid -eq [int]$g.gid
+      if ($nm -ne $id) { $out += "INV refuse uid-collision user=$($g.name) uid=$($g.gid) holder=$($t.name)" }
+    }
+  }
+  foreach ($x in @(Get-MoveProp $M 'subids' @())) {
+    if (-not $x) { continue }
+    $a0 = [long]$x.start; $a1 = $a0 + [long]$x.count
+    foreach ($t in @(Get-MoveProp $S 'target_subids' @())) {
+      if (-not $t -or [string]$t.kind -cne [string]$x.kind -or [string]$t.user -ceq [string]$x.name) { continue }
+      $b0 = [long]$t.start; $b1 = $b0 + [long]$t.count
+      if ($a0 -lt $b1 -and $b0 -lt $a1) { $out += "INV refuse uid-collision what=subuid user=$($x.name) holder=$($t.user)" }
+    }
+  }
   $out
 }
 # D.2 step 3b, 0c: new's TCP connect to the manifest's egress[] pairs and the `INV host external` services (warn only)
-# DESIGN-GAP (T10-G24): the egress[] element shape is not fixed; reading: {addr|host, port}.
+# B.14.9: egress[] {addr, port} (W1-T10-G24)
 function Test-MoveReach($S, $M, $Lines) {
   $pairs = @()
-  foreach ($e in @(Get-MoveProp $M 'egress' @())) { $a = [string](Get-MoveProp $e 'addr' (Get-MoveProp $e 'host' '')); $p = [string](Get-MoveProp $e 'port' ''); if ($a -and $p) { $pairs += , @($a, $p) } }
+  foreach ($e in @(Get-MoveProp $M 'egress' @())) { $a = [string](Get-MoveProp $e 'addr' ''); $p = [string](Get-MoveProp $e 'port' ''); if ($a -and $p) { $pairs += , @($a, $p) } }
   foreach ($l in @($Lines)) { if ("$l" -cmatch '\AINV host external=\S+ service=([A-Za-z0-9.-]+):([0-9]+)\z') { $pairs += , @($Matches[1], $Matches[2]) } }
   $new = Get-MoveMachine $S 'new'
   foreach ($pp in $pairs) {
@@ -2281,39 +2428,45 @@ function Test-MoveReach($S, $M, $Lines) {
     if ($r.Code -ne 0) { Write-MoveLines @("INV warn egress addr=$($pp[0]) port=$($pp[1])") }
   }
 }
-# D.2 step 4 / 0c: gh admin on the legacy repos (B.10.4). Refusal lines.
-function Get-MoveGhRefusals($M) {
+# D.2 step 4 / 0c: gh admin on the state's legacy_push[] repos (B.10.4). Refusal lines.
+function Get-MoveGhRefusals($S) {
   $out = @()
-  foreach ($lp in @(Get-MoveProp $M 'legacy_push' @())) {
-    $repo = [string]$lp.repo; if (-not (Test-DeployRepo $repo)) { continue }
+  foreach ($lp in @(Get-MoveProp $S 'legacy_push' @())) {
+    $repo = [string](Get-MoveProp $lp 'repo' ''); if (-not (Test-DeployRepo $repo)) { continue }
     $r = Invoke-MoveTool 'gh' @('secret', 'list', '-R', $repo)
     if ($r.Code -ne 0) { $out += "INV refuse gh-permission repo=$repo" }
   }
   $out
 }
-# B.10.5 push scan: the owner's repos whose workflows reach a machine by ssh. @{ Ok; Push = @(@{ Repo; File }) } (ssh-push only)
-# DESIGN-GAP (T10-G23): "the owner's repos" = `gh repo list --limit 1000`; the match is DEPLOY_KNOWN_HOSTS, ssh-keyscan, an ssh deploy
-# action (appleboy/ssh-action, webfactory/ssh-agent) or secrets.*HOST*.
-function Get-MovePushScan($M) {
-  $legacy = @(@(Get-MoveProp $M 'legacy_push' @()) | ForEach-Object { [string]$_.repo })
+# B.10.5 push scan (D.2 step 4; a rebuild scans again, D.0.10): the owner's repos (`gh repo list --limit 1000`, W1-T10-G23) whose
+# workflows match DEPLOY_KNOWN_HOSTS, ssh-keyscan, an ssh deploy action (appleboy/ssh-action, webfactory/ssh-agent) or secrets.*HOST*.
+# @{ Ok; Push = @(@{ Repo; File }) (ssh-push); Legacy = @({project, repo}) (gate-push, the state's legacy_push[], W1-T3-GAP-11) }
+# DESIGN-GAP (T10c-LP): B.10.5 says "a repo of a legacy project is gate-push" but nothing tells the laptop which repo is a legacy
+# project's, nor its project name. Reading: a matched repo with a workflow naming DEPLOY_KNOWN_HOSTS (the gate-push secret of B.10.2) is
+# gate-push, its project written ''; every other match is ssh-push.
+function Get-MovePushScan {
   $ls = Invoke-MoveTool 'gh' @('repo', 'list', '--limit', '1000', '--json', 'nameWithOwner')
   if ($ls.Code -ne 0) { Write-Host 'lỗi: gh không liệt kê được repo (gh auth login?).'; return @{ Ok = $false } }
   try { $repos = @(ConvertFrom-Json ($ls.Out -join "`n") | ForEach-Object { [string]$_.nameWithOwner }) } catch { Write-Host 'lỗi: gh trả danh sách repo không đọc được.'; return @{ Ok = $false } }
-  $push = @()
+  $push = @(); $legacy = @()
   foreach ($repo in $repos) {
     if (-not (Test-DeployRepo $repo)) { continue }
     $w = Invoke-MoveTool 'gh' @('api', "repos/$repo/contents/.github/workflows")
     if ($w.Code -ne 0) { if (($w.Out -join ' ') -match '404|Not Found') { continue }; Write-Host "lỗi: gh không đọc được workflow của $repo."; return @{ Ok = $false } }
     try { $files = @(ConvertFrom-Json ($w.Out -join "`n") | ForEach-Object { [string]$_.name } | Where-Object { $_ -cmatch '\A[A-Za-z0-9._-]+\.ya?ml\z' }) } catch { continue }
+    $hits = @(); $gate = $false
     foreach ($f in $files) {
       $tx = Invoke-MoveTool 'gh' @('api', "repos/$repo/contents/.github/workflows/$f", '-H', 'Accept: application/vnd.github.raw')
       if ($tx.Code -ne 0) { Write-Host "lỗi: gh không đọc được $f của $repo."; return @{ Ok = $false } }
-      if (($tx.Out -join "`n") -notmatch 'DEPLOY_KNOWN_HOSTS|ssh-keyscan|appleboy/ssh-action|webfactory/ssh-agent|secrets\.\w*HOST\w*') { continue }
-      if ($legacy -ccontains $repo) { continue }   # gate-push (B.10.2): handled by the DEPLOY_KNOWN_HOSTS chore
-      $push += @{ Repo = $repo; File = $f }
+      $t = $tx.Out -join "`n"
+      if ($t -notmatch 'DEPLOY_KNOWN_HOSTS|ssh-keyscan|appleboy/ssh-action|webfactory/ssh-agent|secrets\.\w*HOST\w*') { continue }
+      if ($t -cmatch 'DEPLOY_KNOWN_HOSTS') { $gate = $true }
+      $hits += $f
     }
+    if ($gate) { $legacy += [pscustomobject][ordered]@{ project = ''; repo = $repo }; continue }   # gate-push (B.10.2): the DEPLOY_KNOWN_HOSTS chore
+    foreach ($f in $hits) { $push += @{ Repo = $repo; File = $f } }
   }
-  @{ Ok = $true; Push = $push }
+  @{ Ok = $true; Push = $push; Legacy = $legacy }
 }
 # an owner question (D.15): the typed answer, one of $Words, or $null (no answer = the negative one)
 function Read-MoveAnswer([string]$Text, [string[]]$Words) {
@@ -2347,9 +2500,10 @@ function Invoke-MovePlanLoop($S, [string[]]$Map) {
     }
     Set-MoveProp $S 'manifest_sha' $p.Mf.Sha; $script:MoveManifest = @{ Text = $p.Mf.Text; Obj = $p.Mf.Obj }
     $M = $p.Mf.Obj
-    $lines = @($p.Lines) + @(Get-MoveUserRefusals $S $M) + @(Get-MoveGhRefusals $M)
-    $scan = Get-MovePushScan $M
+    $scan = Get-MovePushScan
     if (-not $scan.Ok) { return @{ Code = 1 } }
+    Set-MoveProp $S 'legacy_push' @($scan.Legacy)   # D.0.9 state legacy_push[] from the push scan (W1-T3-GAP-11)
+    $lines = @($p.Lines) + @(Get-MoveUserRefusals $S $M) + @(Get-MovePlatformRefusals $S $M) + @(Get-MoveGhRefusals $S)
     foreach ($x in @($scan.Push)) { if (@($S.sshpush_disabled) -cnotcontains "$($x.Repo):$($x.File)") { $lines += "INV refuse push-deploy repo=$($x.Repo) workflow=$($x.File)" } }
     $tr = @($p.Lines | Where-Object { $_ -cmatch '\AINV warn transient-excluded unit=(\S+)' } | ForEach-Object { if ($_ -cmatch 'unit=(\S+)') { $Matches[1] } })
     Set-MoveAnswer $S 'transient-excluded' @($tr)
@@ -2485,13 +2639,18 @@ function Invoke-MovePlanCmd([string]$NewAlias, [string]$Addr, [string]$OldAddrAr
     if (-not $nkey) { Write-MoveLines @("INV refuse target-addr why=no-ed25519"); return 65 }
     $S.new.hostkey_line = $nkey
     Write-Host "Khoá máy mới (ed25519): $(Get-MoveFingerprint $nkey) — có thể so với trang quản lý của nhà cung cấp."
-    $tu = @(); $sb = 0
+    # D.0.9: target_users[], target_groups[], target_subids[], target_addrs[], target_stop_budget_s and target_platform, once per move
+    $tu = @(); $tg = @(); $ts = @(); $ta = @(); $sb = 0; $tp = 0
     foreach ($l in $pf.Lines) {
       # DESIGN-GAP (T10-G39, F8c): D.0.9 gives target_users[] as {name, uid}; the entries also keep preflight's home_nonskel for step 3b
       if ("$l" -cmatch '\AINV target user=(\S+) uid=([0-9]+) home-nonskel=([01])\z') { $tu += [pscustomobject][ordered]@{ name = $Matches[1]; uid = [int]$Matches[2]; home_nonskel = [int]$Matches[3] } }
+      elseif ("$l" -cmatch '\AINV target group=(\S+) gid=([0-9]+)\z') { $tg += [pscustomobject][ordered]@{ name = $Matches[1]; gid = [int]$Matches[2] } }
+      elseif ("$l" -cmatch '\AINV target subid user=(\S+) kind=(uid|gid) start=([0-9]+) count=([0-9]+)\z') { $ts += [pscustomobject][ordered]@{ user = $Matches[1]; kind = $Matches[2]; start = [long]$Matches[3]; count = [long]$Matches[4] } }
+      elseif ("$l" -cmatch '\AINV target addr=(\S+)\z') { $ta += $Matches[1] }
+      elseif ("$l" -cmatch '\AINV target platform=([01])\z') { $tp = [int]$Matches[1] }
       elseif ("$l" -cmatch '\AINV target stop_budget_s=([0-9]+)\z') { $sb = [int]$Matches[1] }
     }
-    Set-MoveProp $S 'target_users' @($tu); Set-MoveProp $S 'target_stop_budget_s' $sb
+    foreach ($kv in @{ target_users = @($tu); target_groups = @($tg); target_subids = @($ts); target_addrs = @($ta); target_stop_budget_s = $sb; target_platform = $tp }.GetEnumerator()) { Set-MoveProp $S $kv.Key $kv.Value }
     $fn = Get-MoveFacts $new
     $clk = @(Get-MoveClockRefusals @{ old = $fo; new = $fn })
     if ($clk.Count) { Write-MoveLines $clk; return 65 }
@@ -2500,7 +2659,7 @@ function Invoke-MovePlanCmd([string]$NewAlias, [string]$Addr, [string]$OldAddrAr
     $pl = Invoke-MovePlanLoop $S $map
     if ($pl.Code -ne 0) { return $pl.Code }
     # D.2 step 6
-    foreach ($lp in @(Get-MoveProp $pl.Mf.Obj 'legacy_push' @())) { Set-MoveMapVal $S.legacy_known_hosts ([string]$lp.repo) "$($S.old.addr) $okey" }
+    foreach ($lp in @(Get-MoveProp $S 'legacy_push' @())) { Set-MoveMapVal $S.legacy_known_hosts ([string]$lp.repo) "$($S.old.addr) $okey" }
     Set-MoveProp $S 'manifest_sha' $pl.Mf.Sha
     $script:MoveDraft = $false
     Save-MoveManifest $pl.Mf.Text
@@ -2527,11 +2686,11 @@ function Wait-MoveRunning($S) {
   }
   0
 }
-# DESIGN-GAP (T10-G12): D.5.2/D.5.3 say every later contact with a lost or discarded new "first runs stop and holds-off there", but no step
-# id is named for it. Reading: `r.stop-dst` on new (stop; the server's stop runs holds-off on a dst) once per verb, sent by the agreement
-# check after new answered status (E-R15 "when new returns") and after new's own agreement step (re-init), only while new holds this
-# move's open move-id (R2-1); a new that does not answer is skipped (F2). O1 (the flags are never cleared) is the Architect's. Note: in dir=back new is
-# the src, while CONTRACT §1.3 names r.stop-dst for dst: the Architect names the step and the machine.
+# D.5.2 / D.5.3 (W1-T10-G12): with new_lost or new_discarded, every later contact with new first runs `r.stop-dst` (stop) there, once per
+# verb (a replay of its rc 0 inside the attempt is enough), sent by the agreement check after new answered status and after new's own
+# agreement step, only while new holds this move's open move-id (R2-1); a new that does not answer is skipped (F2). The flags clear at a
+# later c.init-new rc 0 (W1-T10-O1, Invoke-MoveInit). DESIGN-GAP (G12 dir=back, still with the Architect, OMP-HANDOFF §13 rev 1k3.7): in
+# dir=back new is the src while CONTRACT §1.3 names r.stop-dst for dst; the step stays r.stop-dst.
 function Invoke-MoveNewFence($S) {
   if (-not ($S.new_lost -eq $true -or $S.new_discarded -eq $true) -or $script:MoveFenced) { return 0 }
   $r = Invoke-MoveCall $S 'new' 'r.stop-dst'
@@ -2618,11 +2777,46 @@ function Invoke-MoveCopyFull($S) {
   Set-MoveProp $S 'gate_id' $ids.Old; Save-MoveState $S
   Write-Host "copy (5): init và prepare trên '$($new.Alias)'..."
   $c = Invoke-MoveInit $S 'new'; if ($c -ne 0) { return $c }
-  $r = Invoke-MoveCall $S 'new' 'c.prepare.N'; if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
+  $c = Invoke-MovePrepare $S; if ($c -ne 0) { return $c }
   Write-Host 'copy (6-8): chép, kiểm tra, áp dụng...'
   $p = Invoke-MovePasses $S; if ($p -ne 0) { return $p }
-  Set-MoveProp $S 'phase' 'copied'; Save-MoveState $S
+  Set-MoveAnswer $S 'refresh-pending' $false; Set-MoveProp $S 'phase' 'copied'; Save-MoveState $S
   Write-Host "Copy xong (copied). Ước tính dừng: khoảng $($S.est.typical_s) giây, tối đa $($S.est.max_s) giây. Khi sẵn sàng:  fcode move cutover"
+  0
+}
+# c.prepare.N on new; B.6.2 (W1-T4b-MVX-GAP-2, GAP-RULINGS-3 §16.5 S-5): its `MOVE item idmap:<user|group>:<name> kind=prepare
+# state=mapped src_id=<n> dst_id=<n>` lines go into state idmap[]; an entry the state lacks runs the D.3 re-plan (plan <id>, c.repin.N on
+# both machines) before c.transfer.N, so every pass reads one pinned idmap[]. Trigger: an entry this c.prepare.N printed that the pinned
+# idmap[] lacks (prepare prints every mapped id at every call), so a re-plan that ended before Invoke-MoveRepin kept the new manifest is
+# redone by the next copy, and an entry nobody prints any more (e.g. a user excluded later) never re-plans (review r2 R2-1). After
+# Invoke-MoveRepin saved the new sha, a later failure is DESIGN-GAP NEW-2 (Architect: c.init-* re-sent with the new --sha is call-argv).
+# Note (Architect, predates this round): the four-field merge keeps two entries for one kind+name when dst_id changes (fails closed at plan).
+function Invoke-MovePrepare($S) {
+  $r = Invoke-MoveCall $S 'new' 'c.prepare.N'; if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
+  $im = @(Get-MoveProp $S 'idmap' @() | Where-Object { $_ }); $got = @()
+  $same = { param($a, $b) [string]$a.kind -ceq [string]$b.kind -and [string]$a.name -ceq [string]$b.name -and [int]$a.src_id -eq [int]$b.src_id -and [int]$a.dst_id -eq [int]$b.dst_id }
+  foreach ($l in $r.Lines) {
+    if ("$l" -cnotmatch '\AMOVE item idmap:(user|group):(\S+) kind=prepare state=mapped src_id=([0-9]+) dst_id=([0-9]+)\z') { continue }
+    $e = [pscustomobject][ordered]@{ kind = $Matches[1]; name = $Matches[2]; src_id = [int]$Matches[3]; dst_id = [int]$Matches[4] }
+    $got += $e; if (@($im | Where-Object { & $same $_ $e }).Count) { continue }
+    $im += $e
+  }
+  Set-MoveProp $S 'idmap' @($im); Save-MoveState $S   # saved before the re-plan: its stdin carries them
+  $pin = @(Get-MoveProp (Get-MoveManifestObj) 'idmap' @() | Where-Object { $_ })
+  if (-not @($got | Where-Object { $x = $_; -not @($pin | Where-Object { & $same $_ $x }).Count }).Count) { return 0 }
+  Write-Host 'copy: máy mới đổi số của user/group hệ thống; lập lại kế hoạch trên máy cũ...'
+  $pl = Invoke-MovePlanLoop $S @(Get-MoveMapText)
+  if ($pl.Code -ne 0) { return $pl.Code }
+  Invoke-MoveRepin $S $pl
+}
+# the re-plan's new manifest kept, then c.repin.N on old and on new (one N for both, W1-T10-G19)
+function Invoke-MoveRepin($S, $Pl) {
+  Set-MoveAnswer $S 'refresh-pending' $true
+  Set-MoveProp $S 'manifest_sha' $Pl.Mf.Sha; Save-MoveManifest $Pl.Mf.Text; $script:MoveManifest = @{ Text = $Pl.Mf.Text; Obj = $Pl.Mf.Obj }
+  Write-PhienText (Get-MovePath 'map.txt') ((@($Pl.Map) -join "`n") + "`n"); Save-MoveState $S
+  $j = '{"manifest":' + $Pl.Mf.Text.Trim() + '}'
+  $r = Invoke-MoveCall $S 'old' 'c.repin.N' @() $j; if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
+  $r = Invoke-MoveCall $S 'new' 'c.repin.N' @() $j -Pass (Get-MovePassOf $r.Id); if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
   0
 }
 # D.3 re-run: a full re-plan, then c.repin.N on old and on new, c.prepare.N, steps 6-8
@@ -2634,13 +2828,8 @@ function Invoke-MoveCopyRefresh($S) {
   Write-Host 'copy: lập lại kế hoạch trên máy cũ (lần chép lại)...'
   $pl = Invoke-MovePlanLoop $S @(Get-MoveMapText)
   if ($pl.Code -ne 0) { return $pl.Code }
-  Set-MoveAnswer $S 'refresh-pending' $true
-  Set-MoveProp $S 'manifest_sha' $pl.Mf.Sha; Save-MoveManifest $pl.Mf.Text; $script:MoveManifest = @{ Text = $pl.Mf.Text; Obj = $pl.Mf.Obj }
-  Write-PhienText (Get-MovePath 'map.txt') ((@($pl.Map) -join "`n") + "`n"); Save-MoveState $S
-  $j = '{"manifest":' + $pl.Mf.Text.Trim() + '}'
-  $r = Invoke-MoveCall $S 'old' 'c.repin.N' @() $j; if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
-  $r = Invoke-MoveCall $S 'new' 'c.repin.N' @() $j -Pass (Get-MovePassOf $r.Id); if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
-  $r = Invoke-MoveCall $S 'new' 'c.prepare.N'; if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
+  $c = Invoke-MoveRepin $S $pl; if ($c -ne 0) { return $c }
+  $c = Invoke-MovePrepare $S; if ($c -ne 0) { return $c }
   $p = Invoke-MovePasses $S; if ($p -ne 0) { return $p }
   Set-MoveAnswer $S 'refresh-pending' $false; Set-MoveProp $S 'phase' 'copied'; Save-MoveState $S
   Write-Host "Copy làm mới xong. Ước tính dừng: khoảng $($S.est.typical_s) giây, tối đa $($S.est.max_s) giây."
@@ -2656,8 +2845,8 @@ function Write-MoveReturnOld($S) {
   $t = @(Get-MoveTransient $S); if ($t.Count) { Write-Host (Get-MoveText 'transient' @{ 'danh sách' = ($t -join ', ') }) }
 }
 # 0c (I14): every check that needs no freeze, before step 1 writes the mark. 0 = go. -BackStart: D.8 0c (src = new, dst = old).
-# DESIGN-GAP (T10-G16): D.8's 0c runs `plan <id> --check-only` on new before the back's write-ahead, and D.0.1 sends it "with the state's
-# values" (still fwd, attempt n, which new stores); reading: those values, to new. Whether it prints the back-new-only lines then is T3's.
+# A manual back's 0c `plan <id> --check-only` carries `--dir back --attempt <state attempt + 1>` (D.0.1; W1-T10-G16, §16 R-1); every other
+# 0c carries the state's values. Its stdin is the `plan <id>` stdin (D.0.9: `--check-only` and `x.check` read the same stdin).
 function Test-MovePreCut($S, [switch]$BackStart) {
   $src = Get-MoveSide $S 'src'; $dst = Get-MoveSide $S 'dst'
   if ($BackStart) { $src = 'new'; $dst = 'old' }
@@ -2684,10 +2873,11 @@ function Test-MovePreCut($S, [switch]$BackStart) {
   if ("$($dk['free_mb'])" -match '\A[0-9]+\z' -and [int]$dk['free_mb'] -lt 2048) { Write-MoveLines @("INV refuse disk free_mb=$($dk['free_mb'])"); return 65 }
   $clk = @(Get-MoveClockRefusals @{ old = (Get-MoveFacts (Get-MoveMachine $S 'old')); new = (Get-MoveFacts (Get-MoveMachine $S 'new')) })
   if ($clk.Count) { Write-MoveLines $clk; return 65 }
-  $gh = @(Get-MoveGhRefusals $M); if ($gh.Count) { Write-MoveLines $gh; return 65 }
+  $gh = @(Get-MoveGhRefusals $S); if ($gh.Count) { Write-MoveLines $gh; return 65 }
   # one read-only `plan <id> --check-only` on src; its duration sets the x.check budget
   $t0 = Get-MoveNow
-  $r = Invoke-MoveGate (Get-MoveMachine $S $src) @('plan', [string]$S.move_id, '--dir', [string]$S.dir, '--attempt', "$($S.attempt)", '--sha', [string]$S.manifest_sha, '--serving', [string]$S.serving, '--check-only') '' (Get-MoveConst 'plan_s')
+  $cd = if ($BackStart) { 'back' } else { [string]$S.dir }; $ca = if ($BackStart) { [int]$S.attempt + 1 } else { [int]$S.attempt }
+  $r = Invoke-MoveGate (Get-MoveMachine $S $src) @('plan', [string]$S.move_id, '--dir', $cd, '--attempt', "$ca", '--sha', [string]$S.manifest_sha, '--serving', [string]$S.serving, '--check-only') (Get-MovePlanStdin $S @(Get-MoveMapText)) (Get-MoveConst 'plan_s')
   $script:MoveCheckOnlyS = [int][Math]::Ceiling(((Get-MoveNow) - $t0).TotalSeconds)
   if (-not $r.Known) { return 1 }
   if ($r.Code -ne 0) {
@@ -2725,8 +2915,9 @@ function Invoke-MoveCutSteps($S, [int]$From, [switch]$Carry) {
       $r = Invoke-MoveCall $S $src 'x.freeze'
       if ($r.Code -eq 0) { break }
       if ($r.Code -eq 75 -and -not $Carry) {
-        $lk = @($r.Lines | Where-Object { $_ -cmatch '\AMOVE wait drain ' } | ForEach-Object { [string](ConvertFrom-MoveKv $_)['lock'] }) -join ', '
-        $a = Read-MoveAnswer (Get-MoveText 'Q-drain' @{ 'khóa' = $lk; n = (Get-MoveConst 'drain_wait_min') }) @('đợi', 'dừng')
+        # Q-drain lists the `MOVE wait drain` locks and the `MOVE wait follower` units (D.15, DECISION-1k6-K1budget)
+        $lk = @($r.Lines | ForEach-Object { if ("$_" -cmatch '\AMOVE wait drain ') { [string](ConvertFrom-MoveKv $_)['lock'] } elseif ("$_" -cmatch '\AMOVE wait follower ') { [string](ConvertFrom-MoveKv $_)['unit'] } } | Where-Object { $_ }) -join ', '
+        $a = Read-MoveAnswer (Get-MoveText 'Q-drain' @{ 'khóa hoặc unit' = $lk; n = (Get-MoveConst 'drain_wait_min') }) @('đợi', 'dừng')
         if ($a -ceq 'đợi') { continue }
         return @{ Fail = 'abandon'; Code = 75 }
       }
@@ -2735,21 +2926,22 @@ function Invoke-MoveCutSteps($S, [int]$From, [switch]$Carry) {
     }
   }
   if ($From -le 3 -and -not $Carry) {
-    $r = Invoke-MoveCall $S $src 'x.check'
+    $r = Invoke-MoveCall $S $src 'x.check' @() (Get-MovePlanStdin $S @(Get-MoveMapText))
     if ($r.Code -ne 0) { return (& $beforeStart 'x.check') }
     $mf = ConvertFrom-MoveManifestLine $r.Lines
     if ($mf) {
       Set-MoveProp $S 'manifest_sha' $mf.Sha; Save-MoveManifest $mf.Text; $script:MoveManifest = @{ Text = $mf.Text; Obj = $mf.Obj }; Save-MoveState $S
       $tr = @($r.Lines | Where-Object { $_ -cmatch '\AINV warn transient-excluded unit=' } | ForEach-Object { if ($_ -cmatch 'unit=(\S+)') { $Matches[1] } }); if ($tr.Count) { Set-MoveAnswer $S 'transient-excluded' @($tr); Save-MoveState $S }
     }
-    $mt = (Read-MoveManifest).Text
-    $r = Invoke-MoveCall $S $dst 'x.repin' @() ('{"manifest":' + $mt.Trim() + '}')
-    if ($r.Code -ne 0) { return (& $beforeStart 'x.repin') }
+    $mt = '{"manifest":' + (Read-MoveManifest).Text.Trim() + '}'
+    foreach ($m in $dst, $src) {   # D.4 step 3: x.repin on dst and on src (src writes its pin lists, W1-T5-DG-T5-4); one id, each machine its record
+      $r = Invoke-MoveCall $S $m 'x.repin' @() $mt
+      if ($r.Code -ne 0) { return (& $beforeStart 'x.repin') }
+    }
     $r = Invoke-MoveCall $S $src 'x.baseline'
     if ($r.Code -ne 0) { return (& $beforeStart 'x.baseline') }
   }
-  # DESIGN-GAP (T10-G32): D.8's table omits step 4 for a manual back; reading: a manual back runs x.guards (D.4 "the same steps"), a
-  # carry-back does not (D.5.2 lists steps 2, 5, 6-10)
+  # a manual back runs x.guards (D.8 row 4, W1-T10-G32); a carry-back does not (D.5.2 lists steps 2, 5, 6-10)
   if ($From -le 4 -and -not $Carry) {
     $r = Invoke-MoveCall $S $src 'x.guards'
     if ($r.Code -eq 75) {
@@ -2768,14 +2960,9 @@ function Invoke-MoveCutSteps($S, [int]$From, [switch]$Carry) {
   if ($From -le 6) {
     Set-MoveAnswer $S 'final-sent' "$($S.dir)-$($S.attempt)-x.final"; Save-MoveState $S   # G35
     $r = Invoke-MoveCall $S 'new' 'x.final'
-    if ($r.Code -ne 0) {
-      # F1 (D.5.2, E-R5, E-R23): "not started" only when new answers status and its last_final is another call; an unknown outcome
-      # with new silent counts as started (carry or back: exit 70, resume only; fwd plain rollback either way)
-      $st = Get-MoveStatus $S 'new' -Quiet
-      $started = [bool]($r.Known -or -not ($st.Ok -and [string]$st.Kv['last_final'] -cne $r.Id))
-      if ($started) { if ($fwd -and -not $Carry) { return (New-MoveFail 'rb' 'x.final') }; return (New-MoveFail 'human' 'x.final' 70) }
-      return (& $beforeStart 'x.final')
-    }
+    # D.5.2 (W1-T11-DG-R11-1): x.final has started once the laptop has sent it, whatever its outcome, an unknown outcome included:
+    # fwd plain rollback; a carry-back or a manual back ends 70, resume only (E-R5, E-R23)
+    if ($r.Code -ne 0) { if ($fwd -and -not $Carry) { return (New-MoveFail 'rb' 'x.final') }; return (New-MoveFail 'human' 'x.final' 70) }
   }
   if ($From -le 7) {
     $v = Invoke-MoveVerify $S -Final
@@ -2790,9 +2977,11 @@ function Invoke-MoveCutSteps($S, [int]$From, [switch]$Carry) {
     if ((Test-MoveLogin $S $dst) -ne 0) { return (New-MoveFail 'human' 'lockout' 70) }
   }
   if ($From -le 8) {
-    # DESIGN-GAP / R5-3 (D.4 step 8 :540, D.0.9 :476): dst_started_at = now only when empty, in the same save as dst_started=true, before
-    # x.start is sent; a resume keeps the first x.start's time. R5-4: "sent with the call" is the existing --dst-started 1, no new token.
-    if (-not (Get-MoveProp $S 'dst_started_at' $null)) { Set-MoveProp $S 'dst_started_at' (Format-MoveTs (Get-MoveNow)) }
+    # R5-3 (D.4 step 8, D.0.9) with the DG-R5-1 reading (t11/review-r5.md:131; DESIGN-GAP, one spot): dst_started_at = now only on the
+    # entry that turns dst_started from false to true, in the same save, before x.start is sent; a resume or a carry-back (already true)
+    # never writes, so an empty or unparseable value prints $CutOffUnknown and never a resume's time. R5-4: "sent with the call" is the
+    # existing --dst-started 1, no new token.
+    if ($S.dst_started -ne $true) { Set-MoveProp $S 'dst_started_at' (Format-MoveTs (Get-MoveNow)) }
     Set-MoveProp $S 'dst_started' $true; Save-MoveState $S
     $r = Invoke-MoveCall $S $dst 'x.start'; if ($r.Code -ne 0) { return (& $afterStart 'x.start') }
     $r = Invoke-MoveCall $S $dst 'x.health'; if ($r.Code -ne 0) { return (& $afterStart 'x.health') }
@@ -2950,9 +3139,8 @@ function Invoke-MoveER19($S) {
   if ($a.Code -ne 0 -or $u.Code -ne 0) { return 70 }
   1
 }
-# D.5.3: new unreachable after dst_started; Q-newlost YES puts old back with its own data.
-# DESIGN-GAP (T10-G44, F8h, DG-T11-11): D.5.3 says "exit 70; the owner may answer Q-newlost"; reading: the question is asked in the same
-# run, and no answer (or anything but YES) ends that run 70.
+# D.5.3 (W1-T11-DG-T11-11): the run that finds new unreachable after dst_started ends 70 without a question; the next `cutover` asks
+# Q-newlost when new still does not answer status (Invoke-Move); YES puts old back with its own data, any other answer ends 70 again.
 function Invoke-MoveNewLost($S) {
   Write-Host 'Máy mới không trả lời sau khi đã chạy ứng dụng.'
   $a = Read-MoveAnswer (Get-MoveText 'Q-newlost' @{ 'giờ' = (Get-MoveCutOff $S) }) @('YES')
@@ -2965,7 +3153,7 @@ function Complete-MoveCutFail($S, $F) {
     'rb' { return (Invoke-MoveRollback $S $F) }
     'carry' {
       $st = Get-MoveStatus $S 'new' -Quiet
-      if (-not $st.Known) { return (Invoke-MoveNewLost $S) }   # E-R4: no automatic action; Q-newlost
+      if (-not $st.Known) { Write-Host 'Máy mới không trả lời sau khi đã chạy ứng dụng; chạy lại  fcode move cutover  để chọn cách xử lý.'; return 70 }   # E-R4: no automatic action
       return (Invoke-MoveCarryBack $S)
     }
     'discard' { return (Invoke-MoveCarryFail $S $F) }
@@ -2979,7 +3167,7 @@ function Complete-MoveCutFail($S, $F) {
 function Invoke-MoveChores($S) {
   $fwd = [string]$S.serving -ceq 'new'
   $M = Get-MoveManifestObj; $ok = $true
-  foreach ($lp in @(Get-MoveProp $M 'legacy_push' @())) {
+  foreach ($lp in @(Get-MoveProp $S 'legacy_push' @())) {
     $repo = [string]$lp.repo
     $line = if ($fwd) { "$($S.new.addr) $($S.new.hostkey_line)" } else { [string](Get-MoveMapVal $S.legacy_known_hosts $repo '') }
     if (-not $line) { continue }
@@ -2989,7 +3177,7 @@ function Invoke-MoveChores($S) {
   if ((Set-MoveAliases $S $fwd) -ne 0) { $ok = $false }
   if ($fwd) {
     $since = [string](Get-MoveProp (Get-MoveMapVal $S.answers 'Q-cut') 'ts' '')
-    foreach ($lp in @(Get-MoveProp $M 'legacy_push' @())) {
+    foreach ($lp in @(Get-MoveProp $S 'legacy_push' @())) {
       if (-not $since) { break }
       $g = Invoke-MoveTool 'gh' @('run', 'list', '-R', [string]$lp.repo, '--status', 'failure', '--created', ">=$since", '--json', 'databaseId,displayTitle,createdAt')
       if ($g.Code -eq 0) { try { foreach ($x in @(ConvertFrom-Json ($g.Out -join "`n"))) { if ($x) { Write-Host "Lượt chạy lỗi trong lúc chuyển ($($lp.repo)): $($x.databaseId) $($x.displayTitle) — chạy lại tay." } } } catch { } }
@@ -3102,6 +3290,7 @@ function Invoke-MoveCutRun($S) {
   }
   $c = Test-MovePreCut $S; if ($c -ne 0) { return $c }
   if ([string]$S.dir -ceq 'fwd') {
+    Write-MoveLines @(Get-MoveMapVal $S.answers 'init-new-warn' @())   # B.5.11: c.init-new's dst-own-unit / new-only lines, kept for Q-cut
     $a = Read-MoveAnswer (Get-MoveCutText $S (Get-MoveTransient $S)) @('có', 'không')
     if ($a -cne 'có') { Write-Host 'Đã hủy, chưa làm gì.'; return 0 }
     Set-MoveAnswer $S 'Q-cut' ([pscustomobject]@{ a = 'có'; ts = (Format-MoveTs (Get-MoveNow)) })
@@ -3138,11 +3327,13 @@ function Invoke-MoveBackRun($S) {
   if ($f.Code -eq 0) { $c = Invoke-MoveChores $S; if ($c -ne 0) { return $c }; return 0 }
   Complete-MoveCutFail $S $f
 }
-# D.7 finish; DESIGN-GAP (T10-G18): "new health passes now" has no step id (x.health would replay its rc 0); reading: new's status
+# D.7 finish, "new healthy now" (I27; W1-T10-G18, W1-T11-DG-T11-5): new's unrecorded status answers GATE_EXIT 0, no call running,
+# frozen=0, and hold_active equal to the number of non-follower holds of hold_sets.start
 function Test-MoveFinishHealth($S) {
   $st = Get-MoveStatus $S 'new' -Quiet
-  $need = @(Get-MoveProp (Get-MoveProp (Get-MoveManifestObj) 'hold_sets') 'start' @()).Count
-  $ok = [bool]($st.Ok -and [string]$st.Kv['call_state'] -cne 'running' -and -not (Test-MoveFrozen $st.Kv) -and "$($st.Kv['hold_active'])" -match '\A[0-9]+\z' -and [int]$st.Kv['hold_active'] -ge $need)
+  $M = Get-MoveManifestObj; $fol = @(Get-MoveProp $M 'followers' @() | ForEach-Object { [string]$_ })
+  $need = @(@(Get-MoveProp (Get-MoveProp $M 'hold_sets') 'start' @()) | Where-Object { $fol -cnotcontains [string]$_ }).Count
+  $ok = [bool]($st.Ok -and [string]$st.Kv['call_state'] -cne 'running' -and -not (Test-MoveFrozen $st.Kv) -and "$($st.Kv['hold_active'])" -match '\A[0-9]+\z' -and [int]$st.Kv['hold_active'] -eq $need)
   if (-not $ok) { Write-MoveLines @("MOVE error health side=new hold_active=$($st.Kv['hold_active'])") }
   $ok
 }
@@ -3194,22 +3385,30 @@ function Show-MoveStatus {
   }
   $rc
 }
-# one machine's `rebuild read` (G4): @{ Mid; Recs; Hk; Mf } or $null when there is no readable move-id
+# one machine's `rebuild read` (D.0.10; 2400 s, W1-T10-G3): @{ Mid; Recs; Hk; Mf; Target } or $null when there is no readable move-id
 function Read-MoveRebuildFacts($Mach) {
-  $r = Invoke-MoveScript $Mach (Get-MoveRebuildScript) @() (Get-MoveConst 'tcp_s') -Pin:(Test-MoveFirstContact $Mach.Addr) -Quiet
-  $mid = @{}; $recs = @(); $hk = ''
+  $r = Invoke-MoveScript $Mach (Get-MoveRebuildScript) @() (Get-MoveConst 'script_s') -Pin:(Test-MoveFirstContact $Mach.Addr) -Quiet
+  $mid = @{}; $recs = @(); $hk = ''; $tg = $null
   foreach ($l in $r.Lines) {
     if ("$l" -cmatch '\AMOVE moveid ') { $mid = ConvertFrom-MoveKv $l }
-    elseif ("$l" -cmatch '\AMOVE hostkey type=ssh-ed25519 pub=([A-Za-z0-9+/=]+)\z') { $hk = "ssh-ed25519 $($Matches[1])" }
+    elseif ("$l" -cmatch '\AMOVE hostkey (ssh-ed25519) ([A-Za-z0-9+/=]+)(?: .*)?\z') { $hk = "$($Matches[1]) $($Matches[2])" }
     elseif ("$l" -cmatch '\AMOVE record ') { $recs += , (ConvertFrom-MoveKv $l) }
+    elseif ("$l" -cmatch '\AMOVE target (.+)\z') { try { $tg = ConvertFrom-Json $Matches[1] } catch { $tg = $null } }
   }
   if ($r.Code -ne 0 -or -not $mid['id']) { return $null }
-  @{ Mid = $mid; Recs = $recs; Hk = $hk; Mf = (ConvertFrom-MoveManifestLine $r.Lines) }
+  @{ Mid = $mid; Recs = $recs; Hk = $hk; Mf = (ConvertFrom-MoveManifestLine $r.Lines); Target = $tg }
 }
-# DESIGN-GAP (T10-G34, F4): D.0.10 does not say where a rebuilt state takes `target_users[]` from (preflight ran once per move and new's
-# users changed since). Reading: the pinned manifest's `same_users[]` (name, uid), so a refresh sends the same `target-user` lines.
-function Get-MoveRebuiltTargetUsers($M) {
-  foreach ($u in @(Get-MoveProp $M 'same_users' @())) { if ($u -and [string]$u.name) { [pscustomobject][ordered]@{ name = [string]$u.name; uid = [int]$u.uid; home_nonskel = 0 } } }
+# D.0.10 (W1-T10-F4, W1-T11-DG-R11-2): target_users[], target_groups[], target_subids[], target_addrs[] and target_stop_budget_s come from
+# new's MV_DIR/target.json (`MOVE target`), never from new's current users.
+# DESIGN-GAP (T10c-RT): DESIGN is silent when there is nothing to read: (a) phase planned before any c.init-new (no target.json yet), or
+# (b) a later phase with target.json missing or unparseable (no `MOVE target` line, or bad JSON at Read-MoveRebuildFacts). Reading, in
+# this one spot: empty target_* and target_stop_budget_s 0 (so a later c.init-new sends and new keeps those empty values).
+function Set-MoveRebuiltTarget($S, $T) {
+  Set-MoveProp $S 'target_users' @(@(Get-MoveProp $T 'users' @()) | Where-Object { $_ } | ForEach-Object { [pscustomobject][ordered]@{ name = [string]$_.name; uid = [int]$_.uid } })
+  Set-MoveProp $S 'target_groups' @(@(Get-MoveProp $T 'groups' @()) | Where-Object { $_ } | ForEach-Object { [pscustomobject][ordered]@{ name = [string]$_.name; gid = [int]$_.gid } })
+  Set-MoveProp $S 'target_subids' @(@(Get-MoveProp $T 'subids' @()) | Where-Object { $_ } | ForEach-Object { [pscustomobject][ordered]@{ user = [string]$_.user; kind = [string]$_.kind; start = [long]$_.start; count = [long]$_.count } })
+  Set-MoveProp $S 'target_addrs' @(@(Get-MoveProp $T 'addrs' @()) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+  Set-MoveProp $S 'target_stop_budget_s' ([int](Get-MoveProp $T 'stop_budget_s' 0))
 }
 function Invoke-MoveRebuild([string]$OldAlias, [string]$NewAlias) {
   if (-not (Test-MoveAlias $OldAlias) -or -not (Test-MoveAlias $NewAlias)) { Write-Host 'Cách dùng: fcode move status --rebuild <máy cũ> <máy mới>'; return 65 }
@@ -3251,8 +3450,15 @@ function Invoke-MoveRebuild([string]$OldAlias, [string]$NewAlias) {
   if ($phase -ceq 'rolled-back' -and $dir -ceq 'back' -and @($got['new'].Recs | Where-Object { [string]$_['rc'] -ceq '0' -and ([string]$_['id']).StartsWith("${p}r.") }).Count) { $phase = 'cut' }
   # DESIGN-GAP (T10-G4): end states are laptop-only (never sent to the machines), so the move-ids may still carry the run's mark: an end phase fixes both
   if ($phase -ceq 'cut') { $serv = 'new'; $mark = '' } elseif ($phase -cin 'back-done', 'rolled-back', 'finished', 'aborted') { if ($phase -cne 'finished') { $serv = 'old' } else { $serv = 'new' }; $mark = '' }
+  # D.0.10 (W1-T10-O2): for dir=back with a mark set and no end phase in the records, the phase is the latest move-id's `phase` (a manual
+  # back sends --phase copied from x.freeze on; a carry-back keeps planned), and carry=true only when that phase is planned
+  if ($dir -ceq 'back' -and $mark -and $phase -cin 'planned', 'copied' -and [string]$latest.Mid['phase'] -cin 'planned', 'copied') { $phase = [string]$latest.Mid['phase'] }
   foreach ($kv in @{ dir = $dir; attempt = $att; phase = $phase; serving = $serv; mark = $(if ($mark) { $mark } else { $null }); dst_started = ([string]$o.Mid['dst_started'] -ceq '1' -or [string]$n.Mid['dst_started'] -ceq '1'); enabled = $false; rebuilt = $true; manifest_sha = $mf.Sha; carry = [bool]($dir -ceq 'back' -and $phase -ceq 'planned' -and $mark) }.GetEnumerator()) { Set-MoveProp $S $kv.Key $kv.Value }
-  Set-MoveProp $S 'target_users' @(Get-MoveRebuiltTargetUsers $mf.Obj)
+  Set-MoveRebuiltTarget $S $n.Target
+  Set-MoveProp $S 'idmap' @(@(Get-MoveProp $mf.Obj 'idmap' @()) | Where-Object { $_ })   # D.0.10: idmap[] from the manifest
+  # DESIGN-GAP (DG-R5-2, the Architect's): D.0.10 names neither pass{} nor last_copy_at; a rebuilt state keeps them empty.
+  $scan = Get-MovePushScan; if (-not $scan.Ok) { Write-Host 'lỗi: không quét lại được repo (D.0.10: legacy_push[] từ một lần quét mới); chưa ghi gì.'; return 1 }
+  Set-MoveProp $S 'legacy_push' @($scan.Legacy)
   $co = Get-MoveRebuiltCutOff $o.Recs; if ($co) { Set-MoveAnswer $S 'Q-cut' ([pscustomobject]@{ a = 'có'; ts = $co }) }   # R2-4 (T10-G36): step 11's since
   Set-MoveProp $S 'dst_started_at' (Get-MoveRebuiltDstStartedAt $S $n.Recs)   # R5-1
   # dur{}: the last record per step and machine (D.0.5)
@@ -3267,7 +3473,7 @@ function Invoke-MoveRebuild([string]$OldAlias, [string]$NewAlias) {
   }
   Set-MoveProp $S.aliases 'laptop_backup' $(if ($serv -ceq 'new') { [string]$S.old.addr } else { $null })   # rebuilt from the move-ids, never from the ssh config
   Set-MoveProp $S.aliases 'coder_backup' $(if ($serv -ceq 'new') { [string]$S.old.addr } else { $null })
-  foreach ($lp in @(Get-MoveProp $mf.Obj 'legacy_push' @())) { Set-MoveMapVal $S.legacy_known_hosts ([string]$lp.repo) "$($S.old.addr) $($o.Hk)" }
+  foreach ($lp in @(Get-MoveProp $S 'legacy_push' @())) { Set-MoveMapVal $S.legacy_known_hosts ([string]$lp.repo) "$($S.old.addr) $($o.Hk)" }
   foreach ($k in 'old', 'new') { $m = if ($k -ceq 'old') { $S.old } else { $S.new }; if ($m.hostkey_line -and -not (Get-MovePinnedKey $m.addr)) { Add-Content -LiteralPath (Get-MoveKnownFile) -Value "$($m.addr) $($m.hostkey_line)" -Encoding ascii } }
   Save-MoveManifest $mf.Text
   Save-MoveState $S
