@@ -121,17 +121,11 @@ struct ProjectsView: View {
             }
             .task(id: polling) {
                 guard polling else { return }
-                // Home every 15 s, the prefs every 4th time (60 s).
-                var turn = 0
+                // Home and the prefs together, every minute.
                 while !Task.isCancelled {
-                    if turn % 4 == 0 {
-                        async let names: Void = prefs.load(app)
-                        await home.load(app)
-                        await names
-                    } else {
-                        await home.load(app)
-                    }
-                    turn += 1
+                    async let names: Void = prefs.load(app)
+                    await home.load(app)
+                    await names
                     try? await Task.sleep(nanoseconds: UInt64(HomeLogic.homePoll * 1_000_000_000))
                 }
             }

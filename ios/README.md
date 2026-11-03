@@ -46,7 +46,7 @@ Các bước chi tiết có trong app: bấm nút **?** (Hướng dẫn) ở gó
 
 ## 4. Cách dùng
 
-- **Màn hình chính** (thanh trên cùng cuộn theo danh sách; chỉ có nút **?** Hướng dẫn và **⚙** Cài đặt). Phiên tự cập nhật mỗi 5 giây, hạn mức và dự án mỗi 15 giây; kéo xuống để cập nhật ngay.
+- **Màn hình chính** (thanh trên cùng cuộn theo danh sách; chỉ có nút **?** Hướng dẫn và **⚙** Cài đặt). Phiên tự cập nhật mỗi 5 giây, hạn mức và dự án mỗi phút; kéo xuống để cập nhật ngay.
   - **Lời chào và giờ** (bên trái thẻ trên cùng): lời chào theo buổi (sáng, trưa, chiều, tối), giờ hiện tại (24 giờ) và thứ, ngày, ví dụ **Thứ Ba, 3/11**. Luôn là giờ Việt Nam, kể cả khi iPhone đặt múi giờ khác; đổi theo từng phút.
   - **Ô hạn mức** (bên phải): mỗi lần một tài khoản, tự chuyển sang tài khoản kế mỗi 4 giây (giữ ngón tay trên ô để dừng). Chạm để mở màn hình **Hạn mức**.
   - Dòng **đang chạy · chờ bạn**: chạm để nhảy tới phiên tương ứng.

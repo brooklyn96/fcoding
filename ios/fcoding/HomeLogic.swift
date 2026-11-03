@@ -760,8 +760,8 @@ enum HomeLogic {
         s.range(of: "^[a-z0-9][a-z0-9-]{0,31}$", options: .regularExpression) != nil
     }
 
-    /// GET /api/home period while the project list is on screen.
-    static let homePoll: TimeInterval = 15
+    /// GET /api/home (and the prefs) period while the project list is on screen.
+    static let homePoll: TimeInterval = 60
 
     // MARK: Greeting (top card)
 
