@@ -15,12 +15,13 @@
 # Test hooks (not for users):
 #   FCODE_INSTALL_SOURCE  folder or https:// URL that holds fcode.ps1 and fcode.cmd
 #   FCODE_INSTALL_DRYRUN  =1: print the install and login commands instead of running them
-#   FCODE_INSTALL_HIDE    comma list of tools (gh,instabox,winget) hidden from the PATH search
+#   FCODE_INSTALL_SSH     ssh program for the box check (default: ssh on the PATH, else the Windows OpenSSH one)
+#   FCODE_INSTALL_HIDE    comma list of tools (gh,winget) hidden from the PATH search
 #   FCODE_INSTALL_ENVKEY  HKCU subkey used instead of "Environment" when editing the user PATH
 #   FCODE_INSTALL_EPFAKE  fake execution policy list, e.g. CurrentUser=Restricted,LocalMachine=Undefined (nothing is set)
 #   FCODE_INSTALL_EPREAL  exactly 1, and only together with EPFAKE: really run Set-ExecutionPolicy (only safe where CurrentUser is already RemoteSigned)
 #
-# Do not capture the output of Invoke-FcodeInstall in a variable: gh and instabox need the real console to log in.
+# Do not capture the output of Invoke-FcodeInstall in a variable: gh needs the real console to log in.
 
 function Invoke-FcodeInstall {
     $ErrorActionPreference = 'Continue'
@@ -32,12 +33,10 @@ function Invoke-FcodeInstall {
     $binDir = Join-Path $env:USERPROFILE '.local\bin'
     $cfgDir = Join-Path $env:USERPROFILE '.fcode'
     $cfgFile = Join-Path $cfgDir 'config.json'
-    $ibDir = Join-Path $env:LOCALAPPDATA 'Programs\instabox'
     $ghZipDir = Join-Path $env:LOCALAPPDATA 'Programs\gh'
     $ghManual = 'C\u00e0i tay t\u1eeb https://cli.github.com r\u1ed3i ch\u1ea1y l\u1ea1i l\u1ec7nh c\u00e0i'
-    $ibManual = 'Ki\u1ec3m tra m\u1ea1ng r\u1ed3i ch\u1ea1y l\u1ea1i l\u1ec7nh c\u00e0i, ho\u1eb7c l\u00e0m theo https://instabox.sh/docs/start'
     # An item that is not done keeps its "what to do" sentence; $null means done.
-    $todo = [ordered]@{ fcode = $null; gh = $null; instabox = $null; ibLogin = $null; ghLogin = $null }
+    $todo = [ordered]@{ fcode = $null; gh = $null; ghLogin = $null; box = $null }
     $cmdName = 'fcode'
 
     function V($s) { [regex]::Unescape($s) }
@@ -117,21 +116,8 @@ function Invoke-FcodeInstall {
         return $null
     }
     function Find-Gh { Find-Tool 'gh' @((Join-Path $env:ProgramFiles 'GitHub CLI\gh.exe'), (Join-Path $ghZipDir 'bin\gh.exe')) }
-    function Test-Runs($exe) {
-        # A file that is not a valid program makes the call throw, so that counts as "does not run" too.
-        try { & $exe --version *> $null; return ($LASTEXITCODE -eq 0) } catch { return $false }
-    }
-    function Find-Ib {
-        # Every candidate is tried (all PATH hits, then the install folder) and the first that runs wins, so a broken copy
-        # (a download cut short, a stale shim) never hides a good one. No working copy means "missing".
-        $c = @()
-        if ($hide -notcontains 'instabox') { $c += @(Get-Command 'instabox' -CommandType Application -All -ErrorAction SilentlyContinue | ForEach-Object { $_.Source }) }
-        $c += (Join-Path $ibDir 'instabox.exe')
-        foreach ($p in $c) { if ($p -and (Test-Path -LiteralPath $p) -and (Test-Runs $p)) { return $p } }
-        return $null
-    }
     function Ensure-OnPath($exe) {
-        # fcode.ps1 calls gh and instabox by name, so the folder of each must be on PATH (this window and the user PATH).
+        # fcode.ps1 calls gh by name, so its folder must be on PATH (this window and the user PATH).
         $d = Split-Path $exe
         foreach ($p in ($env:Path -split ';')) { if ($p.Trim() -and (Norm $p) -eq (Norm $d)) { return $true } }
         try { if (Add-UserPath $d) { Say '\u2713 \u0110\u00e3 th\u00eam th\u01b0 m\u1ee5c {0} v\u00e0o PATH' $d }; return $true } catch { return $false }
@@ -221,7 +207,7 @@ function Invoke-FcodeInstall {
 
     # ---------- 2. config ----------
     if (-not (Test-Path -LiteralPath $cfgFile)) {
-        $json = "{`n  `"instabox`": `"`",`n  `"box`": `"coder`",`n  `"syncRepos`": [],`n  `"ipaRepo`": `"brooklyn96/fcoding`",`n  `"ipaTag`": `"latest`"`n}`n"
+        $json = "{`n  `"host`": `"oracle`",`n  `"syncRepos`": [],`n  `"ipaRepo`": `"brooklyn96/fcoding`",`n  `"ipaTag`": `"latest`"`n}`n"
         $null = New-Item -ItemType Directory -Path $cfgDir -Force
         [IO.File]::WriteAllText($cfgFile, $json, (New-Object Text.UTF8Encoding $false))
         Say '\u2713 \u0110\u00e3 t\u1ea1o file c\u1ea5u h\u00ecnh {0}' $cfgFile
@@ -286,59 +272,8 @@ function Invoke-FcodeInstall {
     }
     if ($gh -and -not (Ensure-OnPath $gh)) { $todo.gh = (V 'Kh\u00f4ng th\u00eam \u0111\u01b0\u1ee3c th\u01b0 m\u1ee5c GitHub CLI v\u00e0o PATH. Ch\u1ea1y l\u1ea1i l\u1ec7nh c\u00e0i, ho\u1eb7c t\u1ef1 th\u00eam th\u01b0 m\u1ee5c ') + (Split-Path $gh) + (V ' v\u00e0o PATH') }
 
-    # ---------- 4. instabox ----------
-    Step 'Ki\u1ec3m tra instabox'
-    function Install-Instabox {
-        # Direct download of the official Windows build, the same files and checks that `npx instabox@latest` uses
-        # (npm package "instabox", lib/cli.mjs installWindows): https://api.instabox.sh/dl/<file> and SHA256SUMS.
-        # Needs no Node.js, no npm and no admin. Docs: https://instabox.sh/docs/start
-        $arch = Get-Cpu
-        $a = switch ($arch) { 'AMD64' { 'amd64' } 'ARM64' { 'arm64' } default { $null } }
-        if (-not $a) { throw ('fc:M\u00e1y n\u00e0y (CPU {0}) ch\u01b0a c\u00f3 b\u1ea3n instabox cho Windows|Xem https://instabox.sh/docs/start|' -f $arch) }
-        $name = "instabox-windows-$a.exe"; $base = 'https://api.instabox.sh/dl'
-        $netCause = 'Kh\u00f4ng t\u1ea3i \u0111\u01b0\u1ee3c instabox (kh\u00f4ng v\u00e0o \u0111\u01b0\u1ee3c api.instabox.sh)'
-        Say '\u0110ang t\u1ea3i instabox t\u1eeb trang ch\u00ednh th\u1ee9c c\u1ee7a instabox v\u00e0 ki\u1ec3m tra m\u00e3 SHA256.'
-        if ($dry) { Say '[ch\u1ea1y th\u1eed] s\u1ebd t\u1ea3i {0}/{1} v\u00e0 {0}/SHA256SUMS, ki\u1ec3m tra SHA256, r\u1ed3i \u0111\u1eb7t v\u00e0o {2}' @($base, $name, $ibDir); return }
-        # Temp exes left by a run that was killed (closed window) are never cleaned by its finally block, so remove them now.
-        Get-ChildItem -LiteralPath $ibDir -Filter '.instabox.install.*.exe' -Force -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-        $d = Join-Path ([IO.Path]::GetTempPath()) ('fcode-ib-' + [guid]::NewGuid().ToString('N'))
-        $null = New-Item -ItemType Directory -Path $d -Force
-        # The exe is downloaded into its final folder under a temporary name (same volume) and renamed only after it is
-        # checked, so an interrupted run can never leave a half-written instabox.exe behind.
-        $null = New-Item -ItemType Directory -Path $ibDir -Force
-        $exe = Join-Path $ibDir ('.instabox.install.' + [guid]::NewGuid().ToString('N') + '.exe')
-        try {
-            $sf = Join-Path $d 'SHA256SUMS'
-            Net $netCause $ibManual { Invoke-WebRequest -UseBasicParsing -Uri "$base/$name" -OutFile $exe -ErrorAction Stop }
-            Net $netCause $ibManual { Invoke-WebRequest -UseBasicParsing -Uri "$base/SHA256SUMS" -OutFile $sf -ErrorAction Stop }
-            $want = (Get-Content -LiteralPath $sf | Where-Object { $_ -match ('\s\*?' + [regex]::Escape($name) + '\s*$') } | Select-Object -First 1) -replace '\s.*$', ''
-            if ($want -notmatch '^[0-9a-fA-F]{64}$' -or (Get-FileHash $exe -Algorithm SHA256).Hash -ne $want.ToUpperInvariant()) { throw 'fc:File t\u1ea3i v\u1ec1 kh\u00f4ng kh\u1edbp m\u00e3 ki\u1ec3m tra n\u00ean \u0111\u00e3 b\u1ecf|Ch\u1ea1y l\u1ea1i l\u1ec7nh c\u00e0i sau v\u00e0i ph\u00fat. N\u1ebfu v\u1eabn l\u1ed7i: https://instabox.sh/docs/start|' }
-            if (-not (Test-Runs $exe)) { throw 'fc:File instabox t\u1ea3i v\u1ec1 kh\u00f4ng ch\u1ea1y \u0111\u01b0\u1ee3c|Ch\u1ea1y l\u1ea1i l\u1ec7nh c\u00e0i sau v\u00e0i ph\u00fat. N\u1ebfu v\u1eabn l\u1ed7i: https://instabox.sh/docs/start|' }
-            try { Move-Item -LiteralPath $exe -Destination (Join-Path $ibDir 'instabox.exe') -Force -ErrorAction Stop }
-            catch { throw ('fc:Kh\u00f4ng ghi \u0111\u00e8 \u0111\u01b0\u1ee3c instabox.exe (c\u00f3 th\u1ec3 instabox \u0111ang ch\u1ea1y \u1edf m\u1ed9t c\u1eeda s\u1ed5 kh\u00e1c)|\u0110\u00f3ng c\u1eeda s\u1ed5 instabox \u0111ang ch\u1ea1y r\u1ed3i ch\u1ea1y l\u1ea1i l\u1ec7nh c\u00e0i|' + $_.Exception.Message) }
-        } finally {
-            Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
-        }
-    }
-    $ib = Find-Ib
-    if ($ib) { Say '\u2713 instabox \u0111\u00e3 c\u00f3' }
-    else {
-        Say 'M\u00e1y ch\u01b0a c\u00f3 instabox, \u0111ang c\u00e0i.'
-        $ibWhy = $null
-        try { Install-Instabox } catch { $ibWhy = Get-Why $_ 'Kh\u00f4ng c\u00e0i t\u1ef1 \u0111\u1ed9ng \u0111\u01b0\u1ee3c instabox' $ibManual; Show-Why $ibWhy }
-        $ib = Find-Ib
-        if ($ib) { Say '\u2713 \u0110\u00e3 c\u00e0i instabox' }
-        elseif ($dry) { $todo.instabox = V 'ch\u01b0a c\u00e0i (\u0111ang ch\u1ea1y th\u1eed)' }
-        elseif ($ibWhy) { $todo.instabox = $ibWhy.Cause + '. ' + $ibWhy.Action }
-        else { $todo.instabox = V $ibManual }
-    }
-    if ($ib) {
-        if (-not (Ensure-OnPath $ib)) { $todo.instabox = (V 'Kh\u00f4ng th\u00eam \u0111\u01b0\u1ee3c th\u01b0 m\u1ee5c instabox v\u00e0o PATH. Ch\u1ea1y l\u1ea1i l\u1ec7nh c\u00e0i, ho\u1eb7c t\u1ef1 th\u00eam th\u01b0 m\u1ee5c ') + (Split-Path $ib) + (V ' v\u00e0o PATH') }
-    }
-
     # ---------- 5. logins ----------
-    # Both checks call the network, so a single failure may be a hiccup: try up to 3 times before asking for a login.
+    # The check calls the network, so a single failure may be a hiccup: try up to 3 times before asking for a login.
     function Test-Login($exe, $a) {
         for ($i = 0; $i -lt 3; $i++) {
             & $exe @a *> $null
@@ -347,23 +282,12 @@ function Invoke-FcodeInstall {
         }
         return $false
     }
-    function Test-IbLogin { Test-Login $ib @('whoami') }
     function Test-GhLogin { Test-Login $gh @('auth', 'status') }
-
-    if ($ib) {
-        if (Test-IbLogin) { Say '\u2713 \u0110\u00e3 \u0111\u0103ng nh\u1eadp instabox' }
-        else {
-            Step 'B\u01b0\u1edbc 1/2: \u0111\u0103ng nh\u1eadp instabox. Tr\u00ecnh duy\u1ec7t s\u1ebd m\u1edf ra, b\u1ea1n \u0111\u0103ng nh\u1eadp r\u1ed3i quay l\u1ea1i \u0111\u00e2y'
-            if ($dry) { Say '[ch\u1ea1y th\u1eed] instabox login' } else { & $ib login }
-            if (Test-IbLogin) { Say '\u2713 \u0110\u00e3 \u0111\u0103ng nh\u1eadp instabox' }
-            else { $todo.ibLogin = V 'g\u00f5: instabox login (n\u1ebfu tr\u00ecnh duy\u1ec7t kh\u00f4ng m\u1edf: instabox login --device)' }
-        }
-    } else { $todo.ibLogin = V 'l\u00e0m sau khi c\u00e0i instabox xong' }
 
     if ($gh) {
         if (Test-GhLogin) { Say '\u2713 \u0110\u00e3 \u0111\u0103ng nh\u1eadp GitHub' }
         else {
-            Step 'B\u01b0\u1edbc 2/2: \u0111\u0103ng nh\u1eadp GitHub'
+            Step '\u0110\u0103ng nh\u1eadp GitHub'
             Say 'GitHub s\u1ebd hi\u1ec7n m\u1ed9t m\u00e3 g\u1ed3m 8 k\u00fd t\u1ef1 (d\u1ea1ng ABCD-1234). B\u1ea1n ch\u00e9p m\u00e3 \u0111\u00f3,'
             Say 'b\u1ea5m Enter \u0111\u1ec3 m\u1edf tr\u00ecnh duy\u1ec7t, d\u00e1n m\u00e3 v\u00e0o \u00f4 tr\u00ean trang GitHub r\u1ed3i b\u1ea5m Authorize.'
             Say 'N\u1ebfu n\u00f3 h\u1ecfi g\u00ec kh\u00e1c, c\u1ee9 b\u1ea5m Enter \u0111\u1ec3 ch\u1ecdn m\u1eb7c \u0111\u1ecbnh.'
@@ -373,9 +297,36 @@ function Invoke-FcodeInstall {
         }
     } else { $todo.ghLogin = V 'l\u00e0m sau khi c\u00e0i gh xong' }
 
+    # ---------- 6. box ----------
+    # The coder is an always-on Oracle VM reached over plain ssh (alias in ~/.ssh/config). Nothing here creates or reads a key:
+    # it only asks the box `true` the way fcode does, and says what is missing when that fails.
+    Step 'Ki\u1ec3m tra k\u1ebft n\u1ed1i t\u1edbi box'
+    $boxHost = if ($env:FCODE_HOST) { $env:FCODE_HOST } else { 'oracle' }
+    if (-not $env:FCODE_HOST -and (Test-Path -LiteralPath $cfgFile)) {
+        try { $cv = [IO.File]::ReadAllText($cfgFile) | ConvertFrom-Json; if ($cv.host) { $boxHost = [string]$cv.host } } catch {}
+    }
+    if ($boxHost -notmatch '\A[A-Za-z0-9][A-Za-z0-9._-]*\z') {
+        $todo.box = V 't\u00ean box (kh\u00f3a host trong config.json ho\u1eb7c bi\u1ebfn FCODE_HOST) kh\u00f4ng h\u1ee3p l\u1ec7: ch\u1ec9 d\u00f9ng ch\u1eef, s\u1ed1 v\u00e0 d\u1ea5u . _ - (t\u00ean trong ~/.ssh/config)'
+    } else {
+        $sshExe = if ($env:FCODE_INSTALL_SSH) { $env:FCODE_INSTALL_SSH } else { Find-Tool 'ssh' @((Join-Path $env:SystemRoot 'System32\OpenSSH\ssh.exe')) }
+        if (-not $sshExe) {
+            $todo.box = V 'm\u00e1y ch\u01b0a c\u00f3 ssh. B\u1eadt t\u00ednh n\u0103ng OpenSSH Client c\u1ee7a Windows (Settings > System > Optional features) r\u1ed3i ch\u1ea1y l\u1ea1i l\u1ec7nh c\u00e0i'
+        } elseif ($dry -and -not $env:FCODE_INSTALL_SSH) {   # the test hook runs the check even in a dry run (it is a fake ssh)
+            Say '[ch\u1ea1y th\u1eed] ssh -o BatchMode=yes -o ConnectTimeout=8 {0} true' $boxHost
+        } else {
+            $sshOut = @(& $sshExe -o BatchMode=yes -o ConnectTimeout=8 $boxHost true 2>&1 | ForEach-Object { "$_" })
+            if ($LASTEXITCODE -eq 0) { Say "\u2713 V\u00e0o \u0111\u01b0\u1ee3c box '{0}'" $boxHost }
+            else {
+                $d = ($sshOut | Where-Object { $_.Trim() } | Select-Object -Last 1)
+                Show-Why @{ Cause = ((V "Kh\u00f4ng v\u00e0o \u0111\u01b0\u1ee3c box '{0}'") -f $boxHost); Detail = [string]$d }
+                $todo.box = (V "ch\u01b0a v\u00e0o \u0111\u01b0\u1ee3c box '{0}'. C\u1ea7n: (1) kh\u1ed1i Host {0} trong {1} g\u1ed3m HostName fcode-quoc.duckdns.org, User quoc, IdentityFile <\u0111\u01b0\u1eddng d\u1eabn kh\u00f3a ri\u00eang c\u1ee7a b\u1ea1n>; (2) kh\u00f3a ri\u00eang n\u1eb1m \u0111\u00fang ch\u1ed7 \u0111\u00f3 (FCode kh\u00f4ng t\u1ea1o v\u00e0 kh\u00f4ng \u0111\u1ecdc kh\u00f3a); (3) g\u00f5 ssh {0} m\u1ed9t l\u1ea7n \u0111\u1ec3 ch\u1ea5p nh\u1eadn kh\u00f3a m\u00e1y ch\u1ee7. Chi ti\u1ebft: docs/HUONG-DAN.md, m\u1ee5c K\u1ebft n\u1ed1i box. Xong th\u00ec ch\u1ea1y l\u1ea1i l\u1ec7nh c\u00e0i") -f $boxHost, (Join-Path $env:USERPROFILE '.ssh\config')
+            }
+        }
+    }
+
     # ---------- summary ----------
     Step 'K\u1ebft qu\u1ea3'
-    $names = [ordered]@{ fcode = 'L\u1ec7nh fcode'; gh = 'GitHub CLI (gh)'; instabox = 'instabox'; ibLogin = '\u0110\u0103ng nh\u1eadp instabox'; ghLogin = '\u0110\u0103ng nh\u1eadp GitHub' }
+    $names = [ordered]@{ fcode = 'L\u1ec7nh fcode'; gh = 'GitHub CLI (gh)'; ghLogin = '\u0110\u0103ng nh\u1eadp GitHub'; box = 'K\u1ebft n\u1ed1i t\u1edbi box' }
     foreach ($k in $names.Keys) {
         if ($todo[$k]) { Write-Host ((V '\u2717 {0}: {1}') -f (V $names[$k]), $todo[$k]) -ForegroundColor Yellow }
         else { Write-Host ((V '\u2713 {0}') -f (V $names[$k])) -ForegroundColor Green }

@@ -1,8 +1,8 @@
 ﻿# Tests for `fcode phien` (laptop/fcode.ps1): omp session sync laptop <-> box.
 # Run:  pwsh -NoProfile -File test/fcode-phien.test.ps1     (also works with: powershell -NoProfile -File ...)
-# Needs python (3.8+) on PATH: the box program ($PhienPy) is run locally through test/fake-instabox.cmd, so the real
+# Needs python (3.8+) on PATH: the box program ($PhienPy) is run locally through test/fake-ssh.cmd, so the real
 # ~/.omp and the real box are never touched. Everything lives in a temp folder that is removed at the end.
-#   FCODE_TEST_BOX=1   also run one end-to-end pass on the real instabox box (throwaway HOME there; laptop side = temp USERPROFILE).
+#   FCODE_TEST_BOX=1   also run one end-to-end pass on the real Oracle box over `ssh oracle` (throwaway HOME there; laptop side = temp USERPROFILE).
 #   FCODE_TEST_ONLY=<regex>   run only the tests whose name matches (used for the mutant runs)
 # Test-only overrides of fcode.ps1 used by the 1.3.3 tests (`phien --nhanh`, `moc`): FCODE_PHIEN_CAP_SEC (the 20 s cap of --nhanh), FCODE_DOCUMENTS
 # (stands for [Environment]::GetFolderPath('MyDocuments'), where `fcode moc` keeps the PowerShell profiles), FCODE_PHIEN_LOCK (the lock name),
@@ -523,8 +523,8 @@ T 'install: new / same / replaced (only when target is a prefix) / skip / busy; 
   Ok (-not (Get-ChildItem $D -Recurse -Filter '*.fcode-part*')) 'no part files left'
 }
 
-# ============================== end to end through the real fcode.ps1 + fake instabox ==============================
-$Cmd = Join-Path $PSScriptRoot 'fake-instabox.cmd'
+# ============================== end to end through the real fcode.ps1 + fake ssh ==============================
+$Cmd = Join-Path $PSScriptRoot 'fake-ssh.cmd'
 $script:E2E = $null
 function Read-PhienLog($w) { $p = Join-Path $w.U '.fcode\phien.log'; if (Test-Path $p) { Get-Content $p -Raw } else { '' } }
 function New-LogMark($w) { (Read-PhienLog $w).Length }
@@ -535,7 +535,7 @@ function New-World([string]$Name) {
   [void](New-Item -ItemType Directory -Path $lp, (Join-Path $u '.fcode'), $bh, $bp -Force)
   $cfg = Join-Path $w 'boxcfg.json'
   [IO.File]::WriteAllText($cfg, (@{ projects = @{ proj = $bp; other = ($w -replace '\\', '/') + '/boxws/other' } } | ConvertTo-Json -Compress))
-  [IO.File]::WriteAllText((Join-Path $u '.fcode\config.json'), (@{ instabox = $Cmd; box = 'coder'; syncRepos = @($lp, (Join-Path $u 'Desktop\other'), (Join-Path $u 'Desktop\notonbox')) } | ConvertTo-Json -Compress))
+  [IO.File]::WriteAllText((Join-Path $u '.fcode\config.json'), (@{ ssh = $Cmd; host = 'oracle'; syncRepos = @($lp, (Join-Path $u 'Desktop\other'), (Join-Path $u 'Desktop\notonbox')) } | ConvertTo-Json -Compress))
   [pscustomobject]@{ W = $w; U = $u; LP = $lp; BH = $bh; BP = $bp; Cfg = $cfg
     LS = Join-Path $u ('.omp\agent\sessions\' + (Get-OmpEncodedDir $lp $u (Join-Path $u 'AppData\Local\Temp')))
     BS = Join-Path $bh ('.omp\agent\sessions\' + (Get-OmpEncodedDir $bp ($bh -replace '\\', '/') (Join-Path $u 'AppData\Local\Temp')))
@@ -646,15 +646,15 @@ T 'e2e: unknown project and project missing on box' {
   $r = Invoke-Fcode $w @('phien', 'nope'); Eq $r.Code 1; Ok ($r.Out -match "Không thấy project 'nope'") $r.Out
   $r = Invoke-Fcode $w @('phien', 'notonbox'); Eq $r.Code 0 $r.Out   # not in box config: nothing to do, no crash
 }
-T 'e2e: auto mode runs only while the box is running, never wakes it, logs a summary' {
+T 'e2e: auto mode runs only while the box can be reached, logs a summary' {
   $w = New-World 'e2e2'
   [void](New-Item -ItemType Directory -Path (Join-Path $w.U 'Desktop\other'), (Join-Path $w.U 'Desktop\notonbox') -Force)
   $s = New-Sess $w.LS '55555555-auto' $w.LP @('a')
-  $r = Invoke-Fcode $w @('phien', '--tu-dong') @{ FAKE_BOX_STATE = 'suspended' }
-  Eq $r.Code 0 $r.Out; Eq (SshCount $w) 0 'no ssh while the box is not running'
+  $r = Invoke-Fcode $w @('phien', '--tu-dong') @{ FAKE_DOWN = '1' }
+  Eq $r.Code 0 $r.Out; Eq (SshCount $w) 0 'no sync ssh while the box cannot be reached'
   Ok (-not (Test-Path $w.BS)) 'nothing copied'
-  $r = Invoke-Fcode $w @('phien', '--tu-dong') @{ FAKE_BOX_STATE = 'running' }
-  Eq $r.Code 0 $r.Out; Ok (Test-Path (Join-Path $w.BS (Split-Path $s -Leaf))) 'copied while running'
+  $r = Invoke-Fcode $w @('phien', '--tu-dong')
+  Eq $r.Code 0 $r.Out; Ok (Test-Path (Join-Path $w.BS (Split-Path $s -Leaf))) 'copied while reachable'
   Eq ($r.Out.Trim()) '' 'auto mode prints nothing'
   $log = Join-Path $w.U '.fcode\phien.log'
   Ok ((Test-Path $log) -and ((Get-Content $log -Raw) -match 'Xong: 1 file gửi lên box')) 'log has the summary'
@@ -824,11 +824,10 @@ T 'e2e: project notes both ways with git rules, hash state, big files, exclude, 
   Ok (-not (Test-Path "$($w.BP)\CLAUDE.local.md")) 'dry run copied nothing'; Eq (Get-Content (Join-Path $w.U 'AppData\Local\fcode\handoff-state.json') -Raw) $d0 'dry run leaves the state alone'
 }
 # ============================== real box (opt-in) ==============================
-# FCODE_TEST_BOX=1: the real instabox box "coder", but only in a throwaway HOME under /tmp there (removed at the end); the laptop side is a temp USERPROFILE.
+# FCODE_TEST_BOX=1: the real Oracle box (`ssh oracle`), but only in a throwaway HOME under /tmp there (removed at the end); the laptop side is a temp USERPROFILE.
 if ($env:FCODE_TEST_BOX) {
-  $RealIb = Join-Path $env:LOCALAPPDATA 'Programs\instabox\instabox.exe'
   function Invoke-RealBox([string]$Remote, [byte[]]$In = $null) {
-    $psi = New-Object Diagnostics.ProcessStartInfo; $psi.FileName = $RealIb; $psi.Arguments = 'ssh coder -- "' + $Remote.Replace('"', '\"') + '"'
+    $psi = New-Object Diagnostics.ProcessStartInfo; $psi.FileName = 'ssh'; $psi.Arguments = '-o BatchMode=yes oracle "' + $Remote.Replace('"', '\"') + '"'
     $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
     $p = [Diagnostics.Process]::Start($psi)
     $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
@@ -840,7 +839,7 @@ if ($env:FCODE_TEST_BOX) {
     $bt = Invoke-RealBox 'mktemp -d /tmp/fcode-phien-test-XXXXXXXX'; Ok ($bt -match '\A/tmp/fcode-phien-test-[A-Za-z0-9]{8}\z') "throwaway dir: $bt"; $bp = "$bt/ws/proj"
     $w = New-World 'real1'
     [void](New-Item -ItemType Directory -Path (Join-Path $w.U 'Desktop\other'), (Join-Path $w.U 'Desktop\notonbox') -Force)
-    [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ instabox = $RealIb; box = 'coder'; syncRepos = @($w.LP) } | ConvertTo-Json -Compress))
+    [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ host = 'oracle'; syncRepos = @($w.LP) } | ConvertTo-Json -Compress))
     $enc = Get-OmpEncodedDir $bp $bt "$bt/tmp"
     $sd = "$bt/.omp/agent/sessions/$enc"
     try {
@@ -882,7 +881,7 @@ if ($env:FCODE_TEST_BOX) {
   T 'real box: a symlinked .git/info/exclude (then a symlinked .git/info) is never written through or over: the note is not placed, the target and the link stay' {
     $bt = Invoke-RealBox 'mktemp -d /tmp/fcode-phien-test-XXXXXXXX'; Ok ($bt -match '\A/tmp/fcode-phien-test-[A-Za-z0-9]{8}\z') "throwaway dir: $bt"; $bp = "$bt/ws/proj"
     $w = New-World 'real4'
-    [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ instabox = $RealIb; box = 'coder'; syncRepos = @($w.LP) } | ConvertTo-Json -Compress))
+    [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ host = 'oracle'; syncRepos = @($w.LP) } | ConvertTo-Json -Compress))
     $sd = "$bt/.omp/agent/sessions/$(Get-OmpEncodedDir $bp $bt "$bt/tmp")"
     try {
       $cfgB64 = [Convert]::ToBase64String($utf8.GetBytes((@{ projects = @{ proj = $bp } } | ConvertTo-Json -Compress)))
@@ -904,7 +903,7 @@ if ($env:FCODE_TEST_BOX) {
   T 'real box: a release with a dangling link at .fcode/.gitignore: the link is never followed or replaced and the release waits (error line, exit 1); link gone: released' {
     $bt = Invoke-RealBox 'mktemp -d /tmp/fcode-phien-test-XXXXXXXX'; Ok ($bt -match '\A/tmp/fcode-phien-test-[A-Za-z0-9]{8}\z') "throwaway dir: $bt"; $bp = "$bt/ws/proj"
     $w = New-World 'real5'
-    [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ instabox = $RealIb; box = 'coder'; syncRepos = @($w.LP) } | ConvertTo-Json -Compress))
+    [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ host = 'oracle'; syncRepos = @($w.LP) } | ConvertTo-Json -Compress))
     $sd = "$bt/.omp/agent/sessions/$(Get-OmpEncodedDir $bp $bt "$bt/tmp")"
     try {
       $cfgB64 = [Convert]::ToBase64String($utf8.GetBytes((@{ projects = @{ proj = $bp } } | ConvertTo-Json -Compress)))
@@ -938,7 +937,7 @@ if ($env:FCODE_TEST_BOX) {
   T 'real box: a session file that a box process holds open is left alone (busy) and its top waits; once closed, the next run updates it' {
     $bt = Invoke-RealBox 'mktemp -d /tmp/fcode-phien-test-XXXXXXXX'; Ok ($bt -match '\A/tmp/fcode-phien-test-[A-Za-z0-9]{8}\z') "throwaway dir: $bt"; $bp = "$bt/ws/proj"
     $w = New-World 'real2'
-    [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ instabox = $RealIb; box = 'coder'; syncRepos = @($w.LP) } | ConvertTo-Json -Compress))
+    [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ host = 'oracle'; syncRepos = @($w.LP) } | ConvertTo-Json -Compress))
     $sd = "$bt/.omp/agent/sessions/$(Get-OmpEncodedDir $bp $bt "$bt/tmp")"
     try {
       $cfgB64 = [Convert]::ToBase64String($utf8.GetBytes((@{ projects = @{ proj = $bp } } | ConvertTo-Json -Compress)))
@@ -960,7 +959,7 @@ if ($env:FCODE_TEST_BOX) {
   T 'real box: fcode add runs the box script under timeout: a stalled script is stopped (124, or 137 when it ignores TERM) and leaves no process' {
     $bt = Invoke-RealBox 'mktemp -d /tmp/fcode-phien-test-XXXXXXXX'; Ok ($bt -match '\A/tmp/fcode-phien-test-[A-Za-z0-9]{8}\z') "throwaway dir: $bt"
     $w = New-World 'real3'
-    [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ instabox = $RealIb; box = 'coder'; syncRepos = @() } | ConvertTo-Json -Compress))
+    [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ host = 'oracle'; syncRepos = @() } | ConvertTo-Json -Compress))
     try {
       $n1 = Get-Random -Minimum 100000 -Maximum 199999; $n2 = $n1 + 1   # sleep lengths unique to this run: the process check sees only ours
       [void](Invoke-RealBox "cat > $bt/stall.sh" $utf8.GetBytes("echo 'R TOKEN_OK'`nsleep $n1`n"))
@@ -986,7 +985,7 @@ T 'e2e: equal-length sessions with other content are reported and left alone' {
   Eq ([Convert]::ToBase64String((Read-Bytes $l))) ([Convert]::ToBase64String($lb)) 'laptop copy untouched'
   Eq ([Convert]::ToBase64String((Read-Bytes $b))) ([Convert]::ToBase64String($bb)) 'box copy untouched'
 }
-T 'e2e: auto run v2: no ssh while the box is down; one sync when it just started; then only when the last ssh is 40+ min old; failures wait for the next slot; manual always runs' {
+T 'e2e: auto run v2: nothing while the box cannot be reached; one sync the first time it can; then only when the last ssh is 40+ min old; failures wait for the next slot; manual always runs' {
   $w = New-World 'e2e9'
   [void](New-Item -ItemType Directory -Path (Join-Path $w.U 'Desktop\other'), (Join-Path $w.U 'Desktop\notonbox') -Force)
   $auto = { param($e = @{}) Invoke-Fcode $w @('phien', '--tu-dong') $e }
@@ -994,12 +993,14 @@ T 'e2e: auto run v2: no ssh while the box is down; one sync when it just started
   $logText = { if (Test-Path $log) { (Get-Content $log -Raw) } else { '' } }
   $onBox = { param($n) Test-Path (Join-Path $w.BS (Split-Path (Get-ChildItem $w.LS -Filter "*$n.jsonl").FullName -Leaf)) }
   [void](New-Sess $w.LS '11111111-aut1' $w.LP @('a'))
-  # box not running: no ssh at all
-  $r = & $auto @{ FAKE_BOX_STATE = 'suspended' }; Eq $r.Code 0; Eq (SshCount $w) 0 'suspended: no ssh'; Eq (Get-AutoState $w).boxRunning $false
-  # box just started: one sync now
+  # box cannot be reached: no sync ssh, no state written, one log line
+  $r = & $auto @{ FAKE_DOWN = '1' }; Eq $r.Code 0; Eq (SshCount $w) 0 'down: no ssh'
+  Ok (-not (Test-Path (Join-Path $w.U 'AppData\Local\fcode\phien-auto.json'))) 'down: no state written'
+  Eq @([regex]::Matches((& $logText), 'không vào được box \(ssh oracle lỗi\)')).Count 1 'down: one log line'
+  # first reachable run: one sync now
   $r = & $auto; Eq $r.Code 0 $r.Out
   $n1 = SshCount $w; Ok ($n1 -gt 0) 'just started: ssh'
-  Ok ((& $logText) -match 'đồng bộ vì: box vừa chạy') 'reason logged'; Ok (& $onBox 'aut1') 'it synced'
+  Ok ((& $logText) -match 'đồng bộ vì: lần đầu \(chưa có trạng thái\)') 'reason logged'; Ok (& $onBox 'aut1') 'it synced'
   Ok (((ConvertTo-Epoch (Get-Date)) - (Get-AutoState $w).lastSshAt) -lt 180) 'last ssh time recorded'
   # running, last ssh a few minutes ago: no ssh, even with a laptop change
   [void](New-Sess $w.LS '22222222-aut2' $w.LP @('a'))
@@ -1027,9 +1028,10 @@ T 'e2e: auto run v2: no ssh while the box is down; one sync when it just started
   Eq ((Get-Content (Join-Path $w.U 'AppData\Local\fcode\phien-status.json') -Raw | ConvertFrom-Json).ok) $false 'failure recorded'
   $n3 = SshCount $w; $r = & $auto; Eq (SshCount $w) $n3 'after a failure: no fast retry'
   Set-AutoState $w $true 41; $r = & $auto; Eq $r.Code 0 $r.Out; Ok (& $onBox 'aut5') 'the next slot retried and copied'
-  # box went away and came back: sync once at once, whatever the last ssh time
-  $n4 = SshCount $w; $r = & $auto @{ FAKE_BOX_STATE = 'suspended' }; Eq (SshCount $w) $n4 'suspended: no ssh'
-  $r = & $auto; Ok ((SshCount $w) -gt $n4) 'box running again: ssh at once'
+  # box went away and came back: nothing while it is away, the state is kept, the 40-minute rule goes on
+  $n4 = SshCount $w; $st0 = [IO.File]::ReadAllText((Join-Path $w.U 'AppData\Local\fcode\phien-auto.json'))
+  $r = & $auto @{ FAKE_DOWN = '1' }; Eq $r.Code 0; Eq (SshCount $w) $n4 'down: no ssh'; Eq ([IO.File]::ReadAllText((Join-Path $w.U 'AppData\Local\fcode\phien-auto.json'))) $st0 'down: state unchanged'
+  $r = & $auto; Eq (SshCount $w) $n4 'back: the last ssh is recent, so still no ssh'
   # manual runs always run
   $n5 = SshCount $w; $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0; Ok ((SshCount $w) -gt $n5) 'manual run: ssh'
   Ok ((Get-AutoState $w).PSObject.Properties.Name.Count -eq 2) 'state holds only boxRunning + lastSshAt'
@@ -1326,16 +1328,16 @@ T 'e2e: a lost acknowledgement (the box placed everything, the answer never came
   Eq (Body $bt) (Body $ls) 'complete'; Ok (Test-Path (Join-Path $w.BBlobs $h1)) 'blob there'
   $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0; Ok ($r.Out -match 'hai bên đã giống nhau') 'no-op'
 }
-T 'e2e: auto run: a failed or unreadable `instabox ls` opens no ssh and leaves phien-auto.json unchanged; the next good check inside 40 min opens none either' {
+T 'e2e: auto run: an unreachable box (ssh true fails) opens no sync ssh and leaves phien-auto.json unchanged; the next good check inside 40 min opens none either' {
   $w = New-W2 'e2e24'
   [void](New-Sess $w.LS '78787878-lsfl' $w.LP @('a'))
   Set-AutoState $w $true 10
   $sp = Join-Path $w.U 'AppData\Local\fcode\phien-auto.json'; $before = [IO.File]::ReadAllText($sp)
-  foreach ($m in 'fail', 'bad', 'nostate') {
-    $r = Invoke-Fcode $w @('phien', '--tu-dong') @{ FAKE_LS = $m }; Eq $r.Code 0 $r.Out
-    Eq (SshCount $w) 0 "ls $($m): no ssh"; Eq ([IO.File]::ReadAllText($sp)) $before "ls $($m): state unchanged"
+  foreach ($i in 1, 2) {
+    $r = Invoke-Fcode $w @('phien', '--tu-dong') @{ FAKE_DOWN = '1' }; Eq $r.Code 0 $r.Out
+    Eq (SshCount $w) 0 "down #$($i): no ssh"; Eq ([IO.File]::ReadAllText($sp)) $before "down #$($i): state unchanged"
   }
-  Ok ((Get-Content (Join-Path $w.U '.fcode\phien.log') -Raw) -match 'không đọc được trạng thái box') 'logged'
+  Eq @([regex]::Matches((Get-Content (Join-Path $w.U '.fcode\phien.log') -Raw), 'không vào được box \(ssh oracle lỗi\)')).Count 2 'one log line per run'
   $r = Invoke-Fcode $w @('phien', '--tu-dong'); Eq $r.Code 0 $r.Out
   Eq (SshCount $w) 0 'recovery 10 min after the last ssh: still no ssh (no false "box just started")'
   Ok ((Get-AutoState $w).boxRunning -and [Math]::Abs((Get-AutoState $w).lastSshAt - ($before | ConvertFrom-Json).lastSshAt) -lt 1) 'last ssh time kept'
@@ -1515,7 +1517,7 @@ T 'e2e r4: phien matches a laptop folder to a box project by its GitHub repo whe
   $ld = Join-Path $w.U 'Desktop\New folder (2)'; New-GitDir $ld; & git -C $ld remote add origin https://github.com/Owner/Proj.git
   New-GitDir $w.BP; & git -C $w.BP remote add origin git@github-proj:owner/proj.git
   [IO.File]::WriteAllText($w.Cfg, (@{ projects = @{ proj = $w.BP; zeta = ($w.W -replace '\\', '/') + '/boxws/zeta' } } | ConvertTo-Json -Compress))
-  [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ instabox = $Cmd; box = 'coder'; syncRepos = @($ld) } | ConvertTo-Json -Compress))
+  [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ ssh = $Cmd; host = 'oracle'; syncRepos = @($ld) } | ConvertTo-Json -Compress))
   $lsd = Join-Path $w.U ('.omp\agent\sessions\' + (Get-OmpEncodedDir $ld $w.U (Join-Path $w.U 'AppData\Local\Temp')))
   $a = New-Sess $lsd 'abcdabcd-rep1' $ld @('a')
   $r = Invoke-Fcode $w @('phien'); Eq $r.Code 0 $r.Out
@@ -1530,7 +1532,7 @@ T 'e2e r4: phien matches a laptop folder to a box project by its GitHub repo whe
   $aaa = ($w2.W -replace '\\', '/') + '/boxws/aaa'
   foreach ($d in $w2.BP, $aaa) { New-GitDir ($d -replace '/', '\'); & git -C $d remote add origin https://github.com/owner/proj.git }
   [IO.File]::WriteAllText($w2.Cfg, (@{ projects = @{ proj = $w2.BP; aaa = $aaa } } | ConvertTo-Json -Compress))
-  [IO.File]::WriteAllText((Join-Path $w2.U '.fcode\config.json'), (@{ instabox = $Cmd; box = 'coder'; syncRepos = @($w2.LP) } | ConvertTo-Json -Compress))
+  [IO.File]::WriteAllText((Join-Path $w2.U '.fcode\config.json'), (@{ ssh = $Cmd; host = 'oracle'; syncRepos = @($w2.LP) } | ConvertTo-Json -Compress))
   $a2 = New-Sess $w2.LS 'abcdabcd-rep2' $w2.LP @('a')
   $r = Invoke-Fcode $w2 @('phien'); Eq $r.Code 0 $r.Out
   Ok (Test-Path (Join-Path $w2.BS (Split-Path $a2 -Leaf))) ("the exact name proj gets the folder; out: " + $r.Out)
@@ -1568,6 +1570,14 @@ T 'add: a box without the installed script is told to update the box' {
   Eq $r.Code 1 $r.Out
   Ok ($r.Out -match 'box chưa có script thêm dự án' -and $r.Out -match 'cd ~/fcode-src && git pull && bash install\.sh') ("told; out: " + $r.Out)
   Eq (@(Get-Content $w.Log | Where-Object { $_ -eq 'ssh script' }).Count) 1 'no retry'
+}
+T 'add: the box script goes over plain `ssh <host> <command>` (no options, no wake), host from FCODE_HOST' {
+  $w = New-World 'add2h'; $fa = Join-Path $w.W 'fake-add.sh'; $argv = Join-Path $w.W 'argv.log'
+  New-FakeAdd $fa 'echo "R CFG_EXISTS"; exit 0'
+  $r = Invoke-Fcode $w @('add', 'owner/repo') @{ FCODE_ADD_SCRIPT = (ConvertTo-Posix $fa); FAKE_ARGV_LOG = $argv; FCODE_HOST = 'oracle-ubuntu' }
+  Eq $r.Code 0 $r.Out
+  Eq ((Get-Content $argv) -join '|') 'oracle-ubuntu CMD' 'one plain ssh call'
+  Ok ($r.Out -match "vào box 'oracle-ubuntu'") ("the host is named; out: " + $r.Out)
 }
 T 'add: NEED_KEY shows the key and the steps, waits for Enter, then the retry succeeds' {
   $w = New-World 'add3'; $fa = Join-Path $w.W 'fake-add.sh'; $cnt = ($w.W -replace '\\', '/') + '/n'
@@ -1619,7 +1629,7 @@ T 'add r6: re-add (only CFG_EXISTS) is success; CFG_WARN is a warning; exits 25 
 T 'add r7: the box script runs under the same timeout as the server (600 s, KILL 30 s later); a stalled script is stopped and told as a safe retry' {
   $runAst = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$FcodeAddRun' }, $true)
   $FcodeAddRun = $null; Invoke-Expression $runAst.Extent.Text
-  Ok ($FcodeAddRun -match '(?m)^exec env -u INSTABOX_API_KEY timeout --kill-after="\$\{FCODE_ADD_KILL_AFTER_S:-30\}" "\$\{FCODE_ADD_TIMEOUT_S:-600\}" bash "\$s" "\$@"$') ("wrapper: " + $FcodeAddRun)
+  Ok ($FcodeAddRun -match '(?m)^exec timeout --kill-after="\$\{FCODE_ADD_KILL_AFTER_S:-30\}" "\$\{FCODE_ADD_TIMEOUT_S:-600\}" bash "\$s" "\$@"$') ("wrapper: " + $FcodeAddRun)
   $w = New-World 'add6'; $fa = Join-Path $w.W 'fake-add.sh'
   foreach ($c in @(@{ B = "echo 'R TOKEN_OK'`nsleep 297"; Code = 124 }, @{ B = "trap '' TERM`necho 'R TOKEN_OK'`nsleep 297"; Code = 137 })) {
     New-FakeAdd $fa $c.B
@@ -1638,12 +1648,6 @@ T 'add r7: the test-only limit overrides take positive integers only (0 would me
     }
   } finally { foreach ($k in $save.Keys) { [Environment]::SetEnvironmentVariable($k, $(if ($null -eq $save[$k]) { [NullString]::Value } else { $save[$k] })) } }
 }
-T 'sync r6: the 60 s `projects` deadline starts after the box is awake (a slow wake does not eat it)' {
-  $w = New-World 'syn4'
-  $r = Invoke-Fcode $w @('sync') @{ FAKE_WAKE_SLEEP = '5'; FCODE_PHIEN_TIMEOUT = '3' }
-  Ok ($r.Out -notmatch 'không đọc được danh sách project trên box') ("the project list was read; out: " + $r.Out)
-  Eq (@(Get-Content $w.Log | Where-Object { $_ -eq 'ssh projects' }).Count) 1 'asked once'
-}
 T 'sync: box projects missing on the laptop are found (OneDrive Desktop, names with spaces and brackets, several matches) or cloned (default folder, empty folder); wrong origin and non-git folders are refused; config keeps its other keys' {
   $w = New-World 'syn1'
   $gh = Join-Path $w.W 'github-test'; $own = Join-Path $gh 'owner'; [void](New-Item -ItemType Directory -Force -Path $own)
@@ -1661,7 +1665,7 @@ T 'sync: box projects missing on the laptop are found (OneDrive Desktop, names w
   $nongit = Join-Path $w.W 'elsewhere\notgit'; Put-File "$nongit\a.txt" 'x'
   $empty = Join-Path $w.W 'elsewhere\work [x]\gamma'; [void](New-Item -ItemType Directory -Force -Path $empty)
   $cfgFile = Join-Path $w.U '.fcode\config.json'
-  [IO.File]::WriteAllText($cfgFile, "{`r`n  `"instabox`": $(ConvertTo-JsonStr $Cmd),`r`n  `"box`": `"coder`",`r`n  `"syncRepos`": [],`r`n  `"ipaTag`": `"latest`"`r`n}`r`n")
+  [IO.File]::WriteAllText($cfgFile, "{`r`n  `"ssh`": $(ConvertTo-JsonStr $Cmd),`r`n  `"host`": `"oracle`",`r`n  `"syncRepos`": [],`r`n  `"ipaTag`": `"latest`"`r`n}`r`n")
   $env0 = @{ FCODE_DESKTOP = $desk; FCODE_DOCUMENTS = $docs; FCODE_GITHUB_BASE = $gh }
   # box order: alpha (one found), beta (two found: pick 2), delta (none: Enter = default), gamma (none: wrong origin, not git, then an empty folder)
   $r = Invoke-Fcode $w @('sync') $env0 ("`n2`n`n" + "$wrong`n$nongit`nC:\a|b`n$empty`n")
@@ -1674,7 +1678,7 @@ T 'sync: box projects missing on the laptop are found (OneDrive Desktop, names w
   Ok ($r.Out -match 'đây là repo owner/other, không phải owner/gamma') 'wrong origin refused'
   Ok ($r.Out -match 'thư mục này không phải git') 'non-git folder refused'
   $c = Get-Content $cfgFile -Raw
-  Ok ($c -match '"ipaTag": "latest"' -and $c -match '"box": "coder"') 'other keys and their layout kept'
+  Ok ($c -match '"ipaTag": "latest"' -and $c -match '"host": "oracle"') 'other keys and their layout kept'
   $sr = @(($c | ConvertFrom-Json).syncRepos)
   Eq (($sr | Sort-Object) -join '|') ((@("$desk\New folder (2)\alpha", "$desk\New folder\beta [old]", "$desk\delta", $empty) | Sort-Object) -join '|') 'syncRepos'
   Ok ((Test-Path -LiteralPath "$desk\delta\.git") -and (Test-Path -LiteralPath "$empty\.git")) 'cloned into the default folder and into the empty folder'
@@ -1684,13 +1688,13 @@ T 'sync: box projects missing on the laptop are found (OneDrive Desktop, names w
   # r5: config.json BOM kept only when it was there; "syncRepos": null / a string is replaced, never a second key
   $CfgBroken = $false
   $cases = @(
-    @{ N = 'bom'; Pre = [byte[]](0xEF, 0xBB, 0xBF); Body = "{`r`n  `"box`": `"coder`",`r`n  `"syncRepos`": [`"C:\\x`"]`r`n}`r`n"; Want = @('C:\x', 'C:\new dir') },
-    @{ N = 'nobom'; Pre = [byte[]]@(); Body = "{ `"box`": `"coder`", `"syncRepos`": [] }"; Want = @('C:\new dir') },
-    @{ N = 'null'; Pre = [byte[]]@(); Body = "{ `"box`": `"coder`", `"syncRepos`": null }"; Want = @('C:\new dir') },
-    @{ N = 'string'; Pre = [byte[]](0xEF, 0xBB, 0xBF); Body = "{ `"syncRepos`": `"C:\\old`", `"box`": `"coder`" }"; Want = @('C:\old', 'C:\new dir') },
-    @{ N = 'number'; Pre = [byte[]]@(); Body = "{ `"syncRepos`": 12, `"box`": `"coder`" }"; Want = @('C:\new dir') },
-    @{ N = 'true'; Pre = [byte[]]@(); Body = "{ `"syncRepos`": true, `"box`": `"coder`" }"; Want = @('C:\new dir') },
-    @{ N = 'false'; Pre = [byte[]]@(); Body = "{ `"box`": `"coder`", `"syncRepos`": false }"; Want = @('C:\new dir') })
+    @{ N = 'bom'; Pre = [byte[]](0xEF, 0xBB, 0xBF); Body = "{`r`n  `"host`": `"oracle`",`r`n  `"syncRepos`": [`"C:\\x`"]`r`n}`r`n"; Want = @('C:\x', 'C:\new dir') },
+    @{ N = 'nobom'; Pre = [byte[]]@(); Body = "{ `"host`": `"oracle`", `"syncRepos`": [] }"; Want = @('C:\new dir') },
+    @{ N = 'null'; Pre = [byte[]]@(); Body = "{ `"host`": `"oracle`", `"syncRepos`": null }"; Want = @('C:\new dir') },
+    @{ N = 'string'; Pre = [byte[]](0xEF, 0xBB, 0xBF); Body = "{ `"syncRepos`": `"C:\\old`", `"host`": `"oracle`" }"; Want = @('C:\old', 'C:\new dir') },
+    @{ N = 'number'; Pre = [byte[]]@(); Body = "{ `"syncRepos`": 12, `"host`": `"oracle`" }"; Want = @('C:\new dir') },
+    @{ N = 'true'; Pre = [byte[]]@(); Body = "{ `"syncRepos`": true, `"host`": `"oracle`" }"; Want = @('C:\new dir') },
+    @{ N = 'false'; Pre = [byte[]]@(); Body = "{ `"host`": `"oracle`", `"syncRepos`": false }"; Want = @('C:\new dir') })
   foreach ($c in $cases) {
     $ConfigFile = Join-Path $w.W "cfg-$($c.N).json"
     [IO.File]::WriteAllBytes($ConfigFile, [byte[]](@($c.Pre) + @($utf8.GetBytes($c.Body))))
@@ -1699,10 +1703,10 @@ T 'sync: box projects missing on the laptop are found (OneDrive Desktop, names w
     Eq (($b[0..2] | ForEach-Object { '{0:X2}' -f $_ }) -join ' ') $(if ($c.Pre.Length) { 'EF BB BF' } else { (($utf8.GetBytes($c.Body)[0..2] | ForEach-Object { '{0:X2}' -f $_ }) -join ' ') }) "$($c.N): first bytes"
     $t = $utf8.GetString($b); if ($c.Pre.Length) { $t = $t.Substring(1) }
     Eq ([regex]::Matches($t, '"syncRepos"').Count) 1 "$($c.N): one syncRepos key"
-    $j = $t | ConvertFrom-Json; Eq (@($j.syncRepos) -join '|') ($c.Want -join '|') "$($c.N): syncRepos"; Eq $j.box 'coder' "$($c.N): other key kept"
+    $j = $t | ConvertFrom-Json; Eq (@($j.syncRepos) -join '|') ($c.Want -join '|') "$($c.N): syncRepos"; Eq $j.host 'oracle' "$($c.N): other key kept"
   }
   # r6: a config.json that is not UTF-8 is refused and never rewritten
-  $ConfigFile = Join-Path $w.W 'cfg-latin1.json'; $lb = [byte[]](@($utf8.GetBytes('{ "box": "c')) + @(0xE0) + @($utf8.GetBytes('", "syncRepos": [] }')))
+  $ConfigFile = Join-Path $w.W 'cfg-latin1.json'; $lb = [byte[]](@($utf8.GetBytes('{ "host": "c')) + @(0xE0) + @($utf8.GetBytes('", "syncRepos": [] }')))
   [IO.File]::WriteAllBytes($ConfigFile, $lb)
   $msg = ''; try { Add-SyncRepoConfig 'C:\new dir' } catch { $msg = $_.Exception.Message }
   Eq $msg 'config.json không phải UTF-8, lưu lại dạng UTF-8 rồi chạy lại' 'refused'
@@ -1762,54 +1766,45 @@ T 'task scheduler: registers a headless every-10-minutes task and the action sho
 }
 
 # ============================== 1.3.3: fcode phien <project> --nhanh ==============================
-# instabox wrapper that logs the first word of every call (ls / wake / ssh): the fake itself logs only ssh
-# $Stall: 'ls' = every `instabox ls` hangs for 60 s; 'put2' = the second and later `ssh ... put` hang for 60 s (the first one runs as the fake decides)
-function Use-LoggedIb($w, [string]$Stall = '') {
-  $w | Add-Member -NotePropertyName IbLog -NotePropertyValue (Join-Path $w.W 'ib-calls.log') -Force
+# ssh wrapper that logs every call as 'true' (the reachability check `ssh ... <host> true`) or 'ssh' (anything else): the fake itself logs only the second kind
+# $Stall: 'check' = every reachability check hangs for 60 s; 'put2' = the second and later `ssh ... put` hang for 60 s (the first one runs as the fake decides)
+function Use-LoggedSsh($w, [string]$Stall = '') {
+  $w | Add-Member -NotePropertyName SshCallLog -NotePropertyValue (Join-Path $w.W 'ib-calls.log') -Force
   $wrap = Join-Path $w.W 'ib-wrap.cmd'
   $hang = switch ($Stall) {
-    'ls' { "if /i `"%1`"==`"ls`" ping -n 60 127.0.0.1 >nul`r`n" }
-    'put2' { "if /i not `"%1`"==`"ssh`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`nfindstr /c:`"ssh put`" `"%FAKE_SSH_LOG%`" >nul 2>&1 || goto run`r`nping -n 60 127.0.0.1 >nul`r`n:run`r`n" }
+    'check' { "if `"%K%`"==`"true`" ping -n 60 127.0.0.1 >nul`r`n" }
+    'put2' { "if `"%K%`"==`"true`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`nfindstr /c:`"ssh put`" `"%FAKE_SSH_LOG%`" >nul 2>&1 || goto run`r`nping -n 60 127.0.0.1 >nul`r`n:run`r`n" }
     # 'put1late': the first `ssh ... put` waits until the epoch second in FAKE_PUT_UNTIL, then runs as the fake decides (an item still under way when the deadline passes)
-    'put1late' { "if /i not `"%1`"==`"ssh`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`nfindstr /c:`"ssh put`" `"%FAKE_SSH_LOG%`" >nul 2>&1 && goto run`r`npython -c `"import os,time;time.sleep(max(0,float(os.environ['FAKE_PUT_UNTIL'])-time.time()))`"`r`n:run`r`n" }
+    'put1late' { "if `"%K%`"==`"true`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`nfindstr /c:`"ssh put`" `"%FAKE_SSH_LOG%`" >nul 2>&1 && goto run`r`npython -c `"import os,time;time.sleep(max(0,float(os.environ['FAKE_PUT_UNTIL'])-time.time()))`"`r`n:run`r`n" }
     # 'gitbreak': before an `ssh ... put` the box project's .git is renamed to .git-x (FAKE_BP = that folder, Windows form; unset = off): the box can no longer find its exclude file
-    'gitbreak' { "if `"%FAKE_BP%`"==`"`" goto run`r`nif /i not `"%1`"==`"ssh`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`nif exist `"%FAKE_BP%\.git`" attrib -h `"%FAKE_BP%\.git`" & ren `"%FAKE_BP%\.git`" .git-x`r`n:run`r`n" }   # .git is hidden: ren does not see it
+    'gitbreak' { "if `"%FAKE_BP%`"==`"`" goto run`r`nif `"%K%`"==`"true`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`nif exist `"%FAKE_BP%\.git`" attrib -h `"%FAKE_BP%\.git`" & ren `"%FAKE_BP%\.git`" .git-x`r`n:run`r`n" }   # .git is hidden: ren does not see it
     # 'exclbreak': before an `ssh ... put` the box project's .git/info/exclude becomes a folder (FAKE_BP as above; unset = off): reading it fails with an OSError
-    'exclbreak' { "if `"%FAKE_BP%`"==`"`" goto run`r`nif /i not `"%1`"==`"ssh`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`ndel /q `"%FAKE_BP%\.git\info\exclude`" >nul 2>&1`r`nmd `"%FAKE_BP%\.git\info\exclude`" >nul 2>&1`r`n:run`r`n" }
+    'exclbreak' { "if `"%FAKE_BP%`"==`"`" goto run`r`nif `"%K%`"==`"true`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`ndel /q `"%FAKE_BP%\.git\info\exclude`" >nul 2>&1`r`nmd `"%FAKE_BP%\.git\info\exclude`" >nul 2>&1`r`n:run`r`n" }
     default { '' }
   }
-  [IO.File]::WriteAllText($wrap, "@echo off`r`necho %1 >>`"$($w.IbLog)`"`r`n${hang}call `"$Cmd`" %*`r`nexit /b %errorlevel%`r`n")
-  [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ instabox = $wrap; box = 'coder'; syncRepos = @($w.LP, (Join-Path $w.U 'Desktop\other'), (Join-Path $w.U 'Desktop\notonbox')) } | ConvertTo-Json -Compress))
+  [IO.File]::WriteAllText($wrap, "@echo off`r`nset K=ssh`r`necho %*| findstr /e /c:`" true`" >nul && set K=true`r`necho %K% >>`"$($w.SshCallLog)`"`r`n${hang}call `"$Cmd`" %*`r`nexit /b %errorlevel%`r`n")
+  [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ ssh = $wrap; host = 'oracle'; syncRepos = @($w.LP, (Join-Path $w.U 'Desktop\other'), (Join-Path $w.U 'Desktop\notonbox')) } | ConvertTo-Json -Compress))
 }
-function IbCalls($w) { if (Test-Path $w.IbLog) { @(Get-Content $w.IbLog | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } else { @() } }
+function SshCalls($w) { if (Test-Path $w.SshCallLog) { @(Get-Content $w.SshCallLog | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } else { @() } }
 function BoxSessions($w) { if (Test-Path $w.BH) { @(Get-ChildItem (Join-Path $w.BH '.omp\agent\sessions') -Recurse -File -Filter '*.jsonl' -ErrorAction SilentlyContinue).Count } else { 0 } }
 $CapMsg = 'phien: hết 20 giây, phần còn lại chạy lần sau'
 $FailMsg = 'phien: không đồng bộ được, xem phien.log'
 function Screen-Lines([string]$Text) { @($Text -split "`r?`n" | Where-Object { $_.Trim() }) }   # what a run printed on the screen
 
-T 'nhanh: box asleep: exit 0 and a message, only `instabox ls`, never wake or ssh' {
-  $w = New-W2 'q1'; Use-LoggedIb $w
+T 'nhanh: box cannot be reached (ssh true fails): a failure, exit 1, one failure line, only the reachability check, no sync ssh' {
+  $w = New-W2 'q1'; Use-LoggedSsh $w
   [void](New-Sess $w.LS '11111111-qs01' $w.LP @('a'))
-  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FAKE_BOX_STATE = 'suspended' }
-  Eq $r.Code 0 $r.Out
-  Eq ((Screen-Lines $r.Out) -join '|') 'phien: box đang ngủ, bỏ qua' 'one line'
-  Eq ((IbCalls $w) -join ',') 'ls' 'only the state check: no wake, no ssh'
-  Eq (SshCount $w) 0 'no ssh'; Eq (BoxSessions $w) 0 'nothing copied'
-}
-T 'nhanh r4: box state unknown (instabox ls fails, bad answer, no state): a failure, exit 1, only `instabox ls`, never wake or ssh' {
-  $w = New-W2 'q1u'; Use-LoggedIb $w
-  [void](New-Sess $w.LS '11111111-qs1u' $w.LP @('a'))
-  foreach ($m in 'fail', 'bad', 'nostate') {
-    $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FAKE_LS = $m }
-    Eq $r.Code 1 "${m}: $($r.Out)"
-    Eq ((Screen-Lines $r.Out) -join '|') $FailMsg "${m}: the failure line only"
+  foreach ($i in 1, 2) {
+    $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FAKE_DOWN = '1' }
+    Eq $r.Code 1 "#${i}: $($r.Out)"
+    Eq ((Screen-Lines $r.Out) -join '|') $FailMsg "#${i}: the failure line only"
   }
-  Eq @([regex]::Matches((Read-PhienLog $w), 'lỗi: không đọc được trạng thái box \(instabox ls lỗi')).Count 3 'the reason is in phien.log each time'
-  Eq ((IbCalls $w) -join ',') 'ls,ls,ls' 'only the state check: no wake, no ssh'
-  Eq (SshCount $w) 0 'no ssh'; Eq (BoxSessions $w) 0 'nothing copied'
+  Eq @([regex]::Matches((Read-PhienLog $w), 'lỗi: không vào được box \(ssh oracle lỗi')).Count 2 'the reason is in phien.log each time'
+  Eq ((SshCalls $w) -join ',') 'true,true' 'only the reachability check'
+  Eq (SshCount $w) 0 'no sync ssh'; Eq (BoxSessions $w) 0 'nothing copied'
 }
-T 'nhanh: running box: the same work as fcode phien for that one project, no wake, no git-push hint, logged' {
-  $w = New-W2 'q2'; Use-LoggedIb $w
+T 'nhanh: reachable box: the same work as fcode phien for that one project, one reachability check first, no git-push hint, logged' {
+  $w = New-W2 'q2'; Use-LoggedSsh $w
   $s = New-Sess $w.LS '22222222-qs02' $w.LP @('a')
   $otherLs = Join-Path $w.U ('.omp\agent\sessions\' + (Get-OmpEncodedDir (Join-Path $w.U 'Desktop\other') $w.U (Join-Path $w.U 'AppData\Local\Temp')))
   [void](New-Sess $otherLs '22222222-qs03' (Join-Path $w.U 'Desktop\other') @('b'))
@@ -1820,15 +1815,15 @@ T 'nhanh: running box: the same work as fcode phien for that one project, no wak
   Ok ((Read-PhienLog $w) -notmatch 'Nhớ đẩy code') 'no push hint in the hook'
   Ok (Test-Path (Join-Path $w.BS (Split-Path $s -Leaf))) 'the project session is on the box'
   Eq (BoxSessions $w) 1 'the other project was not touched'
-  Ok ((IbCalls $w) -notcontains 'wake') ('never wakes: ' + ((IbCalls $w) -join ','))
-  Ok ((IbCalls $w) -contains 'ssh') 'it did sync'
+  Eq @((SshCalls $w))[0] 'true' 'the reachability check comes first'
+  Ok ((SshCalls $w) -contains 'ssh') 'it did sync'
   Ok ((Get-Content (Join-Path $w.U '.fcode\phien.log') -Raw) -match 'Xong: 1 file gửi lên box') 'summary in the log (a background run has no screen)'
   $r = Invoke-Fcode $w @('phien', 'nope', '--nhanh'); Eq $r.Code 1 'unknown project is still an error'
   Eq ((Screen-Lines $r.Out) -join '|') $FailMsg 'a failure is one short line'; Ok ((Read-PhienLog $w) -match "Không thấy project 'nope'") 'the reason is in phien.log'
   $r = Invoke-Fcode $w @('phien', '--nhanh'); Eq $r.Code 1 '--nhanh needs a project'
 }
 T 'nhanh: lock busy: exit 0 at once with a message, nothing else is touched' {
-  $w = New-W2 'q3'; Use-LoggedIb $w
+  $w = New-W2 'q3'; Use-LoggedSsh $w
   [void](New-Sess $w.LS '33333333-qs04' $w.LP @('a'))
   $mx = New-Object Threading.Mutex($false, $env:FCODE_PHIEN_LOCK); Ok ($mx.WaitOne(0)) 'the test holds the lock'
   try {
@@ -1836,7 +1831,7 @@ T 'nhanh: lock busy: exit 0 at once with a message, nothing else is touched' {
     Eq $r.Code 0 $r.Out
     Eq ((Screen-Lines $r.Out) -join '|') 'phien: đang có lần đồng bộ khác, bỏ qua' 'one line'
     Ok ($sec -lt 25) "no waiting for the lock ($([Math]::Round($sec)) s)"
-    Eq (IbCalls $w).Count 0 'not even `instabox ls`'
+    Eq (SshCalls $w).Count 0 'not even the reachability check'
     Ok ((Read-PhienLog $w) -match 'đang có lần đồng bộ khác, bỏ qua') 'the busy line is in phien.log too'
     # r4 F1: phien.log has its own lock (<lock>-log). $sec (above) is the run with that lock free; the busy line is the run's only log line
     $busy = 'đang có lần đồng bộ khác, bỏ qua'; $logf = Join-Path $w.U '.fcode\phien.log'
@@ -1874,7 +1869,7 @@ T 'nhanh: lock busy: exit 0 at once with a message, nothing else is touched' {
   } finally { try { $mx.ReleaseMutex() } catch { }; $mx.Dispose() }
 }
 T 'nhanh: the 20 s cap ends the run cleanly: exit 0, message, no later batch, nothing half-placed; the next run finishes' {
-  $w = New-W2 'q4'; Use-LoggedIb $w
+  $w = New-W2 'q4'; Use-LoggedSsh $w
   $a = New-Sess $w.LS 'aaaa1111-cap1' $w.LP @('a'); Grow-Sess $a 30
   $b = New-Sess $w.LS 'bbbb2222-cap2' $w.LP @('b'); Grow-Sess $b 30
   $t0 = Get-Date
@@ -1891,15 +1886,15 @@ T 'nhanh: the 20 s cap ends the run cleanly: exit 0, message, no later batch, no
   Ok ((Test-Path (Join-Path $w.BS (Split-Path $a -Leaf))) -and (Test-Path (Join-Path $w.BS (Split-Path $b -Leaf)))) 'the next run sends both'
 }
 T 'nhanh: a cap that has already passed before the scan: exit 0 and the message, no ssh' {
-  $w = New-W2 'q5'; Use-LoggedIb $w
+  $w = New-W2 'q5'; Use-LoggedSsh $w
   [void](New-Sess $w.LS '55555555-qs05' $w.LP @('a'))
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '1' }
   Eq $r.Code 0 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $CapMsg 'only the cap line'
   Eq (SshCount $w) 0 'no ssh once the time is up'
   $r = Invoke-Fcode $w @('phien', 'proj') @{ FCODE_PHIEN_CAP_SEC = '1' }; Eq $r.Code 0 'the cap is for --nhanh only'; Eq (BoxSessions $w) 1 'a normal run ignores the cap and syncs'
 }
-T 'nhanh r2: a failing sync (box listed running, ssh fails) is ONE short line on the screen; the details are in phien.log' {
-  $w = New-W2 'q6'; Use-LoggedIb $w
+T 'nhanh r2: a failing sync (box reachable, ssh fails) is ONE short line on the screen; the details are in phien.log' {
+  $w = New-W2 'q6'; Use-LoggedSsh $w
   [void](New-Sess $w.LS '66666666-qs06' $w.LP @('a'))
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FAKE_SSH_FAIL = '1' }
   Eq $r.Code 1 $r.Out
@@ -1907,17 +1902,29 @@ T 'nhanh r2: a failing sync (box listed running, ssh fails) is ONE short line on
   Ok ((Read-PhienLog $w) -match 'lỗi: không nói chuyện được với box') 'the reason is logged'
 }
 # L2: every child program of a quick run is bounded by the cap (the stalls below last 60 s; the cap is 8 s)
-T 'nhanh r2: `instabox ls` that hangs is killed at the cap: exit 0, only the cap line, no ssh' {
-  $w = New-W2 'q7'; Use-LoggedIb $w 'ls'
+T 'nhanh r2: a reachability check that hangs is killed at the cap: exit 0, only the cap line, no sync ssh' {
+  $w = New-W2 'q7'; Use-LoggedSsh $w 'check'
   [void](New-Sess $w.LS '77777777-qs07' $w.LP @('a'))
   $t0 = Get-Date; $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '8' }; $sec = ((Get-Date) - $t0).TotalSeconds
-  Eq $r.Code 0 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $CapMsg 'the cap line, not "box đang ngủ"'
-  Ok ($sec -lt 30) "ended at the cap ($([Math]::Round($sec)) s, `instabox ls` hangs 60 s)"
+  Eq $r.Code 0 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $CapMsg 'the cap line, not the failure line'
+  Ok ($sec -lt 30) "ended at the cap ($([Math]::Round($sec)) s, the check hangs 60 s)"
   Eq (SshCount $w) 0 'no ssh'
+}
+T 'auto r1: a reachability check that hangs is cut by the auto deadline (not unbounded): exit 0, no sync ssh, state unchanged, one log line' {
+  $w = New-W2 'a1'; Use-LoggedSsh $w 'check'
+  [void](New-Sess $w.LS '77777777-au01' $w.LP @('a'))
+  Set-AutoState $w $true 10
+  $sp = Join-Path $w.U 'AppData\Local\fcode\phien-auto.json'; $before = [IO.File]::ReadAllText($sp)
+  $t0 = Get-Date; $r = Invoke-Fcode $w @('phien', '--tu-dong') @{ FCODE_PHIEN_TIMEOUT = '5' }; $sec = ((Get-Date) - $t0).TotalSeconds
+  Eq $r.Code 0 $r.Out
+  Ok ($sec -lt 40) "cut by the deadline ($([Math]::Round($sec)) s, the check hangs 60 s)"
+  Eq ((SshCalls $w) -join ',') 'true' 'only the reachability check, no sync ssh'
+  Eq ([IO.File]::ReadAllText($sp)) $before 'state unchanged'
+  Eq @([regex]::Matches((Get-Content (Join-Path $w.U '.fcode\phien.log') -Raw), 'không vào được box \(ssh oracle lỗi\)')).Count 1 'one log line'
 }
 foreach ($shim in 'omp', 'git') {
   T "nhanh r2: a hanging `"$shim`" (found first on PATH) is killed at the cap: exit 0, only the cap line, nothing is sent" {
-    $w = New-W2 "q8$shim"; Use-LoggedIb $w
+    $w = New-W2 "q8$shim"; Use-LoggedSsh $w
     [void](New-Sess $w.LS '88888888-qs08' $w.LP @('a'))
     $bin = Join-Path $w.W 'shim'; [void](New-Item -ItemType Directory -Path $bin -Force)
     [IO.File]::WriteAllText((Join-Path $bin "$shim.cmd"), "@echo off`r`nping -n 60 127.0.0.1 >nul`r`n")
@@ -1982,7 +1989,7 @@ T 'nhanh r3: nothing inside an item stops for the deadline: hash, scan, notes, g
 }
 # L4: the cap line is for a run that stopped on the cap; a real error keeps its exit code and its own one line (a second batch that is cut by the cap does not wipe it)
 T 'nhanh r2: a real error before the cap keeps exit code 1 and the failure line; the cap does not turn it into a clean exit' {
-  $w = New-W2 'q10'; Use-LoggedIb $w 'put2'
+  $w = New-W2 'q10'; Use-LoggedSsh $w 'put2'
   $a = New-Sess $w.LS 'aaaa1010-er01' $w.LP @('a'); Grow-Sess $a 30
   $b = New-Sess $w.LS 'bbbb1010-er02' $w.LP @('b'); Grow-Sess $b 30
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '25'; FAKE_SSH_CUT = 'put:1:0:fail' }
@@ -1992,7 +1999,7 @@ T 'nhanh r2: a real error before the cap keeps exit code 1 and the failure line;
   Ok ((Read-PhienLog $w) -match [regex]::Escape($CapMsg)) 'the cap is in the log'
 }
 T 'nhanh r2: a run that all finished does not claim the cap: no cap line, no "phần còn lại" in the log' {
-  $w = New-W2 'q11'; Use-LoggedIb $w
+  $w = New-W2 'q11'; Use-LoggedSsh $w
   [void](New-Sess $w.LS '11111111-fin1' $w.LP @('a'))
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '60' }
   Eq $r.Code 0 $r.Out; Eq (Screen-Lines $r.Out).Count 0 'silent'
@@ -2000,7 +2007,7 @@ T 'nhanh r2: a run that all finished does not claim the cap: no cap line, no "ph
 }
 # L3 (second half): a quick run does not move the 40-minute gap of the auto run, so what it left undone is still picked up by the next auto run
 T 'nhanh r2: a cut quick run leaves phien-auto.json alone; the next 10-minute auto run (last ssh 100 min ago) still syncs what was left' {
-  $w = New-W2 'q12'; Use-LoggedIb $w
+  $w = New-W2 'q12'; Use-LoggedSsh $w
   $a = New-Sess $w.LS 'aaaa1212-au01' $w.LP @('a'); Grow-Sess $a 30
   Set-AutoState $w $true 100; $before = Get-AutoState $w
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '15'; FAKE_SSH_CUT = 'put:1:0:stall' }
@@ -2017,7 +2024,7 @@ function Body-Sha([string]$p) { $o = Get-PhienOff $p; Get-RangeSha $p $o ((Get-I
 # Q1: Install-PhienNote does every git call before it places the note; a git that never answers check-ignore is killed (3 s floor or
 # time left + 5 s) and the note waits: never placed without its exclude line (r6: a stall on --git-path now hits the scan: no note work at all)
 T 'nhanh r3: a note from the box with a git that stalls (check-ignore): never placed without its exclude line; the next run places and excludes it' {
-  $w = New-W2 'q13'; Use-LoggedIb $w
+  $w = New-W2 'q13'; Use-LoggedSsh $w
   New-GitDir $w.LP; New-GitDir $w.BP
   Put-File "$($w.BP)\HANDOFF.md" 'box handoff'
   $realGit = (Get-Command git -CommandType Application | Select-Object -First 1).Source
@@ -2037,7 +2044,7 @@ T 'nhanh r3: a note from the box with a git that stalls (check-ignore): never pl
 }
 # Q2: a batch that is under way when the deadline passes is finished whole (its child has the 5 s grace); the run then stops before the next batch
 T 'nhanh r3: a batch still under way when the deadline passes ends whole (placed, all of it); no next batch starts; the next run sends the rest' {
-  $w = New-W2 'q14'; Use-LoggedIb $w 'put1late'
+  $w = New-W2 'q14'; Use-LoggedSsh $w 'put1late'
   $a = New-Sess $w.LS 'aaaa1414-it01' $w.LP @('a'); Grow-Sess $a 30
   $b = New-Sess $w.LS 'bbbb1414-it02' $w.LP @('b'); Grow-Sess $b 30
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '15'; FAKE_PUT_UNTIL = "$((ConvertTo-Epoch (Get-Date)) + 15.5)" }
@@ -2052,7 +2059,7 @@ T 'nhanh r3: a batch still under way when the deadline passes ends whole (placed
   Eq (BoxSessions $w) 2 'the next run sends the other one'
 }
 T 'nhanh r3: an earlier batch failure, then the deadline at the next safe point: exit 1 and the failure line (the cap does not erase it)' {
-  $w = New-W2 'q15'; Use-LoggedIb $w 'put1late'
+  $w = New-W2 'q15'; Use-LoggedSsh $w 'put1late'
   $a = New-Sess $w.LS 'aaaa1515-ef01' $w.LP @('a'); Grow-Sess $a 30
   $b = New-Sess $w.LS 'bbbb1515-ef02' $w.LP @('b'); Grow-Sess $b 30
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '15'; FAKE_PUT_UNTIL = "$((ConvertTo-Epoch (Get-Date)) + 15.5)"; FAKE_SSH_CUT = 'put:1:0:fail' }
@@ -2064,7 +2071,7 @@ T 'nhanh r3: an earlier batch failure, then the deadline at the next safe point:
 # Q6: a run killed at any point (the hook's 25 s kill, Ctrl+C) never leaves a half-written file under a real name; what it left (its staging in
 # %TEMP%, part files) carries its PID and is removed at the start of the next run, however fresh; a live run's part file stays
 T 'nhanh r3: a run killed mid-way leaves nothing half-written; the next run removes its staging and part files at once and finishes' {
-  $w = New-W2 'q16'; Use-LoggedIb $w
+  $w = New-W2 'q16'; Use-LoggedSsh $w
   $a = New-Sess $w.LS 'aaaa1616-kil1' $w.LP @('a'); Grow-Sess $a 5
   $lt = Join-Path $w.U 'AppData\Local\Temp'; [void](New-Item -ItemType Directory -Force -Path $lt)
   $p = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '60'; FAKE_SSH_CUT = 'put:1:0:stall' } -NoWait
@@ -2081,9 +2088,9 @@ T 'nhanh r3: a run killed mid-way leaves nothing half-written; the next run remo
   $dead = "$($w.LS)\x.jsonl.fcode-part-$kpid-abcdef", "$($w.LP)\HANDOFF-k.md.fcode-part-$kpid-abcdef"
   $live = "$($w.LS)\y.jsonl.fcode-part-$PID-abcdef"   # this test process is alive and older than the file: a run that is still going
   foreach ($f in @($dead) + @($live)) { Put-File $f 'x' }
-  # r4 F4: the staging goes as soon as the next run holds the lock, even when that run stops early (box asleep)
-  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FAKE_BOX_STATE = 'suspended' }; Eq $r.Code 0 $r.Out
-  Eq ((Screen-Lines $r.Out) -join '|') 'phien: box đang ngủ, bỏ qua' 'the asleep line'
+  # r4 F4: the staging goes as soon as the next run holds the lock, even when that run stops early (box cannot be reached)
+  $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FAKE_DOWN = '1' }; Eq $r.Code 1 $r.Out
+  Eq ((Screen-Lines $r.Out) -join '|') $FailMsg 'the failure line'
   Ok (-not (Test-Path $left[0].FullName)) 'the staging of the killed run is removed at once, before the box check'
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FCODE_PHIEN_CAP_SEC = '60' }; Eq $r.Code 0 $r.Out
   foreach ($f in $dead) { Ok (-not (Test-Path $f)) "part file of the killed run removed: $(Split-Path $f -Leaf)" }
@@ -2092,7 +2099,7 @@ T 'nhanh r3: a run killed mid-way leaves nothing half-written; the next run remo
 }
 # Q4: quick mode keeps the script's ErrorActionPreference ('Stop'): a cmdlet error is an error as in `fcode phien`, never a silent partial run
 T 'nhanh r3: a cmdlet error (a folder that cannot be listed) is an error in quick mode too: exit 1, the failure line, the reason in phien.log' {
-  $w = New-W2 'q17'; Use-LoggedIb $w
+  $w = New-W2 'q17'; Use-LoggedSsh $w
   $s = New-Sess $w.LS 'eeee1717-acl1' $w.LP @('a')
   $lk = Join-Path $w.LS ([IO.Path]::GetFileNameWithoutExtension($s) + '\locked'); Put-File "$lk\x.txt" 'x'
   $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -2108,7 +2115,7 @@ T 'nhanh r3: a cmdlet error (a folder that cannot be listed) is an error in quic
 # ---- r4: the supervisor (kill-on-close job), crash-safe writes, ownership first, big items left to the other runs ----
 # F3: the exclude line is added before the note is placed: an exclude file fcode cannot write means no note (never a visible, unexcluded one)
 T 'nhanh r4: a read-only .git/info/exclude on the laptop: the note is not placed, exit 1, the failure line, the reason logged; writable again: placed and excluded' {
-  $w = New-W2 'q19'; Use-LoggedIb $w
+  $w = New-W2 'q19'; Use-LoggedSsh $w
   New-GitDir $w.LP; New-GitDir $w.BP
   Put-File "$($w.BP)\HANDOFF.md" 'box handoff'
   $exf = "$($w.LP)\.git\info\exclude"; $before = Read-Bytes $exf
@@ -2128,7 +2135,7 @@ T 'nhanh r4: a read-only .git/info/exclude on the laptop: the note is not placed
 }
 # F2: never write through a link
 T 'nhanh r4: a note from the box when .git/info on the laptop is a junction: not placed, one log line, exit 0, the target untouched' {
-  $w = New-W2 'q20'; Use-LoggedIb $w
+  $w = New-W2 'q20'; Use-LoggedSsh $w
   New-GitDir $w.LP; New-GitDir $w.BP
   Put-File "$($w.BP)\HANDOFF.md" 'box handoff'
   $tg = Join-Path $w.W 'info-elsewhere'; New-InfoJunction $w.LP $tg "# user`n"
@@ -2139,7 +2146,7 @@ T 'nhanh r4: a note from the box when .git/info on the laptop is a junction: not
 }
 # F3 end to end: the ownership saved with the placement lets fcode give its line back once git tracks the name; the user's copy is never lost
 T 'nhanh r4: a note placed from the box, then committed on the box and fetched on the laptop: the line is given back, git shows the copy, refuses to overwrite it, the text stays' {
-  $w = New-W2 'q21'; Use-LoggedIb $w
+  $w = New-W2 'q21'; Use-LoggedSsh $w
   New-GitDir $w.LP; New-GitDir $w.BP
   $bo = Join-Path $w.W 'origin.git'; New-Origin $bo
   foreach ($d in $w.LP, $w.BP) { Fetch-Origin $d $bo; $ErrorActionPreference = 'Continue'; & git -C $d checkout -q -B main origin/main 2>&1 | Out-Null; $ErrorActionPreference = 'Stop' }
@@ -2165,7 +2172,7 @@ T 'nhanh r4: a note placed from the box, then committed on the box and fetched o
 }
 # F6: a quick run (20 s) never starts a batch of one file over 50 MB, nor the late top waiting for it
 T 'nhanh r4: a file over 50 MB is left to the auto run / fcode phien: the small sessions sync both ways, a log line names it, exit 0, silent; fcode phien sends it' {
-  $w = New-W2 'q18'; Use-LoggedIb $w
+  $w = New-W2 'q18'; Use-LoggedSsh $w
   $a = New-Sess $w.LS '0000000a-big8' $w.LP @('a'); Put-Big (Join-Path $a.Replace('.jsonl', '') 'huge.log') 60 58
   $b = New-Sess $w.LS 'ffffffff-sml8' $w.LP @('b')
   $c = New-Sess $w.BS 'cccccccc-box8' $w.BP @('c')
@@ -2181,7 +2188,7 @@ T 'nhanh r4: a file over 50 MB is left to the auto run / fcode phien: the small 
 }
 # F7: the hard bound. git answers check-ignore after 2 s; 12 notes make the local scan (one item) run far past the cap, so only the supervisor ends it
 T 'nhanh r4: a quick run still busy at cap + 10 s is ended for good with every child (git): exit 1, the failure line, logged; the next run syncs' {
-  $w = New-W2 'q22'; Use-LoggedIb $w
+  $w = New-W2 'q22'; Use-LoggedSsh $w
   New-GitDir $w.LP; New-GitDir $w.BP
   foreach ($i in 1..12) { Put-File "$($w.LP)\HANDOFF-$i.md" "n$i" }
   $realGit = (Get-Command git -CommandType Application | Select-Object -First 1).Source
@@ -2201,11 +2208,11 @@ T 'nhanh r4: a quick run still busy at cap + 10 s is ended for good with every c
 T 'nhanh r4: --nen waits first (35 s by default, more than the 30 s "being written" rule; FCODE_MOC_DELAY in tests), then syncs; --nen needs --nhanh' {
   $sd = $env:FCODE_MOC_DELAY; $env:FCODE_MOC_DELAY = $null
   try { Eq (Get-PhienNenDelaySec) 35 'the default wait'; Ok ((Get-PhienNenDelaySec) -gt 30) 'longer than the 30 s rule' } finally { $env:FCODE_MOC_DELAY = $sd }
-  $w = New-W2 'q23'; Use-LoggedIb $w
+  $w = New-W2 'q23'; Use-LoggedSsh $w
   [void](New-Sess $w.LS '23232323-nen1' $w.LP @('a'))
   $p = Invoke-Fcode $w @('phien', 'proj', '--nhanh', '--nen') @{ FCODE_MOC_DELAY = '4' } -NoWait
   try {
-    Start-Sleep -Seconds 2; Eq (IbCalls $w).Count 0 'nothing in the first 2 s, not even `instabox ls`'
+    Start-Sleep -Seconds 2; Eq (SshCalls $w).Count 0 'nothing in the first 2 s, not even the reachability check'
     Ok ($p.WaitForExit(40000)) 'it ends'; Eq $p.ExitCode 0 'exit 0'
   } finally { $p.Dispose() }
   Eq (BoxSessions $w) 1 'then it synced'
@@ -2219,7 +2226,7 @@ function Get-RunTree([int]$Top, [datetime]$Since) {
   , @($found | Where-Object { $_.Name -ne 'conhost.exe' } | ForEach-Object { "$($_.Name) $($_.ProcessId)" })
 }
 T 'nhanh r4: the supervisor killed at any moment (before its job, while the worker starts, mid-send): 2 s later nothing of the run is alive, nothing is half-placed' {
-  $w = New-W2 'q24'; Use-LoggedIb $w
+  $w = New-W2 'q24'; Use-LoggedSsh $w
   $a = New-Sess $w.LS 'aaaa2424-sup1' $w.LP @('a'); Grow-Sess $a 5
   foreach ($k in 0, 60, 150, 400, 1500, -1) {
     $ev = @{ FCODE_PHIEN_CAP_SEC = '60' }
@@ -2243,7 +2250,7 @@ T 'nhanh r4: the supervisor killed at any moment (before its job, while the work
 # ---- r5: ownership is saved for sure before the line; a release that could not remove the line keeps it; Write-PhienText leftovers ----
 # r6 T4: ownership needs no record (the pair is written with the note); a state file that cannot be written still stops the run with the failure line
 T 'nhanh r5: handoff-state.json cannot be written: the note from the box is placed with its pair; exit 1, the failure line, the reason logged; writable again: the sha is saved' {
-  $w = New-W2 'q25'; Use-LoggedIb $w
+  $w = New-W2 'q25'; Use-LoggedSsh $w
   New-GitDir $w.LP; New-GitDir $w.BP
   Put-File "$($w.BP)\HANDOFF.md" 'box handoff'
   $sf = Join-Path $w.U 'AppData\Local\fcode\handoff-state.json'; Put-File $sf '{}'
@@ -2262,7 +2269,7 @@ T 'nhanh r5: handoff-state.json cannot be written: the note from the box is plac
   Ok ($null -ne (Get-Content $sf -Raw | ConvertFrom-Json).PSObject.Properties['proj/HANDOFF.md']) 'and the sha record saved'
 }
 T 'nhanh r5: a release whose exclude line cannot be removed (.git/info became a link) says so, exit 1, nothing written through the link; once fixed the next run removes the pair' {
-  $w = New-W2 'q26'; Use-LoggedIb $w
+  $w = New-W2 'q26'; Use-LoggedSsh $w
   New-GitDir $w.LP; New-GitDir $w.BP
   $bo = Join-Path $w.W 'origin.git'; New-Origin $bo
   foreach ($d in $w.LP, $w.BP) { Fetch-Origin $d $bo; $ErrorActionPreference = 'Continue'; & git -C $d checkout -q -B main origin/main 2>&1 | Out-Null; $ErrorActionPreference = 'Stop' }
@@ -2292,7 +2299,7 @@ T 'nhanh r5: a release whose exclude line cannot be removed (.git/info became a 
 }
 # r6 T-L3a (Rule L): only fcode's complete generated names are deleted, on both machines; a lookalike name is never touched however old
 T 'nhanh r6: lookalike names are never deleted; fcode''s own dead names are (laptop and box)' {
-  $w = New-W2 'q27'; Use-LoggedIb $w
+  $w = New-W2 'q27'; Use-LoggedSsh $w
   New-GitDir $w.LP; New-GitDir $w.BP; [void](New-Sess $w.LS '27272727-lft1' $w.LP @('a'))
   Put-File "$($w.BP)\HANDOFF.md" 'box handoff'   # placed on the laptop: the laptop exclude is written in this run
   $gone = Start-Process -FilePath $env:ComSpec -ArgumentList '/c', 'exit' -WindowStyle Hidden -PassThru; $gone.WaitForExit(); $dp = $gone.Id
@@ -2317,7 +2324,7 @@ T 'nhanh r6: lookalike names are never deleted; fcode''s own dead names are (lap
 }
 # r6 T-L3b: a linked worktree (.git is a file): the exclude file and its leftovers are at the path git names (the main repo's .git\info)
 T 'nhanh r6: a project that is a linked worktree: the note is excluded at the path git names and a dead run''s part file there is swept' {
-  $w = New-W2 'q28'; Use-LoggedIb $w
+  $w = New-W2 'q28'; Use-LoggedSsh $w
   $main = Join-Path $w.W 'main repo'; New-GitDir $main; New-GitDir $w.BP
   $ErrorActionPreference = 'Continue'
   & git -C $main -c user.name=t -c user.email=t@t commit -q --allow-empty -m x 2>&1 | Out-Null
@@ -2339,7 +2346,7 @@ function Set-NoteState($w, [hashtable]$S) { Put-File (Join-Path $w.U 'AppData\Lo
 function Get-DeadPid { $g = Start-Process -FilePath $env:ComSpec -ArgumentList '/c', 'exit' -WindowStyle Hidden -PassThru; $g.WaitForExit(); $g.Id }
 # r6 T-L5: the state file is read strictly; a broken one stops the run before any change (and names the file)
 T 'nhanh r6: a handoff-state.json that is not a JSON object stops the run before anything is changed' {
-  $w = New-W2 'q29'; Use-LoggedIb $w
+  $w = New-W2 'q29'; Use-LoggedSsh $w
   New-GitDir $w.LP; New-GitDir $w.BP
   Put-File "$($w.BP)\HANDOFF.md" 'box handoff'
   $sf = Join-Path $w.U 'AppData\Local\fcode\handoff-state.json'; $exf = "$($w.LP)\.git\info\exclude"; $ex0 = Read-Bytes $exf
@@ -2357,7 +2364,7 @@ T 'nhanh r6: a handoff-state.json that is not a JSON object stops the run before
 }
 # r6 T-L2a: a 1.3.2/1.3.3 record whose line is not there any more ('absent') is forgotten by the release, exit 0
 T 'nhanh r6: a legacy record whose line the user already removed: the release forgets it, exit 0' {
-  $w = New-W2 'q30'; Use-LoggedIb $w
+  $w = New-W2 'q30'; Use-LoggedSsh $w
   New-GitDir $w.LP; New-GitDir $w.BP
   $bo = Join-Path $w.W 'origin.git'; New-Origin $bo; Push-Origin $bo 'HANDOFF.md' 'in git'; Fetch-Origin $w.LP $bo
   Put-File "$($w.LP)\HANDOFF.md" 'laptop copy'
@@ -2369,7 +2376,7 @@ T 'nhanh r6: a legacy record whose line the user already removed: the release fo
 }
 # r6 T3: ownership comes from the box's own file, never from a reply: a lost reply cannot turn the user's line into fcode's
 T 'nhanh r6: a put whose reply is lost, onto a box that already had the user''s own /HANDOFF.md line: no ownership, the user''s line is never removed' {
-  $w = New-W2 'q31'; Use-LoggedIb $w
+  $w = New-W2 'q31'; Use-LoggedSsh $w
   New-GitDir $w.LP; New-GitDir $w.BP
   $bex = "$($w.BP)\.git\info\exclude"; [IO.File]::WriteAllText($bex, "# mine`n/HANDOFF.md`n"); $b0 = Read-Bytes $bex
   Put-File "$($w.LP)\HANDOFF.md" 'laptop handoff'
@@ -2385,7 +2392,7 @@ T 'nhanh r6: a put whose reply is lost, onto a box that already had the user''s 
 }
 # r6 T5: 1.3.2/1.3.3 lines (bare, remembered by a record) are released by the record on both machines; a link keeps the record
 T 'nhanh r6: lines of 1.3.2/1.3.3 (bare, with a record) are still released by the record (laptop and box); a linked .git/info keeps it' {
-  $w = New-W2 'q32'; Use-LoggedIb $w
+  $w = New-W2 'q32'; Use-LoggedSsh $w
   New-GitDir $w.LP; New-GitDir $w.BP
   $n = 'HANDOFF-legacy.md'; $user = "# mine`n/$n`n/keep`n"
   $bo = Join-Path $w.W 'origin.git'; New-Origin $bo; Push-Origin $bo $n 'in git'; Fetch-Origin $w.LP $bo
@@ -2414,7 +2421,7 @@ T 'nhanh r6: lines of 1.3.2/1.3.3 (bare, with a record) are still released by th
 }
 # r6 T6 (O5): a release the box could not do is a failure; nothing is forgotten; the pair is still there for the next run
 T 'nhanh r6: the box cannot find its exclude file during a release: failure line, exit 1, nothing forgotten; fixed: removed' {
-  $w = New-W2 'q33'; Use-LoggedIb $w 'gitbreak'
+  $w = New-W2 'q33'; Use-LoggedSsh $w 'gitbreak'
   New-GitDir $w.LP; New-GitDir $w.BP
   Put-File "$($w.LP)\HANDOFF-lap.md" 'from laptop'
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
@@ -2468,7 +2475,7 @@ T 'notes r6: the box rewrites .git/info/exclude atomically and sweeps only its o
 }
 # r6 T8: both machines edit .git/info/exclude as bytes, keeping the file's newline; the pattern is the note name's UTF-8 bytes (what git reads)
 T 'nhanh r6: .git/info/exclude is edited as bytes on both machines: CRLF, a Latin-1 byte and a Vietnamese note name survive add + remove' {
-  $w = New-W2 'q35'; Use-LoggedIb $w
+  $w = New-W2 'q35'; Use-LoggedSsh $w
   New-GitDir $w.LP; New-GitDir $w.BP
   $lat = [Text.Encoding]::GetEncoding(28591)
   $orig = $lat.GetBytes("# mine`r`n/caf" + [char]0xE9 + ".txt`r`n/keep`r`n")
@@ -2490,7 +2497,7 @@ T 'nhanh r6: .git/info/exclude is edited as bytes on both machines: CRLF, a Lati
 # r6 T10: an exclude file that cannot be read means no note work for that project this run (never "no line of ours"), then the release
 T 'nhanh r6: an exclude file that cannot be read: no note work for that project this run, then the release (laptop and box)' {
   # laptop: the pair from a placement, the name then tracked on the box (fetched)
-  $w = New-W2 'q36'; Use-LoggedIb $w
+  $w = New-W2 'q36'; Use-LoggedSsh $w
   New-GitDir $w.LP; New-GitDir $w.BP
   Put-File "$($w.BP)\HANDOFF.md" 'box text'
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
@@ -2505,7 +2512,7 @@ T 'nhanh r6: an exclude file that cannot be read: no note work for that project 
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
   Ok ((Get-Content $exf -Raw) -notmatch 'HANDOFF') 'unlocked: released'
   # box: the pair on the box, the name then tracked on the laptop, and a new laptop note waiting
-  $w = New-W2 'q37'; Use-LoggedIb $w
+  $w = New-W2 'q37'; Use-LoggedSsh $w
   New-GitDir $w.LP; New-GitDir $w.BP
   Put-File "$($w.LP)\HANDOFF-lap.md" 'from laptop'
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
@@ -2521,7 +2528,7 @@ T 'nhanh r6: an exclude file that cannot be read: no note work for that project 
 }
 # r7 R2-2: git answers `ls-files` but not `rev-parse --git-path` (exit 128): no note work for that project this run, on either direction, nothing written
 T 'nhanh r7: a git whose rev-parse --git-path fails after ls-files answered: no note work for that project this run, nothing written; the next run works' {
-  $w = New-W2 'q38'; Use-LoggedIb $w
+  $w = New-W2 'q38'; Use-LoggedSsh $w
   New-GitDir $w.LP; New-GitDir $w.BP
   Put-File "$($w.LP)\HANDOFF-lap.md" 'from laptop'; Put-File "$($w.BP)\HANDOFF-box.md" 'from box'
   $lex = "$($w.LP)\.git\info\exclude"; $bex = "$($w.BP)\.git\info\exclude"; $l0 = Read-Bytes $lex; $b0 = Read-Bytes $bex
@@ -3043,14 +3050,14 @@ print(m['git'](d, '-c', 'alias.e=!printf %s "$LC_ALL"', 'e').stdout == b'C')
 # r12 e2e (release 1.3.6): two projects on one repository (linked work trees) share one .git/info/exclude on each side
 function Git-Seed([string]$Dir) { $ErrorActionPreference = 'Continue'; & git -C $Dir -c user.name=t -c user.email=t@t commit -q --allow-empty -m seed 2>&1 | Out-Null }
 function Add-Wt([string]$Repo, [string]$Path, [string]$Branch) { $ErrorActionPreference = 'Continue'; & git -C $Repo worktree add -q $Path -b $Branch 2>&1 | Out-Null; if ($LASTEXITCODE -ne 0) { throw "git worktree add $Path failed" } }
-function Set-SyncRepos($w, [string[]]$Repos) { $cp = Join-Path $w.U '.fcode\config.json'; $c = Get-Content $cp -Raw | ConvertFrom-Json; [IO.File]::WriteAllText($cp, (@{ instabox = $c.instabox; box = $c.box; syncRepos = @($Repos) } | ConvertTo-Json -Compress)) }
+function Set-SyncRepos($w, [string[]]$Repos) { $cp = Join-Path $w.U '.fcode\config.json'; $c = Get-Content $cp -Raw | ConvertFrom-Json; [IO.File]::WriteAllText($cp, (@{ ssh = $c.ssh; host = $c.host; syncRepos = @($Repos) } | ConvertTo-Json -Compress)) }
 function Pair-Count([string]$File, [string]$Name) { [regex]::Matches((Latin $File), '(?m)^# fcode\r?\n/' + [regex]::Escape($Name) + '\r?$').Count }
 function Kept-Rx([string]$Proj, [string]$File, [string]$Side) { '(?m)  \[' + $Proj + '\] ghi chú ' + [regex]::Escape($File) + ': dự án khác cùng kho trên ' + $Side + ' còn dùng dòng giấu /' + [regex]::Escape($File) + ', fcode chưa gỡ\r?$' }
 function Ign-Rc([string]$Dir, [string]$Name) { $ErrorActionPreference = 'Continue'; & git -C $Dir check-ignore -q -- $Name 2>&1 | Out-Null; $LASTEXITCODE }
 # a world with project proj and project other as linked work trees of one repository on BOTH sides; -Junction: the laptop project is registered
 # through a junction alias (Desk2 -> Desktop)
 function New-ShareWorld([string]$Name, [switch]$Junction) {
-  $w = New-W2 $Name; Use-LoggedIb $w
+  $w = New-W2 $Name; Use-LoggedSsh $w
   New-GitDir $w.LP; New-GitDir $w.BP; Git-Seed $w.LP; Git-Seed $w.BP
   $w | Add-Member -NotePropertyName LO -NotePropertyValue (Join-Path $w.U 'Desktop\other') -Force
   $w | Add-Member -NotePropertyName BO -NotePropertyValue (($w.W -replace '\\', '/') + '/boxws/other') -Force
@@ -3130,7 +3137,7 @@ T 'nhanh r12: laptop side: both work trees released in one run: no kept line, th
   Eq (Pair-Count $lex 'TASK.md') 0 'the pair is gone'; Ok ((Test-Path "$($w.LP)\TASK.md") -and (Test-Path "$($w.LO)\TASK.md")) 'both laptop copies are kept'
 }
 T 'nhanh r12: quick run, two laptop checkouts with the same folder name: the one the run does not scan still counts (syncRepos is walked, not the project list)' {
-  $w = New-W2 'q45'; Use-LoggedIb $w
+  $w = New-W2 'q45'; Use-LoggedSsh $w
   New-GitDir $w.LP; New-GitDir $w.BP; Git-Seed $w.LP; Git-Seed $w.BP
   $a = Join-Path $w.U 'A\proj'; [void](New-Item -ItemType Directory -Path (Split-Path $a) -Force); Add-Wt $w.LP $a 'wta'
   Set-SyncRepos $w @($a, $w.LP)
@@ -3318,7 +3325,7 @@ print(m['ensure_excluded'](d, name), open(p, 'rb').read() == pair, m['place_note
   Eq ($out -join ',') 'False True failed False True,False True,False True,True True ok True' 'a negated name is never placed (the user''s line untouched, no duplicate pair); once git hides it, it is placed'
 }
 T 'nhanh r9: a .gitignore negation on the laptop (!HANDOFF.md) outranks the pair: the note from the box is not placed until the negation is gone' {
-  $w = New-W2 'q40'; Use-LoggedIb $w
+  $w = New-W2 'q40'; Use-LoggedSsh $w
   New-GitDir $w.LP; New-GitDir $w.BP
   [IO.File]::WriteAllText("$($w.LP)\.gitignore", "!HANDOFF.md`n"); Put-File "$($w.BP)\HANDOFF.md" 'box handoff'
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh'); Eq $r.Code 0 $r.Out
@@ -3332,7 +3339,7 @@ T 'nhanh r9: a .gitignore negation on the laptop (!HANDOFF.md) outranks the pair
 }
 # r8: an OSError of ensure_excluded in the put's ensure loop is a False, not a traceback: the reply is still sent, the run does not fail as a whole
 T 'nhanh r8: the box cannot read its exclude file in the put''s ensure step (it is a folder): the put still answers, exit 0' {
-  $w = New-W2 'q39'; Use-LoggedIb $w 'exclbreak'
+  $w = New-W2 'q39'; Use-LoggedSsh $w 'exclbreak'
   New-GitDir $w.LP; New-GitDir $w.BP
   Put-File "$($w.LP)\HANDOFF.md" 'same text'; Put-File "$($w.BP)\HANDOFF.md" 'same text'
   $r = Invoke-Fcode $w @('phien', 'proj', '--nhanh') @{ FAKE_BP = ($w.BP -replace '/', '\') }
@@ -3534,7 +3541,7 @@ T 'moc hook: project is found by the folder you are in (nested, longest path, ca
   foreach ($x in 'proj\a\b', 'proj\sub\z', 'proj2', 'Mixed\child', 'x\app', 'y\app', 'New folder (2)\q') { [void](New-Item -ItemType Directory -Path (Join-Path $d $x) -Force) }
   # the nested repo is listed BEFORE its parent: a "last match wins" rule would pick the parent and fail the 'longest' case
   $repos = @((Join-Path $w.LP 'sub'), $w.LP, (($d + '\MIXED\') -replace '\\', '/'), (Join-Path $d 'x\app'), (Join-Path $d 'y\app'), (Join-Path $d 'New folder (2)'))
-  [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ instabox = $Cmd; box = 'coder'; syncRepos = $repos } | ConvertTo-Json -Compress))
+  [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ ssh = $Cmd; host = 'oracle'; syncRepos = $repos } | ConvertTo-Json -Compress))
   [void](Moc $w 'bat'); $b = New-MocBin $w
   $cases = @(@('root', 'proj', 'proj'), @('nested', 'proj\a\b', 'proj'), @('longest', 'proj\sub\z', 'sub'), @('sibling', 'proj2', ''), @('case', 'Mixed\child', 'mixed'),
     @('dupfirst', 'x\app', 'app'), @('dupsecond', 'y\app', ''), @('badname', 'New folder (2)\q', ''), @('outside', '', ''))
@@ -3706,16 +3713,17 @@ T 'alias e2e: the project list shows "alias (real name)"' {
   Ok ($r.Out -match "Có: Dự án \(proj\), other, notonbox") ("list; out: " + $r.Out)
   Ok ($r.Out.IndexOf([char]27) -lt 0) 'no escape code reaches the screen'
 }
-# the bare form (fcode <name>) opens an interactive ssh: a stub instabox logs the script it would run and passes everything else to the fake box
-function Use-BareIb($w) {
+# the bare form (fcode <name>) opens an interactive ssh: a stub ssh logs the script it would run and passes everything else to the fake box
+function Use-BareSsh($w) {
   $py = Join-Path $w.W 'ib-bare.py'; $cmd = Join-Path $w.W 'ib-bare.cmd'; $w | Add-Member -NotePropertyName BareLog -NotePropertyValue (Join-Path $w.W 'bare.log') -Force
-  $fake = Join-Path $PSScriptRoot 'fake-instabox.py'
+  $fake = Join-Path $PSScriptRoot 'fake-ssh.py'
   # BARE_FAIL=<word>,<word>: a call whose word is one of these exits 78 (the box script found no session of that name); BARE_DROP: exits 255 (the ssh dropped)
   $src = @'
 import base64, os, re, subprocess, sys
 a = sys.argv[1:]
-if a and a[0] == 'ssh' and 'base64 -d' in a[-1] and 'python3' not in a[-1]:
+if 'base64 -d' in a[-1] and 'python3' not in a[-1]:
     open(os.environ['BARE_LOG'], 'a', encoding='utf-8').write(a[-1] + '\n')
+    open(os.environ['BARE_LOG'] + '.argv', 'a', encoding='utf-8').write(' '.join(a[:-1]) + '\n')   # the options and the host, as fcode gave them
     t = base64.b64decode(re.search(r'echo (\S+) \|', a[-1]).group(1)).decode('utf-8')
     w = re.search(r"(?m)^set -- '(.*)'", t).group(1)
     sys.exit(78 if w in os.environ.get('BARE_FAIL', '').split(',') else 255 if w in os.environ.get('BARE_DROP', '').split(',') else 0)
@@ -3723,7 +3731,7 @@ sys.exit(subprocess.call([sys.executable, r'@@FAKE@@'] + a))
 '@
   [IO.File]::WriteAllText($py, $src.Replace('@@FAKE@@', $fake), $utf8)
   [IO.File]::WriteAllText($cmd, "@echo off`r`npython `"$py`" %*`r`nexit /b %errorlevel%`r`n")
-  [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ instabox = $cmd; box = 'coder'; syncRepos = @($w.LP, (Join-Path $w.U 'Desktop\other'), (Join-Path $w.U 'Desktop\notonbox')) } | ConvertTo-Json -Compress))
+  [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ ssh = $cmd; host = 'oracle'; syncRepos = @($w.LP, (Join-Path $w.U 'Desktop\other'), (Join-Path $w.U 'Desktop\notonbox')) } | ConvertTo-Json -Compress))
 }
 function Get-BareArgs($w) {   # the word each bare call put in `set -- '<word>'` at the head of the script it sent to the box
   if (-not (Test-Path $w.BareLog)) { return @() }
@@ -3733,13 +3741,54 @@ function Get-BareArgs($w) {   # the word each bare call put in `set -- '<word>'`
     [regex]::Match($t, "(?m)^set -- '(.*)'").Groups[1].Value })
 }
 T 'alias e2e: the bare form turns an alias into the real name before the script goes to the box; a number, a session name and a real name go through as typed' {
-  $w = New-W2 'al6'; Use-BareIb $w; Set-AliasCache $w '{"order":[],"aliases":{"proj":"my proj"}}'
+  $w = New-W2 'al6'; Use-BareSsh $w; Set-AliasCache $w '{"order":[],"aliases":{"proj":"my proj"}}'
   foreach ($a in 'my proj', 'MY PROJ', 'proj', '2', 'omp-1') { $r = Invoke-Fcode $w @($a) @{ BARE_LOG = $w.BareLog }; Eq $r.Code 0 "[$a] $($r.Out)" }
   Eq ((Get-BareArgs $w) -join '|') 'proj|proj|proj|2|omp-1'
   Eq (Calls $w 'projects') 0 'the cache was there: no extra call'
 }
+T 'bare form: `ssh -q -tt <host> <script>` with the host from config (default oracle), FCODE_HOST wins; `--list` has no tty option; no wake, no instabox' {
+  $w = New-W2 'al6h'; Use-BareSsh $w; Set-AliasCache $w '{"order":[],"aliases":{}}'
+  $r = Invoke-Fcode $w @('omp-1') @{ BARE_LOG = $w.BareLog }; Eq $r.Code 0 $r.Out
+  $r = Invoke-Fcode $w @('omp-2') @{ BARE_LOG = $w.BareLog; FCODE_HOST = 'oracle-ubuntu' }; Eq $r.Code 0 $r.Out
+  $r = Invoke-Fcode $w @('--list') @{ BARE_LOG = $w.BareLog }; Eq $r.Code 0 $r.Out
+  Eq ((Get-Content ($w.BareLog + '.argv')) -join '|') '-q -tt oracle|-q -tt oracle-ubuntu|oracle'
+  $cfg = Join-Path $w.U '.fcode\config.json'; $c = Get-Content $cfg -Raw | ConvertFrom-Json
+  [IO.File]::WriteAllText($cfg, (@{ ssh = $c.ssh; host = 'other-alias'; box = 'ignored'; syncRepos = @($w.LP) } | ConvertTo-Json -Compress))
+  Remove-Item ($w.BareLog + '.argv')
+  $env:FCODE_BOX = 'ignored-too'
+  try { $r = Invoke-Fcode $w @('omp-3') @{ BARE_LOG = $w.BareLog }; Eq $r.Code 0 $r.Out } finally { Remove-Item Env:\FCODE_BOX }
+  Eq ((Get-Content ($w.BareLog + '.argv')) -join '|') '-q -tt other-alias' 'config host is used; config box and FCODE_BOX are not'
+}
+T 'phien: the reachability check is `ssh -o BatchMode=yes -o ConnectTimeout=8 <host> true`, the sync calls are `ssh -o BatchMode=yes <host> <command>`; FCODE_HOST picks the host' {
+  $w = New-W2 'q1h'
+  $argv = Join-Path $w.W 'argv.log'
+  [void](New-Sess $w.LS '11111111-argv' $w.LP @('a'))
+  $r = Invoke-Fcode $w @('phien', '--tu-dong') @{ FAKE_ARGV_LOG = $argv }; Eq $r.Code 0 $r.Out
+  $l = @(Get-Content $argv)
+  Eq $l[0] '-o BatchMode=yes -o ConnectTimeout=8 oracle true' 'the reachability check, the default host'
+  Ok ($l.Count -ge 2 -and (@($l[1..($l.Count - 1)] | Where-Object { $_ -ne '-o BatchMode=yes oracle CMD' }).Count -eq 0)) ('the sync calls: ' + ($l -join ' / '))
+  Remove-Item $argv
+  $r = Invoke-Fcode $w @('phien', '--tu-dong') @{ FAKE_ARGV_LOG = $argv; FCODE_HOST = 'oracle-ubuntu' }; Eq $r.Code 0 $r.Out
+  Eq (@(Get-Content $argv)[0]) '-o BatchMode=yes -o ConnectTimeout=8 oracle-ubuntu true' 'FCODE_HOST wins'
+}
+T 'host r1: a host that ssh would read as an option or that holds odd characters is refused once, at the source, for every command: exit 1, message, no ssh at all' {
+  $w = New-W2 'h1'; Use-LoggedSsh $w
+  [void](New-Sess $w.LS '11111111-host' $w.LP @('a'))
+  foreach ($bad in '-oProxyCommand=calc.exe', 'a b', 'a"b', 'oracle;id', '.oracle', 'a/b') {
+    foreach ($cmd in @('phien', '--tu-dong'), @('phien', 'proj', '--nhanh'), @('add', 'owner/repo'), @('omp-1'), @('--list')) {
+      $r = Invoke-Fcode $w $cmd @{ FCODE_HOST = $bad }
+      Eq $r.Code 1 (($cmd -join ' ') + ' with host ' + $bad + ': ' + $r.Out)
+      Ok ($r.Out -match 'tên box không hợp lệ') ('message: ' + $r.Out)
+    }
+  }
+  Eq (SshCalls $w).Count 0 'no ssh was started'
+  $cfg = Join-Path $w.U '.fcode\config.json'; $c = Get-Content $cfg -Raw | ConvertFrom-Json
+  [IO.File]::WriteAllText($cfg, (@{ ssh = $c.ssh; host = '-oProxyCommand=calc.exe'; syncRepos = @($w.LP) } | ConvertTo-Json -Compress))
+  $r = Invoke-Fcode $w @('phien', '--tu-dong'); Eq $r.Code 1 $r.Out; Ok ($r.Out -match 'tên box không hợp lệ') 'the config host is checked too'
+  Eq (SshCalls $w).Count 0 'no ssh from the config host either'
+}
 T 'alias e2e: the bare form with no cache asks the box once, then never again' {
-  $w = New-W2 'al7'; Use-BareIb $w; Set-BoxPrefs $w '{"order":[],"aliases":{"proj":"pj"}}'
+  $w = New-W2 'al7'; Use-BareSsh $w; Set-BoxPrefs $w '{"order":[],"aliases":{"proj":"pj"}}'
   $r = Invoke-Fcode $w @('pj') @{ BARE_LOG = $w.BareLog }; Eq $r.Code 0 $r.Out
   Eq (Calls $w 'projects') 1 'the first call learns the aliases'
   $r = Invoke-Fcode $w @('omp-1') @{ BARE_LOG = $w.BareLog }; Eq $r.Code 0 $r.Out
@@ -3747,7 +3796,7 @@ T 'alias e2e: the bare form with no cache asks the box once, then never again' {
   Eq ((Get-BareArgs $w) -join '|') 'proj|omp-1'
 }
 T 'alias e2e: the bare form asks the box once for a word that can only be an alias, then refuses it; no script goes to the box' {
-  $w = New-W2 'al8'; Use-BareIb $w; Set-AliasCache $w '{"order":[],"aliases":{"proj":"pj"}}'
+  $w = New-W2 'al8'; Use-BareSsh $w; Set-AliasCache $w '{"order":[],"aliases":{"proj":"pj"}}'
   $r = Invoke-Fcode $w @('a b') @{ BARE_LOG = $w.BareLog }; Eq $r.Code 1 $r.Out
   Ok ($r.Out -match "Không hiểu lệnh 'a b'") $r.Out
   Eq (@(Get-BareArgs $w).Count) 0 'nothing was sent'
@@ -3779,7 +3828,7 @@ T 'alias e2e: the box reads prefs.json by the server''s lenient rules: known pro
   Eq ($c.names -join ',') 'proj,other,zeta,p4,p5,p6,p7' 'the real names, in config order'
 }
 T 'alias e2e: a project added later takes a name that was an alias: the real name wins (bare form and phien)' {
-  $w = New-W2 'al10'; Use-BareIb $w; Set-BoxCfg $w @('web', 'beta'); Set-BoxPrefs $w '{"aliases":{"beta":"web"}}'
+  $w = New-W2 'al10'; Use-BareSsh $w; Set-BoxCfg $w @('web', 'beta'); Set-BoxPrefs $w '{"aliases":{"beta":"web"}}'
   $r = Invoke-Fcode $w @('web') @{ BARE_LOG = $w.BareLog }; Eq $r.Code 0 $r.Out
   Eq ((Get-BareArgs $w) -join '|') 'web' 'the box dropped the alias: web is web'
   Ok ((Get-AliasCache $w) -notmatch '"beta":"web"') 'and the cache has none'
@@ -3806,7 +3855,7 @@ T 'alias e2e: fcode phien <alias> (or the box name) works when the laptop folder
   $ld = Join-Path $w.U 'Desktop\FCode'; New-GitDir $ld; & git -C $ld remote add origin https://github.com/Owner/Proj.git
   New-GitDir $w.BP; & git -C $w.BP remote add origin git@github-proj:owner/proj.git
   [IO.File]::WriteAllText($w.Cfg, (@{ projects = @{ proj = $w.BP } } | ConvertTo-Json -Compress))
-  [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ instabox = $Cmd; box = 'coder'; syncRepos = @($ld) } | ConvertTo-Json -Compress))
+  [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ ssh = $Cmd; host = 'oracle'; syncRepos = @($ld) } | ConvertTo-Json -Compress))
   Set-BoxPrefs $w '{"aliases":{"proj":"App"}}'
   $lsd = Join-Path $w.U ('.omp\agent\sessions\' + (Get-OmpEncodedDir $ld $w.U (Join-Path $w.U 'AppData\Local\Temp')))
   $a = New-Sess $lsd 'abcdabcd-al11' $ld @('a')
@@ -3897,7 +3946,7 @@ T 'alias e2e: project names that differ only in case cannot break the scan reply
   Eq (@(((Get-AliasCache $w) | ConvertFrom-Json).aliases.PSObject.Properties.Name | Sort-Object) -join ',') 'Alpha,proj'
 }
 T 'alias e2e: the bare form asks the box once for a word the box does not know, even with a cache; an alias set after the cache is found; a session the box knows asks nothing' {
-  $w = New-W2 'al13'; Use-BareIb $w; Set-AliasCache $w '{"order":[],"names":["proj","other"],"aliases":{},"repos":{}}'
+  $w = New-W2 'al13'; Use-BareSsh $w; Set-AliasCache $w '{"order":[],"names":["proj","other"],"aliases":{},"repos":{}}'
   Set-BoxPrefs $w '{"aliases":{"proj":"pj"}}'
   $e = @{ BARE_LOG = $w.BareLog; BARE_FAIL = 'pj,omp-9' }
   $r = Invoke-Fcode $w @('omp-1') $e; Eq $r.Code 0 $r.Out
@@ -3912,8 +3961,8 @@ T 'alias e2e: the bare form asks the box once for a word the box does not know, 
   $r = Invoke-Fcode $w @('my proj') $e; Eq $r.Code 0 $r.Out
   Eq (@(Get-BareArgs $w) | Select-Object -Last 1) 'proj' 'a word with a space can only be an alias: asked before the first script'
 }
-T 'alias e2e: a dropped ssh (255) or any other failure is not "no such session": the bare form does not wake the box or ask it; the user sees the exit code' {
-  $w = New-W2 'al14'; Use-BareIb $w; Set-AliasCache $w '{"order":[],"names":["proj"],"aliases":{},"repos":{}}'
+T 'alias e2e: a dropped ssh (255) or any other failure is not "no such session": the bare form does not ask the box; the user sees the exit code' {
+  $w = New-W2 'al14'; Use-BareSsh $w; Set-AliasCache $w '{"order":[],"names":["proj"],"aliases":{},"repos":{}}'
   Set-BoxPrefs $w '{"aliases":{"proj":"pj"}}'
   $r = Invoke-Fcode $w @('pj') @{ BARE_LOG = $w.BareLog; BARE_DROP = 'pj' }
   Eq $r.Code 255 $r.Out

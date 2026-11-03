@@ -23,6 +23,7 @@
    - [Đồng bộ phiên chat omp giữa laptop và box (`fcode phien`)](#đồng-bộ-phiên-chat-omp-giữa-laptop-và-box-fcode-phien)
    - [Tự đồng bộ khi mở agent (`fcode moc`)](#tự-đồng-bộ-khi-mở-agent-fcode-moc)
    - [Cài lệnh fcode trên máy Windows khác](#cài-lệnh-fcode-trên-máy-windows-khác)
+   - [Kết nối box (ssh)](#kết-nối-box-ssh)
 9. [Bảo mật](#9-bảo-mật)
 10. [Phát triển](#10-phát-triển)
 
@@ -416,11 +417,11 @@ fcode-deploy <tên> trust off
 Mọi phiên là phiên tmux thật trên box, nên bạn vào cùng phiên với điện thoại từ laptop và thấy đúng những gì điện thoại thấy:
 
 ```sh
-instabox ssh <tên-box> -- tmux ls
-instabox ssh <tên-box> -- -tt tmux -u attach -t <tên-phiên>
+ssh oracle tmux ls
+ssh -tt oracle tmux -u attach -t <tên-phiên>
 ```
 
-`-tt` (đặt trước `tmux`) bắt ssh mở một màn hình thật; thiếu nó, tmux báo `open terminal failed: not a terminal`. `-u` để chữ tiếng Việt hiện đúng.
+`-tt` (đặt trước tên máy `oracle`) bắt ssh mở một màn hình thật; thiếu nó, tmux báo `open terminal failed: not a terminal`. `-u` để chữ tiếng Việt hiện đúng.
 
 Để thoát mà **không tắt** phiên: bấm **Ctrl+B**, thả ra rồi bấm **D**.
 
@@ -430,16 +431,16 @@ Khi điện thoại mở một phiên, app đặt kích thước cửa sổ tmux
 - Hoặc từ laptop:
 
   ```sh
-  instabox ssh <tên-box> -- tmux set-option -wu -t <tên-phiên> window-size
+  ssh oracle tmux set-option -wu -t <tên-phiên> window-size
   ```
 
 Đừng gõ lệnh này vào ô chat của omp, Claude Code hay Codex: nó sẽ được gửi cho trợ lý như một tin nhắn. Lần sau điện thoại mở lại phiên, kích thước lại theo điện thoại.
 
 ### Lệnh `fcode` (tùy chọn)
 
-Lệnh `fcode` nằm trong thư mục `laptop/` của kho mã này, chạy trên PowerShell hoặc cmd của Windows và không bắt buộc. Để vào phiên, `fcode` gọi `instabox ssh` cho bạn; ngoài ra còn có `fcode new` (mở phiên mới), `fcode sync` (dùng git ngay trên laptop), `fcode ipa` (tải app về máy), `fcode add` (thêm dự án) và `fcode pair` (ghép iPhone mới). Cách cài nằm ngay bên dưới, ở mục [Cài lệnh fcode trên máy Windows khác](#cài-lệnh-fcode-trên-máy-windows-khác).
+Lệnh `fcode` nằm trong thư mục `laptop/` của kho mã này, chạy trên PowerShell hoặc cmd của Windows và không bắt buộc. Để vào phiên, `fcode` gọi `ssh` thẳng tới box cho bạn (tên ssh `oracle` trong `~/.ssh/config`); ngoài ra còn có `fcode new` (mở phiên mới), `fcode sync` (dùng git ngay trên laptop), `fcode ipa` (tải app về máy), `fcode add` (thêm dự án) và `fcode pair` (ghép iPhone mới). Cách cài nằm ngay bên dưới, ở mục [Cài lệnh fcode trên máy Windows khác](#cài-lệnh-fcode-trên-máy-windows-khác).
 
-Tên box và các thư mục mà `fcode sync` cập nhật nằm trong file `%USERPROFILE%\.fcode\config.json` (mục `box`, mặc định `coder`, và mục `syncRepos`). Biến môi trường `FCODE_BOX` chỉ dùng để đổi tên box tạm thời cho một lần chạy; `FCODE_SYNC_REPOS` cũng vậy cho danh sách thư mục.
+Tên ssh của box và các thư mục mà `fcode sync` cập nhật nằm trong file `%USERPROFILE%\.fcode\config.json` (mục `host`, mặc định `oracle`, và mục `syncRepos`). Biến môi trường `FCODE_HOST` chỉ dùng để đổi tên ssh tạm thời cho một lần chạy; `FCODE_SYNC_REPOS` cũng vậy cho danh sách thư mục.
 
 ```sh
 fcode           # liệt kê các phiên, gõ số để vào
@@ -514,7 +515,7 @@ Ghi chú ở thư mục gốc project: cùng lượt đồng bộ này chép hai
 - `[<dự án>] ghi chú <file>: dự án khác cùng kho trên <box|laptop> còn dùng dòng giấu /<file>, fcode chưa gỡ`: đây là thông báo, không phải lỗi (mã lỗi giữ nguyên): file đó đã vào git ở một dự án nhưng một dự án khác cùng kho vẫn còn bản chưa theo dõi được giấu nhờ dòng đó, nên fcode giữ dòng và hỏi lại ở mỗi lần chạy. Cách xử lý: xem điểm về hai dự án dùng chung `.git/info/exclude` ở trên (giữ bản cũ). Thông báo này chỉ hiện khi chắc chắn có dự án khác còn dùng dòng; nếu git lỗi hoặc không trả lời thì fcode báo lỗi (xem hai dòng lỗi ở trên). Chạy tay thì dòng hiện trên màn hình; lần nhanh và lần tự động chỉ ghi vào phien.log.
 - `[<thư mục>] không đọc được .git/info/exclude (<lý do>), bỏ qua ghi chú của dự án này lần này`: `<thư mục>` là đường dẫn thư mục dự án trên laptop, `<lý do>` là lời báo lỗi của PowerShell. Laptop không đọc được file đó (ví dụ phần mềm diệt virus đang giữ file). Ghi chú của dự án đó được bỏ qua trong lần này, phiên và các dự án khác vẫn đồng bộ, lần sau thử lại. Chạy tay thì dòng hiện trên màn hình; lần nhanh và lần tự động chỉ ghi vào phien.log. Box gặp chuyện tương tự thì cũng bỏ qua ghi chú của dự án đó lần này và không in dòng nào.
 
-Tự động và box nghỉ: box gói miễn phí tự nghỉ sau 30 phút không dùng, và mỗi lần mở kết nối tới box đều tính là có người dùng. Vì vậy tự động chạy kiểu thưa: mỗi 10 phút nó chỉ hỏi `instabox ls` xem box có đang chạy không (không bao giờ đánh thức box). Box không chạy thì thôi. `instabox ls` lỗi hoặc trả về thứ không đọc được thì lần đó bỏ qua, không kết nối box và không đổi trạng thái đã lưu. Box vừa chuyển từ nghỉ sang chạy thì đồng bộ ngay một lần. Còn lại, chỉ đồng bộ khi lần mở kết nối gần nhất (của lần tự động hoặc lần chạy tay; lần đồng bộ nhanh khi mở agent không tính) đã cách từ **40 phút** trở lên, tức là lâu hơn 30 phút box tự nghỉ, nên box không ai dùng vẫn luôn được nghỉ. Lần bị lỗi cũng chỉ chờ đến mốc 40 phút sau, không thử lại dồn dập. Cả hai chiều đều chia theo file thành từng đợt tối đa 50 MB (mỗi đợt một kết nối, gửi xong đợt này mới làm đợt sau), nên đường truyền chậm hoặc bị ngắt giữa chừng thì các đợt đã xong vẫn nằm ở máy nhận và lần sau chỉ làm tiếp phần còn lại, kể cả một phiên rất lớn. Thứ tự: các đợt thường (tối đa 50 MB) làm trước theo cả hai chiều, rồi từng file lớn hơn 50 MB đi riêng một đợt, file nhỏ trước. Một đợt lỗi thì được ghi chú và lần chạy vẫn tiếp tục; chỉ hết giờ hoặc mất kết nối box mới dừng cả lần chạy. File lớn chưa chép xong thì báo `phiên lớn: <file> chưa chép xong — chạy fcode phien khi mạng tốt`, không bao giờ báo thành công; chạy tay (15 phút mỗi kết nối) sẽ làm nốt. Lần chạy tự động có tổng thời gian tối đa 7 phút: hết giờ thì dừng kết nối đang treo và không bắt đầu đợt mới (chạy tay: tối đa 15 phút mỗi kết nối). Thay đổi ở laptop hoặc ở box nhờ vậy sang bên kia chậm nhất sau khoảng 40 phút; muốn ngay thì gõ `fcode phien`. File lớn hơn 50 MB không đi theo lần đồng bộ nhanh khi mở agent (lần đó chỉ ghi vào phien.log `phiên lớn: <file> — lần nhanh không chép, để lần tự động hoặc fcode phien`); lần tự động hoặc `fcode phien` chép file đó. Chạy tay và chạy tự động dùng chung một khóa nên không giẫm lên nhau (chạy tay chờ lượt tự động xong). Chạy thử `--thu` không chép gì nhưng vẫn ghi lại giờ kết nối box, vì kết nối đó cũng tính là dùng box. Lý do và kết quả ghi ở `%USERPROFILE%\.fcode\phien.log` (mỗi dòng ghi ngay kèm giờ; file quá 200 KB thì được đổi tên thành `phien.log.1`, là phần nhật ký cũ hơn, rồi `phien.log` mới bắt đầu).
+Tự động: để không đồng bộ liên tục, tự động chạy kiểu thưa: mỗi 10 phút nó chỉ hỏi box một câu rất nhẹ (`ssh -o BatchMode=yes -o ConnectTimeout=8 oracle true`) xem vào được không. Không vào được (mất mạng, box tắt, tên ssh sai) thì lần đó bỏ qua, không đồng bộ, không đổi trạng thái đã lưu và ghi một dòng vào phien.log. Vào được mà chưa có trạng thái nào (lần đầu) thì đồng bộ ngay một lần. Còn lại, chỉ đồng bộ khi lần mở kết nối gần nhất (của lần tự động hoặc lần chạy tay; lần đồng bộ nhanh khi mở agent không tính) đã cách từ **40 phút** trở lên. Lần bị lỗi cũng chỉ chờ đến mốc 40 phút sau, không thử lại dồn dập. Cả hai chiều đều chia theo file thành từng đợt tối đa 50 MB (mỗi đợt một kết nối, gửi xong đợt này mới làm đợt sau), nên đường truyền chậm hoặc bị ngắt giữa chừng thì các đợt đã xong vẫn nằm ở máy nhận và lần sau chỉ làm tiếp phần còn lại, kể cả một phiên rất lớn. Thứ tự: các đợt thường (tối đa 50 MB) làm trước theo cả hai chiều, rồi từng file lớn hơn 50 MB đi riêng một đợt, file nhỏ trước. Một đợt lỗi thì được ghi chú và lần chạy vẫn tiếp tục; chỉ hết giờ hoặc mất kết nối box mới dừng cả lần chạy. File lớn chưa chép xong thì báo `phiên lớn: <file> chưa chép xong — chạy fcode phien khi mạng tốt`, không bao giờ báo thành công; chạy tay (15 phút mỗi kết nối) sẽ làm nốt. Lần chạy tự động có tổng thời gian tối đa 7 phút: hết giờ thì dừng kết nối đang treo và không bắt đầu đợt mới (chạy tay: tối đa 15 phút mỗi kết nối). Thay đổi ở laptop hoặc ở box nhờ vậy sang bên kia chậm nhất sau khoảng 40 phút; muốn ngay thì gõ `fcode phien`. File lớn hơn 50 MB không đi theo lần đồng bộ nhanh khi mở agent (lần đó chỉ ghi vào phien.log `phiên lớn: <file> — lần nhanh không chép, để lần tự động hoặc fcode phien`); lần tự động hoặc `fcode phien` chép file đó. Chạy tay và chạy tự động dùng chung một khóa nên không giẫm lên nhau (chạy tay chờ lượt tự động xong). Chạy thử `--thu` không chép gì nhưng vẫn ghi lại giờ kết nối box. Lý do và kết quả ghi ở `%USERPROFILE%\.fcode\phien.log` (mỗi dòng ghi ngay kèm giờ; file quá 200 KB thì được đổi tên thành `phien.log.1`, là phần nhật ký cũ hơn, rồi `phien.log` mới bắt đầu).
 
 Dọn rác: mỗi lần chạy thật, fcode xóa các file tạm do chính nó để lại. Nó chỉ xóa file có tên **đúng hoàn toàn** theo các mẫu dưới đây, và chỉ ở chỗ nó đã tạo ra file đó. Tên chỉ giống một phần (ví dụ `fcode-phien-backup`, `x.jsonl.fcode-part-backup`, `exclude.part-backup`) thì không bao giờ bị đụng vào.
 
@@ -543,8 +544,8 @@ Sau khi bật, mỗi lần bạn gõ `omp`, `claude` hoặc `codex` trong thư m
 Cần biết:
 
 - **Màn hình êm**: đồng bộ xong bình thường thì không hiện gì (chi tiết ghi ở `%USERPROFILE%\.fcode\phien.log`). Nếu có chuyện, màn hình hiện tối đa **một dòng** ở cuối, và agent luôn được mở.
-- **Không đánh thức box.** Box đang ngủ thì hiện `phien: box đang ngủ, bỏ qua` và agent mở ngay. Lần tự động mỗi 10 phút ở trên vẫn là phương án dự phòng.
-- **Không đọc được trạng thái box thì là lỗi, không phải "ngủ".** Nếu `instabox ls` lỗi (ví dụ bạn chưa chạy `instabox login`), màn hình hiện `phien: không đồng bộ được, xem phien.log` và trong phien.log ghi `lỗi: không đọc được trạng thái box (instabox ls lỗi — đã chạy "instabox login" chưa?)`; agent vẫn mở.
+- **Box luôn bật.** Trước khi đồng bộ, FCode chỉ hỏi box một câu rất nhẹ (`ssh -o BatchMode=yes -o ConnectTimeout=8 oracle true`). Lần tự động mỗi 10 phút ở trên vẫn là phương án dự phòng.
+- **Không vào được box thì là lỗi.** Nếu `ssh oracle` không vào được (mất mạng, box tắt, tên ssh sai), màn hình hiện `phien: không đồng bộ được, xem phien.log` và trong phien.log ghi `lỗi: không vào được box (ssh oracle lỗi — kiểm tra mạng và alias ssh)`; agent vẫn mở.
 - **Dừng ở khoảng 20 giây** mỗi lần (có thể dư vài giây khi một bước đang hoàn tất); FCode chỉ dừng giữa hai việc, không bao giờ bỏ dở một file, và các lệnh con (ssh, tar, kiểm tra box) cũng bị dừng đúng hạn. Hết giờ thì hiện `phien: hết 20 giây, phần còn lại chạy lần sau`; phần còn lại làm tiếp ở lần mở agent sau, hoặc ở lần tự động kế tiếp theo lịch thường (lần đồng bộ nhanh không đẩy lùi lịch đó). File lớn hơn 50 MB không bao giờ đi theo lần nhanh, mà để lần tự động hoặc `fcode phien` chép (lần nhanh chỉ ghi `phiên lớn: <file> — lần nhanh không chép, để lần tự động hoặc fcode phien` vào phien.log).
 - **Ngắt hẳn ở 30 giây.** Nếu một lần đồng bộ nhanh vẫn chưa xong sau 30 giây (ví dụ một lệnh bị treo), FCode ngắt hẳn nó cùng mọi lệnh con của nó, màn hình hiện `phien: không đồng bộ được, xem phien.log` và phien.log ghi `lỗi: lần chạy nhanh vượt quá 30 giây nên bị ngắt hẳn …`; việc đang làm dở để lần sau, agent vẫn mở. Nếu Windows không cho FCode tạo lớp bảo vệ này, lần nhanh không đồng bộ gì, màn hình hiện cùng dòng `phien: không đồng bộ được, xem phien.log` và phien.log ghi lý do (`lỗi: không tạo được job bảo vệ cho lần chạy nhanh (…) — không đồng bộ`). Lần chạy tay `fcode phien` thì không bị ngắt như vậy.
 - Đang có một lần đồng bộ khác chạy thì hiện `phien: đang có lần đồng bộ khác, bỏ qua` và mở agent luôn.
@@ -574,33 +575,49 @@ Lệnh cài sẽ lần lượt làm các việc sau, mỗi việc một dòng tr
 2. Cho phép PowerShell chạy lệnh `fcode` (chế độ RemoteSigned, chỉ áp dụng cho tài khoản của bạn). Nếu máy công ty khóa việc này bằng chính sách của quản trị viên, lệnh cài báo `✗` ở dòng "Lệnh fcode" và bạn cần nhờ quản trị viên cho phép chế độ RemoteSigned (khi đó `fcode.cmd` cũng không chạy được). Nếu không bật được vì lý do khác, gõ `fcode.cmd` thay cho `fcode`.
 3. Tạo file cấu hình `%USERPROFILE%\.fcode\config.json` nếu chưa có (có rồi thì giữ nguyên).
 4. Kiểm tra **GitHub CLI** (`gh`). Máy chưa có thì tự cài. Nếu Windows hỏi quyền, bấm **Yes**; bấm No cũng được, lệnh cài sẽ tự thử cách khác không cần quyền admin.
-5. Kiểm tra **instabox**. Máy chưa có thì tải thẳng bản Windows từ trang chính thức của instabox và kiểm tra mã SHA256 của file. Không cần cài Node.js.
-6. Hướng dẫn bạn đăng nhập, **chỉ với phần chưa đăng nhập**. Bạn không phải gõ mật khẩu vào cửa sổ này.
+5. Hướng dẫn bạn đăng nhập GitHub, **chỉ khi chưa đăng nhập**. Bạn không phải gõ mật khẩu vào cửa sổ này.
+6. Thử vào box bằng `ssh -o BatchMode=yes -o ConnectTimeout=8 oracle true`. Vào được thì dòng "Kết nối tới box" là `✓`. Chưa vào được thì dòng đó là `✗` kèm việc còn thiếu (xem [Kết nối box (ssh)](#kết-nối-box-ssh)).
 
-Bạn đăng nhập tối đa hai lần, theo thứ tự:
+Lệnh cài không tạo khóa và không đọc khóa của bạn: khóa ssh và tên `oracle` trong `%USERPROFILE%\.ssh\config` bạn tự có sẵn (xem [Kết nối box (ssh)](#kết-nối-box-ssh)); lệnh cài chỉ thử vào box rồi báo kết quả.
 
-- **Bước 1/2, instabox**: trình duyệt mở ra, bạn đăng nhập rồi quay lại cửa sổ PowerShell. Nếu trình duyệt không mở, gõ `instabox login --device` và làm theo mã hiện ra.
-- **Bước 2/2, GitHub**: GitHub hiện một mã 8 ký tự (dạng `ABCD-1234`). Chép mã đó, bấm Enter, dán mã vào trang GitHub vừa mở rồi bấm **Authorize**.
+Đăng nhập GitHub: GitHub hiện một mã 8 ký tự (dạng `ABCD-1234`). Chép mã đó, bấm Enter, dán mã vào trang GitHub vừa mở rồi bấm **Authorize**.
 
 Cuối cùng có bảng kết quả, mỗi dòng là `✓` (xong) hoặc `✗` kèm việc cần làm. Gặp `✗` thì làm theo dòng đó rồi chạy lại đúng lệnh trên; chạy lại bao nhiêu lần cũng an toàn và chỉ làm phần còn thiếu. Xong thì **mở cửa sổ PowerShell mới** (Start, gõ `PowerShell`, Enter) rồi gõ `fcode help` để xem danh sách lệnh.
 
 Nếu bạn đã tải kho mã này về máy, chạy `powershell -ExecutionPolicy Bypass -File .\laptop\install.ps1` trong thư mục kho mã cũng được.
 
+### Kết nối box (ssh)
+
+`fcode` vào box bằng `ssh` thường, không qua dịch vụ nào khác. Máy Windows cần ba thứ:
+
+1. **OpenSSH Client** của Windows (Windows 10/11 thường có sẵn; thiếu thì bật ở Settings > System > Optional features).
+2. **Khóa riêng** của bạn (file không có đuôi `.pub`) cất trong `%USERPROFILE%\.ssh`, khóa công khai tương ứng đã nằm trên box. Lệnh cài không tạo, không chép và không đọc khóa.
+3. **Một khối `Host`** trong file `%USERPROFILE%\.ssh\config` (chưa có file thì tạo mới):
+
+```
+Host oracle
+  HostName fcode-quoc.duckdns.org
+  User quoc
+  IdentityFile ~/.ssh/<tên-file-khóa-riêng-của-bạn>
+```
+
+Rồi gõ `ssh oracle` **một lần** trong PowerShell: ssh hỏi có tin khóa của máy chủ không, gõ `yes`, vào được thì gõ `exit`. Từ đó `fcode` chạy không hỏi gì nữa (nó dùng `BatchMode`, nên thiếu bước này `fcode` sẽ báo không vào được box).
+
+Muốn dùng tên khác `oracle`, đặt tên đó vào khóa `host` của `%USERPROFILE%\.fcode\config.json` (hoặc biến `FCODE_HOST` cho một lần chạy). Tên chỉ gồm chữ, số và dấu `.` `_` `-`, và phải bắt đầu bằng chữ hoặc số; tên sai thì `fcode` dừng ngay và không chạy ssh. Kiểm tra: `ssh -o BatchMode=yes -o ConnectTimeout=8 oracle true` chạy xong, không hiện gì và không báo lỗi là được. Lệnh cài chạy đúng lệnh này ở bước 6 rồi báo kết quả.
+
 **Sửa file cấu hình.** Mở `%USERPROFILE%\.fcode\config.json` bằng Notepad:
 
 ```json
 {
-  "instabox": "",
-  "box": "coder",
+  "host": "oracle",
   "syncRepos": ["C:/Users/ten-ban/code/du-an-1", "C:/Users/ten-ban/code/du-an-2"],
   "ipaRepo": "brooklyn96/fcoding",
   "ipaTag": "latest"
 }
 ```
 
-- `box`: tên box mà `fcode` sẽ vào (mặc định `coder`).
+- `host`: tên ssh (trong `~/.ssh/config`) của box mà `fcode` sẽ vào (mặc định `oracle`).
 - `syncRepos`: các thư mục trên máy mà `fcode sync` cập nhật. Viết dấu gạch chéo `/` giữa các thư mục (hoặc gấp đôi dấu `\`), mỗi thư mục trong dấu ngoặc kép, cách nhau bằng dấu phẩy. Để trống `[]` nếu chưa dùng.
-- `instabox`: đường dẫn đầy đủ tới `instabox.exe`. Để trống `""` là máy tự tìm.
 - `ipaRepo`, `ipaTag`: nơi `fcode ipa` lấy file cài app iPhone. Thường không cần đổi.
 
 File này chỉ do bạn sửa; lệnh cài không bao giờ ghi đè nó. Danh sách đầy đủ các lệnh: gõ `fcode help`.
