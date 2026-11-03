@@ -860,9 +860,13 @@ test('SSE: a ping that hits backpressure during a capture, then drain -> the lat
 
 test('screen trim is linear: 2000 lines x 300 spaces < 50 ms and correct', () => {
   const blank = `${' '.repeat(300)}\n`.repeat(2000);
-  const t0 = performance.now();
-  const out = trimScreen(`top  \n${blank}`);
-  const dt = performance.now() - t0;
+  // best of 5: one cold or descheduled run (a loaded box, a JIT warm-up) says nothing about linear versus quadratic; the best run must still be < 50 ms, which a quadratic trim never reaches
+  let out, dt = Infinity;
+  for (let i = 0; i < 5; i++) {
+    const t0 = performance.now();
+    out = trimScreen(`top  \n${blank}`);
+    dt = Math.min(dt, performance.now() - t0);
+  }
   assert.equal(out, 'top  ');
   assert.ok(dt < 50, `${dt} ms`);
   assert.equal(trimScreen(blank), '');
