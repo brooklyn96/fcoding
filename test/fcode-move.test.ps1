@@ -1,4 +1,4 @@
-# Tests for `fcode move` v2 (laptop/fcode.ps1): the laptop side of deploy-gate docs/move/CONTRACT.md (DESIGN rev 1k3.2, DECISION-1k3).
+# Tests for `fcode move` v2 (laptop/fcode.ps1): the laptop side of deploy-gate docs/move/CONTRACT.md (DESIGN rev 1k3.7.1, DECISION-1k3 and its errata).
 # Run:  pwsh -NoProfile -File test/fcode-move.test.ps1      (Windows: pwsh only, the bash cases print a skipped count; Linux: full run)
 # Nothing real is contacted. Every function of fcode.ps1 is loaded out of the file (the script body never runs) and the seams are replaced
 # by fakes defined afterwards: Invoke-MoveTimedExe (every ssh to old / new), Invoke-MoveTool (ssh -G, ssh-keygen, gh), Invoke-BoxScript
@@ -7,7 +7,7 @@
 # state, as on the rehearsal pair. USERPROFILE is a temp folder, removed at the end.
 #   FCODE_TEST_ONLY=<regex>   run only the cases whose name matches
 #   FCODE_TEST_NO_BASH=1      run as on Windows (no bash): the bash cases are skipped and counted
-#   MV_MOVE_MD=<path>         deploy-gate docs/MOVE.md for L.texts-match-move-md
+#   MV_MOVE_MD=<path>         deploy-gate docs/MOVE.md for L.texts-match-move-md, which fails when it is unset (G.2, W1-T11-DG-T11-1)
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $Repo = Split-Path -Parent $PSScriptRoot
@@ -31,18 +31,18 @@ $CallRx = '^(fwd|back)-(0|[1-9][0-9]*)-(c\.init-old|c\.init-new|c\.(repin|prepar
 $IgnoredFlags = @('budget', 'mark', 'dst-started', 'phase', 'serving')
 $Valued = @('dir', 'attempt', 'sha', 'call', 'budget', 'serving', 'mark', 'dst-started', 'phase', 'role', 'seed', 'since', 'lst')
 
-# ============================== the DESIGN-GAP readings the suite follows (one named spot each; the Architect rules them) ==============================
-$BackDoneExit = 0                                         # DG-T11-8: a manual back that reaches back-done exits 0 (D.8 names no code)
-$GhForm = @{                                              # DG-T11-9: T10's gh call forms (CONTRACT names none)
+# ============================== rulings and readings the suite follows (a reading = one named spot; the Architect rules it) ==============================
+$BackDoneExit = 0                                         # D.8: a manual back that reaches back-done exits 0 (W1-T11-DG-T11-8)
+$GhForm = @{                                              # D.0.2: T10's gh call forms; CONTRACT §7 records them from T10's code (W1-T11-DG-T11-9)
   RepoList = '^repo list'; SecretList = '^secret list -R '; SecretSet = '^secret set DEPLOY_KNOWN_HOSTS'; RunList = '^run list -R '; Disable = '^workflow disable'
   WfDir = '^api repos/{0}/contents/\.github/workflows$'; WfFile = '^api repos/{0}/contents/\.github/workflows/{1}'
   SecretListAny = '^secret list'; Json = '--json'; Api = '^api '        # the fake gh's default answers (test: Invoke-MoveTool, gh branch)
 }
 $CutAllowlistText = 'danh sách IP được phép'              # T10-G8: the Q-cut wording of E-N9's external-IP-allowlist reminder (D.15 gives no Vietnamese text)
 $DiskLabel0c = 'Máy mới không đủ chỗ trống trên đĩa'      # T10-G14: 0c "fresh space" = dst free_mb >= 2048, refused as `INV refuse disk`
-# T10-G18 / DG-T11-5: finish's "new health passes now" is new's unrecorded status (hold_active >= |start set|, frozen=0) -> L.finish-health
-# DG-R11-1 (proposal, Architect): a sent x.final whose outcome stays unknown counts as started (exit 70, resume only) -> L.carry-after-final-70, L.back-rollback-to-cut (manual back)
-# DG-R11-2 / T10-G34: a rebuilt state takes target_users[] from the pinned manifest's same_users[] -> L.rebuild (target_users case)
+# D.7 / D.10: finish's "new healthy now" is new's unrecorded status: hold_active = the non-follower holds of hold_sets.start, frozen=0, no call running (W1-T10-G18, W1-T11-DG-T11-5) -> L.finish-health
+# D.5.2: a sent x.final, whatever its outcome (unknown included), has started: exit 70, resume only (W1-T11-DG-R11-1) -> L.carry-after-final-70 (PROBE.er5-final-new-down), L.back-rollback-to-cut
+# D.0.9 / D.0.10: new keeps c.init-new's "target" stdin key as MV_DIR/target.json; a rebuild takes the target_* values from rebuild read's MOVE target line (W1-T11-DG-R11-2, W1-T10R-F4) -> L.rebuild
 function PassStep([string]$Step, [int]$N) { "$Step.$N" }  # T10-G19: one N per pass of a counted step, the same id on both machines
 $FenceStep = 'r.stop-dst'                                 # T10-G12: the lost/discarded-new fence step on new (Architect: step and machine open)
 $QGuardKey = 'Q-guard'                                    # T10-G51: the Q-guard project names kept in answers{} for the question of a resume
@@ -51,17 +51,12 @@ $ClockUnreadable = 'side={0} skew_s=-'                    # T10 R2-5: unreadable
 $GioFmt = 'dd/MM/yyyy HH:mm:ss'                           # R5-2: the <giờ> fill is exactly (ConvertTo-MoveTime $dst_started_at).ToLocalTime().ToString($GioFmt, Invariant), no suffix (D.5.3: dst_started_at in the laptop's time zone)
 $RebuildDstStartedAt = 'fwd-{0}-x.start'                  # R5-1: a rebuilt dst_started_at = start= of new's fwd-<a>-x.start record; a = attempt when dir=fwd, attempt − 1 when carry=true; '' otherwise (manual back, no record, start=-). Q-cut.ts stays the start= of old's latest fwd x.freeze (R2-4)
 $TsRx = '^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$'               # the record format of every time value in state.json
-# T10 review-r2 O1 and O2: the reviewer's proposals; the Architect rules them. Their cases print PENDING (no pass, no fail) until set to $true here.
-#   O1: new_lost / new_discarded no longer fence a later attempt whose c.init-new returned 0 -> L.new-lost (later attempt)
-#   O2: a manual back in flight (mark set, x.freeze sent) is rebuilt with carry=false -> L.rebuild (manual back in flight)
-$ArchitectRuled = @{ O1 = $false; O2 = $false }
-$script:pending = 0
+$LegacyWfLine = '      - run: echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > kh'   # DESIGN-GAP (T10c-LP, Architect): B.10.5 does not say which matched repo is a legacy project's; T10c's reading: a workflow naming DEPLOY_KNOWN_HOSTS is gate-push (project '') -> Use-Legacy, L.push-scan
 
 # ============================== harness ==============================
-function T([string]$Name, [scriptblock]$Body, [switch]$NeedsBash, [string]$PendingArchitect = '') {
+function T([string]$Name, [scriptblock]$Body, [switch]$NeedsBash) {
   if ($env:FCODE_TEST_ONLY -and $Name -notmatch $env:FCODE_TEST_ONLY) { return }
   if ($NeedsBash -and -not $script:BashExe) { $script:skip++; Write-Host "SKIP $Name (needs bash)"; return }
-  if ($PendingArchitect -and -not $ArchitectRuled[$PendingArchitect]) { $script:pending++; Write-Host "PENDING $Name (Architect ruling $PendingArchitect)"; return }
   if ($script:LoadErr) { $script:fail++; Write-Host "FAIL $Name :: $($script:LoadErr)"; return }
   try {
     Reset-World
@@ -135,7 +130,7 @@ function New-Manifest {
     same_users = @(); groups = @(); subids = @(); idmap = @()
     pkgs = @([ordered]@{ name = 'nodejs'; version = '22.23.3-1nodesource1' })
     apt_sources = @(); firewall = [ordered]@{ state = 'inactive'; rules = @() }; hosts_custom = @(); hostnames = @(); connectors = @()
-    pm2 = [ordered]@{ configured = @(); must_be_online = @() }; redis = @(); pg = @(); guards = @(); legacy_push = @(); inbound = @(); public_ports = @(); egress = @(); rewrites = @()
+    pm2 = [ordered]@{ configured = @(); must_be_online = @() }; redis = @(); pg = @(); guards = @(); inbound = @(); public_ports = @(); egress = @(); rewrites = @()
     identity = [ordered]@{ hostname = 'oldhost'; tz = 'Asia/Ho_Chi_Minh'; locales = @('en_US.UTF-8'); swap_mb = 0; os = 'debian-13'; arch = 'x86_64'; systemd = 257 }
     gate_id = $GateA
     totals = [ordered]@{ bytes_apparent = 3000000; inodes = 300 }
@@ -157,7 +152,7 @@ function Reset-World {
     Faults = (New-Object Collections.ArrayList); Answers = (New-Object Collections.Queue); Prompts = (New-Object Collections.ArrayList)
     Gh = (New-Object Collections.ArrayList); GhLog = (New-Object Collections.ArrayList); KeygenLog = (New-Object Collections.ArrayList); ToolLog = (New-Object Collections.ArrayList)
     BoxLog = (New-Object Collections.ArrayList); Mf = (New-Manifest); PlanStdin = (New-Object Collections.ArrayList); PlanN = 0
-    Pf = @('INV target user=quoc uid=1000 home-nonskel=1', 'INV target stop_budget_s=120'); PfCode = 0
+    Pf = @('INV target user=quoc uid=1000 home-nonskel=1', 'INV target addr=198.51.100.20', 'INV target platform=0', 'INV target stop_budget_s=120'); PfCode = 0
     CheckOut = @('INV ok'); CheckCode = 0; CheckOnlyOut = @('INV ok'); CheckOnlyCode = 0; PlanHook = $null; PlanOut = @('INV ok'); PlanCode = 0
     NewGate = (New-Object Collections.Queue); TcpFail = @{}; LoginRc = 0; CoderUp = $true; Dur = @{}; Sleeps = 0
     Violations = (New-Object Collections.ArrayList); Runaway = $null; StateSeen = (New-Object Collections.ArrayList); Hooks = @{}; Out = (New-Object Collections.ArrayList); OutFrom = 0; BoxStates = (New-Object Collections.ArrayList)
@@ -329,6 +324,8 @@ function Fake-Gate($m, [string]$Cmd, [string]$Stdin, $e) {
     [void]$W.PlanStdin.Add($lines)
     $tu = @($lines | Where-Object { $_ -cmatch '\Atarget-user ' })
     $mapl = @($lines | Where-Object { $_ -cnotmatch '\Atarget-user ' })
+    # plan <id> copies the stdin `idmap <user|group> <name> <src_id> <dst_id>` lines into the manifest's idmap[] (B.6.2); plan --check / --check-only keep the pinned value
+    $W.Mf.idmap = @(foreach ($l in $lines) { if ($l -cmatch '\Aidmap (user|group) (\S+) ([0-9]+) ([0-9]+)\z') { [ordered]@{ kind = $Matches[1]; name = $Matches[2]; src_id = [int]$Matches[3]; dst_id = [int]$Matches[4] } } })
     $out = @($W.PlanOut); $code = $W.PlanCode
     if ($W.PlanHook) { $h = & $W.PlanHook $W.PlanN $mapl; if ($h) { $out = @($h.Out); $code = $h.Code } }
     $flt = Get-Fault $m.Name 'plan:full'; if ($flt) { $out = @($flt.Out); $code = $flt.Rc }
@@ -411,6 +408,7 @@ function Apply-Effects($m, [string]$Step, [string]$Verb, $f, $sw, [string]$Id, [
       $j = $null; try { $j = $Stdin | ConvertFrom-Json } catch { [void]$script:W.Violations.Add("init stdin is not JSON") }
       $m.MoveId = @{ id = $Id; role = $f['role']; dir = $f['dir']; attempt = [int]$f['attempt']; state = 'open'; mark = $(if ($f['mark'] -and $f['mark'] -cne 'null') { $f['mark'] } else { $null }); phase = $f['phase']; serving = $f['serving']; dst_started = $f['dst-started']; old_addr = $(if ($j) { $j.old_addr }); new_addr = $(if ($j) { $j.new_addr }) }
       $m.InitStdin = $j; $m.Sha = $f['sha']
+      if ($Step -ceq 'c.init-new' -and $j -and $j.PSObject.Properties['target'] -and -not $m.Target) { $m.Target = ConvertTo-Json -InputObject $j.target -Depth 10 -Compress }   # MV_DIR/target.json, written only when absent (D.0.9)
       if ($f['role'] -ceq 'new' -and $f['dir'] -ceq 'fwd') { $m.Frozen = $true; $m.Active = 0; $m.Enabled = $false }
     }
     '^(c\.repin\.[0-9]+|x\.repin)$' { $m.Sha = $f['sha']; try { $m.RepinStdin = $Stdin | ConvertFrom-Json } catch { [void]$script:W.Violations.Add('repin stdin is not JSON') } }
@@ -444,9 +442,10 @@ function Fake-Script($m, [string]$Text, $e) {
     'rebuild read' {
       if (-not $m.MoveId) { return (New-Res 1 @()) }
       $mi = $m.MoveId; $o = @('MOVE moveid ' + (@(foreach ($k in 'id', 'role', 'dir', 'attempt', 'state', 'mark', 'dst_started', 'phase', 'serving', 'old_addr', 'new_addr') { "$k=$(if ($null -ne $mi[$k]) { $mi[$k] })" }) -join ' '))
-      $o += "MOVE hostkey type=ssh-ed25519 pub=$($m.Key)"
-      foreach ($c in $m.Order) { $r = $m.Rec[$c]; $o += "MOVE record id=$c rc=$(if ($null -ne $r.Rc) { $r.Rc } else { '-' }) start=$(if ($r.Start) { $r.Start } else { '-' }) end=$(if ($r.End) { $r.End } else { '-' })" }
+      $o += "MOVE hostkey ssh-ed25519 $($m.Key)"
+      foreach ($c in $m.Order) { $r = $m.Rec[$c]; $o += "MOVE record id=$c start=$(if ($r.Start) { $r.Start } else { '-' }) end=$(if ($r.End) { $r.End } else { '-' }) rc=$(if ($null -ne $r.Rc) { $r.Rc } else { '-' })" }
       $o += (Get-ManifestLine $null)
+      if ($m.Target) { $o += "MOVE target $($m.Target)" }   # new only: c.init-new kept it (D.0.10)
       return (New-Res 0 $o)
     }
     default { return (New-Res 0 @()) }
@@ -650,6 +649,13 @@ function Fx-Finished { Fx-Cut; Ans 'YES'; $r = Run-Move @('finish'); Eq $r.Code 
 function Fx-Aborted { Fx-Copied; Ans 'có'; $r = Run-Move @('abort'); Eq $r.Code 0 "abort exit ($($r.Text))" }
 # a carry-back started by a failed x.health on new (E-R8), with an extra fault inside it
 function Start-Carry([switch]$NoRun) { Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.health$' -Rc 69 -Out @('MOVE item app.service kind=unit state=failed ActiveState=failed') }
+# a legacy repo as the push scan finds it (reading T10c-LP, $LegacyWfLine); legacy_push[] is a state field, never a manifest field (W1-T3-GAP-11)
+function Use-Legacy {
+  Add-Gh $GhForm.RepoList @("[{""nameWithOwner"":""$LegacyRepo""}]")
+  Add-Gh ($GhForm.WfDir -f $LegacyRepo) @('[{"name":"deploy.yml"}]')
+  Add-Gh ($GhForm.WfFile -f $LegacyRepo, 'deploy\.yml') @($LegacyWfLine)
+}
+function NothingWritten([string]$What = 'nothing written') { $s = Get-St; Ok ($null -eq $s -or $s.phase -cne 'planned') $What }
 
 # bash runs (the scripts the laptop sends over plain ssh, run for real against a throw-away FCM_ROOT, tools stubbed through PATH)
 function New-Stubs([hashtable]$Bodies) {
@@ -729,8 +735,47 @@ T 'L.pre-uid-collision: a moved uid held by another name on new, or a moved name
   Reset-World; $W.Pf = @('INV target user=quoc uid=1000 home-nonskel=1', 'INV target user=app uid=1500 home-nonskel=0', 'INV target stop_budget_s=120')
   [void](Do-Plan -Want 65); HasText 'Trùng user hoặc uid trên máy mới'
 }
+T 'L.pre-uid-collision: groups and subid ranges (B.6.2; W1-T11-DG-T11-4) — a moved gid held by another group on new, a moved group with another gid, or a moved user''s subid range overlapping another user''s range on new refuses uid-collision at plan, nothing written; the same name and gid, the same user''s range or an adjacent range pass' {
+  $pf0 = @('INV target user=quoc uid=1000 home-nonskel=1', 'INV target user=app uid=1001 home-nonskel=0', 'INV target platform=0', 'INV target stop_budget_s=120')
+  foreach ($c in @(@('ops', 1800, 65), @('devs', 1801, 65), @('devs', 1800, 0))) {
+    Reset-World; $W.Mf.groups = @([ordered]@{ name = $c[0]; gid = $c[1]; members = @() }); $W.Pf = $pf0 + 'INV target group=devs gid=1800'
+    [void](Do-Plan -Want $c[2])
+    if ($c[2] -eq 65) { HasText 'Trùng user hoặc uid trên máy mới'; NothingWritten "[$($c[0]) $($c[1])] nothing written"; Eq (@(RecCalls -All).Count) 0 'no recorded call' }
+  }
+  foreach ($c in @(@('zed', 120000, 65), @('app', 120000, 0), @('zed', 165536, 0))) {
+    Reset-World; $W.Mf.subids = @([ordered]@{ kind = 'uid'; name = 'app'; start = 100000; count = 65536 }); $W.Pf = $pf0 + "INV target subid user=$($c[0]) kind=uid start=$($c[1]) count=65536"
+    [void](Do-Plan -Want $c[2])
+    if ($c[2] -eq 65) { HasText 'Trùng user hoặc uid trên máy mới'; HasText 'what=subuid'; NothingWritten "[$($c[0]) $($c[1])] nothing written" }
+  }
+}
+T 'L.pre-platform-mixed: with platform=1 from preflight, plan refuses at 3b (target-not-empty, nothing written) a manifest moving /usr/local/bin/node, a root under a platform directory or the unit file of a platform unit; with platform=0 the same manifest passes (B.5.2 mixed pair)' {
+  $pf = { param($p) @('INV target user=quoc uid=1000 home-nonskel=1', "INV target platform=$p", 'INV target stop_budget_s=120') }
+  $cases = @(
+    @([ordered]@{ id = 'file-usr-local-bin-node'; root = '/usr/local/bin/node'; kind = 'file'; bytes_apparent = 1000; inodes = 1 }, '/usr/local/bin/node'),
+    @([ordered]@{ id = 'tree-usr-local-lib-node_modules-pkg'; root = '/usr/local/lib/node_modules/pkg'; kind = 'tree'; bytes_apparent = 1000; inodes = 3 }, '/usr/local/lib/node_modules/pkg'),
+    @([ordered]@{ id = 'files-etc-systemd-system'; root = '/etc/systemd/system'; kind = 'files'; files_from = @('sshd.service'); bytes_apparent = 100; inodes = 1 }, '/etc/systemd/system/sshd.service'))
+  foreach ($c in $cases) {
+    Reset-World; $W.Pf = & $pf 1; $W.Mf.items = @($W.Mf.items) + $c[0]
+    [void](Do-Plan -Want 65); HasText 'Máy mới không trống'; HasText $c[1]; NothingWritten "[$($c[1])] nothing written"; Eq (@(RecCalls -All).Count) 0 'no recorded call'
+    Reset-World; $W.Pf = & $pf 0; $W.Mf.items = @($W.Mf.items) + $c[0]
+    [void](Do-Plan -Want 0); Eq (St-Raw 'target_platform') '0' "[$($c[1])] target_platform stored"
+  }
+  Reset-World; $W.Pf = & $pf 1; [void](Do-Plan -Want 0); Eq (St-Raw 'target_platform') '1' 'a platform=1 target with no platform path moved passes'
+}
+T 'L.pre-platform-mixed: a D.3 copy re-run checks its re-plan against the stored target_platform — an item root added under /usr/local/bin refuses at 3b before c.repin.N; with a stored 0 it passes; new is never asked again (B.5.2, D.3; GAP-RULINGS-3 §16.7 T-4)' {
+  $node = [ordered]@{ id = 'file-usr-local-bin-node'; root = '/usr/local/bin/node'; kind = 'file'; bytes_apparent = 1000; inodes = 1 }
+  $W.Pf = @('INV target user=quoc uid=1000 home-nonskel=1', 'INV target platform=1', 'INV target stop_budget_s=120'); Fx-Copied; Eq (St-Raw 'target_platform') '1' 'stored from preflight'
+  $W.Mf.items = @($W.Mf.items) + $node
+  [void](Do-Copy 65); HasText 'Máy mới không trống'; HasText '/usr/local/bin/node'
+  Ordered @('^old plan:full$'); Eq (SentAny '-c\.repin\.') 0 'refused before c.repin.N'; Eq (SentAny '-c\.(prepare|transfer)\.') 0 'nothing prepared or transferred'
+  Eq (@(LogNow | Where-Object { $_ -match 'script:preflight' }).Count) 0 'new not asked again'
+  Reset-World; Fx-Copied; Eq (St-Raw 'target_platform') '0' 'stored 0'
+  $W.Pf = @('INV target user=quoc uid=1000 home-nonskel=1', 'INV target platform=1', 'INV target stop_budget_s=120')   # new would answer 1 now; the stored value rules
+  $W.Mf.items = @($W.Mf.items) + $node
+  [void](Do-Copy 0); Ok ((Sent 'old' '-c\.repin\.1$') -eq 1) "the re-plan went on to c.repin.1: $(LogNow)"; Eq (@(LogNow | Where-Object { $_ -match 'script:preflight' }).Count) 0 'new not asked again'
+}
 T 'L.pre-reach: preflight refusing old-unreachable, new-unreachable or dns ends plan with 65 and the label' {
-  foreach ($c in @(@('old-unreachable', 'Máy mới không kết nối được máy cũ'), @('new-unreachable what=github.com', 'Máy mới không kết nối được tới địa chỉ cần thiết'), @('dns why=unreachable', 'Không tra được DNS qua DoH'))) {
+  foreach ($c in @(@('old-unreachable', 'Máy mới không kết nối được máy cũ'), @('new-unreachable host=github.com', 'Máy mới không kết nối được tới địa chỉ cần thiết'), @('dns why=unreachable', 'Không tra được DNS qua DoH'))) {
     Reset-World; $W.Pf = @("INV refuse $($c[0])"); $W.PfCode = 65
     [void](Do-Plan -Want 65); HasText $c[1]; Eq (@(RecCalls -All).Count) 0 'no recorded call'
   }
@@ -740,10 +785,10 @@ T 'L.pre-addr: an --addr that is not IPv4 or a name refuses target-addr before a
   Reset-World; $W.Pf = @('INV refuse target-addr why=hostkey'); $W.PfCode = 65; [void](Do-Plan -Want 65); HasText 'Địa chỉ máy mới không hợp lệ'
 }
 T 'L.pre-gh: gh without admin on a legacy repo refuses gh-permission at plan and at cutover 0c, nothing frozen' {
-  $W.Mf.legacy_push = @([ordered]@{ project = 'deal-sync'; repo = $LegacyRepo })
+  Use-Legacy
   Add-Gh "$($GhForm.SecretList)$([regex]::Escape($LegacyRepo))" @('HTTP 403: Resource not accessible') 1 1
   [void](Do-Plan -Want 65); HasText 'gh không có quyền admin trên repo'; HasText $LegacyRepo
-  Reset-World; $W.Mf.legacy_push = @([ordered]@{ project = 'deal-sync'; repo = $LegacyRepo }); Fx-Copied
+  Reset-World; Use-Legacy; Fx-Copied
   Add-Gh "$($GhForm.SecretList)$([regex]::Escape($LegacyRepo))" @('HTTP 403') 1 -1
   [void](Do-Cutover 65); HasText 'gh không có quyền admin trên repo'; Eq (Sent 'old' '-x\.freeze$') 0 'nothing frozen'
 }
@@ -784,6 +829,14 @@ function Assert-NothingFrozen([int]$Want, [string]$Text = '') { Eq $script:Last.
 T 'L.pre-call-running: at 0c a call still running on new ends the cutover with 75, nothing frozen' {
   Fx-Copied; Set-Running 'new' 'fwd-1-c.adopt.1'; [void](Do-Cutover -1); Assert-NothingFrozen 75
 }
+T 'L.pre-stale-manifest: 0c plan <id> --check-only and x.check read the same stdin as plan <id> (the target-user, target-addr and idmap lines; D.0.9, D.2 step 3)' {
+  Fx-Planned; Add-Fault -M new -Key '-c\.prepare\.1$' -Rc 0 -Out @('MOVE item idmap:user:svc kind=prepare state=mapped src_id=105 dst_id=110'); [void](Do-Copy 0); [void](Do-Cutover 0)
+  $cs = @(@(RecCalls | Where-Object { $_.Call -ceq 'fwd-1-x.check' }) + @(Calls | Where-Object { $_.Step -ceq 'plan:check-only' })); Ok ($cs.Count -ge 2) "x.check and the 0c check-only were sent: $(LogNow)"
+  foreach ($c in $cs) {
+    $in = @("$($c.Stdin)" -split '\r?\n' | Where-Object { $_ })
+    foreach ($l in 'target-user quoc 1000', 'target-addr 198.51.100.20', 'idmap user svc 105 110') { Ok ($in -ccontains $l) "$($c.M) $($c.Step) stdin lacks [$l]: $($in -join ' | ')" }
+  }
+}
 T 'L.pre-dst-quiet: at 0c an active hold on new ends the cutover with 65, nothing frozen' {
   Fx-Copied; $W.new.Active = 1; [void](Do-Cutover -1); Assert-NothingFrozen 65
 }
@@ -811,6 +864,86 @@ T 'L.pre-rsync-argv: the preflight script refuses a client argv that is not its 
   $r = Run-Bash $txt $pa (New-FcmRoot) (New-Stubs @{ ssh = 'exit 0'; timeout = $tmo })
   Ok ($r.Text -notmatch 'target-rsync-argv') "the pair's own rsync must pass: $($r.Text)"
 } -NeedsBash
+# ============================== the shipped preflight script, run for real (G.2, W1-T11-DG-R11-3; bash cases) ==============================
+$PfArgs = @('--old-addr', $OldAddr, '--addr', $NewAddr, '--src-os', 'debian-13', '--src-arch', 'x86_64', '--src-systemd', '257')
+$PlatformUnits = @('instabox-data-init.service', 'instabox-guest-agent.service', 'instabox-guest-reboot.service', 'instabox-identity.service', 'instabox-ssh-hostkeys.service', 'instabox-user.service', 'sshd.service')   # CONTRACT §3.5 LIST platform-units
+function Fx-File([string]$R, [string]$P, [string]$Text = "x`n") { $f = Join-Path $R $P.TrimStart('/'); [void](New-Item -ItemType Directory -Force -Path (Split-Path -Parent $f)); [IO.File]::WriteAllText($f, $Text, $utf8) }
+# a fixture root: dpkg lists, /etc/skel, /etc/subuid, /etc/subgid, and fx-passwd / fx-group (what the getent stub answers)
+function Pf-Root {
+  $r = New-FcmRoot
+  foreach ($d in 'var/lib/dpkg/info', 'etc/skel') { [void](New-Item -ItemType Directory -Force -Path (Join-Path $r $d)) }
+  foreach ($f in 'fx-passwd', 'fx-group', 'etc/subuid', 'etc/subgid') { Fx-File $r $f '' }
+  $r
+}
+function Pf-Timeout([int]$TcpRc) { 'while [ $# -gt 0 ]; do case $1 in -k|-s|--kill-after|--signal) shift 2;; -*) shift;; *) break;; esac; done; shift; case "$*" in *"/dev/tcp"*) exit {0};; esac; exec "$@"' -f $TcpRc }
+function Pf-Stubs([hashtable]$Over = @{}) {
+  $b = @{
+    uname = 'echo x86_64'; ssh = 'exit 0'; timeout = (Pf-Timeout 0)
+    getent = 'case $1 in passwd) f=fx-passwd;; group) f=fx-group;; *) exit 2;; esac; [ -r "$FCM_ROOT/$f" ] || exit 2; if [ $# -ge 2 ]; then grep -E "^$2:" "$FCM_ROOT/$f" || exit 2; else cat "$FCM_ROOT/$f"; fi'
+    ip = 'fam=; for a in "$@"; do case $a in -4) fam=4;; -6) fam=6;; esac; done; [ "$fam" = 6 ] || echo "2: eth0    inet 198.51.100.20/24 brd 198.51.100.255 scope global eth0"; [ "$fam" = 4 ] || echo "2: eth0    inet6 2001:db8::20/64 scope global"; exit 0'
+  }
+  foreach ($k in $Over.Keys) { $b[$k] = $Over[$k] }
+  New-Stubs $b
+}
+function Pf-Run([string]$R, [string]$Stubs, [string[]]$A = $PfArgs) { Run-Bash (Get-MovePreflightScript) $A $R $Stubs }
+function PfHas($Res, [string]$Line) { Ok (@($Res.Out | Where-Object { "$_".TrimEnd() -ceq $Line }).Count -ge 1) "preflight must print [$Line]: $($Res.Text)" }
+function PfLacks($Res, [string]$Rx) { $h = @($Res.Out | Where-Object { "$_" -match $Rx }); Ok ($h.Count -eq 0) "preflight must not print [$Rx]: $($h -join ' | ')" }
+T 'L.pre-os: the preflight script refuses another Debian major, another arch or a lower systemd major (65) and passes the pair''s own values (B.0.2)' {
+  $r = Pf-Run (Pf-Root) (Pf-Stubs); Eq $r.Code 0 "a clean target ($($r.Text))"; PfHas $r 'INV ok'; PfLacks $r '^INV refuse '
+  $fr = Pf-Root; Fx-File $fr 'etc/os-release' "ID=ubuntu`nVERSION_ID=`"24.04`"`n"
+  $r = Pf-Run $fr (Pf-Stubs); Eq $r.Code 65 'ubuntu'; PfHas $r 'INV refuse os src=debian-13 dst=ubuntu-24'
+  $r = Pf-Run (Pf-Root) (Pf-Stubs @{ uname = 'echo aarch64' }); Eq $r.Code 65 'arch'; PfHas $r 'INV refuse arch src=x86_64 dst=aarch64'
+  $r = Pf-Run (Pf-Root) (Pf-Stubs @{ systemctl = 'if [ "$1" = --version ]; then echo "systemd 252 (252.30-1~deb12u2)"; fi; exit 0' }); Eq $r.Code 65 'systemd'; PfHas $r 'INV refuse os what=systemd src=257 dst=252'
+} -NeedsBash
+T 'L.pre-reach: the preflight script refuses old-unreachable, new-unreachable host=github.com and dns why=unreachable with 65 (B.0.2)' {
+  $r = Pf-Run (Pf-Root) (Pf-Stubs @{ timeout = (Pf-Timeout 1) }); Eq $r.Code 65 'old'; PfHas $r "INV refuse old-unreachable addr=$OldAddr"
+  $r = Pf-Run (Pf-Root) (Pf-Stubs @{ curl = 'case "$*" in *dns-query*) exit 0;; *github.com*) exit 7;; esac; exit 0' }); Eq $r.Code 65 'github'; PfHas $r 'INV refuse new-unreachable host=github.com'; PfLacks $r '^INV refuse dns '
+  $r = Pf-Run (Pf-Root) (Pf-Stubs @{ curl = 'case "$*" in *dns-query*) exit 7;; esac; exit 0' }); Eq $r.Code 65 'dns'; PfHas $r 'INV refuse dns why=unreachable'; PfLacks $r 'new-unreachable'
+} -NeedsBash
+T 'L.pre-addr: the preflight script refuses an --addr outside ^[A-Za-z0-9.-]+$ (target-addr addr=-) and a target without an ed25519 host key (target-addr why=no-ed25519) (B.0.2)' {
+  $a = @($PfArgs); $a[3] = 'bad_addr!'; $r = Pf-Run (Pf-Root) (Pf-Stubs) $a; Eq $r.Code 65 'addr'; PfHas $r 'INV refuse target-addr addr=-'
+  $fr = Pf-Root; Remove-Item -LiteralPath (Join-Path $fr 'etc/ssh/ssh_host_ed25519_key.pub'); $r = Pf-Run $fr (Pf-Stubs); Eq $r.Code 65 'no key'; PfHas $r 'INV refuse target-addr why=no-ed25519'
+} -NeedsBash
+T 'L.pre-empty-rules: package-default units, skel copies and empty unowned dirs pass; a uid ≥ 1000 user with a non-skel home is reported home-nonskel=1 and never refused by preflight (B.0.3, E-P2)' {
+  $fr = Pf-Root
+  Fx-File $fr 'etc/systemd/system/pkg-default.service' "[Unit]`n"; Fx-File $fr 'opt/vendor/bin/tool'; Fx-File $fr 'var/lib/dpkg/info/pkgx.list' "/etc/systemd/system/pkg-default.service`n/opt/vendor/bin/tool`n"
+  [void](New-Item -ItemType Directory -Force -Path (Join-Path $fr 'etc/systemd/system/multi-user.target.wants'))
+  & ln -s /usr/lib/systemd/system/cron.service (Join-Path $fr 'etc/systemd/system/multi-user.target.wants/cron.service'); & ln -s /usr/lib/systemd/system/rsyslog.service (Join-Path $fr 'etc/systemd/system/syslog.service')
+  foreach ($d in 'opt/emptydir', 'srv/empty', 'usr/local/bin', 'usr/local/etc') { [void](New-Item -ItemType Directory -Force -Path (Join-Path $fr $d)) }
+  Fx-File $fr 'etc/skel/.bashrc' "# skel`n"; Fx-File $fr 'home/alice/.bashrc' "# skel`n"; Fx-File $fr 'home/bob/.bashrc' "# skel`n"; Fx-File $fr 'home/bob/notes.txt' "mine`n"
+  Fx-File $fr 'fx-passwd' "root:x:0:0:root:/root:/bin/bash`nalice:x:1500:1500::/home/alice:/bin/bash`nbob:x:1501:1501::/home/bob:/bin/bash`nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin`n"
+  $r = Pf-Run $fr (Pf-Stubs); Eq $r.Code 0 "exit ($($r.Text))"; PfHas $r 'INV ok'; PfLacks $r '^INV refuse '
+  PfHas $r 'INV target user=alice uid=1500 home-nonskel=0'; PfHas $r 'INV target user=bob uid=1501 home-nonskel=1'; PfLacks $r '^INV target user=(nobody|root) '
+} -NeedsBash
+T 'L.pre-empty-rules: an unowned file under /opt refuses once with its top-level entry; an unowned unit file, a running container and another move''s move-id refuse target-not-empty (65) (B.0.3, E-P2, E-P36)' {
+  $fr = Pf-Root
+  Fx-File $fr 'opt/app/data/f.txt'; Fx-File $fr 'opt/app/g.txt'; Fx-File $fr 'srv/www/index.html'; Fx-File $fr 'etc/systemd/system/app.service' "[Unit]`n"; Fx-File $fr 'var/lib/fcode-move/move-id' "id=mv-20261101000000-abcdef`n"
+  $r = Pf-Run $fr (Pf-Stubs @{ docker = 'case "$*" in *--format*) echo web;; *ps*) echo 0123456789ab;; esac; exit 0' }); Eq $r.Code 65 "exit ($($r.Text))"
+  PfHas $r 'INV refuse target-not-empty path=/opt/app'; Eq (@($r.Out | Where-Object { "$_" -match 'path=/opt/app' }).Count) 1 'one refusal for /opt/app'; PfLacks $r 'path=/opt/app/'; PfHas $r 'INV refuse target-not-empty path=/srv/www'
+  PfHas $r 'INV refuse target-not-empty path=/etc/systemd/system/app.service'; PfHas $r 'INV refuse target-not-empty path=container:web'; PfHas $r 'INV refuse target-not-empty path=/var/lib/fcode-move/move-id'
+} -NeedsBash
+T 'L.pre-empty-rules: the platform entries pass only on a target carrying all seven platform unit files (INV target platform=1); a non-platform entry still refuses; with one unit file missing the same paths and unit files refuse and platform=0 (B.5.2, CONTRACT §3.5)' {
+  $mk = {
+    param([string[]]$Units)
+    $fr = Pf-Root
+    foreach ($u in $Units) { Fx-File $fr "etc/systemd/system/$u" "[Unit]`n" }
+    foreach ($p in 'usr/local/bin/node', 'usr/local/etc/npmrc', 'opt/npm/bin/npm', 'opt/containerd/bin/x', 'usr/local/lib/node_modules/corepack/package.json', 'usr/local/go/bin/go', 'usr/local/share/ca-certificates/instabox-proxy.crt') { Fx-File $fr $p }
+    $fr
+  }
+  $r = Pf-Run (& $mk $PlatformUnits) (Pf-Stubs); Eq $r.Code 0 "platform present ($($r.Text))"; PfHas $r 'INV target platform=1'; PfLacks $r '^INV refuse '; PfHas $r 'INV ok'
+  $fr = & $mk $PlatformUnits; Fx-File $fr 'usr/local/bin/mytool'; $r = Pf-Run $fr (Pf-Stubs); Eq $r.Code 65 'a non-platform entry'; PfHas $r 'INV refuse target-not-empty path=/usr/local/bin'
+  $r = Pf-Run (& $mk @($PlatformUnits | Where-Object { $_ -cne 'sshd.service' })) (Pf-Stubs); Eq $r.Code 65 "six of seven ($($r.Text))"; PfHas $r 'INV target platform=0'
+  PfHas $r 'INV refuse target-not-empty path=/opt/npm'; Ok (@($r.Out | Where-Object { "$_" -match '^INV refuse target-not-empty path=/usr/local/' }).Count -ge 1) "the /usr/local entries refuse: $($r.Text)"
+  PfHas $r 'INV refuse target-not-empty path=/etc/systemd/system/instabox-user.service'
+} -NeedsBash
+T 'L.pre-uid-collision: the preflight script prints new''s groups with gid ≥ 1000, every /etc/subuid and /etc/subgid line and every global address (B.0.2; W1-T11-DG-T11-4)' {
+  $fr = Pf-Root
+  Fx-File $fr 'fx-group' "root:x:0:`nsudo:x:27:alice`ndevs:x:1800:alice`n"; Fx-File $fr 'etc/subuid' "alice:100000:65536`n"; Fx-File $fr 'etc/subgid' "alice:165536:65536`n"
+  $r = Pf-Run $fr (Pf-Stubs); Eq $r.Code 0 "exit ($($r.Text))"
+  PfHas $r 'INV target group=devs gid=1800'; PfLacks $r '^INV target group=(root|sudo) '
+  PfHas $r 'INV target subid user=alice kind=uid start=100000 count=65536'; PfHas $r 'INV target subid user=alice kind=gid start=165536 count=65536'
+  PfHas $r 'INV target addr=198.51.100.20'; PfHas $r 'INV target addr=2001:db8::20'
+} -NeedsBash
 T 'L.check-diff: check is zero-write, sends plan - --check-only, shows new refusals first against check.json, exits 65 or 0' {
   $W.CheckOut = @('INV refuse pm2-unsaved names=api'); $W.CheckCode = 65
   $r = Run-Move @('check'); Eq $r.Code 65 'first check'; HasText 'Danh sách pm2 chưa được lưu'
@@ -825,12 +958,12 @@ T 'L.check-diff: check is zero-write, sends plan - --check-only, shows new refus
 }
 T 'L.push-scan: a non-legacy repo whose workflow deploys over ssh asks Q-sshpush; không refuses push-deploy, có disables that workflow for good; a legacy repo is gate-push' {
   foreach ($a in 'không', 'có') {
-    Reset-World; $W.Mf.legacy_push = @([ordered]@{ project = 'deal-sync'; repo = $LegacyRepo })
+    Reset-World
     Add-Gh $GhForm.RepoList @('[{"nameWithOwner":"brooklyn96/task"},{"nameWithOwner":"brooklyn96/BD-Team-Project"}]')
     Add-Gh ($GhForm.WfDir -f 'brooklyn96/task') @('[{"name":"deploy.yml"}]')
     Add-Gh ($GhForm.WfFile -f 'brooklyn96/task', 'deploy\.yml') @('jobs:', '  d:', '    steps:', '      - run: ssh-keyscan $HOST >> ~/.ssh/known_hosts')
     Add-Gh ($GhForm.WfDir -f 'brooklyn96/BD-Team-Project') @('[{"name":"deploy.yml"}]')
-    Add-Gh ($GhForm.WfFile -f 'brooklyn96/BD-Team-Project', 'deploy\.yml') @('      - run: echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > kh')
+    Add-Gh ($GhForm.WfFile -f 'brooklyn96/BD-Team-Project', 'deploy\.yml') @($LegacyWfLine)
     Ans $a
     if ($a -ceq 'không') { [void](Do-Plan -Want 65); HasText 'Có workflow deploy thẳng qua ssh' } else { [void](Do-Plan -Want 0) }
     Ok (@(Lines | Where-Object { $_ -match '\AWorkflow của repo brooklyn96/task( \(deploy\.yml\))? deploy thẳng qua ssh\. Tắt hẳn workflow đó\? \(có / không\)\z' }).Count -ge 1) "Q-sshpush text: $(Lines)"
@@ -868,6 +1001,29 @@ T 'L.copy-refresh-reprepares: a user added on old after the first copy is in the
 T 'L.copy-planned-no-chore0: plan sets enabled=true, so copy in phase planned never runs chore 0 (I31)' {
   Fx-Planned; Eq (Get-St).enabled $true 'enabled at plan'
   [void](Do-Copy 0); NoChore0
+}
+T 'L.copy-idmap: a c.prepare.N idmap line the state lacks is kept in idmap[] and re-plans (plan <id> with the idmap stdin line, c.repin.N on both) before c.transfer.N; a re-plan that was refused is redone by the next copy before any transfer (B.6.2)' {
+  $idl = 'MOVE item idmap:user:svc kind=prepare state=mapped src_id=105 dst_id=110'
+  Fx-Planned; Add-Fault -M new -Key '-c\.prepare\.1$' -Rc 0 -Out @($idl)
+  [void](Do-Copy 0)
+  Ordered @('^new fwd-1-c\.prepare\.1$', '^old plan:full$', '^(old|new) fwd-1-c\.repin\.1$', '^new fwd-1-c\.transfer\.1$')
+  Ok ((Sent 'old' '-c\.repin\.1$') -eq 1 -and (Sent 'new' '-c\.repin\.1$') -eq 1) "c.repin.1 on both: $(LogNow)"
+  Ok (@($W.PlanStdin[-1]) -ccontains 'idmap user svc 105 110') "re-plan stdin: $(@($W.PlanStdin[-1]) -join ' | ')"
+  Ok (@(@((Get-St).idmap) | Where-Object { $_.kind -ceq 'user' -and $_.name -ceq 'svc' -and "$($_.src_id)" -ceq '105' -and "$($_.dst_id)" -ceq '110' }).Count -eq 1) "state idmap[]: $(ConvertTo-Json -InputObject @((Get-St).idmap) -Compress)"
+  Eq $W.new.Sha $W.LastSha 'new pinned to the re-planned sha'
+  Reset-World; Fx-Planned
+  Add-Fault -M new -Key '-c\.prepare\.1$' -Rc 0 -Out @($idl); Add-Fault -M old -Key '^plan:full$' -Rc 65 -Out @('INV refuse transient unit=x.service')
+  $r1 = Run-Move @('copy'); Ok ($r1.Code -ne 0) "the refused re-plan stops the copy ($($r1.Text))"; Eq (SentAny '-c\.transfer\.') 0 'first copy: nothing transferred'
+  Add-Fault -M new -Key '-c\.prepare\.2$' -Rc 0 -Out @($idl)
+  [void](Do-Copy 0); Before '^old plan:full$' '^new fwd-1-c\.transfer\.'; Ok (@($W.PlanStdin[-1]) -ccontains 'idmap user svc 105 110') "the redone re-plan sends the idmap line: $(@($W.PlanStdin[-1]) -join ' | ')"
+}
+T 'L.copy-idmap: a state idmap[] entry that the re-plan dropped (the owner added exclude user svc) and this c.prepare.N no longer prints never re-plans again at the refresh (B.6.2: only an entry this c.prepare.N printed that the pinned idmap[] lacks)' {
+  $idl = 'MOVE item idmap:user:svc kind=prepare state=mapped src_id=105 dst_id=110'
+  Fx-Planned; Add-Fault -M new -Key '-c\.prepare\.1$' -Rc 0 -Out @($idl)
+  [void](Do-Copy 0); Eq (Get-St).phase 'copied' 'phase after the first copy'
+  $W.PlanHook = { param($n, $mapl) $W.Mf.idmap = @(@($W.Mf.idmap) | Where-Object { $_.name -cne 'svc' }); $null }   # the server's map step drops the excluded user's entry
+  [void](Do-Copy 0)
+  Eq (@(LogNow | Where-Object { $_ -match '^old plan:full$' }).Count) 1 "plan:full count in the refresh copy (its own re-plan only): $((LogNow) -join ' ; ')"
 }
 T 'L.copy-after-collision-remedy: a copy whose c.init-new failed is re-run under the same id after the remedy, and the server runs it again' {
   Fx-Planned; Add-Fault -M new -Key '-c\.init-new$' -Rc 1 -Out @('MOVE error tool-missing tool=e2fsprogs')
@@ -921,6 +1077,12 @@ T 'L.drain-question: x.freeze busy at cap_s asks Q-drain; đợi sends the same 
   Fx-Copied; Add-Fault -M old -Key '-x\.freeze$' -Rc 75 -Out @('MOVE wait drain lock=/var/lock/fcode-deploy/task.lock waited=900')
   Ans 'có', 'đợi'; $r = Run-Move @('cutover'); Eq $r.Code 0 "exit ($($r.Text))"
   Ok (@(Lines | Where-Object { $_ -match '\AMáy cũ còn việc deploy đang chạy \(.*\)\. đợi = đợi thêm [0-9]+ phút; dừng = mở lại máy cũ và dừng\. \(đợi / dừng\)\z' }).Count -ge 1) "Q-drain text: $(Lines)"
+  Eq (@(LogNow | Where-Object { $_ -ceq 'old fwd-1-x.freeze' }).Count) 2 'x.freeze sent twice under its id'; Eq (Get-St).phase 'cut' 'phase'
+}
+T 'L.drain-question: a follower still active at its own stop_budget_s (MOVE wait follower) asks Q-drain naming the unit; đợi sends the same x.freeze again (D.4 step 2, DECISION-1k6-K1budget)' {
+  Fx-Copied; Add-Fault -M old -Key '-x\.freeze$' -Rc 75 -Out @('MOVE wait follower unit=job.service waited=930')
+  Ans 'có', 'đợi'; $r = Run-Move @('cutover'); Eq $r.Code 0 "exit ($($r.Text))"
+  Ok (@(Lines | Where-Object { $_ -match '\AMáy cũ còn việc deploy đang chạy \([^)]*job\.service[^)]*\)\. đợi = đợi thêm [0-9]+ phút; dừng = mở lại máy cũ và dừng\. \(đợi / dừng\)\z' }).Count -ge 1) "Q-drain names the follower: $(Lines)"
   Eq (@(LogNow | Where-Object { $_ -ceq 'old fwd-1-x.freeze' }).Count) 2 'x.freeze sent twice under its id'; Eq (Get-St).phase 'cut' 'phase'
 }
 T 'L.guard-question: a busy guard at cap_s asks Q-guard; tiếp tục goes to step 5 without re-running guards, dừng rolls back (10, never 75)' {
@@ -980,10 +1142,10 @@ T 'L.prerule-after-rb-unfreeze-fail: the next verb repairs old first with chore 
   Ordered @('^old fwd-1-x\.enable\.[0-9]+$', '^old fwd-1-x\.unfreeze\.[0-9]+$', '^old fwd-2-c\.init-old$')
   Eq $W.old.Frozen $false 'old unfrozen by the repair'
 }
-T 'L.rb-health-fail-unfreezes: a failing r.health-src is reported after the unfreeze; old serves (exit 10 or 70: DESIGN-GAP D.5.1 vs E-R18)' {
-  Fx-Copied; Add-Fault -M new -Key '-x\.final$' -Rc 1; Add-Fault -M old -Key '-r\.health-src$' -Rc 69
-  [void](Do-Cutover -1); Ok ($script:Last.Code -in 10, 70) "exit 10 (D.5.1) or 70 (E-R18), got $($script:Last.Code)"
-  Before '^old fwd-1-r\.unfreeze-src$' '^old fwd-1-r\.health-src$'; Eq $W.old.Frozen $false 'unfrozen'; Eq (Get-St).serving 'old' 'serving'; Eq (Get-St).phase 'rolled-back' 'phase'
+T 'L.rb-health-fail-unfreezes: a failing r.health-src is reported after the unfreeze with the failed checks; old serves, exit 10 (report only: D.5.1, E-R18; W1-T11-DG-T11-2)' {
+  Fx-Copied; Add-Fault -M new -Key '-x\.final$' -Rc 1; Add-Fault -M old -Key '-r\.health-src$' -Rc 69 -Out @('MOVE item health-nginx kind=check state=failed')
+  [void](Do-Cutover 10); HasText 'health-nginx'
+  Before '^old fwd-1-r\.unfreeze-src$' '^old fwd-1-r\.health-src$'; Eq $W.old.Frozen $false 'unfrozen'; $s = Get-St; Eq $s.serving 'old' 'serving'; Eq $s.phase 'rolled-back' 'phase'; Eq $s.enabled $true 'enabled (r.start-src answered 0)'
 }
 T 'L.rb-after-deadline: a call past its deadline (budget + 60, unit ended rc 143) is read by status, then the rollback runs' {
   Fx-Copied; Add-Fault -M new -Key '-x\.final$' -Mode timeout
@@ -1036,7 +1198,8 @@ T 'L.bounded-calls: every call has a deadline; recorded calls carry --budget fro
   Eq $b2['fwd-1-c.prepare.2'] 600 'c.prepare.2 = max(300, 3 × 200)'; Eq $b2['fwd-1-c.adopt.2'] 3000 'c.adopt.2 = max(1860, 3 × 1000)'
   [void](Do-Cutover 0); $s = Get-St
   $b3 = @{}; foreach ($c in @(RecCalls)) { $b3[$c.Call] = [int]$c.Budget }
-  Eq $b3['fwd-1-x.freeze'] 900 'x.freeze = cap_s'; Eq $b3['fwd-1-x.guards'] 900 'x.guards = cap_s'; Eq $b3['fwd-1-x.switch'] 120 'x.switch'
+  Eq $b3['fwd-1-x.freeze'] (900 + 120 + 30) 'x.freeze = cap_s + cron.service (the one periodic source of the stop set) + 30'; Eq $b3['fwd-1-x.guards'] 930 'x.guards = cap_s + Σ run_s (no guard) + 30'; Eq $b3['fwd-1-x.switch'] 60 'x.switch = 60 (no connector, no tunnel name)'
+  Eq $b3['fwd-1-x.baseline'] 300 'x.baseline = 300 (no redis, pg, tunnel, container, linger or health entry)'; Eq $b3['fwd-1-x.health'] 300 'x.health'
   Eq $b3['fwd-1-x.check'] (3 * 7 + 60) 'x.check = 3 × the measured 0c check-only + 60'
   Eq $b3['fwd-1-x.stop-src'] (3 * 120 + 30) 'x.stop-src = Σ stop budgets + 30'; Eq $b3['fwd-1-x.start'] (3 * 60 + 60) 'x.start = Σ start budgets + 60'
   Eq $b3['fwd-1-x.final'] (2 * [int]$s.est.transfer_s + 300) 'x.final = 2 × transfer_s + 300'; Eq $b3['fwd-1-x.verify'] (2 * [int]$s.est.verify_s + 120) 'x.verify = 2 × verify_s + 120'
@@ -1092,7 +1255,6 @@ T 'L.pin-hostkey: the first contact pins new''s key under --addr in the move kno
 }
 
 # ============================== step 10 and 11: chore 0 and the chores ==============================
-function Use-Legacy { $W.Mf.legacy_push = @([ordered]@{ project = 'deal-sync'; repo = $LegacyRepo }) }
 function GhSets { @($W.GhLog | Where-Object { $_.Text -match $GhForm.SecretSet }) }
 T 'L.known-hosts-line-format: DEPLOY_KNOWN_HOSTS becomes "<--addr> ssh-ed25519 <new key>"; old''s line is "<alias HostName before the swap> ssh-ed25519 <old key>", never --old-addr' {
   Use-Legacy; [void](Do-Plan @('--old-addr', '127.0.0.1:2222')); [void](Do-Copy); [void](Do-Cutover 0)
@@ -1162,8 +1324,19 @@ T 'L.step10-fail-no-carry: chore 0 failing after the proof ends exit 1 with new 
 }
 
 # ============================== finish (D.7) ==============================
-T 'L.finish-health: finish refuses (exit 1) when new is not healthy now (reading T10-G18: new''s status shows fewer active holds than the start set); no f.* call' {
+T 'L.finish-health: finish refuses (exit 1) when new is not healthy now (D.7: new''s status shows fewer active holds than the non-follower holds of the start set); no f.* call' {
   Fx-Cut; $W.new.Active = 1; Ans 'YES'; $r = Run-Move @('finish'); Eq $r.Code 1 'exit'; Eq (SentAny '-f\.(old|new)$') 0 'no finish call'
+}
+T 'L.finish-health: hold_active must equal the non-follower holds of hold_sets.start (D.7, D.10; W1-T10-G18, W1-T11-DG-T11-5) — a follower in the start set never blocks finish; one active hold more refuses' {
+  $fx = {
+    $W.Mf.holds = @($W.Mf.holds) + [ordered]@{ id = 'job.service'; kind = 'unit'; type = 'service'; unit_file_state = 'static'; active_state = 'inactive'; sub_state = 'dead'; remain_after_exit = 'no'; triggered_by = @('cron.service'); n_restarts = 0; stop_budget_s = 120; start_budget_s = 60; listen = @() }
+    $W.Mf.followers = @('job.service'); $W.Mf.hold_sets.start = @($W.Mf.hold_sets.start) + 'job.service'; $W.Mf.hold_sets.stop = @($W.Mf.hold_sets.stop) + 'job.service'
+    Fx-Cut
+  }
+  & $fx; Eq $W.new.Active $Holds 'new runs the three non-follower holds'
+  Ans 'YES'; $r = Run-Move @('finish'); Eq $r.Code 0 "finish with a follower in the start set ($($r.Text))"; Eq (Get-St).phase 'finished' 'phase'
+  Reset-World; & $fx; $W.new.Active = $Holds + 1
+  Ans 'YES'; $r = Run-Move @('finish'); Eq $r.Code 1 "hold_active above the non-follower count ($($r.Text))"; Eq (SentAny '-f\.(old|new)$') 0 'no finish call'
 }
 T 'L.finish-chores-pending: finish refuses (exit 1) while a chore is pending' {
   Fx-Cut; [void](Patch-St @{ chores_done = $false }); Ans 'YES'; $r = Run-Move @('finish'); Eq $r.Code 1 'exit'; Eq (SentAny '-f\.(old|new)$') 0 'no finish call'
@@ -1192,6 +1365,18 @@ T 'L.back-same-code: a manual back runs the cutover steps with dir=back: src = n
   }
   Eq (Sent 'old' '-x\.freeze$') 0 'no freeze on old in a back'
   $s = Get-St; Eq $s.phase 'back-done' 'phase'; Eq $s.serving 'old' 'serving'; Ok ($null -eq $s.mark) 'mark'; Eq $s.dir 'back' 'dir'
+}
+T 'L.back-same-code: step 3 re-pins both machines with x.repin under one id, in a fwd cutover and in a manual back (D.4 step 3; GAP-RULINGS-3 rev 1k3.3 "x.repin on both")' {
+  Fx-Cut; Eq (Sent 'old' '^fwd-1-x\.repin$' -All) 1 'fwd x.repin on old'; Eq (Sent 'new' '^fwd-1-x\.repin$' -All) 1 'fwd x.repin on new'
+  Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "back ($($r.Text))"
+  Eq (Sent 'old' '^back-2-x\.repin$') 1 'back x.repin on old'; Eq (Sent 'new' '^back-2-x\.repin$') 1 'back x.repin on new'
+}
+T 'L.back-same-code: a manual back''s 0c plan <id> --check-only on new carries --dir back --attempt <state attempt + 1> (the write-ahead values); a fwd cutover''s carries the state''s fwd values (D.0.1, W1-T10-G16)' {
+  $show = { param($cs) @($cs | ForEach-Object { "$($_.M) --dir $($_.Flags['dir']) --attempt $($_.Flags['attempt'])" }) -join ', ' }
+  Fx-Copied; [void](Do-Cutover 0)
+  $c = @(Calls | Where-Object { $_.Step -ceq 'plan:check-only' }); Ok ($c.Count -ge 1 -and $c[0].M -ceq 'old' -and $c[0].Flags['dir'] -ceq 'fwd' -and $c[0].Flags['attempt'] -ceq '1') "fwd 0c: $(& $show $c)"
+  Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "back ($($r.Text))"
+  $c = @(Calls | Where-Object { $_.Step -ceq 'plan:check-only' }); Ok ($c.Count -ge 1 -and $c[0].M -ceq 'new' -and $c[0].Flags['dir'] -ceq 'back' -and $c[0].Flags['attempt'] -ceq '2') "back 0c: $(& $show $c)"
 }
 T 'L.back-init-crash: the back write-ahead (dir=back, attempt+1, phase=planned, carry=false) is in state.json before b.init-*; a crash after it re-runs both inits' {
   Fx-Cut; $script:Seen = $null; $W.Hooks['b.init-new'] = { param($m, $e) if (-not $script:Seen) { $script:Seen = Get-St } }
@@ -1540,7 +1725,7 @@ T 'L.call-key-sites: every Invoke-MoveCall site sends a single-quoted step of th
 }
 T 'L.texts-match-move-md: every owner text and reason label of docs/MOVE.md (CONTRACT §8.3 copy) is in laptop/fcode.ps1 verbatim' {
   $p = $env:MV_MOVE_MD
-  Ok ($p -and (Test-Path -LiteralPath $p)) "MV_MOVE_MD must name deploy-gate docs/MOVE.md (got [$p])"
+  Ok ($p -and (Test-Path -LiteralPath $p)) "MV_MOVE_MD must name deploy-gate docs/MOVE.md (G.2, W1-T11-DG-T11-1; got [$p])"
   $md = [IO.File]::ReadAllText($p) -replace "`r`n", "`n"
   $blk = { param($b, $e) $i = $md.IndexOf($b); if ($i -lt 0) { throw "docs/MOVE.md lacks $b" }; $j = $md.IndexOf($e, $i); $md.Substring($i + $b.Length, $j - $i - $b.Length) }
   $d151 = & $blk '<!-- BEGIN verbatim DESIGN D.15.1' '<!-- END verbatim -->'
@@ -1563,7 +1748,7 @@ T 'L.suite-windows: without bash (Windows) a bash case is skipped and counted, n
 }
 
 # ============================== a down new, rebuild after the swap, the cut-off time (T10 review r1 F1–F6) ==============================
-T 'L.carry-after-final-70: an x.final whose outcome stays unknown (new drops during it) counts as started (reading DG-R11-1): exit 70, no Q-discard, old never started' {
+T 'L.carry-after-final-70: PROBE.er5-final-new-down — an x.final whose outcome stays unknown (new drops during it) has started (D.5.2, W1-T11-DG-R11-1): exit 70, no Q-discard, old never started' {
   Start-Carry; Add-Fault -M new -Key '^back-2-x\.final$' -Mode down; Ans 'có', 'YES'
   $r = Run-Move @('cutover'); Eq $r.Code 70 "exit ($($r.Text))"; Eq (SentAny '-r\.start-src$') 0 'old not started'
   Ok (@(Lines -Last | Where-Object { $_ -match 'Gõ YES' }).Count -eq 0) 'no Q-discard after x.final started'
@@ -1592,12 +1777,22 @@ T 'L.rebuild: after the step-11 alias swap the rebuild reads old through Reach-O
   Eq $s.old.addr $OldAddr 'old.addr'; Eq $s.new.addr $NewAddr 'new.addr'
   Eq "$($s.aliases.laptop_backup)" $OldAddr 'laptop_backup rebuilt from the move-ids'; Eq "$($s.aliases.coder_backup)" $OldAddr 'coder_backup rebuilt from the move-ids'
 }
-T 'L.rebuild: a rebuilt state keeps target_users[] from the pinned same_users[] (reading DG-R11-2), so the next re-plan sends the target-user lines' {
-  Fx-Copied; [IO.File]::Delete((StatePath))
-  foreach ($n in 'old', 'new') { $W[$n].MoveId.old_addr = $OldAddr; $W[$n].MoveId.new_addr = $NewAddr }
+T 'L.rebuild: target_users[], target_groups[], target_subids[], target_addrs[] and target_stop_budget_s come from new''s target.json (c.init-new''s "target" stdin, read back as MOVE target), never from the pinned same_users[] or new''s current users; the next re-plan sends them (D.0.9, D.0.10; W1-T11-DG-R11-2, W1-T10R-F4)' {
+  $W.Pf = @('INV target user=quoc uid=1000 home-nonskel=1', 'INV target user=zed uid=1700 home-nonskel=0', 'INV target group=devs gid=1800', 'INV target subid user=zed kind=uid start=300000 count=65536', 'INV target subid user=zed kind=gid start=300000 count=65536', 'INV target addr=198.51.100.20', 'INV target addr=2001:db8::20', 'INV target platform=0', 'INV target stop_budget_s=240')
+  Fx-Copied
+  $want = [ordered]@{ users = 'quoc:1000,zed:1700'; groups = 'devs:1800'; subids = 'zed:uid:300000:65536,zed:gid:300000:65536'; addrs = '198.51.100.20,2001:db8::20'; stop = '240' }
+  $flat = { param($u, $g, $sb, $a, $st) [ordered]@{ users = (@($u | ForEach-Object { "$($_.name):$($_.uid)" }) -join ','); groups = (@($g | ForEach-Object { "$($_.name):$($_.gid)" }) -join ','); subids = (@($sb | ForEach-Object { "$($_.user):$($_.kind):$($_.start):$($_.count)" }) -join ','); addrs = (@($a) -join ','); stop = "$st" } }
+  $t = $W.new.InitStdin.target; Ok ($null -ne $t) "c.init-new stdin carries the ""target"" key: $(ConvertTo-Json -InputObject $W.new.InitStdin -Depth 4 -Compress)"
+  $got = & $flat $t.users $t.groups $t.subids $t.addrs $t.stop_budget_s; foreach ($k in $want.Keys) { Eq $got[$k] $want[$k] "c.init-new target.$k" }
+  $s = Get-St; $got = & $flat $s.target_users $s.target_groups $s.target_subids $s.target_addrs $s.target_stop_budget_s; foreach ($k in $want.Keys) { Eq $got[$k] $want[$k] "state target_$k after plan" }
+  $in = @($W.PlanStdin[-1]); foreach ($l in 'target-user zed 1700', 'target-addr 198.51.100.20', 'target-addr 2001:db8::20') { Ok ($in -ccontains $l) "plan stdin lacks [$l]: $($in -join ' | ')" }
+  [IO.File]::Delete((StatePath)); foreach ($n in 'old', 'new') { $W[$n].MoveId.old_addr = $OldAddr; $W[$n].MoveId.new_addr = $NewAddr }
+  $W.Pf = @('INV target user=quoc uid=1000 home-nonskel=1', 'INV target user=late uid=1900 home-nonskel=1', 'INV target stop_budget_s=1')   # new's users now: never read by a rebuild
   $r = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $r.Code 0 "rebuild ($($r.Text))"
-  $n0 = $W.PlanStdin.Count; [void](Run-Move @('copy'))
-  Ok ($W.PlanStdin.Count -gt $n0) 'the copy refresh re-plans'; Ok (@($W.PlanStdin[-1]) -ccontains 'target-user quoc 1000') "re-plan stdin: $(@($W.PlanStdin[-1]) -join ' | ')"
+  Ok (@(LogNow | Where-Object { $_ -ceq 'new script:rebuild read' }).Count -ge 1) "rebuild read on new: $(LogNow)"; Eq (@(LogNow | Where-Object { $_ -match 'script:preflight' }).Count) 0 'no preflight in a rebuild'
+  $s = Get-St; $got = & $flat $s.target_users $s.target_groups $s.target_subids $s.target_addrs $s.target_stop_budget_s; foreach ($k in $want.Keys) { Eq $got[$k] $want[$k] "rebuilt target_$k" }
+  $n0 = $W.PlanStdin.Count; [void](Run-Move @('copy')); Ok ($W.PlanStdin.Count -gt $n0) 'the copy refresh re-plans'
+  $in = @($W.PlanStdin[-1]); foreach ($l in 'target-user quoc 1000', 'target-user zed 1700', 'target-addr 2001:db8::20') { Ok ($in -ccontains $l) "re-plan stdin lacks [$l]: $($in -join ' | ')" }; Ok (-not ($in -match 'late')) 'never new''s current users'
 }
 T 'L.pre-clock: new against old over 5 s refuses clock even when each is within 5 s of the laptop' {
   $W.old.Skew = 4; $W.new.Skew = -4; [void](Do-Plan -Want 65); HasText 'Đồng hồ các máy lệch nhau quá 5 giây'
@@ -1624,7 +1819,9 @@ T 'L.new-lost-fence-text: a resumed cutover keeps dst_started_at = the first x.s
 }
 T 'L.new-lost-fence-text: a later attempt''s <giờ> is its own x.start, never an earlier attempt''s dst_started_at (R5-3 cleared; D.5.3, W1-T10-F5)' {
   Start-Carry; [void](Do-Cutover 10); [void](Do-Copy 0)
+  $script:AtFreeze = '?'; $W.Hooks['x.freeze'] = { param($m, $e) if ($e.Call -ceq 'fwd-3-x.freeze') { $script:AtFreeze = St-Raw 'dst_started_at' } }
   Add-Fault -M new -Key '^fwd-3-x\.health$' -Mode down; [void](Do-Cutover 70)
+  Ok ($null -eq $script:AtFreeze -or $script:AtFreeze -ceq 'null') "the dst_started=false save of step 1 also cleared dst_started_at (R5-3), seen at fwd-3-x.freeze: [$($script:AtFreeze)]"
   $script:Clock = $script:Clock.AddHours(2); Ans 'không'; [void](Run-Move @('cutover')); $g = Get-QuestionTime
   Eq $g (Expect-Gio (Rec-Start new ($RebuildDstStartedAt -f 3))) '<giờ> of attempt 3'; Ok ($g -cne (Expect-Gio (Rec-Start new ($RebuildDstStartedAt -f 1)))) "not attempt 1's x.start: $g"
 }
@@ -1686,7 +1883,7 @@ T 'L.copy-refresh-reprepares: a refresh that failed before its c.prepare blocks 
   Ans 'có'; $r = Run-Move @('cutover'); Eq $r.Code 1 "cutover after a failed refresh ($($r.Text))"; HasText 'chạy fcode move copy lại'; Eq (SentAny '-x\.freeze$') 0 'nothing frozen'
   [void](Do-Copy 0); Ans 'có'; $r = Run-Move @('cutover'); Eq $r.Code 0 "cutover after a good refresh ($($r.Text))"
 }
-T 'L.back-rollback-to-cut: in a manual back an x.final whose outcome stays unknown ends 70 (resume only), never the E-R19 restart (reading DG-R11-1)' {
+T 'L.back-rollback-to-cut: in a manual back an x.final whose outcome stays unknown ends 70 (resume only), never the E-R19 restart (D.5.2, W1-T11-DG-R11-1)' {
   Fx-Cut; Add-Fault -M new -Key '^back-2-x\.final$' -Mode down; Ans 'YES'
   $r = Run-Move @('back'); $s = Get-St
   Eq $r.Code 70 "exit ($($r.Text))"; Eq (SentAny '-r\.start-src$') 0 'no E-R19 restart'
@@ -1702,18 +1899,32 @@ T 'L.abort-new-unreachable: new answers again after a carry-back''s Q-newlost (i
   Ans 'YES'; $r2 = Run-Move @('cutover'); Eq $r2.Code 10 "Q-newlost after power-off (first run $($r1.Code): $($r1.Text) || second: $($r2.Text))"; Eq (Get-St).new_lost $true 'new_lost'
   $script:W.new.Up = $true; Ans 'có'; $r = Run-Move @('abort'); Eq $r.Code 0 "abort once new answers again ($($r.Text)) log: $(LogNow)"
 }
-T 'L.new-lost: a later attempt in which new serves again is never fenced by the old new_lost flag (no r.stop-dst to the serving new)' {
+T 'L.new-lost: a later attempt in which new serves again is never fenced by the old new_lost flag (no r.stop-dst to the serving new; D.5.3, W1-T10-O1)' {
   Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.health$' -Mode down; [void](Do-Cutover 70)
   Ans 'YES'; $r = Run-Move @('cutover'); Eq $r.Code 10 'Q-newlost'
-  $script:W.new.Up = $true; [void](Do-Copy); [void](Do-Cutover); Eq (Get-St).serving 'new' 'second attempt cut'
+  $script:W.new.Up = $true; [void](Do-Copy); Eq (Get-St).new_lost $false 'cleared by the later c.init-new rc 0'; [void](Do-Cutover); Eq (Get-St).serving 'new' 'second attempt cut'
   Add-Fault -M new -Key '-c\.transfer\.' -Rc 1; Ans 'YES'; $rb = Run-Move @('back'); $st = Get-St; $r = Run-Move @('back')
   Eq (Sent 'new' "$([regex]::Escape($FenceStep))$") 0 "$FenceStep sent to the serving new (first back $($rb.Code), state $($st.dir)-$($st.attempt) $($st.phase) serving=$($st.serving)): $(LogNow)"
-} -PendingArchitect O1
-T 'L.rebuild: a manual back in flight (mark set, x.freeze sent) is rebuilt with carry=false, never as a carry-back' {
+}
+T 'L.new-lost: a later attempt''s c.init-new rc 0 clears new_lost and new_discarded; a c.init-new that failed clears neither (D.5.3, W1-T10-O1)' {
+  Start-Carry; Add-Fault -M old -Key '^back-2-x\.stop-dst$' -Rc 1; Ans 'có', 'YES'; $r = Run-Move @('cutover'); Eq $r.Code 10 "Q-discard YES ($($r.Text))"; Eq (Get-St).new_discarded $true 'new_discarded'
+  Add-Fault -M new -Key '-c\.init-new$' -Rc 1 -Out @('MOVE error tool-missing tool=e2fsprogs'); $r = Do-Copy -1; Ok ($r.Code -ne 0) "the copy whose c.init-new failed ($($r.Text))"; Eq (Get-St).new_discarded $true 'kept after a failed c.init-new'
+  [void](Do-Copy 0); Eq (Get-St).new_discarded $false 'cleared by c.init-new rc 0'
+  Reset-World; Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.health$' -Mode down; [void](Do-Cutover 70); Ans 'YES'; $r = Run-Move @('cutover'); Eq $r.Code 10 'Q-newlost'; Eq (Get-St).new_lost $true 'new_lost'
+  $W.new.Up = $true; Add-Fault -M new -Key '-c\.init-new$' -Rc 1 -Out @('MOVE error tool-missing tool=e2fsprogs'); $r = Do-Copy -1; Ok ($r.Code -ne 0) "the copy whose c.init-new failed ($($r.Text))"; Eq (Get-St).new_lost $true 'new_lost kept after a failed c.init-new'
+  [void](Do-Copy 0); Eq (Get-St).new_lost $false 'cleared by c.init-new rc 0'
+}
+T 'L.rebuild: a manual back in flight (mark set, x.freeze sent) is rebuilt with carry=false, never as a carry-back (D.0.10, W1-T10-O2)' {
   Fx-BackAt 'copied' 'cutting'; Recs 'new' 'back-2' @('x.check'); [IO.File]::Delete((StatePath))
   $r = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $r.Code 0 "rebuild ($($r.Text))"
-  Eq (Get-St).carry $false "a manual back rebuilt as a carry-back (phase $((Get-St).phase), mark $((Get-St).mark))"
-} -PendingArchitect O2
+  Eq (Get-St).carry $false "a manual back rebuilt as a carry-back (phase $((Get-St).phase), mark $((Get-St).mark))"; Eq (Get-St).phase 'copied' 'phase = the latest move-id phase (D.0.10, W1-T10-O2)'
+}
+T 'L.rebuild: legacy_push[] comes from a new push scan and legacy_known_hosts{} holds old''s line from old''s key (D.0.10; W1-T3-GAP-11)' {
+  Use-Legacy; Fx-Cut; [IO.File]::Delete((StatePath)); foreach ($n in 'old', 'new') { $W[$n].MoveId.old_addr = $OldAddr; $W[$n].MoveId.new_addr = $NewAddr }
+  $r = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $r.Code 0 "rebuild ($($r.Text))"
+  $s = Get-St; Ok (@($s.legacy_push | Where-Object { "$($_.repo)" -ceq $LegacyRepo }).Count -eq 1) "legacy_push[] from the scan: $(ConvertTo-Json -InputObject $s.legacy_push -Compress)"
+  Eq "$($s.legacy_known_hosts.$LegacyRepo)" "$OldAddr ssh-ed25519 $KeyOld" 'old''s line rebuilt from old''s key'
+}
 
 # ============================== round 4: T10 review-r3 OUT-OF-SCOPE (T11), the cases that kill m2, m4, m5 and m6 ==============================
 T 'L.resume-table: machines disagree on (dir, attempt), abort with new_lost set and no move-id on new: no fence is sent to new (reading T10-G12)' {
@@ -1781,6 +1992,58 @@ T 'L.pre-clock: unreadable facts on one machine refuse clock at plan and at 0c, 
   Reset-World; Fx-Copied; Add-Fault -M old -Key '^script:facts$' -Rc 1 -Out @(); $r = Do-Cutover 65
   HasText 'Đồng hồ các máy lệch nhau quá 5 giây'; HasText ($ClockUnreadable -f 'old'); Eq (Sent 'old' '-x\.freeze$') 0 'nothing frozen'
 }
+
+# ============================== rev 1k3.7: the K1 budget rows (D.0.6, G.2.1; DECISION-1k6-K1budget) ==============================
+function New-Hold([string]$Id, [int]$Stop, [string]$Kind = 'unit', [string[]]$Trig = @(), [string]$User = '') {
+  $h = [ordered]@{ id = $Id; kind = $Kind }; if ($User) { $h['user'] = $User }
+  $h['type'] = $(if ($Id -match '\.([a-z]+)$') { $Matches[1] } else { $Kind })
+  $h['unit_file_state'] = 'enabled'; $h['active_state'] = 'active'; $h['sub_state'] = 'running'; $h['remain_after_exit'] = 'no'
+  if ($Trig.Count) { $h['triggered_by'] = @($Trig) }
+  $h['n_restarts'] = 0; $h['stop_budget_s'] = $Stop; $h['start_budget_s'] = 60; $h['listen'] = @(); $h
+}
+function Set-Holds([object[]]$H, [string[]]$Start, [string[]]$Stop, [string[]]$Followers = @()) { $W.Mf.holds = @($H); $W.Mf.hold_sets = [ordered]@{ enable = @($Start); start = @($Start); stop = @($Stop) }; $W.Mf.followers = @($Followers) }
+function Budget-Of([string]$M, [string]$Call) { $c = @(RecCalls -All | Where-Object { $_.M -ceq $M -and $_.Call -ceq $Call }); Ok ($c.Count -ge 1) "$M $Call was not sent: $(LogNow -All)"; [int]$c[0].Budget }
+function Tunnel-Names { @(foreach ($n in 'a', 'b', 'c') { [ordered]@{ name = "$n.example.com"; source = 'ingress'; class = 'tunnel'; service = 'http://127.0.0.1:8080' } }) }
+T 'L.budget-freeze: x.freeze --budget = cap_s + Σ stop_budget_s of the periodic sources (kind unit, in hold_sets.stop, cron.service|*.timer|*.path) and of the same-scope holds they trigger, each once, + 30 = 1950' {
+  Set-Holds @((New-Hold 'cron.service' 60), (New-Hold 'x.timer' 30), (New-Hold 'job.service' 930 -Trig 'x.timer', 'cron.service'), (New-Hold 'app.service' 120), (New-Hold 'y.timer' 40), (New-Hold 'alice:z.timer' 70 'user-unit' -User 'alice'), (New-Hold 's-job.service' 50 -Trig 'x.socket')) `
+    -Start @('cron.service', 'x.timer', 'app.service', 'y.timer') -Stop @('cron.service', 'x.timer', 'job.service', 'app.service', 'alice:z.timer', 's-job.service') -Followers @('job.service', 's-job.service')
+  Fx-Copied; [void](Do-Cutover -1)
+  Eq (Budget-Of 'old' 'fwd-1-x.freeze') 1950 'x.freeze = 900 + 60 + 30 + 930 + 30'
+}
+function Fx-HealthManifest {
+  $W.Mf.redis = @([ordered]@{ unit = 'redis-server.service' }, [ordered]@{ unit = 'redis-b.service' }); $W.Mf.pg = @([ordered]@{ cluster = '17/main' })
+  $W.Mf.hostnames = @(Tunnel-Names) + [ordered]@{ name = 'd.example.com'; source = 'nginx'; class = 'inbound-backed' }
+  $extra = @((New-Hold 'container:web' 120 'container'), (New-Hold 'linger:alice' 30 'linger' -User 'alice'), (New-Hold 'alice:container:bot' 120 'user-container' -User 'alice'))
+  $W.Mf.holds = @($W.Mf.holds) + $extra; $W.Mf.hold_sets.start = @($W.Mf.hold_sets.start) + @($extra | ForEach-Object { $_.id }); $W.Mf.hold_sets.enable = @($W.Mf.hold_sets.start)
+  $W.Mf.health = @([ordered]@{ project = 'p1'; health_budget_s = 135 }, [ordered]@{ project = 'p2'; health_budget_s = 30 }, [ordered]@{ project = 'p3'; health_budget_s = 30 })
+  $W.Mf.guards = @([ordered]@{ project = 'p1'; kind = 'v2'; guard_timeout_s = 95; run_s = 235 }, [ordered]@{ project = 'p2'; kind = 'v2'; guard_timeout_s = 30; run_s = 170 })   # p3 has no guard
+}
+T 'L.budget-health: x.baseline, x.health and r.health-src --budget = 300 + 10 × (|redis[]| + |pg[]|) + 20 × tunnel names + 60 × container + 40 × linger + 60 × user-container holds of hold_sets.start + 20 × |health[]| + Σ health_budget_s = 805; with dur.x.baseline.old = 300 → 900' {
+  Fx-HealthManifest; Fx-Copied; [void](Do-Cutover -1)
+  Eq (Budget-Of 'old' 'fwd-1-x.baseline') 805 'x.baseline'; Eq (Budget-Of 'new' 'fwd-1-x.health') 805 'x.health'
+  Reset-World; Fx-HealthManifest; $W.Dur['^x\.baseline$'] = 300; Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.final$' -Rc 1; [void](Do-Cutover 10)
+  Eq (Budget-Of 'old' 'fwd-1-r.health-src') 805 'r.health-src'; Eq (Budget-Of 'old' 'fwd-1-x.baseline') 805 'x.baseline before any measure'
+  [void](Do-Copy 0); [void](Do-Cutover -1); Eq (Budget-Of 'old' 'fwd-2-x.baseline') 900 'x.baseline = max(805, 3 × 300)'
+}
+T 'L.budget-guards: x.guards --budget = cap_s + Σ guards[].run_s + 30 = 1573 (a v2 guard_timeout_s 120 pinned as run_s 260, deal-sync 130, vps-scraper 253)' {
+  $W.Mf.guards = @([ordered]@{ project = 'task'; kind = 'v2'; guard_timeout_s = 120; run_s = 260 }, [ordered]@{ project = 'deal-sync'; kind = 'legacy'; run_s = 130 }, [ordered]@{ project = 'vps-scraper'; kind = 'legacy'; run_s = 253 })
+  Fx-Copied; [void](Do-Cutover -1); Eq (Budget-Of 'old' 'fwd-1-x.guards') 1573 'x.guards = 900 + 260 + 130 + 253 + 30'
+}
+T 'L.budget-switch: x.switch --budget = 60 + 140 × unit connectors + 140 × container connectors + 20 × tunnel names = 540' {
+  $W.Mf.connectors = @([ordered]@{ id = 'cloudflared.service'; kind = 'unit' }, [ordered]@{ id = 'cloudflared-b.service'; kind = 'unit' }, [ordered]@{ id = 'container:tunnel'; kind = 'container' })
+  $W.Mf.hostnames = @(Tunnel-Names) + [ordered]@{ name = 'd.example.com'; source = 'nginx'; class = 'inbound-backed' }
+  Fx-Copied; [void](Do-Cutover -1); Eq (Budget-Of 'new' 'fwd-1-x.switch') 540 'x.switch = 60 + 280 + 140 + 60'
+}
+T 'L.budget-stop: x.stop-src, x.stop-dst and r.stop-dst --budget = Σ stop_budget_s of hold_sets.stop + 30 + 600 per Redis hold + 60 per pm2 hold + 120 per container/user-container hold = 1930' {
+  $fx = {
+    Set-Holds @((New-Hold 'app.service' 400), (New-Hold 'redis-server.service' 300), (New-Hold 'pm2-root.service' 100), (New-Hold 'container:web' 100 'container'), (New-Hold 'alice:container:bot' 100 'user-container' -User 'alice')) `
+      -Start @('app.service', 'redis-server.service', 'pm2-root.service', 'container:web', 'alice:container:bot') -Stop @('app.service', 'redis-server.service', 'pm2-root.service', 'container:web', 'alice:container:bot')
+    $W.Mf.redis = @([ordered]@{ unit = 'redis-server.service' })   # pm2 hold = pm2-*.service (B.5.9 classes, W1-T4-DG-T4-3); Redis holds = the redis[] entries (D.0.6)
+  }
+  & $fx; Fx-Copied; [void](Do-Cutover -1)
+  Eq (Budget-Of 'old' 'fwd-1-x.stop-src') 1930 'x.stop-src = 1000 + 30 + 600 + 60 + 240'; Eq (Budget-Of 'new' 'fwd-1-x.stop-dst') 1930 'x.stop-dst'
+  Reset-World; & $fx; Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.final$' -Rc 1; [void](Do-Cutover 10); Eq (Budget-Of 'new' 'fwd-1-r.stop-dst') 1930 'r.stop-dst'
+}
 T 'L.call-key-sites: every call id the laptop sent in this run is in the closed step list' {
   Ok ($script:AllCalls.Count -gt 0) 'no recorded call was seen in this run'
   $bad = @($script:AllCalls | Where-Object { $_ -notmatch $CallRx } | Select-Object -Unique); Ok ($bad.Count -eq 0) "ids outside the closed list: $($bad -join ', ')"
@@ -1791,6 +2054,6 @@ $env:USERPROFILE = $savedProfile
 Set-Location -LiteralPath ([IO.Path]::GetTempPath())
 Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host ''
-Write-Host "fcode-move.test.ps1: $($script:pass) passed, $($script:fail) failed, $($script:skip) skipped (bash cases), $($script:pending) pending (Architect rulings)"
+Write-Host "fcode-move.test.ps1: $($script:pass) passed, $($script:fail) failed, $($script:skip) skipped (bash cases)"
 if ($script:fail -gt 0) { exit 1 }
 exit 0
