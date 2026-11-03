@@ -36,7 +36,7 @@ async function boot(opts = {}) {
   // home v2 sources default to nothing real: no scan of this machine's logs, no omp/gh on PATH
   const app = createApp({ configDir, tmux: [process.execPath, FAKE], log: (l) => logs.push(l), pollMs: 40, pasteEnterDelayMs: 0,
     spendRoots: {}, updatesFile: path.join(root, 'no-status.json'), gitSync: null, gitSyncFile: path.join(root, 'no-git-sync.json'), omp: [process.execPath, '-e', 'process.exit(1)'], gh: [process.execPath, '-e', 'process.exit(1)'],
-    ompSessionsRoot: path.join(root, 'omp-sessions'), warmTickMs: 0, workTickMs: 0, ...opts }); // warmTickMs / workTickMs 0: no warm-up and no session poll from boot, so the tests that count tool calls stay as they are
+    ompSessionsRoot: path.join(root, 'omp-sessions'), warmTickMs: 0, ...opts }); // warmTickMs 0: no warm-up from boot, so the tests that count tool calls stay as they are
   const port = await app.listen(0, '127.0.0.1');
   const ctx = { app, port, logs, root, configDir };
   ctx.req = (method, p, o = {}) => request(port, method, p, o);
@@ -3223,7 +3223,7 @@ test('codex reset: every omp answer maps to a result and a Vietnamese message', 
 
 test('GET /api/home: the whole shape from omp, logs, gh and status.json; no box ring, no staging', () => homeApp(async (c) => {
   const h = await c.warm((x) => x.accounts[3]?.resets.target && x.totals.spend && !x.projects[0].loading); // every part has landed
-  assert.deepEqual(Object.keys(h), ['generatedAt', 'accounts', 'totals', 'projects', 'updates', 'omp', 'working']);
+  assert.deepEqual(Object.keys(h), ['generatedAt', 'accounts', 'totals', 'projects', 'updates', 'omp']); // no 'working'
   assert.equal(h.generatedAt, new Date(c.clock.t).toISOString());
   assert.deepEqual(h.accounts.map((a) => a.id), ['anthropic/1', 'anthropic/2', 'anthropic/3', 'openai-codex/4']);
   const cx = h.accounts[3];
@@ -3237,7 +3237,7 @@ test('GET /api/home: the whole shape from omp, logs, gh and status.json; no box 
   assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: 'owner/repo', branch: 'main', prs: prsOf(GH.prs), lastRun: ship, git: GIT_NULL })));
   assert.deepEqual(Object.keys(h.updates), ['omp', 'claude', 'codex']);
   assert.ok(!JSON.stringify(h).includes('github-work')); // the remote URL never leaves the server
-  assert.ok(h.projects.every((p) => !('staging' in p)));
+  assert.ok(!('box' in h) && h.projects.every((p) => !('staging' in p)));
 }));
 
 test('GET /api/home caches: quota 60 s, projects 2 min, spend 5 min; one refresh shared by concurrent requests', () => homeApp(async (c) => {
@@ -4539,7 +4539,7 @@ test('omp format guard: known versions -> formatOk true with the omp version; a 
     await withApp(async (c) => {
       const { cookie } = await c.login();
       assert.deepEqual(await homeOmp(c, cookie), { version: '18.12.6', formatOk: true, reason: null }); // no sessions at all
-      assert.deepEqual(Object.keys((await c.req('GET', '/api/home', { cookie })).json).slice(-3), ['updates', 'omp', 'working']);
+      assert.deepEqual(Object.keys((await c.req('GET', '/api/home', { cookie })).json).slice(-2), ['updates', 'omp']);
     }, { omp: s.omp });
     await withApp(async (c) => {
       const { cookie } = await c.login();
@@ -4859,187 +4859,6 @@ test('omp format guard: an empty or title-only file, and a header-less file youn
       fs.writeFileSync(path.join(d, `2026-10-25T10-00-00-000Z_${ID.a}.jsonl`), '{"type":"title","title":"x"}\n{"type":"session","version":4,"cwd":"/x"}\n');
       assert.deepEqual(await homeOmp(c, cookie), { version: '18.12.6', formatOk: false, reason: 'unknown_version:4' });
     }, { omp: s.omp });
-  } finally { s.cleanup(); }
-});
-
-// ---------- GET /api/home `working`: the sessions whose tmux activity moved within WORK_GAP (60 s), polled from tmux list-sessions ----------
-// A stub tmux: list-sessions prints the rows the test wrote ([name, activity, project, harness, created]; no rows = "no server running"), or fails.
-const T_SEC = 1_700_000_000;
-function workStub() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-work-'));
-  fs.writeFileSync(path.join(dir, 'tmux.mjs'), `import fs from 'node:fs';
-const d = ${JSON.stringify(dir)}, a = process.argv.slice(2);
-fs.appendFileSync(d + '/calls.log', a.join(' ') + '\\n');
-if (fs.existsSync(d + '/fail')) { process.stderr.write('boom'); process.exit(1); }
-if (a[0] === 'list-sessions') setTimeout(() => { // a file named "slow" makes every answer take 400 ms
-  const rows = JSON.parse(fs.readFileSync(d + '/rows.json', 'utf8'));
-  if (!rows.length) { process.stderr.write('no server running on /tmp/tmux-1000/default'); process.exit(1); }
-  for (const [n, act, proj = 'alpha', harness = 'omp', created = 1] of rows) console.log([n, created, 0, act, 0, harness, proj].join('|'));
-}, fs.existsSync(d + '/slow') ? 400 : 0);\n`);
-  const s = {
-    dir, tmux: [process.execPath, path.join(dir, 'tmux.mjs')],
-    set: (rows) => fs.writeFileSync(path.join(dir, 'rows.json'), JSON.stringify(rows)),
-    calls: () => { try { return fs.readFileSync(path.join(dir, 'calls.log'), 'utf8').trim().split('\n').filter(Boolean); } catch { return []; } },
-    cleanup: () => fs.rmSync(dir, { recursive: true, force: true }),
-  };
-  s.set([]);
-  return s;
-}
-// runs fn with an app whose clock is `clock` (ms) and whose tmux is the stub; poll(rows) writes the rows and runs one poll, home() reads `working`
-async function withWork(fn) {
-  const s = workStub();
-  const clock = { t: T_SEC * 1000 };
-  try {
-    await withApp(async (c) => {
-      const { cookie } = await c.login();
-      const home = async () => (await c.req('GET', '/api/home', { cookie })).json;
-      const poll = async (rows) => { if (rows) s.set(rows); await c.app.tickWork(); return (await home()).working; };
-      await fn({ c, s, clock, home, poll, at: (sec) => { clock.t = (T_SEC + sec) * 1000; } });
-    }, { tmux: s.tmux, now: () => clock.t });
-  } finally { s.cleanup(); }
-}
-const W = (name, since, project = 'alpha', harness = 'omp') => ({ name, project, harness, since: T_SEC + since });
-
-test('working: always an array in the contract shape; no sessions -> []; box and staging are gone from /api/home', () => withWork(async ({ home, poll }) => {
-  assert.deepEqual(await poll([]), []);
-  const h = await home();
-  assert.deepEqual(Object.keys(h), ['generatedAt', 'accounts', 'totals', 'projects', 'updates', 'omp', 'working']);
-  assert.ok(!('box' in h) && h.projects.every((p) => !('staging' in p)));
-}));
-
-test('working: a session whose activity is inside the 60 s gap is working, since = that activity; its project and harness come from tmux', () => withWork(async ({ poll, at }) => {
-  at(0);
-  assert.deepEqual(await poll([['a', T_SEC - 5, 'my.proj', 'claude']]), [W('a', -5, 'my.proj', 'claude')]); // first seen already active
-  at(54); // 59 s after the activity
-  assert.deepEqual(await poll(), [W('a', -5, 'my.proj', 'claude')]);
-  at(55); // exactly 60 s: still inside the gap
-  assert.deepEqual(await poll(), [W('a', -5, 'my.proj', 'claude')]);
-}));
-
-test('working: a session first seen quiet is not working; the first activity after that starts its streak', () => withWork(async ({ poll, at }) => {
-  at(0);
-  assert.deepEqual(await poll([['a', T_SEC - 300]]), []);
-  at(10);
-  assert.deepEqual(await poll([['a', T_SEC + 8], ['b', T_SEC - 100]]), [W('a', 8)]);
-  at(12); // b was seen quiet, so it is not in a streak: activity inside 60 s of its old one is still a new streak, from that activity
-  assert.deepEqual(await poll([['a', T_SEC + 11], ['b', T_SEC - 45]]), [W('b', -45), W('a', 8)]);
-}));
-
-test('working: a streak continues while activity keeps advancing inside the gap, however long it runs', () => withWork(async ({ poll, at }) => {
-  at(0);
-  assert.deepEqual(await poll([['a', T_SEC]]), [W('a', 0)]);
-  for (let s = 20; s <= 300; s += 20) { at(s); assert.deepEqual(await poll([['a', T_SEC + s - 3]]), [W('a', 0)], `at ${s}`); }
-  // a poll that sees no new activity still holds the streak while the last activity is inside the gap
-  at(300 + 50);
-  assert.deepEqual(await poll(), [W('a', 0)]);
-}));
-
-test('working: the streak ends after 60 s with no activity advance, and the session drops out; new activity then starts a new streak', () => withWork(async ({ poll, at }) => {
-  at(0);
-  assert.deepEqual(await poll([['a', T_SEC]]), [W('a', 0)]);
-  at(61); // 61 s of quiet
-  assert.deepEqual(await poll(), []);
-  at(200);
-  assert.deepEqual(await poll(), []); // still quiet
-  at(210);
-  assert.deepEqual(await poll([['a', T_SEC + 205]]), [W('a', 205)]); // a new streak, not the old since
-  at(250);
-  assert.deepEqual(await poll([['a', T_SEC + 245]]), [W('a', 205)]); // and it continues
-}));
-
-test('working: quiet for more than the gap between two activity readings (no poll in between saw it end) is a new streak', () => withWork(async ({ poll, at }) => {
-  at(0);
-  assert.deepEqual(await poll([['a', T_SEC]]), [W('a', 0)]);
-  at(100); // the next reading: activity moved, but 100 s after the last one
-  assert.deepEqual(await poll([['a', T_SEC + 99]]), [W('a', 99)]);
-}));
-
-test('working: /api/home does not report a streak whose gap has passed before the next poll; the poll then drops it', () => withWork(async ({ poll, home, at }) => {
-  at(0);
-  assert.deepEqual(await poll([['a', T_SEC]]), [W('a', 0)]);
-  at(61); // no poll yet
-  assert.deepEqual((await home()).working, []);
-}));
-
-test('working: a session that disappears is dropped; one with the same name that comes back later starts a new streak', () => withWork(async ({ poll, at }) => {
-  at(0);
-  assert.deepEqual(await poll([['a', T_SEC], ['b', T_SEC - 2]]), [W('b', -2), W('a', 0)]);
-  at(10);
-  assert.deepEqual(await poll([['b', T_SEC + 8]]), [W('b', -2)]); // a is gone
-  at(20);
-  assert.deepEqual(await poll([['a', T_SEC + 18], ['b', T_SEC + 18]]), [W('b', -2), W('a', 18)]); // a is back: a new streak
-  // the same name killed and made again between two polls (a new created time) is a new session, never the old streak
-  at(30);
-  assert.deepEqual(await poll([['a', T_SEC + 28, 'alpha', 'omp', 99], ['b', T_SEC + 28]]), [W('b', -2), W('a', 28)]);
-  // every session gone (tmux has no server): nothing is working and nothing is kept
-  at(31);
-  assert.deepEqual(await poll([]), []);
-  at(32);
-  assert.deepEqual(await poll([['b', T_SEC + 31]]), [W('b', 31)]);
-}));
-
-test('working: ordered by since ascending (longest first); equal since by name', () => withWork(async ({ poll, at }) => {
-  at(0);
-  assert.deepEqual(await poll([['c', T_SEC - 30], ['b', T_SEC - 10], ['a', T_SEC - 30], ['d', T_SEC - 50]]), [W('d', -50), W('a', -30), W('c', -30), W('b', -10)]);
-  at(15);
-  assert.deepEqual(await poll([['c', T_SEC + 8], ['b', T_SEC + 8], ['a', T_SEC + 8], ['d', T_SEC + 8]]), [W('d', -50), W('a', -30), W('c', -30), W('b', -10)]);
-}));
-
-test('working: a tmux error (not "no server") leaves the streaks as they are; the clock alone then ends them', () => withWork(async ({ poll, s, at }) => {
-  at(0);
-  assert.deepEqual(await poll([['a', T_SEC]]), [W('a', 0)]);
-  fs.writeFileSync(path.join(s.dir, 'fail'), '');
-  at(10);
-  assert.deepEqual(await poll(), [W('a', 0)]); // the poll failed: nothing changed, the activity of 10 s ago still counts
-  at(70);
-  assert.deepEqual(await poll(), []); // 70 s without an advance
-  fs.rmSync(path.join(s.dir, 'fail'));
-  at(80);
-  assert.deepEqual(await poll([['a', T_SEC + 75]]), [W('a', 75)]);
-}));
-
-test('working: the poll is only list-sessions (no capture-pane, no other tmux call)', () => withWork(async ({ poll, s, at }) => {
-  at(0);
-  await poll([['a', T_SEC]]); await poll(); await poll();
-  const calls = s.calls();
-  assert.ok(calls.length >= 3 && calls.every((l) => l.startsWith('list-sessions')), calls.join('\n'));
-}));
-
-test('working: one poll at a time: a tick (or a tickWork call) while the previous poll runs starts no second tmux child', () => withWork(async ({ s, c, home, at }) => {
-  at(0);
-  s.set([['a', T_SEC]]);
-  fs.writeFileSync(path.join(s.dir, 'slow'), '');
-  const first = c.app.tickWork();
-  await c.app.tickWork(); await c.app.tickWork(); // skipped at once: the first is still running
-  assert.ok(await until(() => s.calls().length === 1));
-  await first;
-  assert.equal(s.calls().length, 1);
-  assert.deepEqual((await home()).working, [W('a', 0)]); // and the one poll did its work
-  await c.app.tickWork(); // the guard is released: the next poll runs
-  assert.equal(s.calls().length, 2);
-  // a poll that failed releases it too
-  fs.writeFileSync(path.join(s.dir, 'fail'), '');
-  await c.app.tickWork(); await c.app.tickWork();
-  assert.equal(s.calls().length, 4);
-}));
-
-test('working: from listen() a timer polls every workTickMs and close() stops it', async () => {
-  const s = workStub();
-  const clock = { t: T_SEC * 1000 };
-  s.set([['a', T_SEC - 1]]);
-  try {
-    await withApp(async (c) => {
-      const { cookie } = await c.login();
-      assert.ok(await until(async () => (await c.req('GET', '/api/home', { cookie })).json.working.length === 1)); // no tickWork call: the timer filled it
-      const n = s.calls().length;
-      assert.ok(await until(() => s.calls().length > n + 2)); // and it keeps polling
-      await c.app.close();
-      assert.ok(await until(() => c.app.stats().running === 0)); // the poll in flight at close() has ended and logged
-      await sleep(100);
-      const after = s.calls().length;
-      await sleep(250);
-      assert.equal(s.calls().length, after); // a timer left running would have polled again
-    }, { tmux: s.tmux, now: () => clock.t, workTickMs: 30 });
   } finally { s.cleanup(); }
 });
 
