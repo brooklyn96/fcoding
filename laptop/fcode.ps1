@@ -1,10 +1,10 @@
-﻿# fcode: vao phien tmux tren box instabox "coder" (1 lan ssh). Xem fcode.sh.
+﻿# fcode: vao phien tmux tren box Oracle (ssh thang, alias "oracle" trong ~/.ssh/config, 1 lan ssh). Xem fcode.sh.
 param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Rest)
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $arg = if ($Rest -and $Rest.Count -gt 0) { $Rest[0] } else { '' }
 # Cau hinh rieng tung may: %USERPROFILE%\.fcode\config.json (install.ps1 tao). Thieu khoa thi dung mac dinh.
-# Khoa: instabox (duong dan instabox.exe), box (ten box), syncRepos (danh sach thu muc cho fcode sync), ipaRepo, ipaTag, deployHost (ten ssh den VPS cho fcode deploy, mac dinh contabo).
+# Khoa: ssh (duong dan ssh.exe), host (alias ssh den box, mac dinh oracle; FCODE_HOST doi tam cho mot lan chay), syncRepos (danh sach thu muc cho fcode sync), ipaRepo, ipaTag, deployHost (ten ssh den VPS cho fcode deploy, mac dinh contabo).
 $ConfigFile = Join-Path $env:USERPROFILE '.fcode\config.json'
 $Cfg = $null; $CfgBroken = $null
 if (Test-Path -LiteralPath $ConfigFile) {
@@ -15,7 +15,9 @@ function Get-Cfg([string]$Key, $Default) {
   $v = if ($Cfg) { $Cfg.$Key }
   if ($null -ne $v -and "$v" -ne '') { $v } else { $Default }
 }
-$box = if ($env:FCODE_BOX) { $env:FCODE_BOX } else { Get-Cfg 'box' 'coder' }
+$box = [string]$(if ($env:FCODE_HOST) { $env:FCODE_HOST } else { Get-Cfg 'host' 'oracle' })   # alias ssh den box (ssh $box ...)
+# checked once, here, for every ssh call (-oProxyCommand=... would run a program; a quote would break the hand-built command line of Invoke-BoxPy)
+if ($box -notmatch '\A[A-Za-z0-9][A-Za-z0-9._-]*\z') { Write-Host "lỗi: tên box không hợp lệ ($(($box -replace '[^\x20-\x7e]', '?'))). Dùng tên trong ~/.ssh/config (chữ, số, dấu . _ -), đặt ở khóa host của config.json hoặc biến FCODE_HOST."; exit 1 }
 # fcode sync: cap nhat cac project tu GitHub (chi fetch + merge --ff-only), liet ke nhanh box/* va PR dang mo.
 # Danh sach project lay tu syncRepos trong config (de test: dat FCODE_SYNC_REPOS = cac duong dan cach nhau bang dau ;)
 $SyncRepos = @(Get-Cfg 'syncRepos' @()) | Where-Object { $_ }
@@ -246,11 +248,11 @@ function Get-PhienKeyOf([string]$BoxName, $Projs) {
   if ($repo) { foreach ($k in $Projs.Keys) { if ((Get-LocalRepoKey $Projs[$k]) -eq $repo) { return [string]$k } } }
   $null
 }
-# project cua box (ten + URL origin + ten goi): danh thuc box, hoi mot lan (han 60 giay, khong phai 900 giay cua mot dot chep phien, tinh tu luc box da thuc).
+# project cua box (ten + URL origin + ten goi): hoi box mot lan (han 60 giay, khong phai 900 giay cua mot dot chep phien).
 # $null neu khong doc duoc. Cung cap nhat ban sao ten goi.
 function Get-BoxProjects {
   $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-  try { & (Get-InstaboxExe) wake $box *> $null; $script:PhienDeadline = [DateTime]::UtcNow.AddSeconds([Math]::Min(60, (Get-PhienLimitSec $false))); $bp = Get-BoxJson (Invoke-BoxPy 'projects' ([byte[]]@())) } catch { $bp = $null } finally { $ErrorActionPreference = $old; $script:PhienDeadline = $null }
+  try { $script:PhienDeadline = [DateTime]::UtcNow.AddSeconds([Math]::Min(60, (Get-PhienLimitSec $false))); $bp = Get-BoxJson (Invoke-BoxPy 'projects' ([byte[]]@())) } catch { $bp = $null } finally { $ErrorActionPreference = $old; $script:PhienDeadline = $null }
   if ($bp) { Save-PrefsCache $bp.prefs }
   $bp
 }
@@ -538,13 +540,13 @@ function Invoke-IpaLocked {
   } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
 }
 
-# duong dan instabox.exe: config > PATH > thu muc cai mac dinh
-function Get-InstaboxExe {
-  $p = Get-Cfg 'instabox' ''
+# duong dan ssh.exe: config (khoa ssh, de thu) > PATH > "ssh"
+function Get-SshExe {
+  $p = Get-Cfg 'ssh' ''
   if ($p -and (Test-Path -LiteralPath $p)) { return $p }
-  $c = Get-Command instabox -ErrorAction SilentlyContinue
+  $c = Get-Command ssh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
   if ($c) { return $c.Source }
-  Join-Path $env:LOCALAPPDATA 'Programs\instabox\instabox.exe'
+  'ssh'
 }
 
 # In mot phan cua bang help: co mau chi khi dau ra la cua so that (khong bi chuyen huong / pipe), nen khong bao gio co ky tu ESC trong van ban
@@ -732,13 +734,13 @@ function Show-Help([string]$Topic = '') {
       '    gì (chỉ ghi lại giờ vừa kết nối box).',
       '>fcode phien tu-dong bat    |    fcode phien tu-dong tat',
       '    Bật / tắt tự động đồng bộ phiên mỗi 10 phút, chạy ngầm (không hiện',
-      '    cửa sổ), chỉ khi box đang chạy, và chỉ mở kết nối khi box vừa bật',
-      '    hoặc cách lần mở trước từ 40 phút (để box tự nghỉ được).',
+      '    cửa sổ), chỉ khi vào được box, và chỉ mở kết nối lần đầu hoặc khi',
+      '    lần mở trước đã cách từ 40 phút.',
       '>fcode phien tu-dong trangthai',
       '    Xem tự động đồng bộ đang bật hay tắt.',
       '>fcode phien <project> --nhanh',
-      '    Bản nhanh cho hook (fcode moc): chỉ một project, không đánh thức',
-      '    box (box đang ngủ thì bỏ qua), tối đa 20 giây, đang có lượt đồng',
+      '    Bản nhanh cho hook (fcode moc): chỉ một project, vào box bằng ssh',
+      '    (không vào được box thì báo lỗi), tối đa 20 giây, đang có lượt đồng',
       '    bộ khác thì bỏ qua. Lần chạy nhanh chưa xong sau 30 giây thì bị',
       '    ngắt hẳn và báo lỗi (fcode phien chạy tay thì không bị ngắt như',
       '    vậy).',
@@ -758,8 +760,8 @@ function Show-Help([string]$Topic = '') {
       '#fcode moc bat    |    fcode moc tat    |    fcode moc trang-thai',
       '  Bật / tắt / xem hook trong profile PowerShell: gõ omp, claude hoặc',
       '  codex trong thư mục một project (có trong syncRepos) thì fcode đồng',
-      '  bộ nhanh phiên trước và sau khi chạy (tối đa khoảng 20 giây, box ngủ',
-      '  thì bỏ qua).',
+      '  bộ nhanh phiên trước và sau khi chạy (tối đa khoảng 20 giây; không',
+      '  vào được box thì báo một dòng lỗi).',
       '  Phiên Claude Code / Codex chưa được chép giữa hai máy, chỉ phiên omp',
       '  và ghi chú project.',
       '',
@@ -824,13 +826,11 @@ function Show-Help([string]$Topic = '') {
 
 # Chay script bash tren box. Tham so di CUNG script (dong "set -- '..'" dau payload, da kiem tra), khong bao gio nam tren dong lenh ssh.
 function Invoke-BoxScript([string]$Script, [string[]]$ScriptArgs) {
-  $ib = Get-InstaboxExe
   $pre = if ($ScriptArgs) { 'set -- ' + (($ScriptArgs | ForEach-Object { "'" + ($_ -replace "'", "'\''") + "'" }) -join ' ') + "`n" } else { '' }
   $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($pre + $Script))
   # script di qua stdin (dong lenh Windows bi gioi han ~8 KB); tren box luu ra file tam roi chay voi stdin = /dev/null
   $remote = 'f=$(mktemp) && base64 -di >$f && bash -l $f </dev/null; rc=$?; rm -f $f; exit $rc'
-  & $ib wake $box *> $null
-  $b64 | & $ib ssh $box -- $remote
+  $b64 | & (Get-SshExe) $box $remote
 }
 
 # ky tu dieu khien (ke ca xuong dong) khong bao gio duoc di vao tham so
@@ -879,7 +879,7 @@ function Invoke-Add {
       $c = $Matches[1]; $d = $Matches[2]; $seen[$c] = $true
       # -Wildcard: DIR_* / HOOK_FAIL* / CLEANUP* khop theo tien to (ten ma tren box co the doi chut); cac nhan khac khop dung ten
       switch -Wildcard ($c) {
-        'NO_SCRIPT'     { Write-Host "lỗi: box chưa có script thêm dự án (bản FCode trên box đã cũ). Cập nhật box: instabox ssh $box rồi chạy: cd ~/fcode-src && git pull && bash install.sh"; Write-Host "  Xong thì chạy lại: fcode add $repo $name" }
+        'NO_SCRIPT'     { Write-Host "lỗi: box chưa có script thêm dự án (bản FCode trên box đã cũ). Cập nhật box: ssh $box rồi chạy: cd ~/fcode-src && git pull && bash install.sh"; Write-Host "  Xong thì chạy lại: fcode add $repo $name" }
         'TOKEN_OK'      { if ($try -eq 1) { Write-Host '[1] Box dùng khoá GitHub sẵn có (token) cho repo này, không cần dán khoá' } }
         'TOKEN_FALLBACK' { Write-Host '[1] Khoá GitHub sẵn có của box không ghi được repo này, chuyển sang khoá SSH riêng cho repo' }
         'KEY_NEW'       { if ($try -eq 1) { Write-Host '[1] Đã tạo khoá SSH riêng cho repo này trên box' } }
@@ -932,7 +932,7 @@ function Invoke-Add {
     if ($code -eq 24) { Write-Host '[4] lỗi: không cài được chốt chặn push lên main, nên chưa thêm project.'; if ($hookD) { Write-Host "  (chi tiết: $hookD)" }; return 1 }
     if ($seen.Count -eq 0) {
       $d = ($lines | Where-Object { "$_".Trim() } | Select-Object -First 1)
-      Write-IpaError 'không nói chuyện được với box. Kiểm tra: đã chạy "instabox login" chưa, và box đang bật không.' $d
+      Write-IpaError "không nói chuyện được với box. Kiểm tra: gõ ssh $box có vào được không (alias trong ~/.ssh/config)." $d
       return 1
     }
     # loi can sua truoc (ten da dung, cau hinh hong, GitHub chan, mang, repo luu tru): thong bao cu the da in o tren, khong bao "chay lai cung lenh"
@@ -1427,7 +1427,7 @@ function Get-BareScript([string]$Arg) {
 $FcodeAddRun = (@'
 s="${FCODE_ADD_SCRIPT:-/data/home/fcoding/fcode-add.sh}"
 [ -f "$s" ] || { echo "R NO_SCRIPT"; exit 3; }
-exec env -u INSTABOX_API_KEY timeout --kill-after="${FCODE_ADD_KILL_AFTER_S:-30}" "${FCODE_ADD_TIMEOUT_S:-600}" bash "$s" "$@"
+exec timeout --kill-after="${FCODE_ADD_KILL_AFTER_S:-30}" "${FCODE_ADD_TIMEOUT_S:-600}" bash "$s" "$@"
 '@) -replace "`r`n", "`n"
 
 # fcode-pair tren box (server worker them --qr). $1 = ten thiet bi (co the rong).
@@ -1436,10 +1436,10 @@ name="${1:-}"
 if [ -n "$name" ]; then exec fcode-pair "$name" --qr; else exec fcode-pair --qr; fi
 '@) -replace "`r`n", "`n"
 
-# fcode phien tren box: chuong trinh python (instabox ssh chay no, yeu cau di qua stdin)
+# fcode phien tren box: chuong trinh python (ssh chay no, yeu cau di qua stdin)
 $PhienPy = (@'
 #!/usr/bin/env python3
-# fcode phien (chay tren box): doc / gui / nhan phien chat omp. Chi laptop goi lenh nay (qua instabox ssh).
+# fcode phien (chay tren box): doc / gui / nhan phien chat omp. Chi laptop goi lenh nay (qua ssh).
 # Lenh: scan | hash | get | put. Dong 1 cua stdin la chinh chuong trinh nay (deflate + base64, do lenh nap doc); phan con lai la
 # yeu cau (JSON) hoac luong tar; ket qua la dong "FCODE-JSON {...}" hoac luong tar sau dong "FCODE-TAR".
 # Chi ghi trong ~/.omp/agent/sessions/<thu-muc-du-an>/ va ~/.omp/agent/blobs/. Khong bao gio xoa, khong doc noi dung tin nhan.
@@ -2490,7 +2490,7 @@ if __name__ == '__main__':
 # --- fcode phien: dong bo phien chat omp giua laptop va box (laptop luon la ben goi; box khong the goi laptop) ---
 # Luat (mot phien = mot ma = mot file .jsonl chi noi them): chi o mot ben -> chep sang ben kia; o ca hai ben va mot ben la phan dau
 # cua ben kia (sau dong header "session") -> chep ban dai de len ban ngan; khac nhau -> khong dong vao, chi bao. Khong bao gio xoa gi.
-# Ben tren box la mot chuong trinh python nho ($PhienPy, chay qua instabox ssh); yeu cau di qua stdin, khong qua dong lenh.
+# Ben tren box la mot chuong trinh python nho ($PhienPy, chay qua ssh); yeu cau di qua stdin, khong qua dong lenh.
 $PhienBusySec = 30
 $FcodeScript = $PSCommandPath
 $PhienLog = Join-Path $env:USERPROFILE '.fcode\phien.log'
@@ -2944,16 +2944,12 @@ function Get-PhienUnitBytes([long]$Size, [string]$Rel = '', [long]$Extra = 0) {
 }
 
 # --- noi chuyen voi box ---
-# 'running' | 'stopped' | 'unknown' (instabox ls loi, JSON hong, khong thay box hoac khong co trang thai): unknown khong doi gi ca
+# 'running' (ssh vao duoc box) | 'unknown' (khong vao duoc: mang, box tat, alias sai): unknown khong doi gi ca. Box Oracle luon bat, khong co trang thai "ngu".
 function Test-BoxRunning {
   try {
-    $r = Invoke-PhienExe (Get-InstaboxExe) @('ls', '--json')
-    if ($r.Code -eq 124) { return 'timeout' }   # only while a phien deadline is set (--nhanh): `instabox ls` ran into it
-    if ($r.Code -ne 0) { return 'unknown' }
-    $list = ($r.Out -join "`n") | ConvertFrom-Json
-    $b = $null; foreach ($x in $list) { foreach ($y in @($x)) { if ($y -and $y.name -eq $box) { $b = $y } } }
-    if (-not $b -or -not "$($b.state)") { return 'unknown' }
-    if ("$($b.state)" -eq 'running') { 'running' } else { 'stopped' }
+    $r = Invoke-PhienExe (Get-SshExe) @('-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', $box, 'true')
+    if ($r.Code -eq 124) { return 'timeout' }   # only while a phien deadline is set (--nhanh): the ssh ran into it
+    if ($r.Code -eq 0) { 'running' } else { 'unknown' }
   } catch { 'unknown' }
 }
 
@@ -2975,7 +2971,7 @@ function Stop-PhienAtCap([bool]$Quick, [hashtable]$Stat) {
   if ($Quick) { Set-PhienScreen $PhienCapMsg; return 0 }
   $Stat.ok = $false; Write-PhienOut 'hết thời gian của lượt này: phần còn lại để lần sau'; 1
 }
-# dung tien trinh va moi tien trinh con cua no (instabox -> ssh); Windows PowerShell 5.1 khong co Kill($true) nen dung taskkill
+# dung tien trinh va moi tien trinh con cua no; Windows PowerShell 5.1 khong co Kill($true) nen dung taskkill
 function Stop-PhienProc($p) {
   try { $p.Kill($true) } catch { try { & taskkill.exe /PID $p.Id /T /F 2>&1 | Out-Null } catch { }; try { $p.Kill() } catch { } }
 }
@@ -3015,7 +3011,6 @@ function Invoke-PhienExe([string]$Exe, [string[]]$ExeArgs, [string]$StdinText) {
 # chay $PhienPy tren box. Tra ve @{Code; Out = byte[]; Err}. stdin: $InBytes hoac noi dung file $InFile.
 # Han chot tinh tu truoc khi ghi byte stdin dau tien; stdin ghi bat dong bo, nen box dung doc thi den han van dung duoc.
 function Invoke-BoxPy([string]$Cmd, [byte[]]$InBytes, [string]$InFile) {
-  if ($box -notmatch '\A[A-Za-z0-9._-]+\z') { throw "tên box '$box' không hợp lệ" }
   $sec = if ($script:PhienDeadline) { (Get-PhienChildMs) / 1000 } else { Get-PhienLimitSec $false }
   $end = [DateTime]::UtcNow.AddSeconds($sec)
   # chuong trinh python (deflate + base64) la dong dau cua stdin; dong lenh chi co lenh nap ngan (khong vuong gioi han do dai)
@@ -3034,8 +3029,8 @@ function Invoke-BoxPy([string]$Cmd, [byte[]]$InBytes, [string]$InFile) {
   }
   $remote = $pre + "python3 -c 'import base64,sys,zlib;exec(zlib.decompress(base64.b64decode(sys.stdin.buffer.readline()),-15).decode())' $Cmd"
   $psi = New-Object Diagnostics.ProcessStartInfo
-  $psi.FileName = Get-InstaboxExe
-  $psi.Arguments = 'ssh ' + $box + ' -- "' + $remote + '"'
+  $psi.FileName = Get-SshExe
+  $psi.Arguments = '-o BatchMode=yes ' + $box + ' "' + $remote + '"'
   $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
   $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
   $body = if ($InFile) { [IO.File]::OpenRead($InFile) } elseif ($InBytes) { New-Object IO.MemoryStream(, $InBytes) } else { New-Object IO.MemoryStream }
@@ -3213,7 +3208,7 @@ function Get-PhienWarning {
 # dong bo mot hay moi project. Tra ve 0 xong, 1 loi.
 # Chep theo tung FILE, tung dot <= 50 MB (mot dot = mot lan ssh), ca hai chieu: dot nao xong thi nam lai ben nhan, lan sau chi chep
 # phan con thieu. Ben nhan dat blob, file di kem, .jsonl long ben trong, roi file .jsonl chinh sau cung (khi moi thu no can da co).
-# $Quick (--nhanh, cho hook cua `fcode moc`): mot project, KHONG danh thuc box, khong cho khoa, toi da 20 s; thoat 0 khi box ngu / khoa ban / het gio.
+# $Quick (--nhanh, cho hook cua `fcode moc`): mot project, khong cho khoa, toi da 20 s; thoat 0 khi khoa ban / het gio (khong vao duoc box la loi, thoat 1).
 # Che do nhanh chi ghi phien.log; man hinh nhan toi da MOT dong (Invoke-Phien in $script:PhienScreen, hoac dong loi khi that bai); thanh cong thi im lang.
 # Han chot (--nhanh, tu dong) chi duoc xem o diem an toan, truoc moi muc (quet, hash, mot dot, mot ghi chu); mot muc da bat dau thi xong tron hoac hong tron.
 function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [bool]$BoxKnownRunning = $false, [bool]$Quick = $false) {
@@ -3221,7 +3216,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
   $capMsg = $PhienCapMsg
   $code = 0; $capHit = $false
   # lan tu dong: MOT han chot cho ca lan chay, tinh tu luc tien trinh bat dau (nhu gioi han 8 phut cua Task Scheduler)
-  $script:PhienDeadline = if ($Auto) { [Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().AddSeconds((Get-PhienLimitSec $true)) } elseif ($Quick) { [Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().AddSeconds((Get-PhienCapSec)) } else { $null }
+  $script:PhienDeadline = if ($Auto) { Get-PhienAutoDeadline } elseif ($Quick) { [Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().AddSeconds((Get-PhienCapSec)) } else { $null }
   $mx = $null; $held = $false
   if (-not $DryRun) {
     try {
@@ -3241,7 +3236,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
   }
   $stat = @{ ran = $false; ok = $true; copied = 0; skipped = 0; diverged = 0; unknown = @(); ompL = ''; ompB = ''; noteCopied = 0; noteConf = @(); noteReleased = @(); unfinished = @(); newProjects = @() }
   try {
-    if (-not $DryRun) { Clear-PhienLeftovers @() }   # the lock is held: a killed run's staging goes now, even when this run stops early (box asleep)
+    if (-not $DryRun) { Clear-PhienLeftovers @() }   # the lock is held: a killed run's staging goes now, even when this run stops early (box unreachable)
     $projs = Get-PhienProjects
     if ($projs.Count -eq 0) { Write-PhienOut "Chưa có project nào trong syncRepos ($ConfigFile)."; return 0 }
     $names = @($projs.Keys)
@@ -3250,14 +3245,12 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
       if (-not $projs.Contains($o)) { Write-PhienOut "Không thấy project '$Only' trong syncRepos. Có: $(@($names | ForEach-Object { Format-ProjectName $_ $projs[$_] }) -join ', ')"; return 1 }
       $names = @($o)
     }
-    if ($Quick) {   # only `instabox ls`: never wakes the box
+    if ($Quick) {   # one cheap reachability check first (ssh true)
       $bs = Test-BoxRunning
       if ($bs -eq 'timeout') { Set-PhienScreen $capMsg; return 0 }
-      if ($bs -eq 'unknown') { $stat.ok = $false; Write-PhienOut 'lỗi: không đọc được trạng thái box (instabox ls lỗi — đã chạy "instabox login" chưa?)'; return 1 }
-      if ($bs -ne 'running') { Set-PhienScreen 'phien: box đang ngủ, bỏ qua'; return 0 }
+      if ($bs -ne 'running') { $stat.ok = $false; Write-PhienOut "lỗi: không vào được box (ssh $box lỗi — kiểm tra mạng và alias ssh)"; return 1 }
     }
     elseif ($Auto) { if (-not $BoxKnownRunning -and (Test-BoxRunning) -ne 'running') { return 0 } }
-    else { & (Get-InstaboxExe) wake $box *> $null }
     $stat.ran = $true; $stat.ompL = Get-OmpVersion
     # moc cho lan tu dong sau: ghi truoc khi mo ssh (lan loi, bi dung giua chung hay chay thu cung tinh: ssh nao cung la hoat dong cua box)
     # a quick run (the hook) does not count: a cut or failed one must not push the next 10-minute auto run behind the 40-minute gap
@@ -3276,7 +3269,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
     if (-not $scan) {
       if ($Quick -and $r.Code -eq 124) { Set-PhienScreen $capMsg; return 0 }   # the deadline ended the call: a cap hit, not an error
       $stat.ok = $false
-      Write-PhienOut 'lỗi: không nói chuyện được với box. Kiểm tra: đã chạy "instabox login" chưa, và box đang bật không.'
+      Write-PhienOut "lỗi: không nói chuyện được với box. Kiểm tra: gõ ssh $box có vào được không (alias trong ~/.ssh/config)."
       $d = ("$($r.Err)" -split "`n" | Where-Object { $_.Trim() } | Select-Object -Last 1); if ($d) { Write-PhienOut "  (chi tiết: $($d.Trim()))" }
       return 1
     }
@@ -3917,29 +3910,26 @@ function Write-PhienAutoState([hashtable]$S) {
   } catch { }
 }
 
-# che do tu dong (luat v2): chi doc `instabox ls --json`, ssh moi ngan khong tinh la hoat dong lam box khong tu nghi duoc.
-#  - box khong chay: khong ssh
-#  - box vua tu khong chay thanh dang chay: dong bo mot lan ngay
-#  - con lai: chi dong bo khi lan mo ssh gan nhat da cach >= 40 phut (lon hon 30 phut box tu nghi khi ranh, nen box khong dung
-#    den thi luon duoc nghi). Lan loi cung chi cho den moc 40 phut sau, khong thu lai nhanh.
+# che do tu dong (luat v2): truoc het kiem tra box vao duoc khong (`ssh <host> true`, rat re).
+#  - khong vao duoc: khong lam gi, khong doi trang thai, ghi mot dong nhat ky
+#  - lan dau (chua co trang thai): dong bo mot lan ngay
+#  - con lai: chi dong bo khi lan mo ssh gan nhat da cach >= 40 phut. Lan loi cung chi cho den moc 40 phut sau, khong thu lai nhanh.
 $PhienAutoGapSec = 2400
+function Get-PhienAutoDeadline { [Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().AddSeconds((Get-PhienLimitSec $true)) }
 function Invoke-PhienAutoRun {
   $as = Read-PhienAutoState
   $last = if ($as) { [double]$as.lastSshAt } else { 0 }
-  $bs = Test-BoxRunning
-  # instabox ls loi / tra ve thu khong doc duoc: khong biet box ra sao -> khong ssh va KHONG doi trang thai (khong tu tao ra "box vua chay")
-  if ($bs -eq 'unknown') { Add-PhienLog @('không đọc được trạng thái box (instabox ls lỗi): bỏ qua lần này, giữ nguyên trạng thái'); return 0 }
-  if ($bs -ne 'running') {
-    if ($as -and $as.boxRunning) { Add-PhienLog @('box không chạy nữa, tạm nghỉ') }
-    Write-PhienAutoState @{ boxRunning = $false; lastSshAt = $last }
-    return 0
-  }
+  # the reachability check runs under the same one deadline as the sync (ConnectTimeout covers only connect + handshake, not auth, a proxy hop or the remote true); a timeout counts as unreachable
+  $saveDl = $script:PhienDeadline; $script:PhienDeadline = Get-PhienAutoDeadline
+  try { $bs = Test-BoxRunning } finally { $script:PhienDeadline = $saveDl }
+  # khong vao duoc box (mang, box tat, alias sai): khong mo ssh dong bo va KHONG doi trang thai
+  if ($bs -ne 'running') { Add-PhienLog @("không vào được box (ssh $box lỗi): bỏ qua lần này, giữ nguyên trạng thái"); return 0 }
   $age = (ConvertTo-Epoch (Get-Date)) - $last
   $mins = [int][Math]::Floor($age / 60)
-  if (-not $as -or -not $as.boxRunning) { $why = 'box vừa chạy (lần đầu trong đợt chạy này)' }
-  elseif ($age -ge $PhienAutoGapSec) { $why = "lần mở ssh trước đã cách $mins phút (từ 40 phút trở lên, box ranh thì đã tự nghỉ)" }
+  if (-not $as) { $why = 'lần đầu (chưa có trạng thái)' }
+  elseif ($age -ge $PhienAutoGapSec) { $why = "lần mở ssh trước đã cách $mins phút (từ 40 phút trở lên)" }
   else {
-    Add-PhienLog @("box đang chạy, lần mở ssh trước mới cách $mins phút (dưới 40): bỏ qua để box tự nghỉ được")
+    Add-PhienLog @("box vào được, lần mở ssh trước mới cách $mins phút (dưới 40): bỏ qua lần này")
     Write-PhienAutoState @{ boxRunning = $true; lastSshAt = $last }
     return 0
   }
@@ -3985,7 +3975,7 @@ function Invoke-PhienAuto([string]$Mode) {
   switch ($Mode) {
     'bat' {
       try { Install-PhienTask $FcodeScript } catch { Write-IpaError 'không bật được chế độ tự động (Task Scheduler báo lỗi).' $_.Exception.Message; return 1 }
-      Write-Host 'Đã bật tự động: cứ 10 phút, nếu box đang chạy, fcode tự đồng bộ phiên chat omp hai chiều (chạy ngầm, không hiện cửa sổ). Mở kết nối thưa (box vừa bật, hoặc cách lần trước từ 40 phút), để box vẫn tự nghỉ được.'
+      Write-Host 'Đã bật tự động: cứ 10 phút, nếu vào được box, fcode tự đồng bộ phiên chat omp hai chiều (chạy ngầm, không hiện cửa sổ). Mở kết nối thưa (lần đầu, hoặc cách lần trước từ 40 phút).'
       Write-Host "Nhật ký: $PhienLog    Tắt: fcode phien tu-dong tat"
       return 0
     }
@@ -4056,7 +4046,7 @@ function Get-PhienJob {
 }
 # the supervisor of a quick run: no job -> no sync at all (fail closed). The worker is the same program with FCODE_PHIEN_WORKER=1 and the screen of this
 # one. When it overruns cap + 10 s this process returns 1 and ends; however this process ends (also killed, or its window closed), the job ends the worker
-# and all its children (git, tar, instabox, ssh). So there is no kill call here.
+# and all its children (git, tar, ssh). So there is no kill call here.
 function Invoke-PhienBounded([string]$Proj, [bool]$Nen) {
   if ($Nen) { Start-Sleep -Seconds (Get-PhienNenDelaySec) }
   $job = Get-PhienJob
@@ -4097,7 +4087,7 @@ function Invoke-Phien {
   if ($quick -and $env:FCODE_PHIEN_WORKER -ne '1') { return (Invoke-PhienBounded $sub $nen) }
   $key = if ($sub) { Get-PhienKeyOf $sub (Get-PhienProjects) }   # ten that tren box -> thu muc tren laptop (cung ten, hoac cung repo GitHub; ten thu muc co the khac)
   $rc = Invoke-PhienSync $(if ($key) { $key } else { $sub }) $false $dry $false $quick
-  # --nhanh (the hook): the screen gets at most one line, the asleep / busy / cap message, or one short line when the sync failed; success prints nothing
+  # --nhanh (the hook): the screen gets at most one line, the busy / cap message, or one short line when the sync failed; success prints nothing
   if ($quick) { if ($script:PhienScreen) { Write-Host $script:PhienScreen } elseif ($rc -ne 0) { Write-Host $PhienFailMsg } }
   $rc
 }
@@ -4261,7 +4251,7 @@ function Invoke-Moc {
     }
   }
   if ($sub -eq 'bat') {
-    Write-Host 'Xong. Mở cửa sổ PowerShell mới. Từ giờ, gõ omp / claude / codex trong thư mục một project (có trong syncRepos), fcode đồng bộ nhanh phiên trước và sau (tối đa khoảng 20 giây; box đang ngủ thì bỏ qua).'
+    Write-Host 'Xong. Mở cửa sổ PowerShell mới. Từ giờ, gõ omp / claude / codex trong thư mục một project (có trong syncRepos), fcode đồng bộ nhanh phiên trước và sau (tối đa khoảng 20 giây; không vào được box thì báo một dòng lỗi).'
     Write-Host "Tắt hook trong cửa sổ này: `$env:FCODE_MOC = '0'  (bật lại: Remove-Item Env:FCODE_MOC, hoặc đóng cửa sổ)    Tắt hẳn: fcode moc tat    Xem trạng thái: fcode moc trang-thai"
     Write-Host 'Hook là hàm bọc nên không chuyển đúng hoàn toàn các tham số kiểu -- và -x:giá-trị, cũng không để lại lỗi trong $?; khi cần đúng tuyệt đối, chạy thẳng claude.exe / codex.exe / omp.exe.'
     Write-MocPolicy
@@ -4299,14 +4289,12 @@ if ($arg -and $arg -ne '--list' -and $arg -ne '--new' -and $arg -notmatch '\A[A-
   exit 1
 }
 if (-not $arg) { $pw = Get-PhienWarning; if ($pw) { Write-Host $pw -ForegroundColor Yellow } }
-$ib = Get-InstaboxExe
+$ssh = Get-SshExe
 while ($true) {
   # tham so $1 di cung script (set -- '..'), khong nam tren dong lenh ssh
   $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((Get-BareScript $arg)))
   $remote = "bash <(echo $b64 | base64 -d)"
-  # box tu tam dung (ranh 30 phut / chay 8 tieng) thi danh thuc truoc; loi wake de ssh tu bao
-  & $ib wake $box *> $null
-  if ($arg -eq '--list') { & $ib ssh $box -- $remote } else { & $ib ssh $box -- -q -tt $remote }
+  if ($arg -eq '--list') { & $ssh $box $remote } else { & $ssh -q -tt $box $remote }
   $rc = $LASTEXITCODE
   if ($rc -eq 78 -and $bareWord -and -not $asked) {   # box bao khong co phien nao ten nay (ma 78; ssh dut, 255, thi khong): co the la ten goi moi dat trong app. Hoi box mot lan; doi duoc ra ten that thi chay lai
     $asked = $true
