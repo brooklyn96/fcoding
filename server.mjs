@@ -397,6 +397,7 @@ export function pairPage(appLink) {
 const QUOTA_TTL = 60e3, LISTING_TTL = 300e3, SPEND_TTL = 300e3, PROJECTS_TTL = 120e3, GATE_CONFIG_TTL = 600e3, RUN_WINDOW = 100; // RUN_WINDOW: Actions runs read per project (deploy line and PR checks)
 const HOME_WAIT_MS = 8000; // a part with no value yet is waited for this long at most, then it is empty and fills in the background
 const FRESH_MIN_MS = 10e3, HOME_FRESH_WAIT_MS = 25e3; // GET /api/home?fresh=1: a part older than 10 s is read again and waited for, 25 s at most
+const WORK_TICK_MS = 10e3, WORK_GAP_MS = 60e3; // GET /api/home `working`: tmux list-sessions is read every 10 s; a session works while its activity moved within 60 s
 const WARM_TICK_MS = 5e3; // from boot every home part is checked this often and refreshed once it is past its own TTL (never more than one refresh at a time)
 const OVERVIEW_PAR = 3, OVERVIEW_KEEP = 4; // GET /api/overview: its git and tmux reads run at most this many at a time, each inside one of the MAX_READS slots; it leaves OVERVIEW_KEEP slots free (two screen reads)
 const QUOTA_STALE_MS = 10 * 60e3; // a report omp fetched longer ago than this is stale
@@ -1656,6 +1657,38 @@ export function createApp(opts = {}) {
     return out;
   }
   const projects = memo(PROJECTS_TTL, () => Promise.all(cfg.projectNames.map(projectInfo)), now);
+  // --- GET /api/home `working`: the sessions whose tmux activity moved within WORK_GAP_MS ---
+  // A poll of `tmux list-sessions` (listSessions, no capture-pane) every WORK_TICK_MS keeps one streak per session, in memory only:
+  // last = the newest activity seen (epoch s), since = the activity at which the current streak began (null while quiet). A streak begins
+  // when activity advances after more than WORK_GAP_MS of quiet, or when a session is first seen already active; it ends once WORK_GAP_MS
+  // pass with no advance. A session gone from tmux is dropped; so is a name that came back as a new session (another `created`).
+  const streaks = new Map(); // name -> {created, last, since, project, harness}
+  const workCtx = { cancelled: false, device: null, gen: -1, admin: true }; // like the admin socket's: run() needs a ctx and there is no device here
+  async function tickWork() {
+    let rows;
+    try { refreshConfig(); workCtx.gen = gen; rows = await listSessions(workCtx); } catch { return; } // tmux busy or failing: the streaks stay as they are
+    const t = now(), keep = new Set();
+    for (const r of rows) {
+      keep.add(r.name);
+      let s = streaks.get(r.name);
+      if (!s || s.created !== r.created) s = { created: r.created, last: 0, since: null };
+      if (r.activity > s.last) { if (s.since === null || r.activity - s.last > WORK_GAP_MS / 1e3) s.since = r.activity; s.last = r.activity; }
+      if (t - s.last * 1e3 > WORK_GAP_MS) s.since = null;
+      streaks.set(r.name, Object.assign(s, { project: r.project, harness: r.harness }));
+    }
+    for (const name of streaks.keys()) if (!keep.has(name)) streaks.delete(name);
+  }
+  // longest first; a streak whose gap has passed since the last poll is already over
+  const workingNow = (t) => [...streaks].filter(([, s]) => s.since !== null && t - s.last * 1e3 <= WORK_GAP_MS)
+    .map(([name, s]) => ({ name, project: s.project, harness: s.harness, since: s.since })).sort((a, b) => a.since - b.since || (a.name < b.name ? -1 : 1));
+  const workTick = opts.workTickMs ?? WORK_TICK_MS;
+  let workTimer = null;
+  function startWork() {
+    if (workTimer || !(workTick > 0)) return;
+    tickWork();
+    workTimer = setInterval(tickWork, workTick);
+    workTimer.unref();
+  }
   // from boot every part is kept warm: one check per tick, and get(0) starts a refresh only for a part past its own TTL (and not in its
   // retry wait), through the memo, so a part is never refreshed twice at once; /api/home then answers from memory
   const warmTick = opts.warmTickMs ?? WARM_TICK_MS;
@@ -1696,6 +1729,7 @@ export function createApp(opts = {}) {
       projects: withGit(cfg.projectNames.map((name) => cachedProjects.get(name) ?? { name, repo: null, branch: null, prs: null, lastRun: null, loading: true })),
       updates,
       omp: g.status === 'fulfilled' ? g.value.value : { version: null, formatOk: true, reason: null }, // not scanned yet: no alarm
+      working: workingNow(t),
     };
   }
   // POST /api/codex-reset: one reset per account at a time; the same requestId joins a running reset, and a final answer
@@ -2395,11 +2429,13 @@ export function createApp(opts = {}) {
     try {
       const bound = await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, host, () => resolve(server.address().port)); });
       startWarm();
+      startWork();
       return bound;
     } catch (e) { adminServer.close(); throw e; }
   };
   const close = () => {
     clearInterval(stallTimer);
+    clearInterval(workTimer); workTimer = null;
     clearInterval(warmTimer); warmTimer = null;
     for (const abort of [...addStops]) abort();
     return Promise.all([
@@ -2408,7 +2444,7 @@ export function createApp(opts = {}) {
     ]);
   };
   const homeIdle = () => Promise.all([quota, listing, spend, projects, ompGuard].map((m) => m.settled())); // tests: no refresh still running
-  return { server, listen, close, devices, homeIdle, stats: () => ({ streams, wakers: wakers.size, running, reads, waiting: queue.length, active: !!active, addJobs: addJobs.size }) };
+  return { server, listen, close, devices, tickWork, homeIdle, stats: () => ({ streams, wakers: wakers.size, running, reads, waiting: queue.length, active: !!active, addJobs: addJobs.size }) };
 }
 
 // ---------- CLI ----------
