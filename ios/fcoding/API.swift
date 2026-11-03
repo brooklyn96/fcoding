@@ -102,12 +102,6 @@ extension API {
         return try JSONDecoder().decode(ResumeResponse.self, from: data).session
     }
 
-    /// POST staging/start: `{ok:true, state:"starting"|"running"}`, or `{ok:false, error}`.
-    func startStaging(project: String) async throws -> StagingStartResponse {
-        let data = try await call("POST", "api/projects/\(project)/staging/start", body: [:])
-        return try JSONDecoder().decode(StagingStartResponse.self, from: data)
-    }
-
     /// POST /api/projects (CONTRACT A11): starts the clone job, returns its id (the same id while
     /// a job for that name runs).
     func addProject(repo: String, name: String) async throws -> String {
@@ -136,7 +130,6 @@ extension API {
 
 struct UploadReply: Decodable { let path: String; let attached: Bool }
 struct ResumeResponse: Decodable { let session: String }
-struct StagingStartResponse: Decodable { let ok: Bool?; let error: String?; let state: String? }
 struct AddProjectReply: Decodable { let job: String }
 
 struct SessionInfo: Decodable, Identifiable, Hashable {

@@ -46,8 +46,8 @@ Các bước chi tiết có trong app: bấm nút **?** (Hướng dẫn) ở gó
 
 ## 4. Cách dùng
 
-- **Màn hình chính** (thanh trên cùng cuộn theo danh sách; chỉ có nút **?** Hướng dẫn và **⚙** Cài đặt). Phiên tự cập nhật mỗi 5 giây, hạn mức và dự án mỗi phút; kéo xuống để cập nhật ngay.
-  - **Vòng giờ box** (bên trái thẻ trên cùng): **Sleeps in** = box còn chạy bao lâu rồi tự nghỉ (tối đa 8 giờ, hoặc sớm hơn nếu rảnh 30 phút). Vòng chuyển vàng khi còn dưới 10 phút. **Wakes in** = box vừa nghỉ vì đã chạy đủ 8 giờ, chưa đánh thức lại được trong khoảng 10 phút. Chạm vào vòng để xem giờ chính xác.
+- **Màn hình chính** (thanh trên cùng cuộn theo danh sách; chỉ có nút **?** Hướng dẫn và **⚙** Cài đặt). Phiên tự cập nhật mỗi 5 giây, hạn mức, dự án và đồng hồ phiên mỗi 15 giây; kéo xuống để cập nhật ngay.
+  - **Đồng hồ phiên** (bên trái thẻ trên cùng): tên phiên đang làm và đã làm được bao lâu (giờ:phút:giây). Nhiều phiên thì tự chuyển sang phiên kế mỗi 5 giây; chạm để chuyển ngay. Không phiên nào đang làm thì hiện **Rảnh**. Vòng mờ với dấu **—**: app chưa có số liệu mới từ box (vừa mở app, mất mạng); chờ vài giây hoặc kéo xuống để cập nhật.
   - **Ô hạn mức** (bên phải): mỗi lần một tài khoản, tự chuyển sang tài khoản kế mỗi 4 giây (giữ ngón tay trên ô để dừng). Chạm để mở màn hình **Hạn mức**.
   - Dòng **đang chạy · chờ bạn**: chạm để nhảy tới phiên tương ứng.
   - **Dự án** (trượt ngang): mỗi thẻ cho biết số PR đang mở, kết quả checks và lần deploy gần nhất. Chạm thẻ để chỉ xem phiên của dự án đó; giữ lâu hoặc bấm **…** để mở phiên mới trong dự án đó.
@@ -85,6 +85,7 @@ Các bước chi tiết có trong app: bấm nút **?** (Hướng dẫn) ở gó
   - Khi xoay ngang: ô nhập thấp lại để màn hình còn chỗ; nút ghim và **⌄** nằm cạnh ô nhập; bấm nút **phím nhanh** bên trái ô nhập để hiện / ẩn hàng phím nhanh.
   - Khi bạn chuyển sang ứng dụng khác, kết nối tạm dừng; mở lại ứng dụng là tự kết nối lại.
 - **Cài đặt** (bánh răng):
+  - **Địa chỉ máy chủ**: khi box chuyển sang địa chỉ mới, chạm vào dòng này, gõ địa chỉ mới (chỉ https; gõ tên miền là đủ) rồi bấm **Lưu**. iPhone thử kết nối bằng đăng nhập hiện tại; được thì đổi luôn, không cần ghép lại; không được thì giữ địa chỉ cũ và báo lý do (báo "chưa ghép" thì gỡ iPhone này rồi ghép lại với máy chủ mới).
   - **Gỡ iPhone này**: gỡ điện thoại này khỏi box.
   - **Gỡ mọi thiết bị**: gỡ tất cả thiết bị đã ghép với box (có hỏi xác nhận).
   - **Gỡ iPhone này** xoá ghép trên iPhone này ngay, kể cả khi box không trả lời.
