@@ -17,7 +17,7 @@ FCode là một app iPhone kèm một máy chủ nhỏ. Máy chủ chạy trên 
 
 1. **Cài máy chủ trên box** (cần Node 22 và tmux):
    `git clone https://github.com/brooklyn96/fcoding.git && cd fcoding && bash install.sh`
-2. **Mở link công khai**: Caddy và tên miền do bộ cài máy Oracle (`setup-oracle.sh`) lo. Mở `https://fcode-quoc.duckdns.org` trong trình duyệt, thấy `fcoding ok` là được.
+2. **Mở link công khai**: box cần Caddy (HTTPS, cổng 443) chuyển tên miền vào cổng 7681; máy Oracle hiện tại đã dựng sẵn Caddy và tên miền khi tạo máy. Mở `https://fcode-quoc.duckdns.org` trong trình duyệt, thấy `fcoding ok` là được.
 3. **Cài app lên iPhone**: tải `fcode.ipa` ở mục **Releases** của GitHub, cài bằng **Sideloadly** (Apple ID miễn phí chạy được 7 ngày, ký lại bằng cách cài đè).
 4. **Ghép iPhone**: trên box chạy `fcode-pair "iPhone của tôi"`, rồi nhập địa chỉ link và mã 6 số vào app.
 5. **(Tùy chọn) Lệnh `fcode` trên laptop Windows**: mở PowerShell, dán `irm https://raw.githubusercontent.com/brooklyn96/fcoding/main/laptop/install.ps1 | iex`.

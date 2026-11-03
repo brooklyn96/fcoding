@@ -156,7 +156,7 @@ Máy chủ nghe ở cổng 7681 trên box, nhưng cổng này đóng với bên 
 https://fcode-quoc.duckdns.org
 ```
 
-(Caddy, tên miền DuckDNS và tường lửa do bộ cài máy Oracle `setup-oracle.sh` lo, không cần làm thêm gì khi cài FCode.) Hãy chép địa chỉ này, bạn sẽ nhập nó vào app ở bước ghép máy. Để kiểm tra, mở địa chỉ trong trình duyệt: nếu thấy dòng chữ `fcoding ok` là máy chủ đang chạy.
+(Trên máy Oracle hiện tại, Caddy, tên miền DuckDNS và tường lửa đã được dựng sẵn khi tạo máy, không cần làm thêm gì khi cài FCode. Với một máy mới, cần dựng một Caddy chuyển HTTPS cổng 443 vào cổng 7681 trước.) Hãy chép địa chỉ này, bạn sẽ nhập nó vào app ở bước ghép máy. Để kiểm tra, mở địa chỉ trong trình duyệt: nếu thấy dòng chữ `fcoding ok` là máy chủ đang chạy.
 
 Địa chỉ công khai thì ai biết cũng mở được trang đó, nhưng mọi chức năng khác đều cần iPhone đã ghép (xem [mục 9](#9-bảo-mật)).
 
