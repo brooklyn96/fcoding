@@ -258,9 +258,9 @@ Muốn dùng lại sau khi bị gỡ thì chạy `fcode-pair` trên box và ghé
 
 Hướng dẫn đầy đủ cho app nằm ở [ios/README.md, mục 4](../ios/README.md#4-cách-dùng). Tóm tắt:
 
-**Màn hình chính** (thanh trên cùng chỉ có nút **?** Hướng dẫn và **⚙** Cài đặt). Phiên tự cập nhật mỗi 5 giây, hạn mức và dự án mỗi 15 giây; kéo xuống để cập nhật ngay.
+**Màn hình chính** (thanh trên cùng chỉ có nút **?** Hướng dẫn và **⚙** Cài đặt). Phiên tự cập nhật mỗi 5 giây, hạn mức và dự án mỗi phút; kéo xuống để cập nhật ngay.
 
-- **Lời chào và giờ** (bên trái thẻ trên cùng): lời chào theo giờ (Chào buổi sáng, trưa, chiều hoặc tối), giờ hiện tại cỡ lớn (24 giờ, ví dụ 22:05) và thứ, ngày (ví dụ Thứ Ba, 3/11). Luôn là **giờ Việt Nam**, dù điện thoại đặt múi giờ nào. Tự đổi mỗi phút theo đồng hồ điện thoại, đã chỉnh theo đồng hồ của box. Không có số liệu nào lấy từ box cho phần này và chạm vào cũng không có gì xảy ra.
+- **Lời chào và giờ** (bên trái thẻ trên cùng): lời chào theo giờ (Chào buổi sáng, trưa, chiều hoặc tối), giờ hiện tại cỡ lớn (24 giờ, ví dụ 22:05) và thứ, ngày (ví dụ Thứ Ba, 3/11). Luôn là **giờ Việt Nam**, dù điện thoại đặt múi giờ nào. Tự đổi mỗi phút theo đồng hồ điện thoại, đã chỉnh theo đồng hồ của box (độ lệch lấy từ `generatedAt` của `GET /api/home`, như trước). Máy chủ không gửi số liệu riêng nào cho phần này. Chạm vào phần này không có gì xảy ra.
 - **Ô hạn mức** (bên phải): mỗi lần một tài khoản, tự chuyển sang tài khoản kế mỗi 4 giây (giữ ngón tay trên ô để dừng). Chạm để mở màn hình **Hạn mức**.
 - Dòng **đang chạy · chờ bạn**: chạm để nhảy tới phiên tương ứng.
 - **Dự án** (trượt ngang): mỗi thẻ cho biết số PR đang mở, kết quả checks và lần deploy gần nhất ("đang đọc…" khi máy chủ vừa khởi động, "chưa đọc được GitHub" khi `gh` lỗi). Chạm thẻ để chỉ xem phiên của dự án đó; bấm **…** để mở phiên mới trong dự án đó. Giữ lâu trên thẻ để mở menu: **Mở phiên mới**, **Đổi tên hiển thị…** và **Sắp xếp**.
