@@ -1523,7 +1523,7 @@ function Invoke-MoveTimedExe([string]$Exe, [string[]]$ExeArgs, [string]$StdinTex
 # ---- state.json (D.0.9; atomic through Write-PhienText) ----
 function New-MoveState([string]$Id, $OldM, $NewM) {
   [pscustomobject][ordered]@{
-    move_id = $Id; dir = 'fwd'; attempt = 1; phase = 'planned'; serving = 'old'; mark = $null; dst_started = $false; carry = $false; enabled = $true
+    move_id = $Id; dir = 'fwd'; attempt = 1; phase = 'planned'; serving = 'old'; mark = $null; dst_started = $false; dst_started_at = $null; carry = $false; enabled = $true
     new_lost = $false; new_discarded = $false; chores_done = $false; rebuilt = $false
     pass = [pscustomobject]@{}; dur = [pscustomobject]@{}; answers = [pscustomobject]@{}
     manifest_sha = ''; gate_id = ''
@@ -1546,6 +1546,8 @@ function Read-MoveState {
   $t = ConvertTo-MoveTime $s.last_copy_at; Set-MoveProp $s 'last_copy_at' $(if ($t) { Format-MoveTs $t } else { $null })
   # (T10-G36) R3-1: pwsh 7's ConvertFrom-Json turns the ISO answers{'Q-cut'}.ts into a [DateTime]; normalise it back to the record format
   $qc = Get-MoveMapVal $s.answers 'Q-cut'; if ($qc) { $t = ConvertTo-MoveTime (Get-MoveProp $qc 'ts' ''); Set-MoveProp $qc 'ts' $(if ($t) { Format-MoveTs $t } else { '' }) }
+  # DESIGN-GAP / R5-3 (D.0.9 :476): dst_started_at is normalised on load like last_copy_at (pwsh 7's ConvertFrom-Json gives a [DateTime])
+  $t = ConvertTo-MoveTime (Get-MoveProp $s 'dst_started_at' $null); Set-MoveProp $s 'dst_started_at' $(if ($t) { Format-MoveTs $t } else { $null })
   $s
 }
 function Save-MoveState($S) { if (-not $script:MoveDraft) { Write-PhienText (Get-MovePath 'state.json') (ConvertTo-Json -InputObject $S -Depth 10) } }
@@ -2706,7 +2708,7 @@ function New-MoveFail([string]$Kind, [string]$Why, [int]$Code = 1) { @{ Fail = $
 # D.4 step 2's two ends (dừng, drain-stuck, the D.12.4 crash): src r.unfreeze-src under the current attempt, then the write-ahead
 function Invoke-MoveAbandonStart($S, [int]$Why) {
   if ((Get-MoveSide $S 'src') -ceq 'old') { $u = Invoke-MoveCall $S 'old' 'r.unfreeze-src' } else { $u = Invoke-MoveCall $S 'new' 'r.unfreeze-src' }
-  if ([string]$S.dir -ceq 'fwd') { $w = Set-MoveWriteAhead $S @{ attempt = [int]$S.attempt + 1; phase = 'copied'; mark = $null; dst_started = $false } -NoCheck }   # E-P35
+  if ([string]$S.dir -ceq 'fwd') { $w = Set-MoveWriteAhead $S @{ attempt = [int]$S.attempt + 1; phase = 'copied'; mark = $null; dst_started = $false; dst_started_at = $null } -NoCheck }   # E-P35; R5-3 clear
   else { $w = Set-MoveWriteAhead $S @{ phase = 'cut'; serving = 'new'; mark = $null } -NoCheck }                                                  # E-R19 end state, E-R36
   # DESIGN-GAP (T10-G49, F8b): §8.3 has no drain-stuck remedy sentence; D.12.3 names `fcode deploy <p> recheck`; reading: this line
   if ($Why -eq 65) { Write-Host 'Còn việc deploy dở: chạy  fcode deploy <tên> recheck  cho project ở dòng trên, rồi chạy lại cutover.'; return 65 }
@@ -2788,6 +2790,9 @@ function Invoke-MoveCutSteps($S, [int]$From, [switch]$Carry) {
     if ((Test-MoveLogin $S $dst) -ne 0) { return (New-MoveFail 'human' 'lockout' 70) }
   }
   if ($From -le 8) {
+    # DESIGN-GAP / R5-3 (D.4 step 8 :540, D.0.9 :476): dst_started_at = now only when empty, in the same save as dst_started=true, before
+    # x.start is sent; a resume keeps the first x.start's time. R5-4: "sent with the call" is the existing --dst-started 1, no new token.
+    if (-not (Get-MoveProp $S 'dst_started_at' $null)) { Set-MoveProp $S 'dst_started_at' (Format-MoveTs (Get-MoveNow)) }
     Set-MoveProp $S 'dst_started' $true; Save-MoveState $S
     $r = Invoke-MoveCall $S $dst 'x.start'; if ($r.Code -ne 0) { return (& $afterStart 'x.start') }
     $r = Invoke-MoveCall $S $dst 'x.health'; if ($r.Code -ne 0) { return (& $afterStart 'x.health') }
@@ -2878,16 +2883,31 @@ function Invoke-MoveCarryBack($S, [switch]$Resume) {
 # DESIGN-GAP (T10-G35): D.5.2 splits a carry-back failure at "x.final has started", and no state field records it; a resume while new
 # is down cannot read new's last_final. Reading: answers{'final-sent'} = the x.final call id, saved before the call is sent.
 function Test-MoveFinalSent($S) { [string](Get-MoveMapVal $S.answers 'final-sent' '') -ceq "$($S.dir)-$($S.attempt)-x.final" }
-# DESIGN-GAP (T10-G36, F5): the `<giờ>` of Q-discard / Q-newlost is "the cut-off time after which every write on new is lost" (D.5.3);
-# no field holds it. Reading: answers{'Q-cut'}.ts (the fwd cutover start: earlier than new's first write, so never understates the loss).
-# R2-4: a rebuilt state takes it from the start= of the latest fwd x.freeze record on old (Get-MoveRebuiltCutOff); with none, the
-# question says the time is unknown, never "now".
-function Get-MoveCutOff($S) { $t = [string](Get-MoveProp (Get-MoveMapVal $S.answers 'Q-cut') 'ts' ''); if ($t) { $t } else { 'không rõ (trước thời điểm bắt đầu cutover)' } }
+# DESIGN-GAP (T10-G36): answers{'Q-cut'}.ts = the fwd cutover start (in-run, before step 1; rebuilt from the start= of old's latest fwd
+# x.freeze record, R2-4, Get-MoveRebuiltCutOff); its only reader is step 11's `--created` since. D.5.3 rev 1k3.6 (:551) overrules it for
+# `<giờ>`, which is dst_started_at (below).
+# DESIGN-GAP / R5-2 (D.5.3 :551 "`<giờ>` … is `dst_started_at` in the laptop's time zone"; the format is not named): the fill is the bare
+# local time in $GioFmt, or $CutOffUnknown when dst_started_at is empty or unparseable.
+function Get-MoveCutOff($S) {
+  $GioFmt = 'dd/MM/yyyy HH:mm:ss'
+  $CutOffUnknown = 'không rõ'
+  $dst_started_at = Get-MoveProp $S 'dst_started_at' ''
+  if (-not $dst_started_at -or $null -eq (ConvertTo-MoveTime $dst_started_at)) { return $CutOffUnknown }
+  (ConvertTo-MoveTime $dst_started_at).ToLocalTime().ToString($GioFmt, [Globalization.CultureInfo]::InvariantCulture)
+}
 # the start= of the latest fwd attempt's x.freeze record on old ('' when none): the cutover start of a rebuilt state (G36, R2-4)
 function Get-MoveRebuiltCutOff($Recs) {
   $best = $null; $ba = -1
   foreach ($rr in @($Recs)) { if ("$($rr['id'])" -match '\Afwd-([0-9]+)-x\.freeze\z' -and [int]$Matches[1] -gt $ba -and (ConvertTo-MoveTime $rr['start'])) { $ba = [int]$Matches[1]; $best = [string]$rr['start'] } }
   if ($best) { $best } else { '' }
+}
+# DESIGN-GAP / R5-1 (D.0.10 :490 names no source for dst_started_at; the move-id holds no time): the start= of new's `fwd-<a>-x.start`
+# record, a = attempt when dir=fwd, attempt − 1 when carry=true (D.5.2 writes attempt+1); '' in every other case (a manual back, no such
+# record, start=-).
+function Get-MoveRebuiltDstStartedAt($S, $Recs) {
+  $a = if ([string]$S.dir -ceq 'fwd') { [int]$S.attempt } elseif ($S.carry -eq $true) { [int]$S.attempt - 1 } else { return '' }
+  foreach ($rr in @($Recs)) { if ([string]$rr['id'] -ceq "fwd-$a-x.start" -and (ConvertTo-MoveTime $rr['start'])) { return [string]$rr['start'] } }
+  ''
 }
 # both `MOVE state` lines as the machines print them (D.5.2 "exit 70 with both status answers"); a down new is not asked
 function Write-MoveBothStatus($S) {
@@ -3086,7 +3106,7 @@ function Invoke-MoveCutRun($S) {
     if ($a -cne 'có') { Write-Host 'Đã hủy, chưa làm gì.'; return 0 }
     Set-MoveAnswer $S 'Q-cut' ([pscustomobject]@{ a = 'có'; ts = (Format-MoveTs (Get-MoveNow)) })
   }
-  [void](Set-MoveWriteAhead $S @{ mark = 'cutting'; dst_started = $false } -NoCheck)   # step 1
+  [void](Set-MoveWriteAhead $S @{ mark = 'cutting'; dst_started = $false; dst_started_at = $null } -NoCheck)   # step 1; R5-3 clear
   $script:MoveSrcStopped = $false
   $f = Invoke-MoveCutSteps $S 2
   if ($f.Code -eq 0) { return (Invoke-MoveChores $S) }
@@ -3110,7 +3130,7 @@ function Invoke-MoveBackRun($S) {
     $r = Invoke-MoveCall $S 'new' 'c.transfer.N'; if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
     Set-MoveProp $S 'phase' 'copied'; Save-MoveState $S
   }
-  [void](Set-MoveWriteAhead $S @{ mark = 'cutting'; dst_started = $false } -NoCheck)
+  [void](Set-MoveWriteAhead $S @{ mark = 'cutting'; dst_started = $false; dst_started_at = $null } -NoCheck)   # D.8 step 1; R5-3 clear
   $script:MoveSrcStopped = $false
   $f = Invoke-MoveCutSteps $S 2
   # DESIGN-GAP (T10-G43, F8h, DG-T11-8): I17 has "10 rolled back, old serves" and D.8 names no exit for a completed manual back; reading:
@@ -3233,7 +3253,8 @@ function Invoke-MoveRebuild([string]$OldAlias, [string]$NewAlias) {
   if ($phase -ceq 'cut') { $serv = 'new'; $mark = '' } elseif ($phase -cin 'back-done', 'rolled-back', 'finished', 'aborted') { if ($phase -cne 'finished') { $serv = 'old' } else { $serv = 'new' }; $mark = '' }
   foreach ($kv in @{ dir = $dir; attempt = $att; phase = $phase; serving = $serv; mark = $(if ($mark) { $mark } else { $null }); dst_started = ([string]$o.Mid['dst_started'] -ceq '1' -or [string]$n.Mid['dst_started'] -ceq '1'); enabled = $false; rebuilt = $true; manifest_sha = $mf.Sha; carry = [bool]($dir -ceq 'back' -and $phase -ceq 'planned' -and $mark) }.GetEnumerator()) { Set-MoveProp $S $kv.Key $kv.Value }
   Set-MoveProp $S 'target_users' @(Get-MoveRebuiltTargetUsers $mf.Obj)
-  $co = Get-MoveRebuiltCutOff $o.Recs; if ($co) { Set-MoveAnswer $S 'Q-cut' ([pscustomobject]@{ a = 'có'; ts = $co }) }   # R2-4 (T10-G36)
+  $co = Get-MoveRebuiltCutOff $o.Recs; if ($co) { Set-MoveAnswer $S 'Q-cut' ([pscustomobject]@{ a = 'có'; ts = $co }) }   # R2-4 (T10-G36): step 11's since
+  Set-MoveProp $S 'dst_started_at' (Get-MoveRebuiltDstStartedAt $S $n.Recs)   # R5-1
   # dur{}: the last record per step and machine (D.0.5)
   foreach ($k in 'old', 'new') {
     foreach ($rr in @($got[$k].Recs | Sort-Object { [string]$_['end'] })) {
@@ -3302,7 +3323,7 @@ function Invoke-Move([string[]]$MoveArgs) {
       'copy-first' { $w = Wait-MoveRunning $S; if ($w -ne 0) { $w } else { Invoke-MoveCopyFull $S } }
       'copy-refresh' { $w = Wait-MoveRunning $S; if ($w -ne 0) { $w } else { Invoke-MoveCopyRefresh $S } }
       'copy-attempt' {
-        $w = Set-MoveWriteAhead $S @{ attempt = [int]$S.attempt + 1; dir = 'fwd'; carry = $false; mark = $null; dst_started = $false }
+        $w = Set-MoveWriteAhead $S @{ attempt = [int]$S.attempt + 1; dir = 'fwd'; carry = $false; mark = $null; dst_started = $false; dst_started_at = $null }   # R5-3 clear
         if ($w -ne 0) { $w } else { Invoke-MoveCopyFull $S }
       }
       'back-precopy' { $r = Invoke-MoveCall $S 'new' 'c.transfer.N'; if ($r.Code -eq 0) { Set-MoveProp $S 'phase' 'copied'; Save-MoveState $S }; ConvertTo-MoveExit $r.Code }
