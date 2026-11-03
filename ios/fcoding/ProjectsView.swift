@@ -121,7 +121,7 @@ struct ProjectsView: View {
             }
             .task(id: polling) {
                 guard polling else { return }
-                // Home every 15 s (the top card's working sessions), the prefs every 4th time (60 s).
+                // Home every 15 s, the prefs every 4th time (60 s).
                 var turn = 0
                 while !Task.isCancelled {
                     if turn % 4 == 0 {
