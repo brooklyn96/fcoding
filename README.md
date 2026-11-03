@@ -4,12 +4,12 @@
 
 ## FCode là gì
 
-FCode là một app iPhone kèm một máy chủ nhỏ. Máy chủ chạy trên **box** (máy Linux đám mây của instabox); mỗi trợ lý chạy trong một phiên tmux nên vẫn sống khi bạn khóa điện thoại. Bạn trò chuyện với trợ lý, trả lời y/n, xem hạn mức và chi phí ngay trên điện thoại, và vào lại đúng phiên đó từ laptop.
+FCode là một app iPhone kèm một máy chủ nhỏ. Máy chủ chạy trên **box** (một máy Linux Oracle chạy liên tục); mỗi trợ lý chạy trong một phiên tmux nên vẫn sống khi bạn khóa điện thoại. Bạn trò chuyện với trợ lý, trả lời y/n, xem hạn mức và chi phí ngay trên điện thoại, và vào lại đúng phiên đó từ laptop.
 
 ## Cách hoạt động
 
 - **Box**: chạy `server.mjs` (Node 22, không cần cài thêm gói) và các phiên tmux.
-- **Link công khai**: `instabox port publish` đưa cổng 7681 của box ra một địa chỉ `https://7681-<id>.instabox.tech`.
+- **Link công khai**: Caddy trên box đưa cổng 7681 ra địa chỉ `https://fcode-quoc.duckdns.org` (HTTPS, cổng 443).
 - **App iPhone**: ghép với box bằng mã 6 số (không có mật khẩu), rồi nói chuyện với box qua link đó.
 - **Laptop**: lệnh `fcode` (tùy chọn) để vào phiên, thêm dự án, ghép iPhone và đồng bộ phiên omp.
 
@@ -17,7 +17,7 @@ FCode là một app iPhone kèm một máy chủ nhỏ. Máy chủ chạy trên 
 
 1. **Cài máy chủ trên box** (cần Node 22 và tmux):
    `git clone https://github.com/brooklyn96/fcoding.git && cd fcoding && bash install.sh`
-2. **Mở link công khai** (chạy trên laptop): `instabox port publish <tên-box> 7681`. Mở link trong trình duyệt, thấy `fcoding ok` là được.
+2. **Mở link công khai**: Caddy và tên miền do bộ cài máy Oracle (`setup-oracle.sh`) lo. Mở `https://fcode-quoc.duckdns.org` trong trình duyệt, thấy `fcoding ok` là được.
 3. **Cài app lên iPhone**: tải `fcode.ipa` ở mục **Releases** của GitHub, cài bằng **Sideloadly** (Apple ID miễn phí chạy được 7 ngày, ký lại bằng cách cài đè).
 4. **Ghép iPhone**: trên box chạy `fcode-pair "iPhone của tôi"`, rồi nhập địa chỉ link và mã 6 số vào app.
 5. **(Tùy chọn) Lệnh `fcode` trên laptop Windows**: mở PowerShell, dán `irm https://raw.githubusercontent.com/brooklyn96/fcoding/main/laptop/install.ps1 | iex`.

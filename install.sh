@@ -77,9 +77,9 @@ fi
 # An "add project" job (fcode-add.sh) is a child in its own process group: systemctl stop / restart sends SIGTERM to the server, whose handler
 # ends the job and its group (CONTRACT A11); after a crash KillMode=process leaves it alone, and the job's own timeout(1) deadline ends it.
 # PATH for the harnesses is set by server.mjs itself (~/.local/bin, ~/.bun/bin, system dirs).
-# The home screen's project list runs gh, which needs GH_TOKEN. A login shell gets it from the instabox vault file
-# (/etc/profile.d/zz-instabox-secrets.sh sources /run/instabox/secrets/env, which lives in RAM); the service takes
-# GH_TOKEN alone from the same file at each start. Nothing is copied to disk and no other variable is kept.
+# The home screen's project list runs gh, which needs GH_TOKEN. A login shell gets it from the secrets env file
+# (FCODE_SECRETS_ENV, default /run/instabox/secrets/env; on the Oracle VM a tmpfiles link to ~/.config/fcode/secrets.env);
+# the service takes GH_TOKEN alone from the same file at each start. Nothing is copied to disk and no other variable is kept.
 cat > "$APP/start.sh" <<'START'
 #!/bin/sh
 f=${FCODE_SECRETS_ENV:-/run/instabox/secrets/env}
@@ -127,5 +127,4 @@ Paired devices:   PC_CONFIG_DIR=$CFG node $APP/server.mjs --devices
 Revoke a device:  PC_CONFIG_DIR=$CFG node $APP/server.mjs --revoke <id>     (or --revoke all)
 Projects: edit $CFG/config.json ("projects": {"name": "/abs/dir"}); the server reloads it by itself.
 Paired devices survive restarts. Changing cookieSecret in config.json unpairs every device.
-Publish:  instabox port publish <box> 7681
 MSG
