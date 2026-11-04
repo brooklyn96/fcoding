@@ -141,7 +141,8 @@ struct HomeGuideView: View {
         ("Chọn trong menu", 0xFF9F0A, [
             "Khi phiên hỏi bạn chọn (một menu có một dòng đang được chọn), các dòng lựa chọn có nền màu nhạt và một thanh nút hiện ngay trên ô nhập.",
             "Chạm ngay dòng trên màn hình, hoặc nút của nó trên thanh, để chọn. Ô **[ ]** chỉ được đánh dấu; chọn xong thì chạm **Submit**.",
-            "Câu hỏi nhiều trang: nút **←** / **→**. Nút **Esc** đóng menu.",
+            "Câu hỏi nhiều trang: nút **←** / **→**. Nút **Esc** đóng menu. Nhiều lựa chọn thì kéo thanh sang ngang.",
+            "Sau mỗi lần chạm, thanh mờ đi khoảng nửa giây: app không bao giờ bấm theo màn hình cũ.",
             "Hoặc dùng các phím **↑** **↓** **Enter** ở đầu hàng phím nhanh.",
         ]),
         ("Lời chào và giờ", 0x64D2FF, [

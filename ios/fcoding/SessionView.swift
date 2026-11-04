@@ -600,11 +600,21 @@ struct TerminalText: UIViewRepresentable {
             return option(at: g.location(in: v)) != nil
         }
 
+        /// Checked at touch-down: a touch that stops a flick or a bounce never picks (by
+        /// `gestureRecognizerShouldBegin` the touch has already stopped the deceleration).
+        func gestureRecognizer(_ g: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+            guard let v = view else { return false }
+            return !(v.isDragging || v.isDecelerating)
+        }
+
+        /// Not together with a long press (text selection, the loupe): the press wins.
         func gestureRecognizer(_ g: UIGestureRecognizer,
-                               shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
+                               shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+            !(other is UILongPressGestureRecognizer)
+        }
 
         @objc func tapped(_ g: UITapGestureRecognizer) {
-            guard let v = view, let o = option(at: g.location(in: v)) else { return }
+            guard let v = view, v.selectedRange.length == 0, let o = option(at: g.location(in: v)) else { return }
             _ = pick(o)
         }
     }
@@ -767,39 +777,29 @@ private struct ChoiceBar: View {
     private var compact: Bool { verticalSizeClass == .compact }
     private var height: CGFloat { compact ? 32 : 40 }
 
+    /// The highlighted option's row, kept in view while the options scroll.
+    private var highlightedRow: Int? { menu.options.first { $0.highlighted }?.row }
+
     var body: some View {
         HStack(spacing: 6) {
-            if menu.tabs { keyButton("←", key: "Left", label: "Câu hỏi trước") }
-            ForEach(menu.options, id: \.row) { o in
-                Button { onPick(o) } label: {
-                    HStack(spacing: 5) {
-                        if let n = MenuLogic.shownNumber(o, in: menu.options) {
-                            Text("\(n)")
-                                .font(.system(size: 15, weight: .bold, design: .monospaced))
-                                .foregroundColor(o.highlighted ? .accentColor : .secondary)
-                        }
-                        if o.checkbox {
-                            Image(systemName: o.checked ? "checkmark.square.fill" : "square")
-                                .font(.system(size: 14, weight: .semibold))
-                                .foregroundColor(o.checked ? .accentColor : .secondary)
-                        }
-                        Text(o.label)
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundColor(.primary)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
+            // The options fill the row when their minimum widths fit; otherwise they scroll
+            // sideways. ← → and Esc stay outside the scroll, always reachable.
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 6) { options(fill: true) }
+                ScrollViewReader { proxy in
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) { options(fill: false) }
                     }
-                    .padding(.horizontal, 8)
-                    .frame(maxWidth: .infinity, minHeight: height)
-                    .background(o.highlighted ? Color.accentColor.opacity(0.22) : Color(uiColor: .tertiarySystemFill),
-                                in: RoundedRectangle(cornerRadius: 8))
-                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.accentColor, lineWidth: o.highlighted ? 1 : 0))
+                    .onAppear { if let r = highlightedRow { proxy.scrollTo(r, anchor: .center) } }
+                    .onChange(of: highlightedRow) { r in
+                        if let r { withAnimation { proxy.scrollTo(r, anchor: .center) } }
+                    }
                 }
-                .accessibilityLabel(MenuLogic.spoken(o, in: menu.options))
-                .accessibilityValue(o.checkbox ? (o.checked ? "Đã đánh dấu" : "Chưa đánh dấu") : "")
-                .accessibilityAddTraits(o.highlighted ? .isSelected : [])
             }
-            if menu.tabs { keyButton("→", key: "Right", label: "Câu hỏi sau") }
+            if menu.tabs {
+                keyButton("←", key: "Left", label: "Câu hỏi trước")
+                keyButton("→", key: "Right", label: "Câu hỏi sau")
+            }
             keyButton("Esc", key: "Escape", label: "Phím Escape, đóng menu")
         }
         .opacity(busy ? 0.4 : 1)
@@ -809,6 +809,45 @@ private struct ChoiceBar: View {
         .frame(maxWidth: .infinity)
         .background(Color(uiColor: .secondarySystemBackground).ignoresSafeArea(edges: .bottom))
         .overlay(alignment: .top) { Divider() }
+    }
+
+    /// One button per option, at least the number plus about 6 characters of label wide (more
+    /// with a checkbox). `fill`: share the row and cut long labels; else full labels, for the scroll.
+    private func options(fill: Bool) -> some View {
+        ForEach(menu.options, id: \.row) { o in
+            let minWidth: CGFloat = o.checkbox ? 104 : 84
+            Button { onPick(o) } label: {
+                HStack(spacing: 5) {
+                    if let n = MenuLogic.shownNumber(o, in: menu.options) {
+                        Text("\(n)")
+                            .font(.system(size: 15, weight: .bold, design: .monospaced))
+                            .foregroundColor(o.highlighted ? .accentColor : .secondary)
+                    }
+                    if o.checkbox {
+                        Image(systemName: o.checked ? "checkmark.square.fill" : "square")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundColor(o.checked ? .accentColor : .secondary)
+                    }
+                    Text(o.label)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundColor(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                .padding(.horizontal, 8)
+                // The ideal width is the minimum, so ViewThatFits picks the filled row exactly when
+                // every option gets its minimum.
+                .frame(minWidth: minWidth, idealWidth: fill ? minWidth : nil, maxWidth: fill ? .infinity : nil,
+                       minHeight: height)
+                .background(o.highlighted ? Color.accentColor.opacity(0.22) : Color(uiColor: .tertiarySystemFill),
+                            in: RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.accentColor, lineWidth: o.highlighted ? 1 : 0))
+            }
+            .id(o.row)
+            .accessibilityLabel(MenuLogic.spoken(o, in: menu.options))
+            .accessibilityValue(o.checkbox ? (o.checked ? "Đã đánh dấu" : "Chưa đánh dấu") : "")
+            .accessibilityAddTraits(o.highlighted ? .isSelected : [])
+        }
     }
 
     private func keyButton(_ title: String, key: String, label: String) -> some View {

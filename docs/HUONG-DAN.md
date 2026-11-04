@@ -293,7 +293,9 @@ Hướng dẫn đầy đủ cho app nằm ở [ios/README.md, mục 4](../ios/RE
   - Hoặc chạm **nút của nó trên thanh chọn** hiện ngay trên ô nhập (cả khi xoay ngang, cả khi ô nhập đang ẩn). Chữ trên màn hình nhỏ thì dùng thanh này cho dễ.
   - App tự bấm ↑ / ↓ tới đúng dòng rồi Enter. Ở câu hỏi chọn nhiều (ô `[ ]`), chạm một dòng chỉ đánh dấu hoặc bỏ đánh dấu dòng đó (phím Space), chưa gửi; chọn xong thì chạm **Submit**. Câu hỏi có nhiều trang thì thanh có thêm nút **←** / **→** để sang câu trước / câu sau. Nút **Esc** đóng menu.
   - Dòng mình gõ đã gửi, chữ đang soạn hay danh sách có số trong câu trả lời không làm hiện thanh: chỉ menu đang chờ bạn chọn mới hiện.
-  - Sau mỗi lần chạm (hay mỗi phím, dòng chữ bạn gửi), thanh và các dòng mờ đi cho tới khi màn hình mới về, nên chạm hai lần không gửi hai lần và app không bấm theo màn hình cũ. Vẫn dùng được ↑ ↓ Enter ở đầu hàng phím nhanh.
+  - Nhiều lựa chọn quá thì phần nút lựa chọn kéo ngang được (nút đang được chọn tự hiện ra); **←** / **→** và **Esc** luôn nằm cố định bên phải.
+  - Sau mỗi lần chạm (hay mỗi phím, dòng chữ bạn gửi), thanh và các dòng mờ đi khoảng nửa giây, tới khi app xem lại màn hình mới nhất và thấy nó khớp với màn hình đang hiện. Nên chạm hai lần không gửi hai lần và app không bao giờ bấm theo màn hình cũ. Vẫn dùng được ↑ ↓ Enter ở đầu hàng phím nhanh.
+  - Chạm để dừng màn hình đang trượt, hay giữ ngón tay để bôi đen chữ trên một dòng lựa chọn, không chọn dòng đó.
 - **Agents**: mở danh sách agent con. Phím **Agents** không hiện ở phiên shell hay phiên không rõ chương trình.
   - Phiên omp: gửi Alt+A, mở Agent Hub. Dùng ↑↓ chọn, Enter mở, Esc đóng.
   - Phiên Claude Code: gõ lệnh `/tasks` rồi Enter. Lệnh chạy ngay cả khi Claude đang làm. Bấm Enter để mở một subagent; các phím khác xem trên màn hình. Bấm Esc đóng danh sách trước khi gửi chữ: trong danh sách, phím `x` dừng subagent đang chọn (`f` đưa nó lên trước).
