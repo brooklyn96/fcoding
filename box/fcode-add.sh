@@ -16,7 +16,7 @@
 # (ca khi clone hong hay bi tat giua chung) bi xoa neu co loi truoc khi project duoc ghi vao cau hinh (va chua co ten nay -> thu muc nay trong cau hinh).
 # Vong doi: moi tien trinh con hoac duoc cho den khi xong truoc khi script di tiep (trap chi chay sau khi lenh dang chay xong), hoac tu bi gioi han:
 # process substitution o url_rewrite_check la 1 lenh git config cuc bo doc den EOF; "timeout 20 gh ..." chay rieng voi gioi han rieng.
-# Han chot cua job la timeout(1) (server.mjs): TERM roi KILL cho ca nhom tien trinh; TERM tu close() cua server duoc timeout chuyen tiep va cung
+# Han chot cua job la ADD_WATCHDOG (server.mjs): TERM roi KILL cho ca nhom tien trinh; TERM tu close() cua server duoc watchdog chuyen tiep va cung
 # khoi dong KILL do. KHONG them &, nohup, setsid, disown, coproc, hay process substitution khong doc den EOF.
 # Ma thoat: 0 xong, 30 xong nhung co canh bao, 40 can dan khoa vao GitHub, 41 khoa chua co quyen ghi,
 # 42 GitHub chan tao nhanh box/*, 43 mang loi, 44 repo da luu tru, 24 khong cai/kiem chung duoc hook, 25 khong dat duoc credential helper,

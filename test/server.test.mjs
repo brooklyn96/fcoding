@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import { createApp, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, strictOrigin, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock,
-  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, releaseRunOf, parseUpdates, updateStatusOf, gateStatusOf, gateRunOf, resetReply, RESET_MSG, memo, codexChildMeta, parseGitSync, ompDirName, ompHead, KNOWN_VERSIONS, repoOfLink } from '../server.mjs';
+  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, releaseRunOf, parseUpdates, updateStatusOf, gateStatusOf, gateRunOf, resetReply, RESET_MSG, memo, codexChildMeta, parseGitSync, ompDirName, ompHead, KNOWN_VERSIONS, repoOfLink, ADD_WATCHDOG } from '../server.mjs';
 
 process.env.TZ = 'America/Los_Angeles'; // spend days follow config.json timeZone, never the process zone: a third zone proves it
 
@@ -4913,8 +4913,8 @@ if (plan.addProject) {
   c.projects[argv[1]] = plan.addProject; fs.writeFileSync(f + '.tmp', JSON.stringify(c), { mode: 0o600 }); fs.renameSync(f + '.tmp', f);
 }
 if (plan.child) { const k = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }); fs.writeFileSync(path.join(dir, 'child.pid'), String(k.pid)); }
-if (plan.ignoreTerm) {
-  process.on('SIGTERM', () => {});
+if (plan.ignoreTerm) { // 'grand': only the grandchild ignores TERM
+  if (plan.ignoreTerm !== 'grand') process.on('SIGTERM', () => {});
   const gsrc = "process.on('SIGTERM',()=>{});require('fs').writeFileSync(" + JSON.stringify(path.join(dir, 'ready-grand')) + ",String(process.pid));setInterval(()=>{},1000)";
   spawn(process.execPath, ['-e', gsrc], { stdio: 'ignore' });
   fs.writeFileSync(path.join(dir, 'ready-fake'), String(process.pid)); // after the handler above
@@ -5045,7 +5045,7 @@ test('add project: every exit code of the script ends the job in its state and c
     [11, R('R DIR_UNSAFE unsafe'), 'failed', 'DIR_CONFLICT', 'unsafe'],
     [24, R('R HOOK_FAIL install'), 'failed', 'FAILED', 'install'], [24, R('R HOOK_FAIL verify'), 'failed', 'FAILED', 'verify'],
     [25, R('R CRED_FAIL config'), 'failed', 'FAILED', 'config'], [26, R('R URL_REWRITE rewrite'), 'failed', 'FAILED', 'rewrite'],
-    [124, R('R KEY_NEW'), 'failed', 'TIMEOUT', null], // timeout(1) ends the job at its deadline
+    [124, R('R KEY_NEW'), 'failed', 'TIMEOUT', null], // the watchdog ends the job at its deadline
     [0, R('R CFG_EXISTS'), 'done', 'ADDED', null], // a rerun of a registered project: nothing but CFG_EXISTS
     [21, R('R CFG_CONFLICT /data/workspace/else'), 'failed', 'CFG_CONFLICT', '/data/workspace/else'],
     [21, R('R ALIAS_FAIL'), 'failed', 'FAILED', null], // 21 is also "cannot write the ssh config": not a name clash
@@ -5054,7 +5054,7 @@ test('add project: every exit code of the script ends the job in its state and c
     [2, R('R BAD_ARGS'), 'failed', 'BAD_ARGS', null],
     [12, R('R CLONE_FAIL fatal: repository not found'), 'failed', 'CLONE_FAIL', 'fatal: repository not found'],
     [20, R('R KEY_FAIL'), 'failed', 'FAILED', null],
-    [1, [], 'failed', 'FAILED', null], [3, [], 'failed', 'FAILED', null], [10, [], 'failed', 'FAILED', null], [31, [], 'failed', 'FAILED', null], [45, [], 'failed', 'FAILED', null], [137, [], 'failed', 'FAILED', null], // 137 never comes back as a code (timeout(1) --kill-after kills the group, node sees a signal)
+    [1, [], 'failed', 'FAILED', null], [3, [], 'failed', 'FAILED', null], [10, [], 'failed', 'FAILED', null], [31, [], 'failed', 'FAILED', null], [45, [], 'failed', 'FAILED', null], [137, [], 'failed', 'FAILED', null], // 137 never comes back as a code (the watchdog's kill-after KILL hits the group and itself, node sees a signal)
     [127, [], 'failed', 'FAILED', null], [255, [], 'failed', 'FAILED', null],
   ];
   for (const [exit, lines, state, code, detail, key] of cases) {
@@ -5426,7 +5426,7 @@ test('add project: ended jobs are pruned on every submit, and at most 50 are kep
   await c.jobEnd((await c.add({ repo: 'o/after' })).json.job);
   assert.ok(c.app.stats().addJobs <= 2, `kept ${c.app.stats().addJobs}`); // only the new one (and, maybe, a job still ending)
 }));
-// the job's deadline and the server's stop, on a real server process (POSIX: process groups and timeout(1))
+// the job's deadline and the server's stop, on a real server process (POSIX: process groups and ADD_WATCHDOG)
 async function addServerProc(fn, { timeoutMs = 2500, plan = { sleep: 120e3, child: true }, killAfter } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-addp-'));
   fs.writeFileSync(path.join(dir, 'fake-add.mjs'), ADD_FAKE_SRC);
@@ -5465,7 +5465,7 @@ test('add project: the job ends by its own deadline after the server is killed (
   child.kill('SIGKILL'); // a crash: nothing runs close(), the job's process group is left alone
   await exited;
   assert.ok(alive(grand), 'the job survives the crash for now');
-  await waitFor(() => !alive(grand), 15000); // timeout(1) at 2.5 s: TERM to the group (kill-after 10 s)
+  await waitFor(() => !alive(grand), 15000); // the watchdog at 2.5 s: TERM to the group
 }));
 
 test('add project: a stop of the service (SIGTERM, SIGINT) ends the running job and its group, then the process exits', { skip: process.platform === 'win32' && 'POSIX' }, async () => {
@@ -5480,7 +5480,7 @@ test('add project: a stop of the service (SIGTERM, SIGINT) ends the running job 
   }
 });
 
-// timeout(1) --kill-after is load-bearing: a job that ignores TERM (and a grandchild that does too) must still die within the bound.
+// the watchdog's kill-after is load-bearing: a job that ignores TERM (and a grandchild that does too) must still die within the bound.
 // "dead" = gone or a zombie (a killed process may stay a zombie when the box has no reaping init)
 const terminatedPid = (pid) => {
   try {
@@ -5488,17 +5488,44 @@ const terminatedPid = (pid) => {
     return st.slice(st.lastIndexOf(')') + 2, st.lastIndexOf(')') + 3) === 'Z';
   } catch { return true; }
 };
-const addPosix = { skip: process.platform !== 'linux' && 'needs Linux (timeout(1), /proc)' };
+const addPosix = { skip: process.platform !== 'linux' && 'needs Linux (process groups, /proc)' };
 
-test('escalation (server): a job and a grandchild that ignore TERM are killed by timeout --kill-after after a server crash', addPosix, () => addServerProc(async ({ child, exited, fake, grand }) => {
+test('escalation (server): a job and a grandchild that ignore TERM are killed by the watchdog\'s kill-after after a server crash', addPosix, () => addServerProc(async ({ child, exited, fake, grand }) => {
   const t0 = Date.now();
-  child.kill('SIGKILL'); // a crash: only timeout(1) is left to enforce the deadline
+  child.kill('SIGKILL'); // a crash: only the watchdog is left to enforce the deadline
   await exited;
   await waitFor(() => terminatedPid(fake) && terminatedPid(grand), 2500 + 2000 + 2000 + 1500); // deadline 2.5 s + kill-after 2 s + 2 s
   assert.ok(Date.now() - t0 >= 2000, 'not before the deadline'); // they ignored TERM: it took the deadline's TERM and then the KILL
 }, { timeoutMs: 2500, killAfter: 2, plan: { sleep: 120e3, ignoreTerm: true } }));
 
-test('escalation (server): a stop of the service forwards TERM through timeout(1) and its kill-after kills a job that ignores it, the server exits 0', addPosix, () => addServerProc(async ({ child, exited, fake, grand }) => {
+// the case uutils' timeout and an early-exiting watchdog both miss: the job itself ends on TERM, only its grandchild ignores it
+test('escalation (server): after a server crash a grandchild that ignores TERM still dies by the KILL, though its job ended on the TERM', addPosix, () => addServerProc(async ({ child, exited, fake, grand }) => {
+  const t0 = Date.now();
+  child.kill('SIGKILL');
+  await exited;
+  await waitFor(() => terminatedPid(fake), 2500 + 2000); // the deadline's TERM ends the job
+  assert.ok(!terminatedPid(grand), 'the grandchild outlives the TERM');
+  await waitFor(() => terminatedPid(grand), 2000 + 2000 + 1500); // the KILL at the deadline + kill-after
+  assert.ok(Date.now() - t0 >= 2000, 'not before the deadline');
+}, { timeoutMs: 2500, killAfter: 2, plan: { sleep: 120e3, ignoreTerm: 'grand' } }));
+
+// ADD_WATCHDOG on its own: the exit like timeout(1) (124 after the deadline, else the job's code or signal; 127 when it cannot start)
+test('add watchdog: exit codes (normal, signal, deadline, deadline + KILL, forwarded TERM, cannot start)', addPosix, async () => {
+  const run = (ms, job, { term } = {}) => new Promise((resolve) => {
+    const w = spawn(process.execPath, ['-e', ADD_WATCHDOG, String(ms), '1000', ...job], { stdio: 'ignore', detached: true });
+    if (term) setTimeout(() => process.kill(-w.pid, 'SIGTERM'), term); // the server's close(): TERM to the group
+    w.on('exit', (code, signal) => resolve({ code, signal }));
+  });
+  const sh = (src) => ['bash', '-c', src]; // bash sets its trap at once, before any TERM can come (the sleeps inherit an ignored TERM)
+  assert.deepEqual(await run(60e3, sh('exit 7')), { code: 7, signal: null });
+  assert.deepEqual(await run(60e3, sh('kill -HUP $$')), { code: null, signal: 'SIGHUP' }); // the job's signal, raised again
+  assert.deepEqual(await run(300, sh('while :; do sleep 0.1; done')), { code: 124, signal: null }); // ended by the deadline's TERM
+  assert.deepEqual(await run(300, sh('trap "" TERM; while :; do sleep 0.1; done')), { code: null, signal: 'SIGKILL' }); // the group KILL, itself too
+  assert.deepEqual(await run(60e3, sh('trap "exit 143" TERM; while :; do sleep 0.1; done'), { term: 500 }), { code: 143, signal: null }); // the script's own TERM code
+  assert.deepEqual(await run(60e3, ['/nonexistent/fcode-add']), { code: 127, signal: null });
+});
+
+test('escalation (server): a stop of the service forwards TERM through the watchdog and its kill-after kills a job that ignores it, the server exits 0', addPosix, () => addServerProc(async ({ child, exited, fake, grand }) => {
   child.kill('SIGTERM');
   const r = await Promise.race([exited, new Promise((x) => setTimeout(x, 8000, 'hung'))]);
   assert.notEqual(r, 'hung', 'the server did not exit');

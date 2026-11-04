@@ -127,7 +127,41 @@ export function parseAddRequest(b) {
 // script exit code -> job code; anything else (or a signal) is FAILED. The script's "R <CODE> [detail]" lines add the public key and the detail.
 const ADD_CODES = { 0: 'ADDED', 30: 'ADDED_WARN', 40: 'NEED_KEY', 41: 'NEED_WRITE', 42: 'WRITE_BLOCKED', 43: 'NET_FAIL', 44: 'REPO_ARCHIVED',
   11: 'DIR_CONFLICT', 21: 'CFG_CONFLICT', 22: 'CFG_BROKEN', 23: 'NAME_USED', 2: 'BAD_ARGS', 12: 'CLONE_FAIL',
-  124: 'TIMEOUT' }; // timeout(1): 124 = the deadline (its --kill-after kill ends it as a signal, not a code; the job's own deadline, kept when the server is gone)
+  124: 'TIMEOUT' }; // ADD_WATCHDOG: 124 = the deadline (its kill-after KILL ends it as a signal, not a code; the job's own deadline, kept when the server is gone)
+// The add job's deadline, run by `node -e` as the leader of the job's process group (spawned detached), so it holds when this server is gone
+// (a crash, or a restart: install.sh uses KillMode=process). argv: <deadline ms> <kill-after ms> <cmd> [args...].
+// At the deadline, or on a TERM from the server, TERM goes to the whole group, and KILL goes to the whole group kill-after later. That is GNU
+// timeout(1) -k, but uutils' timeout (the default `timeout` from Ubuntu 26.04, 0.10) sends that KILL to its direct child only.
+// After a TERM it stays until the rest of the group is gone (zombies do not count) or the KILL is sent.
+// Exit like timeout(1): 124 after the deadline, else the job's own code, or its signal raised again; 127 when the job cannot start.
+export const ADD_WATCHDOG = `const fs = require('fs'), { spawn } = require('child_process');
+const [ms, killMs, cmd, ...args] = process.argv.slice(1), me = String(process.pid);
+let timedOut = false, armed = false;
+const term = () => {
+  if (armed) return;
+  armed = true;
+  try { process.kill(0, 'SIGTERM'); } catch {}
+  setTimeout(() => { try { process.kill(0, 'SIGKILL'); } catch {} }, Number(killMs));
+};
+const member = (p) => { // /proc/<pid>/stat after "(comm) ": state ppid pgrp ...
+  try { const s = fs.readFileSync('/proc/' + p + '/stat', 'utf8'), f = s.slice(s.lastIndexOf(')') + 2).split(' '); return f[0] !== 'Z' && f[2] === me; } catch { return false; }
+};
+const others = () => { try { return fs.readdirSync('/proc').some((p) => /^[0-9]+$/.test(p) && p !== me && member(p)); } catch { return true; } };
+const end = (code, signal) => {
+  if (timedOut) process.exit(124);
+  if (signal) { process.removeAllListeners('SIGTERM'); process.kill(process.pid, signal); }
+  process.exit(code ?? 128 + (require('os').constants.signals[signal] ?? 0));
+};
+process.on('SIGTERM', term);
+const deadline = setTimeout(() => { timedOut = true; term(); }, Number(ms));
+const child = spawn(cmd, args, { stdio: 'inherit' });
+child.on('error', () => process.exit(127));
+child.on('exit', (code, signal) => {
+  clearTimeout(deadline);
+  const wait = () => (armed && others() ? setTimeout(wait, 200) : end(code, signal));
+  wait();
+});
+`;
 // the detail words the app matches: DIR_EXISTS 'exists', DIR_UNSAFE 'unsafe', HOOK_FAIL 'install' | 'verify'; also URL_REWRITE 'rewrite' (26) and CRED_FAIL 'config' (25); first line with text wins
 const ADD_DETAIL = ['SSH_DETAIL', 'CLONE_FAIL', 'DIR_EXISTS', 'DIR_UNSAFE', 'HOOK_FAIL', 'URL_REWRITE', 'CRED_FAIL', 'CFG_CONFLICT', 'CFG_BROKEN', 'CLEANUP_FAIL'];
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -1742,14 +1776,10 @@ export function createApp(opts = {}) {
   // and nothing but the name and the code is logged. FCODE_CFG points the script at THIS server's config.json. ---
   const addSpec = specOf(opts.addScript ?? process.env.PC_ADD_SCRIPT ?? ['bash', [ADD_SCRIPT, ADD_SCRIPT_DEV].find((f) => fs.existsSync(f)) ?? ADD_SCRIPT]);
   const addTimeout = opts.addTimeoutMs ?? (Number(process.env.PC_ADD_TIMEOUT_MS) || ADD_TIMEOUT_MS);
-  // on Linux the script runs under timeout(1): the deadline then holds on its own even when this server is gone (a crash, or a restart that
-  // leaves the job alone: install.sh uses KillMode=process); a graceful stop ends the jobs through close(). 124 maps to TIMEOUT; a kill-after kill ends as a signal.
+  // off Windows the script runs under ADD_WATCHDOG: the deadline then holds on its own even when this server is gone (a crash, or a restart
+  // that leaves the job alone: install.sh uses KillMode=process); a graceful stop ends the jobs through close(). 124 maps to TIMEOUT; a kill-after kill ends as a signal.
   const addKillAfter = Number(process.env.PC_ADD_KILL_AFTER_S) || ADD_KILL_AFTER_S; // test-only override, like PC_ADD_TIMEOUT_MS
-  // the KILL to the whole group at --kill-after is GNU timeout's. uutils' timeout (the default `timeout` from Ubuntu 26.04) sends it to the
-  // direct child only (its group send gives up when signal(SIGKILL, SIG_IGN) fails), so a TERM-ignoring grandchild would outlive the deadline:
-  // Ubuntu keeps GNU's as gnutimeout, and that one is used when it is on PATH
-  const timeoutBin = toolEnv().PATH.split(':').some((d) => d && fs.existsSync(path.join(d, 'gnutimeout'))) ? 'gnutimeout' : 'timeout';
-  const addWrap = process.platform === 'win32' ? [] : [timeoutBin, `--kill-after=${addKillAfter}`, String(addTimeout / 1000)];
+  const addWrap = process.platform === 'win32' ? [] : [process.execPath, '-e', ADD_WATCHDOG, String(addTimeout), String(addKillAfter * 1000)];
   const addJobs = new Map(); // id -> job
   const addRunning = new Map(); // name -> its running job
   const addStops = new Set(); // one per running child: ends it when the app closes
@@ -1788,7 +1818,7 @@ export function createApp(opts = {}) {
     child.on('close', (code) => { clearTimeout(grace); finish(addOutcome(code, out)); }); // the job is gone: no late SIGKILL to a group id that may be reused
     timer = setTimeout(() => {
       finish({ state: 'failed', code: 'TIMEOUT' });
-      killGroup('SIGTERM'); // the script cleans up its clone on TERM; on Linux timeout(1) kills what is left at +30 s, this backstop only at +45 s
+      killGroup('SIGTERM'); // the script cleans up its clone on TERM; off Windows ADD_WATCHDOG kills what is left at +30 s, this backstop only at +45 s
       grace = setTimeout(() => killGroup('SIGKILL'), opts.addKillGraceMs ?? ADD_KILL_GRACE_MS); // opts.addKillGraceMs: tests
       grace.unref();
     }, addTimeout);
