@@ -36,6 +36,7 @@ FCode là một app iPhone kèm một máy chủ nhỏ. Máy chủ chạy trên 
 - **`fcode sync`** (v1.3.2): kéo code mới về laptop, và với project có trên box mà chưa có trên laptop thì tìm bản clone sẵn có (hoặc clone mới), thêm vào `syncRepos` rồi đồng bộ ngay.
 - **`fcode add <chủ/repo>`** (v1.3.2): thêm dự án vào box; có token GitHub ghi được thì xong ngay, không thì lệnh chỉ cách dán khóa.
 - **Từ laptop**: `fcode` liệt kê và vào phiên (thoát bằng Ctrl+B rồi D); `fcode pair` ghép iPhone mới bằng mã QR; `fcode ipa` tải app bản mới.
+- **Chép chữ và dán ảnh từ laptop** (cần Windows Terminal, vào phiên bằng `fcode`): kéo chuột để bôi đen là chép luôn vào clipboard laptop (không cần giữ Shift); **Alt+V** dán ảnh đang nằm trong clipboard laptop vào phiên (đường dẫn ảnh được gõ sẵn, chưa gửi); **Ctrl+V** vẫn dán chữ. Ảnh dùng Alt+V vì Windows Terminal giữ Ctrl+V cho việc dán chữ. Cập nhật cả laptop (chạy lại lệnh cài) và box (`git pull` rồi `bash install.sh` trong `~/fcode-src`); chi tiết và các thông báo lỗi: [docs/HUONG-DAN.md](docs/HUONG-DAN.md#chép-chữ-và-dán-ảnh-từ-laptop).
 
 ## Bảo mật
 
