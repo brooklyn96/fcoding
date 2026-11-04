@@ -107,7 +107,9 @@ fcode-notify <project> <kind> "<nội dung>" [link]
 | `error: io` | 1 | lỗi khoá hoặc ghi; file cũ giữ nguyên |
 
 - Hộp thư: `~/.local/state/fcode/notify/outbox.tsv` (thư mục 700, file 600), mỗi tin một dòng, 6 cột cách nhau bằng TAB: `id  epoch  project  kind  nội_dung  link`. Chỉ giữ 50 dòng mới nhất; mỗi lần ghi là file tạm + `mv` dưới `flock` (`outbox.lock`). Hermes đọc bằng `tail -c 65536` của file này và tự kiểm tra lại từng dòng.
-- `install.sh` cài `fcode-notify` vào `~/.local/bin`. Luật cho agent (khi nào được gọi) nằm ở `box/agents-notify.md`; người quản trị tự đưa vào `~/.omp/agent/AGENTS.md`, như `box/agents-git.md`.
+- `install.sh` cài `fcode-notify` vào `~/.local/bin`, và tạo sẵn thư mục hộp thư (700) cùng một file `outbox.tsv` **rỗng** (600) bằng `: >>` (không bao giờ cắt file đang có), để lần kéo đầu tiên của Hermes đọc được file thay vì báo lỗi; file rỗng là hợp lệ, `fcode-notify` ghi tiếp vào đó.
+- Lệnh cố định chạy qua bash của user (`/bin/bash`), bash này đọc `~/.bashrc` cả với lệnh ssh không tương tác. `~/.bashrc` **không được in gì** cho shell không tương tác (giữ đoạn chặn `case $- in *i*) ;; *) return;; esac` ở đầu file): mọi chữ in thêm sẽ nối vào dữ liệu và làm Hermes bỏ mất tin.
+- Luật cho agent (khi nào được gọi) nằm ở `box/agents-notify.md`; người quản trị tự đưa vào `~/.omp/agent/AGENTS.md`, như `box/agents-git.md`.
 - Biến thử nghiệm `FCODE_NOTIFY_DIR` và `FCODE_NOTIFY_NOW` chỉ có tác dụng khi `FCODE_NOTIFY_TEST=1`.
 
 Kiểm thử (thư mục tạm, không đụng hộp thư thật): `bash test/fcode-notify.test.sh`.

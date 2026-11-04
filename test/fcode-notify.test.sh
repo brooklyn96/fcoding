@@ -275,6 +275,32 @@ note shop info 'two'; eq "malformed old lines do not break a run" "$RC" 0
 fresh; mkdir -p "$D"; printf '1899999999-deadbeef\t1899999999\tshop\tinfo\tlast line no newline\t' >"$D/outbox.tsv"
 note shop info 'after partial'; eq "last old line without LF is kept and terminated" "$(lines)" 2
 
+# ---------- install.sh creates an empty outbox (never truncates) ----------
+SNIP=$(grep -F ': >>"$d/outbox.tsv"' "$ROOT/install.sh" | grep -v '^#' | head -n1)
+[ -n "$SNIP" ] && ok "install.sh has the outbox-creating command" || no "install.sh has the outbox-creating command"
+HI="$T/home-install"; mkdir -p "$HI"
+HOME="$HI" bash -c "$SNIP"; RC=$?
+ID_DIR="$HI/.local/state/fcode/notify"
+eq "install snippet: rc 0" "$RC" 0
+eq "install snippet: dir mode 700" "$(stat -c %a "$ID_DIR")" 700
+eq "install snippet: outbox mode 600" "$(stat -c %a "$ID_DIR/outbox.tsv")" 600
+eq "install snippet: outbox is empty" "$(wc -c <"$ID_DIR/outbox.tsv" | tr -d ' ')" 0
+# the empty outbox is accepted and appended to (real default path under HOME: no test hooks)
+OUT=$(unset FCODE_NOTIFY_TEST; HOME="$HI" bash "$FN" shop info 'into the pre-created outbox'); RC=$?
+[[ $OUT =~ ^notify:\ queued\  ]] && [ "$RC" = 0 ] && ok "pre-created empty outbox accepted" || no "pre-created empty outbox accepted ('$OUT' rc=$RC)"
+eq "pre-created outbox: one line written" "$(wc -l <"$ID_DIR/outbox.tsv" | tr -d ' ')" 1
+eq "pre-created outbox: text stored" "$(cut -f5 "$ID_DIR/outbox.tsv")" 'into the pre-created outbox'
+eq "pre-created outbox: mode still 600" "$(stat -c %a "$ID_DIR/outbox.tsv")" 600
+OUT=$(unset FCODE_NOTIFY_TEST; HOME="$HI" bash "$FN" shop info 'second note'); RC=$?
+eq "second note appended" "$(wc -l <"$ID_DIR/outbox.tsv" | tr -d ' ')" 2
+# running the snippet again (an install over an existing outbox) keeps every byte and the mode
+cp "$ID_DIR/outbox.tsv" "$T/outbox.before"
+HOME="$HI" bash -c "$SNIP"; RC=$?
+eq "install snippet again: rc 0" "$RC" 0
+cmp -s "$T/outbox.before" "$ID_DIR/outbox.tsv" && ok "install snippet does not truncate an existing outbox" || no "install snippet does not truncate an existing outbox"
+eq "install snippet again: mode 600" "$(stat -c %a "$ID_DIR/outbox.tsv")" 600
+rm -rf "$HI"
+
 # ---------- concurrency: parallel runs under the lock ----------
 fresh
 NOW=$BASE
@@ -289,6 +315,7 @@ NOW=
 grep -Eq '\b(curl|wget|nc|ssh|scp|telnet)\b' <(grep -v '^#' "$FN") && no "script makes no network call" || ok "script makes no network call"
 if [ -f "$ROOT/box/agents-notify.md" ]; then
   grep -qF 'fcode-notify <project> <kind> "<short text>" [link]' "$ROOT/box/agents-notify.md" && ok "agents-notify.md carries the rule" || no "agents-notify.md carries the rule"
+  grep -qF 'A session already cut off by its own quota cannot call it.' "$ROOT/box/agents-notify.md" && ok "agents-notify.md stuck line carries the quota limit" || no "agents-notify.md stuck line carries the quota limit"
 else no "box/agents-notify.md exists"; fi
 
 echo "passed: $PASS, failed: $FAIL"
