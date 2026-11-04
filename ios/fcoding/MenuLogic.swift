@@ -229,11 +229,11 @@ enum MenuLogic {
         return (Menu(options: options, tabs: rows[..<first].contains { isTabHeader($0.text) }), last)
     }
 
-    /// "Type something" (Claude) and "Other (type your own)" (omp): the owner types the answer, so a
-    /// pick only moves there.
+    /// Claude's "Type something" row: the owner types the answer, so a pick only moves there.
+    /// omp's "Other (type your own)" is not one: typed text is dropped there, and Enter opens its
+    /// "Custom answer" editor, so that row gets the moves and Enter like any other.
     static func isFreeText(_ o: Option) -> Bool {
-        let l = o.label.lowercased()
-        return l.hasPrefix("type something") || l.hasPrefix("other (type")
+        o.label.lowercased().hasPrefix("type something")
     }
 
     /// The published screen is what the box shows: the same text line by line, trailing spaces and
@@ -258,7 +258,7 @@ enum MenuLogic {
 
     /// The keys that move the highlight to `target` and act on it: Up or Down by the row distance
     /// (left out when already there), then Enter, or Space for a checkbox row (it toggles; it never
-    /// submits). A free-text row ("Type something", "Other") gets the moves only. [] for invalid
+    /// submits). A free-text row (Claude's "Type something") gets the moves only. [] for invalid
     /// input (not exactly one highlight, the target not in the list, or more than 20 rows away: the
     /// server's repeat limit, and a capped move would act on the wrong row) or nothing to send.
     static func keys(toChoose target: Option, in opts: [Option]) -> [(key: String, `repeat`: Int)] {
@@ -1713,8 +1713,33 @@ effort to use
         // omp Ask box: no numbers, U+F054 chevron, U+F10C circles, descriptions 2 columns deeper.
         let ompRows = "Xem trạng thái repo (Recommended) | Bắt đầu task mới | Dọn dẹp thư mục tạm | Other (type your own)"
         eq("omp ask", summary(ompAsk), ">" + ompRows)
-        eq("omp ask pick Other", pick(ompAsk, 3), "Downx3")
+        // Typed text is dropped on "Other"; Enter opens omp's "Custom answer" editor (facts-menu-need-r5).
+        eq("omp ask pick Other", pick(ompAsk, 3), "Downx3,Enterx1")
         eq("omp ask pick 2", pick(ompAsk, 1), "Downx1,Enterx1")
+        // DERIVED from facts-menu-need-r5.md (its plain capture hides the chevron and circles; they
+        // are put back as in ompAsk): the default highlight is the "(Recommended)" option, row 4.
+        let ompFooter = lines(ompAsk).first { $0.contains("↑/↓ move") } ?? ""
+        let ompRec = [
+            "╭─ Ask ──────────────────────────────────────────╮",
+            "│ Bạn muốn mình làm gì tiếp theo?                │",
+            "├────────────────────────────────────────────────┤",
+            "│   \u{F10C} A. Rà soát code                          │",
+            "│       Đọc và đánh giá code trong thư mục hiện tại. │",
+            "│   \u{F10C} B. Sửa lỗi                               │",
+            "│       Bạn mô tả lỗi, mình đưa vào quy trình sửa. │",
+            "│   \u{F10C} C. Thêm tính năng                        │",
+            "│       Lên kế hoạch và làm một tính năng mới.   │",
+            "│ \u{F054} \u{F10C} D. Chỉ thử công cụ (Recommended)        │",
+            "│       Không làm gì thêm, chỉ kiểm tra công cụ. │",
+            "│   \u{F10C} Other (type your own)                    │",
+            "├────────────────────────────────────────────────┤",
+            ompFooter,
+            "╰────────────────────────────────────────────────╯",
+        ].joined(separator: "\n")
+        eq("omp recommended", summary(ompRec), "A. Rà soát code | B. Sửa lỗi | C. Thêm tính năng | >D. Chỉ thử công cụ (Recommended) | Other (type your own)")
+        eq("omp recommended pick 1", pick(ompRec, 0), "Upx3,Enterx1")
+        eq("omp recommended pick Other", pick(ompRec, 4), "Downx1,Enterx1")
+        eq("omp recommended spoken", spokenAt(ompRec, 0), "Chọn 1: A. Rà soát code")
         eq("omp ask spoken", spokenAt(ompAsk, 3), "Chọn 4: Other (type your own)")
         let ompAskDown = ompAsk.replacingOccurrences(of: "│ \u{F054} \u{F10C} Xem", with: "│   \u{F10C} Xem")
             .replacingOccurrences(of: "│   \u{F10C} Bắt", with: "│ \u{F054} \u{F10C} Bắt")
@@ -1816,7 +1841,7 @@ effort to use
         eq("footer inside a line", summary("Pick\n❯ 1. Yes\n  2. No\n\nok · Esc to cancel"), "none")
         eq("wrapped label", summary("Run?\n› 1. Yes\n  2. Yes, and don't ask\n   again\n  3. No\n\nPress enter to confirm or esc to cancel"),
            ">1. Yes | 2. Yes, and don't ask | 3. No")
-        eq("free text", [askSingle, multiTab2, ompAsk].map { options(lines($0)).filter(isFreeText).count }, [1, 1, 1])
+        eq("free text", [askSingle, multiTab2, ompAsk].map { options(lines($0)).filter(isFreeText).count }, [1, 1, 0])
 
         // Distances: up to 20 rows, never a capped move.
         let long = (0..<25).map { Option(number: $0 + 1, label: "o\($0)", highlighted: $0 == 0, row: $0) }
