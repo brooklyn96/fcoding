@@ -51,7 +51,8 @@ $ClockUnreadable = 'side={0} skew_s=-'                    # T10 R2-5: unreadable
 $GioFmt = 'dd/MM/yyyy HH:mm:ss'                           # R5-2: the <giờ> fill is exactly (ConvertTo-MoveTime $dst_started_at).ToLocalTime().ToString($GioFmt, Invariant), no suffix (D.5.3: dst_started_at in the laptop's time zone)
 $RebuildDstStartedAt = 'fwd-{0}-x.start'                  # R5-1: a rebuilt dst_started_at = start= of new's fwd-<a>-x.start record; a = attempt when dir=fwd, attempt − 1 when carry=true; '' otherwise (manual back, no record, start=-). Q-cut.ts stays the start= of old's latest fwd x.freeze (R2-4)
 $TsRx = '^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$'               # the record format of every time value in state.json
-$LegacyWfLine = '      - run: echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > kh'   # DESIGN-GAP (T10c-LP, Architect): B.10.5 does not say which matched repo is a legacy project's; T10c's reading: a workflow naming DEPLOY_KNOWN_HOSTS is gate-push (project '') -> Use-Legacy, L.push-scan
+$LegacyWfLine = '      - run: echo "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > kh'   # a legacy deploy workflow line (B.10.2); the scan matches it, but naming DEPLOY_KNOWN_HOSTS never makes a repo gate-push (ruling T10c-LP 04/11) -> L.push-scan
+$LegacyFactsLine = 'MOVE legacy project={0} origin={1}'   # ruling T10c-LP 04/11: the facts script prints `git -C <dir> remote get-url origin` of /opt/deal-sync (project deal-sync) and /opt/internal-scraper (vps-scraper, lib/legacy.sh); T10d's line form; only old's lines count -> Use-Legacy, L.push-scan, L.rebuild
 
 # ============================== harness ==============================
 function T([string]$Name, [scriptblock]$Body, [switch]$NeedsBash) {
@@ -114,7 +115,7 @@ $LegacyRepo = 'brooklyn96/BD-Team-Project'
 function New-Machine([string]$Name, [string]$Addr, [string]$Key, [string]$Hn, [bool]$Serving) {
   @{ Name = $Name; Addr = $Addr; Key = $Key; Hostname = $Hn; Up = $true; HasGate = $Serving; NoMove = $false; Gate = $GateA
      MoveId = $null; Frozen = $false; Holds = $Holds; Active = $(if ($Serving) { $Holds } else { 0 }); Enabled = $Serving
-     Rec = @{}; Order = (New-Object Collections.ArrayList); Last = $null; Running = $null; Skew = 0; Digest = @{}; Lst = @{}; Os = 'debian-13'; Sha = '' }
+     Rec = @{}; Order = (New-Object Collections.ArrayList); Last = $null; Running = $null; Skew = 0; Digest = @{}; Lst = @{}; Os = 'debian-13'; Sha = ''; Legacy = @() }
 }
 function New-Manifest {
   [ordered]@{
@@ -328,7 +329,7 @@ function Fake-Gate($m, [string]$Cmd, [string]$Stdin, $e) {
     $W.Mf.idmap = @(foreach ($l in $lines) { if ($l -cmatch '\Aidmap (user|group) (\S+) ([0-9]+) ([0-9]+)\z') { [ordered]@{ kind = $Matches[1]; name = $Matches[2]; src_id = [int]$Matches[3]; dst_id = [int]$Matches[4] } } })
     $out = @($W.PlanOut); $code = $W.PlanCode
     if ($W.PlanHook) { $h = & $W.PlanHook $W.PlanN $mapl; if ($h) { $out = @($h.Out); $code = $h.Code } }
-    $flt = Get-Fault $m.Name 'plan:full'; if ($flt) { $out = @($flt.Out); $code = $flt.Rc }
+    $flt = Get-Fault $m.Name 'plan:full'; if ($flt) { $out = @($flt.Out); $code = $flt.Rc; if ($flt.Mode -ceq 'nomanifest') { return (New-Res $code (@($out) + "GATE_EXIT $code")) } }   # nomanifest: a refusal the server prints without a manifest (map-invalid, _mvp_finalize)
     return (New-Res $code (@($out) + (Get-ManifestLine $tu) + "GATE_EXIT $code"))
   }
   # a recorded call
@@ -435,7 +436,7 @@ function Fake-Script($m, [string]$Text, $e) {
   if ($flt) { if ($flt.Do) { & $flt.Do $m $e }; if ($flt.Mode -eq 'down') { return (New-Res 255 @()) }; return (New-Res $flt.Rc @($flt.Out)) }
   switch ($name) {
     'preflight' { return (New-Res $W.PfCode @($W.Pf)) }
-    'facts' { return (New-Res 0 @("MOVE facts os=$($m.Os) arch=x86_64 systemd=257 epoch=$(Get-Epoch ($script:Clock.AddSeconds($m.Skew)))")) }
+    'facts' { return (New-Res 0 (@($m.Legacy) + @("MOVE facts os=$($m.Os) arch=x86_64 systemd=257 epoch=$(Get-Epoch ($script:Clock.AddSeconds($m.Skew)))"))) }   # the legacy origin lines ($LegacyFactsLine) come first, as T10d's script prints them
     'bootstrap key' { return (New-Res 0 @("MOVE key type=ssh-ed25519 pub=$TheMoveKey")) }
     'bootstrap gate' { $m.HasGate = $true; $m.Gate = $(if ($W.NewGate.Count) { $W.NewGate.Dequeue() } else { $W.old.Gate }); return (New-Res 0 @('LOG gate installed')) }
     'tcp' { $k = "$($sa[0]):$($sa[1])"; return (New-Res $(if ($W.TcpFail.ContainsKey($k)) { 1 } else { 0 }) @()) }
@@ -649,11 +650,13 @@ function Fx-Finished { Fx-Cut; Ans 'YES'; $r = Run-Move @('finish'); Eq $r.Code 
 function Fx-Aborted { Fx-Copied; Ans 'có'; $r = Run-Move @('abort'); Eq $r.Code 0 "abort exit ($($r.Text))" }
 # a carry-back started by a failed x.health on new (E-R8), with an extra fault inside it
 function Start-Carry([switch]$NoRun) { Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.health$' -Rc 69 -Out @('MOVE item app.service kind=unit state=failed ActiveState=failed') }
-# a legacy repo as the push scan finds it (reading T10c-LP, $LegacyWfLine); legacy_push[] is a state field, never a manifest field (W1-T3-GAP-11)
+# a legacy repo as the push scan finds it: a matched workflow and old's /opt/deal-sync origin = its slug (ruling T10c-LP 04/11, $LegacyFactsLine);
+# legacy_push[] is a state field, never a manifest field (W1-T3-GAP-11)
 function Use-Legacy {
   Add-Gh $GhForm.RepoList @("[{""nameWithOwner"":""$LegacyRepo""}]")
   Add-Gh ($GhForm.WfDir -f $LegacyRepo) @('[{"name":"deploy.yml"}]')
   Add-Gh ($GhForm.WfFile -f $LegacyRepo, 'deploy\.yml') @($LegacyWfLine)
+  $script:W.old.Legacy = @($LegacyFactsLine -f 'deal-sync', "git@github.com:$LegacyRepo.git")
 }
 function NothingWritten([string]$What = 'nothing written') { $s = Get-St; Ok ($null -eq $s -or $s.phase -cne 'planned') $What }
 
@@ -709,6 +712,29 @@ T 'L.plan-questions: Q-pm2save có saves on old as p.pm2-save.1 (attempt 0) and 
   Ok ((Sent 'old' '^fwd-0-p\.pm2-save\.1$' -All) -eq 1) 'p.pm2-save.1 on old with attempt 0'
   Ok ((Sent 'old' '^fwd-0-p\.cert-renew\.1$' -All) -eq 1) 'p.cert-renew.1 on old with attempt 0'
   Ordered @('^old plan:full', '^old fwd-0-p\.pm2-save\.1$', '^old plan:full') -All
+}
+T 'L.plan-rewrites-remedy: old''s plan <id> refusing map-invalid ref=rewrites with no manifest (a bare rewrite own-ip line while a family has more than one old or new address) ends plan with 65 and the remedy "ghi rõ `<from>=<to>`", nothing written; another map-invalid ref gets no such remedy (ruling 04/11 #3, B.12.5, E-P11)' {
+  Add-Fault -M old -Key '^plan:full$' -Rc 65 -Out @('INV refuse map-invalid ref=rewrites') -Mode nomanifest
+  [void](Do-Plan -Want 65); HasText 'ghi rõ `<from>=<to>`'
+  NothingWritten; Ok (-not (Test-Path -LiteralPath (Join-Path (MoveDir) 'manifest.json'))) 'no manifest.json'; Eq (@(RecCalls -All).Count) 0 'no recorded call'
+  Reset-World; Add-Fault -M old -Key '^plan:full$' -Rc 65 -Out @('INV refuse map-invalid ref=include') -Mode nomanifest
+  [void](Do-Plan -Want 65); NoText 'ghi rõ `<from>=<to>`'; NothingWritten
+}
+T 'L.plan-tunnel-remedies: a connector ingress naming old''s own address (INV refuse own-ip path=ingress:<hostname>), Q-ownip không, ends plan 65 with the remedy "đổi service của tên đó trong cấu hình tunnel sang 127.0.0.1 hoặc tên container"; an own-ip file path gets no such remedy (B.12.4, W1-T3-GAP-17, CONTRACT §8.3.2)' {
+  $W.PlanOut = @('INV refuse own-ip path=ingress:app.example.com'); $W.PlanCode = 65; Ans 'không'
+  [void](Do-Plan -Want 65); HasText 'đổi service của tên đó trong cấu hình tunnel sang 127.0.0.1 hoặc tên container'; NothingWritten
+  Reset-World; $W.PlanOut = @('INV refuse own-ip path=/opt/app/conf.yml'); $W.PlanCode = 65; Ans 'không'
+  [void](Do-Plan -Want 65); NoText 'đổi service của tên đó trong cấu hình tunnel'
+}
+T 'L.plan-tunnel-remedies: a connector whose /config cannot be read (INV refuse unmapped what=connector path=<hold id>) ends plan 65 with the remedy "kiểm tra cổng metrics của connector rồi chạy lại"; another unmapped form gets no such remedy (B.12.4, W1-T3-GAP-18, CONTRACT §8.3.2)' {
+  $W.PlanOut = @('INV refuse unmapped what=connector path=cloudflared.service'); $W.PlanCode = 65
+  [void](Do-Plan -Want 65); HasText 'kiểm tra cổng metrics của connector rồi chạy lại'; NothingWritten
+  Reset-World; $W.PlanOut = @('INV refuse unmapped what=unit path=x.service'); $W.PlanCode = 65
+  [void](Do-Plan -Want 65); NoText 'kiểm tra cổng metrics của connector'
+}
+T 'L.plan-tunnel-remedies: old''s plan <id> refusing with no manifest (an invalid map, move-plan.sh _mvp_finalize) still prints the B.12.4 tunnel refusals; each gets its CONTRACT §8.3.2 remedy' {
+  Add-Fault -M old -Key '^plan:full$' -Rc 65 -Out @('INV refuse own-ip path=ingress:app.example.com', 'INV refuse unmapped what=connector path=cloudflared.service', 'INV refuse map-invalid ref=include') -Mode nomanifest
+  [void](Do-Plan -Want 65); HasText 'đổi service của tên đó trong cấu hình tunnel sang 127.0.0.1 hoặc tên container'; HasText 'kiểm tra cổng metrics của connector rồi chạy lại'; NothingWritten
 }
 T 'L.pre-os: preflight refusing os or arch ends plan with 65, the label, and nothing written' {
   foreach ($c in @(@('os want=debian-13 have=ubuntu-24.04', 'Máy mới khác bản Debian của máy cũ'), @('arch want=x86_64 have=aarch64', 'Máy mới khác kiến trúc CPU của máy cũ'))) {
@@ -843,6 +869,12 @@ T 'L.pre-dst-quiet: at 0c an active hold on new ends the cutover with 65, nothin
 T 'L.pre-stale-manifest: at 0c a plan <id> --check-only refusing manifest-stale ends with 65 "chạy fcode move copy lại", nothing frozen' {
   Fx-Copied; Add-Fault -M old -Key '^plan:check-only$' -Rc 65 -Out @('MOVE error manifest-stale what=user name=bob'); [void](Do-Cutover -1); Assert-NothingFrozen 65 'chạy fcode move copy lại'
 }
+T 'L.plan-tunnel-remedies: at 0c a plan <id> --check-only refusing unmapped what=connector (the same discovery as plan) ends 65 with the remedy, nothing frozen' {
+  Fx-Copied; Add-Fault -M old -Key '^plan:check-only$' -Rc 65 -Out @('INV refuse unmapped what=connector path=cloudflared.service'); [void](Do-Cutover -1); Assert-NothingFrozen 65 'kiểm tra cổng metrics của connector rồi chạy lại'
+}
+T 'L.plan-tunnel-remedies: at 0c a plan <id> --check-only refusing own-ip path=ingress:<hostname> ends 65 with the remedy, nothing frozen' {
+  Fx-Copied; Add-Fault -M old -Key '^plan:check-only$' -Rc 65 -Out @('INV refuse own-ip path=ingress:app.example.com'); [void](Do-Cutover -1); Assert-NothingFrozen 65 'đổi service của tên đó trong cấu hình tunnel sang 127.0.0.1 hoặc tên container'
+}
 T 'L.pre-uid-collision: at 0c the uid-collision compare runs again against the stored target_users[] and refuses, nothing frozen' {
   Fx-Copied; [void](Patch-St @{ target_users = @([ordered]@{ name = 'other'; uid = 1001; home_nonskel = 0 }) }); [void](Do-Cutover -1); Assert-NothingFrozen 65 'Trùng user hoặc uid trên máy mới'
 }
@@ -944,6 +976,22 @@ T 'L.pre-uid-collision: the preflight script prints new''s groups with gid ≥ 1
   PfHas $r 'INV target subid user=alice kind=uid start=100000 count=65536'; PfHas $r 'INV target subid user=alice kind=gid start=165536 count=65536'
   PfHas $r 'INV target addr=198.51.100.20'; PfHas $r 'INV target addr=2001:db8::20'
 } -NeedsBash
+T 'L.push-scan: the facts script prints one MOVE legacy line per legacy project directory on the machine (/opt/deal-sync deal-sync, /opt/internal-scraper vps-scraper) from a read-only git remote get-url origin, next to MOVE facts; no other directory, nothing written (ruling T10c-LP 04/11)' {
+  $git = @(Get-Command git -CommandType Application -ErrorAction SilentlyContinue)[0]; Ok ($null -ne $git) 'git on the test machine'
+  $fr = New-FcmRoot
+  $repos = [ordered]@{ 'opt/deal-sync' = 'git@github.com:brooklyn96/BD-Team-Project.git'; 'opt/internal-scraper' = 'https://github.com/brooklyn96/Internal-scraper.git'; 'opt/internal-scraper-staging' = 'git@github.com:brooklyn96/Staging.git'; 'srv/deal-sync' = 'git@github.com:brooklyn96/Other.git' }
+  foreach ($d in $repos.Keys) { $p = Join-Path $fr $d; [void](& $git.Source -c init.defaultBranch=main init -q $p 2>&1); [void](& $git.Source -C $p remote add origin $repos[$d] 2>&1) }
+  $snap = { @(Get-ChildItem -LiteralPath $fr -Recurse -File -Force | Sort-Object FullName | ForEach-Object { "$($_.FullName.Substring($fr.Length)) $(Get-Sha256Hex ([IO.File]::ReadAllBytes($_.FullName)))" }) -join "`n" }
+  $before = & $snap
+  $gs = @{ git = "GIT_TEST_ASSUME_DIFFERENT_OWNER=1 exec '$($git.Source)' `"`$@`""; uname = 'echo x86_64' }   # every repo counts as another owner's: /opt/internal-scraper is not root-owned on contabo (safe.directory)
+  $r = Run-Bash (Get-MoveFactsScript) @() $fr (New-Stubs $gs); Eq $r.Code 0 "exit ($($r.Text))"
+  $lg = @($r.Out | Where-Object { "$_" -cmatch '\AMOVE legacy ' } | ForEach-Object { "$_".TrimEnd() })
+  Eq ($lg -join ' | ') ((($LegacyFactsLine -f 'deal-sync', $repos['opt/deal-sync']), ($LegacyFactsLine -f 'vps-scraper', $repos['opt/internal-scraper'])) -join ' | ') 'the legacy lines'
+  Ok (@($r.Out | Where-Object { "$_" -cmatch '\AMOVE facts os=debian-13 ' }).Count -eq 1) "MOVE facts still printed: $($r.Text)"
+  Eq (& $snap) $before 'nothing written under the root'
+  [IO.Directory]::Delete((Join-Path $fr 'opt/deal-sync'), $true); $r = Run-Bash (Get-MoveFactsScript) @() $fr (New-Stubs $gs); Eq $r.Code 0 "exit without /opt/deal-sync ($($r.Text))"
+  Eq (@($r.Out | Where-Object { "$_" -cmatch '\AMOVE legacy ' }) -join ' | ') ($LegacyFactsLine -f 'vps-scraper', $repos['opt/internal-scraper']) 'a missing directory prints no line'
+} -NeedsBash
 T 'L.check-diff: check is zero-write, sends plan - --check-only, shows new refusals first against check.json, exits 65 or 0' {
   $W.CheckOut = @('INV refuse pm2-unsaved names=api'); $W.CheckCode = 65
   $r = Run-Move @('check'); Eq $r.Code 65 'first check'; HasText 'Danh sách pm2 chưa được lưu'
@@ -956,20 +1004,26 @@ T 'L.check-diff: check is zero-write, sends plan - --check-only, shows new refus
   Eq (@(RecCalls -All).Count) 0 'check sends no recorded call'; Ok ($null -eq (Get-St)) 'check writes no state.json'
   Ok (@(LogNow -All | Where-Object { $_ -notmatch '^old (plan:check|status|script:facts)$' }).Count -eq 0) "check talks to old's plan - --check-only (and read-only facts) only: $(LogNow -All)"
 }
-T 'L.push-scan: a non-legacy repo whose workflow deploys over ssh asks Q-sshpush; không refuses push-deploy, có disables that workflow for good; a legacy repo is gate-push' {
+T 'L.push-scan: a matched repo is gate-push only when its slug equals the origin remote of a legacy directory on old, project = that legacy name; every other match (one naming DEPLOY_KNOWN_HOSTS, or an origin seen only on new, included) asks Q-sshpush; không refuses push-deploy, có disables that workflow for good (B.10.5, ruling T10c-LP 04/11)' {
   foreach ($a in 'không', 'có') {
     Reset-World
-    Add-Gh $GhForm.RepoList @('[{"nameWithOwner":"brooklyn96/task"},{"nameWithOwner":"brooklyn96/BD-Team-Project"}]')
-    Add-Gh ($GhForm.WfDir -f 'brooklyn96/task') @('[{"name":"deploy.yml"}]')
-    Add-Gh ($GhForm.WfFile -f 'brooklyn96/task', 'deploy\.yml') @('jobs:', '  d:', '    steps:', '      - run: ssh-keyscan $HOST >> ~/.ssh/known_hosts')
-    Add-Gh ($GhForm.WfDir -f 'brooklyn96/BD-Team-Project') @('[{"name":"deploy.yml"}]')
-    Add-Gh ($GhForm.WfFile -f 'brooklyn96/BD-Team-Project', 'deploy\.yml') @($LegacyWfLine)
+    Add-Gh $GhForm.RepoList @('[{"nameWithOwner":"brooklyn96/task"},{"nameWithOwner":"brooklyn96/BD-Team-Project"},{"nameWithOwner":"brooklyn96/Internal-scraper"}]')
+    foreach ($rp in 'brooklyn96/task', 'brooklyn96/BD-Team-Project', 'brooklyn96/Internal-scraper') { Add-Gh ($GhForm.WfDir -f $rp) @('[{"name":"deploy.yml"}]') }
+    Add-Gh ($GhForm.WfFile -f 'brooklyn96/task', 'deploy\.yml') @('jobs:', '  d:', '    steps:', '      - run: ssh-keyscan $HOST >> ~/.ssh/known_hosts', $LegacyWfLine)
+    Add-Gh ($GhForm.WfFile -f 'brooklyn96/BD-Team-Project', 'deploy\.yml') @('jobs:', '  d:', '    steps:', '      - uses: appleboy/ssh-action@v1')
+    Add-Gh ($GhForm.WfFile -f 'brooklyn96/Internal-scraper', 'deploy\.yml') @($LegacyWfLine)
+    $W.old.Legacy = @(($LegacyFactsLine -f 'deal-sync', 'git@github.com:brooklyn96/BD-Team-Project.git'), ($LegacyFactsLine -f 'vps-scraper', 'https://github.com/brooklyn96/Internal-scraper.git'))
+    $W.new.Legacy = @($LegacyFactsLine -f 'deal-sync', 'git@github.com:brooklyn96/task.git')   # not a directory on old
     Ans $a
     if ($a -ceq 'không') { [void](Do-Plan -Want 65); HasText 'Có workflow deploy thẳng qua ssh' } else { [void](Do-Plan -Want 0) }
     Ok (@(Lines | Where-Object { $_ -match '\AWorkflow của repo brooklyn96/task( \(deploy\.yml\))? deploy thẳng qua ssh\. Tắt hẳn workflow đó\? \(có / không\)\z' }).Count -ge 1) "Q-sshpush text: $(Lines)"
-    Ok (@(Lines | Where-Object { $_ -match 'BD-Team-Project.*\(có / không\)' }).Count -eq 0) 'a legacy repo is gate-push: no question'
+    Ok (@(Lines | Where-Object { $_ -match '(BD-Team-Project|Internal-scraper).*\(có / không\)' }).Count -eq 0) "a legacy repo is gate-push: no question: $(Lines)"
     $dis = @($W.GhLog | Where-Object { $_.Text -match $GhForm.Disable })
-    if ($a -ceq 'không') { Eq $dis.Count 0 'không disables nothing' } else { Ok ($dis.Count -eq 1 -and $dis[0].Text -match 'deploy\.yml' -and $dis[0].Text -match 'brooklyn96/task') "có disables brooklyn96/task deploy.yml only: $(@($dis | ForEach-Object { $_.Text }) -join ' | ')" }
+    if ($a -ceq 'không') { Eq $dis.Count 0 'không disables nothing' } else {
+      Ok ($dis.Count -eq 1 -and $dis[0].Text -match 'deploy\.yml' -and $dis[0].Text -match 'brooklyn96/task') "có disables brooklyn96/task deploy.yml only: $(@($dis | ForEach-Object { $_.Text }) -join ' | ')"
+      $lp = @(@((Get-St).legacy_push) | Where-Object { $_ } | ForEach-Object { "$($_.project)=$($_.repo)" }) | Sort-Object
+      Eq ($lp -join ',') 'deal-sync=brooklyn96/BD-Team-Project,vps-scraper=brooklyn96/Internal-scraper' 'state legacy_push[] {project, repo}'
+    }
   }
 }
 
@@ -989,6 +1043,17 @@ T 'L.copy-refresh-transfers-again: a copy re-run is a full re-plan from the stor
   Eq (@(LogNow | Where-Object { $_ -match 'script:preflight' }).Count) 0 'no new preflight'
   $in = @($W.PlanStdin[-1]); Ok ($in -ccontains 'target-user quoc 1000') "stored target_users on the re-plan stdin: $($in -join ' | ')"; Ok (-not ($in -match 'zed')) 'never the current preflight list'
   foreach ($n in 'old', 'new') { $j = $W[$n].RepinStdin; Ok ($null -ne $j -and $null -ne $j.manifest) "c.repin stdin on $n holds the manifest"; Ok (-not $j.PSObject.Properties['old_addr'] -and -not $j.PSObject.Properties['new_addr']) "c.repin stdin on $n has no address keys" }
+}
+T 'L.copy-refresh-transfers-again: a first copy that failed after both c.init-* is re-run with no c.init-* (both statuses show this move-id at the state''s dir and attempt): plan <id>, c.repin.N on both, c.prepare.N, steps 6–8 (ruling NEW-2 (a), K1)' {
+  Fx-Planned; Add-Fault -M new -Key '-c\.transfer\.1$' -Rc 1
+  $r1 = Run-Move @('copy'); Ok ($r1.Code -ne 0) "first copy fails ($($r1.Text))"
+  [void](Do-Copy 0)
+  Eq (SentAny '-c\.init-(old|new)$') 0 "no c.init-* re-sent: $((LogNow) -join ' ; ')"
+  Eq (@(LogNow | Where-Object { $_ -match '^old plan:full$' }).Count) 1 "one plan <id>: $((LogNow) -join ' ; ')"
+  Ok ((Sent 'old' '^fwd-1-c\.repin\.[0-9]+$') -eq 1 -and (Sent 'new' '^fwd-1-c\.repin\.[0-9]+$') -eq 1) "c.repin.N on both: $((LogNow) -join ' ; ')"
+  foreach ($n in 'old', 'new') { Before '^old plan:full$' "^$n fwd-1-c\.repin\.[0-9]+$"; Before "^$n fwd-1-c\.repin\.[0-9]+$" '^new fwd-1-c\.prepare\.[0-9]+$' }
+  Ordered @('^new fwd-1-c\.prepare\.[0-9]+$', '^new fwd-1-c\.transfer\.[0-9]+$', '^(old|new) fwd-1-c\.verify\.[0-9]+$', '^new fwd-1-c\.adopt\.[0-9]+$')
+  Eq (Get-St).phase 'copied' 'phase'; foreach ($n in 'old', 'new') { Eq $W[$n].Sha $W.LastSha "$n pinned to the re-plan's sha" }
 }
 T 'L.copy-refresh-reprepares: a user added on old after the first copy is in the re-planned manifest; both machines re-pin to its sha before c.prepare.2 creates it' {
   Fx-Copied
@@ -1025,11 +1090,56 @@ T 'L.copy-idmap: a state idmap[] entry that the re-plan dropped (the owner added
   [void](Do-Copy 0)
   Eq (@(LogNow | Where-Object { $_ -match '^old plan:full$' }).Count) 1 "plan:full count in the refresh copy (its own re-plan only): $((LogNow) -join ' ; ')"
 }
-T 'L.copy-after-collision-remedy: a copy whose c.init-new failed is re-run under the same id after the remedy, and the server runs it again' {
-  Fx-Planned; Add-Fault -M new -Key '-c\.init-new$' -Rc 1 -Out @('MOVE error tool-missing tool=e2fsprogs')
+T 'L.copy-idmap: a first copy whose idmap re-plan re-pinned both machines and then failed at c.adopt.1 is copied again with no c.init-* (ruling NEW-2 (a); T10c PROBE.rev2-replan-then-fail)' {
+  $idl = 'MOVE item idmap:user:svc kind=prepare state=mapped src_id=105 dst_id=110'
+  Fx-Planned; Add-Fault -M new -Key '-c\.prepare\.1$' -Rc 0 -Out @($idl); Add-Fault -M new -Key '-c\.adopt\.1$' -Rc 1
+  $r1 = Run-Move @('copy'); Ok ($r1.Code -ne 0) "first copy fails ($($r1.Text))"; Ok ((Sent 'new' '^fwd-1-c\.repin\.1$') -eq 1) "the first copy re-pinned new: $((LogNow) -join ' ; ')"
+  Add-Fault -M new -Key '-c\.prepare\.[2-9]$' -Rc 0 -Out @($idl)
+  $r2 = Run-Move @('copy'); Eq $r2.Code 0 "second copy exit ($($r2.Text)) log: $((LogNow) -join ' ; ')"
+  Eq (SentAny '-c\.init-(old|new)$') 0 "no c.init-* re-sent: $((LogNow) -join ' ; ')"; Eq (@(LogNow | Where-Object { $_ -match 'call-argv' }).Count) 0 'no call-argv'
+  Before '^old plan:full$' '^new fwd-1-c\.prepare\.[0-9]+$'; Before '^new fwd-1-c\.prepare\.[0-9]+$' '^new fwd-1-c\.adopt\.[0-9]+$'
+  Eq (Get-St).phase 'copied' 'phase'; foreach ($n in 'old', 'new') { Eq $W[$n].Sha $W.LastSha "$n pinned to the re-planned sha" }
+}
+T 'L.copy-idmap: an idmap re-plan whose c.repin.1 failed on new (the laptop already on the new sha) is finished by the next copy with no c.init-* (ruling NEW-2 (a); T10c PROBE.rev2-repin-fail)' {
+  $idl = 'MOVE item idmap:user:svc kind=prepare state=mapped src_id=105 dst_id=110'
+  Fx-Planned; Add-Fault -M new -Key '-c\.prepare\.1$' -Rc 0 -Out @($idl); Add-Fault -M new -Key '-c\.repin\.1$' -Rc 1
+  $r1 = Run-Move @('copy'); Ok ($r1.Code -ne 0) "first copy fails ($($r1.Text))"; Eq (SentAny '-c\.transfer\.') 0 'nothing transferred'; Eq (Get-St).manifest_sha $W.LastSha 'the laptop is on the new sha'
+  Add-Fault -M new -Key '-c\.prepare\.[2-9]$' -Rc 0 -Out @($idl)
+  $r2 = Run-Move @('copy'); Eq $r2.Code 0 "second copy exit ($($r2.Text)) log: $((LogNow) -join ' ; ')"
+  Eq (SentAny '-c\.init-(old|new)$') 0 "no c.init-* re-sent: $((LogNow) -join ' ; ')"; Eq (@(LogNow | Where-Object { $_ -match 'call-argv' }).Count) 0 'no call-argv'
+  Ok ((Sent 'new' '^fwd-1-c\.repin\.[0-9]+$') -ge 1) "new re-pinned: $((LogNow) -join ' ; ')"; Before '^new fwd-1-c\.repin\.[0-9]+$' '^new fwd-1-c\.transfer\.[0-9]+$'
+  Eq (Get-St).phase 'copied' 'phase'; foreach ($n in 'old', 'new') { Eq $W[$n].Sha $W.LastSha "$n pinned to the re-planned sha" }
+}
+T 'L.copy-after-collision-remedy: a copy whose c.init-new failed (the server wrote the move-id first) is re-run under the same id after the remedy, and the server runs it again; old''s init is not re-sent, so the copy goes on as the D.3 re-run (plan <id>, c.repin.N on both, c.prepare.N)' {
+  Fx-Planned; Add-Fault -M new -Key '-c\.init-new$' -Rc 1 -Out @('MOVE error tool-missing tool=e2fsprogs') -Effect
   $r = Do-Copy -1; Ok ($r.Code -ne 0) 'the first copy fails'
   [void](Do-Copy 0)
   Eq (Sent 'new' '^fwd-1-c\.init-new$') 1 'the same id runs again (not a replay)'; Eq (Get-St).phase 'copied' 'phase'
+  Eq (SentAny '^fwd-1-c\.init-old$' -All) 1 "c.init-old never re-sent: old's status shows this move-id at (fwd, 1) (ruling NEW-2 (a)): $((LogNow) -join ' ; ')"
+  Eq (@(LogNow | Where-Object { $_ -match '^old plan:full$' }).Count) 1 "one plan <id>: $((LogNow) -join ' ; ')"; Before '^new fwd-1-c\.init-new$' '^old plan:full$'
+  Ok ((Sent 'old' '^fwd-1-c\.repin\.[0-9]+$') -eq 1 -and (Sent 'new' '^fwd-1-c\.repin\.[0-9]+$') -eq 1) "c.repin.N once on each machine: $((LogNow) -join ' ; ')"
+  foreach ($n in 'old', 'new') { Before '^old plan:full$' "^$n fwd-1-c\.repin\.[0-9]+$"; Before "^$n fwd-1-c\.repin\.[0-9]+$" '^new fwd-1-c\.prepare\.[0-9]+$' }
+}
+T 'L.copy-after-collision-remedy: c.init-old wrote the move-id, then failed (keys-race 70 at the move-key line, E-S8); the next copy re-sends c.init-old under the same id and the server runs it again (D.0.5, E-P31; move-run.sh writes the move-id first; T10d review PROBE.rv10d-init-old-halfdone)' {
+  Fx-Planned; Add-Fault -M old -Key '-c\.init-old$' -Rc 70 -Out @('MOVE error keys-race path=/root/.ssh/authorized_keys') -Effect
+  $r1 = Run-Move @('copy'); Ok ($r1.Code -ne 0) "first copy fails ($($r1.Text))"
+  Ok ($null -ne $W.old.MoveId -and "$($W.old.MoveId.attempt)" -ceq '1') 'old holds the move-id of the half-done init'
+  $r2 = Run-Move @('copy'); Eq $r2.Code 0 "second copy exit ($($r2.Text))"; Eq (Get-St).phase 'copied' 'phase'
+  Eq (Sent 'old' '^fwd-1-c\.init-old$') 1 "the half-done c.init-old runs again on the re-run: $((LogNow) -join ' ; ')"
+}
+T 'L.copy-after-collision-remedy: c.init-new wrote the move-id, then failed (holds-off rc 1); the next copy re-sends c.init-new before any transfer (I12, D.0.5, E-P31; T10d review PROBE.rv10d-init-new-halfdone)' {
+  Fx-Planned; Add-Fault -M new -Key '-c\.init-new$' -Rc 1 -Out @('LOG holds-off failed') -Effect
+  $r1 = Run-Move @('copy'); Ok ($r1.Code -ne 0) "first copy fails ($($r1.Text))"
+  $r2 = Run-Move @('copy'); Eq $r2.Code 0 "second copy exit ($($r2.Text))"; Eq (Get-St).phase 'copied' 'phase'
+  Eq (Sent 'new' '^fwd-1-c\.init-new$') 1 "the half-done c.init-new runs again on the re-run: $((LogNow) -join ' ; ')"; Before '^new fwd-1-c\.init-new$' '^new fwd-1-c\.transfer\.[0-9]+$'
+}
+T 'L.copy-after-collision-remedy: c.init-new wrote the move-id and was still running when ssh dropped; the next copy''s status shows it running, it ends failed while copy waits (Wait-MoveRunning keeps the stale status), and the copy re-sends c.init-new under the same id before any transfer (DESIGN-GAP T10d-NEW2-halfdone: only a done init counts as seen)' {
+  Fx-Planned; Add-Fault -M new -Key '-c\.init-new$' -Rc 1 -Out @('LOG holds-off pending') -Effect -Mode down
+  $r1 = Run-Move @('copy'); Ok ($r1.Code -ne 0) "first copy fails ($($r1.Text))"
+  Ok ($null -ne $W.new.MoveId -and "$($W.new.MoveId.attempt)" -ceq '1') 'new holds the move-id of the half-done init'
+  $W.new.Up = $true; Set-Running 'new' 'fwd-1-c.init-new'; $W.new.Running.Rc = 1; $W.new.Running.Left = 1
+  $r2 = Run-Move @('copy'); Eq $r2.Code 0 "second copy exit ($($r2.Text)) log: $((LogNow) -join ' ; ')"; Eq (Get-St).phase 'copied' 'phase'
+  Eq (Sent 'new' '^fwd-1-c\.init-new$') 1 "the init that ended failed runs again: $((LogNow) -join ' ; ')"; Before '^new fwd-1-c\.init-new$' '^new fwd-1-c\.transfer\.[0-9]+$'
 }
 T 'L.wait-transfer: a call still running when its deadline passes is waited for or re-attached by id, never answered busy by another id' {
   Fx-Planned; Add-Fault -M new -Key '-c\.transfer\.1$' -Rc 0 -Mode running -Left 3
@@ -1533,6 +1643,7 @@ T 'L.retry-after-back-done: a carry-back ends with carry=false, so copy starts t
   Start-Carry; [void](Do-Cutover 10); Eq (Get-St).carry $false 'carry cleared at back-done'
   [void](Do-Copy 0); $s = Get-St; Eq $s.dir 'fwd' 'dir'; Eq $s.attempt 3 'attempt'; Eq $s.phase 'copied' 'phase'
   Ok ((Sent 'old' '^fwd-3-c\.init-old$') -eq 1) 'c.init-old of attempt 3'; Eq (@(LogNow | Where-Object { $_ -match 'script:preflight' }).Count) 0 'no B.0.3 preflight'
+  Eq (@(LogNow | Where-Object { $_ -match '^old plan:full$' }).Count) 0 "attempt 3's first copy is no re-run (status showed the move-id at the earlier attempt; ruling NEW-2 (dir, attempt)): $((LogNow) -join ' ; ')"; Eq (SentAny '-c\.repin\.') 0 'no c.repin.N'
   Reset-World; Start-Carry; [void](Do-Cutover 10); Ans 'có'; $r = Run-Move @('abort'); Eq $r.Code 0 "abort after the carry-back ($($r.Text))"; Eq (Get-St).phase 'aborted' 'phase'
 }
 
@@ -1922,7 +2033,7 @@ T 'L.rebuild: a manual back in flight (mark set, x.freeze sent) is rebuilt with 
 T 'L.rebuild: legacy_push[] comes from a new push scan and legacy_known_hosts{} holds old''s line from old''s key (D.0.10; W1-T3-GAP-11)' {
   Use-Legacy; Fx-Cut; [IO.File]::Delete((StatePath)); foreach ($n in 'old', 'new') { $W[$n].MoveId.old_addr = $OldAddr; $W[$n].MoveId.new_addr = $NewAddr }
   $r = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $r.Code 0 "rebuild ($($r.Text))"
-  $s = Get-St; Ok (@($s.legacy_push | Where-Object { "$($_.repo)" -ceq $LegacyRepo }).Count -eq 1) "legacy_push[] from the scan: $(ConvertTo-Json -InputObject $s.legacy_push -Compress)"
+  $s = Get-St; Ok (@($s.legacy_push | Where-Object { "$($_.repo)" -ceq $LegacyRepo -and "$($_.project)" -ceq 'deal-sync' }).Count -eq 1) "legacy_push[] from the scan (project from old's /opt/deal-sync origin, ruling T10c-LP): $(ConvertTo-Json -InputObject $s.legacy_push -Compress)"
   Eq "$($s.legacy_known_hosts.$LegacyRepo)" "$OldAddr ssh-ed25519 $KeyOld" 'old''s line rebuilt from old''s key'
 }
 
