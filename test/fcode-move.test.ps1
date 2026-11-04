@@ -146,6 +146,7 @@ function Reset-World {
   [IO.File]::WriteAllText((Join-Path (Join-Path $Home2 '.ssh') 'config'), $SshConfig0, $utf8)
   [IO.File]::WriteAllText((Join-Path (Join-Path $CoderHome '.ssh') 'config'), $CoderConfig0, $utf8)
   $script:Clock = [DateTime]::SpecifyKind([DateTime]'2026-11-02T10:00:00', [DateTimeKind]::Utc)
+  [void]$script:Cfg2.Remove('moveTargets')   # O1: no platform_user unless a case names one (Set-PlatformUser)
   $script:Last = $null
   $script:W = @{
     old = (New-Machine 'old' $OldAddr $KeyOld 'oldhost' $true); new = (New-Machine 'new' $NewAddr $KeyNew 'newhost' $false)
@@ -698,10 +699,88 @@ T 'L.plan-state: plan writes the D.2 step 6 state and the manifest, sends the de
   $mp = Join-Path (MoveDir) 'manifest.json'; Ok (Test-Path -LiteralPath $mp) 'manifest.json kept'
   Eq (Get-Sha256Hex ([IO.File]::ReadAllBytes($mp))) $W.LastSha 'manifest.json bytes = the pinned sha'
   $in = @($W.PlanStdin[-1])
-  foreach ($l in 'exclude user dino', 'exclude unit velh-pilot-hourly.timer', 'target-user quoc 1000') { Ok ($in -ccontains $l) "plan stdin lacks [$l]: $($in -join ' | ')" }
+  foreach ($l in 'exclude user dino', 'exclude unit velh-pilot-hourly.timer', 'exclude /etc/ssl/certs', 'target-user quoc 1000') { Ok ($in -ccontains $l) "plan stdin lacks [$l]: $($in -join ' | ')" }
   Ok ([Array]::IndexOf($in, 'target-user quoc 1000') -gt [Array]::IndexOf($in, 'exclude unit velh-pilot-hourly.timer')) 'target-user lines come after the map lines'
   Ordered @('^new script:preflight', '^old plan:full') -All
   Eq (@(RecCalls -All | Where-Object { $_.Call -notmatch '-p\.' }).Count) 0 'plan sends no recorded call but p.*'
+}
+T 'L.plan-state: with --map <file> the laptop still prepends every default line (exclude /etc/ssl/certs included) before the file''s lines, map.txt keeps them and the copy re-plan sends them again (B.14.2, CONTRACT LIST map-defaults; ruling 04/11 (3) 4)' {
+  $mf = Join-Path $Root ('map-' + [guid]::NewGuid().ToString('N') + '.txt'); [IO.File]::WriteAllText($mf, "exclude pkg chromium`n", $utf8)
+  [void](Do-Plan -Extra @('--map', $mf)); Remove-Item -LiteralPath $mf -Force
+  $in = @($W.PlanStdin[-1]); $d = @('exclude user dino', 'exclude unit velh-pilot-hourly.timer', 'exclude /etc/ssl/certs')
+  foreach ($l in $d) { Ok ($in -ccontains $l) "plan stdin lacks the default [$l]: $($in -join ' | ')"; Ok ([Array]::IndexOf($in, $l) -lt [Array]::IndexOf($in, 'exclude pkg chromium')) "the default [$l] comes before the map file's lines: $($in -join ' | ')" }
+  $mt = @([IO.File]::ReadAllText((Join-Path (MoveDir) 'map.txt')) -split "`r?`n")
+  foreach ($l in @($d) + 'exclude pkg chromium') { Ok ($mt -ccontains $l) "map.txt lacks [$l]: $($mt -join ' | ')" }
+  [void](Do-Copy); $n0 = $W.PlanStdin.Count; [void](Do-Copy 0); Ok ($W.PlanStdin.Count -gt $n0) 'the copy re-run re-plans (D.3)'
+  $in = @($W.PlanStdin[-1]); foreach ($l in @($d) + 'exclude pkg chromium') { Ok ($in -ccontains $l) "re-plan stdin lacks [$l]: $($in -join ' | ')" }
+}
+# O1 (ruling 04/11 (3) 5, CONTRACT §4.1): the laptop's config.json key moveTargets.<ssh alias>.platform_user, as ConvertFrom-Json gives it
+function Set-PlatformUser($Old, $New) {
+  $o = [ordered]@{}; if ($null -ne $Old) { $o[$OldAlias] = [pscustomobject]@{ platform_user = $Old } }; if ($null -ne $New) { $o[$NewAlias] = [pscustomobject]@{ platform_user = $New } }
+  $script:Cfg2['moveTargets'] = [pscustomobject]$o
+}
+function PuLines($Calls) { @(foreach ($c in @($Calls)) { @("$($c.Stdin)" -split "`n" | Where-Object { $_ -cmatch '\Aplatform-user' }) }) }
+function PlanPuLines { @(foreach ($s in $script:W.PlanStdin) { @($s | Where-Object { $_ -cmatch '\Aplatform-user' }) }) }
+# CONTRACT §4.1 / D.0.9: the platform-user line is the LAST stdin line, after the idmap lines (review t10f F2)
+function PuLast([string[]]$In, [string]$Want, [string]$What) {
+  $in = @($In | Where-Object { $_ }); Eq $in[-1] $Want "$What the last stdin line: $($in -join ' | ')"
+  Eq (@($in | Where-Object { $_ -cmatch '\Aplatform-user' }).Count) 1 "$What one platform-user line"
+  $ix = @(for ($i = 0; $i -lt $in.Count; $i++) { if ($in[$i] -cmatch '\Aidmap ') { $i } }); Ok ($ix.Count -ge 1) "$What holds an idmap line: $($in -join ' | ')"
+}
+T 'L.plan-platform-user: old.platform_user set in config.json sends exactly one stdin line platform-user <old''s name>, as the last line after the idmap lines, to plan <id> on old (the copy re-plan, plan --check-only and x.check on old too) and state.json keeps old.platform_user and new.platform_user; in fwd no call to new carries it; a manual back sends platform-user <new''s name> last to plan --check-only and x.check on new, none to old, none when new''s key is unset (ruling 04/11 (3) 5, R6-CONTRACT O1 fix 04/11, CONTRACT §4.1)' {
+  $idl = 'MOVE item idmap:user:svc kind=prepare state=mapped src_id=105 dst_id=110'
+  Set-PlatformUser 'quoc' 'admin'; [void](Do-Plan)
+  Eq ((PlanPuLines) -join ' | ') 'platform-user quoc' 'plan stdin: one platform-user line with old''s name'; Eq @($W.PlanStdin[-1])[-1] 'platform-user quoc' 'plan stdin: the last line'
+  $s = Get-St; Eq "$($s.old.platform_user)" 'quoc' 'state old.platform_user'; Eq "$($s.new.platform_user)" 'admin' 'state new.platform_user'
+  Add-Fault -M new -Key '-c\.prepare\.1$' -Rc 0 -Out @($idl); [void](Do-Copy 0); Ok (@(@((Get-St).idmap) | Where-Object { $_.name -ceq 'svc' }).Count -eq 1) 'the idmap entry is in state'
+  $n0 = $W.PlanStdin.Count; [void](Do-Copy 0); Ok ($W.PlanStdin.Count -gt $n0) 'the copy re-run re-plans'
+  PuLast @($W.PlanStdin[-1]) 'platform-user quoc' 're-plan:'
+  [void](Do-Cutover)
+  foreach ($st in 'plan:check-only', 'x.check') {
+    $cs = @($W.Calls | Where-Object { $_.M -ceq 'old' -and $_.Step -ceq $st }); Ok ($cs.Count -ge 1) "$st on old was sent: $(LogNow)"
+    foreach ($c in $cs) { PuLast @("$($c.Stdin)" -split '\r?\n') 'platform-user quoc' "$st on old:" }
+  }
+  Eq (@(PuLines @($W.Calls | Where-Object { $_.M -ceq 'new' })).Count) 0 'fwd: no call to new carries a platform-user line'
+  Reset-World; Set-PlatformUser 'quoc' 'admin'; Fx-Planned; Add-Fault -M new -Key '-c\.prepare\.1$' -Rc 0 -Out @($idl); [void](Do-Copy 0); [void](Do-Cutover); Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "back exit ($($r.Text))"
+  $bk = @(for ($i = $W.CallFrom; $i -lt $W.Calls.Count; $i++) { $W.Calls[$i] })
+  $cs = @($bk | Where-Object { $_.M -ceq 'new' -and $_.Step -cin 'plan:check-only', 'x.check' }); Ok ($cs.Count -ge 1) "a manual back checks on new: $(LogNow)"
+  foreach ($c in $cs) { PuLast @("$($c.Stdin)" -split '\r?\n') 'platform-user admin' "back $($c.Step) on new:" }
+  Eq (@(PuLines @($bk | Where-Object { $_.M -ceq 'old' })).Count) 0 'back: no call to old carries a platform-user line'
+  Reset-World; Set-PlatformUser 'quoc' $null; Fx-BackDone
+  $bk = @(for ($i = $W.CallFrom; $i -lt $W.Calls.Count; $i++) { $W.Calls[$i] }); Ok (@($bk | Where-Object { $_.M -ceq 'new' -and $_.Step -cin 'plan:check-only', 'x.check' }).Count -ge 1) "a manual back checks on new: $(LogNow)"
+  Eq (@(PuLines $bk).Count) 0 "back with new's key unset: no platform-user line: $(PuLines $bk)"
+  Reset-World; Set-PlatformUser 'quoc' $null; [void](Do-Plan); Eq ((PlanPuLines) -join ' | ') 'platform-user quoc' 'only old''s key set: the line'; Eq "$((Get-St).new.platform_user)" '' 'new.platform_user empty'
+  Reset-World; Set-PlatformUser $null 'quoc'; [void](Do-Plan); Eq (@(PlanPuLines).Count) 0 "only new's key set: no line at a fwd plan ($(PlanPuLines))"; Eq "$((Get-St).old.platform_user)" '' 'old.platform_user empty'; Eq "$((Get-St).new.platform_user)" 'quoc' 'new.platform_user'
+}
+T 'L.plan-platform-user: with no platform_user (no moveTargets, no entry for the alias, or an empty name) no platform-user line is ever sent, at plan, the copy re-plan or the cutover checks, and the state keeps both empty (ruling 04/11 (3) 5: unset = contabo, nothing changes)' {
+  foreach ($c in 'none', 'empty', 'other alias') {
+    Reset-World; if ($c -ceq 'empty') { Set-PlatformUser '' '' } elseif ($c -ceq 'other alias') { $script:Cfg2['moveTargets'] = [pscustomobject]@{ elsewhere = [pscustomobject]@{ platform_user = 'quoc' } } }
+    Fx-Copied; [void](Do-Copy 0); [void](Do-Cutover)
+    Eq (@(PlanPuLines).Count) 0 "[$c] no platform-user line at plan: $(PlanPuLines)"; Eq (@(PuLines $W.Calls).Count) 0 "[$c] no call carries a platform-user line"
+    $s = Get-St; Eq "$($s.old.platform_user)" '' "[$c] old.platform_user"; Eq "$($s.new.platform_user)" '' "[$c] new.platform_user"
+  }
+}
+T 'L.plan-platform-user: a platform_user that is not a Linux user name (target-user grammar ^[a-z_][a-z0-9_.-]*$) for old or new refuses plan with 65 before any ssh and writes nothing; status --rebuild reads the same key (a valid name rebuilt and sent again, an invalid one refused 65) (ruling 04/11 (3) 5)' {
+  foreach ($v in @('Quoc', '1x', 'a b', 'quoc;id', 'quoc$', [int]5)) {
+    foreach ($side in 'old', 'new') {
+      Reset-World; if ($side -ceq 'old') { Set-PlatformUser $v 'quoc' } else { Set-PlatformUser 'quoc' $v }
+      [void](Do-Plan -Want 65); HasText 'platform_user'; Eq $W.Calls.Count 0 "[$side $v] no ssh to old or new"; NothingWritten "[$side $v] nothing written"
+    }
+  }
+  Reset-World; Set-PlatformUser 'quoc' 'quoc'; Fx-Copied; [IO.File]::Delete((StatePath)); foreach ($n in 'old', 'new') { $W[$n].MoveId.old_addr = $OldAddr; $W[$n].MoveId.new_addr = $NewAddr }
+  $r = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $r.Code 0 "rebuild ($($r.Text))"; Eq "$((Get-St).old.platform_user)" 'quoc' 'rebuilt old.platform_user'; Eq "$((Get-St).new.platform_user)" 'quoc' 'rebuilt new.platform_user'
+  $n0 = $W.PlanStdin.Count; [void](Run-Move @('copy')); Ok ($W.PlanStdin.Count -gt $n0) 'the copy refresh re-plans'; Eq ((@($W.PlanStdin[-1]) | Where-Object { $_ -cmatch '\Aplatform-user' }) -join ' | ') 'platform-user quoc' 'the re-plan after a rebuild'
+  [IO.File]::Delete((StatePath)); Set-PlatformUser 'Quoc' 'quoc'; $n0 = $W.Calls.Count
+  $r = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $r.Code 65 "rebuild with an invalid name ($($r.Text))"; HasText 'platform_user'; Eq $W.Calls.Count $n0 'no ssh'; Ok (-not (Test-Path -LiteralPath (StatePath))) 'no state written'
+}
+T 'L.plan-platform-user: a --map file line platform-user <name> (a laptop stdin line, never a map line) refuses map-invalid ref=platform-user, plan exits 65 before any ssh and writes nothing, with or without platform_user in config.json (ruling 04/11 (3) 5: named only in the config; D.0.9)' {
+  foreach ($c in @(@('platform-user quoc', $null), @('  platform-user root', 'quoc'))) {
+    Reset-World; if ($null -ne $c[1]) { Set-PlatformUser $c[1] $null }
+    $mf = Join-Path $Root ('map-' + [guid]::NewGuid().ToString('N') + '.txt'); [IO.File]::WriteAllText($mf, "exclude pkg chromium`n$($c[0])`n", $utf8)
+    [void](Do-Plan -Extra @('--map', $mf) -Want 65); Remove-Item -LiteralPath $mf -Force
+    HasText 'File map có tham chiếu sai'; HasText 'ref=platform-user'   # the map-invalid label of INV refuse map-invalid ref=platform-user
+    Eq $W.Calls.Count 0 "[$($c[0])] no ssh"; Eq $W.PlanStdin.Count 0 "[$($c[0])] no plan sent"; NothingWritten "[$($c[0])] nothing written"
+  }
 }
 T 'L.plan-questions: Q-pm2save có saves on old as p.pm2-save.1 (attempt 0) and plans again; Q-cert có renews as p.cert-renew.1; texts as CONTRACT §8.3' {
   $W.PlanHook = { param($n, $map) if ($n -eq 1) { @{ Out = @('INV refuse pm2-unsaved names=api,bot', 'INV warn cert-expiring name=a.example.com days=5'); Code = 65 } } else { @{ Out = @('INV ok'); Code = 0 } } }
@@ -1019,6 +1098,26 @@ T 'L.pre-empty-rules: the platform entries pass only on a target carrying all se
   PfHas $r 'INV refuse target-not-empty path=/opt/npm'; Ok (@($r.Out | Where-Object { "$_" -match '^INV refuse target-not-empty path=/usr/local/' }).Count -ge 1) "the /usr/local entries refuse: $($r.Text)"
   PfHas $r 'INV refuse target-not-empty path=/etc/systemd/system/instabox-user.service'
 } -NeedsBash
+T 'L.pre-empty-rules: /usr/local/man as the base-files link with the text share/man passes, on a platform and on a non-platform target; a real dir there, a plain file, a link with any other text (also /usr/local/share/man, which resolves to the same dir) or the same link at another path refuses target-not-empty (ruling 04/11 (3) 2, B.0.3, CONTRACT §3.5)' {
+  $mk = {
+    param([string[]]$Units = @())
+    $fr = Pf-Root; foreach ($u in $Units) { Fx-File $fr "etc/systemd/system/$u" "[Unit]`n" }
+    [void](New-Item -ItemType Directory -Force -Path (Join-Path $fr 'usr/local/share/man')); $fr
+  }
+  foreach ($u in @(, @()) + @(, $PlatformUnits)) {
+    $fr = & $mk $u; & ln -s share/man (Join-Path $fr 'usr/local/man')
+    $r = Pf-Run $fr (Pf-Stubs); Eq $r.Code 0 "the link share/man, $(@($u).Count) platform units ($($r.Text))"; PfHas $r 'INV ok'; PfLacks $r '^INV refuse '
+  }
+  $fr = & $mk; Fx-File $fr 'usr/local/man/man1/x.1'; $r = Pf-Run $fr (Pf-Stubs); Eq $r.Code 65 "a real dir ($($r.Text))"; PfHas $r 'INV refuse target-not-empty path=/usr/local/man'
+  $fr = & $mk; Fx-File $fr 'usr/local/man' "share/man`n"; $r = Pf-Run $fr (Pf-Stubs); Eq $r.Code 65 "a plain file ($($r.Text))"; PfHas $r 'INV refuse target-not-empty path=/usr/local/man'
+  foreach ($t in '/usr/local/share/man', 'share/man/', './share/man', 'share/doc') {
+    $fr = & $mk $PlatformUnits; & ln -s $t (Join-Path $fr 'usr/local/man'); $r = Pf-Run $fr (Pf-Stubs); Eq $r.Code 65 "the link text [$t] ($($r.Text))"; PfHas $r 'INV refuse target-not-empty path=/usr/local/man'
+  }
+  foreach ($p in 'usr/local/manpages', 'opt/man', 'srv/man') {
+    $fr = & $mk $PlatformUnits; [void](New-Item -ItemType Directory -Force -Path (Join-Path $fr (Split-Path -Parent $p))); & ln -s share/man (Join-Path $fr $p)
+    $r = Pf-Run $fr (Pf-Stubs); Eq $r.Code 65 "the link share/man at /$p ($($r.Text))"; PfHas $r "INV refuse target-not-empty path=/$p"
+  }
+} -NeedsBash
 T 'L.pre-uid-collision: the preflight script prints new''s groups with gid ≥ 1000, every /etc/subuid and /etc/subgid line and every global address (B.0.2; W1-T11-DG-T11-4)' {
   $fr = Pf-Root
   Fx-File $fr 'fx-group' "root:x:0:`nsudo:x:27:alice`ndevs:x:1800:alice`n"; Fx-File $fr 'etc/subuid' "alice:100000:65536`n"; Fx-File $fr 'etc/subgid' "alice:165536:65536`n"
@@ -1054,6 +1153,17 @@ T 'L.check-diff: check is zero-write, sends plan - --check-only, shows new refus
   $W.CheckOut = @('INV ok'); $W.CheckCode = 0; $r = Run-Move @('check'); Eq $r.Code 0 'clean check'
   Eq (@(RecCalls -All).Count) 0 'check sends no recorded call'; Ok ($null -eq (Get-St)) 'check writes no state.json'
   Ok (@(LogNow -All | Where-Object { $_ -notmatch '^old (plan:check|status|script:facts)$' }).Count -eq 0) "check talks to old's plan - --check-only (and read-only facts) only: $(LogNow -All)"
+}
+T 'L.check-diff: check''s plan - --check-only stdin is exactly the default map lines (exclude user dino, exclude unit velh-pilot-hourly.timer, exclude /etc/ssl/certs) and nothing else: no platform-user line with platform_user set, no map.txt line after a plan with --map (GAP-RULINGS-3 W1-T3-GAP-1, D.0.9; ruling 04/11 (3) 4, review t10f F1/F3)' {
+  $want = "exclude user dino`nexclude unit velh-pilot-hourly.timer`nexclude /etc/ssl/certs`n"
+  foreach ($c in 'plain', 'platform_user', 'after plan --map') {
+    Reset-World
+    if ($c -cne 'plain') { Set-PlatformUser 'quoc' 'quoc' }
+    if ($c -ceq 'after plan --map') { $mf = Join-Path $Root ('map-' + [guid]::NewGuid().ToString('N') + '.txt'); [IO.File]::WriteAllText($mf, "exclude pkg chromium`n", $utf8); [void](Do-Plan -Extra @('--map', $mf)); Remove-Item -LiteralPath $mf -Force }
+    $n0 = $W.Calls.Count; $r = Run-Move @('check'); Eq $r.Code 0 "[$c] check ($($r.Text))"
+    $cs = @(for ($i = $n0; $i -lt $W.Calls.Count; $i++) { if ($W.Calls[$i].Step -ceq 'plan:check') { $W.Calls[$i] } }); Eq $cs.Count 1 "[$c] one plan - --check-only"
+    Eq ("$($cs[0].Stdin)" -replace "`r`n", "`n") $want "[$c] check stdin"
+  }
 }
 T 'L.push-scan: a matched repo is gate-push only when its slug equals the origin remote of a legacy directory on old, project = that legacy name; every other match (one naming DEPLOY_KNOWN_HOSTS, or an origin seen only on new, included) asks Q-sshpush; không refuses push-deploy, có disables that workflow for good (B.10.5, ruling T10c-LP 04/11)' {
   foreach ($a in 'không', 'có') {
