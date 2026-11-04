@@ -2362,7 +2362,19 @@ function Get-MoveMapText { $p = Get-MovePath 'map.txt'; if ([IO.File]::Exists($p
 # O1 (ruling 04/11 (3) 5; CONTRACT §4.1 old/new.platform_user): the platform login user of a target is NAMED in the laptop's config.json,
 # `moveTargets.<ssh alias>.platform_user` (one name or empty), never guessed. '' = unset; $null = not a name (printed; the caller exits 65).
 function Get-MovePlatformUser([string]$Alias) {
-  $v = Get-MoveProp (Get-MoveProp (Get-Cfg 'moveTargets' $null) $Alias) 'platform_user'
+  $mt = Get-Cfg 'moveTargets' $null
+  $e = $null; $has = $false
+  if ($null -ne $mt) {
+    if ($mt -isnot [Management.Automation.PSCustomObject]) { Write-Host "lỗi: khóa moveTargets trong config.json không phải một đối tượng { `"<tên ssh>`": { `"platform_user`": `"<tên user>`" } }."; return $null }
+    $p = $mt.PSObject.Properties[$Alias]
+    if ($p) { $has = $true; $e = $p.Value }
+  }
+  if ($has) {
+    if ($e -isnot [Management.Automation.PSCustomObject]) { Write-Host "lỗi: khóa moveTargets.$Alias trong config.json không phải một đối tượng { `"platform_user`": `"<tên user>`" }."; return $null }
+    $pp = $e.PSObject.Properties['platform_user']
+    if ($pp -and $pp.Value -isnot [string]) { Write-Host "lỗi: khóa moveTargets.$Alias.platform_user trong config.json không phải một chuỗi (tên user Linux hoặc để trống)."; return $null }
+  }
+  $v = Get-MoveProp $e 'platform_user'
   if ($null -eq $v -or ($v -is [string] -and $v -ceq '')) { return '' }
   if ($v -is [string] -and $v -cmatch '\A[a-z_][a-z0-9_.-]*\z') { return $v }   # the target-user name regex (lib/move-plan.sh stdin reader)
   Write-Host "lỗi: platform_user của máy '$Alias' trong config.json (moveTargets) không hợp lệ: cần một tên user Linux hoặc để trống."
