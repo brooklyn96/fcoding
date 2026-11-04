@@ -8,6 +8,7 @@
 // FAKE_TMUX_DELAYS: JSON {command: ms}, overrides FAKE_TMUX_DELAY_MS per command ("capture-pane -S": only captures with history).
 // FAKE_TMUX_DUP_ONCE: new-session for that name answers "duplicate session" once, as if created outside the server.
 // FAKE_TMUX_FAIL_ON: that command (e.g. paste-buffer) answers "can't find session", as if the session died at that step.
+// Global env (set-environment -g): only which names are set, never values; each new session records globalToken (GH_TOKEN or GITHUB_TOKEN set).
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -50,7 +51,16 @@ switch (cmd) {
     }
     if (process.env.FAKE_TMUX_EXIT) break; // the pane's command died: the session is already gone
     const after = Number(process.env.FAKE_TMUX_EXIT_AFTER_MS || 0); // the harness exits this long after start
-    st.sessions[name] = { created: 1700000000, dir: arg('-c'), cmd: argv[argv.length - 1], opts: {}, ...(after && { diesAt: Date.now() + after }) };
+    // globalToken: the session would inherit a GH_TOKEN / GITHUB_TOKEN from the server's global env (see set-environment)
+    const globalToken = !!(st.globalEnv?.GH_TOKEN || st.globalEnv?.GITHUB_TOKEN);
+    st.sessions[name] = { created: 1700000000, dir: arg('-c'), cmd: argv[argv.length - 1], opts: {}, globalToken, ...(after && { diesAt: Date.now() + after }) };
+    save(st);
+    break;
+  }
+  case 'set-environment': { // only -g: `-g NAME VALUE` marks NAME as set (the value is never kept), `-g -u NAME` unsets it
+    if (!argv.includes('-g')) break;
+    st.globalEnv ??= {};
+    if (argv.includes('-u')) delete st.globalEnv[argv.at(-1)]; else st.globalEnv[argv.at(-2)] = true;
     save(st);
     break;
   }

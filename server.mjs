@@ -979,7 +979,8 @@ export function createApp(opts = {}) {
   // env file at session start, then execs the harness (A3). Only paths are on the tmux command line, never the token. No loader: as before it.
   const loader = [path.join(SERVER_DIR, 'start.sh'), path.join(SERVER_DIR, 'box', 'start.sh')].find((f) => fs.existsSync(f));
   if (!loader) log('warning: start.sh not found next to server.mjs; harness sessions start without GH_TOKEN (run bash install.sh)');
-  const harnessLaunch = loader ? `${HARNESS_ENV}${shq(`FCODE_SECRETS_ENV=${process.env.FCODE_SECRETS_ENV || SECRETS_ENV}`)} /bin/sh ${shq(loader)} ` : HARNESS_ENV;
+  const secrets = path.resolve(process.env.FCODE_SECRETS_ENV || SECRETS_ENV); // absolute, once: a session's cwd is its project dir
+  const harnessLaunch = loader ? `${HARNESS_ENV}${shq(`FCODE_SECRETS_ENV=${secrets}`)} /bin/sh ${shq(loader)} ` : HARNESS_ENV;
   const pollMs = opts.pollMs ?? 700;
   const pingMs = opts.pingMs ?? 15000;
   const drainTimeout = opts.drainTimeoutMs ?? DRAIN_TIMEOUT;
@@ -1273,16 +1274,11 @@ export function createApp(opts = {}) {
 
   const validProject = (p) => typeof p === 'string' && cfg.projectNames.includes(p);
   const validHarness = (h) => typeof h === 'string' && Object.hasOwn(HARNESSES, h);
-  // once, at listen and before the first new-session: a tmux server that outlived a restart (KillMode=process) or was started from a
-  // login shell may hold GH_TOKEN in its global env; an unset carries no value. No tmux server running: nothing to clean (error ignored).
-  let tmuxEnvClean = null;
-  const cleanTmuxEnv = () => (tmuxEnvClean ??= (async () => {
-    const ctx = { cancelled: false, device: null, gen, admin: true, mutation: true };
-    for (const v of TOKEN_VARS) await run(ctx, ['set-environment', '-g', '-u', v]).catch(() => {});
-  })());
   // runs inside a mutation job
   async function createSession(name, project, harness, ctx, command = HARNESSES[harness]) {
-    await cleanTmuxEnv();
+    // right before EVERY new-session: a tmux server that outlived a restart (KillMode=process) or was started later from a login shell may
+    // hold GH_TOKEN in its global env; an unset carries no value. Any failure (no server running yet, a gate refusal) never blocks the create.
+    for (const v of TOKEN_VARS) await run(ctx, ['set-environment', '-g', '-u', v]).catch(() => {});
     try {
       await run(ctx, ['new-session', '-d', '-s', name, '-c', cfg.projects[project], harnessLaunch + command]);
     } catch (e) {
@@ -2416,7 +2412,6 @@ export function createApp(opts = {}) {
     try {
       const bound = await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, host, () => resolve(server.address().port)); });
       startWarm();
-      void cleanTmuxEnv();
       return bound;
     } catch (e) { adminServer.close(); throw e; }
   };

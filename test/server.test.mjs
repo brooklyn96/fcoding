@@ -22,7 +22,8 @@ const HOME = os.homedir();
 const LOADER = path.join(here, '..', 'box', 'start.sh'); // a checkout has no start.sh next to server.mjs: box/start.sh is the loader
 const shq = (s) => `'${s.replace(/'/g, "'\\''")}'`;
 const ENV_PART = `env LANG=C.UTF-8 LC_ALL=C.UTF-8 'PATH=${HOME}/.local/bin:${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin' `; // the launch before the loader
-const launchOf = (loader, secrets = process.env.FCODE_SECRETS_ENV || '/run/instabox/secrets/env') => `${ENV_PART}${shq(`FCODE_SECRETS_ENV=${secrets}`)} /bin/sh ${shq(loader)} `;
+// the server makes the secrets path absolute once (path.resolve against its cwd)
+const launchOf = (loader, secrets = process.env.FCODE_SECRETS_ENV || '/run/instabox/secrets/env') => `${ENV_PART}${shq(`FCODE_SECRETS_ENV=${path.resolve(secrets)}`)} /bin/sh ${shq(loader)} `;
 const LAUNCH = launchOf(LOADER);
 
 async function boot(opts = {}) {
@@ -55,7 +56,7 @@ async function boot(opts = {}) {
   ctx.allCalls = () => {
     try { return fs.readFileSync(path.join(fakeDir, 'log.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; }
   };
-  // without the once-per-server `set-environment -g -u` token cleanup (A3), which the tests that count tmux calls do not expect
+  // without the per-create `set-environment -g -u` token cleanup (A3), which the tests that count tmux calls do not expect
   ctx.calls = () => ctx.allCalls().filter((x) => x.argv[0] !== 'set-environment');
   ctx.close = async () => {
     await app.close();
@@ -944,7 +945,7 @@ async function serverCopy(dir, withLoader = true) {
   return import(pathToFileURL(path.join(dir, 'server.mjs')).href);
 }
 
-test('install.sh start.sh: the loader reads GH_TOKEN alone, as data; a hostile file never runs, blocks or prints', { skip: POSIX }, () => {
+test('install.sh start.sh: the loader reads GH_TOKEN alone, as data, under a strict whole-file grammar; a hostile file never runs, blocks or prints', { skip: POSIX }, () => {
   const install = fs.readFileSync(path.join(here, '..', 'install.sh'), 'utf8');
   assert.match(install, /\ninstall -m 755 "\$SRC\/box\/start\.sh" "\$APP\/start\.sh"\n/); // the one loader, shared with the harness sessions
   assert.match(install, /ExecStart=\/bin\/sh \$APP\/start\.sh \$\(command -v node\) \$APP\/server\.mjs/);
@@ -959,21 +960,37 @@ test('install.sh start.sh: the loader reads GH_TOKEN alone, as data; a hostile f
   };
   const expect = (tok) => `${JSON.stringify([tok, null])}\n`;
   try {
+    const tokLine = 'GH_TOKEN=tokS1\n'; // 15 bytes
+    const pad = (n) => `${'#'.repeat(n - 1)}\n`; // a comment line of n bytes
+    // any line outside the grammar means NO token for the whole file (fail closed), whatever else the file holds
     const cases = [
-      ['plain', 'export GH_TOKEN=tok_test\nexport OTHER_SECRET=zz\necho noise\n', 'tok_test'],
-      ['set -x', 'set -x\nexport GH_TOKEN=tokA1\n', 'tokA1'],
-      ['trap on EXIT', `trap 'echo pwned; touch ${shq(pwn)}' EXIT\nGH_TOKEN=tokB2\n`, 'tokB2'],
-      ['exit 3', 'exit 3\nexport GH_TOKEN=tokC3\n', 'tokC3'],
-      ['syntax error', 'if then fi ((\nexport GH_TOKEN=tokD4\n', 'tokD4'],
-      ['read x', 'read x\nexport GH_TOKEN=tokE5\n', 'tokE5'],
-      ['empty token', 'export GH_TOKEN=\n', null],
+      ['plain', 'export GH_TOKEN=tok_test\nexport OTHER_SECRET=zz\n', 'tok_test'],
+      ['a mixed valid file: comments, blanks, quotes, empty values, spaces, CRLF; the last GH_TOKEN wins',
+        "# vault\r\n\r\n   \t\nexport A='x y'\nB=\"q r\"\nC=\nexport   D=plain_1   \n  # GH_TOKEN=commented\nexport GH_TOKEN=\"tokG7\"\r\n  export   GH_TOKEN='tokH8'  \r\nE=after\n", 'tokH8'],
+      ['set -x', 'set -x\nexport GH_TOKEN=tokA1\n', null],
+      ['trap on EXIT', `trap 'echo pwned; touch ${shq(pwn)}' EXIT\nGH_TOKEN=tokB2\n`, null],
+      ['exit 3', 'exit 3\nexport GH_TOKEN=tokC3\n', null],
+      ['syntax error', 'if then fi ((\nexport GH_TOKEN=tokD4\n', null],
+      ['read x', 'read x\nexport GH_TOKEN=tokE5\n', null],
+      ['echo', 'echo noise\nexport GH_TOKEN=tokE6\n', null],
+      ['a multiline value whose inner line looks like GH_TOKEN=', 'export X="line one\nGH_TOKEN=tokM1\n"\n', null],
+      ['a heredoc', 'cat <<EOF\nGH_TOKEN=tokM2\nEOF\n', null],
+      ['an unbalanced quote', "A='open\nGH_TOKEN=tokM3\n", null],
+      ['a trailing comment after a value', 'GH_TOKEN=tokM4 # mine\n', null],
+      ['export without a value', 'export GH_TOKEN\n', null],
+      ['a bad name', '1A=x\nGH_TOKEN=tokM5\n', null],
+      ['an expansion in double quotes', 'A="$HOME"\nGH_TOKEN=tokM6\n', null],
+      ['a backslash in double quotes', 'A="a\\"b"\nGH_TOKEN=tokM7\n', null],
       ['command substitution', `export GH_TOKEN=$(touch ${shq(pwn)})\n`, null],
-      ['a space', 'export GH_TOKEN="a b"\n', null],
+      ['backticks', `export GH_TOKEN=\`touch ${shq(pwn)}\`\n`, null],
+      ['a NUL byte', 'A=x\0y\nGH_TOKEN=tokN1\n', null],
+      ['empty token', 'export GH_TOKEN=\n', null],
+      ['a space in the quoted value', 'export GH_TOKEN="a b"\n', null],
       ['256 characters', `GH_TOKEN=${'a'.repeat(256)}\n`, null],
       ['255 characters', `GH_TOKEN=${'a'.repeat(255)}\n`, 'a'.repeat(255)],
-      ['oversized: a line past 64 KiB is never read', `${'#'.repeat(70000)}\nexport GH_TOKEN=tokF6\n`, null],
-      ['the last line wins; one pair of quotes is stripped; CRLF', 'export GH_TOKEN="tokG7"\r\n  export   GH_TOKEN=\'tokH8\'\r\n', 'tokH8'],
-      ['mismatched quotes', 'export GH_TOKEN="tokI9\'\n', null],
+      ['exactly 65536 bytes', pad(65536 - tokLine.length) + tokLine, 'tokS1'],
+      ['65537 bytes', pad(65537 - tokLine.length) + tokLine, null],
+      ['a value crossing the 64 KiB boundary (a cut read would give "tok")', pad(65536 - 'GH_TOKEN=tok'.length) + tokLine, null],
       ['other variables never reach the command', 'export OTHER=x\nGH_TOKEN_X=nope\nOLD_GH_TOKEN=bad\n#GH_TOKEN=bad\nexport GH_TOKEN=tokJ0\n', 'tokJ0'],
       ['no GH_TOKEN line: the inherited one is dropped', 'export OTHER=x\n', null],
     ];
@@ -1024,16 +1041,28 @@ test('harness sessions: every harness and every creation path starts through the
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('harness sessions: tmux global GH_TOKEN / GITHUB_TOKEN are unset once, at start and before the first new-session', () => withApp(async (c) => {
-  const unsets = () => c.allCalls().filter((x) => x.argv[0] === 'set-environment');
-  assert.ok(await until(() => unsets().length === 2, 3000));
-  assert.deepEqual(unsets().map((x) => x.argv), [['set-environment', '-g', '-u', 'GH_TOKEN'], ['set-environment', '-g', '-u', 'GITHUB_TOKEN']]);
+test('harness sessions: tmux global GH_TOKEN / GITHUB_TOKEN are unset right before EVERY new-session, also after a later global set', () => withApp(async (c) => {
   const { cookie } = await c.login();
+  // a tmux server started (or touched) later by a login shell: its global env gets a token between two creates
+  const setGlobal = () => {
+    for (const v of ['GH_TOKEN', 'GITHUB_TOKEN']) spawnSync(process.execPath, [FAKE, 'set-environment', '-g', v, 'dummy_global'], { env: { PATH: process.env.PATH, FAKE_TMUX_DIR: process.env.FAKE_TMUX_DIR } });
+  };
+  setGlobal();
   assert.equal((await mkSession(c, cookie, 'one')).status, 201);
+  setGlobal();
   assert.equal((await mkSession(c, cookie, 'two')).status, 201);
-  assert.equal(unsets().length, 2); // once per server, not per session
-  const first = c.allCalls().find((x) => x.argv[0] === 'new-session');
-  assert.ok(unsets().every((x) => x.t1 <= first.t0));
+  setGlobal();
+  assert.equal((await c.req('POST', '/api/open', { cookie, body: { project: 'alpha', harness: 'omp' } })).json?.created, true);
+  setGlobal();
+  assert.equal((await c.req('POST', '/api/open', { cookie, body: { project: 'alpha', harness: 'omp', fresh: true } })).json?.created, true);
+  const st = JSON.parse(fs.readFileSync(fakeState(c), 'utf8'));
+  for (const n of ['one', 'two', 'alpha-omp', 'alpha-omp-2']) assert.equal(st.sessions[n]?.globalToken, false, n); // no session inherits it
+  const server = c.allCalls().filter((x) => !(x.argv[0] === 'set-environment' && !x.argv.includes('-u'))); // without the test's own sets
+  const at = server.flatMap((x, i) => (x.argv[0] === 'new-session' ? [i] : []));
+  assert.equal(at.length, 4);
+  for (const i of at) { // directly preceded by both unsets, every time
+    assert.deepEqual(server.slice(i - 2, i).map((x) => x.argv), [['set-environment', '-g', '-u', 'GH_TOKEN'], ['set-environment', '-g', '-u', 'GITHUB_TOKEN']], server[i].argv[3]);
+  }
 }));
 
 test('harness sessions: no start.sh beside server.mjs: one warning, harnesses start as before the loader', async () => {
@@ -1066,7 +1095,7 @@ test('harness sessions: the logged launch, run as tmux runs it from a path with 
           assert.equal(r.status, 0, r.stderr); assert.equal(r.stderr, '');
           return r.stdout.trim();
         };
-        fs.writeFileSync(secrets, 'export GH_TOKEN=tok_session\nexport OTHER=x\necho noise\n');
+        fs.writeFileSync(secrets, '# vault\nexport GH_TOKEN=tok_session\nexport OTHER=x\n');
         assert.equal(run(), '["tok_session",null]');
         fs.writeFileSync(secrets, 'export GH_TOKEN=tok_rotated\n');
         assert.equal(run(), '["tok_rotated",null]'); // read at each session start: a rotated token reaches the next session
@@ -1074,6 +1103,25 @@ test('harness sessions: the logged launch, run as tmux runs it from a path with 
         assert.equal(run(), '[null,null]'); // no file: it still starts, without GH_TOKEN
       }, { make: mod.createApp });
     });
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('harness sessions: a relative FCODE_SECRETS_ENV is made absolute once at start; a session in another cwd reads the same file', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-ghtok-'));
+  const secrets = path.join(dir, 'env'), elsewhere = path.join(dir, 'project');
+  fs.mkdirSync(elsewhere);
+  try {
+    await withEnv({ FCODE_SECRETS_ENV: path.relative(process.cwd(), secrets) }, () => withApp(async (c) => {
+      assert.ok(!path.isAbsolute(process.env.FCODE_SECRETS_ENV));
+      const { cookie } = await c.login();
+      await mkSession(c, cookie, 'rel');
+      const cmd = c.calls().find((x) => x.argv[0] === 'new-session').argv.at(-1);
+      assert.equal(cmd, `${launchOf(LOADER, secrets)}bash -l`); // the absolute path, not the relative one
+      if (process.platform === 'win32') return; // running the launch needs POSIX sh
+      fs.writeFileSync(secrets, 'export GH_TOKEN=tok_abs1\n');
+      const r = spawnSync('/bin/sh', ['-c', cmd.slice(0, -'bash -l'.length) + PROBE], { encoding: 'utf8', cwd: elsewhere, timeout: 5000, env: { HOME, PATH: '/usr/bin:/bin' } });
+      assert.deepEqual([r.status, r.stderr, r.stdout.trim()], [0, '', '["tok_abs1",null]']); // tmux starts the pane in the project dir
+    }));
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -2358,7 +2406,7 @@ const freePort = () => new Promise((resolve) => { const s = net.createServer().l
 // the real server as a child: resolves {listening, child} once it serves, or {code, err} when it exits first
 async function startServer(configDir) {
   const port = await freePort();
-  // the fake tmux: the server's start-time `set-environment -g -u` must never reach the real tmux of whoever runs the tests
+  // the fake tmux: no tmux call of a spawned server (e.g. the per-create `set-environment -g -u`) may reach the real tmux of whoever runs the tests
   const env = { ...process.env, PC_CONFIG_DIR: configDir, PC_PORT: String(port), PC_TMUX: JSON.stringify([process.execPath, FAKE]), FAKE_TMUX_DIR: path.join(path.dirname(configDir), 'fake') };
   const child = spawn(process.execPath, [SERVER], { env, stdio: ['ignore', 'pipe', 'pipe'] });
   let out = '', err = '';
