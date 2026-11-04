@@ -16,6 +16,8 @@ mkdir -p "$APP"
 [ ! -f "$SRC/box/fcode-add.sh" ] || install -m 755 "$SRC/box/fcode-add.sh" "$APP/fcode-add.sh"
 # the box CLI for the deploy gate's operator key: ~/.local/bin/fcode-deploy (docs/HUONG-DAN.md, "Deploy từ box")
 [ ! -f "$SRC/box/fcode-deploy.sh" ] || install -D -m 755 "$SRC/box/fcode-deploy.sh" "$HOME/.local/bin/fcode-deploy"
+# the box command that leaves a one-way notice in the outbox Hermes pulls: ~/.local/bin/fcode-notify (box/README.md)
+[ ! -f "$SRC/box/fcode-notify.sh" ] || install -D -m 755 "$SRC/box/fcode-notify.sh" "$HOME/.local/bin/fcode-notify"
 
 mkdir -p "$CFG"
 chmod 700 "$CFG"
