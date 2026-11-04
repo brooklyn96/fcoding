@@ -9,7 +9,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import { createApp, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, strictOrigin, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock,
-  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, releaseRunOf, parseUpdates, updateStatusOf, gateStatusOf, gateRunOf, resetReply, RESET_MSG, memo, codexChildMeta, parseGitSync, ompDirName, ompHead, KNOWN_VERSIONS, repoOfLink, ADD_WATCHDOG } from '../server.mjs';
+  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, releaseRunOf, parseUpdates, updateStatusOf, gateStatusOf, gateRunOf, resetReply, RESET_MSG, memo, codexChildMeta, parseGitSync, ompDirName, ompHead, KNOWN_VERSIONS, repoOfLink } from '../server.mjs';
+import { ADD_WATCHDOG, addOutcome } from '../server.mjs';
 
 process.env.TZ = 'America/Los_Angeles'; // spend days follow config.json timeZone, never the process zone: a third zone proves it
 
@@ -5510,19 +5511,48 @@ test('escalation (server): after a server crash a grandchild that ignores TERM s
 }, { timeoutMs: 2500, killAfter: 2, plan: { sleep: 120e3, ignoreTerm: 'grand' } }));
 
 // ADD_WATCHDOG on its own: the exit like timeout(1) (124 after the deadline, else the job's code or signal; 127 when it cannot start)
+const runWatchdog = (ms, job, { ready, env } = {}) => new Promise((resolve) => {
+  const w = spawn(process.execPath, ['-e', ADD_WATCHDOG, String(ms), '1000', ...job], { stdio: ['ignore', 'ignore', 'pipe'], detached: true, env: { ...process.env, ...env } });
+  let err = '';
+  w.stderr.on('data', (d) => { err += d; });
+  if (ready) waitFor(() => fs.existsSync(ready)).then(() => process.kill(-w.pid, 'SIGTERM')); // the server's close(): TERM to the group
+  w.on('close', (code, signal) => resolve({ code, signal, err }));
+});
+const sh = (src) => ['bash', '-c', src]; // bash sets its trap at once, before any TERM can come (the sleeps inherit an ignored TERM)
+
 test('add watchdog: exit codes (normal, signal, deadline, deadline + KILL, forwarded TERM, cannot start)', addPosix, async () => {
-  const run = (ms, job, { term } = {}) => new Promise((resolve) => {
-    const w = spawn(process.execPath, ['-e', ADD_WATCHDOG, String(ms), '1000', ...job], { stdio: 'ignore', detached: true });
-    if (term) setTimeout(() => process.kill(-w.pid, 'SIGTERM'), term); // the server's close(): TERM to the group
-    w.on('exit', (code, signal) => resolve({ code, signal }));
-  });
-  const sh = (src) => ['bash', '-c', src]; // bash sets its trap at once, before any TERM can come (the sleeps inherit an ignored TERM)
-  assert.deepEqual(await run(60e3, sh('exit 7')), { code: 7, signal: null });
-  assert.deepEqual(await run(60e3, sh('kill -HUP $$')), { code: null, signal: 'SIGHUP' }); // the job's signal, raised again
-  assert.deepEqual(await run(300, sh('while :; do sleep 0.1; done')), { code: 124, signal: null }); // ended by the deadline's TERM
-  assert.deepEqual(await run(300, sh('trap "" TERM; while :; do sleep 0.1; done')), { code: null, signal: 'SIGKILL' }); // the group KILL, itself too
-  assert.deepEqual(await run(60e3, sh('trap "exit 143" TERM; while :; do sleep 0.1; done'), { term: 500 }), { code: 143, signal: null }); // the script's own TERM code
-  assert.deepEqual(await run(60e3, ['/nonexistent/fcode-add']), { code: 127, signal: null });
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-wd-'));
+  const run = async (...a) => { const { err, ...r } = await runWatchdog(...a); assert.doesNotMatch(err, /Debugger|inspector/i); return r; }; // no inspector opened
+  try {
+    assert.deepEqual(await run(60e3, sh('exit 7')), { code: 7, signal: null });
+    assert.deepEqual(await run(60e3, sh('kill -HUP $$')), { code: null, signal: 'SIGHUP' }); // the job's signal, raised again
+    // signals this node handles itself are not raised again (SIGPIPE: ignored; SIGUSR1: would open the inspector, "Debugger listening";
+    // SIGTERM: the watchdog's own handler): 128 + n, which the server reads the same as the signal
+    assert.deepEqual(await run(60e3, sh('kill -PIPE $$')), { code: 141, signal: null });
+    assert.deepEqual(await run(60e3, sh('kill -USR1 $$')), { code: 138, signal: null });
+    assert.deepEqual(await run(60e3, sh('kill -TERM $$')), { code: 143, signal: null });
+    for (const n of [141, 138, 143]) assert.deepEqual(addOutcome(n, 'R KEY_NEW\n'), addOutcome(null, 'R KEY_NEW\n'));
+    assert.deepEqual(await run(300, sh('while :; do sleep 0.1; done')), { code: 124, signal: null }); // ended by the deadline's TERM
+    assert.deepEqual(await run(300, sh('trap "" TERM; while :; do sleep 0.1; done')), { code: null, signal: 'SIGKILL' }); // the group KILL, itself too
+    const ready = path.join(tmp, 'ready'); // written after the trap is set: no TERM before it
+    assert.deepEqual(await run(60e3, sh(`trap "exit 143" TERM; : > '${ready}'; while :; do sleep 0.1; done`), { ready }), { code: 143, signal: null }); // the script's own TERM code
+    assert.deepEqual(await run(60e3, ['/nonexistent/fcode-add']), { code: 127, signal: null });
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
+
+test('add watchdog: a group member whose /proc stat cannot be read counts as alive (the KILL stays armed); a gone one (ENOENT) does not', addPosix, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-wdproc-'));
+  try {
+    fs.mkdirSync(path.join(root, '999999998')); // a pid dir with no stat: the process is gone (ENOENT)
+    const job = sh('while :; do sleep 0.1; done'); // ends on the deadline's TERM
+    const gone = await runWatchdog(300, job, { env: { PC_WATCHDOG_PROC: root } });
+    assert.deepEqual([gone.code, gone.signal], [124, null]); // nobody left: the exit comes at once
+    fs.mkdirSync(path.join(root, '999999999', 'stat'), { recursive: true }); // a stat that cannot be read (EISDIR): maybe still there
+    const t0 = Date.now();
+    const unknown = await runWatchdog(300, job, { env: { PC_WATCHDOG_PROC: root } });
+    assert.deepEqual([unknown.code, unknown.signal], [null, 'SIGKILL']); // it waited and sent the group KILL (deadline 0.3 s + kill-after 1 s)
+    assert.ok(Date.now() - t0 >= 1200, `${Date.now() - t0} ms`);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test('escalation (server): a stop of the service forwards TERM through the watchdog and its kill-after kills a job that ignores it, the server exits 0', addPosix, () => addServerProc(async ({ child, exited, fake, grand }) => {

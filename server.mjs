@@ -132,10 +132,14 @@ const ADD_CODES = { 0: 'ADDED', 30: 'ADDED_WARN', 40: 'NEED_KEY', 41: 'NEED_WRIT
 // (a crash, or a restart: install.sh uses KillMode=process). argv: <deadline ms> <kill-after ms> <cmd> [args...].
 // At the deadline, or on a TERM from the server, TERM goes to the whole group, and KILL goes to the whole group kill-after later. That is GNU
 // timeout(1) -k, but uutils' timeout (the default `timeout` from Ubuntu 26.04, 0.10) sends that KILL to its direct child only.
-// After a TERM it stays until the rest of the group is gone (zombies do not count) or the KILL is sent.
+// After a TERM it stays until the rest of the group is gone (zombies do not count) or the KILL is sent; a process whose stat cannot be read
+// (any error but ENOENT / ESRCH, which mean it is gone) counts as still there, so the KILL stays armed.
 // Exit like timeout(1): 124 after the deadline, else the job's own code, or its signal raised again; 127 when the job cannot start.
+// A signal this node handles itself (SIGPIPE: ignored; SIGUSR1: starts the inspector; SIGTERM: the handler below) is not raised again,
+// and neither is one that leaves it alive: those exit 128 + n, which the server reads the same as the signal (FAILED).
+// PC_WATCHDOG_PROC (test-only) points the group check at a fake /proc.
 export const ADD_WATCHDOG = `const fs = require('fs'), { spawn } = require('child_process');
-const [ms, killMs, cmd, ...args] = process.argv.slice(1), me = String(process.pid);
+const [ms, killMs, cmd, ...args] = process.argv.slice(1), me = String(process.pid), proc = process.env.PC_WATCHDOG_PROC || '/proc';
 let timedOut = false, armed = false;
 const term = () => {
   if (armed) return;
@@ -144,12 +148,13 @@ const term = () => {
   setTimeout(() => { try { process.kill(0, 'SIGKILL'); } catch {} }, Number(killMs));
 };
 const member = (p) => { // /proc/<pid>/stat after "(comm) ": state ppid pgrp ...
-  try { const s = fs.readFileSync('/proc/' + p + '/stat', 'utf8'), f = s.slice(s.lastIndexOf(')') + 2).split(' '); return f[0] !== 'Z' && f[2] === me; } catch { return false; }
+  try { const s = fs.readFileSync(proc + '/' + p + '/stat', 'utf8'), f = s.slice(s.lastIndexOf(')') + 2).split(' '); return f[0] !== 'Z' && f[2] === me; }
+  catch (e) { return e.code !== 'ENOENT' && e.code !== 'ESRCH'; }
 };
-const others = () => { try { return fs.readdirSync('/proc').some((p) => /^[0-9]+$/.test(p) && p !== me && member(p)); } catch { return true; } };
+const others = () => { try { return fs.readdirSync(proc).some((p) => /^[0-9]+$/.test(p) && p !== me && member(p)); } catch { return true; } };
 const end = (code, signal) => {
   if (timedOut) process.exit(124);
-  if (signal) { process.removeAllListeners('SIGTERM'); process.kill(process.pid, signal); }
+  if (signal && signal !== 'SIGPIPE' && signal !== 'SIGUSR1' && !process.listenerCount(signal)) process.kill(process.pid, signal);
   process.exit(code ?? 128 + (require('os').constants.signals[signal] ?? 0));
 };
 process.on('SIGTERM', term);
