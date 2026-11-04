@@ -129,16 +129,17 @@ const ADD_CODES = { 0: 'ADDED', 30: 'ADDED_WARN', 40: 'NEED_KEY', 41: 'NEED_WRIT
   11: 'DIR_CONFLICT', 21: 'CFG_CONFLICT', 22: 'CFG_BROKEN', 23: 'NAME_USED', 2: 'BAD_ARGS', 12: 'CLONE_FAIL' };
 // The add job's deadline, run by `node -e` as the leader of the job's process group (spawned detached), so it holds when this server is gone
 // (a crash, or a restart: install.sh uses KillMode=process). argv: <deadline ms> <kill-after ms> <cmd> [args...].
-// At the deadline, or on a TERM from the server, TERM goes to the whole group, and KILL goes to the whole group kill-after later. That is GNU
-// timeout(1) -k, but uutils' timeout (the default `timeout` from Ubuntu 26.04, 0.10) sends that KILL to its direct child only.
+// At the deadline, or on the TERM the server sends to the watchdog alone, TERM goes to the whole group, and KILL goes to the whole group
+// kill-after later: like GNU timeout -k, but the KILL always comes (uutils' timeout, the default `timeout` from Ubuntu 26.04, 0.10, sends its
+// KILL to its direct child only). The server never TERMs the group itself, so the watchdog is armed before any member of the group sees a TERM.
 // Once the TERM has gone out the watchdog never leaves before the KILL: no look at the group can prove it empty (a process may fork right after
 // it), so the KILL is sent whatever the group looks like, and it ends the watchdog too (it is in the group). The server then sees the signal
 // SIGKILL, never a code. Nobody needs a code: at the deadline the server has already ended the job as TIMEOUT by its own timer, and on close()
 // the server is exiting.
 // Not armed (the job ends on its own): it exits at once like timeout(1), with the job's own code or its signal raised again; 127 when the job
-// cannot start. SIGUSR1 is not raised again (it would start the inspector), and two more signals do not end this node by being raised: SIGPIPE
-// (Node ignores it) and SIGTERM (its handler runs only after the exit below). Those three exit 128 + n, which the server reads the same as the
-// signal (FAILED).
+// cannot start. SIGUSR1 is not raised again (it would start the inspector), and three more signals do not end this node by being raised:
+// SIGPIPE and SIGXFSZ (Node ignores them) and SIGTERM (its handler runs only after the exit below). Those three exit 128 + n, which the
+// server reads the same as the signal (FAILED).
 export const ADD_WATCHDOG = `const { spawn } = require('child_process');
 const [ms, killMs, cmd, ...args] = process.argv.slice(1);
 let armed = false;
@@ -1774,8 +1775,9 @@ export function createApp(opts = {}) {
   const addSpec = specOf(opts.addScript ?? process.env.PC_ADD_SCRIPT ?? ['bash', [ADD_SCRIPT, ADD_SCRIPT_DEV].find((f) => fs.existsSync(f)) ?? ADD_SCRIPT]);
   const addTimeout = opts.addTimeoutMs ?? (Number(process.env.PC_ADD_TIMEOUT_MS) || ADD_TIMEOUT_MS);
   // off Windows the script runs under ADD_WATCHDOG: the deadline then holds on its own even when this server is gone (a crash, or a restart
-  // that leaves the job alone: install.sh uses KillMode=process); a graceful stop ends the jobs through close(). After a TERM the watchdog
-  // always sends the group KILL at kill-after and ends with it: the server sees a signal, never an exit code, and TIMEOUT comes from the timer below.
+  // that leaves the job alone: install.sh uses KillMode=process); a graceful stop ends the jobs through close(). The server's TERM goes to the
+  // watchdog alone, which sends it to the group; after a TERM the watchdog always sends the group KILL at kill-after and ends with it: the server
+  // sees a signal, never an exit code, and TIMEOUT comes from the timer below.
   const addKillAfter = opts.addKillAfterS ?? (Number(process.env.PC_ADD_KILL_AFTER_S) || ADD_KILL_AFTER_S); // test-only override, like addTimeoutMs
   const addWrap = process.platform === 'win32' ? [] : [process.execPath, '-e', ADD_WATCHDOG, String(addTimeout), String(addKillAfter * 1000)];
   const addJobs = new Map(); // id -> job
@@ -1796,7 +1798,8 @@ export function createApp(opts = {}) {
     pruneAdd();
     let out = '', child, timer, grace;
     const end = () => { clearTimeout(timer); addStops.delete(abort); };
-    const abort = () => { end(); killGroup('SIGTERM'); clearTimeout(grace); }; // the app closes
+    // TERM to the watchdog alone, which sends it to its group once armed; Node refuses the kill after 'exit', so a reused pid is never hit
+    const abort = () => { end(); child.kill('SIGTERM'); clearTimeout(grace); }; // the app closes
     const finish = (res) => {
       if (job.state !== 'running') return;
       end();
@@ -1805,7 +1808,11 @@ export function createApp(opts = {}) {
       addRunning.delete(name);
       log(`add-project ${name} ${job.code}`);
     };
-    const killGroup = (sig) => { try { process.kill(process.platform === 'win32' ? child.pid : -child.pid, sig); } catch {} }; // -pid: the group
+    // the SIGKILL backstop only: -pid is the group only while the watchdog is not reaped (a zombie leader still holds its pgid; after 'exit' the id may be another process's)
+    const killGroup = (sig) => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      try { process.kill(process.platform === 'win32' ? child.pid : -child.pid, sig); } catch {} // -pid: the group
+    };
     try {
       const [cmd, ...pre] = [...addWrap, ...addSpec];
       child = spawn(cmd, [...pre, repo, name], { stdio: ['ignore', 'pipe', 'ignore'], detached: true, windowsHide: true, env: { ...toolEnv(), FCODE_CFG: cfgFile } });
@@ -1813,10 +1820,11 @@ export function createApp(opts = {}) {
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (c) => { if (out.length < ADD_OUT_MAX) out += c; });
     child.on('error', () => finish({ state: 'failed', code: 'FAILED' }));
-    child.on('close', (code) => { clearTimeout(grace); finish(addOutcome(code, out)); }); // the job is gone: no late SIGKILL to a group id that may be reused
+    child.on('exit', () => clearTimeout(grace)); // the watchdog is reaped: no late SIGKILL to a group id that may be reused
+    child.on('close', (code) => finish(addOutcome(code, out)));
     timer = setTimeout(() => {
       finish({ state: 'failed', code: 'TIMEOUT' });
-      killGroup('SIGTERM'); // the script cleans up its clone on TERM; off Windows ADD_WATCHDOG sends the group KILL at +30 s, this backstop only at +45 s
+      child.kill('SIGTERM'); // TERM to the watchdog alone, which sends it to its group once armed (the script cleans up its clone on TERM) and the group KILL at +30 s; this backstop only at +45 s
       grace = setTimeout(() => killGroup('SIGKILL'), opts.addKillGraceMs ?? ADD_KILL_GRACE_MS); // opts.addKillGraceMs: tests
       grace.unref();
     }, addTimeout);
