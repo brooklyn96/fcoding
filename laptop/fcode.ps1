@@ -1329,6 +1329,7 @@ function Get-MoveText([string]$Key, [hashtable]$F = @{}) {
     'Q-cert' { 'Chứng chỉ <tên> hết hạn sau <n> ngày. Gia hạn trên máy cũ trước khi chuyển? (có / không)' }
     'Q-direct' { 'Tên <tên> trỏ thẳng về máy cũ (<lớp>). Bạn sẽ tự đổi bản ghi DNS hoặc origin Cloudflare sang máy mới lúc chuyển? (có / không)' }
     'Q-ownip' { 'Các file sau chứa địa chỉ của máy cũ: <danh sách>. Thay bằng địa chỉ máy mới khi chép? (có / không)' }
+    'Q-ownip-pairs' { 'Máy cũ có các địa chỉ <địa chỉ cũ>, máy mới có các địa chỉ <địa chỉ mới>. Gõ từng cặp theo dạng địa chỉ máy cũ=địa chỉ máy mới để thay trong các file trên, mỗi cặp một dòng; gõ một dòng trống để kết thúc.' }   # D.15.1 "Q-ownip (several addresses)"
     'Q-port' { 'Các dịch vụ sau nhận kết nối thẳng qua IP: <danh sách>. Phía khách phải đổi sang IP máy mới sau khi chuyển. Đồng ý? (có / không)' }
     'Q-inbound' { 'Các kết nối vào sau sẽ mất sau khi chuyển cho đến khi bạn trỏ lại phía khách: <danh sách>. Đồng ý? (có / không)' }
     'Q-sshd' { 'Cấu hình sshd của máy mới khác máy cũ (<khóa>). Áp dụng các file sshd của máy cũ lên máy mới? (có / không)' }
@@ -2559,7 +2560,17 @@ function Invoke-MovePlanLoop($S, [string[]]$Map) {
     if ($own.Count -and -not $asked['Q-ownip']) {
       $a = Read-MoveAnswer (Get-MoveText 'Q-ownip' @{ 'danh sách' = ($own -join ', ') }) @('có', 'không')
       Set-MoveAsk $S $asked 'Q-ownip' $a
-      if ($a -ceq 'có') { foreach ($x in $own) { $map += "rewrite own-ip $x" }; $again = $true }
+      if ($a -ceq 'có') {
+        # B.12.5 / D.15 (ruling 04/11 (2) C, Q-ownip-compose): a family (':' = IPv6, as the server) with more than one address in dial.old
+        # or dial.new takes the owner's `<from>=<to>` pairs, so the re-plan never refuses its own output (map-invalid ref=rewrites); the
+        # bare line only for exactly one address per family. A typed line not of the map's `<from>=<to>` form (B.14.2) is not written.
+        $dial = Get-MoveProp $M 'dial'; $do = @(Get-MoveProp $dial 'old' @()); $dn = @(Get-MoveProp $dial 'new' @())
+        if (@(foreach ($v6 in $false, $true) { foreach ($l in @(, $do) + @(, $dn)) { if (@($l | Where-Object { "$_".Contains(':') -eq $v6 }).Count -gt 1) { 1 } } }).Count) {
+          Write-Host ''; Write-Host (Get-MoveText 'Q-ownip-pairs' @{ 'địa chỉ cũ' = ($do -join ', '); 'địa chỉ mới' = ($dn -join ', ') })
+          $pairs = @(); while ($true) { $t = Read-SyncLine ''; if ($null -eq $t -or -not $t.Trim()) { break }; if ($t.Trim() -cmatch '\A[A-Za-z0-9._:-]{1,255}=[A-Za-z0-9._:-]{1,255}\z') { $pairs += $t.Trim() } }
+          foreach ($x in $own) { foreach ($q in $pairs) { $map += "rewrite own-ip $x $q"; $again = $true } }
+        } else { foreach ($x in $own) { $map += "rewrite own-ip $x" }; $again = $true }
+      }
     }
     $ports = @($refs | Where-Object { $_ -cmatch '\AINV refuse public-port\b' } | ForEach-Object { $k = & $kv $_; if ($k['unit'] -and $k['proto'] -and $k['port']) { "$($k['unit'])/$($k['proto'])/$($k['port'])" } })
     if ($ports.Count -and -not $asked['Q-port']) {
@@ -2784,9 +2795,9 @@ function Get-MoveGateIds($S) {
 # D.3 steps 2-9 (the first copy of an attempt). Ruling 04/11 #9 (NEW-2, option (a)): a re-run never re-sends c.init-* to a machine whose
 # status (the verb's agreement check, Test-MoveInitSeen) already shows this move-id at the state's (dir, attempt); when one was skipped,
 # the copy goes on as the D.3 re-run: plan <id> -> c.repin.N on both -> c.prepare.N -> steps 6-8 (Invoke-MoveCopyRefresh).
-# DESIGN-GAP (T10d-NEW2-halfdone, P2): the server writes the move-id before the rest of init (lib/move-run.sh _mvr_init, "the move-id first"), so a failed,
-# interrupted or running c.init-* also shows this move-id; reading: "shows" also needs the machine's last call not to be this attempt's
-# c.init-<machine> left unfinished, so a half-done init runs again under the same id (D.0.5, E-P31; no repin ran after it, same sha).
+# Ruling 04/11 (2) A (T10d-NEW2-halfdone; DESIGN D.0.5 / D.3 rev 1k3.8, E-P31, E-P33): "shows this move-id" means a FINISHED init. The
+# server writes the move-id before the rest of init (lib/move-run.sh _mvr_init), so the machine's last call must not be this attempt's
+# c.init-<machine> with a call_state other than done; a half-done init re-sends the same id (init is idempotent on src and dst).
 # Remaining edge: on new, a fence r.stop-dst sent by the agreement check (new_lost / new_discarded) after a half-done c.init-new becomes
 # new's last call, and the init then counts as done (these flags are not set in phase planned on a normal first copy).
 function Test-MoveInitSeen($S, [string]$M) {
