@@ -12,6 +12,8 @@ import { createApp, HARNESSES, parseConfig, writePrivate, trimScreen, sgrOnly, t
   parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, releaseRunOf, parseUpdates, updateStatusOf, gateStatusOf, gateRunOf, resetReply, RESET_MSG, memo, codexChildMeta, parseGitSync, ompDirName, ompHead, KNOWN_VERSIONS, repoOfLink } from '../server.mjs';
 
 process.env.TZ = 'America/Los_Angeles'; // spend days follow config.json timeZone, never the process zone: a third zone proves it
+// no test may make the loader read the real secrets file: a path that does not exist, unless the caller already chose one
+process.env.FCODE_SECRETS_ENV ||= path.join(os.tmpdir(), `fcode-no-secrets-${process.pid}`, 'env');
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const FAKE = path.join(here, 'fake-tmux.mjs');
@@ -23,7 +25,7 @@ const LOADER = path.join(here, '..', 'box', 'start.sh'); // a checkout has no st
 const shq = (s) => `'${s.replace(/'/g, "'\\''")}'`;
 const ENV_PART = `env LANG=C.UTF-8 LC_ALL=C.UTF-8 'PATH=${HOME}/.local/bin:${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin' `; // the launch before the loader
 // the server makes the secrets path absolute once (path.resolve against its cwd)
-const launchOf = (loader, secrets = process.env.FCODE_SECRETS_ENV || '/run/instabox/secrets/env') => `${ENV_PART}${shq(`FCODE_SECRETS_ENV=${path.resolve(secrets)}`)} /bin/sh ${shq(loader)} `;
+const launchOf = (loader, secrets = process.env.FCODE_SECRETS_ENV) => `${ENV_PART}${shq(`FCODE_SECRETS_ENV=${path.resolve(secrets)}`)} /bin/sh ${shq(loader)} `;
 const LAUNCH = launchOf(LOADER);
 
 async function boot(opts = {}) {
@@ -945,7 +947,7 @@ async function serverCopy(dir, withLoader = true) {
   return import(pathToFileURL(path.join(dir, 'server.mjs')).href);
 }
 
-test('install.sh start.sh: the loader reads GH_TOKEN alone, as data, under a strict whole-file grammar; a hostile file never runs, blocks or prints', { skip: POSIX }, () => {
+test('install.sh start.sh: the loader reads GH_TOKEN alone, as data, under a strict whole-file grammar; a hostile file never runs, blocks or prints', { skip: POSIX }, (t) => {
   const install = fs.readFileSync(path.join(here, '..', 'install.sh'), 'utf8');
   assert.match(install, /\ninstall -m 755 "\$SRC\/box\/start\.sh" "\$APP\/start\.sh"\n/); // the one loader, shared with the harness sessions
   assert.match(install, /ExecStart=\/bin\/sh \$APP\/start\.sh -v \$\(command -v node\) \$APP\/server\.mjs/); // the service passes -v: the journal says why there is no token
@@ -956,6 +958,7 @@ test('install.sh start.sh: the loader reads GH_TOKEN alone, as data, under a str
   // every awk present (mawk, gawk, the PATH one: unique by realpath), each as the `awk` first on PATH: a locale or dialect that breaks one is caught
   const awks = [...new Set(['/usr/bin/mawk', '/usr/bin/gawk', onPath('awk')].filter((p) => p && fs.existsSync(p)).map((p) => fs.realpathSync(p)))];
   assert.ok(awks.length > 0, 'an awk is needed');
+  t.diagnostic(`awks used: ${awks.join(', ')}`);
   const bins = awks.map((a, i) => { const d = path.join(dir, `awk${i}`); fs.mkdirSync(d); fs.symlinkSync(a, path.join(d, 'awk')); return d; });
   const L = (s) => Buffer.from(s, 'latin1'); // a body with raw bytes (\xff, \0)
   // env A: the inherited tokens are stale; env B adds a UTF-8 locale (gawk then rejects an awk regex that is not byte-wise)
@@ -1062,6 +1065,13 @@ test('install.sh start.sh: the loader reads GH_TOKEN alone, as data, under a str
         'GH_TOKEN=~abc\n',
         "GH_TOKEN='\n",
         "GH_TOKEN=''\n",
+        "A='\nGH_TOKEN=t1\n", // a lone quote (drop `length(val) < 2`)
+        'A="x\\"\nGH_TOKEN=t1\n', // a backslash before the closing quote (the dq class)
+        `A="\`touch ${pwn}\`"\nGH_TOKEN=t1\n`, // a backtick in double quotes (the dq class)
+        'A=x(\nGH_TOKEN=t1\n', // a bare `(` (the bare class)
+        'A=x\\\nGH_TOKEN=t1\n', // a bare backslash: a shell joins the next line
+        `A=x>${pwn}\nGH_TOKEN=t1\n`, // a bare `>`: a shell would write the file
+        `A=x<${pwn}\nGH_TOKEN=t1\n`, // a bare `<` (a shell would read the file or fail)
       ].map((b) => [`no token: ${JSON.stringify(Buffer.from(b).toString('latin1'))}`, b, null]),
       // a token
       ...[
@@ -1161,7 +1171,7 @@ test('install.sh start.sh: the loader reads GH_TOKEN alone, as data, under a str
     // name rule self-check: the names bash evaluates as arithmetic on assignment (probed in `-c` AND `-i -c`) must be a subset of the
     // six the loader refuses; a seventh name in a newer bash fails here: add it to the regex in start.sh, a row, and the docs
     if (fs.existsSync('/bin/bash')) {
-      const bash = (args, opts = {}) => spawnSync('/bin/bash', ['--norc', '--noprofile', ...args], { encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'ignore'], ...opts });
+      const bash = (args, opts = {}) => spawnSync('/bin/bash', ['--norc', '--noprofile', ...args], { encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'ignore'], detached: true, ...opts }); // detached (setsid): `-i` opens /dev/tty, which would stop a run in a background job group
       const SIX = ['OPTIND', 'HISTCMD', 'MAILCHECK', 'RANDOM', 'SRANDOM', 'SECONDS'];
       const names = new Set([...bash(['-c', 'compgen -v']).stdout.split('\n'), ...bash(['-i', '-c', 'compgen -v']).stdout.split('\n'),
         ...SIX, 'LINENO', 'BASHPID', 'EPOCHSECONDS', 'EPOCHREALTIME', 'BASH_SUBSHELL', 'DIRSTACK', 'GROUPS', 'FUNCNAME', 'BASH_ARGV0', 'BASH_COMMAND', 'TMOUT', 'HISTSIZE', 'PROMPT_COMMAND', 'PS1']);
@@ -1170,7 +1180,8 @@ test('install.sh start.sh: the loader reads GH_TOKEN alone, as data, under a str
       const marked = (mode) => {
         const hit = [];
         for (const n of [...names].filter((x) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(x))) {
-          spawnSync('/bin/bash', ['--norc', '--noprofile', ...mode, `: "\${${n}-}"; ${n}='x[$(touch ${mdir}/${n})0]'`], { cwd: probeDir, timeout: 5000, stdio: 'ignore', env: { PATH: process.env.PATH, HOME: probeDir } });
+          const r = spawnSync('/bin/bash', ['--norc', '--noprofile', ...mode, `: "\${${n}-}"; ${n}='x[$(touch ${mdir}/${n})0]'`], { cwd: probeDir, timeout: 5000, stdio: 'ignore', detached: true, env: { PATH: process.env.PATH, HOME: probeDir } });
+          assert.ok(r.status !== null && !r.error, `the probe of ${n} (bash ${mode.join(' ')}) did not finish: ${r.error?.message ?? `signal ${r.signal}`}`);
           if (fs.existsSync(path.join(mdir, n))) { hit.push(n); fs.rmSync(path.join(mdir, n)); }
         }
         return hit.sort();
