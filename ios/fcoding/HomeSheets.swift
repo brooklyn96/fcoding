@@ -138,6 +138,11 @@ struct HomeGuideView: View {
             "Vuốt một phiên sang trái để **Đổi tên** hoặc **Đóng**.",
             "Kéo danh sách xuống để làm mới.",
         ]),
+        ("Chọn trong menu", 0xFF9F0A, [
+            "Khi phiên hỏi bạn chọn (ví dụ **1. Yes, proceed** / **2. No, exit**), một thanh nút hiện ngay trên ô nhập, tự hiện và tự ẩn.",
+            "Chạm một nút để chọn mục đó. Nút **Esc** đóng menu.",
+            "Hoặc dùng các phím **↑** **↓** **Enter** ở đầu hàng phím nhanh.",
+        ]),
         ("Lời chào và giờ", 0x64D2FF, [
             "Bên trái thẻ trên cùng: lời chào theo buổi, giờ hiện tại và thứ, ngày hôm nay.",
             "Giờ luôn là **giờ Việt Nam**, kể cả khi iPhone đặt múi giờ khác.",

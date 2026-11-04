@@ -98,6 +98,13 @@ struct SessionView: View {
                 .accessibilityHint(model.imageCancellable ? "Chạm để huỷ ảnh" : model.imageBusy ? "" : "Chạm để ẩn")
             }
 
+            let menu = menuOptions
+            if !menu.isEmpty {
+                ChoiceBar(options: menu, busy: model.inputPending > 0,
+                          onPick: { choose($0, in: menu) },
+                          onEscape: { model.key("Escape") })
+            }
+
             if composerShown {
                 ComposerView(
                     draftKey: "draft.\(name)",
@@ -184,6 +191,20 @@ struct SessionView: View {
     private func hideComposer() {
         composerFocused = false
         composerShown = false
+    }
+
+    /// The numbered menu at the bottom of the shown screen; [] when there is none (or loading).
+    private var menuOptions: [MenuLogic.Option] {
+        MenuLogic.options(String(model.styled.characters).components(separatedBy: "\n"))
+    }
+
+    /// A tap on the choice bar: the keys that move the highlight and confirm, in one queued input.
+    /// Without a single highlight, the number is typed without Enter (Claude selects by number).
+    /// Nothing while another input is queued, so a double tap never fires twice.
+    private func choose(_ option: MenuLogic.Option, in options: [MenuLogic.Option]) {
+        guard model.inputPending == 0 else { return }
+        let keys = MenuLogic.keys(toChoose: option, in: options)
+        _ = keys.isEmpty ? model.send(String(option.number), enter: false) : model.keys(keys)
     }
 
     /// The session name in a harness-coloured chip (as HarnessBadge), cut in the middle when long.
@@ -647,6 +668,59 @@ final class TermTextView: UITextView {
     }
 }
 
+// MARK: - Choice bar
+
+/// One button per option of the numbered menu on screen (the highlighted one marked), then Esc.
+/// Above the composer, or at the bottom while it is hidden; both orientations. Off while an input
+/// is queued or in flight.
+private struct ChoiceBar: View {
+    let options: [MenuLogic.Option]
+    let busy: Bool
+    let onPick: (MenuLogic.Option) -> Void
+    let onEscape: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(options, id: \.number) { o in
+                Button { onPick(o) } label: {
+                    HStack(spacing: 5) {
+                        Text("\(o.number)")
+                            .font(.system(size: 15, weight: .bold, design: .monospaced))
+                            .foregroundColor(o.highlighted ? .accentColor : .secondary)
+                        Text(o.label)
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundColor(.primary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                    .padding(.horizontal, 8)
+                    .frame(maxWidth: .infinity, minHeight: 40)
+                    .background(o.highlighted ? Color.accentColor.opacity(0.22) : Color(uiColor: .tertiarySystemFill),
+                                in: RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.accentColor, lineWidth: o.highlighted ? 1 : 0))
+                }
+                .accessibilityLabel("Chọn \(o.number): \(o.label)")
+                .accessibilityAddTraits(o.highlighted ? .isSelected : [])
+            }
+            Button(action: onEscape) {
+                Text("Esc")
+                    .font(.system(size: 15, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.primary)
+                    .frame(minWidth: 52, minHeight: 40)
+                    .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8))
+            }
+            .accessibilityLabel("Phím Escape, đóng menu")
+        }
+        .opacity(busy ? 0.4 : 1)
+        .disabled(busy)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity)
+        .background(Color(uiColor: .secondarySystemBackground).ignoresSafeArea(edges: .bottom))
+        .overlay(alignment: .top) { Divider() }
+    }
+}
+
 // MARK: - Composer
 
 private struct QuickKey {
@@ -664,17 +738,18 @@ private struct QuickKey {
 private let agentCommands = ["claude": "/tasks", "codex": "/subagents"]
 
 private let quickKeys: [QuickKey] = [
+    // Menu keys first, so they show without scrolling (also in landscape).
     QuickKey(title: "Esc", key: "Escape", label: "Phím Escape"),
+    QuickKey(title: "↑", key: "Up", label: "Mũi tên lên"),
+    QuickKey(title: "↓", key: "Down", label: "Mũi tên xuống"),
+    QuickKey(title: "Enter", key: "Enter", label: "Phím Enter"),
     // omp agent hub (Alt+A): ↑/↓ chọn, Enter mở, Esc đóng. claude /tasks, codex /subagents.
     QuickKey(title: "Agents", key: "M-a", label: "Mở danh sách agent", symbol: "person.2", agents: true),
     QuickKey(title: "Ctrl+C", key: "C-c", label: "Control C, dừng"),
-    QuickKey(title: "↑", key: "Up", label: "Mũi tên lên"),
-    QuickKey(title: "↓", key: "Down", label: "Mũi tên xuống"),
     QuickKey(title: "←", key: "Left", label: "Mũi tên trái"),
     QuickKey(title: "→", key: "Right", label: "Mũi tên phải"),
     QuickKey(title: "Tab", key: "Tab", label: "Phím Tab"),
     QuickKey(title: "⇧Tab", key: "BTab", label: "Shift Tab"),
-    QuickKey(title: "Enter", key: "Enter", label: "Phím Enter"),
     QuickKey(title: "y", key: "y", label: "Chữ y, đồng ý"),
     QuickKey(title: "n", key: "n", label: "Chữ n, từ chối"),
     QuickKey(title: "^O", key: "C-o", label: "Control O, mở rộng", ompOnly: true),

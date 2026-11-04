@@ -218,12 +218,17 @@ final class SessionModel: ObservableObject {
     /// One FIFO chain for keys and sends: each request starts only after the previous one
     /// finished, so "↓ then Enter" reaches tmux in tap order. Enqueued synchronously by the caller.
     private var inputTail: Task<Bool, Never>?
+    /// Queued or running inputs; the choice bar is off while this is above 0.
+    @Published private(set) var inputPending = 0
 
     private func enqueue(_ op: @escaping @MainActor () async -> Bool) -> Task<Bool, Never> {
         let previous = inputTail
-        let job = Task { @MainActor () async -> Bool in
+        inputPending += 1
+        let job = Task { @MainActor [weak self] () async -> Bool in
             _ = await previous?.value
-            return await op()
+            let ok = await op()
+            self?.inputPending -= 1
+            return ok
         }
         inputTail = job
         return job
@@ -249,6 +254,24 @@ final class SessionModel: ObservableObject {
             guard let self = self, let api = self.app?.api else { return false }
             do {
                 try await api.call("POST", "api/key/\(self.name)", body: ["key": key])
+                self.errorText = nil
+                return true
+            } catch {
+                self.fail(error)
+                return false
+            }
+        }
+    }
+
+    /// Queues the keys as one input, each request after the previous one, with its repeat
+    /// (1...20); stops at the first failure so a later Enter never confirms the wrong option.
+    func keys(_ keys: [(key: String, `repeat`: Int)]) -> Task<Bool, Never> {
+        enqueue { [weak self] in
+            guard let self = self, let api = self.app?.api else { return false }
+            do {
+                for k in keys {
+                    try await api.call("POST", "api/key/\(self.name)", body: ["key": k.key, "repeat": k.repeat])
+                }
                 self.errorText = nil
                 return true
             } catch {
