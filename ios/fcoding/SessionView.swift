@@ -622,9 +622,11 @@ struct TerminalText: UIViewRepresentable {
     }
 }
 
-/// Made with `init(usingTextLayoutManager: false)`, which on iOS 16 does not run this subclass's
-/// Swift stored-property initializers: the storage stays zeroed. Only weak or optional stored
-/// properties are allowed here (zero = nil); keep any other state in the Coordinator.
+/// Made with `init(usingTextLayoutManager: false)`, which (at least on iOS 16) does not run this
+/// subclass's Swift stored-property initializers: the storage stays zeroed. Stored properties here
+/// may only be `weak` references, or Optionals of class or array type (zero reads as nil); never a
+/// value type (a zeroed Optional Int or Bool reads as .some(0) / .some(false)) and never an initial
+/// value. Keep any other state in the Coordinator.
 /// (1.3.21 added `marks: [UIView] = []` here: a null array buffer, a crash on every session open.)
 final class TermTextView: UITextView {
     struct Geo: Equatable {
