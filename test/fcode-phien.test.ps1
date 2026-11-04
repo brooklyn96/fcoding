@@ -3719,12 +3719,12 @@ function Use-BareSsh($w) {
   $fake = Join-Path $PSScriptRoot 'fake-ssh.py'
   # BARE_FAIL=<word>,<word>: a call whose word is one of these exits 78 (the box script found no session of that name); BARE_DROP: exits 255 (the ssh dropped)
   $src = @'
-import base64, os, re, subprocess, sys
+import base64, gzip, os, re, subprocess, sys
 a = sys.argv[1:]
 if 'base64 -d' in a[-1] and 'python3' not in a[-1]:
     open(os.environ['BARE_LOG'], 'a', encoding='utf-8').write(a[-1] + '\n')
     open(os.environ['BARE_LOG'] + '.argv', 'a', encoding='utf-8').write(' '.join(a[:-1]) + '\n')   # the options and the host, as fcode gave them
-    t = base64.b64decode(re.search(r'echo (\S+) \|', a[-1]).group(1)).decode('utf-8')
+    t = gzip.decompress(base64.b64decode(re.search(r'echo (\S+) \|', a[-1]).group(1))).decode('utf-8')
     w = re.search(r"(?m)^set -- '(.*)'", t).group(1)
     sys.exit(78 if w in os.environ.get('BARE_FAIL', '').split(',') else 255 if w in os.environ.get('BARE_DROP', '').split(',') else 0)
 sys.exit(subprocess.call([sys.executable, r'@@FAKE@@'] + a))
@@ -3737,7 +3737,8 @@ function Get-BareArgs($w) {   # the word each bare call put in `set -- '<word>'`
   if (-not (Test-Path $w.BareLog)) { return @() }
   @(Get-Content $w.BareLog | Where-Object { $_ } | ForEach-Object {
     $b = [regex]::Match($_, 'echo (\S+) \|').Groups[1].Value
-    $t = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b))
+    $gs = New-Object IO.Compression.GZipStream((New-Object IO.MemoryStream (, [Convert]::FromBase64String($b))), [IO.Compression.CompressionMode]::Decompress)
+    $sr = New-Object IO.StreamReader($gs, [Text.Encoding]::UTF8); $t = $sr.ReadToEnd(); $sr.Dispose()
     [regex]::Match($t, "(?m)^set -- '(.*)'").Groups[1].Value })
 }
 T 'alias e2e: the bare form turns an alias into the real name before the script goes to the box; a number, a session name and a real name go through as typed' {
@@ -3752,6 +3753,8 @@ T 'bare form: `ssh -q -tt <host> <script>` with the host from config (default or
   $r = Invoke-Fcode $w @('omp-2') @{ BARE_LOG = $w.BareLog; FCODE_HOST = 'oracle-ubuntu' }; Eq $r.Code 0 $r.Out
   $r = Invoke-Fcode $w @('--list') @{ BARE_LOG = $w.BareLog }; Eq $r.Code 0 $r.Out
   Eq ((Get-Content ($w.BareLog + '.argv')) -join '|') '-q -tt oracle|-q -tt oracle-ubuntu|oracle'
+  $rem = @(Get-Content $w.BareLog)[0]
+  Ok ($rem -match '\Abash <\(echo [A-Za-z0-9+/=]+ \| base64 -d \| gunzip\)\z' -and $rem.Length -lt 6000) ("the script travels gzip+base64, well under cmd.exe's 8191 limit (a .cmd ssh wrapper); length " + $rem.Length)
   $cfg = Join-Path $w.U '.fcode\config.json'; $c = Get-Content $cfg -Raw | ConvertFrom-Json
   [IO.File]::WriteAllText($cfg, (@{ ssh = $c.ssh; host = 'other-alias'; box = 'ignored'; syncRepos = @($w.LP) } | ConvertTo-Json -Compress))
   Remove-Item ($w.BareLog + '.argv')
@@ -3911,7 +3914,8 @@ T 'alias: the box script shows "alias (real name)" in the session list and the `
     Ok ($r.Out.Contains('  2) a$(echo PWNED)b?;x (other)')) 'a tab became ?, the text was not run'
     Ok ($r.Out -notmatch '(?m)^PWNED' -and -not $r.Out.Contains('zzz')) 'nothing ran; a name that is no project name is not sent'
     Ok ($r.Out.Contains('Đang mở phiên mới (Cửa hàng (deal-sync), omp)')) ("opening line; out: " + $r.Out)
-    Ok ($r.Log.Contains('fcode-new deal-sync omp') -and $r.Log.Contains('tmux -u attach -t =deal-sync-omp')) ("the real name went to fcode-new; log: " + $r.Log)
+    Ok ($r.Log.Contains('fcode-new deal-sync omp') -and $r.Log.Contains('tmux -u attach -t =deal-sync-omp ;')) ("the real name went to fcode-new; log: " + $r.Log)
+    Ok ($r.Log.Contains('tmux -u attach -t =deal-sync-omp ; set-option -w window-size latest ; set-option mouse on' + "`n")) ("after the attach: the window follows this client (latest, not a frozen resize), the wheel scrolls (mouse on, this session only); log: " + $r.Log)
   }
   With-PrefsCache $null {
     $r = Invoke-BareScript (Get-BareScript '--list') '' 'list0'
