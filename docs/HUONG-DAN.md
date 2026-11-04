@@ -36,7 +36,8 @@ Tính năng chính:
 - Trò chuyện với **omp**, **Claude Code** hoặc **Codex** chạy trong tmux trên box. (Máy chủ vẫn chạy được **shell** (bash), nhưng app không còn liệt kê shell.)
 - **Hộp thư tổng quan**: mọi phiên được chia thành **Cần bạn**, **Đang chạy** và **Đang nghỉ**. Việc cần bạn trả lời luôn nằm trên cùng.
 - **Trả lời y/n ngay trên danh sách**, không cần mở phiên.
-- **Hàng phím nhanh**: Esc, Ctrl+C, mũi tên, Tab, Shift+Tab, Enter, y, n, **Agents** (phiên omp, Claude Code và Codex) và **^O** (chỉ trong phiên omp), cùng nút `/` cho các lệnh hay dùng.
+- **Chọn trong menu bằng một chạm**: khi phiên hỏi bạn chọn (một menu có một dòng đang được chọn), chạm ngay dòng đó trên màn hình hoặc nút của nó trên thanh chọn.
+- **Hàng phím nhanh**: Esc, ↑, ↓, Enter, **Agents** (phiên omp, Claude Code và Codex), Ctrl+C, ←, →, Tab, Shift+Tab, y, n và **^O** (chỉ trong phiên omp), cùng nút `/` cho các lệnh hay dùng.
 - **Gõ tiếng Việt** bình thường bằng bàn phím iPhone; chữ được gửi nguyên vẹn lên box.
 - **Phiên mới bằng nút +**: chọn chương trình và dự án, luôn tạo phiên mới.
 - Ghép máy bằng **mã 6 số**, không có mật khẩu; iPhone mới ghép thêm được bằng **mã QR** (`fcode-pair --qr`, hoặc `fcode pair` trên laptop).
@@ -286,7 +287,16 @@ Hướng dẫn đầy đủ cho app nằm ở [ios/README.md, mục 4](../ios/RE
 - Nút **ghim** trên ô nhập: khi ghim, ô nhập hiện sẵn mỗi lần mở phiên và vẫn ở lại sau khi gửi. Bấm lần nữa để bỏ ghim. App nhớ lựa chọn này.
 - **Màu và biểu tượng**: màn hình hiện đúng màu của chương trình (chữ, nền, đậm, nghiêng, gạch chân), nên dễ phân biệt lỗi, phần thêm/xóa của diff hay mục đang chọn. Các biểu tượng đặc biệt (nhánh git, thư mục…) hiện đúng nhờ font Nerd Font đi kèm app. Tên phiên ở thanh trên nằm trong nhãn màu theo chương trình (claude cam, omp tím, codex xanh).
 - Link trong màn hình được gạch chân; chạm để mở trong trình duyệt. Link dài bị omp cắt xuống dòng thường vẫn mở đúng cả link. Nhấn giữ để chép chữ trên màn hình.
-- Hàng phím nhanh: Esc, **Agents**, Ctrl+C, mũi tên, Tab, ⇧Tab, Enter, y, n, **^O**. Nút `/` chèn các lệnh hay dùng như `/model`, `/clear`. Phím được gửi đúng thứ tự bạn bấm.
+- Hàng phím nhanh: Esc, ↑, ↓, Enter, **Agents**, Ctrl+C, ←, →, Tab, ⇧Tab, y, n, **^O**. Nút `/` chèn các lệnh hay dùng như `/model`, `/clear`. Phím được gửi đúng thứ tự bạn bấm.
+- **Chọn trong menu**: khi phiên hỏi bạn chọn, tức là hiện một menu có **một dòng đang được chọn** (dấu ❯ hay ›; ví dụ câu hỏi tin thư mục của Claude **No, exit** / **Yes, I trust this folder**, câu hỏi xin quyền chạy lệnh, câu hỏi của Claude có nhiều lựa chọn, câu hỏi xin quyền của Codex, hộp **Ask** của omp), app cho bạn chọn bằng một chạm theo hai cách:
+  - Chạm **ngay dòng lựa chọn trên màn hình**: các dòng lựa chọn có nền màu nhạt (dòng đang được chọn đậm hơn).
+  - Hoặc chạm **nút của nó trên thanh chọn** hiện ngay trên ô nhập (cả khi xoay ngang, cả khi ô nhập đang ẩn). Chữ trên màn hình nhỏ thì dùng thanh này cho dễ.
+  - App tự bấm ↑ / ↓ tới đúng dòng rồi Enter. Ở câu hỏi chọn nhiều (ô `[ ]`), chạm một dòng chỉ đánh dấu hoặc bỏ đánh dấu dòng đó (phím Space), chưa gửi; chọn xong thì chạm **Submit**. Dòng **Type something** của Claude: app chỉ đưa con trỏ tới đó, bạn gõ thẳng câu trả lời vào dòng đó rồi Enter để gửi (không cần Enter trước khi gõ); Esc huỷ cả câu hỏi. Dòng **Other (type your own)** của omp: app đưa con trỏ tới đó và bấm Enter, omp mở ô **Custom answer**; bạn gõ câu trả lời rồi bấm Enter (hoặc Ctrl+Q) để gửi, bấm Esc để quay lại danh sách lựa chọn. Câu hỏi có nhiều trang thì thanh có thêm nút **←** / **→** để sang câu trước / câu sau. Nút **Esc** đóng menu.
+  - Dòng mình gõ đã gửi, chữ đang soạn hay danh sách có số trong câu trả lời không làm hiện thanh: chỉ menu đang chờ bạn chọn mới hiện.
+  - Nhiều lựa chọn quá thì phần nút lựa chọn kéo ngang được (nút đang được chọn tự hiện ra); **←** / **→** và **Esc** luôn nằm cố định bên phải.
+  - Sau mỗi lần chạm (hay mỗi phím, dòng chữ bạn gửi), thanh và các dòng mờ đi tới khi màn hình bạn đang thấy giống hệt màn hình app vừa hỏi lại box (thường khoảng nửa giây). Nhờ vậy chạm hai lần không gửi hai lần, và app không bấm theo màn hình đã cũ. Lúc mờ, cả nút **Esc**, **←**, **→** trên thanh cũng mờ theo; nếu thanh vẫn mờ, dùng ↑ ↓ Enter (và Esc) ở hàng phím nhanh.
+  - Hiếm khi: nếu chương trình vẽ lại chậm hơn khoảng nửa giây, hay tự đổi màn hình đúng lúc bạn chạm, lần chạm vẫn có thể rơi vào màn hình vừa bị thay. Nhìn lại màn hình trước khi chạm vào câu hỏi quan trọng.
+  - Chạm để dừng màn hình đang trượt, hay giữ ngón tay để bôi đen chữ trên một dòng lựa chọn, không chọn dòng đó.
 - **Agents**: mở danh sách agent con. Phím **Agents** không hiện ở phiên shell hay phiên không rõ chương trình.
   - Phiên omp: gửi Alt+A, mở Agent Hub. Dùng ↑↓ chọn, Enter mở, Esc đóng.
   - Phiên Claude Code: gõ lệnh `/tasks` rồi Enter. Lệnh chạy ngay cả khi Claude đang làm. Bấm Enter để mở một subagent; các phím khác xem trên màn hình. Bấm Esc đóng danh sách trước khi gửi chữ: trong danh sách, phím `x` dừng subagent đang chọn (`f` đưa nó lên trước).
