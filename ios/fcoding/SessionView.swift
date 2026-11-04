@@ -528,6 +528,8 @@ struct TerminalText: UIViewRepresentable {
         var marksDirty = false
         /// Each marked option line, in content coordinates.
         var optionRects: [(rect: CGRect, option: MenuLogic.Option)] = []
+        /// The accent views behind those lines (held here: see the note on `TermTextView`).
+        var marks: [UIView] = []
         var reading = ScreenFeed.Reading(record: nil)
         var positionKey = ""
         var bottomRequest = 0
@@ -620,6 +622,10 @@ struct TerminalText: UIViewRepresentable {
     }
 }
 
+/// Made with `init(usingTextLayoutManager: false)`, which on iOS 16 does not run this subclass's
+/// Swift stored-property initializers: the storage stays zeroed. Only weak or optional stored
+/// properties are allowed here (zero = nil); keep any other state in the Coordinator.
+/// (1.3.21 added `marks: [UIView] = []` here: a null array buffer, a crash on every session open.)
 final class TermTextView: UITextView {
     struct Geo: Equatable {
         var size: CGSize
@@ -667,11 +673,9 @@ final class TermTextView: UITextView {
 
     /// Light accent backgrounds behind the live menu's option lines (stronger on the highlighted
     /// one, dimmed while locked), their tap rects, and one VoiceOver action per option.
-    private var marks: [UIView] = []
-
     private func placeMarks(_ c: TerminalText.Coordinator) {
-        marks.forEach { $0.removeFromSuperview() }
-        marks = []
+        c.marks.forEach { $0.removeFromSuperview() }
+        c.marks = []
         c.optionRects = []
         guard let menu = c.menu, let lines = c.lines else {
             accessibilityCustomActions = nil
@@ -690,7 +694,7 @@ final class TermTextView: UITextView {
             mark.layer.cornerRadius = 4
             mark.isUserInteractionEnabled = false
             insertSubview(mark, at: 0)
-            marks.append(mark)
+            c.marks.append(mark)
             c.optionRects.append((rect: rect, option: o))
         }
         accessibilityCustomActions = c.locked ? nil : menu.options.map { o in
