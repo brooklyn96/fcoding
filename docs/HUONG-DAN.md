@@ -368,11 +368,11 @@ Từ v1.3.2, bạn thêm dự án GitHub vào box ngay trên iPhone, không cầ
 | thoát 25 | Box không ghi được cấu hình đăng nhập GitHub cho repo này. |
 | thoát 26 | Cấu hình git trên box đang chuyển hướng địa chỉ GitHub (`insteadOf`, `pushInsteadOf`, `pushurl`): gỡ trên box rồi chạy lại. |
 | `ADDED_WARN` (30) | Đã thêm nhưng có mục cần xem lại, ví dụ không xóa được nhánh thử `box/fcode-add-check-…` (xóa nhánh đó trên GitHub). Dự án vẫn dùng được. |
-| `TIMEOUT` (124 / 137) | Quá 10 phút nên bị dừng; chạy lại là an toàn. |
+| `TIMEOUT` (137) | Quá 10 phút nên bị dừng; chạy lại là an toàn. |
 
 Thêm lại một dự án đã có (cùng tên, cùng repo) không làm gì và báo thành công (`ADDED`, thoát 0).
 
-**Làm tay trên box**: `timeout --kill-after=30 600 bash /data/home/fcoding/fcode-add.sh <chủ/repo> <tên>` (script do `install.sh` cài; tự nó không có giới hạn thời gian, nên lệnh làm tay cần `timeout` như trên). Giới hạn 10 phút tự động chỉ áp dụng khi thêm từ app và bằng `fcode add`; thêm lỗi chỉ xóa thư mục do chính lần đó tạo ra, thư mục có sẵn từ trước không bao giờ bị xóa; thêm lại cùng một repo là an toàn. Cách làm tương đương trên laptop: `fcode add <chủ/repo> [tên]`.
+**Làm tay trên box**: `fcode-add <chủ/repo> <tên>` (lệnh do `install.sh` cài, cùng giới hạn 10 phút như app; quá giờ thì bị dừng và thoát mã 137). Bấm **Ctrl+C** cũng dừng lệnh: box cần tối đa 30 giây để dọn xong rồi lệnh mới trả về (mã 137). Lỡ tắt cửa sổ thì box vẫn tự dọn trong 30 giây đó. Nếu gõ `fcode-add` mà box báo "command not found" thì box còn bản cũ; nếu lệnh in `R NO_SCRIPT` và thoát mã 3 thì box thiếu một phần của bản mới. Cả hai cách xử lý giống nhau, chạy trên box: `cd ~/fcode-src && git pull && bash install.sh`. Giới hạn 10 phút tự động áp dụng khi thêm từ app, bằng `fcode add` trên laptop và bằng lệnh `fcode-add` làm tay; thêm lỗi chỉ xóa thư mục do chính lần đó tạo ra, thư mục có sẵn từ trước không bao giờ bị xóa; thêm lại cùng một repo là an toàn. Cách làm tương đương trên laptop: `fcode add <chủ/repo> [tên]`.
 
 ### Gửi ảnh trong chat
 
@@ -485,7 +485,7 @@ fcode new       # mở phiên mới: chọn dự án và harness (hoặc gõ 0 t
   - Hỏi bạn xác nhận hoặc chọn một thư mục tìm thấy, hoặc dán đường dẫn khác (mặc định `Desktop\<tên>`). Thư mục phải là git và có cùng origin GitHub với project; thư mục trống hoặc chưa có thì được clone về.
   - Thư mục được thêm vào `syncRepos` trong `%USERPROFILE%\.fcode\config.json` và đồng bộ ngay một lần.
   - Nếu đã đặt biến `FCODE_SYNC_REPOS` thì bước này được bỏ qua.
-- `fcode add <chủ/repo> [tên]`: thêm một dự án GitHub vào box để omp làm việc và hiện trong danh sách của app. Lệnh chạy script đã cài sẵn trên box: nếu token GitHub của box ghi được thì xong luôn, không cần khóa. Nếu không, lệnh hiện khóa công khai kèm các bước dán vào trang GitHub của repo, chờ bạn bấm Enter rồi thử lại. Nếu box chưa có script, lệnh báo `cd ~/fcode-src && git pull && bash install.sh` (chạy trên box). Xong lệnh gợi ý chạy `fcode sync` để có project này cả trên laptop.
+- `fcode add <chủ/repo> [tên]`: thêm một dự án GitHub vào box để omp làm việc và hiện trong danh sách của app. Lệnh chạy lệnh `fcode-add` đã cài sẵn trên box (giới hạn 10 phút): nếu token GitHub của box ghi được thì xong luôn, không cần khóa. Nếu không, lệnh hiện khóa công khai kèm các bước dán vào trang GitHub của repo, chờ bạn bấm Enter rồi thử lại. Nếu box chưa có lệnh `fcode-add` (box cũ, chưa cập nhật), lệnh báo `cd ~/fcode-src && git pull && bash install.sh` (chạy trên box). Xong lệnh gợi ý chạy `fcode sync` để có project này cả trên laptop.
 - `fcode pair [tên thiết bị]`: tạo mã ghép kèm mã QR cho iPhone mới (cần `publicUrl`, xem [mục 6](#ghép-thêm-iphone-bằng-mã-qr)).
 - `fcode ipa`: tải bản app mới nhất về `Downloads\fcode.ipa`. Khi có bản mới, kéo file này vào Sideloadly và bấm Start; việc tự ký lại 7 ngày của Sideloadly chỉ gia hạn bản đang cài, không tự cập nhật. Không có `fcode` thì tải `fcode.ipa` từ **Releases** trên GitHub.
 

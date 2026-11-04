@@ -536,7 +536,19 @@ function New-World([string]$Name) {
   $cfg = Join-Path $w 'boxcfg.json'
   [IO.File]::WriteAllText($cfg, (@{ projects = @{ proj = $bp; other = ($w -replace '\\', '/') + '/boxws/other' } } | ConvertTo-Json -Compress))
   [IO.File]::WriteAllText((Join-Path $u '.fcode\config.json'), (@{ ssh = $Cmd; host = 'oracle'; syncRepos = @($lp, (Join-Path $u 'Desktop\other'), (Join-Path $u 'Desktop\notonbox')) } | ConvertTo-Json -Compress))
-  [pscustomobject]@{ W = $w; U = $u; LP = $lp; BH = $bh; BP = $bp; Cfg = $cfg
+  # the box CLI that $FcodeAddRun hands over to ($HOME/.local/bin/fcode-add; Invoke-Fcode points HOME at the world's home for `add`). A stand-in with the contract of box/fcode-add-run.sh
+  # (no node or server.mjs needed here): missing script -> "R NO_SCRIPT" + 3; the job's own code; 137 after the deadline (GNU timeout says 124 on TERM, the real watchdog KILLs the group and says 137)
+  $fb = Join-Path $u '.local\bin'; [void](New-Item -ItemType Directory -Path $fb -Force)
+  [IO.File]::WriteAllText((Join-Path $fb 'fcode-add'), (@'
+#!/bin/sh
+s="${FCODE_ADD_SCRIPT:-/data/home/fcoding/fcode-add.sh}"
+[ -f "$s" ] || { echo "R NO_SCRIPT"; exit 3; }
+timeout --kill-after="${FCODE_ADD_KILL_AFTER_S:-30}" "${FCODE_ADD_TIMEOUT_S:-600}" bash "$s" "$@"
+rc=$?
+[ "$rc" -eq 124 ] && rc=137
+exit "$rc"
+'@ -replace "`r`n", "`n") + "`n", $utf8)
+  [pscustomobject]@{ W = $w; U = $u; LP = $lp; BH = $bh; BP = $bp; Cfg = $cfg; FakeBox = $true
     LS = Join-Path $u ('.omp\agent\sessions\' + (Get-OmpEncodedDir $lp $u (Join-Path $u 'AppData\Local\Temp')))
     BS = Join-Path $bh ('.omp\agent\sessions\' + (Get-OmpEncodedDir $bp ($bh -replace '\\', '/') (Join-Path $u 'AppData\Local\Temp')))
     LBlobs = Join-Path $u '.omp\agent\blobs'; BBlobs = Join-Path $bh '.omp\agent\blobs'; Log = Join-Path $w 'ssh.log' }
@@ -547,6 +559,7 @@ function Invoke-Fcode($World, [string[]]$FArgs, [hashtable]$ExtraEnv = @{}, [str
   $ErrorActionPreference = 'Continue'   # Windows PowerShell 5.1 turns native stderr into errors under Stop
   $save = @{}
   $set = @{ USERPROFILE = $World.U; LOCALAPPDATA = (Join-Path $World.U 'AppData\Local'); FCODE_PHIEN_BOXENV = ('HOME=' + ($World.BH -replace '\\', '/') + ' FCODE_CFG=' + ($World.Cfg -replace '\\', '/')); FAKE_SSH_LOG = $World.Log; TEMP = (Join-Path $World.U 'AppData\Local\Temp'); TMP = (Join-Path $World.U 'AppData\Local\Temp') }
+  if ($World.FakeBox -and $FArgs.Count -and $FArgs[0] -eq 'add') { $set['HOME'] = $World.U }   # the fake box runs the add script with Git's bash: its $HOME must hold the stand-in fcode-add (never the real home)
   foreach ($k in $ExtraEnv.Keys) { $set[$k] = $ExtraEnv[$k] }
   foreach ($k in $set.Keys) { $save[$k] = [Environment]::GetEnvironmentVariable($k); [Environment]::SetEnvironmentVariable($k, $set[$k]) }
   try {
@@ -956,15 +969,15 @@ if ($env:FCODE_TEST_BOX) {
       Eq (Invoke-RealBox "grep -c '`"id`":`"b`"' $sd/$an") '1' 'updated once nothing holds it'
     } finally { [void](Invoke-RealBox "kill `$(cat $bt/pid 2>/dev/null) 2>/dev/null; rm -rf $bt; echo ok") }
   }
-  T 'real box: fcode add runs the box script under timeout: a stalled script is stopped (124, or 137 when it ignores TERM) and leaves no process' {
+  T 'real box: fcode add runs the box script through the box CLI fcode-add under the server watchdog: a stalled script (also one that ignores TERM) is stopped (137, never 124) and leaves no process' {
     $bt = Invoke-RealBox 'mktemp -d /tmp/fcode-phien-test-XXXXXXXX'; Ok ($bt -match '\A/tmp/fcode-phien-test-[A-Za-z0-9]{8}\z') "throwaway dir: $bt"
-    $w = New-World 'real3'
+    $w = New-World 'real3'; $w.FakeBox = $false   # the real box: its own $HOME/.local/bin/fcode-add, and the real ssh must not see a changed HOME
     [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ host = 'oracle'; syncRepos = @() } | ConvertTo-Json -Compress))
     try {
       $n1 = Get-Random -Minimum 100000 -Maximum 199999; $n2 = $n1 + 1   # sleep lengths unique to this run: the process check sees only ours
       [void](Invoke-RealBox "cat > $bt/stall.sh" $utf8.GetBytes("echo 'R TOKEN_OK'`nsleep $n1`n"))
       [void](Invoke-RealBox "cat > $bt/stallterm.sh" $utf8.GetBytes("trap '' TERM`necho 'R TOKEN_OK'`nsleep $n2`n"))
-      foreach ($c in @(@{ S = 'stall.sh'; Code = 124 }, @{ S = 'stallterm.sh'; Code = 137 })) {
+      foreach ($c in @(@{ S = 'stall.sh'; Code = 137 }, @{ S = 'stallterm.sh'; Code = 137 })) {
         $sw = [Diagnostics.Stopwatch]::StartNew()
         $r = Invoke-Fcode $w @('add', 'owner/repo') @{ FCODE_ADD_SCRIPT = "$bt/$($c.S)"; FCODE_ADD_TIMEOUT_S = '2'; FCODE_ADD_KILL_AFTER_S = '2' }
         Ok ($sw.Elapsed.TotalSeconds -lt 90) "returned in $([int]$sw.Elapsed.TotalSeconds) s"
@@ -1564,11 +1577,17 @@ T 'add: fcode add runs the script installed on the box (token path: no key step)
   Eq ((Get-Content ($log -replace '/', '\')) -join '|') 'ARGS Owner/Repo-X repo-x' 'arguments'
   Ok ($r.Out -match 'chạy fcode sync') 'points to fcode sync for the laptop copy'
 }
-T 'add: a box without the installed script is told to update the box' {
+T 'add: a box without the installed script, or without the box CLI fcode-add, is told to update the box (install.sh), no retry' {
   $w = New-World 'add2'
   $r = Invoke-Fcode $w @('add', 'owner/repo') @{ FCODE_ADD_SCRIPT = (ConvertTo-Posix (Join-Path $w.W 'missing\fcode-add.sh')) }
   Eq $r.Code 1 $r.Out
-  Ok ($r.Out -match 'box chưa có script thêm dự án' -and $r.Out -match 'cd ~/fcode-src && git pull && bash install\.sh') ("told; out: " + $r.Out)
+  Ok ($r.Out -match 'cd ~/fcode-src && git pull && bash install\.sh') ("told; out: " + $r.Out)
+  Eq (@(Get-Content $w.Log | Where-Object { $_ -eq 'ssh script' }).Count) 1 'no retry'
+  $w = New-World 'add2b'; Remove-Item (Join-Path $w.U '.local\bin\fcode-add')   # no CLI on the box at all (a box that was never updated)
+  $fa = Join-Path $w.W 'fake-add.sh'; New-FakeAdd $fa 'echo "R CFG_EXISTS"; exit 0'
+  $r = Invoke-Fcode $w @('add', 'owner/repo') @{ FCODE_ADD_SCRIPT = (ConvertTo-Posix $fa) }
+  Eq $r.Code 1 $r.Out
+  Ok ($r.Out -match 'cd ~/fcode-src && git pull && bash install\.sh' -and $r.Out -notmatch 'đã có trên box') ("told, the script was not run; out: " + $r.Out)
   Eq (@(Get-Content $w.Log | Where-Object { $_ -eq 'ssh script' }).Count) 1 'no retry'
 }
 T 'add: the box script goes over plain `ssh <host> <command>` (no options, no wake), host from FCODE_HOST' {
@@ -1626,17 +1645,21 @@ T 'add r6: re-add (only CFG_EXISTS) is success; CFG_WARN is a warning; exits 25 
     Ok ($r.Out -notmatch 'chạy lại là an toàn' -or $c.B -match 'CFG_WARN') ("no false retry promise; out: " + $r.Out)
   }
 }
-T 'add r7: the box script runs under the same timeout as the server (600 s, KILL 30 s later); a stalled script is stopped and told as a safe retry' {
+T 'add r7: the wrapper hands over to the box CLI fcode-add (same watchdog as the server: 600 s, KILL 30 s later) and nothing else; after the deadline the CLI answers 137 and it is told as a safe retry' {
   $runAst = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$FcodeAddRun' }, $true)
   $FcodeAddRun = $null; Invoke-Expression $runAst.Extent.Text
-  Ok ($FcodeAddRun -match '(?m)^exec timeout --kill-after="\$\{FCODE_ADD_KILL_AFTER_S:-30\}" "\$\{FCODE_ADD_TIMEOUT_S:-600\}" bash "\$s" "\$@"$') ("wrapper: " + $FcodeAddRun)
+  Ok ($FcodeAddRun -match '(?m)^export FCODE_ADD_SCRIPT FCODE_ADD_TIMEOUT_S FCODE_ADD_KILL_AFTER_S$') ("wrapper exports the test overrides: " + $FcodeAddRun)
+  Ok ($FcodeAddRun -match '(?m)^f="\$HOME/\.local/bin/fcode-add"$') ("wrapper names the box CLI: " + $FcodeAddRun)
+  Ok ($FcodeAddRun -match '(?m)^\[ -x "\$f" \] \|\| \{ echo "R NO_SCRIPT"; exit 3; \}$') ("wrapper: a box without the CLI says R NO_SCRIPT, exit 3: " + $FcodeAddRun)
+  Ok ($FcodeAddRun -match '(?m)^exec "\$f" "\$@"$') ("wrapper: exec of the CLI, arguments passed on: " + $FcodeAddRun)
+  Ok ($FcodeAddRun -cnotmatch 'timeout|bash "\$s"') ("no own timeout and no direct script run any more: " + $FcodeAddRun)
   $w = New-World 'add6'; $fa = Join-Path $w.W 'fake-add.sh'
-  foreach ($c in @(@{ B = "echo 'R TOKEN_OK'`nsleep 297"; Code = 124 }, @{ B = "trap '' TERM`necho 'R TOKEN_OK'`nsleep 297"; Code = 137 })) {
+  foreach ($c in @(@{ B = "echo 'R TOKEN_OK'`nsleep 297" }, @{ B = "trap '' TERM`necho 'R TOKEN_OK'`nsleep 297" })) {   # the watchdog KILLs the whole group, so both end in 137 (never 124)
     New-FakeAdd $fa $c.B
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $r = Invoke-Fcode $w @('add', 'owner/repo') @{ FCODE_ADD_SCRIPT = (ConvertTo-Posix $fa); FCODE_ADD_TIMEOUT_S = '2'; FCODE_ADD_KILL_AFTER_S = '2' }
     Ok ($sw.Elapsed.TotalSeconds -lt 60) "returned in $([int]$sw.Elapsed.TotalSeconds) s"
-    Eq $r.Code 1 $r.Out; Ok ($r.Out -match "chạy quá 10 phút nên đã bị dừng \(mã $($c.Code)\)\. Chạy lại là an toàn: fcode add owner/repo repo") ("told; out: " + $r.Out)
+    Eq $r.Code 1 $r.Out; Ok ($r.Out -match "chạy quá 10 phút nên đã bị dừng \(mã 137\)\. Chạy lại là an toàn: fcode add owner/repo repo") ("told; out: " + $r.Out)
   }
 }
 T 'add r7: the test-only limit overrides take positive integers only (0 would mean no limit for timeout)' {

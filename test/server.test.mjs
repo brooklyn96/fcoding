@@ -7300,3 +7300,256 @@ test('GET /api/home?fresh=1: the quota and the reset listing are read side by si
   assert.ok(took >= 1400 && took < 2700, `took ${took} ms`); // in series it would be 3 s and more
   assert.deepEqual([resetsOf(h), pct(h), h.accounts.every((a) => !a.stale)], [3, 42, true]);
 }));
+
+// ======================= box/fcode-add-run.sh: the box CLI `fcode-add` (laptop `fcode add` and the owner's manual entry) =======================
+// It runs the installed fcode-add.sh under the server's own ADD_WATCHDOG (read from server.mjs, never a copy), under setsid. Its deadline exit is 137.
+const ADD_RUN = path.join(here, '..', 'box', 'fcode-add-run.sh');
+const REPO_ROOT = path.join(here, '..');
+const addRunEnv = (vars) => envWith({ HOME: os.tmpdir(), PATH: `${path.dirname(process.execPath)}${path.delimiter}${process.env.PATH}`, FCODE_APP: REPO_ROOT,
+  FCODE_ADD_SCRIPT: undefined, FCODE_ADD_TIMEOUT_S: undefined, FCODE_ADD_KILL_AFTER_S: undefined, ...vars });
+// Every run spawns its child detached (own session and group, as sshd or a tty gives it). 'direct': the CLI itself is that group's leader (`ssh box fcode-add …`, or an
+// interactive job; the laptop's payload is the 'parent' shape: bash -c leads, bash -l execs the CLI); 'parent': a bash leader runs the CLI in the foreground, so the CLI is a plain member of that group (no leader), and reports the CLI's
+// status (`rc=`) and a bystander of that group (`bystander up|gone`); 'bg': like 'parent', but the CLI runs in the background and its pid is printed (`cli=`).
+// sendSig: { sig, when }: once when() holds (via 'bg' also once `cli=` is out) the signal goes to the CLI's own pid ('bg'), or to the CLI's whole
+// group ('direct', which is what a tty does on Ctrl-C or a hangup). The watchdog and the job live in their own session (setsid), out of the caller's
+// group, so the cap must end both: it kills the caller's group and the job's group (the job writes its pgid to $FCODE_TEST_PGID, see addRunScript),
+// and resolves even when the pipes do not close.
+function runAddCli(env, { args = ['o/r', 'name'], via = 'parent', capMs = 20000, sendSig } = {}) {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    const pgidFile = env.FCODE_TEST_PGID ?? (env.FCODE_ADD_SCRIPT ? path.join(path.dirname(env.FCODE_ADD_SCRIPT), 'job.pgid') : undefined);
+    if (pgidFile) fs.rmSync(pgidFile, { force: true });
+    const argv = via === 'direct' ? ['/bin/sh', [ADD_RUN, ...args]]
+      : via === 'bg' ? ['/bin/bash', ['-c', 'sleep 1000 & b=$!; /bin/sh "$0" "$@" & c=$!; echo "cli=$c"; wait $c; rc=$?; if kill -0 $b 2>/dev/null; then echo "bystander up"; else echo "bystander gone"; fi; kill $b 2>/dev/null; echo "rc=$rc"', ADD_RUN, ...args]]
+      : ['/bin/bash', ['-c', 'sleep 1000 & b=$!; /bin/sh "$0" "$@"; rc=$?; if kill -0 $b 2>/dev/null; then echo "bystander up"; else echo "bystander gone"; fi; kill $b 2>/dev/null; echo "rc=$rc"', ADD_RUN, ...args]];
+    const p = spawn(argv[0], argv[1], { env: addRunEnv({ ...env, ...(pgidFile && { FCODE_TEST_PGID: pgidFile }) }), stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    let out = '', err = '', capped = false, done = false, sigAt = 0;
+    const finish = (code, signal) => {
+      if (done) return; done = true; clearTimeout(cap);
+      resolve({ code, signal, out, err, ms: Date.now() - t0, sigAt, capped, rc: /^rc=(\d+)$/m.exec(out)?.[1] ?? null, bystander: /^bystander (\w+)$/m.exec(out)?.[1] ?? null });
+    };
+    p.stdout.on('data', (d) => { out += d; }); p.stderr.on('data', (d) => { err += d; });
+    if (sendSig) waitFor(() => sendSig.when() && (via !== 'bg' || /^cli=\d+$/m.test(out)), capMs).then(() => {
+      sigAt = Date.now();
+      process.kill(via === 'bg' ? Number(/^cli=(\d+)$/m.exec(out)[1]) : -p.pid, sendSig.sig);
+    }).catch(() => {});
+    const cap = setTimeout(() => {
+      capped = true;
+      killJobGroup(pgidFile);
+      try { process.kill(-p.pid, 'SIGKILL'); } catch {}
+      setTimeout(() => finish(null, 'SIGKILL'), 3000);
+    }, capMs);
+    p.on('close', finish);
+  });
+}
+// SIGKILLs the process group whose id the job wrote to pgidFile (the watchdog's group: the watchdog, the job and every descendant)
+function killJobGroup(pgidFile) {
+  let g = 0; try { g = Number(fs.readFileSync(pgidFile, 'utf8')) || 0; } catch {}
+  if (g > 1) { try { process.kill(-g, 'SIGKILL'); } catch {} }
+}
+const addRunDir = (prefix) => fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+// every job starts by writing its process-group id to $FCODE_TEST_PGID (set by runAddCli), so a test can end the whole group
+const addRunScript = (dir, body) => {
+  const f = path.join(dir, 'job.sh');
+  fs.writeFileSync(f, `[ -z "$FCODE_TEST_PGID" ] || { cut -d' ' -f5 /proc/$$/stat > "$FCODE_TEST_PGID.tmp" && mv "$FCODE_TEST_PGID.tmp" "$FCODE_TEST_PGID"; }\n${body}`);
+  return f;
+};
+
+test('fcode-add CLI: install.sh installs it as ~/.local/bin/fcode-add beside fcode-deploy and lists it in the usage text', () => {
+  const install = fs.readFileSync(path.join(here, '..', 'install.sh'), 'utf8');
+  assert.match(install, /\n\[ ! -f "\$SRC\/box\/fcode-add-run\.sh" \] \|\| install -D -m 755 "\$SRC\/box\/fcode-add-run\.sh" "\$HOME\/\.local\/bin\/fcode-add"\n/);
+  assert.match(install, /fcode-add <owner\/repo> <name>/); // the usage text at the end
+});
+
+test('fcode-add CLI: the job\'s exit code, stdout, stderr and arguments pass through; a clean run is quick and signals nobody', addPosix, async () => {
+  const dir = addRunDir('pc-addrun-');
+  try {
+    const s = addRunScript(dir, 'echo "R KEY_NEW ssh-ed25519 AAAA"; echo "args=$1|$2"; echo "oops" >&2; exit 7\n');
+    for (const via of ['parent', 'direct']) {
+      const r = await runAddCli({ FCODE_ADD_SCRIPT: s }, { via });
+      assert.ok(!r.capped, via);
+      assert.match(r.out, /^R KEY_NEW ssh-ed25519 AAAA\nargs=o\/r\|name\n/, via);
+      assert.match(r.err, /^oops\n/, via);
+      if (via === 'parent') assert.deepEqual([r.rc, r.bystander], ['7', 'up'], r.out);
+      else assert.deepEqual([r.code, r.signal], [7, null], via);
+    }
+    const ok = await runAddCli({ FCODE_ADD_SCRIPT: addRunScript(dir, 'echo "R OK"\n') });
+    assert.deepEqual([ok.rc, ok.bystander], ['0', 'up']);
+    assert.ok(ok.ms < 8000, `${ok.ms} ms: a job that ends on its own must not wait for the deadline`);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('fcode-add CLI: the caller is a process-group leader (`ssh box fcode-add …`, an interactive job): the job\'s code is not lost (a bare `exec setsid` would fork and answer 0 at once)', addPosix, async () => {
+  const dir = addRunDir('pc-addrun-');
+  try {
+    const r = await runAddCli({ FCODE_ADD_SCRIPT: addRunScript(dir, 'sleep 0.4; echo "R DONE"; exit 7\n') }, { via: 'direct' });
+    assert.deepEqual([r.code, r.signal, r.out], [7, null, 'R DONE\n']);
+    // and the deadline, as the same leader sees it: the watchdog's group KILL, 137 (or the signal itself), never 0, never 124
+    const pidFile = path.join(dir, 'leader.pid');
+    const d = await runAddCli({ FCODE_ADD_SCRIPT: addRunScript(dir, `echo $$ > '${pidFile}'; trap '' TERM; while :; do sleep 0.1; done\n`), FCODE_ADD_TIMEOUT_S: '1', FCODE_ADD_KILL_AFTER_S: '1' }, { via: 'direct' });
+    assert.ok(!d.capped);
+    assert.deepEqual([d.code, d.signal], [137, null], d.out); // only the watchdog's group KILL: a KILLed CLI (no setsid) would show signal SIGKILL
+    assert.ok(d.ms >= 2000, `${d.ms} ms: not before the deadline + kill-after`);
+    await waitFor(() => terminatedPid(Number(fs.readFileSync(pidFile, 'utf8'))), 3000);
+  } finally { killJobGroup(path.join(dir, 'job.pgid')); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// the job forks a grandchild that ignores TERM (set before the exec, so the sleep is born ignoring it), waits until it exists, then idles; the job itself dies on a TERM
+const GRAND_JOB = `bash -c 'trap "" TERM; echo $$ > "$FCODE_TEST_PID.tmp" && mv "$FCODE_TEST_PID.tmp" "$FCODE_TEST_PID"; exec sleep 1000' </dev/null >/dev/null 2>&1 &
+while [ ! -s "$FCODE_TEST_PID" ]; do sleep 0.02; done
+echo "R WAITING"
+exec sleep 1000
+`;
+test('fcode-add CLI: the deadline TERMs the group and, kill-after later, KILLs it: a TERM-ignoring grandchild dies, exit 137 (not 124, not before 2 s), the caller\'s group is not signalled', addPosix, async () => {
+  const dir = addRunDir('pc-addrun-');
+  const pidFile = path.join(dir, 'grand.pid');
+  const readPid = () => { try { return Number(fs.readFileSync(pidFile, 'utf8')) || 0; } catch { return 0; } };
+  try {
+    const s = addRunScript(dir, GRAND_JOB);
+    const r = await runAddCli({ FCODE_ADD_SCRIPT: s, FCODE_ADD_TIMEOUT_S: '1', FCODE_ADD_KILL_AFTER_S: '1', FCODE_TEST_PID: pidFile });
+    assert.ok(!r.capped, 'the run hung');
+    assert.equal(r.rc, '137', r.out);
+    assert.match(r.out, /^R WAITING\n/);
+    assert.ok(r.ms >= 2000, `${r.ms} ms: not before deadline + kill-after`);
+    assert.ok(r.ms < 12000, `${r.ms} ms`);
+    assert.equal(r.bystander, 'up', 'a process of the caller\'s group was killed: the watchdog\'s kill(0) reached the caller\'s group');
+    const grand = readPid();
+    assert.ok(grand > 0, 'the grandchild started');
+    await waitFor(() => terminatedPid(grand), 3000);
+  } finally {
+    killJobGroup(path.join(dir, 'job.pgid'));
+    const g = readPid(); if (g) { try { process.kill(g, 'SIGKILL'); } catch {} }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('fcode-add CLI: no script, no server.mjs or a server without ADD_WATCHDOG -> R NO_SCRIPT and exit 3, nothing is run', addPosix, async () => {
+  const dir = addRunDir('pc-addrun-');
+  try {
+    const marker = path.join(dir, 'ran');
+    const s = addRunScript(dir, `: > '${marker}'\n`);
+    const app = path.join(dir, 'app'); fs.mkdirSync(app);
+    const bad = path.join(dir, 'bad'); fs.mkdirSync(bad); fs.writeFileSync(path.join(bad, 'server.mjs'), 'export const NOTHING = 1;\n');
+    const throwing = path.join(dir, 'throwing'); fs.mkdirSync(throwing); fs.writeFileSync(path.join(throwing, 'server.mjs'), 'throw new Error("boom");\n');
+    const empty = path.join(dir, 'empty'); fs.mkdirSync(empty); fs.writeFileSync(path.join(empty, 'server.mjs'), 'export const ADD_WATCHDOG = "";\n');
+    const cases = {
+      'missing script': { FCODE_APP: REPO_ROOT, FCODE_ADD_SCRIPT: path.join(dir, 'nope.sh') },
+      'missing server.mjs': { FCODE_APP: app, FCODE_ADD_SCRIPT: s },
+      'server without ADD_WATCHDOG': { FCODE_APP: bad, FCODE_ADD_SCRIPT: s },
+      'server that throws on import': { FCODE_APP: throwing, FCODE_ADD_SCRIPT: s },
+      'empty ADD_WATCHDOG': { FCODE_APP: empty, FCODE_ADD_SCRIPT: s },
+    };
+    for (const [what, env] of Object.entries(cases)) for (const via of ['parent', 'direct']) {
+      const r = await runAddCli(env, { via });
+      assert.ok(!r.capped, what);
+      assert.match(r.out, /^R NO_SCRIPT\n/, `${what} (${via})`);
+      if (via === 'parent') assert.equal(r.rc, '3', what); else assert.deepEqual([r.code, r.signal], [3, null], what);
+    }
+    assert.ok(!fs.existsSync(marker), 'the script ran');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('fcode-add CLI: limits are 1 to 5 digits without a leading zero; anything else falls back to 600 s / 30 s (seen on the watchdog\'s argv)', addPosix, async () => {
+  const dir = addRunDir('pc-addrun-');
+  try {
+    // a server whose ADD_WATCHDOG only prints its own argv: [timeout ms, kill-after ms, bash, script, args...]
+    const app = path.join(dir, 'app'); fs.mkdirSync(app);
+    fs.writeFileSync(path.join(app, 'server.mjs'), 'export const ADD_WATCHDOG = "process.stdout.write(JSON.stringify(process.argv.slice(1)))";\n');
+    const s = addRunScript(dir, 'exit 0\n');
+    const seen = async (t, k) => {
+      const r = await runAddCli({ FCODE_APP: app, FCODE_ADD_SCRIPT: s, FCODE_ADD_TIMEOUT_S: t, FCODE_ADD_KILL_AFTER_S: k }, { via: 'direct' });
+      assert.deepEqual([r.code, r.err], [0, '']);
+      return JSON.parse(r.out);
+    };
+    assert.deepEqual(await seen(undefined, undefined), ['600000', '30000', 'bash', s, 'o/r', 'name']);
+    assert.deepEqual((await seen('5', '7')).slice(0, 2), ['5000', '7000']);
+    assert.deepEqual((await seen('99999', '12')).slice(0, 2), ['99999000', '12000']);
+    for (const bad of ['0', 'x', '', '-1', '01', '1.5', '100000', ' 5', '5 ', '1e3', '5;ls']) {
+      assert.deepEqual((await seen(bad, bad)).slice(0, 2), ['600000', '30000'], JSON.stringify(bad));
+      assert.deepEqual((await seen(bad, '9')).slice(0, 2), ['600000', '9000'], `timeout ${JSON.stringify(bad)}`); // each limit on its own
+      assert.deepEqual((await seen('9', bad)).slice(0, 2), ['9000', '30000'], `kill-after ${JSON.stringify(bad)}`);
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// the laptop's $FcodeAddRun (laptop/fcode.ps1) is the box-side snippet the laptop sends over ssh: run it here with bash against a fake ~/.local/bin/fcode-add
+test('laptop $FcodeAddRun: execs ~/.local/bin/fcode-add, no timeout(1); the FCODE_ADD_* vars and the arguments reach it; a missing CLI gives R NO_SCRIPT and exit 3', { skip: process.platform === 'win32' && 'bash' }, () => {
+  const ps1 = fs.readFileSync(path.join(here, '..', 'laptop', 'fcode.ps1'), 'utf8');
+  const m = /\$FcodeAddRun = \(@'\r?\n([\s\S]*?)\r?\n'@\)/.exec(ps1);
+  assert.ok(m, '$FcodeAddRun here-string not found in laptop/fcode.ps1');
+  const snippet = m[1].replace(/\r\n/g, '\n') + '\n';
+  assert.match(snippet, /\$HOME\/\.local\/bin\/fcode-add/);
+  assert.match(snippet, /exec "\$f" "\$@"/);
+  assert.doesNotMatch(snippet, /\btimeout\b/);
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-lapadd-'));
+  try {
+    const run = (prefix, ...args) => spawnSync('bash', ['-c', prefix + snippet, 'fcode-add-test', ...args], { encoding: 'utf8', timeout: 10000, env: { PATH: process.env.PATH, HOME: home } });
+    // no CLI yet: the box is not installed or updated
+    let r = run('', 'o/r', 'name');
+    assert.deepEqual([r.status, r.stdout, r.stderr], [3, 'R NO_SCRIPT\n', '']);
+    const bin = path.join(home, '.local', 'bin'); fs.mkdirSync(bin, { recursive: true });
+    const cli = path.join(bin, 'fcode-add');
+    fs.writeFileSync(cli, '#!/bin/sh\nprintf \'%s\\n\' "S=${FCODE_ADD_SCRIPT-unset}" "T=${FCODE_ADD_TIMEOUT_S-unset}" "K=${FCODE_ADD_KILL_AFTER_S-unset}"\nfor a in "$@"; do printf \'A=%s\\n\' "$a"; done\nexit 5\n');
+    fs.chmodSync(cli, 0o644);
+    r = run('', 'o/r', 'name'); // not executable: the same answer
+    assert.deepEqual([r.status, r.stdout], [3, 'R NO_SCRIPT\n']);
+    fs.chmodSync(cli, 0o755);
+    r = run('', 'o/r', 'name'); // the vars are unset here and stay unset (exporting an unset var must not invent one)
+    assert.deepEqual([r.status, r.stdout], [5, 'S=unset\nT=unset\nK=unset\nA=o/r\nA=name\n']);
+    // the laptop's prefix lines (fcode.ps1 Invoke-Add) set them as plain assignments before the snippet
+    r = run("FCODE_ADD_SCRIPT='/tmp/x y.sh'\nFCODE_ADD_TIMEOUT_S=5\nFCODE_ADD_KILL_AFTER_S=2\n", 'a/b', 'c d');
+    assert.deepEqual([r.status, r.stdout], [5, 'S=/tmp/x y.sh\nT=5\nK=2\nA=a/b\nA=c d\n']);
+    r = run('FCODE_ADD_TIMEOUT_S=9\n', 'o/r', 'name'); // only the ones that are set
+    assert.deepEqual([r.status, r.stdout], [5, 'S=unset\nT=9\nK=unset\nA=o/r\nA=name\n']);
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+// A signal to the CLI (Ctrl-C, a hung-up terminal, a kill; a dropped ssh without a tty sends none) is forwarded to the watchdog alone: it TERMs the job's group and KILLs it kill-after later, so the CLI ends
+// with 137 only after kill-after, the TERM-ignoring grandchild is dead, and the caller's group is not hit. The deadline is far away (600 s): only the forward ends the run.
+// INT and HUP go via 'direct' (the CLI is the leader of a detached group and the signal goes to that whole group, as a tty does): a background job of a
+// non-interactive bash starts with INT ignored and could not trap it. TERM goes to the CLI's own pid, from a bash parent, with the caller's group watched.
+for (const [sig, via] of [['SIGTERM', 'bg'], ['SIGINT', 'direct'], ['SIGHUP', 'direct']]) {
+  test(`fcode-add CLI: a ${sig} to the CLI (${via}) is forwarded to the watchdog: the TERM-ignoring grandchild is dead after kill-after, the CLI exits 137, the caller's group is not signalled`, addPosix, async () => {
+    const dir = addRunDir('pc-addrun-');
+    const pidFile = path.join(dir, 'grand.pid');
+    const readPid = () => { try { return Number(fs.readFileSync(pidFile, 'utf8')) || 0; } catch { return 0; } };
+    try {
+      const t0 = Date.now();
+      const r = await runAddCli({ FCODE_ADD_SCRIPT: addRunScript(dir, GRAND_JOB), FCODE_ADD_KILL_AFTER_S: '1', FCODE_TEST_PID: pidFile },
+        { via, sendSig: { sig, when: () => readPid() > 0 } });
+      assert.ok(!r.capped, `the run hung: the ${sig} did not end the watchdog`);
+      assert.ok(r.sigAt > 0, 'the signal was sent');
+      if (via === 'bg') assert.deepEqual([r.rc, r.bystander], ['137', 'up'], r.out); // the caller's group (the bystander) is not signalled
+      else assert.deepEqual([r.code, r.signal], [137, null], r.out);
+      const after = Date.now() - r.sigAt;
+      assert.ok(r.ms - (r.sigAt - t0) >= 900, `${r.ms - (r.sigAt - t0)} ms after the signal: the KILL comes only at kill-after`);
+      assert.ok(after < 15000, `${after} ms`);
+      await waitFor(() => terminatedPid(readPid()), 3000);
+    } finally {
+      killJobGroup(path.join(dir, 'job.pgid'));
+      const g = readPid(); if (g) { try { process.kill(g, 'SIGKILL'); } catch {} }
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+// a non-interactive ssh login has PATH=/usr/bin:/bin (no node): the CLI appends the server's tool dirs (~/.local/bin, ~/.bun/bin) and /usr/local/bin and still runs the job.
+// node here is a logging wrapper in the tool dir under a temp HOME, so the lookup itself is seen (a node in /usr/local/bin would hide a missing append)
+const nodeInSystemPath = spawnSync('/bin/sh', ['-c', 'command -v node'], { env: { PATH: '/usr/bin:/bin' }, encoding: 'utf8' }).status === 0;
+for (const toolDir of ['.local/bin', '.bun/bin']) {
+  test(`fcode-add CLI: PATH=/usr/bin:/bin without node: node is found in ~/${toolDir}, the job runs and its code passes through`, { skip: (process.platform !== 'linux' && 'needs Linux') || (nodeInSystemPath && 'node is in /usr/bin or /bin here: the lookup cannot be seen') }, async () => {
+    const dir = addRunDir('pc-addrun-'), home = addRunDir('pc-addhome-');
+    try {
+      const bin = path.join(home, toolDir); fs.mkdirSync(bin, { recursive: true });
+      const log = path.join(dir, 'node.log');
+      fs.writeFileSync(path.join(bin, 'node'), `#!/bin/sh\necho "$0" >> '${log}'\nexec '${process.execPath}' "$@"\n`, { mode: 0o755 });
+      const r = await runAddCli({ HOME: home, PATH: '/usr/bin:/bin', FCODE_ADD_SCRIPT: addRunScript(dir, 'echo "R OK"; exit 7\n') }, { via: 'direct' });
+      assert.ok(!r.capped);
+      assert.deepEqual([r.code, r.signal, r.out, r.err], [7, null, 'R OK\n', '']);
+      assert.ok(fs.readFileSync(log, 'utf8').includes(path.join(bin, 'node')), 'the wrapper in the tool dir was the node that ran');
+    } finally {
+      killJobGroup(path.join(dir, 'job.pgid'));
+      fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+}
