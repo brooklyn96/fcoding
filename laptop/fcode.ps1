@@ -1362,6 +1362,9 @@ function Get-MoveText([string]$Key, [hashtable]$F = @{}) {
     'new-down' { 'máy mới không trả lời; máy cũ chạy lại' }
     'rsync-remedy' { 'cài rsync <CONTRACT version> trên máy mới, hoặc chụp lại T0b và phát hành gate' }
     'acl-remedy' { 'gỡ mục ACL đó trên máy cũ rồi chạy lại' }
+    'rewrites-remedy' { 'ghi rõ `<from>=<to>`' }
+    'ingress-remedy' { 'đổi service của tên đó trong cấu hình tunnel sang 127.0.0.1 hoặc tên container' }
+    'connector-remedy' { 'kiểm tra cổng metrics của connector rồi chạy lại' }
     default { throw "Get-MoveText: $Key" }
   }
   foreach ($k in $F.Keys) { $t = $t.Replace("<$k>", [string]$F[$k]) }
@@ -1917,6 +1920,10 @@ exit 0
 }
 # DESIGN-GAP (T10-G2): B.0.2 compares new with src (OS, arch, systemd) and the clock (≤ 5 s) before `plan` on old exists, and no
 # CONTRACT line carries those facts. Reading: this read-only script, on both machines. One line, MOVE facts.
+# Ruling 04/11 #5 (T10c-LP): before it, one `MOVE legacy project=<name> origin=<url>` line per legacy project directory whose read-only
+# `git remote get-url origin` answers (the push scan reads old's, Get-MovePushScan).
+# DESIGN-GAP (T10d-LP-line, CONTRACT §7.7): ruling 5 gives no line form and the §7.7 `facts` row lists only `MOVE facts …`; this
+# `MOVE legacy` form is the reading, for T0 to add to that row.
 function Get-MoveFactsScript {
 @'
 #!/bin/bash
@@ -1926,6 +1933,9 @@ R=${FCM_ROOT:-}
 os=unknown-0
 if [ -r "$R/etc/os-release" ]; then os=$(. "$R/etc/os-release"; v=${VERSION_ID%%.*}; echo "${ID:-unknown}-${v:-0}"); fi
 sd=$(systemctl --version 2>/dev/null | awk 'NR==1 { print $2 + 0 }')
+for x in deal-sync=/opt/deal-sync vps-scraper=/opt/internal-scraper; do
+  u=$(git -c safe.directory='*' -C "$R${x#*=}" remote get-url origin 2>/dev/null) && [ -n "$u" ] && echo "MOVE legacy project=${x%%=*} origin=$u"
+done
 echo "MOVE facts os=$os arch=$(uname -m) systemd=${sd:-0} epoch=$(date +%s)"
 '@
 }
@@ -2441,10 +2451,12 @@ function Get-MoveGhRefusals($S) {
 # B.10.5 push scan (D.2 step 4; a rebuild scans again, D.0.10): the owner's repos (`gh repo list --limit 1000`, W1-T10-G23) whose
 # workflows match DEPLOY_KNOWN_HOSTS, ssh-keyscan, an ssh deploy action (appleboy/ssh-action, webfactory/ssh-agent) or secrets.*HOST*.
 # @{ Ok; Push = @(@{ Repo; File }) (ssh-push); Legacy = @({project, repo}) (gate-push, the state's legacy_push[], W1-T3-GAP-11) }
-# DESIGN-GAP (T10c-LP): B.10.5 says "a repo of a legacy project is gate-push" but nothing tells the laptop which repo is a legacy
-# project's, nor its project name. Reading: a matched repo with a workflow naming DEPLOY_KNOWN_HOSTS (the gate-push secret of B.10.2) is
-# gate-push, its project written ''; every other match is ssh-push.
-function Get-MovePushScan {
+# Ruling 04/11 #5 (T10c-LP): a matched repo is gate-push when its slug equals the `origin` remote of a legacy project's directory on
+# old (`MOVE legacy` lines of old's facts, read here at every scan); `project` = that legacy name. Every other match is ssh-push (Q-sshpush).
+# DESIGN-GAP (T10d-LP-slug, P3): "slug" form not given; reading: ConvertTo-MoveSlug (host not checked), case ignored (as GitHub names).
+function Get-MovePushScan($S) {
+  $fo = Get-MoveFacts (Get-MoveMachine $S 'old')
+  if (-not $fo) { Write-Host "lỗi: không đọc được dữ kiện máy cũ '$($S.old.alias)' (origin của project cũ)."; return @{ Ok = $false } }
   $ls = Invoke-MoveTool 'gh' @('repo', 'list', '--limit', '1000', '--json', 'nameWithOwner')
   if ($ls.Code -ne 0) { Write-Host 'lỗi: gh không liệt kê được repo (gh auth login?).'; return @{ Ok = $false } }
   try { $repos = @(ConvertFrom-Json ($ls.Out -join "`n") | ForEach-Object { [string]$_.nameWithOwner }) } catch { Write-Host 'lỗi: gh trả danh sách repo không đọc được.'; return @{ Ok = $false } }
@@ -2454,16 +2466,16 @@ function Get-MovePushScan {
     $w = Invoke-MoveTool 'gh' @('api', "repos/$repo/contents/.github/workflows")
     if ($w.Code -ne 0) { if (($w.Out -join ' ') -match '404|Not Found') { continue }; Write-Host "lỗi: gh không đọc được workflow của $repo."; return @{ Ok = $false } }
     try { $files = @(ConvertFrom-Json ($w.Out -join "`n") | ForEach-Object { [string]$_.name } | Where-Object { $_ -cmatch '\A[A-Za-z0-9._-]+\.ya?ml\z' }) } catch { continue }
-    $hits = @(); $gate = $false
+    $hits = @()
     foreach ($f in $files) {
       $tx = Invoke-MoveTool 'gh' @('api', "repos/$repo/contents/.github/workflows/$f", '-H', 'Accept: application/vnd.github.raw')
       if ($tx.Code -ne 0) { Write-Host "lỗi: gh không đọc được $f của $repo."; return @{ Ok = $false } }
       $t = $tx.Out -join "`n"
       if ($t -notmatch 'DEPLOY_KNOWN_HOSTS|ssh-keyscan|appleboy/ssh-action|webfactory/ssh-agent|secrets\.\w*HOST\w*') { continue }
-      if ($t -cmatch 'DEPLOY_KNOWN_HOSTS') { $gate = $true }
       $hits += $f
     }
-    if ($gate) { $legacy += [pscustomobject][ordered]@{ project = ''; repo = $repo }; continue }   # gate-push (B.10.2): the DEPLOY_KNOWN_HOSTS chore
+    $lp = @($fo.Legacy | Where-Object { $hits.Count -and $_.Slug -and $_.Slug -ieq $repo } | Select-Object -First 1)
+    if ($lp.Count) { $legacy += [pscustomobject][ordered]@{ project = [string]$lp[0].Project; repo = $repo }; continue }   # gate-push (B.10.2)
     foreach ($f in $hits) { $push += @{ Repo = $repo; File = $f } }
   }
   @{ Ok = $true; Push = $push; Legacy = $legacy }
@@ -2480,6 +2492,12 @@ function Read-MoveAnswer([string]$Text, [string[]]$Words) {
 }
 function Set-MoveAnswer($S, [string]$Q, $A) { Set-MoveMapVal $S.answers $Q $A }
 function Set-MoveAsk($S, [hashtable]$Asked, [string]$Q, $A) { $Asked[$Q] = $true; Set-MoveAnswer $S $Q $(if ($A) { $A } else { 'không' }) }
+# CONTRACT §8.3.2 remedies of the B.12.4 tunnel refusals, wherever a plan form prints them: plan and the D.3 re-plan, with or without a
+# manifest (move-plan.sh _mvp_finalize), and the 0c plan <id> --check-only (the same discovery)
+function Write-MoveTunnelRemedies($Lines) {
+  if (@($Lines | Where-Object { "$_" -cmatch '\AINV refuse own-ip path=ingress:\S+\z' }).Count) { Write-Host (Get-MoveText 'ingress-remedy') }   # B.12.4 (W1-T3-GAP-17)
+  if (@($Lines | Where-Object { "$_" -cmatch '\AINV refuse unmapped what=connector path=\S+\z' }).Count) { Write-Host (Get-MoveText 'connector-remedy') }   # B.12.4 (W1-T3-GAP-18)
+}
 # D.2 steps 3-5 (and the D.3 re-plan): plan on old with the map, the laptop checks, the questions, plan again until INV ok or a refusal the
 # owner left. @{ Code; Mf; Map }
 # DESIGN-GAP (T10-G22): CONTRACT §2.1 does not fix the k=v keys the questions are filled from; reading: pm2-unsaved (the rest of the
@@ -2494,13 +2512,15 @@ function Invoke-MovePlanLoop($S, [string[]]$Map) {
       Write-MoveLines $p.Lines
       if ($p.Code -eq 65 -or $mErr.Count -or @($p.Lines | Where-Object { $_ -cmatch '\AINV refuse ' }).Count) {
         if (@($mErr | Where-Object { $_ -cmatch '\AMOVE error acl-mapped-id ' }).Count) { Write-Host (Get-MoveText 'acl-remedy') }
+        if (@($p.Lines | Where-Object { $_ -cmatch '\AINV refuse map-invalid ref=rewrites\z' }).Count) { Write-Host (Get-MoveText 'rewrites-remedy') }   # B.12.5, E-P11 (ruling 04/11 #3)
+        Write-MoveTunnelRemedies $p.Lines
         return @{ Code = 65 }
       }
       Write-Host 'lỗi: máy cũ không trả manifest (thiếu dòng MOVE manifest hoặc sha không khớp).'; return @{ Code = 1 }
     }
     Set-MoveProp $S 'manifest_sha' $p.Mf.Sha; $script:MoveManifest = @{ Text = $p.Mf.Text; Obj = $p.Mf.Obj }
     $M = $p.Mf.Obj
-    $scan = Get-MovePushScan
+    $scan = Get-MovePushScan $S
     if (-not $scan.Ok) { return @{ Code = 1 } }
     Set-MoveProp $S 'legacy_push' @($scan.Legacy)   # D.0.9 state legacy_push[] from the push scan (W1-T3-GAP-11)
     $lines = @($p.Lines) + @(Get-MoveUserRefusals $S $M) + @(Get-MovePlatformRefusals $S $M) + @(Get-MoveGhRefusals $S)
@@ -2510,6 +2530,7 @@ function Invoke-MovePlanLoop($S, [string[]]$Map) {
     $refs = @($lines | Where-Object { $_ -cmatch '\AINV refuse ' })
     Write-MoveLines (@($p.Lines | Where-Object { $_ -cnotmatch '\AINV refuse ' }) + $refs)
     if (@($refs | Where-Object { $_ -cmatch '\AINV refuse uid-collision ' }).Count) { foreach ($x in $refs) { if ($x -cmatch '\AINV refuse uid-collision .*\bholder=(\S+)') { Write-Host ('  ' + (Get-MoveText 'uid-remedy' @{ h = $Matches[1] })) } } }
+    Write-MoveTunnelRemedies $refs
     Test-MoveReach $S $M $p.Lines
     # D.2 step 5: the questions, in this order; each answer writes a map line or runs its p.* call, then plan runs again
     $again = $false
@@ -2577,22 +2598,26 @@ function Invoke-MovePlanLoop($S, [string[]]$Map) {
   Write-Host 'lỗi: plan vẫn chưa xong sau nhiều lượt trả lời.'
   @{ Code = 1 }
 }
-# `MOVE facts` of a machine: @{ Os; Arch; Systemd; Skew } or $null
+# `MOVE facts` of a machine: @{ Os; Arch; Systemd; Skew; Legacy = @(@{ Project; Slug }) } or $null
 function Get-MoveFacts($Mach, [switch]$Pin) {
   $t0 = Get-MoveNow
   $r = Invoke-MoveScript $Mach (Get-MoveFactsScript) @() (Get-MoveConst 'tcp_s') -Pin:$Pin -Quiet
   $t1 = Get-MoveNow
+  $lg = @(foreach ($l in $r.Lines) { if ("$l" -cmatch '\AMOVE legacy project=(deal-sync|vps-scraper) origin=(\S+)\z') { @{ Project = $Matches[1]; Slug = (ConvertTo-MoveSlug $Matches[2]) } } })
   foreach ($l in $r.Lines) {
     if ("$l" -cmatch '\AMOVE facts ') {
       $k = ConvertFrom-MoveKv $l
       if ("$($k['epoch'])" -notmatch '\A[0-9]+\z') { return $null }
       $mid = $t0.AddTicks([long](($t1 - $t0).Ticks / 2))
       $off = [double]$k['epoch'] - ($mid - (New-Object DateTime 1970, 1, 1, 0, 0, 0, ([DateTimeKind]::Utc))).TotalSeconds   # signed, corrected to the sample's midpoint
-      return @{ Os = [string]$k['os']; Arch = [string]$k['arch']; Systemd = [string]$k['systemd']; Off = $off; Skew = [Math]::Abs($off); Slack = ($t1 - $t0).TotalSeconds / 2 }
+      return @{ Os = [string]$k['os']; Arch = [string]$k['arch']; Systemd = [string]$k['systemd']; Off = $off; Skew = [Math]::Abs($off); Slack = ($t1 - $t0).TotalSeconds / 2; Legacy = $lg }
     }
   }
   $null
 }
+# `<owner>/<repo>` of a git remote url (ssh `git@host:o/r.git`, `https://host/o/r`): its last two path parts, `.git` and a trailing `/`
+# dropped; '' when none
+function ConvertTo-MoveSlug([string]$Url) { if ($Url -cmatch '[:/]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?\z') { $Matches[1] } else { '' } }
 # B.0.2 (D.2, 0c): new's skew against src and against the laptop, each ≤ 5 s (F6). Refusal lines.
 # DESIGN-GAP (T10-G37, F6): B.0.2 does not state a rule for src against the laptop; reading: old more than 5 s off the laptop refuses too
 # (it guards the laptop-side T0 that verify's --since carries).
@@ -2756,14 +2781,25 @@ function Get-MoveGateIds($S) {
   $o = Get-MoveStatus $S 'old' -Quiet; $n = Get-MoveStatus $S 'new' -Quiet
   @{ Ok = ($o.Known -and $n.Known); Old = [string]$o.Kv['gate']; New = [string]$n.Kv['gate']; NewMove = [string]$n.Kv['move_id']; StOld = $o; StNew = $n }
 }
-# D.3 steps 2-9 (the first copy of an attempt)
+# D.3 steps 2-9 (the first copy of an attempt). Ruling 04/11 #9 (NEW-2, option (a)): a re-run never re-sends c.init-* to a machine whose
+# status (the verb's agreement check, Test-MoveInitSeen) already shows this move-id at the state's (dir, attempt); when one was skipped,
+# the copy goes on as the D.3 re-run: plan <id> -> c.repin.N on both -> c.prepare.N -> steps 6-8 (Invoke-MoveCopyRefresh).
+# DESIGN-GAP (T10d-NEW2-halfdone, P2): the server writes the move-id before the rest of init (lib/move-run.sh _mvr_init, "the move-id first"), so a failed,
+# interrupted or running c.init-* also shows this move-id; reading: "shows" also needs the machine's last call not to be this attempt's
+# c.init-<machine> left unfinished, so a half-done init runs again under the same id (D.0.5, E-P31; no repin ran after it, same sha).
+# Remaining edge: on new, a fence r.stop-dst sent by the agreement check (new_lost / new_discarded) after a half-done c.init-new becomes
+# new's last call, and the init then counts as done (these flags are not set in phase planned on a normal first copy).
+function Test-MoveInitSeen($S, [string]$M) {
+  $st = $script:MoveSeen[$M]
+  [bool]($st -and $st.Ok -and [string]$st.Kv['move_id'] -ceq [string]$S.move_id -and [string]$st.Kv['dir'] -ceq [string]$S.dir -and [string]$st.Kv['attempt'] -ceq "$($S.attempt)" -and -not ([string]$st.Kv['call'] -ceq "$($S.dir)-$($S.attempt)-c.init-$M" -and [string]$st.Kv['call_state'] -cne 'done'))
+}
 function Invoke-MoveCopyFull($S) {
-  $new = Get-MoveMachine $S 'new'
+  $new = Get-MoveMachine $S 'new'; $rerun = $false
   Write-Host "copy (2): công cụ và khoá chuyển máy trên '$($new.Alias)'..."
   $script:MovePub = $null
   if (-not (Get-MovePub $S)) { return 1 }
-  Write-Host 'copy (3): init trên máy cũ...'
-  $c = Invoke-MoveInit $S 'old'; if ($c -ne 0) { return $c }
+  if (Test-MoveInitSeen $S 'old') { $rerun = $true }
+  else { Write-Host 'copy (3): init trên máy cũ...'; $c = Invoke-MoveInit $S 'old'; if ($c -ne 0) { return $c } }
   Write-Host "copy (4): chép cổng deploy sang '$($new.Alias)'..."
   for ($i = 1; $i -le 2; $i++) {
     $g = Invoke-MoveScript $new (Get-MoveBootstrapGateScript) @('--old-addr', (Get-MoveOldAddrForNew $S))
@@ -2776,7 +2812,8 @@ function Invoke-MoveCopyFull($S) {
   }
   Set-MoveProp $S 'gate_id' $ids.Old; Save-MoveState $S
   Write-Host "copy (5): init và prepare trên '$($new.Alias)'..."
-  $c = Invoke-MoveInit $S 'new'; if ($c -ne 0) { return $c }
+  if (Test-MoveInitSeen $S 'new') { $rerun = $true } else { $c = Invoke-MoveInit $S 'new'; if ($c -ne 0) { return $c } }
+  if ($rerun) { return (Invoke-MoveCopyRefresh $S) }
   $c = Invoke-MovePrepare $S; if ($c -ne 0) { return $c }
   Write-Host 'copy (6-8): chép, kiểm tra, áp dụng...'
   $p = Invoke-MovePasses $S; if ($p -ne 0) { return $p }
@@ -2788,8 +2825,8 @@ function Invoke-MoveCopyFull($S) {
 # state=mapped src_id=<n> dst_id=<n>` lines go into state idmap[]; an entry the state lacks runs the D.3 re-plan (plan <id>, c.repin.N on
 # both machines) before c.transfer.N, so every pass reads one pinned idmap[]. Trigger: an entry this c.prepare.N printed that the pinned
 # idmap[] lacks (prepare prints every mapped id at every call), so a re-plan that ended before Invoke-MoveRepin kept the new manifest is
-# redone by the next copy, and an entry nobody prints any more (e.g. a user excluded later) never re-plans (review r2 R2-1). After
-# Invoke-MoveRepin saved the new sha, a later failure is DESIGN-GAP NEW-2 (Architect: c.init-* re-sent with the new --sha is call-argv).
+# redone by the next copy, and an entry nobody prints any more (e.g. a user excluded later) never re-plans (review r2 R2-1). A failure
+# after Invoke-MoveRepin saved the new sha is redone by the next copy as the re-run of Invoke-MoveCopyFull (ruling 04/11 #9, NEW-2).
 # Note (Architect, predates this round): the four-field merge keeps two entries for one kind+name when dst_id changes (fails closed at plan).
 function Invoke-MovePrepare($S) {
   $r = Invoke-MoveCall $S 'new' 'c.prepare.N'; if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
@@ -2883,6 +2920,7 @@ function Test-MovePreCut($S, [switch]$BackStart) {
   if ($r.Code -ne 0) {
     if (@($r.Lines | Where-Object { $_ -cmatch '\AMOVE error manifest-stale ' }).Count) { Write-Host (Get-MoveText 'copy-again') }
     if (@($r.Lines | Where-Object { $_ -cmatch '\AMOVE error acl-mapped-id ' }).Count) { Write-Host (Get-MoveText 'acl-remedy') }
+    Write-MoveTunnelRemedies $r.Lines
     Write-Host 'Chưa làm gì.'
     return $(if ($r.Code -eq 75) { 75 } else { 65 })
   }
@@ -3457,7 +3495,7 @@ function Invoke-MoveRebuild([string]$OldAlias, [string]$NewAlias) {
   Set-MoveRebuiltTarget $S $n.Target
   Set-MoveProp $S 'idmap' @(@(Get-MoveProp $mf.Obj 'idmap' @()) | Where-Object { $_ })   # D.0.10: idmap[] from the manifest
   # DESIGN-GAP (DG-R5-2, the Architect's): D.0.10 names neither pass{} nor last_copy_at; a rebuilt state keeps them empty.
-  $scan = Get-MovePushScan; if (-not $scan.Ok) { Write-Host 'lỗi: không quét lại được repo (D.0.10: legacy_push[] từ một lần quét mới); chưa ghi gì.'; return 1 }
+  $scan = Get-MovePushScan $S; if (-not $scan.Ok) { Write-Host 'lỗi: không quét lại được repo (D.0.10: legacy_push[] từ một lần quét mới); chưa ghi gì.'; return 1 }
   Set-MoveProp $S 'legacy_push' @($scan.Legacy)
   $co = Get-MoveRebuiltCutOff $o.Recs; if ($co) { Set-MoveAnswer $S 'Q-cut' ([pscustomobject]@{ a = 'có'; ts = $co }) }   # R2-4 (T10-G36): step 11's since
   Set-MoveProp $S 'dst_started_at' (Get-MoveRebuiltDstStartedAt $S $n.Recs)   # R5-1
