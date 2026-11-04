@@ -773,6 +773,43 @@ T 'L.plan-platform-user: a platform_user that is not a Linux user name (target-u
   [IO.File]::Delete((StatePath)); Set-PlatformUser 'Quoc' 'quoc'; $n0 = $W.Calls.Count
   $r = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $r.Code 65 "rebuild with an invalid name ($($r.Text))"; HasText 'platform_user'; Eq $W.Calls.Count $n0 'no ssh'; Ok (-not (Test-Path -LiteralPath (StatePath))) 'no state written'
 }
+# RV-G1 (R7-CONTRACT P3, 04/11 (4)): a moveTargets.<alias> entry that is not an object, or a platform_user that is not a string, is refused with
+# a Vietnamese error naming moveTargets and config.json, never read as unset. Values as ConvertFrom-Json gives them (a JSON array = object[]).
+function Set-TargetEntries($OldE, $NewE) { $script:Cfg2['moveTargets'] = [pscustomobject][ordered]@{ $OldAlias = $OldE; $NewAlias = $NewE } }
+function Pu-Obj($V) { [pscustomobject]@{ platform_user = $V } }
+$MalformedEntries = @(
+  @{ N = 'entry string'; V = 'quoc' }, @{ N = 'entry array of one object'; V = @([pscustomobject]@{ platform_user = 'quoc' }) }, @{ N = 'entry array of two'; V = @((Pu-Obj 'quoc'), (Pu-Obj 'admin')) },
+  @{ N = 'entry empty array'; V = @() }, @{ N = 'entry number'; V = [long]5 }, @{ N = 'entry bool'; V = $true }, @{ N = 'entry null'; V = $null })
+$MalformedNames = @(
+  @{ N = 'platform_user number'; V = [long]5 }, @{ N = 'platform_user fraction'; V = [double]1.5 }, @{ N = 'platform_user bool'; V = $true },
+  @{ N = 'platform_user array of one string'; V = @('quoc') }, @{ N = 'platform_user array empty'; V = @() }, @{ N = 'platform_user object'; V = [pscustomobject]@{ a = 'quoc' } }, @{ N = 'platform_user null'; V = $null })
+T 'L.plan-platform-user: a malformed moveTargets entry (the entry for old or new is a string, an array, a number or null; or its platform_user is a number, a bool, an array, an object or null; or moveTargets itself is not an object) refuses plan with 65 and an error naming the key moveTargets.<alias> (or .platform_user) and config.json, before any ssh, and writes nothing; status --rebuild refuses it too; a valid entry (extra keys, or an object without platform_user) still plans (RV-G1, R7-CONTRACT P3)' {
+  foreach ($m in @($MalformedEntries) + @($MalformedNames)) {
+    foreach ($side in 'old', 'new') {
+      Reset-World; $ok = Pu-Obj 'quoc'; if ($m.N -like 'entry*') { $bad = $m.V } else { $bad = Pu-Obj $m.V }   # plain assignment keeps an array whole (an if-expression would unroll it)
+      if ($side -ceq 'old') { $a = $OldAlias } else { $a = $NewAlias }; if ($m.N -like 'entry*') { $key = "moveTargets.$($a) trong config.json" } else { $key = "moveTargets.$($a).platform_user trong config.json" }
+      if ($side -ceq 'old') { Set-TargetEntries $bad $ok } else { Set-TargetEntries $ok $bad }
+      [void](Do-Plan -Want 65); HasText $key   # the key of the refused value, with its alias (the old grammar text names only 'moveTargets' and config.json)
+      Eq $W.Calls.Count 0 "[$side $($m.N)] no ssh to old or new"; Eq $W.PlanStdin.Count 0 "[$side $($m.N)] no plan sent"; NothingWritten "[$side $($m.N)] nothing written"
+    }
+  }
+  foreach ($tl in @(@{ N = 'string'; V = 'x' }, @{ N = 'number'; V = [long]5 }, @{ N = 'false'; V = $false }, @{ N = 'array of two objects'; V = @((Pu-Obj 'quoc'), (Pu-Obj 'admin')) })) {   # a one-element array is unrolled by Get-Cfg itself (DG-1), not tested
+    Reset-World; $script:Cfg2['moveTargets'] = $tl.V
+    [void](Do-Plan -Want 65); HasText 'khóa moveTargets trong config.json'; Eq $W.Calls.Count 0 "[moveTargets $($tl.N)] no ssh"; Eq $W.PlanStdin.Count 0 "[moveTargets $($tl.N)] no plan sent"; NothingWritten "[moveTargets $($tl.N)] nothing written"
+  }
+  foreach ($c in @(@('old', $MalformedEntries[0]), @('new', $MalformedEntries[1]), @('old', $MalformedNames[0]), @('new', $MalformedNames[3]))) {
+    Reset-World; Set-PlatformUser 'quoc' 'quoc'; Fx-Copied; [IO.File]::Delete((StatePath)); foreach ($n in 'old', 'new') { $W[$n].MoveId.old_addr = $OldAddr; $W[$n].MoveId.new_addr = $NewAddr }
+    if ($c[1].N -like 'entry*') { $bad = $c[1].V } else { $bad = Pu-Obj $c[1].V }; $ok = Pu-Obj 'quoc'
+    if ($c[0] -ceq 'old') { $a = $OldAlias } else { $a = $NewAlias }; if ($c[1].N -like 'entry*') { $key = "moveTargets.$($a) trong config.json" } else { $key = "moveTargets.$($a).platform_user trong config.json" }
+    if ($c[0] -ceq 'old') { Set-TargetEntries $bad $ok } else { Set-TargetEntries $ok $bad }; $n0 = $W.Calls.Count
+    $r = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $r.Code 65 "[rebuild $($c[0]) $($c[1].N)] exit ($($r.Text))"; HasText $key
+    Eq $W.Calls.Count $n0 "[rebuild $($c[0]) $($c[1].N)] no ssh"; Ok (-not (Test-Path -LiteralPath (StatePath))) "[rebuild $($c[0]) $($c[1].N)] no state written"
+  }
+  Reset-World; Set-TargetEntries ([pscustomobject]@{ platform_user = 'quoc'; note = 'x'; extra = 5 }) ([pscustomobject]@{}); [void](Do-Plan)
+  Eq ((PlanPuLines) -join ' | ') 'platform-user quoc' 'a valid entry with extra keys: the line'; $s = Get-St; Eq "$($s.old.platform_user)" 'quoc' 'valid entry: old.platform_user'; Eq "$($s.new.platform_user)" '' 'an object without platform_user is unset'
+  Reset-World; Set-TargetEntries ([pscustomobject]@{}) ([pscustomobject]@{ platform_user = '' }); Fx-Copied; [void](Do-Cutover)
+  Eq (@(PuLines $W.Calls).Count) 0 'objects without a name or with an empty name: unset, no line'
+}
 T 'L.plan-platform-user: a --map file line platform-user <name> (a laptop stdin line, never a map line) refuses map-invalid ref=platform-user, plan exits 65 before any ssh and writes nothing, with or without platform_user in config.json (ruling 04/11 (3) 5: named only in the config; D.0.9)' {
   foreach ($c in @(@('platform-user quoc', $null), @('  platform-user root', 'quoc'))) {
     Reset-World; if ($null -ne $c[1]) { Set-PlatformUser $c[1] $null }
