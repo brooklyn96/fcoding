@@ -1946,6 +1946,7 @@ export function createApp(opts = {}) {
       return await mutate(ctx, async () => {
         const cur = (await listSessions(ctx)).find((x) => x.name === s.name);
         if (!cur || cur.project !== s.project || cur.harness !== s.harness || cur.created !== s.created) return false;
+        await leaveMode(s.name, ctx);
         await (s.harness === 'codex' ? run(ctx, ['send-keys', '-t', pane(s.name), '-l', '--', file]) : pasteText(s.name, file, ctx));
         return true;
       });

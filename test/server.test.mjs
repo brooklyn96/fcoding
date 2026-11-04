@@ -5896,13 +5896,32 @@ test('upload: attach puts the path alone in the input, no Enter: claude, omp, sh
     const keys = calls.flatMap((x) => x.argv);
     assert.ok(!keys.includes('Enter'), `${h}: Enter was sent`);
     assert.ok(!calls.some((x) => x.argv[0] === 'send-keys' && x.argv.some((a) => /^(C-m|KPEnter)$/.test(a))), h);
+    const quit = ['copy-mode', '-q', '-t', `=s-${h}:`]; // a laptop may have left the pane in copy mode: leave it first
     if (h === 'codex') {
-      assert.deepEqual(calls.map((x) => x.argv), [['send-keys', '-t', '=s-codex:', '-l', '--', r.json.path]]);
+      assert.deepEqual(calls.map((x) => x.argv), [quit, ['send-keys', '-t', '=s-codex:', '-l', '--', r.json.path]]);
     } else {
-      assert.deepEqual(calls.map((x) => x.argv), [['load-buffer', '-b', 'pc', '-'], ['paste-buffer', '-p', '-d', '-b', 'pc', '-t', `=s-${h}:`]]);
-      assert.equal(calls[0].text, r.json.path); // the path and nothing else: no newline, no quotes
+      assert.deepEqual(calls.map((x) => x.argv), [quit, ['load-buffer', '-b', 'pc', '-'], ['paste-buffer', '-p', '-d', '-b', 'pc', '-t', `=s-${h}:`]]);
+      assert.equal(calls[1].text, r.json.path); // the path and nothing else: no newline, no quotes
     }
   }
+}));
+
+test('upload: attach leaves any pane mode (copy-mode -q) before it types the path, and types nothing when that fails', () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 'm-codex', 'codex');
+  await mkAgent(c, cookie, 'm-claude', 'claude');
+  for (const h of ['codex', 'claude']) {
+    const before = c.calls().length;
+    assert.equal((await upPost(c, cookie, 'alpha', JPG, { session: `m-${h}` })).json.attached, true, h);
+    const typed = c.calls().slice(before).map((x) => x.argv[0]).filter((a) => a !== 'list-sessions');
+    assert.deepEqual(typed, h === 'codex' ? ['copy-mode', 'send-keys'] : ['copy-mode', 'load-buffer', 'paste-buffer'], h);
+  }
+  const before = c.calls().length;
+  await withEnv({ FAKE_TMUX_FAIL_ON: 'copy-mode' }, async () => {
+    const r = await upPost(c, cookie, 'alpha', JPG, { session: 'm-codex' });
+    assert.equal(r.status, 200, r.text);
+    assert.equal(r.json.attached, false); // the file is saved, the input is not touched
+  });
+  assert.ok(!c.calls().slice(before).some((x) => ['send-keys', 'load-buffer', 'paste-buffer'].includes(x.argv[0])));
 }));
 
 test('upload: without a session nothing goes to tmux and attached is false', () => withUpload(async (c, dirs, cookie) => {
