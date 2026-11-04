@@ -720,6 +720,57 @@ T 'L.plan-rewrites-remedy: old''s plan <id> refusing map-invalid ref=rewrites wi
   Reset-World; Add-Fault -M old -Key '^plan:full$' -Rc 65 -Out @('INV refuse map-invalid ref=include') -Mode nomanifest
   [void](Do-Plan -Want 65); NoText 'ghi rõ `<from>=<to>`'; NothingWritten
 }
+# Q-ownip-compose (ruling 04/11 (2); DESIGN rev 1k3.8 B.12.5, D.15, D.15.1). The fake plan <id> answers as old's B.12.5 / E-P11: an own-ip
+# path without a rewrite line refuses own-ip, a bare `rewrite own-ip <path>` while a family has more than one address in dial.old or
+# dial.new refuses map-invalid ref=rewrites, every path covered gives INV ok. The manifest's dial {old[], new[]} carries the addresses.
+$OwnipPaths = @('/etc/hostview-turn.conf', '/etc/hostview-turn.nft')
+$OwnipSeveralText = 'Máy cũ có các địa chỉ <địa chỉ cũ>, máy mới có các địa chỉ <địa chỉ mới>. Gõ từng cặp theo dạng địa chỉ máy cũ=địa chỉ máy mới để thay trong các file trên, mỗi cặp một dòng; gõ một dòng trống để kết thúc.'   # DESIGN D.15.1 "Q-ownip (several addresses)" = CONTRACT §8.3.1, verbatim
+function Set-OwnipPlan([string[]]$Old, [string[]]$New) {
+  $W.Mf.dial = [ordered]@{ old = @($Old); new = @($New) }
+  $fam = { param($a, $six) @($a | Where-Object { ($_ -like '*:*') -eq $six }).Count }
+  $script:OwnipSeveral = (& $fam $Old $false) -gt 1 -or (& $fam $Old $true) -gt 1 -or (& $fam $New $false) -gt 1 -or (& $fam $New $true) -gt 1
+  $W.PlanHook = { param($n, $map)
+    $rw = @($map | Where-Object { $_ -cmatch '\Arewrite own-ip ' })
+    if ($script:OwnipSeveral -and @($rw | Where-Object { $_ -cmatch '\Arewrite own-ip \S+\z' }).Count) { return @{ Out = @('INV refuse map-invalid ref=rewrites'); Code = 65 } }
+    $left = @($OwnipPaths | Where-Object { $p = $_; -not @($rw | Where-Object { $_ -cmatch "\Arewrite own-ip $([regex]::Escape($p))(?: \S+=\S+)?\z" }).Count })
+    if ($left.Count) { @{ Out = @($left | ForEach-Object { "INV refuse own-ip path=$_" }); Code = 65 } } else { @{ Out = @('INV ok'); Code = 0 } }
+  }
+}
+function OwnipLines { @(foreach ($s in $W.PlanStdin) { @($s | Where-Object { $_ -cmatch '\Arewrite own-ip ' }) }) }
+T 'L.plan-rewrites-remedy: Q-ownip with two old addresses in a family (or two new ones; IPv4 or IPv6) asks for the <from>=<to> pairs after có, writes rewrite own-ip <path> <from>=<to> per path and pair, never the bare line, and the re-plan accepts its own output (ruling 04/11 (2) Q-ownip-compose, B.12.5, D.15)' {
+  Set-OwnipPlan @('203.0.113.10', '203.0.113.11') @('198.51.100.20'); Ans 'có', '203.0.113.10=198.51.100.20', '203.0.113.11=198.51.100.20', ''
+  [void](Do-Plan); Eq $W.PlanN 2 'plan runs = the refusal + one accepted re-plan'; Eq $W.Answers.Count 0 'every typed pair and the closing blank line were read'
+  $want = @(foreach ($p in $OwnipPaths) { foreach ($x in '203.0.113.10=198.51.100.20', '203.0.113.11=198.51.100.20') { "rewrite own-ip $p $x" } })
+  Eq ((@($W.PlanStdin[-1]) | Where-Object { $_ -cmatch '\Arewrite own-ip ' }) -join ' | ') ($want -join ' | ') 'the re-plan map: one pair line per path and pair'
+  Ok (@(OwnipLines | Where-Object { $_ -cmatch '\Arewrite own-ip \S+\z' }).Count -eq 0) "no bare rewrite line is ever sent: $(OwnipLines)"
+  $mt = @([IO.File]::ReadAllText((Join-Path (MoveDir) 'map.txt')) -split "`r?`n" | Where-Object { $_ -cmatch '\Arewrite own-ip ' })
+  Eq ($mt -join ' | ') ($want -join ' | ') 'map.txt keeps the pair lines (the copy re-plan reads them)'; Eq (Get-St).phase 'planned' 'phase'
+  Reset-World; Set-OwnipPlan @('203.0.113.10') @('198.51.100.20', '198.51.100.21'); Ans 'có', '203.0.113.10=198.51.100.21', ''
+  [void](Do-Plan); Eq $W.PlanN 2 'two new addresses: one accepted re-plan'
+  Eq ((@($W.PlanStdin[-1]) | Where-Object { $_ -cmatch '\Arewrite own-ip ' }) -join ' | ') (@($OwnipPaths | ForEach-Object { "rewrite own-ip $_ 203.0.113.10=198.51.100.21" }) -join ' | ') 'two new addresses: the pair lines'
+  Reset-World; Set-OwnipPlan @('203.0.113.10', '2001:db8::10', '2001:db8::11') @('198.51.100.20', '2001:db8::20'); Ans 'có', '2001:db8::10=2001:db8::20', '2001:db8::11=2001:db8::20', ''
+  [void](Do-Plan); Eq $W.PlanN 2 'two old IPv6 addresses: one accepted re-plan'
+  $want = @(foreach ($p in $OwnipPaths) { foreach ($x in '2001:db8::10=2001:db8::20', '2001:db8::11=2001:db8::20') { "rewrite own-ip $p $x" } })
+  Eq ((@($W.PlanStdin[-1]) | Where-Object { $_ -cmatch '\Arewrite own-ip ' }) -join ' | ') ($want -join ' | ') 'two old IPv6 addresses: the pair lines'
+  Ok (@(OwnipLines | Where-Object { $_ -cmatch '\Arewrite own-ip \S+\z' }).Count -eq 0) "two old IPv6 addresses: no bare rewrite line is sent: $(OwnipLines)"
+}
+T 'L.plan-rewrites-remedy: Q-ownip with exactly one address per family in dial.old and dial.new (one IPv4, one IPv6 each) writes the bare rewrite own-ip <path> as before and asks for no pair (ruling 04/11 (2) Q-ownip-compose, B.12.5)' {
+  Set-OwnipPlan @('203.0.113.10', '2001:db8::10') @('198.51.100.20', '2001:db8::20'); Ans 'có'
+  [void](Do-Plan); Eq $W.PlanN 2 'one accepted re-plan'; Eq $W.Prompts.Count 1 "only Q-ownip is asked: $($W.Prompts -join ' | ')"
+  Eq ((OwnipLines) -join ' | ') (@($OwnipPaths | ForEach-Object { "rewrite own-ip $_" }) -join ' | ') 'the bare lines, once each'
+  NoText 'Gõ từng cặp'; Eq (Get-St).phase 'planned' 'phase'
+}
+T 'L.plan-rewrites-remedy: the pair question is the D.15.1 text "Q-ownip (several addresses)" byte for byte, after the Q-ownip text, its fills naming old''s and new''s dial addresses (ruling 04/11 (2) Q-ownip-compose, CONTRACT §8.3.1)' {
+  Set-OwnipPlan @('203.0.113.10', '203.0.113.11') @('198.51.100.20'); Ans 'có', '203.0.113.10=198.51.100.20', '203.0.113.11=198.51.100.20', ''
+  [void](Do-Plan)
+  $rx = '\A' + (@($OwnipSeveralText -split '<[^>]+>' | ForEach-Object { [regex]::Escape($_) }) -join '(.+)') + '\z'
+  $hit = @(Lines | Where-Object { $_ -cmatch $rx }); Eq $hit.Count 1 "the D.15.1 line once: $(Lines)"
+  $m = [regex]::Match($hit[0], $rx); $f1 = $m.Groups[1].Value; $f2 = $m.Groups[2].Value
+  Ok ($f1.Contains('203.0.113.10') -and $f1.Contains('203.0.113.11') -and -not $f1.Contains('198.51.100.20')) "<địa chỉ cũ> = old's dial addresses: [$f1]"
+  Ok ($f2.Contains('198.51.100.20') -and -not $f2.Contains('203.0.113.1')) "<địa chỉ mới> = new's dial addresses: [$f2]"
+  $l = @(Lines); $iq = [Array]::IndexOf($l, (@($l | Where-Object { $_ -cmatch '\ACác file sau chứa địa chỉ của máy cũ: ' })[0])); $is = [Array]::IndexOf($l, $hit[0])
+  Ok ($iq -ge 0 -and $iq -lt $is) "Q-ownip comes before the pair question: $iq, $is"
+}
 T 'L.plan-tunnel-remedies: a connector ingress naming old''s own address (INV refuse own-ip path=ingress:<hostname>), Q-ownip không, ends plan 65 with the remedy "đổi service của tên đó trong cấu hình tunnel sang 127.0.0.1 hoặc tên container"; an own-ip file path gets no such remedy (B.12.4, W1-T3-GAP-17, CONTRACT §8.3.2)' {
   $W.PlanOut = @('INV refuse own-ip path=ingress:app.example.com'); $W.PlanCode = 65; Ans 'không'
   [void](Do-Plan -Want 65); HasText 'đổi service của tên đó trong cấu hình tunnel sang 127.0.0.1 hoặc tên container'; NothingWritten
