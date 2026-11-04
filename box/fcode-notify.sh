@@ -8,15 +8,17 @@
 #   [link]: empty or an https URL of at most 160 characters
 # Output: exactly one line on stdout, then exit:
 #   notify: queued <id>                                        exit 0
-#   notify: duplicate                                          exit 0   (same project+kind+text+link in the last 30 min; nothing written)
+#   notify: duplicate                                          exit 0   (same project+kind+text+link+session in the last 30 min; nothing written)
 #   error: usage | bad-project | bad-kind | bad-text | bad-link  exit 65 (nothing written)
 #   error: rate-limited                                        exit 75  (more than 6 notes for this project or 15 in total in the last 60 min)
 #   error: io                                                  exit 1   (lock / write failure; the old file stays as it was)
-# Outbox: $HOME/.local/state/fcode/notify/outbox.tsv (dir 700, file 600), one note per line, 6 TAB-separated fields:
-#   id (<epoch>-<8 hex>)  epoch  project  kind  text  link
+# Outbox: $HOME/.local/state/fcode/notify/outbox.tsv (dir 700, file 600), one note per line, 7 TAB-separated fields:
+#   id (<epoch>-<8 hex>)  epoch  project  kind  text  link  session
+# session = the tmux session this note comes from (^[a-z0-9][a-z0-9._-]{0,63}$), found by this script itself: `tmux display-message -p -t $TMUX_PANE '#S'`
+# when TMUX and TMUX_PANE are set (under `timeout 2`); empty (never an error) outside tmux, when tmux fails or hangs or when the name does not match. Old 6-field lines are still read (session empty).
 # Only the newest 50 lines are kept; every rewrite is a temp file + mv under flock (outbox.lock).
-# Test hooks, honoured only with FCODE_NOTIFY_TEST=1: FCODE_NOTIFY_DIR (outbox dir) and FCODE_NOTIFY_NOW (epoch seconds).
-# Needs: bash, node (text check only), flock, od, mktemp. Reads nothing but its arguments and the outbox; makes no network call.
+# Test hooks, honoured only with FCODE_NOTIFY_TEST=1: FCODE_NOTIFY_DIR (outbox dir), FCODE_NOTIFY_NOW (epoch seconds) and FCODE_NOTIFY_SESSION (replaces the tmux lookup; may be empty).
+# Needs: bash, node (text check only), flock, od, mktemp, timeout (coreutils; only for the tmux lookup). Reads nothing but its arguments and the outbox; makes no network call.
 set -u
 export LC_ALL=C
 export PATH="${HOME:-/nonexistent}/.local/bin:${HOME:-/nonexistent}/.bun/bin:/usr/local/bin:$PATH"
@@ -66,6 +68,15 @@ fi
 [[ $NOW =~ ^[0-9]{10}$ ]] || io
 OUT=$DIR/outbox.tsv
 
+# session: from tmux, or (test only) from FCODE_NOTIFY_SESSION; anything that does not match the name rule becomes empty
+session=
+if [ "${FCODE_NOTIFY_TEST:-}" = 1 ] && [ -n "${FCODE_NOTIFY_SESSION+x}" ]; then
+  session=$FCODE_NOTIFY_SESSION
+elif [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then
+  session=$(timeout 2 tmux display-message -p -t "$TMUX_PANE" '#S' 2>/dev/null </dev/null) || session=
+fi
+[[ $session =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || session=
+
 mkdir -p "$DIR" 2>/dev/null && chmod 700 "$DIR" 2>/dev/null || io
 if ! { exec 9>>"$DIR/outbox.lock"; } 2>/dev/null; then io; fi
 flock -w 10 9 || io
@@ -82,15 +93,16 @@ if [ -e "$OUT" ] || [ -L "$OUT" ]; then
   done <"$OUT"
 fi
 
-# duplicate (same project+kind+text+link within 30 min) is answered before the rate limit; the counts are over the last 60 min
+# duplicate (same project+kind+text+link+session within 30 min) is answered before the rate limit; the counts are over the last 60 min
 ids=" " n_all=0 n_proj=0 i=0
 while [ "$i" -lt "${#old[@]}" ]; do
-  IFS=$'\t' read -r l_id l_ep l_pr l_kd l_tx l_lk <<<"${old[$i]}"
+  # TAB is blank space to read: empty fields would collapse. Text has no control characters, so \001 is a safe separator.
+  IFS=$'\001' read -r l_id l_ep l_pr l_kd l_tx l_lk l_se <<<"${old[$i]//$'\t'/$'\001'}"
   i=$((i + 1))
   ids="$ids$l_id "
   [[ $l_ep =~ ^[0-9]{10}$ ]] || continue
   age=$((NOW - 10#$l_ep))
-  if [ "$age" -le 1800 ] && [ "$l_pr" = "$project" ] && [ "$l_kd" = "$kind" ] && [ "$l_tx" = "$text" ] && [ "$l_lk" = "$link" ]; then
+  if [ "$age" -le 1800 ] && [ "$l_pr" = "$project" ] && [ "$l_kd" = "$kind" ] && [ "$l_tx" = "$text" ] && [ "$l_lk" = "$link" ] && [ "$l_se" = "$session" ]; then
     bye 'notify: duplicate' 0
   fi
   if [ "$age" -lt 3600 ]; then
@@ -116,7 +128,7 @@ start=0
 {
   i=$start
   while [ "$i" -lt "${#old[@]}" ]; do printf '%s\n' "${old[$i]}"; i=$((i + 1)); done
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$NOW" "$project" "$kind" "$text" "$link"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$NOW" "$project" "$kind" "$text" "$link" "$session"
 } >"$tmp" || io
 chmod 600 "$tmp" && mv -f "$tmp" "$OUT" || io
 tmp=
