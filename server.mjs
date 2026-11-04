@@ -132,10 +132,8 @@ const ADD_CODES = { 0: 'ADDED', 30: 'ADDED_WARN', 40: 'NEED_KEY', 41: 'NEED_WRIT
 const ADD_DETAIL = ['SSH_DETAIL', 'CLONE_FAIL', 'DIR_EXISTS', 'DIR_UNSAFE', 'HOOK_FAIL', 'URL_REWRITE', 'CRED_FAIL', 'CFG_CONFLICT', 'CFG_BROKEN', 'CLEANUP_FAIL'];
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ADD_SCRIPT = path.join(SERVER_DIR, 'fcode-add.sh'), ADD_SCRIPT_DEV = path.join(SERVER_DIR, 'box', 'fcode-add.sh'); // installed next to server.mjs, or in a checkout
-// every harness session starts through start.sh (box/start.sh; installed next to server.mjs): it takes GH_TOKEN alone from the secrets
-// env file at session start, then execs the harness (A3). Only the loader's path is on the tmux command line, never the token.
-const LOADER = [path.join(SERVER_DIR, 'start.sh'), path.join(SERVER_DIR, 'box', 'start.sh')].find((f) => fs.existsSync(f)) ?? path.join(SERVER_DIR, 'start.sh');
-const HARNESS_LAUNCH = `${HARNESS_ENV}/bin/sh ${shq(LOADER)} `;
+const SECRETS_ENV = '/run/instabox/secrets/env'; // the secrets env file the loader reads GH_TOKEN from (FCODE_SECRETS_ENV overrides)
+const TOKEN_VARS = ['GH_TOKEN', 'GITHUB_TOKEN']; // never handed to tmux: its server would copy them into its global env (A3)
 const GH_LIST_MS = 60e3, GH_PAGES = 3, GH_PAGE_SIZE = 100, GH_LIST_MAX = GH_PAGES * GH_PAGE_SIZE; // GET /api/github/repos: cache time, pages read, most repos listed
 // pages 1..3 of the newest-updated repos, one JSON object per line ("@json"); no --paginate (an account with thousands of repos would run out of time)
 const ghReposArgs = (page) => ['api', `/user/repos?affiliation=owner,collaborator,organization_member&sort=updated&per_page=${GH_PAGE_SIZE}&page=${page}`, '--jq',
@@ -977,6 +975,11 @@ export function createApp(opts = {}) {
   let tmuxSpec = opts.tmux ?? process.env.PC_TMUX ?? 'tmux';
   if (typeof tmuxSpec === 'string') tmuxSpec = tmuxSpec.startsWith('[') ? JSON.parse(tmuxSpec) : [tmuxSpec];
   const log = opts.log || ((s) => console.log(s));
+  // every harness session starts through start.sh (box/start.sh; installed next to server.mjs): it reads GH_TOKEN alone from the secrets
+  // env file at session start, then execs the harness (A3). Only paths are on the tmux command line, never the token. No loader: as before it.
+  const loader = [path.join(SERVER_DIR, 'start.sh'), path.join(SERVER_DIR, 'box', 'start.sh')].find((f) => fs.existsSync(f));
+  if (!loader) log('warning: start.sh not found next to server.mjs; harness sessions start without GH_TOKEN (run bash install.sh)');
+  const harnessLaunch = loader ? `${HARNESS_ENV}${shq(`FCODE_SECRETS_ENV=${process.env.FCODE_SECRETS_ENV || SECRETS_ENV}`)} /bin/sh ${shq(loader)} ` : HARNESS_ENV;
   const pollMs = opts.pollMs ?? 700;
   const pingMs = opts.pingMs ?? 15000;
   const drainTimeout = opts.drainTimeoutMs ?? DRAIN_TIMEOUT;
@@ -1203,9 +1206,10 @@ export function createApp(opts = {}) {
     return new Promise((resolve, reject) => {
       const [cmd, ...pre] = spec;
       try {
+        const env = { ...process.env, LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', ...(spec === gitSpec && { GIT_OPTIONAL_LOCKS: '0' }) };
+        if (spec === tmuxSpec) for (const v of TOKEN_VARS) delete env[v]; // the service keeps its GH_TOKEN for gh; tmux never sees it
         const child = execFile(cmd, [...pre, ...args], {
-          encoding: 'utf8', timeout: 5000, maxBuffer: 16 << 20, windowsHide: true,
-          env: { ...process.env, LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', ...(spec === gitSpec && { GIT_OPTIONAL_LOCKS: '0' }) },
+          encoding: 'utf8', timeout: 5000, maxBuffer: 16 << 20, windowsHide: true, env,
         }, (err, stdout, stderr) => {
           free();
           if (!err) return resolve(stdout);
@@ -1269,10 +1273,18 @@ export function createApp(opts = {}) {
 
   const validProject = (p) => typeof p === 'string' && cfg.projectNames.includes(p);
   const validHarness = (h) => typeof h === 'string' && Object.hasOwn(HARNESSES, h);
+  // once, at listen and before the first new-session: a tmux server that outlived a restart (KillMode=process) or was started from a
+  // login shell may hold GH_TOKEN in its global env; an unset carries no value. No tmux server running: nothing to clean (error ignored).
+  let tmuxEnvClean = null;
+  const cleanTmuxEnv = () => (tmuxEnvClean ??= (async () => {
+    const ctx = { cancelled: false, device: null, gen, admin: true, mutation: true };
+    for (const v of TOKEN_VARS) await run(ctx, ['set-environment', '-g', '-u', v]).catch(() => {});
+  })());
   // runs inside a mutation job
   async function createSession(name, project, harness, ctx, command = HARNESSES[harness]) {
+    await cleanTmuxEnv();
     try {
-      await run(ctx, ['new-session', '-d', '-s', name, '-c', cfg.projects[project], HARNESS_LAUNCH + command]);
+      await run(ctx, ['new-session', '-d', '-s', name, '-c', cfg.projects[project], harnessLaunch + command]);
     } catch (e) {
       if (/duplicate session/i.test(e.stderr || '')) throw new HttpErr(409, 'exists');
       throw e;
@@ -2404,6 +2416,7 @@ export function createApp(opts = {}) {
     try {
       const bound = await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, host, () => resolve(server.address().port)); });
       startWarm();
+      void cleanTmuxEnv();
       return bound;
     } catch (e) { adminServer.close(); throw e; }
   };

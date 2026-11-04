@@ -24,8 +24,10 @@ const fail = (msg) => { process.stderr.write(msg + '\n'); process.exit(1); };
 const t0 = Date.now();
 let stdin = null;
 if (cmd === 'load-buffer') stdin = fs.readFileSync(0).toString('base64');
-// logged on exit (success or failure) with start/end times so tests can measure overlap and ordering
-process.on('exit', () => fs.appendFileSync(path.join(dir, 'log.jsonl'), JSON.stringify({ argv, stdin, t0, t1: Date.now() }) + '\n'));
+// logged on exit (success or failure) with start/end times so tests can measure overlap and ordering.
+// hasGhToken: whether this call's environment holds GH_TOKEN or GITHUB_TOKEN (a real tmux server would copy it into its global env); never the value
+const hasGhToken = 'GH_TOKEN' in process.env || 'GITHUB_TOKEN' in process.env;
+process.on('exit', () => fs.appendFileSync(path.join(dir, 'log.jsonl'), JSON.stringify({ argv, stdin, t0, t1: Date.now(), hasGhToken }) + '\n'));
 const delays = JSON.parse(process.env.FAKE_TMUX_DELAYS || '{}'); // per command, e.g. {"capture-pane": 300}
 const delay = Number((argv.includes('-S') ? delays[`${cmd} -S`] : undefined) ?? delays[cmd] ?? process.env.FAKE_TMUX_DELAY_MS ?? 0);
 if (delay) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
