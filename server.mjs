@@ -1798,7 +1798,7 @@ export function createApp(opts = {}) {
     pruneAdd();
     let out = '', child, timer, grace;
     const end = () => { clearTimeout(timer); addStops.delete(abort); };
-    // TERM to the watchdog alone, which sends it to its group once armed; Node refuses the kill after 'exit', so a reused pid is never hit
+    // TERM to the watchdog alone (on Windows the script), which sends it to its group once armed; Node refuses the kill after 'exit', so a reused pid is never hit
     const abort = () => { end(); child.kill('SIGTERM'); clearTimeout(grace); }; // the app closes
     const finish = (res) => {
       if (job.state !== 'running') return;
@@ -1824,7 +1824,7 @@ export function createApp(opts = {}) {
     child.on('close', (code) => finish(addOutcome(code, out)));
     timer = setTimeout(() => {
       finish({ state: 'failed', code: 'TIMEOUT' });
-      child.kill('SIGTERM'); // TERM to the watchdog alone, which sends it to its group once armed (the script cleans up its clone on TERM) and the group KILL at +30 s; this backstop only at +45 s
+      child.kill('SIGTERM'); // TERM to the watchdog alone (on Windows the script), which sends it to its group once armed (the script cleans up its clone on TERM) and the group KILL at +30 s; this backstop only at +45 s
       grace = setTimeout(() => killGroup('SIGKILL'), opts.addKillGraceMs ?? ADD_KILL_GRACE_MS); // opts.addKillGraceMs: tests
       grace.unref();
     }, addTimeout);

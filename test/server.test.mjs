@@ -4944,7 +4944,7 @@ async function addApp(fn, extra = {}) {
       await fn(c, dir);
     }, { addScript: [process.execPath, path.join(dir, 'fake-add.mjs'), dir], addKillAfterS: 1, ...extra }); // off Windows a watchdog outlives its job until its kill-after
   } finally {
-    try { process.kill(Number(fs.readFileSync(path.join(dir, 'child.pid'), 'utf8')), 'SIGKILL'); } catch {}
+    try { const p = Number(fs.readFileSync(path.join(dir, 'child.pid'), 'utf8')); if (p > 0) process.kill(p, 'SIGKILL'); } catch {}
     try { const d = Number(fs.readFileSync(path.join(dir, 'daemon.pid'), 'utf8')); if (d > 0) process.kill(d, 'SIGKILL'); } catch {} // a missing file throws; never kill pid 0 (the runner's own group)
     fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
@@ -5176,7 +5176,7 @@ test('add project: closing the app ends a running script and its group', { skip:
     assert.ok(alive(child));
     await c.close();
     await waitFor(() => !alive(child), 5000);
-  } finally { try { process.kill(Number(fs.readFileSync(path.join(dir, 'child.pid'), 'utf8')), 'SIGKILL'); } catch {} fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+  } finally { try { const p = Number(fs.readFileSync(path.join(dir, 'child.pid'), 'utf8')); if (p > 0) process.kill(p, 'SIGKILL'); } catch {} fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
 
 test('add project: the new project is in /api/home, /api/meta and /api/overview at once, with no restart; ended jobs are kept 30 minutes', () => addApp(async (c) => {
