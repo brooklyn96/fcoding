@@ -1340,12 +1340,14 @@ resolve() { # $1 = so hoac ten (hoac dau ten) -> dat $sel
 }
 
 attach() {
-  echo "Thoát mà không tắt phiên: bấm Ctrl+B rồi D"
+  echo "Thoát mà không tắt phiên: bấm Ctrl+B rồi D. Lăn chuột để cuộn, bấm q để về cuối; giữ Shift khi kéo chuột để bôi đen chữ"
   sleep 2
   case "${TERM:-}" in ""|dumb) export TERM=xterm-256color ;; esac
   # The app sizes the window to the phone (window-size manual), so a laptop client would see only part of it.
   # Resize to this client right after attaching; the app sets its own size again when the phone opens the session.
-  exec tmux -u attach -t "=$1" \; resize-window -A
+  # Mouse on for this session only (the server's tmux default is off): the wheel then scrolls the pane history in
+  # copy mode instead of doing nothing. The app never sends mouse events, so it is not affected.
+  exec tmux -u attach -t "=$1" \; resize-window -A \; set-option mouse on
 }
 
 # --- mo phien moi: dung fcode-new tren box (hop dong: --projects / --harnesses / <project> <harness>) ---

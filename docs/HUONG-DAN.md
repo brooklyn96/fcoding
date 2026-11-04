@@ -460,7 +460,7 @@ fcode new       # mở phiên mới: chọn dự án và harness (hoặc gõ 0 t
 - `fcode pair [tên thiết bị]`: tạo mã ghép kèm mã QR cho iPhone mới (cần `publicUrl`, xem [mục 6](#ghép-thêm-iphone-bằng-mã-qr)).
 - `fcode ipa`: tải bản app mới nhất về `Downloads\fcode.ipa`. Khi có bản mới, kéo file này vào Sideloadly và bấm Start; việc tự ký lại 7 ngày của Sideloadly chỉ gia hạn bản đang cài, không tự cập nhật. Không có `fcode` thì tải `fcode.ipa` từ **Releases** trên GitHub.
 
-Thoát bằng **Ctrl+B** rồi **D**, phiên vẫn chạy tiếp. Khi vào từ laptop, phiên tự chỉnh cho vừa cửa sổ laptop (kể cả khi vừa mở trên điện thoại); lần sau mở lại trên điện thoại, app tự chỉnh lại theo màn hình điện thoại.
+Thoát bằng **Ctrl+B** rồi **D**, phiên vẫn chạy tiếp. Khi vào từ laptop, phiên tự chỉnh cho vừa cửa sổ laptop (kể cả khi vừa mở trên điện thoại); lần sau mở lại trên điện thoại, app tự chỉnh lại theo màn hình điện thoại. Lăn chuột để cuộn lên xem lại; bấm **q** (hoặc lăn xuống tới cuối) để về chỗ đang chạy. Khi bật cuộn bằng chuột, muốn bôi đen chữ để chép thì giữ **Shift** trong lúc kéo chuột.
 
 ### Đồng bộ phiên chat omp giữa laptop và box (`fcode phien`)
 
