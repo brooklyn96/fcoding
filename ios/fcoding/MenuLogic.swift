@@ -61,7 +61,8 @@ enum MenuLogic {
     /// The menu now on screen: the last run of numbered lines in the last 12 non-empty lines.
     /// Wrapped label lines inside the run (indented past the option's number) are skipped; any
     /// other line ends the run, and a "1." starts a new one. Returned only when the run has at
-    /// least 2 options numbered 1, 2, 3… in order; otherwise [].
+    /// least 2 options numbered 1, 2, 3… in order and exactly ONE of them is highlighted (❯, > or
+    /// ›), so a plain numbered list in an answer is never a menu; otherwise [].
     static func options(_ lines: [String]) -> [Option] {
         let tail = lines.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }.suffix(window).map(parse)
         var last: [Option] = []
@@ -84,13 +85,14 @@ enum MenuLogic {
             }
         }
         if !run.isEmpty { last = run }
-        guard last.count >= 2, last.enumerated().allSatisfy({ $0.element.number == $0.offset + 1 }) else { return [] }
+        guard last.count >= 2, last.enumerated().allSatisfy({ $0.element.number == $0.offset + 1 }),
+              last.filter(\.highlighted).count == 1 else { return [] }
         return last
     }
 
     /// The keys that move the highlight to `target` and confirm it: Up or Down (repeat capped at
-    /// 20, left out when already there), then Enter. [] when not exactly one option is
-    /// highlighted: the caller then types the number as text, without Enter.
+    /// 20, left out when already there), then Enter. [] only for invalid input (not exactly one
+    /// option highlighted, or the target not in the list); never for a menu `options` returned.
     static func keys(toChoose target: Option, in opts: [Option]) -> [(key: String, `repeat`: Int)] {
         let lit = opts.indices.filter { opts[$0].highlighted }
         guard lit.count == 1, let t = opts.firstIndex(where: { $0.number == target.number }) else { return [] }
@@ -188,12 +190,17 @@ enum MenuLogic {
         eq("starts at 2", opts("Pick\n❯ 2. Yes\n  3. No\n").count, 0)
         eq("no space after dot", opts("1.5 MB\n2.0 MB\n").count, 0)
 
-        // No highlight: keys is [] (the caller types the digit).
-        let plain = "Choose a model:\n1. Opus\n2. Sonnet\n"
-        eq("plain options", summary(opts(plain)), "1 Opus | 2 Sonnet")
-        eq("plain pick 2", pick(plain, 2), "")
-        // Two highlights: keys is [].
-        eq("two highlights", pick("Allow this command?\n› 1. Yes\n> 2. Yes, and always allow\n", 1), "")
+        // No highlight or two highlights: not a menu.
+        eq("no highlight", opts("Choose a model:\n1. Opus\n2. Sonnet\n").count, 0)
+        eq("two highlights", opts("Allow this command?\n› 1. Yes\n> 2. Yes, and always allow\n").count, 0)
+        // Claude's answer with a plain numbered list, then the "> " input prompt: not a menu.
+        let answer = "● Next steps:\n  1. Add the parser\n  2. Wire the bar\n  3. Update the docs\n\n> \n"
+        eq("answer list", opts(answer).count, 0)
+        // The highlighted option itself: Enter only.
+        eq("already highlighted", pick(perm, 1), "Enterx1")
+        // keys() on invalid input (two highlights, built by hand) is [].
+        let twoLit = [Option(number: 1, label: "a", highlighted: true), Option(number: 2, label: "b", highlighted: true)]
+        eq("keys two highlights", keyText(keys(toChoose: twoLit[1], in: twoLit)), "")
 
         // An older menu higher up, a newer one below: the newer wins.
         let twice = """

@@ -139,7 +139,7 @@ struct HomeGuideView: View {
             "Kéo danh sách xuống để làm mới.",
         ]),
         ("Chọn trong menu", 0xFF9F0A, [
-            "Khi phiên hỏi bạn chọn (ví dụ **1. Yes, proceed** / **2. No, exit**), một thanh nút hiện ngay trên ô nhập, tự hiện và tự ẩn.",
+            "Khi phiên hiện một menu có số với một dòng đang được chọn (dấu ❯, ví dụ **1. Yes, proceed** / **2. No, exit**), một thanh nút hiện ngay trên ô nhập, tự hiện và tự ẩn.",
             "Chạm một nút để chọn mục đó. Nút **Esc** đóng menu.",
             "Hoặc dùng các phím **↑** **↓** **Enter** ở đầu hàng phím nhanh.",
         ]),

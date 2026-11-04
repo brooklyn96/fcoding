@@ -199,12 +199,12 @@ struct SessionView: View {
     }
 
     /// A tap on the choice bar: the keys that move the highlight and confirm, in one queued input.
-    /// Without a single highlight, the number is typed without Enter (Claude selects by number).
-    /// Nothing while another input is queued, so a double tap never fires twice.
+    /// Nothing while another input is queued (a double tap never fires twice), or for invalid input.
     private func choose(_ option: MenuLogic.Option, in options: [MenuLogic.Option]) {
         guard model.inputPending == 0 else { return }
         let keys = MenuLogic.keys(toChoose: option, in: options)
-        _ = keys.isEmpty ? model.send(String(option.number), enter: false) : model.keys(keys)
+        guard !keys.isEmpty else { return }
+        _ = model.keys(keys)
     }
 
     /// The session name in a harness-coloured chip (as HarnessBadge), cut in the middle when long.
