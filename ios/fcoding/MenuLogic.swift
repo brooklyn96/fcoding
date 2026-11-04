@@ -111,9 +111,10 @@ enum MenuLogic {
         return r
     }
 
-    /// Leading phrases of the Claude and codex key hint footers. Only the start of the line is
-    /// matched: a phone-width pane wraps or cuts the rest, and a status line that merely contains
-    /// the words (a codex thread title, an omp project name) never starts with them.
+    /// Leading phrases of the Claude and codex key hint footers. Only the start of the footer is
+    /// matched, over its rows joined with one space: a narrow pane wraps the footer at word
+    /// boundaries (even "Press enter to confirm" below 24 columns), and a status line that merely
+    /// contains the words (a codex thread title, an omp project name) never starts with them.
     private static let footers = ["Enter to confirm", "Enter to select", "Esc to cancel", "Press enter to confirm", "enter select"]
 
     /// The omp Ask box footer row: "│ 󰌑 select · n note · ↑/↓ move · 󱊷 cancel · Alt+H hide │".
@@ -128,8 +129,12 @@ enum MenuLogic {
 
     /// The live menu now on screen, or nil. Anchored on the menu's footer, in the last 40 non-empty
     /// lines:
-    /// - Anchor: a Claude / codex footer (`footers`) starting in one of the last 2 non-empty lines,
-    ///   or the omp Ask footer row directly above the box's "╰". Without one, Claude's question tab
+    /// - Anchor: a Claude / codex footer (`footers`) at the end of the bottom block (the non-blank
+    ///   rows that end at the last non-blank row): the earliest of the block's last 6 rows from which
+    ///   the rows to the end, joined with one space, start with a footer phrase (6 = the longest
+    ///   footer wrapped at the 20-column floor, plus one). The wide multi-select captures draw the
+    ///   footer right under "5. Chat about this", with no blank line, so it is the block's tail.
+    ///   Or the omp Ask footer row directly above the box's "╰". Without one, Claude's question tab
     ///   header above a run that reaches the last 4 non-empty lines (the Submit tab).
     /// - The highlight is the lowest marker row (❯ › > or the omp chevron, then a space) of the
     ///   block directly above the anchor whose run is valid. The run's item column (the "N." digit,
@@ -149,9 +154,11 @@ enum MenuLogic {
         let filled = rows.indices.filter { !rows[$0].blank }
         guard !filled.isEmpty else { return nil }
         var anchor: Int?
-        for i in filled.suffix(2) where footers.contains(where: { rows[i].text.hasPrefix($0) }) {
-            anchor = i
-            break
+        var bottom = filled.count - 1
+        while bottom > 0, filled[bottom - 1] == filled[bottom] - 1 { bottom -= 1 }
+        for s in max(bottom, filled.count - 6)..<filled.count {
+            let footer = filled[s...].map { rows[$0].text }.joined(separator: " ")
+            if footers.contains(where: { footer.hasPrefix($0) }) { anchor = filled[s]; break }
         }
         if anchor == nil, let b = filled.suffix(4).last(where: { rows[$0].lead == "╰" }),
            let f = filled.last(where: { $0 < b }), isOmpFooter(rows[f]) {
@@ -176,9 +183,9 @@ enum MenuLogic {
         let item = rows[m].markerColumn + 2
         func lit(_ r: Row) -> Bool { r.marked && r.markerColumn == item - 2 }
         var first = m, up = m - 1
+        // Rows top...m hold no blank line: the block above the anchor is one non-blank run.
         while up >= top, rows[first].number != 1 {
             let r = rows[up]
-            if r.blank { break }
             if !r.rule {
                 if r.column < item { break }
                 if lit(r) { return nil }
@@ -186,12 +193,12 @@ enum MenuLogic {
             }
             up -= 1
         }
-        var last = m, gap = false
+        // Below m only the rest of that run, then blank lines up to the anchor.
+        var last = m
         for k in (m + 1)..<end {
             let r = rows[k]
-            if r.blank { gap = true; continue }
-            if r.rule { continue }
-            if gap || r.column < item || lit(r) { return nil }
+            if r.blank || r.rule { continue }
+            if r.column < item || lit(r) { return nil }
             last = k
         }
         var options: [Option] = []
@@ -230,14 +237,21 @@ enum MenuLogic {
         return l.hasPrefix("type something") || l.hasPrefix("other (type")
     }
 
-    /// The same choices on screen: number, label, highlight and checkbox state of every option, and
-    /// the tabs. Rows are ignored (the same menu moves up as output scrolls).
-    static func sameChoices(_ a: Menu?, _ b: Menu?) -> Bool {
-        guard let a = a, let b = b else { return a == nil && b == nil }
-        return a.tabs == b.tabs && a.options.count == b.options.count && zip(a.options, b.options).allSatisfy { x, y in
-            x.number == y.number && x.label == y.label && x.highlighted == y.highlighted
-                && x.checkbox == y.checkbox && x.checked == y.checked
+    /// The published screen is what the box shows: the same text line by line, trailing spaces and
+    /// trailing blank lines ignored (a redraw leaves stale padding); or no menu on either
+    /// side (the box is working, nothing to tap).
+    static func sameScreen(_ shown: [String], _ shownMenu: Menu?, _ probe: [String], _ probeMenu: Menu?) -> Bool {
+        if shownMenu == nil && probeMenu == nil { return true }
+        func plain(_ lines: [String]) -> [Substring] {
+            var out = lines.map { line -> Substring in
+                var s = Substring(line)
+                while let c = s.last, c.isWhitespace { s.removeLast() }
+                return s
+            }
+            while out.last?.isEmpty == true { out.removeLast() }
+            return out
         }
+        return plain(shown) == plain(probe)
     }
 
     /// The menu's options, [] when there is no live menu.
@@ -1734,14 +1748,23 @@ effort to use
         eq("codex draft, title Esc to cancel", summary(codexDraftFoo.replacingOccurrences(of: "Create x file", with: "Esc to cancel stale jobs")), "none")
         eq("omp draft, project select-cancel", summary(ompDraftAltEnter.replacingOccurrences(of: "zz-cap/omp", with: "select-cancel")), "none")
 
-        // sameChoices ignores rows, not choices.
-        let shifted = menu(lines("older output\n\n" + trust))
-        eq("same choices, moved", sameChoices(menu(lines(trust)), shifted), true)
-        eq("same choices, rows differ", menu(lines(trust)) == shifted, false)
-        eq("other highlight", sameChoices(menu(lines(trust)), menu(lines(trustRow2))), false)
-        eq("checked changed", sameChoices(menu(lines(multiDown)), menu(lines(multiSpace))), false)
-        eq("both none", sameChoices(nil, nil), true)
-        eq("menu gone", sameChoices(menu(lines(bash)), nil), false)
+        // sameScreen: the whole text, trailing spaces and blank lines ignored; no menu on both sides.
+        func same(_ a: String, _ b: String) -> Bool {
+            sameScreen(lines(a), menu(lines(a)), lines(b), menu(lines(b)))
+        }
+        eq("same screen", same(trust, trust), true)
+        eq("stale padding", same(trust, lines(trust).map { $0 + "   " }.joined(separator: "\n") + "\n\n"), true)
+        eq("both working", same("✻ Thinking… (3s)", "✻ Thinking… (4s)"), true)
+        eq("highlight moved", same(trust, trustRow2), false)
+        eq("checkbox toggled", same(multiDown, multiSpace), false)
+        eq("menu gone", same(bash, idleAfterEsc), false)
+        eq("menu came", same(idleAfterEsc, bash), false)
+        let nextBash = bash.replacingOccurrences(of: "echo hi > x.txt", with: "echo bye > y.txt")
+        eq("next prompt, same choices", same(bash, nextBash), false)
+        eq("next prompt keeps the menu", summary(nextBash), summary(bash))
+        eq("new output above", same(trust, "older output\n\n" + trust), false)
+        let noHeader = lines(askSingle).filter { !$0.hasPrefix("←") }.joined(separator: "\n")
+        eq("tab header gone", same(askSingle, noHeader), false)
 
         // Rules on small inputs.
         eq("empty", summary(""), "none")
@@ -1752,7 +1775,24 @@ effort to use
         eq("with hint", summary("Pick\n❯ 1. Yes\n  2. No\n\nEsc to cancel"), ">1. Yes | 2. No")
         eq("out of window", summary(ompAsk + "\n" + (1...40).map { "line \($0)" }.joined(separator: "\n")), "none")
         eq("footer wrapped", summary("Pick\n❯ 1. Yes\n  2. No\n\nEnter to select · Tab/Arrow\nkeys to navigate"), ">1. Yes | 2. No")
-        eq("footer not at the end", summary("Pick\n❯ 1. Yes\n  2. No\n\nEsc to cancel\na\nb"), "none")
+        eq("footer block of 7 rows", summary("Pick\n❯ 1. Yes\n  2. No\n\nEsc to cancel\na\nb\nc\nd\ne\nf"), "none")
+        // DERIVED (provisional until a ~40-column capture): the ctrl+g footer wrapped to 3 rows.
+        let footer3 = narrowOnType.replacingOccurrences(of: "Enter to select · Tab/Arrow keys to navigate · \nctrl+g to edit in Vim · Esc to cancel",
+                                                        with: "Enter to select · Tab/Arrow keys to\nnavigate · ctrl+g to edit in Vim · Esc to\ncancel")
+        eq("footer 3 lines, replaced", footer3 != narrowOnType, true)
+        eq("footer 3 lines", summary(footer3), summary(narrowOnType))
+        eq("footer 5 lines", summary("Pick\n❯ 1. Yes\n  2. No\n\nEnter to select ·\nTab/Arrow keys to\nnavigate · ctrl+g to\nedit in Vim · Esc to\ncancel"), ">1. Yes | 2. No")
+        // DERIVED: codex's footer at 21 columns ("Press enter to confirm" itself wraps).
+        let codex21 = narrowCodex.replacingOccurrences(of: "  Press enter to confirm or esc to cancel",
+                                                       with: "  Press enter to\n  confirm or esc to\n  cancel")
+        eq("codex footer at 21 cols, replaced", codex21 != narrowCodex, true)
+        eq("codex footer at 21 cols", summary(codex21), summary(narrowCodex))
+        // Pinned rules: the window offset, a marker needs a space, the walk up stops at "1.", no mix.
+        let far = (1...50).map { "x\($0)" }.joined(separator: "\n") + "\n\n" + trust
+        eq("row beyond window", options(lines(far)).first?.row, lines(far).firstIndex { $0.contains("❯ No, exit") })
+        eq("marker needs a space", summary("Pick\n❯ No\n  >_ Yes\n\nEsc to cancel"), ">No | >_ Yes")
+        eq("stops at 1.", summary("Pick\n  Note here\n  1. Yes\n❯ 2. No\n\nEsc to cancel"), "1. Yes | >2. No")
+        eq("mixed rows", summary("Pick\n❯ 1. Yes\n  maybe\n  2. No\n\nEsc to cancel"), "none")
         eq("footer inside a line", summary("Pick\n❯ 1. Yes\n  2. No\n\nok · Esc to cancel"), "none")
         eq("wrapped label", summary("Run?\n› 1. Yes\n  2. Yes, and don't ask\n   again\n  3. No\n\nPress enter to confirm or esc to cancel"),
            ">1. Yes | 2. Yes, and don't ask | 3. No")
