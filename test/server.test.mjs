@@ -2285,12 +2285,17 @@ test('instance lock: after SIGKILL a new start succeeds at once and replaces the
   try {
     const a = await startServer(c.configDir); running.push(a);
     assert.ok(a.listening, a.err);
-    const ino = fs.lstatSync(sock).ino;
     await new Promise((r) => { a.child.once('exit', r); a.child.kill('SIGKILL'); });
     assert.ok(fs.lstatSync(sock).isSocket()); // left behind by the crash
+    await assert.rejects(adminRequest(c.configDir, { cmd: 'devices' }), { code: 'ENOSERVER' }); // stale: nobody listens on it
+    // a hard link keeps the stale inode alive, so its number cannot be handed to the new socket (ext4 reuses a freed one at once)
+    const old = `${sock}.old`; fs.linkSync(sock, old);
+    const ino = fs.lstatSync(old).ino;
     const b = await startServer(c.configDir); running.push(b);
     assert.ok(b.listening, b.err);
-    assert.notEqual(fs.lstatSync(sock).ino, ino);
+    assert.equal(fs.lstatSync(old).nlink, 1); // the server unlinked the stale path...
+    assert.notEqual(fs.lstatSync(sock).ino, ino); // ...and bound a new socket there
+    assert.ok(fs.lstatSync(sock).isSocket());
     assert.equal(fs.statSync(sock).mode & 0o777, 0o600);
     assert.equal((await adminRequest(c.configDir, { cmd: 'pair' })).ok, true);
   } finally { await Promise.all(running.map(stop)); fs.rmSync(c.root, { recursive: true, force: true }); }

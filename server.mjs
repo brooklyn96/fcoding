@@ -1745,7 +1745,11 @@ export function createApp(opts = {}) {
   // on Linux the script runs under timeout(1): the deadline then holds on its own even when this server is gone (a crash, or a restart that
   // leaves the job alone: install.sh uses KillMode=process); a graceful stop ends the jobs through close(). 124 maps to TIMEOUT; a kill-after kill ends as a signal.
   const addKillAfter = Number(process.env.PC_ADD_KILL_AFTER_S) || ADD_KILL_AFTER_S; // test-only override, like PC_ADD_TIMEOUT_MS
-  const addWrap = process.platform === 'win32' ? [] : ['timeout', `--kill-after=${addKillAfter}`, String(addTimeout / 1000)];
+  // the KILL to the whole group at --kill-after is GNU timeout's. uutils' timeout (the default `timeout` from Ubuntu 26.04) sends it to the
+  // direct child only (its group send gives up when signal(SIGKILL, SIG_IGN) fails), so a TERM-ignoring grandchild would outlive the deadline:
+  // Ubuntu keeps GNU's as gnutimeout, and that one is used when it is on PATH
+  const timeoutBin = toolEnv().PATH.split(':').some((d) => d && fs.existsSync(path.join(d, 'gnutimeout'))) ? 'gnutimeout' : 'timeout';
+  const addWrap = process.platform === 'win32' ? [] : [timeoutBin, `--kill-after=${addKillAfter}`, String(addTimeout / 1000)];
   const addJobs = new Map(); // id -> job
   const addRunning = new Map(); // name -> its running job
   const addStops = new Set(); // one per running child: ends it when the app closes
