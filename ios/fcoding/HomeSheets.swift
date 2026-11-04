@@ -140,7 +140,7 @@ struct HomeGuideView: View {
         ]),
         ("Chọn trong menu", 0xFF9F0A, [
             "Khi phiên hỏi bạn chọn (một menu có một dòng đang được chọn), các dòng lựa chọn có nền màu nhạt và một thanh nút hiện ngay trên ô nhập.",
-            "Chạm ngay dòng trên màn hình, hoặc nút của nó trên thanh, để chọn. Ô **[ ]** chỉ được đánh dấu; chọn xong thì chạm **Submit**. Dòng **Type something** (Claude): app chỉ đưa con trỏ tới đó, bạn gõ rồi Enter. Dòng **Other** (omp): app bấm Enter mở ô **Custom answer**, bạn gõ rồi Enter (hoặc Ctrl+Q); Esc để quay lại.",
+            "Chạm ngay dòng trên màn hình, hoặc nút của nó trên thanh, để chọn. Ô **[ ]** chỉ được đánh dấu; chọn xong thì chạm **Submit**. Dòng **Type something** (Claude): app chỉ đưa con trỏ tới đó, bạn gõ thẳng vào rồi Enter; Esc huỷ cả câu hỏi. Dòng **Other** (omp): app bấm Enter mở ô **Custom answer**, bạn gõ rồi Enter (hoặc Ctrl+Q); Esc để quay lại.",
             "Câu hỏi nhiều trang: nút **←** / **→**. Nút **Esc** đóng menu. Nhiều lựa chọn thì kéo thanh sang ngang.",
             "Sau mỗi lần chạm, thanh mờ đi tới khi màn hình bạn thấy giống màn hình trên box (thường khoảng nửa giây). Nếu thanh vẫn mờ, dùng hàng phím nhanh.",
             "Hoặc dùng các phím **↑** **↓** **Enter** ở đầu hàng phím nhanh.",
