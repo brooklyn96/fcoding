@@ -237,8 +237,9 @@ final class SessionModel: ObservableObject {
     /// The menu (bar and tappable lines) is off from an input's start until the published screen is
     /// the same screen as a probe (`MenuLogic.sameScreen`): a screen the app asks for after the
     /// chain drained, so its capture starts after the last key reached the box. Only that unlocks
-    /// it. Keys are never computed from a screen that differs from the box's, and a double tap
-    /// never fires twice.
+    /// it. Keys are computed only from a screen that equalled a probe taken after the input (the box
+    /// can still move on after that, or an older frame can arrive late over a slow stream); a
+    /// double tap never fires twice.
     @Published private(set) var menuLocked = false
     /// The newest probe of this input chain (plain lines and their menu); nil until one comes back.
     private var probe: (lines: [String], menu: MenuLogic.Menu?)?
@@ -281,10 +282,15 @@ final class SessionModel: ObservableObject {
         probeTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(delay * 1e9))
             guard !Task.isCancelled else { return }
-            let result: Result<Screen, Error>
+            let result: Result<(lines: [String], menu: MenuLogic.Menu?), Error>
             do {
                 let data = try await api.call("GET", path, query: SessionModel.ansi, timeout: 3)
-                result = .success(try JSONDecoder().decode(Screen.self, from: data))
+                // Decoded and scanned off the main actor, like the stream's screens.
+                result = .success(try await Task.detached(priority: .userInitiated) { () throws -> (lines: [String], menu: MenuLogic.Menu?) in
+                    let screen = try JSONDecoder().decode(Screen.self, from: data)
+                    let lines = ANSI.runs(screen.text).map(\.text).joined().components(separatedBy: "\n")
+                    return (lines: lines, menu: MenuLogic.menu(lines))
+                }.value)
             } catch {
                 result = .failure(error)
             }
@@ -292,9 +298,8 @@ final class SessionModel: ObservableObject {
             guard !Task.isCancelled, let self = self else { return }
             self.probeTask = nil
             switch result {
-            case .success(let screen):
-                let lines = ANSI.runs(screen.text).map(\.text).joined().components(separatedBy: "\n")
-                self.probe = (lines, MenuLogic.menu(lines))
+            case .success(let found):
+                self.probe = found
                 self.checkUnlock()
             case .failure(let error):
                 if self.isTerminal(error) { return }
