@@ -126,12 +126,46 @@ export function parseAddRequest(b) {
 }
 // script exit code -> job code; anything else (or a signal) is FAILED. The script's "R <CODE> [detail]" lines add the public key and the detail.
 const ADD_CODES = { 0: 'ADDED', 30: 'ADDED_WARN', 40: 'NEED_KEY', 41: 'NEED_WRITE', 42: 'WRITE_BLOCKED', 43: 'NET_FAIL', 44: 'REPO_ARCHIVED',
-  11: 'DIR_CONFLICT', 21: 'CFG_CONFLICT', 22: 'CFG_BROKEN', 23: 'NAME_USED', 2: 'BAD_ARGS', 12: 'CLONE_FAIL',
-  124: 'TIMEOUT' }; // timeout(1): 124 = the deadline (its --kill-after kill ends it as a signal, not a code; the job's own deadline, kept when the server is gone)
+  11: 'DIR_CONFLICT', 21: 'CFG_CONFLICT', 22: 'CFG_BROKEN', 23: 'NAME_USED', 2: 'BAD_ARGS', 12: 'CLONE_FAIL' };
+// The add job's deadline, run by `node -e` as the leader of the job's process group (spawned detached), so it holds when this server is gone
+// (a crash, or a restart: install.sh uses KillMode=process). argv: <deadline ms> <kill-after ms> <cmd> [args...].
+// At the deadline, or on the TERM the server sends to the watchdog alone, TERM goes to the whole group, and KILL goes to the whole group
+// kill-after later: like GNU timeout -k, but the KILL always comes (uutils' timeout, the default `timeout` from Ubuntu 26.04, 0.10, sends its
+// KILL to its direct child only). The server never TERMs the group itself, so the watchdog is armed before any member of the group sees a TERM.
+// Once the TERM has gone out the watchdog never leaves before the KILL: no look at the group can prove it empty (a process may fork right after
+// it), so the KILL is sent whatever the group looks like, and it ends the watchdog too (it is in the group). The server then sees the signal
+// SIGKILL, never a code. Nobody needs a code: at the deadline the server has already ended the job as TIMEOUT by its own timer, and on close()
+// the server is exiting.
+// Not armed (the job ends on its own): it exits at once like timeout(1), with the job's own code or its signal raised again; 127 when the job
+// cannot start. SIGUSR1 is not raised again (it would start the inspector), and three more signals do not end this node by being raised:
+// SIGPIPE and SIGXFSZ (Node ignores them) and SIGTERM (its handler runs only after the exit below). Those three exit 128 + n, which the
+// server reads the same as the signal (FAILED).
+export const ADD_WATCHDOG = `const { spawn } = require('child_process');
+const [ms, killMs, cmd, ...args] = process.argv.slice(1);
+let armed = false;
+const term = () => {
+  if (armed) return;
+  armed = true;
+  try { process.kill(0, 'SIGTERM'); } catch {}
+  setTimeout(() => { try { process.kill(0, 'SIGKILL'); } catch {} }, Number(killMs));
+};
+process.on('SIGTERM', term);
+const deadline = setTimeout(term, Number(ms));
+const child = spawn(cmd, args, { stdio: 'inherit' });
+child.on('error', () => { if (!armed) process.exit(127); });
+child.on('exit', (code, signal) => {
+  clearTimeout(deadline);
+  if (armed) return; // the KILL timer is the only way out
+  if (signal && signal !== 'SIGUSR1') process.kill(process.pid, signal);
+  process.exit(code ?? 128 + (require('os').constants.signals[signal] ?? 0));
+});
+`;
 // the detail words the app matches: DIR_EXISTS 'exists', DIR_UNSAFE 'unsafe', HOOK_FAIL 'install' | 'verify'; also URL_REWRITE 'rewrite' (26) and CRED_FAIL 'config' (25); first line with text wins
 const ADD_DETAIL = ['SSH_DETAIL', 'CLONE_FAIL', 'DIR_EXISTS', 'DIR_UNSAFE', 'HOOK_FAIL', 'URL_REWRITE', 'CRED_FAIL', 'CFG_CONFLICT', 'CFG_BROKEN', 'CLEANUP_FAIL'];
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ADD_SCRIPT = path.join(SERVER_DIR, 'fcode-add.sh'), ADD_SCRIPT_DEV = path.join(SERVER_DIR, 'box', 'fcode-add.sh'); // installed next to server.mjs, or in a checkout
+const SECRETS_ENV = '/run/instabox/secrets/env'; // the secrets env file the loader reads GH_TOKEN from (FCODE_SECRETS_ENV overrides)
+const TOKEN_VARS = ['GH_TOKEN', 'GITHUB_TOKEN']; // never handed to tmux: its server would copy them into its global env (A3)
 const GH_LIST_MS = 60e3, GH_PAGES = 3, GH_PAGE_SIZE = 100, GH_LIST_MAX = GH_PAGES * GH_PAGE_SIZE; // GET /api/github/repos: cache time, pages read, most repos listed
 // pages 1..3 of the newest-updated repos, one JSON object per line ("@json"); no --paginate (an account with thousands of repos would run out of time)
 const ghReposArgs = (page) => ['api', `/user/repos?affiliation=owner,collaborator,organization_member&sort=updated&per_page=${GH_PAGE_SIZE}&page=${page}`, '--jq',
@@ -973,6 +1007,12 @@ export function createApp(opts = {}) {
   let tmuxSpec = opts.tmux ?? process.env.PC_TMUX ?? 'tmux';
   if (typeof tmuxSpec === 'string') tmuxSpec = tmuxSpec.startsWith('[') ? JSON.parse(tmuxSpec) : [tmuxSpec];
   const log = opts.log || ((s) => console.log(s));
+  // every harness session starts through start.sh (box/start.sh; installed next to server.mjs): it reads GH_TOKEN alone from the secrets
+  // env file at session start, then execs the harness (A3). Only paths are on the tmux command line, never the token. No loader: as before it.
+  const loader = [path.join(SERVER_DIR, 'start.sh'), path.join(SERVER_DIR, 'box', 'start.sh')].find((f) => fs.existsSync(f));
+  if (!loader) log('warning: start.sh not found next to server.mjs; harness sessions start without GH_TOKEN (run bash install.sh)');
+  const secrets = path.resolve(process.env.FCODE_SECRETS_ENV || SECRETS_ENV); // absolute, once: a session's cwd is its project dir
+  const harnessLaunch = loader ? `${HARNESS_ENV}${shq(`FCODE_SECRETS_ENV=${secrets}`)} /bin/sh ${shq(loader)} ` : HARNESS_ENV;
   const pollMs = opts.pollMs ?? 700;
   const pingMs = opts.pingMs ?? 15000;
   const drainTimeout = opts.drainTimeoutMs ?? DRAIN_TIMEOUT;
@@ -1199,9 +1239,10 @@ export function createApp(opts = {}) {
     return new Promise((resolve, reject) => {
       const [cmd, ...pre] = spec;
       try {
+        const env = { ...process.env, LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', ...(spec === gitSpec && { GIT_OPTIONAL_LOCKS: '0' }) };
+        if (spec === tmuxSpec) for (const v of TOKEN_VARS) delete env[v]; // the service keeps its GH_TOKEN for gh; tmux never sees it
         const child = execFile(cmd, [...pre, ...args], {
-          encoding: 'utf8', timeout: 5000, maxBuffer: 16 << 20, windowsHide: true,
-          env: { ...process.env, LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', ...(spec === gitSpec && { GIT_OPTIONAL_LOCKS: '0' }) },
+          encoding: 'utf8', timeout: 5000, maxBuffer: 16 << 20, windowsHide: true, env,
         }, (err, stdout, stderr) => {
           free();
           if (!err) return resolve(stdout);
@@ -1267,8 +1308,11 @@ export function createApp(opts = {}) {
   const validHarness = (h) => typeof h === 'string' && Object.hasOwn(HARNESSES, h);
   // runs inside a mutation job
   async function createSession(name, project, harness, ctx, command = HARNESSES[harness]) {
+    // right before EVERY new-session: a tmux server that outlived a restart (KillMode=process) or was started later from a login shell may
+    // hold GH_TOKEN in its global env; an unset carries no value. Any failure (no server running yet, a gate refusal) never blocks the create.
+    for (const v of TOKEN_VARS) await run(ctx, ['set-environment', '-g', '-u', v]).catch(() => {});
     try {
-      await run(ctx, ['new-session', '-d', '-s', name, '-c', cfg.projects[project], HARNESS_ENV + command]);
+      await run(ctx, ['new-session', '-d', '-s', name, '-c', cfg.projects[project], harnessLaunch + command]);
     } catch (e) {
       if (/duplicate session/i.test(e.stderr || '')) throw new HttpErr(409, 'exists');
       throw e;
@@ -1742,10 +1786,12 @@ export function createApp(opts = {}) {
   // and nothing but the name and the code is logged. FCODE_CFG points the script at THIS server's config.json. ---
   const addSpec = specOf(opts.addScript ?? process.env.PC_ADD_SCRIPT ?? ['bash', [ADD_SCRIPT, ADD_SCRIPT_DEV].find((f) => fs.existsSync(f)) ?? ADD_SCRIPT]);
   const addTimeout = opts.addTimeoutMs ?? (Number(process.env.PC_ADD_TIMEOUT_MS) || ADD_TIMEOUT_MS);
-  // on Linux the script runs under timeout(1): the deadline then holds on its own even when this server is gone (a crash, or a restart that
-  // leaves the job alone: install.sh uses KillMode=process); a graceful stop ends the jobs through close(). 124 maps to TIMEOUT; a kill-after kill ends as a signal.
-  const addKillAfter = Number(process.env.PC_ADD_KILL_AFTER_S) || ADD_KILL_AFTER_S; // test-only override, like PC_ADD_TIMEOUT_MS
-  const addWrap = process.platform === 'win32' ? [] : ['timeout', `--kill-after=${addKillAfter}`, String(addTimeout / 1000)];
+  // off Windows the script runs under ADD_WATCHDOG: the deadline then holds on its own even when this server is gone (a crash, or a restart
+  // that leaves the job alone: install.sh uses KillMode=process); a graceful stop ends the jobs through close(). The server's TERM goes to the
+  // watchdog alone, which sends it to the group; after a TERM the watchdog always sends the group KILL at kill-after and ends with it: the server
+  // sees a signal, never an exit code, and TIMEOUT comes from the timer below.
+  const addKillAfter = opts.addKillAfterS ?? (Number(process.env.PC_ADD_KILL_AFTER_S) || ADD_KILL_AFTER_S); // test-only override, like addTimeoutMs
+  const addWrap = process.platform === 'win32' ? [] : [process.execPath, '-e', ADD_WATCHDOG, String(addTimeout), String(addKillAfter * 1000)];
   const addJobs = new Map(); // id -> job
   const addRunning = new Map(); // name -> its running job
   const addStops = new Set(); // one per running child: ends it when the app closes
@@ -1764,7 +1810,8 @@ export function createApp(opts = {}) {
     pruneAdd();
     let out = '', child, timer, grace;
     const end = () => { clearTimeout(timer); addStops.delete(abort); };
-    const abort = () => { end(); killGroup('SIGTERM'); clearTimeout(grace); }; // the app closes
+    // TERM to the watchdog alone (on Windows the script), which sends it to its group once armed; Node refuses the kill after 'exit', so a reused pid is never hit
+    const abort = () => { end(); child.kill('SIGTERM'); clearTimeout(grace); }; // the app closes
     const finish = (res) => {
       if (job.state !== 'running') return;
       end();
@@ -1773,7 +1820,11 @@ export function createApp(opts = {}) {
       addRunning.delete(name);
       log(`add-project ${name} ${job.code}`);
     };
-    const killGroup = (sig) => { try { process.kill(process.platform === 'win32' ? child.pid : -child.pid, sig); } catch {} }; // -pid: the group
+    // the SIGKILL backstop only: -pid is the group only while the watchdog is not reaped (a zombie leader still holds its pgid; after 'exit' the id may be another process's)
+    const killGroup = (sig) => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      try { process.kill(process.platform === 'win32' ? child.pid : -child.pid, sig); } catch {} // -pid: the group
+    };
     try {
       const [cmd, ...pre] = [...addWrap, ...addSpec];
       child = spawn(cmd, [...pre, repo, name], { stdio: ['ignore', 'pipe', 'ignore'], detached: true, windowsHide: true, env: { ...toolEnv(), FCODE_CFG: cfgFile } });
@@ -1781,10 +1832,11 @@ export function createApp(opts = {}) {
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (c) => { if (out.length < ADD_OUT_MAX) out += c; });
     child.on('error', () => finish({ state: 'failed', code: 'FAILED' }));
-    child.on('close', (code) => { clearTimeout(grace); finish(addOutcome(code, out)); }); // the job is gone: no late SIGKILL to a group id that may be reused
+    child.on('exit', () => clearTimeout(grace)); // the watchdog is reaped: no late SIGKILL to a group id that may be reused
+    child.on('close', (code) => finish(addOutcome(code, out)));
     timer = setTimeout(() => {
       finish({ state: 'failed', code: 'TIMEOUT' });
-      killGroup('SIGTERM'); // the script cleans up its clone on TERM; on Linux timeout(1) kills what is left at +30 s, this backstop only at +45 s
+      child.kill('SIGTERM'); // TERM to the watchdog alone (on Windows the script), which sends it to its group once armed (the script cleans up its clone on TERM) and the group KILL at +30 s; this backstop only at +45 s
       grace = setTimeout(() => killGroup('SIGKILL'), opts.addKillGraceMs ?? ADD_KILL_GRACE_MS); // opts.addKillGraceMs: tests
       grace.unref();
     }, addTimeout);
