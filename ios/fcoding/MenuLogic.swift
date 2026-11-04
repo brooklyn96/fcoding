@@ -129,11 +129,12 @@ enum MenuLogic {
 
     /// The live menu now on screen, or nil. Anchored on the menu's footer, in the last 40 non-empty
     /// lines:
-    /// - Anchor: a Claude / codex footer (`footers`) at the end of the bottom block (the non-blank
-    ///   rows that end at the last non-blank row): the earliest of the block's last 6 rows from which
-    ///   the rows to the end, joined with one space, start with a footer phrase (6 = the longest
-    ///   footer wrapped at the 20-column floor, plus one). The wide multi-select captures draw the
-    ///   footer right under "5. Chat about this", with no blank line, so it is the block's tail.
+    /// - Anchor: the first row of the bottom block (the non-blank rows that end at the last non-blank
+    ///   row), when the block has at most 6 rows and its rows, joined with one space, start with a
+    ///   Claude / codex footer (`footers`; 6 = the longest footer wrapped at the 20-column floor,
+    ///   plus one). Every raw capture has a blank line above its footer. An input box (a draft, its
+    ///   rule and status line) is one block whose first row is never a footer, even when a later
+    ///   draft line starts with a footer phrase.
     ///   Or the omp Ask footer row directly above the box's "╰". Without one, Claude's question tab
     ///   header above a run that reaches the last 4 non-empty lines (the Submit tab).
     /// - The highlight is the lowest marker row (❯ › > or the omp chevron, then a space) of the
@@ -156,10 +157,8 @@ enum MenuLogic {
         var anchor: Int?
         var bottom = filled.count - 1
         while bottom > 0, filled[bottom - 1] == filled[bottom] - 1 { bottom -= 1 }
-        for s in max(bottom, filled.count - 6)..<filled.count {
-            let footer = filled[s...].map { rows[$0].text }.joined(separator: " ")
-            if footers.contains(where: { footer.hasPrefix($0) }) { anchor = filled[s]; break }
-        }
+        let footer = filled[bottom...].map { rows[$0].text }.joined(separator: " ")
+        if filled.count - bottom <= 6, footers.contains(where: { footer.hasPrefix($0) }) { anchor = filled[bottom] }
         if anchor == nil, let b = filled.suffix(4).last(where: { rows[$0].lead == "╰" }),
            let f = filled.last(where: { $0 < b }), isOmpFooter(rows[f]) {
             anchor = f
@@ -423,6 +422,7 @@ Bạn muốn mình ưu tiên điều gì khi làm việc?
 
 Enter to select · Tab/Arrow keys to navigate · Esc to cancel
 """#
+        // grep -v capture, blank line restored before the footer (raw layout: tab2Raw, askSingle).
         let multiTab2 = #"""
  ▐▛███▛█   Claude Code v2.1.317
 ▝▜██████▀  Opus 5.5 · Claude Team
@@ -444,9 +444,11 @@ Bạn muốn nhận những loại thông báo nào trong lúc mình làm việc
      Submit                                                                                         
 ────────────────────────────────────────────────────────────────────────────────────────────────────
   5. Chat about this
+
 Enter to select · Tab/Arrow keys to navigate · Esc to cancel
                                                          
 """#
+        // grep -v capture, blank line restored before the footer (raw layout: tab2Raw, askSingle).
         let multiDown = #"""
 ←  ☐ Ưu tiên  ☐ Thông báo  ✔ Submit  →
 Bạn muốn nhận những loại thông báo nào trong lúc mình làm việc?
@@ -460,9 +462,11 @@ Bạn muốn nhận những loại thông báo nào trong lúc mình làm việc
      Submit                                                                                         
 ────────────────────────────────────────────────────────────────────────────────────────────────────
   5. Chat about this
+
 Enter to select · Tab/Arrow keys to navigate · Esc to cancel
                                                          
 """#
+        // grep -v capture, blank line restored before the footer (raw layout: tab2Raw, askSingle).
         let multiSpace = #"""
 ←  ☐ Ưu tiên  ☒ Thông báo  ✔ Submit  →
 Bạn muốn nhận những loại thông báo nào trong lúc mình làm việc?
@@ -476,6 +480,7 @@ Bạn muốn nhận những loại thông báo nào trong lúc mình làm việc
      Submit                                                                                         
 ────────────────────────────────────────────────────────────────────────────────────────────────────
   5. Chat about this
+
 Enter to select · Tab/Arrow keys to navigate · Esc to cancel
                                                          
 """#
@@ -1775,6 +1780,21 @@ effort to use
         eq("with hint", summary("Pick\n❯ 1. Yes\n  2. No\n\nEsc to cancel"), ">1. Yes | 2. No")
         eq("out of window", summary(ompAsk + "\n" + (1...40).map { "line \($0)" }.joined(separator: "\n")), "none")
         eq("footer wrapped", summary("Pick\n❯ 1. Yes\n  2. No\n\nEnter to select · Tab/Arrow\nkeys to navigate"), ">1. Yes | 2. No")
+        eq("footer not in the bottom block", summary("Pick\n❯ 1. Yes\n  2. No\n\nEsc to cancel\n\nok"), "none")
+        // A draft line that starts with a footer phrase is still a draft (a pick would submit it).
+        let draft3 = draftFoo.replacingOccurrences(of: "  2. bar              ", with: "  2. bar\n  Esc to cancel stale jobs")
+        eq("draft, 3rd line Esc to cancel, replaced", draft3 != draftFoo, true)
+        eq("draft, 3rd line Esc to cancel", summary(draft3), "none")
+        eq("draft, 3rd line Enter to confirm", summary(draftFoo.replacingOccurrences(of: "  2. bar              ", with: "  2. bar\n  Enter to confirm the order")), "none")
+        let ompDraft3 = ompDraftAltEnter.replacingOccurrences(of: "  2. bare", with: "  2. bare\n  Esc to cancel x")
+        eq("omp draft, 3rd line Esc to cancel, replaced", ompDraft3 != ompDraftAltEnter, true)
+        eq("omp draft, 3rd line Esc to cancel", summary(ompDraft3), "none")
+        let ompBare = ompDraftAltEnter.replacingOccurrences(of: "❯ 1. foo", with: "❯ foo")
+            .replacingOccurrences(of: "  2. bare", with: "  bare\n  Enter to confirm x")
+        eq("omp unnumbered draft, Enter to confirm, replaced", ompBare.contains("❯ foo ") && ompBare.contains("  bare\n"), true)
+        eq("omp unnumbered draft, Enter to confirm", summary(ompBare), "none")
+        eq("narrow wrapped draft", summary(draftFoo.replacingOccurrences(of: "  2. bar              ",
+                                                                         with: "  2. the hint at the bottom says\n  Esc to cancel but it does not")), "none")
         eq("footer block of 7 rows", summary("Pick\n❯ 1. Yes\n  2. No\n\nEsc to cancel\na\nb\nc\nd\ne\nf"), "none")
         // DERIVED (provisional until a ~40-column capture): the ctrl+g footer wrapped to 3 rows.
         let footer3 = narrowOnType.replacingOccurrences(of: "Enter to select · Tab/Arrow keys to navigate · \nctrl+g to edit in Vim · Esc to cancel",
