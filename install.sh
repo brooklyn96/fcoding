@@ -78,7 +78,7 @@ fi
 # KillMode=process: the tmux server (and every harness session) is started by this service;
 # restarting or crashing the service must not take it down. StartLimitIntervalSec=0: always restart.
 # An "add project" job (fcode-add.sh) is a child in its own process group: systemctl stop / restart sends SIGTERM to the server, whose handler
-# ends the job and its group (CONTRACT A11); after a crash KillMode=process leaves it alone, and the job's own timeout(1) deadline ends it.
+# ends the job and its group (CONTRACT A11); after a crash KillMode=process leaves it alone, and the job's own deadline (ADD_WATCHDOG in server.mjs) ends it.
 # PATH for the harnesses is set by server.mjs itself (~/.local/bin, ~/.bun/bin, system dirs).
 # The home screen's project list runs gh, which needs GH_TOKEN. A login shell gets it from the secrets env file
 # (FCODE_SECRETS_ENV, default /run/instabox/secrets/env; on the Oracle VM a tmpfiles link to ~/.config/fcode/secrets.env);
