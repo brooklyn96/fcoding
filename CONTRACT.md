@@ -51,7 +51,7 @@ UI requirements (frontend): Vietnamese labels; login screen; session list (creat
 ## Amendment A2 (2026-10-25): behind the instabox proxy, robustness
 - Proxy facts (Architect probe): the instabox port proxy overwrites X-Forwarded-For with the real client IP, sends Host: 127.0.0.1:<port> and X-Forwarded-Proto: https, and normalises `//` to `/`. First-hop XFF is the client IP. Only the native app is a client; an Origin header, when present, must equal `https://` + (X-Forwarded-Host || Host), else 403 (browsers are not supported clients).
 - /api/screen and SSE `cursor` are relative to the visible pane; `rows` is the visible pane height; `text` may include history above it (client maps y = lineCount - rows + cursor.y).
-- Phone resize makes the window size manual; a laptop that attaches later runs `tmux resize-window -A` (documented in README).
+- Phone resize makes the window size manual; `fcode` on a laptop attaches with `set-option -w window-size latest` (the window follows the laptop client, also on later resizes) and `set-option mouse on` (this session only: the wheel scrolls). A pane the laptop leaves in copy mode would take the phone's input as copy-mode keys, so `send` and `key` first run `copy-mode -q -t =<name>:` (leaves any pane mode, a no-op when there is none).
 - Fail closed: if sessions.json cannot be written, the server stops accepting any session (all protected routes 401) until a write succeeds; logout returns 500 in that case.
 - Password change (`--set-password`) rotates cookieSecret; a running server notices the config change (mtime check before auth) and reloads the hash and secret, dropping all sessions immediately — no restart needed.
 - Limits: at most 50 SSE streams (reserved before any await), at most 20 queued sends (503 {error:"busy"}), at most 8 concurrent tmux child processes; queued work for a closed request is cancelled.
@@ -144,7 +144,7 @@ Applies to `GET /api/screen/:name` and `GET /api/stream/:name` (the SSE `screen`
    - the underline colour (`58`, `59`), colours that are cut off or out of range, and codes above 107 are dropped; a sequence with nothing left is dropped.
 3. Server-side text matching never sees escapes: prompt detection, the preview and the inbox/overview state work on text with escapes removed. (`/api/overview` reads the pane without `-e` and also strips any escape it meets.)
 4. `hash` covers exactly the `text` that is sent (plus size and cursor, as before). With `ansi=1` a colour-only change gives a new hash, so the stream sends a new event. Trailing lines that hold only SGR and blanks count as blank and are trimmed, like trailing blank lines today.
-5. tmux targets: a call that needs a pane (`capture-pane`, `display-message`, `send-keys`, `paste-buffer`, `resize-window`, `set-option`) uses `-t =<name>:`; a bare `=<name>` does not resolve a pane ("can't find pane"). Calls that need only a session (`has-session`, `kill-session`) use `-t =<name>`.
+5. tmux targets: a call that needs a pane (`capture-pane`, `display-message`, `send-keys`, `paste-buffer`, `resize-window`, `copy-mode`, `set-option`) uses `-t =<name>:`; a bare `=<name>` does not resolve a pane ("can't find pane"). Calls that need only a session (`has-session`, `kill-session`) use `-t =<name>`.
 
 6. (T35, 2026-10-30) Optional query `delta=1` on `GET /api/stream/:name` only (`/api/screen` ignores it; any other value = off, and then the bytes are exactly as before).
    - The first event is always a full `event: screen`.

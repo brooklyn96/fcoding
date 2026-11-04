@@ -1552,8 +1552,12 @@ export function createApp(opts = {}) {
     try { await run(ctx, ['paste-buffer', '-p', '-d', '-b', 'pc', '-t', pane(name)]); }
     catch (e) { await run(ctx, ['delete-buffer', '-b', 'pc']).catch(() => {}); throw e; }
   }
+  // A laptop attached with `fcode` scrolls with the mouse wheel, which puts the pane in copy mode; a pane left there would take the
+  // phone's text and keys as copy-mode commands. copy-mode -q leaves any pane mode and is a no-op when there is none. Runs inside a mutation job.
+  const leaveMode = (name, ctx) => run(ctx, ['copy-mode', '-q', '-t', pane(name)]);
   // runs inside a mutation job; every step re-checks through run(ctx)
   async function sendText(name, text, enter, ctx) {
+    await leaveMode(name, ctx);
     text = text.replace(/\r\n?/g, '\n');
     if (text && (text.includes('\n') || Buffer.byteLength(text) > LONG_TEXT)) {
       await pasteText(name, text, ctx);
@@ -2325,7 +2329,7 @@ export function createApp(opts = {}) {
         const { key: k, repeat = 1 } = b;
         if (typeof k !== 'string' || !KEYS.includes(k)) throw new HttpErr(400, 'bad_key');
         if (!Number.isInteger(repeat) || repeat < 1 || repeat > 20) throw new HttpErr(400, 'invalid');
-        await mutate(ctx, () => run(ctx, ['send-keys', '-t', pane(name), ...Array(repeat).fill(k)]));
+        await mutate(ctx, async () => { await leaveMode(name, ctx); await run(ctx, ['send-keys', '-t', pane(name), ...Array(repeat).fill(k)]); });
         poke(name);
         return json(res, 200, { ok: true });
       }

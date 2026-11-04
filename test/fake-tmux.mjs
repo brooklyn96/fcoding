@@ -7,6 +7,7 @@
 // windowActivity (window_activity, default 0), screen (capture-pane text).
 // FAKE_TMUX_DELAYS: JSON {command: ms}, overrides FAKE_TMUX_DELAY_MS per command ("capture-pane -S": only captures with history).
 // FAKE_TMUX_DUP_ONCE: new-session for that name answers "duplicate session" once, as if created outside the server.
+// FAKE_TMUX_FAIL_ON: that command (e.g. paste-buffer) answers "can't find session", as if the session died at that step.
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -30,7 +31,9 @@ const delay = Number((argv.includes('-S') ? delays[`${cmd} -S`] : undefined) ?? 
 if (delay) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
 
 // like real tmux 3.x: these commands take a target-pane, and a bare "=name" does not resolve one ("can't find pane"); "=name:" does
-if (['capture-pane', 'display-message', 'send-keys', 'paste-buffer', 'resize-window', 'set-option'].includes(cmd) && /^=[^:]*$/.test(arg('-t') || '')) fail(`can't find pane: ${arg('-t').slice(1)}`);
+if (['capture-pane', 'display-message', 'send-keys', 'paste-buffer', 'resize-window', 'set-option', 'copy-mode'].includes(cmd) && /^=[^:]*$/.test(arg('-t') || '')) fail(`can't find pane: ${arg('-t').slice(1)}`);
+
+if (process.env.FAKE_TMUX_FAIL_ON === cmd) fail(`can't find session: ${target()}`);
 
 const st = load();
 const needSession = () => { if (!st.sessions[target()]) fail(`can't find session: ${target()}`); };
@@ -94,6 +97,6 @@ switch (cmd) {
     break;
   }
   case 'display-message': needSession(); console.log(`80 24 ${st.sessions[target()].cursor || '3 5'}`); break; // cursor: "x y", set by a test
-  case 'send-keys': case 'paste-buffer': case 'resize-window': needSession(); break;
+  case 'send-keys': case 'paste-buffer': case 'resize-window': case 'copy-mode': needSession(); break;
   default: break; // load-buffer, delete-buffer: ok
 }

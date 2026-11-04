@@ -292,13 +292,19 @@ test('send: multi-line and long text use load-buffer (stdin) + paste-buffer -p',
   assert.equal(c.calls().at(-1).argv[0], 'paste-buffer');
   // concurrent sends do not interleave use of the shared buffer
   await Promise.all([1, 2, 3].map((n) => c.req('POST', '/api/send/work', { cookie, body: { text: `a${n}\nb${n}`, enter: false } })));
-  assert.deepEqual(c.calls().slice(-6).map((x) => x.argv[0]), ['load-buffer', 'paste-buffer', 'load-buffer', 'paste-buffer', 'load-buffer', 'paste-buffer']);
+  assert.deepEqual(c.calls().slice(-9).map((x) => x.argv[0]), ['copy-mode', 'load-buffer', 'paste-buffer', 'copy-mode', 'load-buffer', 'paste-buffer', 'copy-mode', 'load-buffer', 'paste-buffer']);
 }));
 
 test('send to a missing session is 404 and the buffer is dropped', () => withApp(async (c) => {
   const { cookie } = await c.login();
   const r = await c.req('POST', '/api/send/ghost', { cookie, body: { text: 'a\nb' } });
   assert.equal(r.status, 404);
+  assert.ok(!c.calls().some((x) => x.argv[0] === 'load-buffer'), 'copy-mode -q failed first: nothing was loaded'); // the first call already finds no session
+  // a session that dies between the load and the paste: the loaded buffer is deleted
+  await mkSession(c, cookie);
+  await withEnv({ FAKE_TMUX_FAIL_ON: 'paste-buffer' }, async () => {
+    assert.equal((await c.req('POST', '/api/send/work', { cookie, body: { text: 'a\nb' } })).status, 404);
+  });
   assert.ok(c.calls().some((x) => x.argv[0] === 'delete-buffer'));
 }));
 
@@ -543,6 +549,28 @@ test('send-keys path: trailing ";" is escaped for tmux, nothing else is touched'
   assert.equal(Buffer.from(lb.stdin, 'base64').toString('utf8'), 'a\nb;');
 }));
 
+// a laptop that scrolled with the mouse wheel leaves the pane in copy mode, where send-keys goes to the copy-mode key table, not to the program
+test('send and key leave any pane mode (copy-mode -q) before they type, so the phone input reaches the program', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  await mkSession(c, cookie);
+  const quit = ['copy-mode', '-q', '-t', '=work:'];
+  const since = async (n, req) => { assert.equal((await req).status, 200); return c.calls().slice(n).map((x) => x.argv); };
+  let n = c.calls().length;
+  assert.deepEqual(await since(n, c.req('POST', '/api/send/work', { cookie, body: { text: 'hi', enter: true } })),
+    [quit, ['send-keys', '-t', '=work:', '-l', '--', 'hi'], ['send-keys', '-t', '=work:', 'Enter']]);
+  n = c.calls().length;
+  assert.deepEqual(await since(n, c.req('POST', '/api/send/work', { cookie, body: { text: '', enter: true } })), [quit, ['send-keys', '-t', '=work:', 'Enter']]);
+  n = c.calls().length;
+  assert.deepEqual((await since(n, c.req('POST', '/api/send/work', { cookie, body: { text: 'a\nb', enter: false } }))).map((a) => a[0]), ['copy-mode', 'load-buffer', 'paste-buffer']);
+  n = c.calls().length;
+  assert.deepEqual(await since(n, c.req('POST', '/api/key/work', { cookie, body: { key: 'Down', repeat: 2 } })), [quit, ['send-keys', '-t', '=work:', 'Down', 'Down']]);
+  // a session that is gone: the failure is the same as before (no typing happens)
+  n = c.calls().length;
+  const gone = await c.req('POST', '/api/key/nope', { cookie, body: { key: 'Up' } });
+  assert.equal(gone.status, 404);
+  assert.ok(!c.calls().slice(n).some((x) => x.argv[0] === 'send-keys'));
+}));
+
 test('SSE admission: at most 50 streams, reserved before any await, all capacity released', () => withApp(async (c) => {
   const { cookie } = await c.login();
   await mkSession(c, cookie);
@@ -628,7 +656,7 @@ test('mutation queue: at most 20 waiting (503 busy); reads capped at 7 children 
     assert.ok(busy.length >= 8 && ok >= 15, `ok=${ok} busy=${busy.length}`);
     assert.deepEqual(busy[0].json, { error: 'busy' });
     assert.equal(c.app.stats().waiting, 0);
-    assert.equal(c.calls().length - before, ok); // only admitted sends reached tmux
+    assert.equal(c.calls().length - before, ok * 2); // only admitted sends reached tmux: copy-mode -q, then send-keys
   });
   // concurrent tmux children never exceed 8
   await withEnv({ FAKE_TMUX_DELAY_MS: '120' }, async () => {
@@ -684,7 +712,8 @@ const rawPost = (port, p, body, cookie) => {
   });
   return { req, done, data };
 };
-const victimRan = (c) => c.calls().some((x) => x.argv.some((a) => String(a).includes('VICTIM')) || (x.argv[0] === 'send-keys' && x.argv.at(-1) === 'Enter'));
+// the victim's send starts with copy-mode -q (no text in its argv); the blockers of these tests never run one (resize-window)
+const victimRan = (c) => c.calls().some((x) => x.argv[0] === 'copy-mode' || x.argv.some((a) => String(a).includes('VICTIM')) || (x.argv[0] === 'send-keys' && x.argv.at(-1) === 'Enter'));
 const rotate = (c) => {
   const f = path.join(c.configDir, 'config.json');
   const cfg = JSON.parse(fs.readFileSync(f, 'utf8'));
@@ -700,7 +729,7 @@ for (const fill of [false, true]) {
         const owner = await c.login({}, 'owner');
         await mkSession(c, owner.cookie);
         await withEnv({ FAKE_TMUX_DELAY_MS: '500' }, async () => {
-          const blocker = c.req('POST', '/api/send/work', { cookie: owner.cookie, body: { text: 'BLOCKER', enter: false } });
+          const blocker = c.req('POST', '/api/resize/work', { cookie: owner.cookie, body: { cols: 80, rows: 24 } }); // one tmux call: a job with two (send) would get its second one refused after a rotate
           assert.ok(await until(() => c.app.stats().running === 1 && c.app.stats().active, 3000));
           let reads = [];
           if (fill) {
@@ -776,10 +805,14 @@ test('text + Enter job cancelled between stages: no Enter is sent', () => withAp
   assert.ok(await until(() => c.calls().some((x) => x.argv[0] === 'paste-buffer')));
   a.req.destroy();
   await sleep(700);
-  // typed text: cancelled while send-keys -l runs
-  await withEnv({ FAKE_TMUX_DELAY_MS: '300' }, async () => {
+  // typed text: cancelled while send-keys -l runs (copy-mode -q ran first, at once; send-keys is the slow one)
+  await withEnv({ FAKE_TMUX_DELAYS: JSON.stringify({ 'send-keys': 600 }) }, async () => {
+    const modes = () => c.calls().filter((x) => x.argv[0] === 'copy-mode').length;
+    const m0 = modes();
     const b = rawPost(c.port, '/api/send/work', { text: 'VICTIM2', enter: true }, cookie);
     b.req.end(b.data);
+    assert.ok(await until(() => modes() > m0, 3000), 'copy-mode -q never ran');
+    await sleep(150); // send-keys -l is now running
     assert.ok(await until(() => c.app.stats().running === 1 && c.app.stats().active, 3000));
     b.req.destroy();
     assert.ok(await until(() => !c.app.stats().active && c.app.stats().running === 0));
@@ -2818,11 +2851,11 @@ test('tmux targets: panes are =name:, session-only commands are =name; a bare =n
     seen.add(argv[0]);
     assert.match(argv[i + 1], ['kill-session', 'has-session'].includes(argv[0]) ? /^=work$/ : /^=work:$/, argv.join(' '));
   }
-  for (const cmd of ['set-option', 'has-session', 'capture-pane', 'display-message', 'send-keys', 'paste-buffer', 'resize-window', 'kill-session']) assert.ok(seen.has(cmd), `${cmd} was not exercised`);
+  for (const cmd of ['set-option', 'has-session', 'capture-pane', 'display-message', 'send-keys', 'paste-buffer', 'resize-window', 'copy-mode', 'kill-session']) assert.ok(seen.has(cmd), `${cmd} was not exercised`);
   // the fake follows real tmux: a bare session target does not resolve a pane
   const fake = (...args) => spawnSync(process.execPath, [FAKE, ...args], { env: { ...process.env, FAKE_TMUX_DIR: path.join(c.root, 'fake') }, encoding: 'utf8' });
   await mkSession(c, cookie);
-  for (const cmd of [['capture-pane', '-p'], ['send-keys'], ['resize-window', '-x', '80'], ['display-message', '-p'], ['paste-buffer'], ['set-option', '@x', '1']]) {
+  for (const cmd of [['capture-pane', '-p'], ['send-keys'], ['resize-window', '-x', '80'], ['display-message', '-p'], ['paste-buffer'], ['copy-mode', '-q'], ['set-option', '@x', '1']]) {
     const bare = fake(cmd[0], '-t', '=work', ...cmd.slice(1)), colon = fake(cmd[0], '-t', '=work:', ...cmd.slice(1));
     assert.equal(bare.status, 1, `${cmd[0]} =work`);
     assert.match(bare.stderr, /can't find pane/);
