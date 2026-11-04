@@ -48,7 +48,11 @@ enum MenuLogic {
         var blank = true
         /// Border chrome only (a rule, a box edge row).
         var rule = false
+        /// The first non-space character of the raw line (the omp box edges "│" and "╰").
+        var lead: Character?
+        /// Starts with a marker followed by a space, at `markerColumn`.
         var marked = false
+        var markerColumn = 0
         /// Where the row's content starts: after the edge, the marker and spaces.
         var column = 0
         var number: Int?
@@ -57,22 +61,24 @@ enum MenuLogic {
         var label = ""
         var checkbox = false
         var checked = false
-        /// The line without its edges (for the key hint and the tab header).
+        /// The line without its edges (for the footer and the tab header).
         var text = ""
     }
 
     private static func parse(_ raw: String) -> Row {
         let chars = Array(raw)
         var r = Row()
-        r.blank = !chars.contains { !$0.isWhitespace }
+        r.lead = chars.first { !$0.isWhitespace }
+        r.blank = r.lead == nil
         var start = 0, end = chars.count
         while start < end, isEdge(chars[start]) { start += 1 }
         while end > start, isEdge(chars[end - 1]) { end -= 1 }
         guard start < end else { r.rule = !r.blank; return r }
         r.text = String(chars[start..<end])
         var i = start
-        if markers.contains(chars[i]) {
+        if markers.contains(chars[i]), i + 1 < end, chars[i + 1].isWhitespace {
             r.marked = true
+            r.markerColumn = i
             i += 1
             while i < end, chars[i].isWhitespace { i += 1 }
         }
@@ -105,9 +111,14 @@ enum MenuLogic {
         return r
     }
 
-    /// Word "cancel" or "select": the menu's key hint line ("Esc to cancel", "enter select · esc back").
-    private static func isHint(_ text: String) -> Bool {
-        text.lowercased().split { !$0.isLetter }.contains { $0 == "cancel" || $0 == "select" }
+    /// Leading phrases of the Claude and codex key hint footers. Only the start of the line is
+    /// matched: a phone-width pane wraps or cuts the rest, and a status line that merely contains
+    /// the words (a codex thread title, an omp project name) never starts with them.
+    private static let footers = ["Enter to confirm", "Enter to select", "Esc to cancel", "Press enter to confirm", "enter select"]
+
+    /// The omp Ask box footer row: "│ 󰌑 select · n note · ↑/↓ move · 󱊷 cancel · Alt+H hide │".
+    private static func isOmpFooter(_ r: Row) -> Bool {
+        r.lead == "│" && r.text.contains("select ·") && r.text.contains("↑/↓ move") && r.text.contains("cancel")
     }
 
     /// Claude's AskUserQuestion tab header: "←  ☐ A  ☒ B  ✔ Submit  →".
@@ -115,16 +126,19 @@ enum MenuLogic {
         text.hasPrefix("←") && text.hasSuffix("→") && text.contains { "☐☒✔".contains($0) }
     }
 
-    /// The live menu now on screen, or nil. Scanned from the end, in the last 40 non-empty lines:
-    /// - The highlighted row is the LAST line that starts with a marker. A marker line drawn below a
-    ///   menu means the menu is gone (the agent's input prompt, or a sent prompt shown again).
-    /// - Option rows start at the highlighted row's content column; numbers "N." are optional but,
-    ///   when present, run 1...n. A line deeper than the previous option's label is its description;
-    ///   in a numbered menu an unnumbered line between the two columns is a row too (Claude's
-    ///   "Submit"). Rule-only lines between rows are skipped; a blank or shallower line ends the run.
-    /// - At least 2 options, and proof it is a menu: the first line after it is a key hint
-    ///   ("cancel" / "select"), or a question tab header is above it. Drafts in the input box have
-    ///   neither.
+    /// The live menu now on screen, or nil. Anchored on the menu's footer, in the last 40 non-empty
+    /// lines:
+    /// - Anchor: a Claude / codex footer (`footers`) starting in one of the last 2 non-empty lines,
+    ///   or the omp Ask footer row directly above the box's "╰". Without one, Claude's question tab
+    ///   header above a run that reaches the last 4 non-empty lines (the Submit tab).
+    /// - The highlight is the lowest marker row (❯ › > or the omp chevron, then a space) of the
+    ///   block directly above the anchor whose run is valid. The run's item column (the "N." digit,
+    ///   the omp circle, or an unnumbered label) is the marker column + 2; a marker elsewhere is text.
+    /// - Option rows start at the item column; numbers are optional but, when present, run 1...n.
+    ///   A deeper line is a description, except, in a numbered checkbox menu, a line between the item
+    ///   and label columns: Claude's "Submit" row. Rule-only lines are skipped; a blank line or a
+    ///   shallower line ends the run, and nothing but blank and rule lines may sit below it.
+    /// - Exactly one highlight and at least 2 options.
     static func menu(_ lines: [String]) -> Menu? {
         var lo = lines.count, seen = 0
         while lo > 0, seen < window {
@@ -132,42 +146,98 @@ enum MenuLogic {
             if lines[lo].contains(where: { !$0.isWhitespace }) { seen += 1 }
         }
         let rows = lines[lo...].map(parse)
-        guard let h = rows.lastIndex(where: { $0.marked }), !rows[h].label.isEmpty else { return nil }
-        let top = rows[h]
-        let numbered = top.number != nil
-        var first = h, up = h - 1
-        while up >= 0, rows[first].number != 1 {
+        let filled = rows.indices.filter { !rows[$0].blank }
+        guard !filled.isEmpty else { return nil }
+        var anchor: Int?
+        for i in filled.suffix(2) where footers.contains(where: { rows[i].text.hasPrefix($0) }) {
+            anchor = i
+            break
+        }
+        if anchor == nil, let b = filled.suffix(4).last(where: { rows[$0].lead == "╰" }),
+           let f = filled.last(where: { $0 < b }), isOmpFooter(rows[f]) {
+            anchor = f
+        }
+        let end = anchor ?? rows.count
+        // The block directly above the anchor: up to the first blank line above its content.
+        var top = end
+        for k in stride(from: end - 1, through: 0, by: -1) {
+            if !rows[k].blank { top = k } else if top < end { break }
+        }
+        for m in stride(from: end - 1, through: top, by: -1) where rows[m].marked {
+            guard let found = run(rows, highlight: m, top: top, end: end, offset: lo) else { continue }
+            if anchor != nil { return found.menu }
+            return found.menu.tabs && found.last >= filled[max(0, filled.count - 4)] ? found.menu : nil
+        }
+        return nil
+    }
+
+    /// The run around the highlighted row `m`, inside rows top..<end; nil when it is not a menu.
+    private static func run(_ rows: [Row], highlight m: Int, top: Int, end: Int, offset: Int) -> (menu: Menu, last: Int)? {
+        let item = rows[m].markerColumn + 2
+        func lit(_ r: Row) -> Bool { r.marked && r.markerColumn == item - 2 }
+        var first = m, up = m - 1
+        while up >= top, rows[first].number != 1 {
             let r = rows[up]
-            if r.blank || r.marked { break }
+            if r.blank { break }
             if !r.rule {
-                if r.column < top.column { break }
+                if r.column < item { break }
+                if lit(r) { return nil }
                 first = up
             }
             up -= 1
         }
-        var options: [Option] = []
-        var labelColumn = Int.max
-        var end = rows.count
-        for k in first..<rows.count {
+        var last = m, gap = false
+        for k in (m + 1)..<end {
             let r = rows[k]
-            if r.blank || (!r.rule && r.column < top.column) { end = k; break }
+            if r.blank { gap = true; continue }
             if r.rule { continue }
-            if r.column == top.column {
-                if (r.number != nil) != numbered { end = k; break }
-            } else if options.isEmpty || !numbered || r.column >= labelColumn {
-                continue // a description, or a line above the first option
+            if gap || r.column < item || lit(r) { return nil }
+            last = k
+        }
+        var options: [Option] = []
+        var numbered: Bool?
+        var labelColumn = Int.max
+        var boxes = false
+        for k in first...last {
+            let r = rows[k]
+            if r.blank || r.rule { continue }
+            let isRow: Bool
+            if r.column == item {
+                if numbered == nil { numbered = r.number != nil } else if numbered != (r.number != nil) { return nil }
+                isRow = true
+            } else {
+                isRow = !options.isEmpty && numbered == true && boxes && r.column < labelColumn
             }
-            options.append(Option(number: r.number, label: r.label, highlighted: k == h,
-                                  checkbox: r.checkbox, checked: r.checked, row: lo + k))
+            guard isRow else {
+                if k == m { return nil } // the marker sits on a description
+                continue
+            }
+            options.append(Option(number: r.number, label: r.label, highlighted: k == m,
+                                  checkbox: r.checkbox, checked: r.checked, row: offset + k))
             labelColumn = r.labelColumn
+            boxes = r.checkbox
         }
         let numbers = options.compactMap(\.number)
         guard options.count >= 2, options.contains(where: { $0.highlighted }),
               numbers.enumerated().allSatisfy({ $0.element == $0.offset + 1 }) else { return nil }
-        let tabs = rows[..<first].contains { isTabHeader($0.text) }
-        let next = rows[end...].first { !$0.blank && !$0.rule }
-        guard tabs || next.map({ isHint($0.text) }) == true else { return nil }
-        return Menu(options: options, tabs: tabs)
+        return (Menu(options: options, tabs: rows[..<first].contains { isTabHeader($0.text) }), last)
+    }
+
+    /// "Type something" (Claude) and "Other (type your own)" (omp): the owner types the answer, so a
+    /// pick only moves there.
+    static func isFreeText(_ o: Option) -> Bool {
+        let l = o.label.lowercased()
+        return l.hasPrefix("type something") || l.hasPrefix("other (type")
+    }
+
+    /// The same choices on screen: number, label, highlight and checkbox state of every option, and
+    /// the tabs. Rows are ignored (the same menu moves up as output scrolls).
+    static func sameChoices(_ a: Menu?, _ b: Menu?) -> Bool {
+        guard let a = a, let b = b else { return a == nil && b == nil }
+        return a.tabs == b.tabs && a.options.count == b.options.count && zip(a.options, b.options).allSatisfy { x, y in
+            x.number == y.number && x.label == y.label && x.highlighted == y.highlighted
+                && x.checkbox == y.checkbox && x.checked == y.checked
+        }
     }
 
     /// The menu's options, [] when there is no live menu.
@@ -175,8 +245,9 @@ enum MenuLogic {
 
     /// The keys that move the highlight to `target` and act on it: Up or Down by the row distance
     /// (left out when already there), then Enter, or Space for a checkbox row (it toggles; it never
-    /// submits). [] for invalid input: not exactly one highlight, the target not in the list, or more
-    /// than 20 rows away (the server's repeat limit; a capped move would act on the wrong row).
+    /// submits). A free-text row ("Type something", "Other") gets the moves only. [] for invalid
+    /// input (not exactly one highlight, the target not in the list, or more than 20 rows away: the
+    /// server's repeat limit, and a capped move would act on the wrong row) or nothing to send.
     static func keys(toChoose target: Option, in opts: [Option]) -> [(key: String, `repeat`: Int)] {
         let lit = opts.indices.filter { opts[$0].highlighted }
         guard lit.count == 1, let t = opts.firstIndex(of: target) else { return [] }
@@ -185,7 +256,7 @@ enum MenuLogic {
         var out: [(key: String, `repeat`: Int)] = []
         if d < 0 { out.append((key: "Up", repeat: -d)) }
         if d > 0 { out.append((key: "Down", repeat: d)) }
-        out.append((key: target.checkbox ? "Space" : "Enter", repeat: 1))
+        if !isFreeText(target) { out.append((key: target.checkbox ? "Space" : "Enter", repeat: 1)) }
         return out
     }
 
@@ -1236,6 +1307,331 @@ x
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 """#
 
+        // Phone width (tmux 48 columns): facts-menu-captures-narrow.md.
+        let narrowAsk = #"""
+
+ ▐▛███▛█   Claude Code v2.1.317
+▝▜██████▀  Opus 5.5 · Claude Team
+ ▝▝   ▝▝   /tmp/zz-cap2/claude
+
+  Get to finished work sooner with Opus 5.5.
+  Switch anytime with /model.
+
+❯ Call the AskUserQuestion tool once with       
+  exactly two questions. Question 1 (header     
+  Color, single choice, 3 options each with a   
+  description sentence of about 12 words):      
+  which color do you like. Question 2 (header   
+  Extras, multiSelect true, 3 options each with 
+  a short description): which extras do you     
+  want. Do nothing else.                        
+
+● Mình sẽ hỏi bạn hai câu về màu sắc và các tùy
+  chọn thêm.
+────────────────────────────────────────────────
+←  ☐ Color  ☐ Extras  ✔ Submit  →
+
+Bạn thích màu nào nhất?
+
+❯ 1. Xanh dương
+     Màu của bầu trời và biển cả, mang lại cảm 
+     giác bình yên, tin cậy.
+  2. Xanh lá
+     Màu của cây cối và thiên nhiên, gợi cảm 
+     giác tươi mới, cân bằng.
+  3. Đỏ
+     Màu nổi bật và mạnh mẽ, thể hiện năng 
+     lượng, nhiệt huyết và đam mê.
+  4. Type something.
+────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · 
+Esc to cancel                                 
+
+
+                                           
+                                             
+                                          
+
+                                              
+
+
+
+                                              
+"""#
+        let narrowMulti = #"""
+
+ ▐▛███▛█   Claude Code v2.1.317
+▝▜██████▀  Opus 5.5 · Claude Team
+ ▝▝   ▝▝   /tmp/zz-cap2/claude
+
+  Get to finished work sooner with Opus 5.5.
+  Switch anytime with /model.
+
+❯ Call the AskUserQuestion tool once with       
+  exactly two questions. Question 1 (header     
+  Color, single choice, 3 options each with a   
+  description sentence of about 12 words):      
+  which color do you like. Question 2 (header   
+  Extras, multiSelect true, 3 options each with 
+  a short description): which extras do you     
+  want. Do nothing else.                        
+
+● Mình sẽ hỏi bạn hai câu về màu sắc và các tùy
+  chọn thêm.
+────────────────────────────────────────────────
+←  ☐ Color  ☐ Extras  ✔ Submit  →
+
+Bạn muốn thêm những tùy chọn nào?
+
+❯ 1. [ ] Chế độ tối
+         Giao diện nền tối, dịu mắt hơn.       
+  2. [ ] Hiệu ứng động      
+         Thêm chuyển động nhẹ khi thao tác.
+  3. [ ] Âm thanh                            
+         Phát âm thanh khi bấm nút.
+  4. [ ] Type something
+     Submit                                
+────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · 
+Esc to cancel
+
+
+
+
+                                           
+                                             
+                                          
+
+                                              
+
+
+
+                                              
+"""#
+        let narrowOnType = #"""
+
+ ▐▛███▛█   Claude Code v2.1.317
+▝▜██████▀  Opus 5.5 · Claude Team
+ ▝▝   ▝▝   /tmp/zz-cap2/claude
+
+  Get to finished work sooner with Opus 5.5.
+  Switch anytime with /model.
+
+❯ Call the AskUserQuestion tool once with       
+  exactly two questions. Question 1 (header     
+  Color, single choice, 3 options each with a   
+  description sentence of about 12 words):      
+  which color do you like. Question 2 (header   
+  Extras, multiSelect true, 3 options each with 
+  a short description): which extras do you     
+  want. Do nothing else.                        
+
+● Mình sẽ hỏi bạn hai câu về màu sắc và các tùy
+  chọn thêm.
+────────────────────────────────────────────────
+←  ☐ Color  ☐ Extras  ✔ Submit  →
+
+Bạn muốn thêm những tùy chọn nào?
+
+  1. [ ] Chế độ tối
+         Giao diện nền tối, dịu mắt hơn.       
+  2. [ ] Hiệu ứng động      
+         Thêm chuyển động nhẹ khi thao tác.
+  3. [ ] Âm thanh                            
+         Phát âm thanh khi bấm nút.
+❯ 4. [ ] Type something
+     Submit                                
+────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · 
+ctrl+g to edit in Vim · Esc to cancel
+
+
+
+
+                                           
+                                             
+                                          
+
+                                              
+
+
+
+                                              
+"""#
+        let narrowOnSubmit = #"""
+
+ ▐▛███▛█   Claude Code v2.1.317
+▝▜██████▀  Opus 5.5 · Claude Team
+ ▝▝   ▝▝   /tmp/zz-cap2/claude
+
+  Get to finished work sooner with Opus 5.5.
+  Switch anytime with /model.
+
+❯ Call the AskUserQuestion tool once with       
+  exactly two questions. Question 1 (header     
+  Color, single choice, 3 options each with a   
+  description sentence of about 12 words):      
+  which color do you like. Question 2 (header   
+  Extras, multiSelect true, 3 options each with 
+  a short description): which extras do you     
+  want. Do nothing else.                        
+
+● Mình sẽ hỏi bạn hai câu về màu sắc và các tùy
+  chọn thêm.
+────────────────────────────────────────────────
+←  ☐ Color  ☐ Extras  ✔ Submit  →
+
+Bạn muốn thêm những tùy chọn nào?
+
+  1. [ ] Chế độ tối
+         Giao diện nền tối, dịu mắt hơn.       
+  2. [ ] Hiệu ứng động      
+         Thêm chuyển động nhẹ khi thao tác.
+  3. [ ] Âm thanh                            
+         Phát âm thanh khi bấm nút.
+  4. [ ] Type something
+❯    Submit                                
+────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · 
+ctrl+g to edit in Vim · Esc to cancel
+
+
+
+
+                                           
+                                             
+                                          
+
+                                              
+
+
+
+                                              
+"""#
+        let narrowBash = #"""
+  Color, single choice, 3 options each with a   
+  description sentence of about 12 words):      
+  which color do you like. Question 2 (header   
+  Extras, multiSelect true, 3 options each with 
+  a short description): which extras do you     
+  want. Do nothing else.                        
+                             
+● Mình sẽ hỏi bạn hai câu về màu sắc và các tùy
+  chọn thêm.                                    
+
+● User declined to answer questions             
+  ⎿  · Bạn thích màu nào nhất? (Xanh dương /    
+     Xanh lá / Đỏ)                              
+     · Bạn muốn thêm những tùy chọn nào? (Chế độ
+     tối / Hiệu ứng động / Âm thanh)            
+
+✻ Sautéed for 6s · done 11:38 AM
+
+❯ Run this exact Bash command and nothing else: 
+  touch /tmp/zz-cap2/claude/a_rather_long_file  
+  _name_for_wrapping_test_one.txt               
+  /tmp/zz-cap2/claude/another_long_file_name_fo 
+  r_wrapping_test_two.txt                       
+                                                
+● Tạo hai tệp rỗng để thử           
+  ⎿  $ touch /tmp/zz-cap2/claude/a_rather_long_f
+     ile_name_for_wrapping_test_one.txt 
+     /tmp/zz-cap2/claude/another_long_file_name_
+     for_wrapping_test_two.txt                  
+
+────────────────────────────────────────────────
+ Bash command                                   
+ Tip: auto mode handles these prompts for you — 
+ choose "switch to auto mode" below
+ Tạo hai tệp rỗng để thử  
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ touch /tmp/zz-cap2/claude/a_rather_long_file
+ │ _name_for_wrapping_test_one.txt
+ │ /tmp/zz-cap2/claude/another_long_file_name_f
+ │ or_wrapping_test_two.txt
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to proceed?                   
+ ❯ 1. Yes                                       
+   2. Yes, and always allow access to          
+      /tmp/zz-cap2/claude from this project   
+   3. Yes, and switch to auto mode · auto mode 
+      handles these prompts for you             
+   4. No                  
+
+ Esc to cancel · Tab to amend                 
+"""#
+        let narrowCodex = #"""
+ 
+  >_ OpenAI Codex (v0.166.0)
+     /tmp/zz-cap2/codex
+ 
+  To get started, describe a task or try one of
+these commands:
+ 
+  /init - create an AGENTS.md file with
+instructions for Codex
+  /status - show current session configuration
+  /permissions - choose what Codex is allowed to
+do
+  /model - choose what model and reasoning
+effort to use
+  /review - review any changes and find issues
+ 
+ 
+› run: touch x
+                        
+                                
+• I’ll run touch x in the workspace.
+                                  
+• Running touch x                 
+                                    
+                                    
+                                    
+                                    
+                                   
+                                
+                               
+                             
+ 
+ 
+  Would you like to run the following command?
+ 
+  Environment: local
+ 
+  Reason: The sandbox failed to start. Allow
+  running touch x outside the sandbox?
+ 
+  $ touch x
+ 
+ 
+› 1. Yes, proceed (y)                           
+  2. Yes, and don't ask again for commands that
+     start with `touch x` (p)
+  3. No, and tell Codex what to do differently
+     (esc)
+                                                
+  Press enter to confirm or esc to cancel       
+"""#
+        let narrowBashDown = #"""
+ Do you want to proceed?                   
+   1. Yes                                       
+ ❯ 2. Yes, and always allow access to          
+      /tmp/zz-cap2/claude from this project   
+   3. Yes, and switch to auto mode · auto mode 
+      handles these prompts for you             
+   4. No                  
+
+ Esc to cancel                                
+"""#
+
         // Claude trust prompt: no numbers, default "No, exit"; highlight on row 1 and on row 2.
         eq("trust", summary(trust), ">No, exit | Yes, I trust this folder")
         eq("trust pick 1", pick(trust, 0), "Enterx1")
@@ -1251,12 +1647,26 @@ x
         // AskUserQuestion: single choice with descriptions, "Chat about this" below a rule, tabs.
         eq("ask single", summary(askSingle), ">1. Tốc độ | 2. Chính xác | 3. Cân bằng | 4. Type something. | 5. Chat about this <>")
         eq("ask single pick 5", pick(askSingle, 4), "Downx4,Enterx1")
+        eq("ask single pick Type something", pick(askSingle, 3), "Downx3")
+        // A description starting with ">" below or above the highlight is text, not a marker.
+        let descBelow = askSingle.replacingOccurrences(of: "     Làm nhanh, chấp nhận kiểm tra ít hơn.",
+                                                       with: "     Làm nhanh, chấp nhận kiểm tra ít hơn.\n     > 10 files")
+        eq("desc > below", summary(descBelow), summary(askSingle))
+        let descAbove = descBelow.replacingOccurrences(of: "❯ 1. Tốc độ", with: "  1. Tốc độ")
+            .replacingOccurrences(of: "  2. Chính xác", with: "❯ 2. Chính xác")
+        eq("desc > above", summary(descAbove), "1. Tốc độ | >2. Chính xác | 3. Cân bằng | 4. Type something. | 5. Chat about this <>")
         // Multi-select: checkbox rows toggle with Space; "Submit" is a row of its own.
         let multiRest = "3. [ ] Tóm tắt cuối | 4. [ ] Type something | Submit | 5. Chat about this <>"
         eq("multi", summary(multiTab2), ">1. [ ] Tiến độ | 2. [ ] Cảnh báo | " + multiRest)
         eq("multi pick 2", pick(multiTab2, 1), "Downx1,Spacex1")
         eq("multi pick Submit", pick(multiTab2, 4), "Downx4,Enterx1")
         eq("multi pick 5", pick(multiTab2, 5), "Downx5,Enterx1")
+        eq("multi pick Type something", pick(multiTab2, 3), "Downx3")
+        // The cursor on the Submit row, drawn "❯    Submit" (captured at phone width: narrowOnSubmit).
+        let onSubmit = multiTab2.replacingOccurrences(of: "❯ 1. [ ] Tiến độ", with: "  1. [ ] Tiến độ")
+            .replacingOccurrences(of: "     Submit", with: "❯    Submit")
+        eq("multi on Submit", summary(onSubmit), "1. [ ] Tiến độ | 2. [ ] Cảnh báo | 3. [ ] Tóm tắt cuối | 4. [ ] Type something | >Submit | 5. Chat about this <>")
+        eq("multi on Submit pick 1", pick(onSubmit, 0), "Upx4,Spacex1")
         eq("multi Submit spoken", spokenAt(multiTab2, 4), "Chọn: Submit")
         eq("multi down", summary(multiDown), "1. [ ] Tiến độ | >2. [ ] Cảnh báo | " + multiRest)
         eq("multi space", summary(multiSpace), "1. [ ] Tiến độ | >2. [x] Cảnh báo | " + multiRest)
@@ -1284,12 +1694,28 @@ x
         // omp Ask box: no numbers, U+F054 chevron, U+F10C circles, descriptions 2 columns deeper.
         let ompRows = "Xem trạng thái repo (Recommended) | Bắt đầu task mới | Dọn dẹp thư mục tạm | Other (type your own)"
         eq("omp ask", summary(ompAsk), ">" + ompRows)
-        eq("omp ask pick Other", pick(ompAsk, 3), "Downx3,Enterx1")
+        eq("omp ask pick Other", pick(ompAsk, 3), "Downx3")
+        eq("omp ask pick 2", pick(ompAsk, 1), "Downx1,Enterx1")
         eq("omp ask spoken", spokenAt(ompAsk, 3), "Chọn 4: Other (type your own)")
         let ompAskDown = ompAsk.replacingOccurrences(of: "│ \u{F054} \u{F10C} Xem", with: "│   \u{F10C} Xem")
             .replacingOccurrences(of: "│   \u{F10C} Bắt", with: "│ \u{F054} \u{F10C} Bắt")
         eq("omp ask down", summary(ompAskDown), ompRows.replacingOccurrences(of: "| Bắt", with: "| >Bắt"))
         eq("omp ask down pick 1", pick(ompAskDown, 0), "Upx1,Enterx1")
+
+        // Phone width: the footer wraps to 2 lines, labels wrap at the label column (a description).
+        let narrowExtras = "1. [ ] Chế độ tối | 2. [ ] Hiệu ứng động | 3. [ ] Âm thanh | "
+        eq("narrow ask", summary(narrowAsk), ">1. Xanh dương | 2. Xanh lá | 3. Đỏ | 4. Type something. | 5. Chat about this <>")
+        eq("narrow multi", summary(narrowMulti), ">" + narrowExtras + "4. [ ] Type something | Submit | 5. Chat about this <>")
+        eq("narrow on Type something", summary(narrowOnType), narrowExtras + ">4. [ ] Type something | Submit | 5. Chat about this <>")
+        eq("narrow on Submit", summary(narrowOnSubmit), narrowExtras + "4. [ ] Type something | >Submit | 5. Chat about this <>")
+        eq("narrow on Submit pick 1", pick(narrowOnSubmit, 0), "Upx4,Spacex1")
+        eq("narrow on Type something pick Submit", pick(narrowOnType, 4), "Downx1,Enterx1")
+        let narrowBashRows = ["1. Yes", "2. Yes, and always allow access to", "3. Yes, and switch to auto mode · auto mode", "4. No"]
+        eq("narrow bash", summary(narrowBash), ">" + narrowBashRows.joined(separator: " | "))
+        eq("narrow bash pick 4", pick(narrowBash, 3), "Downx3,Enterx1")
+        eq("narrow bash down", summary(narrowBashDown), narrowBashRows[0] + " | >" + narrowBashRows[1...].joined(separator: " | "))
+        eq("narrow codex", summary(narrowCodex), ">1. Yes, proceed (y) | 2. Yes, and don't ask again for commands that | 3. No, and tell Codex what to do differently")
+        eq("narrow codex pick 3", pick(narrowCodex, 2), "Downx2,Enterx1")
 
         // Not a live menu: input prompts, sent prompts in the transcript, numbered drafts, browsers.
         let notMenus: [(String, String)] = [
@@ -1304,6 +1730,18 @@ x
             ("ompSettings", ompSettings),
         ]
         for (name, text) in notMenus { eq(name, summary(text), "none") }
+        // A status line that merely contains footer words: a codex thread title, an omp project.
+        eq("codex draft, title Esc to cancel", summary(codexDraftFoo.replacingOccurrences(of: "Create x file", with: "Esc to cancel stale jobs")), "none")
+        eq("omp draft, project select-cancel", summary(ompDraftAltEnter.replacingOccurrences(of: "zz-cap/omp", with: "select-cancel")), "none")
+
+        // sameChoices ignores rows, not choices.
+        let shifted = menu(lines("older output\n\n" + trust))
+        eq("same choices, moved", sameChoices(menu(lines(trust)), shifted), true)
+        eq("same choices, rows differ", menu(lines(trust)) == shifted, false)
+        eq("other highlight", sameChoices(menu(lines(trust)), menu(lines(trustRow2))), false)
+        eq("checked changed", sameChoices(menu(lines(multiDown)), menu(lines(multiSpace))), false)
+        eq("both none", sameChoices(nil, nil), true)
+        eq("menu gone", sameChoices(menu(lines(bash)), nil), false)
 
         // Rules on small inputs.
         eq("empty", summary(""), "none")
@@ -1313,6 +1751,12 @@ x
         eq("no hint", summary("Pick\n❯ 1. Yes\n  2. No\n\nok"), "none")
         eq("with hint", summary("Pick\n❯ 1. Yes\n  2. No\n\nEsc to cancel"), ">1. Yes | 2. No")
         eq("out of window", summary(ompAsk + "\n" + (1...40).map { "line \($0)" }.joined(separator: "\n")), "none")
+        eq("footer wrapped", summary("Pick\n❯ 1. Yes\n  2. No\n\nEnter to select · Tab/Arrow\nkeys to navigate"), ">1. Yes | 2. No")
+        eq("footer not at the end", summary("Pick\n❯ 1. Yes\n  2. No\n\nEsc to cancel\na\nb"), "none")
+        eq("footer inside a line", summary("Pick\n❯ 1. Yes\n  2. No\n\nok · Esc to cancel"), "none")
+        eq("wrapped label", summary("Run?\n› 1. Yes\n  2. Yes, and don't ask\n   again\n  3. No\n\nPress enter to confirm or esc to cancel"),
+           ">1. Yes | 2. Yes, and don't ask | 3. No")
+        eq("free text", [askSingle, multiTab2, ompAsk].map { options(lines($0)).filter(isFreeText).count }, [1, 1, 1])
 
         // Distances: up to 20 rows, never a capped move.
         let long = (0..<25).map { Option(number: $0 + 1, label: "o\($0)", highlighted: $0 == 0, row: $0) }
