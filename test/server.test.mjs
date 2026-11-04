@@ -8,11 +8,13 @@ import { spawnSync, execFile, spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
-import { createApp, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, strictOrigin, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock,
+import { createApp, HARNESSES, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, strictOrigin, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock,
   parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, releaseRunOf, parseUpdates, updateStatusOf, gateStatusOf, gateRunOf, resetReply, RESET_MSG, memo, codexChildMeta, parseGitSync, ompDirName, ompHead, KNOWN_VERSIONS, repoOfLink } from '../server.mjs';
 import { ADD_WATCHDOG, addOutcome } from '../server.mjs';
 
 process.env.TZ = 'America/Los_Angeles'; // spend days follow config.json timeZone, never the process zone: a third zone proves it
+// no test may make the loader read the real secrets file: a path that does not exist, unless the caller already chose one
+process.env.FCODE_SECRETS_ENV ||= path.join(os.tmpdir(), `fcode-no-secrets-${process.pid}`, 'env');
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const FAKE = path.join(here, 'fake-tmux.mjs');
@@ -20,7 +22,12 @@ const SERVER = path.join(here, '..', 'server.mjs');
 const VN = 'Xin chào, tiếng Việt có dấu: ắ ẫ ợ ữ';
 const ABS = path.resolve(os.tmpdir());
 const HOME = os.homedir();
-const LAUNCH = `env LANG=C.UTF-8 LC_ALL=C.UTF-8 'PATH=${HOME}/.local/bin:${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin' `;
+const LOADER = path.join(here, '..', 'box', 'start.sh'); // a checkout has no start.sh next to server.mjs: box/start.sh is the loader
+const shq = (s) => `'${s.replace(/'/g, "'\\''")}'`;
+const ENV_PART = `env LANG=C.UTF-8 LC_ALL=C.UTF-8 'PATH=${HOME}/.local/bin:${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin' `; // the launch before the loader
+// the server makes the secrets path absolute once (path.resolve against its cwd)
+const launchOf = (loader, secrets = process.env.FCODE_SECRETS_ENV) => `${ENV_PART}${shq(`FCODE_SECRETS_ENV=${path.resolve(secrets)}`)} /bin/sh ${shq(loader)} `;
+const LAUNCH = launchOf(LOADER);
 
 async function boot(opts = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-test-'));
@@ -35,7 +42,7 @@ async function boot(opts = {}) {
   process.env.FAKE_TMUX_DIR = fakeDir;
   const logs = [];
   // home v2 sources default to nothing real: no scan of this machine's logs, no omp/gh on PATH
-  const app = createApp({ configDir, tmux: [process.execPath, FAKE], log: (l) => logs.push(l), pollMs: 40, pasteEnterDelayMs: 0,
+  const app = (opts.make ?? createApp)({ configDir, tmux: [process.execPath, FAKE], log: (l) => logs.push(l), pollMs: 40, pasteEnterDelayMs: 0,
     spendRoots: {}, updatesFile: path.join(root, 'no-status.json'), gitSync: null, gitSyncFile: path.join(root, 'no-git-sync.json'), omp: [process.execPath, '-e', 'process.exit(1)'], gh: [process.execPath, '-e', 'process.exit(1)'],
     ompSessionsRoot: path.join(root, 'omp-sessions'), warmTickMs: 0, ...opts }); // warmTickMs 0: no warm-up from boot, so the tests that count tool calls stay as they are
   const port = await app.listen(0, '127.0.0.1');
@@ -49,9 +56,11 @@ async function boot(opts = {}) {
     return { cookie: r.headers['set-cookie'][0].split(';')[0], json: r.json, token: r.json.token };
   };
   ctx.deviceId = async (name) => (await adminRequest(configDir, { cmd: 'devices' })).devices.find((d) => d.name === name).id;
-  ctx.calls = () => {
+  ctx.allCalls = () => {
     try { return fs.readFileSync(path.join(fakeDir, 'log.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; }
   };
+  // without the per-create `set-environment -g -u` token cleanup (A3), which the tests that count tmux calls do not expect
+  ctx.calls = () => ctx.allCalls().filter((x) => x.argv[0] !== 'set-environment');
   ctx.close = async () => {
     await app.close();
     for (let i = 0; i < 150 && app.stats().running + app.stats().waiting > 0; i++) await new Promise((r) => setTimeout(r, 20));
@@ -928,21 +937,396 @@ test('empty projects: meta, overview and the + flow work with no projects; a fre
   assert.deepEqual((await c.req('GET', '/api/meta', { cookie })).json.projects, ['beta']);
 }));
 
-test('install.sh start.sh: the service takes GH_TOKEN alone from the instabox secrets file, nothing else', { skip: process.platform === 'win32' && 'POSIX sh' }, () => {
+// ---- GH_TOKEN for harness sessions (CONTRACT A3 "Harness launch"): one loader, read as data; tmux never sees the service's token ----
+const POSIX = process.platform === 'win32' && 'POSIX sh';
+const PROBE = `'${process.execPath}' -e 'console.log(JSON.stringify([process.env.GH_TOKEN ?? null, process.env.OTHER ?? null, process.env.GITHUB_TOKEN ?? null]))'`;
+// a fresh module instance of server.mjs in `dir` (with box/start.sh beside it, or alone): what SERVER_DIR finds is what the copy has
+async function serverCopy(dir, withLoader = true) {
+  fs.mkdirSync(path.join(dir, 'box'), { recursive: true });
+  fs.copyFileSync(SERVER, path.join(dir, 'server.mjs'));
+  if (withLoader) fs.copyFileSync(LOADER, path.join(dir, 'box', 'start.sh'));
+  return import(pathToFileURL(path.join(dir, 'server.mjs')).href);
+}
+
+test('install.sh start.sh: the loader reads GH_TOKEN alone, as data, under a strict whole-file grammar; a hostile file never runs, blocks or prints', { skip: POSIX }, (t) => {
   const install = fs.readFileSync(path.join(here, '..', 'install.sh'), 'utf8');
-  const m = /cat > "\$APP\/start\.sh" <<'START'\r?\n([\s\S]*?)\r?\nSTART\r?\n/.exec(install);
-  assert.ok(m, 'start.sh not found in install.sh');
-  assert.match(install, /ExecStart=\/bin\/sh \$APP\/start\.sh \$\(command -v node\) \$APP\/server\.mjs/);
+  assert.match(install, /\ninstall -m 755 "\$SRC\/box\/start\.sh" "\$APP\/start\.sh"\n/); // the one loader, shared with the harness sessions
+  assert.match(install, /ExecStart=\/bin\/sh \$APP\/start\.sh -v \$\(command -v node\) \$APP\/server\.mjs/); // the service passes -v: the journal says why there is no token
+  assert.ok(install.indexOf('install -m 755 "$SRC/box/start.sh"') < install.indexOf('install-autoupdate.sh'), 'the loader is installed before the auto-update step');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-start-'));
+  const f = path.join(dir, 'env'), pwn = path.join(dir, 'PWNED');
+  const onPath = (name) => (process.env.PATH || '').split(path.delimiter).map((d) => path.join(d, name)).find((p) => fs.existsSync(p));
+  // every awk present (mawk, gawk, the PATH one: unique by realpath), each as the `awk` first on PATH: a locale or dialect that breaks one is caught
+  const awks = [...new Set(['/usr/bin/mawk', '/usr/bin/gawk', onPath('awk')].filter((p) => p && fs.existsSync(p)).map((p) => fs.realpathSync(p)))];
+  assert.ok(awks.length > 0, 'an awk is needed');
+  t.diagnostic(`awks used: ${awks.join(', ')}`);
+  const bins = awks.map((a, i) => { const d = path.join(dir, `awk${i}`); fs.mkdirSync(d); fs.symlinkSync(a, path.join(d, 'awk')); return d; });
+  const L = (s) => Buffer.from(s, 'latin1'); // a body with raw bytes (\xff, \0)
+  // env A: the inherited tokens are stale; env B adds a UTF-8 locale (gawk then rejects an awk regex that is not byte-wise)
+  const envFor = (bin, file, extra = {}) => ({ PATH: `${bin}${path.delimiter}${process.env.PATH}`, FCODE_SECRETS_ENV: file, GH_TOKEN: 'stale_inherited_1', GITHUB_TOKEN: 'stale_inherited_2', ...extra });
+  const ENV_B = { LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8' };
+  const go = (env, { v = false, shell = '/bin/sh' } = {}) => spawnSync('/bin/sh', ['-c', `exec ${shell} ${shq(LOADER)} ${v ? '-v ' : ''}${PROBE}`], { encoding: 'utf8', cwd: dir, timeout: 5000, env });
+  const expect = (tok) => `${JSON.stringify([tok, null, null])}\n`; // [GH_TOKEN, OTHER, GITHUB_TOKEN]
+  // out(file): the probe's output, the same on every awk and in both envs; status 0, nothing on stderr
+  const out = (file = f) => {
+    const seen = new Set();
+    for (const bin of bins) for (const extra of [{}, ENV_B]) {
+      const r = go(envFor(bin, file, extra));
+      assert.equal(r.status, 0, r.stderr); assert.equal(r.stderr, '');
+      seen.add(r.stdout);
+    }
+    assert.equal(seen.size, 1, `awks or locales disagree: ${[...seen].join(' ')}`);
+    return [...seen][0];
+  };
+  // status(label, file, word, tok): `-v`: exactly one stderr line, never a value; stdout as without -v
+  const status = (label, file, word, tok = null) => {
+    for (const bin of bins) {
+      const r = go(envFor(bin, file), { v: true });
+      assert.equal(r.status, 0, `${label}: ${r.stderr}`);
+      assert.equal(r.stderr, `fcoding start.sh: secrets file ${file}: ${word}\n`, label);
+      assert.equal(r.stdout, expect(tok), label);
+    }
+  };
+  const withBody = (body, fn) => { fs.writeFileSync(f, body); return fn(); };
   try {
-    fs.writeFileSync(path.join(dir, 'start.sh'), `${m[1]}\n`);
-    fs.writeFileSync(path.join(dir, 'env'), 'export GH_TOKEN=tok-test\nexport OTHER_SECRET=zz\necho noise\n');
-    const probe = [process.execPath, '-e', 'console.log(JSON.stringify([process.env.GH_TOKEN ?? null, process.env.OTHER_SECRET ?? null]))'];
-    const env = { PATH: process.env.PATH, FCODE_SECRETS_ENV: path.join(dir, 'env') };
-    const out = (e) => spawnSync('/bin/sh', [path.join(dir, 'start.sh'), ...probe], { encoding: 'utf8', env: e }).stdout.trim();
-    assert.equal(out(env), '["tok-test",null]');
-    assert.equal(out({ ...env, FCODE_SECRETS_ENV: path.join(dir, 'missing') }), '[null,null]'); // no file: starts without it
-    assert.equal(out({ ...env, GH_TOKEN: 'mine' }), '["mine",null]'); // one already set wins
+    const tokLine = 'GH_TOKEN=tokS1\n'; // 15 bytes
+    const pad = (n) => `${'#'.repeat(n - 1)}\n`; // a comment line of n bytes
+    // any line outside the grammar means NO token for the whole file (fail closed), whatever else the file holds
+    const cases = [
+      ['plain', 'export GH_TOKEN=tok_test\nexport OTHER_SECRET=zz\n', 'tok_test'],
+      ['a mixed valid file: comments, blanks, quotes, empty values, spaces, CRLF; the last GH_TOKEN wins',
+        "# vault\r\n\r\n   \t\nexport A='x y'\nB=\"q r\"\nC=\nexport   D=plain_1   \n  # GH_TOKEN=commented\nexport GH_TOKEN=\"tokG7\"\r\n  export   GH_TOKEN='tokH8'  \r\nE=after\n", 'tokH8'],
+      ['set -x', 'set -x\nexport GH_TOKEN=tokA1\n', null],
+      ['trap on EXIT', `trap 'echo pwned; touch ${shq(pwn)}' EXIT\nGH_TOKEN=tokB2\n`, null],
+      ['exit 3', 'exit 3\nexport GH_TOKEN=tokC3\n', null],
+      ['syntax error', 'if then fi ((\nexport GH_TOKEN=tokD4\n', null],
+      ['read x', 'read x\nexport GH_TOKEN=tokE5\n', null],
+      ['echo', 'echo noise\nexport GH_TOKEN=tokE6\n', null],
+      ['a multiline value whose inner line looks like GH_TOKEN=', 'export X="line one\nGH_TOKEN=tokM1\n"\n', null],
+      ['a heredoc', 'cat <<EOF\nGH_TOKEN=tokM2\nEOF\n', null],
+      ['an unbalanced quote', "A='open\nGH_TOKEN=tokM3\n", null],
+      ['a trailing comment after a value', 'GH_TOKEN=tokM4 # mine\n', null],
+      ['export without a value', 'export GH_TOKEN\n', null],
+      ['a bad name', '1A=x\nGH_TOKEN=tokM5\n', null],
+      ['an expansion in double quotes', 'A="$HOME"\nGH_TOKEN=tokM6\n', null],
+      ['a backslash in double quotes', 'A="a\\"b"\nGH_TOKEN=tokM7\n', null],
+      ['command substitution', `export GH_TOKEN=$(touch ${shq(pwn)})\n`, null],
+      ['backticks', `export GH_TOKEN=\`touch ${shq(pwn)}\`\n`, null],
+      ['a NUL byte', 'A=x\0y\nGH_TOKEN=tokN1\n', null],
+      ['empty token', 'export GH_TOKEN=\n', null],
+      ['a space in the quoted value', 'export GH_TOKEN="a b"\n', null],
+      ['256 characters', `GH_TOKEN=${'a'.repeat(256)}\n`, null],
+      ['255 characters', `GH_TOKEN=${'a'.repeat(255)}\n`, 'a'.repeat(255)],
+      ['exactly 65536 bytes', pad(65536 - tokLine.length) + tokLine, 'tokS1'],
+      ['65537 bytes', pad(65537 - tokLine.length) + tokLine, null],
+      ['a value crossing the 64 KiB boundary (a cut read would give "tok")', pad(65536 - 'GH_TOKEN=tok'.length) + tokLine, null],
+      ['other variables never reach the command', 'export OTHER=x\nGH_TOKEN_X=nope\nOLD_GH_TOKEN=bad\n#GH_TOKEN=bad\nexport GH_TOKEN=tokJ0\n', 'tokJ0'],
+      ['no GH_TOKEN line: the inherited one is dropped', 'export OTHER=x\n', null],
+      // no token (the label is the file's bytes)
+      ...[
+        L('B="x\xff\nGH_TOKEN=inner_leak\n\xff"\n'),
+        'A=x;cat<<X=1\nGH_TOKEN=heredoc_leak\nX=1\n',
+        'A=x;id\nGH_TOKEN=t1\n',
+        'A=x|id\nGH_TOKEN=t1\n',
+        'A=x&\nGH_TOKEN=t1\n',
+        '\vGH_TOKEN=t1\n',
+        '\fGH_TOKEN=t1\n',
+        'GH_TOKEN=ab\rcd\n',
+        "A='x\ry'\nGH_TOKEN=t1\n",
+        L('GH_TOKEN=ab\0cd\n'),
+        L("A='x\0y'\nGH_TOKEN=t1\n"),
+        L('GH_TOKEN=t\xff\n'),
+        'GH_TOKEN="t1"x\n',
+        "A=''''\nGH_TOKEN=t1\n",
+        'GH_TOKEN=a\nGH_TOKEN=\n',
+        "GH_TOKEN=DUMMY\nOPTIND='GH_TOKEN=123'\n",
+        `GH_TOKEN=DUMMY\nOPTIND='a[$(touch ${pwn})0]'\n`,
+        "export HISTCMD='GH_TOKEN=5'\nGH_TOKEN=t\n",
+        'RANDOM=1\nGH_TOKEN=t\n',
+        "SRANDOM='x[$(id)]'\nGH_TOKEN=t\n",
+        'OPTIND=1\nGH_TOKEN=t\n',
+        'SECONDS=5\nGH_TOKEN=t\n',
+        "GH_TOKEN=DUMMY\nMAILCHECK='GH_TOKEN=123'\n",
+        `GH_TOKEN=DUMMY\nMAILCHECK='a[$(touch ${pwn})0]'\n`,
+        `export MAILCHECK='x[$(touch ${pwn})]'\nGH_TOKEN=tokMC\n`,
+        'MAILCHECK=1\nGH_TOKEN=t\n',
+        'GH_TOKEN=tok1\nOPTIND=2\n',
+        L('#x\0y\nGH_TOKEN=DUMMY\n'),
+        '#x\ry\nGH_TOKEN=DUMMY\n',
+        '#x\vy\nGH_TOKEN=DUMMY\n',
+        L('A=x\x7fy\nGH_TOKEN=t\n'),
+        L('#x\x7fy\nGH_TOKEN=t\n'),
+        'GH_TOKEN=tok\r\r\n',
+        L('\xef\xbb\xbfGH_TOKEN=tokBOM\n'), // a BOM
+        'GH_TOKEN=tokH\nH0', // the loader's own sentinel is not a file line
+        'H0\n',
+        'export export GH_TOKEN=x\n',
+        'GH_TOKEN+=x\n',
+        "A=$'x'\nGH_TOKEN=t\n",
+        'GH_TOKEN=~abc\n',
+        "GH_TOKEN='\n",
+        "GH_TOKEN=''\n",
+        "A='\nGH_TOKEN=t1\n", // a lone quote (drop `length(val) < 2`)
+        'A="x\\"\nGH_TOKEN=t1\n', // a backslash before the closing quote (the dq class)
+        `A="\`touch ${pwn}\`"\nGH_TOKEN=t1\n`, // a backtick in double quotes (the dq class)
+        'A=x(\nGH_TOKEN=t1\n', // a bare `(` (the bare class)
+        'A=x\\\nGH_TOKEN=t1\n', // a bare backslash: a shell joins the next line
+        `A=x>${pwn}\nGH_TOKEN=t1\n`, // a bare `>`: a shell would write the file
+        `A=x<${pwn}\nGH_TOKEN=t1\n`, // a bare `<` (a shell would read the file or fail)
+      ].map((b) => [`no token: ${JSON.stringify(Buffer.from(b).toString('latin1'))}`, b, null]),
+      // a token
+      ...[
+        ['GH_TOKEN=tokCR\r\n', 'tokCR'],
+        ['GH_TOKEN=tokA\nGH_TOKEN=tokB \r\n', 'tokB'],
+        ["A='Hồng'\nGH_TOKEN=tokU\n", 'tokU'],
+        [Buffer.concat([Buffer.from('# Hồng '), Buffer.from([0xff]), Buffer.from('\nGH_TOKEN=tokCU\n')]), 'tokCU'],
+        [L('A=x\xff\nGH_TOKEN=tokB\n'), 'tokB'],
+        ['A="a\'b"\nGH_TOKEN=tokQ\n', 'tokQ'],
+        ["A='a\\b $x `y` #z'\nGH_TOKEN=tokS\n", 'tokS'],
+        ['A=~/x:b=c,d@e%f+g^h\nGH_TOKEN=tokA\n', 'tokA'],
+        ['export\tGH_TOKEN=tokT\n', 'tokT'],
+        ['GH_TOKEN=tokN', 'tokN'], // no final newline
+        ['# a comment\r\nGH_TOKEN=tokCm\r\n', 'tokCm'],
+        ['GH_TOKEN=tokH\n#H0\n', 'tokH'],
+        ['LINENO=3\nBASH_SUBSHELL=1\nEPOCHSECONDS=1\nGH_TOKEN=tokL2\n', 'tokL2'],
+        ['TMOUT=0\nHISTSIZE=1000\nLINES=24\nGH_TOKEN=tokT2\n', 'tokT2'],
+        ["GH_TOKEN=DUMMY\nPROMPT_COMMAND='GH_TOKEN=123'\n", 'DUMMY'], // the boundary row: prompt-time names are the shell's business (CONTRACT A3)
+        ['gh_token=x\nGH_TOKEN=tokL\n', 'tokL'],
+        ['\r\nGH_TOKEN=tokCr2\n', 'tokCr2'],
+        ['GH_TOKEN=tokA1\nGH_TOKEN=tokB2\n', 'tokB2'],
+        [pad(65536 - 'GH_TOKEN=tokS2'.length) + 'GH_TOKEN=tokS2', 'tokS2'], // 65536 bytes, the last line has no newline
+      ].map(([b, t]) => [`token ${t}: ${JSON.stringify(Buffer.from(b).toString('latin1').slice(0, 60))}`, b, t]),
+    ];
+    for (const [label, body, tok] of cases) {
+      fs.writeFileSync(f, body);
+      assert.equal(out(), expect(tok), label);
+    }
+    assert.ok(!fs.existsSync(pwn), 'nothing in the file ran');
+    assert.equal(out(path.join(dir, 'missing')), expect(null)); // no file: starts without it
+    fs.rmSync(f); spawnSync('mkfifo', [f]);
+    assert.ok(fs.statSync(f).isFIFO());
+    assert.equal(out(), expect(null)); // a FIFO is refused, never opened (it would block)
+    fs.rmSync(f); fs.writeFileSync(f, 'GH_TOKEN=tokK1\n'); fs.chmodSync(f, 0);
+    if (process.getuid?.() !== 0) assert.equal(out(), expect(null)); // unreadable: the same
+    fs.chmodSync(f, 0o600);
+
+    // -v: one stderr line `fcoding start.sh: secrets file <path>: <status>`, never a value; the command runs as without -v
+    status('good file', f, 'ok', 'tokK1');
+    withBody('A="$HOME"\nGH_TOKEN=x\n', () => status('expansion', f, 'line-1'));
+    withBody('A=ok\nB="$x"\n', () => status('second line', f, 'line-2'));
+    withBody("GH_TOKEN=DUMMY\nOPTIND='GH_TOKEN=123'\n", () => status('OPTIND', f, 'line-2'));
+    withBody("GH_TOKEN=DUMMY\nMAILCHECK='GH_TOKEN=123'\n", () => status('MAILCHECK', f, 'line-2'));
+    withBody(L('#x\0y\nGH_TOKEN=x\n'), () => status('NUL in a comment', f, 'line-1'));
+    withBody(L('GH_TOKEN=ab\0cd\n'), () => status('NUL in a value (an awk that splits records at NUL would say line-2)', f, 'line-1'));
+    withBody(pad(65537 - tokLine.length) + tokLine, () => status('65537 bytes', f, 'too-big'));
+    withBody('export GH_TOKEN=\n', () => status('empty token', f, 'bad-GH_TOKEN'));
+    withBody('export OTHER=x\n', () => status('no GH_TOKEN line', f, 'no-GH_TOKEN'));
+    withBody('', () => status('empty file', f, 'no-GH_TOKEN'));
+    fs.rmSync(f);
+    status('missing', f, 'missing');
+    fs.symlinkSync(path.join(dir, 'nowhere'), f);
+    status('dangling symlink', f, 'missing');
+    fs.rmSync(f); spawnSync('mkfifo', [f]);
+    status('FIFO', f, 'not-a-file');
+    fs.rmSync(f); fs.mkdirSync(f);
+    status('directory', f, 'not-a-file');
+    fs.rmdirSync(f); fs.writeFileSync(f, 'GH_TOKEN=tokK1\n'); fs.chmodSync(f, 0);
+    if (process.getuid?.() !== 0) status('mode 0', f, 'unreadable');
+    fs.chmodSync(f, 0o600);
+
+    // fault injection: head or awk missing, failing or killed is no token (never a partial read), the command still runs
+    fs.writeFileSync(f, 'GH_TOKEN=tokF1\n');
+    const faults = path.join(dir, 'faults');
+    fs.mkdirSync(faults);
+    const wrap = (name, tail) => { fs.writeFileSync(path.join(faults, name), `#!/bin/sh\n${onPath(name)} "$@"\n${tail}\n`, { mode: 0o755 }); };
+    const faultEnv = (bin) => envFor(bin, f);
+    for (const [label, name, tail] of [['head exits 1', 'head', 'exit 1'], ['head is killed', 'head', 'kill -9 $$'], ['awk exits 9', 'awk', 'exit 9'], ['awk is killed', 'awk', 'kill -9 $$']]) {
+      wrap(name, tail);
+      const env = faultEnv(faults);
+      const a = go(env), b = go(env, { v: true });
+      assert.deepEqual([a.status, a.stdout, a.stderr], [0, expect(null), ''], label);
+      assert.deepEqual([b.status, b.stdout, b.stderr], [0, expect(null), `fcoding start.sh: secrets file ${f}: error\n`], label);
+      fs.rmSync(path.join(faults, name));
+    }
+    for (const [label, only, name] of [['head is missing', awks[0], 'awk'], ['awk is missing', fs.realpathSync(onPath('head')), 'head']]) {
+      const bare = path.join(dir, `only-${name}`);
+      fs.mkdirSync(bare); fs.symlinkSync(only, path.join(bare, name));
+      const env = { ...envFor(bare, f), PATH: bare };
+      const a = go(env), b = go(env, { v: true });
+      assert.deepEqual([a.status, a.stdout, a.stderr], [0, expect(null), ''], label);
+      assert.deepEqual([b.status, b.stdout, b.stderr], [0, expect(null), `fcoding start.sh: secrets file ${f}: error\n`], label);
+    }
+
+    // xtrace: an inherited SHELLOPTS=xtrace must never trace the token (set +x is the first command)
+    if (fs.existsSync('/bin/bash')) {
+      fs.writeFileSync(f, 'export GH_TOKEN=tokXT9\n');
+      const env = envFor(bins[0], f, { SHELLOPTS: 'xtrace' });
+      const a = go(env, { shell: '/bin/bash' }), b = go(env, { v: true, shell: '/bin/bash' });
+      assert.deepEqual([a.status, a.stdout], [0, expect('tokXT9')]);
+      assert.ok(!a.stderr.includes('tokXT9'), a.stderr);
+      assert.equal(b.status, 0); assert.equal(b.stdout, expect('tokXT9'));
+      assert.ok(!b.stderr.includes('tokXT9'), b.stderr);
+      assert.ok(b.stderr.endsWith(`fcoding start.sh: secrets file ${f}: ok\n`), b.stderr);
+    }
+
+    // name rule self-check: the names bash evaluates as arithmetic on assignment (probed in `-c` AND `-i -c`) must be a subset of the
+    // six the loader refuses; a seventh name in a newer bash fails here: add it to the regex in start.sh, a row, and the docs
+    if (fs.existsSync('/bin/bash')) {
+      const bash = (args, opts = {}) => spawnSync('/bin/bash', ['--norc', '--noprofile', ...args], { encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'ignore'], detached: true, ...opts }); // detached (setsid): `-i` opens /dev/tty, which would stop a run in a background job group
+      const SIX = ['OPTIND', 'HISTCMD', 'MAILCHECK', 'RANDOM', 'SRANDOM', 'SECONDS'];
+      const names = new Set([...bash(['-c', 'compgen -v']).stdout.split('\n'), ...bash(['-i', '-c', 'compgen -v']).stdout.split('\n'),
+        ...SIX, 'LINENO', 'BASHPID', 'EPOCHSECONDS', 'EPOCHREALTIME', 'BASH_SUBSHELL', 'DIRSTACK', 'GROUPS', 'FUNCNAME', 'BASH_ARGV0', 'BASH_COMMAND', 'TMOUT', 'HISTSIZE', 'PROMPT_COMMAND', 'PS1']);
+      const mdir = path.join(dir, 'marks'), probeDir = path.join(dir, 'probe');
+      fs.mkdirSync(mdir); fs.mkdirSync(probeDir);
+      const marked = (mode) => {
+        const hit = [];
+        for (const n of [...names].filter((x) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(x))) {
+          const r = spawnSync('/bin/bash', ['--norc', '--noprofile', ...mode, `: "\${${n}-}"; ${n}='x[$(touch ${mdir}/${n})0]'`], { cwd: probeDir, timeout: 5000, stdio: 'ignore', detached: true, env: { PATH: process.env.PATH, HOME: probeDir } });
+          assert.ok(r.status !== null && !r.error, `the probe of ${n} (bash ${mode.join(' ')}) did not finish: ${r.error?.message ?? `signal ${r.signal}`}`);
+          if (fs.existsSync(path.join(mdir, n))) { hit.push(n); fs.rmSync(path.join(mdir, n)); }
+        }
+        return hit.sort();
+      };
+      const six = [...SIX].sort();
+      const plain = marked(['-c']), interactive = marked(['-i', '-c']);
+      assert.ok(plain.every((n) => SIX.includes(n)), `bash -c evaluates ${plain} on assignment`);
+      assert.ok(interactive.every((n) => SIX.includes(n)), `bash -i -c evaluates ${interactive} on assignment`);
+      const ver = bash(['-c', 'echo "${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"']).stdout.trim().split('.').map(Number);
+      if (ver[0] > 5 || (ver[0] === 5 && ver[1] >= 2)) assert.deepEqual(interactive, six, 'bash >= 5.2, interactive: exactly the six names'); // MAILCHECK only here
+      assert.deepEqual(fs.readdirSync(probeDir), [], 'the probe left nothing behind');
+      for (const n of SIX) {
+        withBody(`${n}=1\nGH_TOKEN=x\n`, () => { assert.equal(out(), expect(null), n); status(n, f, 'line-1'); });
+      }
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('harness sessions: every harness and every creation path starts through the loader; tmux never gets the token', async () => {
+  const TOKEN = 'ghp_sessionTokenProbe123';
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-ghtok-'));
+  const secrets = path.join(dir, 'env');
+  fs.writeFileSync(secrets, `export GH_TOKEN=${TOKEN}\nexport OTHER=x\n`);
+  try {
+    // as on the box: the service holds the token. Set BEFORE this copy of server.mjs is imported: a read at module load is caught too
+    await withEnv({ GH_TOKEN: TOKEN, GITHUB_TOKEN: TOKEN, FCODE_SECRETS_ENV: secrets }, async () => {
+      const mod = await serverCopy(path.join(dir, 'app'));
+      const launch = launchOf(path.join(dir, 'app', 'box', 'start.sh'), secrets);
+      await withApp(async (c) => {
+        const { cookie } = await c.login();
+        for (const h of Object.keys(HARNESSES)) {
+          assert.equal((await c.req('POST', '/api/sessions', { cookie, body: { name: `s-${h}`, project: 'alpha', harness: h } })).status, 201, h);
+          assert.equal((await c.req('POST', '/api/open', { cookie, body: { project: 'my.proj', harness: h } })).json?.created, true, h);
+          assert.equal((await c.req('POST', '/api/open', { cookie, body: { project: 'my.proj', harness: h, fresh: true } })).json?.created, true, h);
+        }
+        assert.equal((await adminRequest(c.configDir, { cmd: 'new', project: 'alpha', harness: 'codex' })).ok, true); // fcode-new
+        const ns = c.calls().filter((x) => x.argv[0] === 'new-session');
+        assert.equal(ns.length, Object.keys(HARNESSES).length * 3 + 1);
+        // in creation order: per harness POST /api/sessions, /api/open, /api/open fresh (openFresh); then fcode-new (openFresh)
+        const want = [...Object.values(HARNESSES).flatMap((h) => [h, h, h]), 'codex'].map((h) => `${launch}${h}`);
+        assert.deepEqual(ns.map((x) => x.argv.at(-1)), want);
+        const all = c.allCalls();
+        assert.ok(all.length > ns.length);
+        for (const x of all) assert.equal(x.hasGhToken, false, x.argv.join(' ')); // no tmux child got GH_TOKEN / GITHUB_TOKEN in its env
+        for (const x of all) assert.ok(!JSON.stringify(x).includes(TOKEN), x.argv.join(' ')); // nor in argv or stdin
+        assert.ok(!c.logs.some((l) => JSON.stringify(l).includes(TOKEN)));
+      }, { make: mod.createApp });
+    });
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('harness sessions: tmux global GH_TOKEN / GITHUB_TOKEN are unset right before EVERY new-session, also after a later global set', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  // a tmux server started (or touched) later by a login shell: its global env gets a token between two creates
+  const setGlobal = () => {
+    for (const v of ['GH_TOKEN', 'GITHUB_TOKEN']) spawnSync(process.execPath, [FAKE, 'set-environment', '-g', v, 'dummy_global'], { env: { PATH: process.env.PATH, FAKE_TMUX_DIR: process.env.FAKE_TMUX_DIR } });
+  };
+  setGlobal();
+  assert.equal((await mkSession(c, cookie, 'one')).status, 201);
+  setGlobal();
+  assert.equal((await mkSession(c, cookie, 'two')).status, 201);
+  setGlobal();
+  assert.equal((await c.req('POST', '/api/open', { cookie, body: { project: 'alpha', harness: 'omp' } })).json?.created, true);
+  setGlobal();
+  assert.equal((await c.req('POST', '/api/open', { cookie, body: { project: 'alpha', harness: 'omp', fresh: true } })).json?.created, true);
+  const st = JSON.parse(fs.readFileSync(fakeState(c), 'utf8'));
+  for (const n of ['one', 'two', 'alpha-omp', 'alpha-omp-2']) assert.equal(st.sessions[n]?.globalToken, false, n); // no session inherits it
+  const server = c.allCalls().filter((x) => !(x.argv[0] === 'set-environment' && !x.argv.includes('-u'))); // without the test's own sets
+  const at = server.flatMap((x, i) => (x.argv[0] === 'new-session' ? [i] : []));
+  assert.equal(at.length, 4);
+  for (const i of at) { // directly preceded by both unsets, every time
+    assert.deepEqual(server.slice(i - 2, i).map((x) => x.argv), [['set-environment', '-g', '-u', 'GH_TOKEN'], ['set-environment', '-g', '-u', 'GITHUB_TOKEN']], server[i].argv[3]);
+  }
+}));
+
+test('harness sessions: a failing tmux set-environment never blocks the create', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  await withEnv({ FAKE_TMUX_FAIL_ON: 'set-environment' }, async () => {
+    assert.equal((await mkSession(c, cookie, 'one')).status, 201);
+  });
+  const calls = c.allCalls();
+  const at = calls.findIndex((x) => x.argv[0] === 'new-session');
+  assert.ok(at >= 2, 'new-session was reached');
+  assert.deepEqual(calls.slice(at - 2, at).map((x) => x.argv), [['set-environment', '-g', '-u', 'GH_TOKEN'], ['set-environment', '-g', '-u', 'GITHUB_TOKEN']]); // both tried, both failed
+  assert.ok(JSON.parse(fs.readFileSync(fakeState(c), 'utf8')).sessions.one, 'the session exists');
+}));
+
+test('harness sessions: no start.sh beside server.mjs: one warning, harnesses start as before the loader', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-noloader-'));
+  try {
+    const mod = await serverCopy(dir, false);
+    await withApp(async (c) => {
+      assert.deepEqual(c.logs.filter((l) => /start\.sh/.test(l)), ['warning: start.sh not found next to server.mjs; harness sessions start without GH_TOKEN (run bash install.sh)']);
+      const { cookie } = await c.login();
+      assert.equal((await mkSession(c, cookie, 'plain')).status, 201);
+      assert.equal(c.calls().find((x) => x.argv[0] === 'new-session').argv.at(-1), `${ENV_PART}bash -l`);
+    }, { make: mod.createApp });
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('harness sessions: the logged launch, run as tmux runs it from a path with a space and a quote, sees the file\'s GH_TOKEN only', { skip: POSIX }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-ghtok-'));
+  const app = path.join(dir, "sp ace'q"), secrets = path.join(dir, "sec rets'env");
+  try {
+    await withEnv({ FCODE_SECRETS_ENV: secrets, GH_TOKEN: undefined }, async () => {
+      const mod = await serverCopy(app);
+      await withApp(async (c) => {
+        const { cookie } = await c.login();
+        await mkSession(c, cookie, 'probe'); // shell harness: bash -l
+        const cmd = c.calls().find((x) => x.argv[0] === 'new-session').argv.at(-1);
+        assert.equal(cmd, `${launchOf(path.join(app, 'box', 'start.sh'), secrets)}bash -l`);
+        const launch = cmd.slice(0, -'bash -l'.length) + PROBE; // the same prefix (env, PATH, secrets path, loader), a probe for the harness
+        const run = () => { // tmux runs the pane command with `sh -c`, in its global env: here a stale token, as an old tmux server may hold
+          const r = spawnSync('/bin/sh', ['-c', launch], { encoding: 'utf8', timeout: 5000, env: { HOME, PATH: '/usr/bin:/bin', GH_TOKEN: 'stale_global_1' } });
+          assert.equal(r.status, 0, r.stderr); assert.equal(r.stderr, '');
+          return r.stdout.trim();
+        };
+        fs.writeFileSync(secrets, '# vault\nexport GH_TOKEN=tok_session\nexport OTHER=x\n');
+        assert.equal(run(), '["tok_session",null,null]');
+        fs.writeFileSync(secrets, 'export GH_TOKEN=tok_rotated\n');
+        assert.equal(run(), '["tok_rotated",null,null]'); // read at each session start: a rotated token reaches the next session
+        fs.rmSync(secrets);
+        assert.equal(run(), '[null,null,null]'); // no file: it still starts, without GH_TOKEN
+      }, { make: mod.createApp });
+    });
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('harness sessions: a relative FCODE_SECRETS_ENV is made absolute once at start; a session in another cwd reads the same file', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-ghtok-'));
+  const secrets = path.join(dir, 'env'), elsewhere = path.join(dir, 'project');
+  fs.mkdirSync(elsewhere);
+  try {
+    await withEnv({ FCODE_SECRETS_ENV: path.relative(process.cwd(), secrets) }, () => withApp(async (c) => {
+      assert.ok(!path.isAbsolute(process.env.FCODE_SECRETS_ENV));
+      const { cookie } = await c.login();
+      await mkSession(c, cookie, 'rel');
+      const cmd = c.calls().find((x) => x.argv[0] === 'new-session').argv.at(-1);
+      assert.equal(cmd, `${launchOf(LOADER, secrets)}bash -l`); // the absolute path, not the relative one
+      if (process.platform === 'win32') return; // running the launch needs POSIX sh
+      fs.writeFileSync(secrets, 'export GH_TOKEN=tok_abs1\n');
+      const r = spawnSync('/bin/sh', ['-c', cmd.slice(0, -'bash -l'.length) + PROBE], { encoding: 'utf8', cwd: elsewhere, timeout: 5000, env: { HOME, PATH: '/usr/bin:/bin' } });
+      assert.deepEqual([r.status, r.stderr, r.stdout.trim()], [0, '', '["tok_abs1",null,null]']); // tmux starts the pane in the project dir
+    }));
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -2227,7 +2611,9 @@ const freePort = () => new Promise((resolve) => { const s = net.createServer().l
 // the real server as a child: resolves {listening, child} once it serves, or {code, err} when it exits first
 async function startServer(configDir) {
   const port = await freePort();
-  const child = spawn(process.execPath, [SERVER], { env: { ...process.env, PC_CONFIG_DIR: configDir, PC_PORT: String(port) }, stdio: ['ignore', 'pipe', 'pipe'] });
+  // the fake tmux: no tmux call of a spawned server (e.g. the per-create `set-environment -g -u`) may reach the real tmux of whoever runs the tests
+  const env = { ...process.env, PC_CONFIG_DIR: configDir, PC_PORT: String(port), PC_TMUX: JSON.stringify([process.execPath, FAKE]), FAKE_TMUX_DIR: path.join(path.dirname(configDir), 'fake') };
+  const child = spawn(process.execPath, [SERVER], { env, stdio: ['ignore', 'pipe', 'pipe'] });
   let out = '', err = '';
   return new Promise((resolve) => {
     child.stdout.on('data', (d) => { out += d; if (out.includes('fcoding listening')) resolve({ listening: true, child, port }); });
@@ -5440,7 +5826,7 @@ async function addServerProc(fn, { timeoutMs = 2500, plan = { sleep: 120e3, chil
   const c0 = await freshDir();
   const port = await freePort();
   const child = spawn(process.execPath, [SERVER], { stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, PC_CONFIG_DIR: c0.configDir, PC_PORT: String(port), PC_ADD_TIMEOUT_MS: String(timeoutMs), ...(killAfter && { PC_ADD_KILL_AFTER_S: String(killAfter) }), PC_ADD_SCRIPT: JSON.stringify([process.execPath, path.join(dir, 'fake-add.mjs'), dir]) } });
+    env: { ...process.env, PC_CONFIG_DIR: c0.configDir, PC_PORT: String(port), PC_TMUX: JSON.stringify([process.execPath, FAKE]), FAKE_TMUX_DIR: path.join(c0.root, 'fake'), PC_ADD_TIMEOUT_MS: String(timeoutMs), ...(killAfter && { PC_ADD_KILL_AFTER_S: String(killAfter) }), PC_ADD_SCRIPT: JSON.stringify([process.execPath, path.join(dir, 'fake-add.mjs'), dir]) } });
   const listening = new Promise((resolve) => child.stdout.on('data', (d) => { if (String(d).includes('fcoding listening')) resolve(); }));
   const exited = new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })));
   const pids = () => { try { return Number(fs.readFileSync(path.join(dir, 'child.pid'), 'utf8')); } catch { return 0; } };

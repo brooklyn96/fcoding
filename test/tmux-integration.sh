@@ -350,8 +350,8 @@ if systemctl --user show-environment >/dev/null 2>&1 && [ -x "$REAL_HOME/.local/
   BODY=$(sed -n '/^cat > "\$UNIT_DIR\/fcoding.service" <<UNIT$/,/^UNIT$/p' "$ROOT/install.sh" | sed '1d;$d')
   APP="$ROOT" CFG="$RUN/unitcfg" BODY="$BODY" bash -c 'eval "cat <<UNIT
 $BODY
-UNIT"' | sed "s|^\[Service\]\$|[Service]\nEnvironment='PC_TMUX=[\"tmux\",\"-L\",\"$USOCK\"]'\nEnvironment=PC_PORT=$UPORT|" >"$UNIT_FILE"
-  grep -q '^KillMode=process' "$UNIT_FILE" && grep -q "^ExecStart=.*node $ROOT/server.mjs" "$UNIT_FILE" && ok "throwaway unit built from install.sh" || bad "unit file" "$(cat "$UNIT_FILE")"
+UNIT"' | sed "s|^\[Service\]\$|[Service]\nEnvironment='PC_TMUX=[\"tmux\",\"-L\",\"$USOCK\"]'\nEnvironment=PC_PORT=$UPORT|" | sed "s|^ExecStart=/bin/sh $ROOT/start.sh |ExecStart=/bin/sh $ROOT/box/start.sh |" >"$UNIT_FILE" # a checkout has box/start.sh, not $ROOT/start.sh (install.sh copies it there)
+  grep -q '^KillMode=process' "$UNIT_FILE" && grep -q "^ExecStart=/bin/sh $ROOT/box/start.sh .*node $ROOT/server.mjs" "$UNIT_FILE" && ok "throwaway unit built from install.sh" || bad "unit file" "$(cat "$UNIT_FILE")"
   systemctl --user daemon-reload
   unit_case() { # unit_case LABEL
     systemctl --user restart "$UNIT"

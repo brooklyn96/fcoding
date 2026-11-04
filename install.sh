@@ -67,6 +67,9 @@ exec env PC_CONFIG_DIR="$CFG" "$(command -v node)" "$APP/server.mjs" --new "\$@"
 WRAP
 chmod 755 "$HOME/.local/bin/fcode-new"
 
+# the one loader of GH_TOKEN (CONTRACT A3), installed before the auto-update step: the timer it installs runs fcode-git-sync, which looks for $APP/start.sh
+install -m 755 "$SRC/box/start.sh" "$APP/start.sh"
+
 # box auto-update (omp, claude, codex timer): idempotent, runs as this user; a failure (e.g. no passwordless sudo) must not abort the install
 if [ -f "$SRC/box/install-autoupdate.sh" ]; then
   bash "$SRC/box/install-autoupdate.sh" || echo "warning: box auto-update was not installed (see box/README.md)" >&2
@@ -79,18 +82,12 @@ fi
 # PATH for the harnesses is set by server.mjs itself (~/.local/bin, ~/.bun/bin, system dirs).
 # The home screen's project list runs gh, which needs GH_TOKEN. A login shell gets it from the secrets env file
 # (FCODE_SECRETS_ENV, default /run/instabox/secrets/env; on the Oracle VM a tmpfiles link to ~/.config/fcode/secrets.env);
-# the service takes GH_TOKEN alone from the same file at each start. Nothing is copied to disk and no other variable is kept.
-cat > "$APP/start.sh" <<'START'
-#!/bin/sh
-f=${FCODE_SECRETS_ENV:-/run/instabox/secrets/env}
-if [ -z "${GH_TOKEN:-}" ] && [ -r "$f" ]; then
-  t=$(. "$f" >/dev/null 2>&1; printf '%s' "${GH_TOKEN:-}")
-  if [ -n "$t" ]; then GH_TOKEN=$t; export GH_TOKEN; fi
-  unset t
-fi
-exec "$@"
-START
-chmod 755 "$APP/start.sh"
+# the service takes GH_TOKEN alone from the same file at each start, through box/start.sh (installed above, next to server.mjs).
+# start.sh reads the file once, as data (head | awk; never sourced or run), and the whole file must pass a strict grammar or there
+# is no token (fail closed; the grammar, incl. the six names OPTIND HISTCMD MAILCHECK RANDOM SRANDOM SECONDS it refuses, is in its
+# header and CONTRACT A3). It drops an inherited GH_TOKEN and GITHUB_TOKEN. The service passes -v: the status line
+# (`journalctl --user -u fcoding | grep start.sh`) says why there is no token, never a value. server.mjs starts every harness session
+# through the same start.sh (no -v), so omp's gh and https pushes get the token too. Nothing is copied to disk and no other variable is kept.
 mkdir -p "$UNIT_DIR"
 cat > "$UNIT_DIR/fcoding.service" <<UNIT
 [Unit]
@@ -101,7 +98,7 @@ StartLimitIntervalSec=0
 [Service]
 Environment=LANG=C.UTF-8
 Environment=PC_CONFIG_DIR=$CFG
-ExecStart=/bin/sh $APP/start.sh $(command -v node) $APP/server.mjs
+ExecStart=/bin/sh $APP/start.sh -v $(command -v node) $APP/server.mjs
 KillMode=process
 Restart=always
 RestartSec=2
