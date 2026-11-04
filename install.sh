@@ -16,6 +16,10 @@ mkdir -p "$APP"
 [ ! -f "$SRC/box/fcode-add.sh" ] || install -m 755 "$SRC/box/fcode-add.sh" "$APP/fcode-add.sh"
 # the box CLI for the deploy gate's operator key: ~/.local/bin/fcode-deploy (docs/HUONG-DAN.md, "Deploy từ box")
 [ ! -f "$SRC/box/fcode-deploy.sh" ] || install -D -m 755 "$SRC/box/fcode-deploy.sh" "$HOME/.local/bin/fcode-deploy"
+# the box command that leaves a one-way notice in the outbox Hermes pulls: ~/.local/bin/fcode-notify (box/README.md)
+[ ! -f "$SRC/box/fcode-notify.sh" ] || install -D -m 755 "$SRC/box/fcode-notify.sh" "$HOME/.local/bin/fcode-notify"
+# the outbox dir (700) and an empty outbox (600), so Hermes' first pull finds a file; ">>" never truncates and is safe against fcode-notify's mv
+( umask 077; d=$HOME/.local/state/fcode/notify; mkdir -p "$d" && chmod 700 "$d" && : >>"$d/outbox.tsv" )
 # the box CLI behind the laptop's `fcode add` and the owner's manual add: ~/.local/bin/fcode-add (runs fcode-add.sh under the server's ADD_WATCHDOG)
 [ ! -f "$SRC/box/fcode-add-run.sh" ] || install -D -m 755 "$SRC/box/fcode-add-run.sh" "$HOME/.local/bin/fcode-add"
 
