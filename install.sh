@@ -20,6 +20,8 @@ mkdir -p "$APP"
 [ ! -f "$SRC/box/fcode-notify.sh" ] || install -D -m 755 "$SRC/box/fcode-notify.sh" "$HOME/.local/bin/fcode-notify"
 # the outbox dir (700) and an empty outbox (600), so Hermes' first pull finds a file; ">>" never truncates and is safe against fcode-notify's mv
 ( umask 077; d=$HOME/.local/state/fcode/notify; mkdir -p "$d" && chmod 700 "$d" && : >>"$d/outbox.tsv" )
+# the box CLI behind the laptop's `fcode add` and the owner's manual add: ~/.local/bin/fcode-add (runs fcode-add.sh under the server's ADD_WATCHDOG)
+[ ! -f "$SRC/box/fcode-add-run.sh" ] || install -D -m 755 "$SRC/box/fcode-add-run.sh" "$HOME/.local/bin/fcode-add"
 
 mkdir -p "$CFG"
 chmod 700 "$CFG"
@@ -124,6 +126,7 @@ Pair a phone (no password): run on the box
 and type the 6-digit code into the app within 120 s. One code per issuer (the command, each paired phone), 3 at most; running it again replaces the command's own code.
   fcode-pair "iPhone" --qr     (also prints a QR of the server address and the code in big digits; needs "publicUrl" in config.json, and qrencode for the QR)
 New session:      fcode-new <project> <harness>     (fcode-new --projects, fcode-new --harnesses; prints the session name)
+Add a project by hand: fcode-add <owner/repo> <name>     (10 min limit, like the app)
 Paired devices:   PC_CONFIG_DIR=$CFG node $APP/server.mjs --devices
 Revoke a device:  PC_CONFIG_DIR=$CFG node $APP/server.mjs --revoke <id>     (or --revoke all)
 Projects: edit $CFG/config.json ("projects": {"name": "/abs/dir"}); the server reloads it by itself.
