@@ -1343,7 +1343,9 @@ attach() {
   echo "Thoát mà không tắt phiên: bấm Ctrl+B rồi D"
   sleep 2
   case "${TERM:-}" in ""|dumb) export TERM=xterm-256color ;; esac
-  exec tmux -u attach -t "=$1"
+  # The app sizes the window to the phone (window-size manual), so a laptop client would see only part of it.
+  # Resize to this client right after attaching; the app sets its own size again when the phone opens the session.
+  exec tmux -u attach -t "=$1" \; resize-window -A
 }
 
 # --- mo phien moi: dung fcode-new tren box (hop dong: --projects / --harnesses / <project> <harness>) ---
