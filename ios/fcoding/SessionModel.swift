@@ -68,7 +68,7 @@ final class SessionModel: ObservableObject {
         // Found once per published screen (scanned from the end), in the view's own line numbering.
         let found = MenuLogic.menu(String(value.characters).components(separatedBy: "\n"))
         if found != menu { menu = found }
-        if let done = drainedAt, screens > done { unlockMenu() }
+        checkUnlock()
     }
 
     /// Bumped with every published screen: a cheap change signal for the view (no text compare).
@@ -226,19 +226,25 @@ final class SessionModel: ObservableObject {
     private var inputTail: Task<Bool, Never>?
     /// Queued or running inputs.
     private var inputPending = 0
-    /// The menu (bar and tappable lines) is off from an input's start until a screen published
-    /// after the chain drained, or 1.5 s after it drained (an input that changes nothing): keys are
-    /// never computed from a screen the box has already moved past, and a double tap never fires twice.
+    /// The menu (bar and tappable lines) is off from an input's start until the published screen
+    /// shows the same choices as a probe: a screen the app asks for 250 ms after the chain drained,
+    /// so its capture starts after the last key reached the box. Keys are never computed from a
+    /// screen the box has already moved past, and a double tap never fires twice.
     @Published private(set) var menuLocked = false
-    /// `screens` when the chain drained; a later screen unlocks the menu.
-    private var drainedAt: Int?
-    private var unlockTask: Task<Void, Never>?
+    /// The probe's menu (`.some(nil)`: no menu on it); nil while none has come back.
+    private var probe: MenuLogic.Menu??
+    private var probeTask: Task<Void, Never>?
+    /// Probes asked again because the published screen did not match (at most 4).
+    private var reprobes = 0
+    /// The probes failed: the older rule, a screen published after `fallbackAt` or 1.5 s later
+    /// (`fallbackDue`), and never while a newer screen is held in `pending`.
+    private var fallbackAt: Int?
+    private var fallbackDue = false
 
     private func enqueue(_ op: @escaping @MainActor () async -> Bool) -> Task<Bool, Never> {
         let previous = inputTail
         inputPending += 1
-        drainedAt = nil
-        unlockTask?.cancel()
+        resetProbe()
         if !menuLocked { menuLocked = true }
         let job = Task { @MainActor [weak self] () async -> Bool in
             _ = await previous?.value
@@ -253,17 +259,73 @@ final class SessionModel: ObservableObject {
     private func inputDone() {
         inputPending -= 1
         guard inputPending == 0 else { return }
-        drainedAt = screens
-        unlockTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            if !Task.isCancelled { self?.unlockMenu() }
+        startProbe()
+    }
+
+    /// GET the screen after 250 ms (the server's last poke step) and keep its menu, plain text as
+    /// in `ScreenRender.build`. A failed request is tried once more, then the fallback rule runs.
+    private func startProbe() {
+        probeTask?.cancel()
+        probeTask = Task { [weak self] in
+            for _ in 0..<2 {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                guard !Task.isCancelled, let self = self else { return }
+                guard let api = self.app?.api,
+                      let data = try? await api.call("GET", "api/screen/\(self.name)", query: SessionModel.ansi),
+                      let screen = try? JSONDecoder().decode(Screen.self, from: data) else { continue }
+                guard !Task.isCancelled else { return }
+                let text = ANSI.runs(screen.text).map(\.text).joined()
+                self.probe = .some(MenuLogic.menu(text.components(separatedBy: "\n")))
+                self.checkUnlock()
+                return
+            }
+            guard !Task.isCancelled else { return }
+            self?.fallBack()
         }
     }
 
-    private func unlockMenu() {
-        drainedAt = nil
-        unlockTask?.cancel()
-        unlockTask = nil
+    private func fallBack() {
+        probe = nil
+        fallbackAt = screens
+        probeTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard !Task.isCancelled, let self = self else { return }
+            self.fallbackDue = true
+            self.checkUnlock()
+        }
+    }
+
+    /// Unlocks once nothing is queued, no newer screen is held, and the published menu has the
+    /// probe's choices. A mismatch asks again (the box may redraw later than the probe), up to 4
+    /// times, then the fallback rule decides.
+    private func checkUnlock() {
+        guard menuLocked, inputPending == 0, pending == nil else { return }
+        if let p = probe {
+            if MenuLogic.sameChoices(menu, p) {
+                unlock()
+            } else if reprobes < 4 {
+                reprobes += 1
+                probe = nil
+                startProbe()
+            } else {
+                fallBack()
+            }
+        } else if let at = fallbackAt, fallbackDue || screens > at {
+            unlock()
+        }
+    }
+
+    private func resetProbe() {
+        probeTask?.cancel()
+        probeTask = nil
+        probe = nil
+        reprobes = 0
+        fallbackAt = nil
+        fallbackDue = false
+    }
+
+    private func unlock() {
+        resetProbe()
         if menuLocked { menuLocked = false }
     }
 
