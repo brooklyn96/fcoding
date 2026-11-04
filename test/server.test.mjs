@@ -4937,7 +4937,7 @@ async function addApp(fn, extra = {}) {
       c.job = (id) => c.req('GET', `/api/projects/jobs/${id}`, { cookie: c.cookie });
       c.jobEnd = async (id) => (await waitFor(async () => { const r = await c.job(id); return r.json?.state !== 'running' && r; })).json;
       await fn(c, dir);
-    }, { addScript: [process.execPath, path.join(dir, 'fake-add.mjs'), dir], ...extra });
+    }, { addScript: [process.execPath, path.join(dir, 'fake-add.mjs'), dir], addKillAfterS: 1, ...extra }); // off Windows a watchdog outlives its job until its kill-after
   } finally {
     try { process.kill(Number(fs.readFileSync(path.join(dir, 'child.pid'), 'utf8')), 'SIGKILL'); } catch {}
     fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
@@ -5046,7 +5046,6 @@ test('add project: every exit code of the script ends the job in its state and c
     [11, R('R DIR_UNSAFE unsafe'), 'failed', 'DIR_CONFLICT', 'unsafe'],
     [24, R('R HOOK_FAIL install'), 'failed', 'FAILED', 'install'], [24, R('R HOOK_FAIL verify'), 'failed', 'FAILED', 'verify'],
     [25, R('R CRED_FAIL config'), 'failed', 'FAILED', 'config'], [26, R('R URL_REWRITE rewrite'), 'failed', 'FAILED', 'rewrite'],
-    [124, R('R KEY_NEW'), 'failed', 'TIMEOUT', null], // the watchdog ends the job at its deadline
     [0, R('R CFG_EXISTS'), 'done', 'ADDED', null], // a rerun of a registered project: nothing but CFG_EXISTS
     [21, R('R CFG_CONFLICT /data/workspace/else'), 'failed', 'CFG_CONFLICT', '/data/workspace/else'],
     [21, R('R ALIAS_FAIL'), 'failed', 'FAILED', null], // 21 is also "cannot write the ssh config": not a name clash
@@ -5428,7 +5427,7 @@ test('add project: ended jobs are pruned on every submit, and at most 50 are kep
   assert.ok(c.app.stats().addJobs <= 2, `kept ${c.app.stats().addJobs}`); // only the new one (and, maybe, a job still ending)
 }));
 // the job's deadline and the server's stop, on a real server process (POSIX: process groups and ADD_WATCHDOG)
-async function addServerProc(fn, { timeoutMs = 2500, plan = { sleep: 120e3, child: true }, killAfter } = {}) {
+async function addServerProc(fn, { timeoutMs = 2500, plan = { sleep: 120e3, child: true }, killAfter = 2 } = {}) { // killAfter: a watchdog outlives its job until then
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-addp-'));
   fs.writeFileSync(path.join(dir, 'fake-add.mjs'), ADD_FAKE_SRC);
   fs.writeFileSync(path.join(dir, 'plan.json'), JSON.stringify(plan));
@@ -5510,7 +5509,8 @@ test('escalation (server): after a server crash a grandchild that ignores TERM s
   assert.ok(Date.now() - t0 >= 2000, 'not before the deadline');
 }, { timeoutMs: 2500, killAfter: 2, plan: { sleep: 120e3, ignoreTerm: 'grand' } }));
 
-// ADD_WATCHDOG on its own: the exit like timeout(1) (124 after the deadline, else the job's code or signal; 127 when it cannot start)
+// ADD_WATCHDOG on its own. Not armed: the exit like timeout(1) (the job's code or signal; 127 when it cannot start). Armed (deadline or forwarded
+// TERM): never an exit before the KILL, and the KILL ends it as a signal
 const runWatchdog = (ms, job, { ready, env } = {}) => new Promise((resolve) => {
   const w = spawn(process.execPath, ['-e', ADD_WATCHDOG, String(ms), '1000', ...job], { stdio: ['ignore', 'ignore', 'pipe'], detached: true, env: { ...process.env, ...env } });
   let err = '';
@@ -5520,7 +5520,7 @@ const runWatchdog = (ms, job, { ready, env } = {}) => new Promise((resolve) => {
 });
 const sh = (src) => ['bash', '-c', src]; // bash sets its trap at once, before any TERM can come (the sleeps inherit an ignored TERM)
 
-test('add watchdog: exit codes (normal, signal, deadline, deadline + KILL, forwarded TERM, cannot start)', addPosix, async () => {
+test('add watchdog: exit codes (normal, signal, cannot start) and, after a TERM, the group KILL and nothing before it', addPosix, async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-wd-'));
   const run = async (...a) => { const { err, ...r } = await runWatchdog(...a); assert.doesNotMatch(err, /Debugger|inspector/i); return r; }; // no inspector opened
   try {
@@ -5532,27 +5532,38 @@ test('add watchdog: exit codes (normal, signal, deadline, deadline + KILL, forwa
     assert.deepEqual(await run(60e3, sh('kill -USR1 $$')), { code: 138, signal: null });
     assert.deepEqual(await run(60e3, sh('kill -TERM $$')), { code: 143, signal: null });
     for (const n of [141, 138, 143]) assert.deepEqual(addOutcome(n, 'R KEY_NEW\n'), addOutcome(null, 'R KEY_NEW\n'));
-    assert.deepEqual(await run(300, sh('while :; do sleep 0.1; done')), { code: 124, signal: null }); // ended by the deadline's TERM
+    const t0 = Date.now(); // a job that ends on the deadline's TERM: the old watchdog left at once with 124; now it waits for the KILL
+    assert.deepEqual(await run(300, sh('while :; do sleep 0.1; done')), { code: null, signal: 'SIGKILL' });
+    assert.ok(Date.now() - t0 >= 300 + 1000, `${Date.now() - t0} ms: not before deadline + kill-after`);
     assert.deepEqual(await run(300, sh('trap "" TERM; while :; do sleep 0.1; done')), { code: null, signal: 'SIGKILL' }); // the group KILL, itself too
     const ready = path.join(tmp, 'ready'); // written after the trap is set: no TERM before it
-    assert.deepEqual(await run(60e3, sh(`trap "exit 143" TERM; : > '${ready}'; while :; do sleep 0.1; done`), { ready }), { code: 143, signal: null }); // the script's own TERM code
+    assert.deepEqual(await run(60e3, sh(`trap "exit 143" TERM; : > '${ready}'; while :; do sleep 0.1; done`), { ready }), { code: null, signal: 'SIGKILL' }); // the script's own TERM code is not used
+    assert.ok(Date.now() - fs.statSync(ready).mtimeMs >= 1000, 'not before kill-after after the TERM');
     assert.deepEqual(await run(60e3, ['/nonexistent/fcode-add']), { code: 127, signal: null });
   } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
 });
 
-test('add watchdog: a group member whose /proc stat cannot be read counts as alive (the KILL stays armed); a gone one (ENOENT) does not', addPosix, async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-wdproc-'));
+// the race no scan of the group can close: a process forks after any look at it, and the process that was seen exits. The job's TERM trap forks a
+// descendant that ignores TERM and exits 0 at once; only the group KILL that the watchdog always sends can end that descendant.
+test('add watchdog: a descendant forked while the TERM is handled still gets the group KILL (the watchdog never leaves early)', addPosix, async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-wdfork-'));
+  const ready = path.join(tmp, 'ready'), pidFile = path.join(tmp, 'desc.pid'), desc = path.join(tmp, 'desc.sh');
+  const descPid = () => { try { return Number(fs.readFileSync(pidFile, 'utf8')) || 0; } catch { return 0; } };
+  fs.writeFileSync(desc, `trap '' TERM\necho $$ > '${pidFile}.tmp' && mv '${pidFile}.tmp' '${pidFile}'\nexec sleep 1000\n`);
   try {
-    fs.mkdirSync(path.join(root, '999999998')); // a pid dir with no stat: the process is gone (ENOENT)
-    const job = sh('while :; do sleep 0.1; done'); // ends on the deadline's TERM
-    const gone = await runWatchdog(300, job, { env: { PC_WATCHDOG_PROC: root } });
-    assert.deepEqual([gone.code, gone.signal], [124, null]); // nobody left: the exit comes at once
-    fs.mkdirSync(path.join(root, '999999999', 'stat'), { recursive: true }); // a stat that cannot be read (EISDIR): maybe still there
-    const t0 = Date.now();
-    const unknown = await runWatchdog(300, job, { env: { PC_WATCHDOG_PROC: root } });
-    assert.deepEqual([unknown.code, unknown.signal], [null, 'SIGKILL']); // it waited and sent the group KILL (deadline 0.3 s + kill-after 1 s)
-    assert.ok(Date.now() - t0 >= 1200, `${Date.now() - t0} ms`);
-  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+    // the trap ignores TERM first, so the descendant is born ignoring it (the forwarded TERM reaches the group twice: from the test, from the watchdog)
+    const job = sh(`trap "trap '' TERM; bash '${desc}' </dev/null >/dev/null 2>&1 & exit 0" TERM; : > '${ready}'; while :; do sleep 0.1; done`);
+    const r = await runWatchdog(60e3, job, { ready });
+    assert.deepEqual([r.code, r.signal], [null, 'SIGKILL']);
+    assert.ok(Date.now() - fs.statSync(ready).mtimeMs >= 1000, 'not before kill-after after the TERM');
+    const pid = descPid();
+    assert.ok(pid > 0, 'the descendant started');
+    await waitFor(() => terminatedPid(pid), 2000);
+  } finally {
+    const pid = descPid();
+    if (pid) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });
 
 test('escalation (server): a stop of the service forwards TERM through the watchdog and its kill-after kills a job that ignores it, the server exits 0', addPosix, () => addServerProc(async ({ child, exited, fake, grand }) => {
@@ -5570,10 +5581,10 @@ test('add project: after a normal TIMEOUT close no late SIGKILL is sent (the kil
     c.plan({ sleep: 60e3 });
     const j = await c.jobEnd((await c.add({ repo: 'o/r' })).json.job);
     assert.equal(j.code, 'TIMEOUT');
-    await new Promise((r) => setTimeout(r, 2000)); // far past the 600 ms grace
+    await new Promise((r) => setTimeout(r, 2000)); // past the 1000 ms grace (the watchdog's own KILL at 600 ms ends the job and clears it)
     assert.deepEqual(kills, [], 'a SIGKILL went to a group that was already gone');
   } finally { process.kill = orig; }
-}, { addTimeoutMs: 300, addKillGraceMs: 600 }));
+}, { addTimeoutMs: 300, addKillAfterS: 0.3, addKillGraceMs: 1000 })); // kill-after < kill-grace, as in production
 
 // ======================= v1.3.3: POST /api/projects/<name>/upload (CONTRACT A12) =======================
 const JPG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46, 0x49, 0x46, 1, 2, 3]);

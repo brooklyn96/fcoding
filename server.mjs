@@ -126,45 +126,37 @@ export function parseAddRequest(b) {
 }
 // script exit code -> job code; anything else (or a signal) is FAILED. The script's "R <CODE> [detail]" lines add the public key and the detail.
 const ADD_CODES = { 0: 'ADDED', 30: 'ADDED_WARN', 40: 'NEED_KEY', 41: 'NEED_WRITE', 42: 'WRITE_BLOCKED', 43: 'NET_FAIL', 44: 'REPO_ARCHIVED',
-  11: 'DIR_CONFLICT', 21: 'CFG_CONFLICT', 22: 'CFG_BROKEN', 23: 'NAME_USED', 2: 'BAD_ARGS', 12: 'CLONE_FAIL',
-  124: 'TIMEOUT' }; // ADD_WATCHDOG: 124 = the deadline (its kill-after KILL ends it as a signal, not a code; the job's own deadline, kept when the server is gone)
+  11: 'DIR_CONFLICT', 21: 'CFG_CONFLICT', 22: 'CFG_BROKEN', 23: 'NAME_USED', 2: 'BAD_ARGS', 12: 'CLONE_FAIL' };
 // The add job's deadline, run by `node -e` as the leader of the job's process group (spawned detached), so it holds when this server is gone
 // (a crash, or a restart: install.sh uses KillMode=process). argv: <deadline ms> <kill-after ms> <cmd> [args...].
 // At the deadline, or on a TERM from the server, TERM goes to the whole group, and KILL goes to the whole group kill-after later. That is GNU
 // timeout(1) -k, but uutils' timeout (the default `timeout` from Ubuntu 26.04, 0.10) sends that KILL to its direct child only.
-// After a TERM it stays until the rest of the group is gone (zombies do not count) or the KILL is sent; a process whose stat cannot be read
-// (any error but ENOENT / ESRCH, which mean it is gone) counts as still there, so the KILL stays armed.
-// Exit like timeout(1): 124 after the deadline, else the job's own code, or its signal raised again; 127 when the job cannot start.
-// A signal this node handles itself (SIGPIPE: ignored; SIGUSR1: starts the inspector; SIGTERM: the handler below) is not raised again,
-// and neither is one that leaves it alive: those exit 128 + n, which the server reads the same as the signal (FAILED).
-// PC_WATCHDOG_PROC (test-only) points the group check at a fake /proc.
-export const ADD_WATCHDOG = `const fs = require('fs'), { spawn } = require('child_process');
-const [ms, killMs, cmd, ...args] = process.argv.slice(1), me = String(process.pid), proc = process.env.PC_WATCHDOG_PROC || '/proc';
-let timedOut = false, armed = false;
+// Once the TERM has gone out the watchdog never leaves before the KILL: no look at the group can prove it empty (a process may fork right after
+// it), so the KILL is sent whatever the group looks like, and it ends the watchdog too (it is in the group). The server then sees the signal
+// SIGKILL, never a code. Nobody needs a code: at the deadline the server has already ended the job as TIMEOUT by its own timer, and on close()
+// the server is exiting.
+// Not armed (the job ends on its own): it exits at once like timeout(1), with the job's own code or its signal raised again; 127 when the job
+// cannot start. SIGUSR1 is not raised again (it would start the inspector), and two more signals do not end this node by being raised: SIGPIPE
+// (Node ignores it) and SIGTERM (its handler runs only after the exit below). Those three exit 128 + n, which the server reads the same as the
+// signal (FAILED).
+export const ADD_WATCHDOG = `const { spawn } = require('child_process');
+const [ms, killMs, cmd, ...args] = process.argv.slice(1);
+let armed = false;
 const term = () => {
   if (armed) return;
   armed = true;
   try { process.kill(0, 'SIGTERM'); } catch {}
   setTimeout(() => { try { process.kill(0, 'SIGKILL'); } catch {} }, Number(killMs));
 };
-const member = (p) => { // /proc/<pid>/stat after "(comm) ": state ppid pgrp ...
-  try { const s = fs.readFileSync(proc + '/' + p + '/stat', 'utf8'), f = s.slice(s.lastIndexOf(')') + 2).split(' '); return f[0] !== 'Z' && f[2] === me; }
-  catch (e) { return e.code !== 'ENOENT' && e.code !== 'ESRCH'; }
-};
-const others = () => { try { return fs.readdirSync(proc).some((p) => /^[0-9]+$/.test(p) && p !== me && member(p)); } catch { return true; } };
-const end = (code, signal) => {
-  if (timedOut) process.exit(124);
-  if (signal && signal !== 'SIGPIPE' && signal !== 'SIGUSR1' && !process.listenerCount(signal)) process.kill(process.pid, signal);
-  process.exit(code ?? 128 + (require('os').constants.signals[signal] ?? 0));
-};
 process.on('SIGTERM', term);
-const deadline = setTimeout(() => { timedOut = true; term(); }, Number(ms));
+const deadline = setTimeout(term, Number(ms));
 const child = spawn(cmd, args, { stdio: 'inherit' });
-child.on('error', () => process.exit(127));
+child.on('error', () => { if (!armed) process.exit(127); });
 child.on('exit', (code, signal) => {
   clearTimeout(deadline);
-  const wait = () => (armed && others() ? setTimeout(wait, 200) : end(code, signal));
-  wait();
+  if (armed) return; // the KILL timer is the only way out
+  if (signal && signal !== 'SIGUSR1') process.kill(process.pid, signal);
+  process.exit(code ?? 128 + (require('os').constants.signals[signal] ?? 0));
 });
 `;
 // the detail words the app matches: DIR_EXISTS 'exists', DIR_UNSAFE 'unsafe', HOOK_FAIL 'install' | 'verify'; also URL_REWRITE 'rewrite' (26) and CRED_FAIL 'config' (25); first line with text wins
@@ -1782,8 +1774,9 @@ export function createApp(opts = {}) {
   const addSpec = specOf(opts.addScript ?? process.env.PC_ADD_SCRIPT ?? ['bash', [ADD_SCRIPT, ADD_SCRIPT_DEV].find((f) => fs.existsSync(f)) ?? ADD_SCRIPT]);
   const addTimeout = opts.addTimeoutMs ?? (Number(process.env.PC_ADD_TIMEOUT_MS) || ADD_TIMEOUT_MS);
   // off Windows the script runs under ADD_WATCHDOG: the deadline then holds on its own even when this server is gone (a crash, or a restart
-  // that leaves the job alone: install.sh uses KillMode=process); a graceful stop ends the jobs through close(). 124 maps to TIMEOUT; a kill-after kill ends as a signal.
-  const addKillAfter = Number(process.env.PC_ADD_KILL_AFTER_S) || ADD_KILL_AFTER_S; // test-only override, like PC_ADD_TIMEOUT_MS
+  // that leaves the job alone: install.sh uses KillMode=process); a graceful stop ends the jobs through close(). After a TERM the watchdog
+  // always sends the group KILL at kill-after and ends with it: the server sees a signal, never an exit code, and TIMEOUT comes from the timer below.
+  const addKillAfter = opts.addKillAfterS ?? (Number(process.env.PC_ADD_KILL_AFTER_S) || ADD_KILL_AFTER_S); // test-only override, like addTimeoutMs
   const addWrap = process.platform === 'win32' ? [] : [process.execPath, '-e', ADD_WATCHDOG, String(addTimeout), String(addKillAfter * 1000)];
   const addJobs = new Map(); // id -> job
   const addRunning = new Map(); // name -> its running job
@@ -1823,7 +1816,7 @@ export function createApp(opts = {}) {
     child.on('close', (code) => { clearTimeout(grace); finish(addOutcome(code, out)); }); // the job is gone: no late SIGKILL to a group id that may be reused
     timer = setTimeout(() => {
       finish({ state: 'failed', code: 'TIMEOUT' });
-      killGroup('SIGTERM'); // the script cleans up its clone on TERM; off Windows ADD_WATCHDOG kills what is left at +30 s, this backstop only at +45 s
+      killGroup('SIGTERM'); // the script cleans up its clone on TERM; off Windows ADD_WATCHDOG sends the group KILL at +30 s, this backstop only at +45 s
       grace = setTimeout(() => killGroup('SIGKILL'), opts.addKillGraceMs ?? ADD_KILL_GRACE_MS); // opts.addKillGraceMs: tests
       grace.unref();
     }, addTimeout);
