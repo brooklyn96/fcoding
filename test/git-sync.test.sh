@@ -371,7 +371,8 @@ else
   echo "note: no Linux /proc here, the auto fast-forward and busy tests are skipped"
 fi
 
-# ---- GH_TOKEN for the timer (it has none of its own): GH_TOKEN alone is taken from the vault file, as text, when the environment has none ----
+# ---- GH_TOKEN for the timer (it has none of its own): it comes ONLY from the shared loader (start.sh), never from the script's own reader or the inherited environment ----
+# The script is next to box/start.sh here (a checkout), so that is the loader; the vault file is parsed by start.sh alone (its grammar is tested with the server tests).
 # A `timeout` shim (first on the script's PATH) records the GH_TOKEN | INSTABOX_API_KEY the fetch would see; it then runs the real one.
 REALTO=$(command -v timeout) && {
   mkdir -p "$HOME/.local/bin"
@@ -383,29 +384,41 @@ SHIM
   chmod +x "$HOME/.local/bin/timeout"
   mkproj tk; adv tk a.txt r-tk; cfg tk
   # tokrun [VAR=value ...]: one timer run with no GH_TOKEN / INSTABOX_API_KEY in the environment (unless given); prints what the fetch saw
-  tokrun() { : >"$T/envseen"; env -u GH_TOKEN -u INSTABOX_API_KEY "$@" bash "$SYNC" >"$T/run.out" 2>&1; tr '\n' ' ' <"$T/envseen" | sed 's/ $//'; }
+  tokrun() { : >"$T/envseen"; env -u GH_TOKEN -u INSTABOX_API_KEY "$@" bash "${TOKSYNC:-$SYNC}" >"$T/run.out" 2>&1; tr '\n' ' ' <"$T/envseen" | sed 's/ $//'; }
   V="$T/vault-env"
-  printf 'echo noise\nexport INSTABOX_API_KEY=ikey-secret-9\nexport GH_TOKEN_X=nope\nexport OLD_GH_TOKEN=bad\n#GH_TOKEN=bad\nexport GH_TOKEN="tok-vault-1"\nexport OTHER=zz\n' >"$V"
-  eq "vault: GH_TOKEN reaches the fetch, INSTABOX_API_KEY does not" "$(tokrun FCODE_SECRETS_ENV="$V")" "tok-vault-1|unset"
-  eq "vault: fetched fine, quiet, token in neither git-sync.json nor stderr, key not either" "$(q projects.tk.error)/$(wc -c <"$T/run.out" | tr -d ' ')/$(grep -rlE 'tok-vault-1|ikey-secret-9' "$HOME/.local/state" "$T/run.out" | wc -l | tr -d ' ')" "null/0/0"
-  printf 'GH_TOKEN=tok_bare.2\r\nINSTABOX_API_KEY=ikey-2\r\n' >"$V"
-  eq "vault: bare line with CRLF" "$(tokrun FCODE_SECRETS_ENV="$V")" "tok_bare.2|unset"
-  printf "export GH_TOKEN='tok-single'\n" >"$V"
-  eq "vault: single quotes" "$(tokrun FCODE_SECRETS_ENV="$V")" "tok-single|unset"
+  printf 'NOISE=1\nexport INSTABOX_API_KEY=ikey-secret-9\nexport GH_TOKEN_X=nope\nexport OLD_GH_TOKEN=bad\n#GH_TOKEN=bad\nexport GH_TOKEN="tok_vault_1"\nexport OTHER=zz\n' >"$V"
+  eq "vault: GH_TOKEN reaches the fetch (through the loader), INSTABOX_API_KEY does not" "$(tokrun FCODE_SECRETS_ENV="$V")" "tok_vault_1|unset"
+  eq "vault: fetched fine, quiet, token in neither git-sync.json nor stderr, key not either" "$(q projects.tk.error)/$(wc -c <"$T/run.out" | tr -d ' ')/$(grep -rlE 'tok_vault_1|ikey-secret-9' "$HOME/.local/state" "$T/run.out" | wc -l | tr -d ' ')" "null/0/0"
+  printf 'GH_TOKEN=tok_bare_2\r\nINSTABOX_API_KEY=ikey-2\r\n' >"$V"
+  eq "vault: bare line with CRLF" "$(tokrun FCODE_SECRETS_ENV="$V")" "tok_bare_2|unset"
+  printf "export GH_TOKEN='tok_single'\n" >"$V"
+  eq "vault: single quotes" "$(tokrun FCODE_SECRETS_ENV="$V")" "tok_single|unset"
   printf 'export GH_TOKEN=$(touch "%s/pwned")\n' "$T" >"$V"
   eq "vault: a value that is not token-like is dropped and nothing is executed (the file is never sourced)" "$(tokrun FCODE_SECRETS_ENV="$V")/$([ -e "$T/pwned" ] && echo pwned || echo none)" "unset|unset/none"
   printf 'export GH_TOKEN="a b"\n' >"$V"
   eq "vault: a value with a space is dropped" "$(tokrun FCODE_SECRETS_ENV="$V")" "unset|unset"
-  printf 'export GH_TOKEN=tok-vault-1\n' >"$V"
-  eq "an already set GH_TOKEN wins over the vault" "$(tokrun FCODE_SECRETS_ENV="$V" GH_TOKEN=mine)" "mine|unset"
-  eq "no vault file: unchanged, no token" "$(tokrun FCODE_SECRETS_ENV="$T/missing-vault")/$(q projects.tk.error)" "unset|unset/null"
+  printf 'export GH_TOKEN=tok_vault_1\n' >"$V"
+  eq "an inherited GH_TOKEN no longer wins: the loader's token replaces it" "$(tokrun FCODE_SECRETS_ENV="$V" GH_TOKEN=mine)" "tok_vault_1|unset"
+  eq "an inherited GH_TOKEN is dropped when the loader has none (no vault file)" "$(tokrun FCODE_SECRETS_ENV="$T/missing-vault" GH_TOKEN=mine)" "unset|unset"
+  eq "no vault file: no token, no error" "$(tokrun FCODE_SECRETS_ENV="$T/missing-vault")/$(q projects.tk.error)" "unset|unset/null"
   mkdir -p "$T/vault-dir"
-  eq "vault path is not a readable file: unchanged, no token, quiet" "$(tokrun FCODE_SECRETS_ENV="$T/vault-dir")/$(wc -c <"$T/run.out" | tr -d ' ')" "unset|unset/0"
+  eq "vault path is not a readable file: no token, quiet" "$(tokrun FCODE_SECRETS_ENV="$T/vault-dir")/$(wc -c <"$T/run.out" | tr -d ' ')" "unset|unset/0"
   printf 'export INSTABOX_API_KEY=ikey-3\n' >"$V"
   eq "vault without a GH_TOKEN line: nothing taken (INSTABOX_API_KEY never)" "$(tokrun FCODE_SECRETS_ENV="$V")" "unset|unset"
-  printf 'export GH_TOKEN=tok-vault-1\n' >"$V"
+  printf 'export GH_TOKEN=tok_vault_1\n' >"$V"
   : >"$T/envseen"; env -u GH_TOKEN -u INSTABOX_API_KEY FCODE_SECRETS_ENV="$V" bash "$SYNC" tk >"$T/run.out" 2>&1
-  eq "single-project run also gets it, same 55 s plan (one fetch)" "$(tr '\n' ' ' <"$T/envseen" | sed 's/ $//')" "tok-vault-1|unset"
+  eq "single-project run also gets it, same 55 s plan (one fetch)" "$(tr '\n' ' ' <"$T/envseen" | sed 's/ $//')" "tok_vault_1|unset"
+  # one parser only: the script's own code has no reader of the secrets file
+  eq "the script itself does not read the secrets file (no sed/head/grep/source on it)" "$(sed 's/[[:space:]]#[[:space:]].*//; /^[[:space:]]*#/d' "$SYNC" | grep -cE 'FCODE_SECRETS_ENV|/run/instabox|secrets|\$vf')" 0
+  # the installed loader ($HOME/fcoding/start.sh, next to nothing: the script lives in ~/.local/bin on a box) wins over a checkout's; a copy of the script
+  # with no start.sh next to it and none installed gets no token at all, and an inherited one is dropped
+  mkdir -p "$T/solo" "$HOME/fcoding"
+  cp "$SYNC" "$T/solo/fcode-git-sync"
+  eq "no loader anywhere: no token, nothing printed, inherited token dropped, fetch still runs" "$(TOKSYNC="$T/solo/fcode-git-sync" tokrun FCODE_SECRETS_ENV="$V" GH_TOKEN=mine)/$(q projects.tk.error)/$(wc -c <"$T/run.out" | tr -d ' ')" "unset|unset/null/0"
+  printf '#!/bin/sh\nGH_TOKEN=tok_installed; export GH_TOKEN\nexec "$@"\n' >"$HOME/fcoding/start.sh"
+  eq "the installed loader is used (the script sits elsewhere, start.sh beside it is absent)" "$(TOKSYNC="$T/solo/fcode-git-sync" tokrun FCODE_SECRETS_ENV="$V")" "tok_installed|unset"
+  eq "the installed loader wins over the start.sh next to the script" "$(tokrun FCODE_SECRETS_ENV="$V")" "tok_installed|unset"
+  rm -rf "$HOME/fcoding" "$T/solo"
   rm -f "$HOME/.local/bin/timeout"
 } || echo "note: no timeout command here, the GH_TOKEN tests are skipped"
 
