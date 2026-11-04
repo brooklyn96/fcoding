@@ -65,10 +65,16 @@ final class SessionModel: ObservableObject {
         pending = nil
         screens += 1
         styled = value
+        // Found once per published screen (scanned from the end), in the view's own line numbering.
+        let found = MenuLogic.menu(String(value.characters).components(separatedBy: "\n"))
+        if found != menu { menu = found }
+        if let done = drainedAt, screens > done { unlockMenu() }
     }
 
     /// Bumped with every published screen: a cheap change signal for the view (no text compare).
     private(set) var screens = 0
+    /// The live choice menu on the published screen, nil when there is none.
+    @Published private(set) var menu: MenuLogic.Menu?
 
     private func setLink(_ value: Link) {
         if link != value { link = value }
@@ -218,20 +224,47 @@ final class SessionModel: ObservableObject {
     /// One FIFO chain for keys and sends: each request starts only after the previous one
     /// finished, so "↓ then Enter" reaches tmux in tap order. Enqueued synchronously by the caller.
     private var inputTail: Task<Bool, Never>?
-    /// Queued or running inputs; the choice bar is off while this is above 0.
-    @Published private(set) var inputPending = 0
+    /// Queued or running inputs.
+    private var inputPending = 0
+    /// The menu (bar and tappable lines) is off from an input's start until a screen published
+    /// after the chain drained, or 1.5 s after it drained (an input that changes nothing): keys are
+    /// never computed from a screen the box has already moved past, and a double tap never fires twice.
+    @Published private(set) var menuLocked = false
+    /// `screens` when the chain drained; a later screen unlocks the menu.
+    private var drainedAt: Int?
+    private var unlockTask: Task<Void, Never>?
 
     private func enqueue(_ op: @escaping @MainActor () async -> Bool) -> Task<Bool, Never> {
         let previous = inputTail
         inputPending += 1
+        drainedAt = nil
+        unlockTask?.cancel()
+        if !menuLocked { menuLocked = true }
         let job = Task { @MainActor [weak self] () async -> Bool in
             _ = await previous?.value
             let ok = await op()
-            self?.inputPending -= 1
+            self?.inputDone()
             return ok
         }
         inputTail = job
         return job
+    }
+
+    private func inputDone() {
+        inputPending -= 1
+        guard inputPending == 0 else { return }
+        drainedAt = screens
+        unlockTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            if !Task.isCancelled { self?.unlockMenu() }
+        }
+    }
+
+    private func unlockMenu() {
+        drainedAt = nil
+        unlockTask?.cancel()
+        unlockTask = nil
+        if menuLocked { menuLocked = false }
     }
 
     /// Queues the text; the returned task's value is true when the server accepted it.

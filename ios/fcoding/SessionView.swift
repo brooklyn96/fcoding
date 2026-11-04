@@ -45,7 +45,8 @@ struct SessionView: View {
                          positionKey: "\(app.serverURL)|\(name)",
                          joinWraps: chipHarness == "omp",
                          // Never under the keyboard button: the opposite edge while it shows.
-                         jumpOnLeft: !composerShown && !kbLeft)
+                         jumpOnLeft: !composerShown && !kbLeft,
+                         onPick: choose)
             .background(Color.black)
             .overlay {
                 if !composerShown {
@@ -98,11 +99,8 @@ struct SessionView: View {
                 .accessibilityHint(model.imageCancellable ? "Chạm để huỷ ảnh" : model.imageBusy ? "" : "Chạm để ẩn")
             }
 
-            let menu = menuOptions
-            if !menu.isEmpty {
-                ChoiceBar(options: menu, busy: model.inputPending > 0,
-                          onPick: { choose($0, in: menu) },
-                          onEscape: { model.key("Escape") })
+            if let menu = model.menu {
+                ChoiceBar(menu: menu, busy: model.menuLocked, onPick: choose, onKey: menuKey)
             }
 
             if composerShown {
@@ -193,18 +191,20 @@ struct SessionView: View {
         composerShown = false
     }
 
-    /// The numbered menu at the bottom of the shown screen; [] when there is none (or loading).
-    private var menuOptions: [MenuLogic.Option] {
-        MenuLogic.options(String(model.styled.characters).components(separatedBy: "\n"))
-    }
-
-    /// A tap on the choice bar: the keys that move the highlight and confirm, in one queued input.
-    /// Nothing while another input is queued (a double tap never fires twice), or for invalid input.
-    private func choose(_ option: MenuLogic.Option, in options: [MenuLogic.Option]) {
-        guard model.inputPending == 0 else { return }
-        let keys = MenuLogic.keys(toChoose: option, in: options)
+    /// A tap on a choice bar button or on an option line of the screen: the keys that move the
+    /// highlight and act on it, in one queued input. Nothing while the menu is locked (an input in
+    /// flight or its screen not shown yet), or when the option is no longer in the shown menu.
+    private func choose(_ option: MenuLogic.Option) {
+        guard !model.menuLocked, let menu = model.menu else { return }
+        let keys = MenuLogic.keys(toChoose: option, in: menu.options)
         guard !keys.isEmpty else { return }
         _ = model.keys(keys)
+    }
+
+    /// Esc, and ← / → for question tabs, from the choice bar; locked like the options.
+    private func menuKey(_ key: String) {
+        guard !model.menuLocked else { return }
+        _ = model.keys([(key: key, repeat: 1)])
     }
 
     /// The session name in a harness-coloured chip (as HarnessBadge), cut in the middle when long.
@@ -385,10 +385,12 @@ struct TerminalView: View {
     var joinWraps = false
     /// Put the jump button on the left (the keyboard button is on the right).
     var jumpOnLeft = false
+    /// A tap (or the VoiceOver action) on an option line of the live menu.
+    var onPick: (MenuLogic.Option) -> Void = { _ in }
     @StateObject private var scroll = ScrollState()
 
     var body: some View {
-        TerminalText(model: model, bottomRequest: bottomRequest, positionKey: positionKey, scroll: scroll)
+        TerminalText(model: model, bottomRequest: bottomRequest, positionKey: positionKey, scroll: scroll, onPick: onPick)
             .onChange(of: fontSize) { size in model.style(fontSize: size, joinWraps: joinWraps) }
             .onChange(of: joinWraps) { join in model.style(fontSize: fontSize, joinWraps: join) }
             .onAppear { model.style(fontSize: fontSize, joinWraps: joinWraps) }
@@ -420,6 +422,7 @@ struct TerminalText: UIViewRepresentable {
     let bottomRequest: Int
     let positionKey: String
     let scroll: ScrollState
+    let onPick: (MenuLogic.Option) -> Void
 
     /// Reading positions by "server|session": in memory while the app runs, mirrored to UserDefaults
     /// (a few numbers per session, the 100 most recent). A new key: the older records are dropped.
@@ -461,6 +464,10 @@ struct TerminalText: UIViewRepresentable {
         c.bottomRequest = bottomRequest
         c.reading = ScreenFeed.Reading(record: TerminalText.positions[positionKey])
         scroll.coordinator = c
+        // A tap on an option line of the live menu picks it; elsewhere it never begins.
+        let tap = UITapGestureRecognizer(target: c, action: #selector(Coordinator.tapped(_:)))
+        tap.delegate = c
+        v.addGestureRecognizer(tap)
         // The model holds new screens while the finger is on it or it is still moving.
         model.scrollView = v
         // .inactive too: the app switcher can kill the app before it ever reaches the background.
@@ -492,6 +499,13 @@ struct TerminalText: UIViewRepresentable {
             c.reading.jump()
             dirty = true
         }
+        c.onPick = onPick
+        if dirty || model.menu != c.menu || model.menuLocked != c.locked {
+            c.menu = model.menu
+            c.locked = model.menuLocked
+            c.marksDirty = true
+            v.setNeedsLayout()
+        }
         if dirty {
             c.dirty = true
             v.setNeedsLayout()
@@ -503,9 +517,17 @@ struct TerminalText: UIViewRepresentable {
         NotificationCenter.default.removeObserver(c)
     }
 
-    final class Coordinator: NSObject, UITextViewDelegate {
+    final class Coordinator: NSObject, UITextViewDelegate, UIGestureRecognizerDelegate {
         let scroll: ScrollState
         weak var view: TermTextView?
+        /// The live menu whose option lines are marked and tappable, and whether it is locked.
+        var menu: MenuLogic.Menu?
+        var locked = false
+        var onPick: (MenuLogic.Option) -> Void = { _ in }
+        /// The marks need placing again (new menu, lock change or new text).
+        var marksDirty = false
+        /// Each marked option line, in content coordinates.
+        var optionRects: [(rect: CGRect, option: MenuLogic.Option)] = []
         var reading = ScreenFeed.Reading(record: nil)
         var positionKey = ""
         var bottomRequest = 0
@@ -559,6 +581,32 @@ struct TerminalText: UIViewRepresentable {
         /// The arrow follows a drag; no state change.
         func scrollViewDidScroll(_ s: UIScrollView) { if !reading.pinned { publish() } }
         func scrollViewDidChangeAdjustedContentInset(_ s: UIScrollView) { s.setNeedsLayout() }
+
+        /// The same as the choice bar button: nothing while locked.
+        func pick(_ o: MenuLogic.Option) -> Bool {
+            guard !locked else { return false }
+            onPick(o)
+            return true
+        }
+
+        private func option(at p: CGPoint) -> MenuLogic.Option? {
+            optionRects.first { $0.rect.contains(p) }?.option
+        }
+
+        /// Only on an option line of an unlocked menu, so selection, links and scrolling elsewhere
+        /// are untouched.
+        func gestureRecognizerShouldBegin(_ g: UIGestureRecognizer) -> Bool {
+            guard !locked, let v = view else { return false }
+            return option(at: g.location(in: v)) != nil
+        }
+
+        func gestureRecognizer(_ g: UIGestureRecognizer,
+                               shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
+
+        @objc func tapped(_ g: UITapGestureRecognizer) {
+            guard let v = view, let o = option(at: g.location(in: v)) else { return }
+            _ = pick(o)
+        }
     }
 }
 
@@ -591,6 +639,10 @@ final class TermTextView: UITextView {
         guard bounds.height > 0, let c = coordinator else { return }
         layoutManager.ensureLayout(for: textContainer)
         let geo = Geo(size: bounds.size, inset: adjustedContentInset, contentH: contentH)
+        if c.marksDirty || geo != c.lastGeo {
+            c.marksDirty = false
+            placeMarks(c)
+        }
         guard c.dirty || geo != c.lastGeo else { return }
         c.lastGeo = geo
         c.dirty = false
@@ -601,6 +653,39 @@ final class TermTextView: UITextView {
         case .none: break
         }
         c.publish()
+    }
+
+    /// Light accent backgrounds behind the live menu's option lines (stronger on the highlighted
+    /// one, dimmed while locked), their tap rects, and one VoiceOver action per option.
+    private var marks: [UIView] = []
+
+    private func placeMarks(_ c: TerminalText.Coordinator) {
+        marks.forEach { $0.removeFromSuperview() }
+        marks = []
+        c.optionRects = []
+        guard let menu = c.menu, let lines = c.lines else {
+            accessibilityCustomActions = nil
+            return
+        }
+        let n = textStorage.length
+        for o in menu.options where o.row < lines.count {
+            let start = TermTextView.utf16Start(o.row, lines), length = lines[o.row].utf16.count
+            guard length > 0, start + length <= n else { continue }
+            let glyphs = layoutManager.glyphRange(forCharacterRange: NSRange(location: start, length: length),
+                                                  actualCharacterRange: nil)
+            let line = layoutManager.boundingRect(forGlyphRange: glyphs, in: textContainer)
+            let rect = CGRect(x: 0, y: line.minY + textContainerInset.top, width: bounds.width, height: line.height)
+            let mark = UIView(frame: rect.insetBy(dx: 2, dy: 0))
+            mark.backgroundColor = UIColor.tintColor.withAlphaComponent((o.highlighted ? 0.32 : 0.16) * (c.locked ? 0.5 : 1))
+            mark.layer.cornerRadius = 4
+            mark.isUserInteractionEnabled = false
+            insertSubview(mark, at: 0)
+            marks.append(mark)
+            c.optionRects.append((rect: rect, option: o))
+        }
+        accessibilityCustomActions = c.locked ? nil : menu.options.map { o in
+            UIAccessibilityCustomAction(name: MenuLogic.spoken(o, in: menu.options)) { [weak c] _ in c?.pick(o) ?? false }
+        }
     }
 
     override func safeAreaInsetsDidChange() {
@@ -670,23 +755,34 @@ final class TermTextView: UITextView {
 
 // MARK: - Choice bar
 
-/// One button per option of the numbered menu on screen (the highlighted one marked), then Esc.
-/// Above the composer, or at the bottom while it is hidden; both orientations. Off while an input
-/// is queued or in flight.
+/// One button per option of the live menu on screen (the highlighted one marked, checkbox rows
+/// with their box), ← / → when the menu has question tabs, then Esc. Above the composer, or at the
+/// bottom while it is hidden; both orientations, lower in landscape. Off while the menu is locked.
 private struct ChoiceBar: View {
-    let options: [MenuLogic.Option]
+    let menu: MenuLogic.Menu
     let busy: Bool
     let onPick: (MenuLogic.Option) -> Void
-    let onEscape: () -> Void
+    let onKey: (String) -> Void
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+    private var compact: Bool { verticalSizeClass == .compact }
+    private var height: CGFloat { compact ? 32 : 40 }
 
     var body: some View {
         HStack(spacing: 6) {
-            ForEach(options, id: \.number) { o in
+            if menu.tabs { keyButton("←", key: "Left", label: "Câu hỏi trước") }
+            ForEach(menu.options, id: \.row) { o in
                 Button { onPick(o) } label: {
                     HStack(spacing: 5) {
-                        Text("\(o.number)")
-                            .font(.system(size: 15, weight: .bold, design: .monospaced))
-                            .foregroundColor(o.highlighted ? .accentColor : .secondary)
+                        if let n = MenuLogic.shownNumber(o, in: menu.options) {
+                            Text("\(n)")
+                                .font(.system(size: 15, weight: .bold, design: .monospaced))
+                                .foregroundColor(o.highlighted ? .accentColor : .secondary)
+                        }
+                        if o.checkbox {
+                            Image(systemName: o.checked ? "checkmark.square.fill" : "square")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundColor(o.checked ? .accentColor : .secondary)
+                        }
                         Text(o.label)
                             .font(.system(size: 15, weight: .semibold))
                             .foregroundColor(.primary)
@@ -694,30 +790,36 @@ private struct ChoiceBar: View {
                             .truncationMode(.tail)
                     }
                     .padding(.horizontal, 8)
-                    .frame(maxWidth: .infinity, minHeight: 40)
+                    .frame(maxWidth: .infinity, minHeight: height)
                     .background(o.highlighted ? Color.accentColor.opacity(0.22) : Color(uiColor: .tertiarySystemFill),
                                 in: RoundedRectangle(cornerRadius: 8))
                     .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.accentColor, lineWidth: o.highlighted ? 1 : 0))
                 }
-                .accessibilityLabel("Chọn \(o.number): \(o.label)")
+                .accessibilityLabel(MenuLogic.spoken(o, in: menu.options))
+                .accessibilityValue(o.checkbox ? (o.checked ? "Đã đánh dấu" : "Chưa đánh dấu") : "")
                 .accessibilityAddTraits(o.highlighted ? .isSelected : [])
             }
-            Button(action: onEscape) {
-                Text("Esc")
-                    .font(.system(size: 15, weight: .semibold, design: .monospaced))
-                    .foregroundColor(.primary)
-                    .frame(minWidth: 52, minHeight: 40)
-                    .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8))
-            }
-            .accessibilityLabel("Phím Escape, đóng menu")
+            if menu.tabs { keyButton("→", key: "Right", label: "Câu hỏi sau") }
+            keyButton("Esc", key: "Escape", label: "Phím Escape, đóng menu")
         }
         .opacity(busy ? 0.4 : 1)
         .disabled(busy)
         .padding(.horizontal, 8)
-        .padding(.vertical, 6)
+        .padding(.vertical, compact ? 4 : 6)
         .frame(maxWidth: .infinity)
         .background(Color(uiColor: .secondarySystemBackground).ignoresSafeArea(edges: .bottom))
         .overlay(alignment: .top) { Divider() }
+    }
+
+    private func keyButton(_ title: String, key: String, label: String) -> some View {
+        Button { onKey(key) } label: {
+            Text(title)
+                .font(.system(size: 15, weight: .semibold, design: .monospaced))
+                .foregroundColor(.primary)
+                .frame(minWidth: 44, minHeight: height)
+                .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8))
+        }
+        .accessibilityLabel(label)
     }
 }
 
