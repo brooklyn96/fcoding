@@ -144,11 +144,11 @@ exec 9>"$DIR/git-sync.lock"
 # The timer unit has no GH_TOKEN (a systemd user unit gets no login environment), so the fetch of a project added by the token route
 # (https origin + the repo's `!gh auth git-credential` helper) would fail on every run. GH_TOKEN comes ONLY from the shared loader
 # start.sh (the one parser of the secrets env file, FCODE_SECRETS_ENV; it reads the file as data, never sources it, takes GH_TOKEN
-# alone, and drops any inherited GH_TOKEN): this script does not read the file itself. The loader is the installed one,
+# alone, and drops any inherited GH_TOKEN and GITHUB_TOKEN: gh would otherwise fall back to GITHUB_TOKEN): this script does not read the file itself. The loader is the installed one,
 # $HOME/fcoding/start.sh (install.sh puts it there; this script is installed elsewhere, in ~/.local/bin), else the start.sh next to
 # this script (a checkout: box/). No loader, or no token from it: no GH_TOKEN, and the fetch runs without one. The token only lives
 # in this process's environment for git's children: never written to the state file, never printed.
-unset GH_TOKEN LOADER
+unset GH_TOKEN GITHUB_TOKEN LOADER
 for f in "$HOME/fcoding/start.sh" "$(dirname -- "$0")/start.sh"; do [ -f "$f" ] && { LOADER=$f; break; }; done
 if [ -n "${LOADER:-}" ]; then
   t=$(/bin/sh "$LOADER" /bin/sh -c 'printf %s "${GH_TOKEN:-}"' 9>&- </dev/null 2>/dev/null)
