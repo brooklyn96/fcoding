@@ -1289,6 +1289,12 @@ function Invoke-Pair {
 
 # --- Hai script bash chay tren box (nhung san de chi can 1 file fcode.ps1) ---
 # fcode.sh: liet ke / chon / vao phien tmux.
+# attach() in it ends with two tmux commands after the attach (kept out of the here-string: the script travels gzip+base64 on the ssh command line):
+# - set-option -w window-size latest: the app sizes the window to the phone (window-size manual), so a laptop client would see only part of it.
+#   "latest" makes the window follow this client now and on every later resize of the laptop terminal (resize-window -A would freeze it
+#   at the attach-time size). The app sets its own size again (resize-window, manual) when the phone opens the session.
+# - set-option mouse on, for this session only (the server's tmux default is off): the wheel scrolls the pane history in copy mode.
+#   A pane the laptop leaves in copy mode would swallow the app's input, so the server quits any pane mode before it sends text or keys.
 $FcodeSh = (@'
 #!/bin/bash
 # fcode (chay tren box): liet ke / chon / vao phien tmux. Dung: fcode.sh [--list | so | ten]
@@ -1343,11 +1349,7 @@ attach() {
   echo "Thoát mà không tắt phiên: bấm Ctrl+B rồi D. Lăn chuột để cuộn, bấm q để về cuối; giữ Shift khi kéo chuột để bôi đen chữ"
   sleep 2
   case "${TERM:-}" in ""|dumb) export TERM=xterm-256color ;; esac
-  # The app sizes the window to the phone (window-size manual), so a laptop client would see only part of it.
-  # Resize to this client right after attaching; the app sets its own size again when the phone opens the session.
-  # Mouse on for this session only (the server's tmux default is off): the wheel then scrolls the pane history in
-  # copy mode instead of doing nothing. The app never sends mouse events, so it is not affected.
-  exec tmux -u attach -t "=$1" \; resize-window -A \; set-option mouse on
+  exec tmux -u attach -t "=$1" \; set-option -w window-size latest \; set-option mouse on
 }
 
 # --- mo phien moi: dung fcode-new tren box (hop dong: --projects / --harnesses / <project> <harness>) ---
@@ -4295,9 +4297,13 @@ if ($arg -and $arg -ne '--list' -and $arg -ne '--new' -and $arg -notmatch '\A[A-
 if (-not $arg) { $pw = Get-PhienWarning; if ($pw) { Write-Host $pw -ForegroundColor Yellow } }
 $ssh = Get-SshExe
 while ($true) {
-  # tham so $1 di cung script (set -- '..'), khong nam tren dong lenh ssh
-  $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((Get-BareScript $arg)))
-  $remote = "bash <(echo $b64 | base64 -d)"
+  # tham so $1 di cung script (set -- '..'), khong nam tren dong lenh ssh. Script nen gzip roi base64: dong lenh ngan (cmd.exe/wrapper .cmd gioi han 8191 ky tu)
+  $gzIn = [Text.Encoding]::UTF8.GetBytes((Get-BareScript $arg))
+  $gzMs = New-Object IO.MemoryStream
+  $gz = New-Object IO.Compression.GZipStream($gzMs, [IO.Compression.CompressionMode]::Compress)
+  $gz.Write($gzIn, 0, $gzIn.Length); $gz.Close()
+  $b64 = [Convert]::ToBase64String($gzMs.ToArray())
+  $remote = "bash <(echo $b64 | base64 -d | gunzip)"
   if ($arg -eq '--list') { & $ssh $box $remote } else { & $ssh -q -tt $box $remote }
   $rc = $LASTEXITCODE
   if ($rc -eq 78 -and $bareWord -and -not $asked) {   # box bao khong co phien nao ten nay (ma 78; ssh dut, 255, thi khong): co the la ten goi moi dat trong app. Hoi box mot lan; doi duoc ra ten that thi chay lai
