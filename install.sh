@@ -79,18 +79,9 @@ fi
 # PATH for the harnesses is set by server.mjs itself (~/.local/bin, ~/.bun/bin, system dirs).
 # The home screen's project list runs gh, which needs GH_TOKEN. A login shell gets it from the secrets env file
 # (FCODE_SECRETS_ENV, default /run/instabox/secrets/env; on the Oracle VM a tmpfiles link to ~/.config/fcode/secrets.env);
-# the service takes GH_TOKEN alone from the same file at each start. Nothing is copied to disk and no other variable is kept.
-cat > "$APP/start.sh" <<'START'
-#!/bin/sh
-f=${FCODE_SECRETS_ENV:-/run/instabox/secrets/env}
-if [ -z "${GH_TOKEN:-}" ] && [ -r "$f" ]; then
-  t=$(. "$f" >/dev/null 2>&1; printf '%s' "${GH_TOKEN:-}")
-  if [ -n "$t" ]; then GH_TOKEN=$t; export GH_TOKEN; fi
-  unset t
-fi
-exec "$@"
-START
-chmod 755 "$APP/start.sh"
+# the service takes GH_TOKEN alone from the same file at each start, through box/start.sh. server.mjs starts every harness session
+# through the same start.sh (next to it), so omp's gh and https pushes get the token too. Nothing is copied to disk and no other variable is kept.
+install -m 755 "$SRC/box/start.sh" "$APP/start.sh"
 mkdir -p "$UNIT_DIR"
 cat > "$UNIT_DIR/fcoding.service" <<UNIT
 [Unit]

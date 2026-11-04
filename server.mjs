@@ -132,6 +132,10 @@ const ADD_CODES = { 0: 'ADDED', 30: 'ADDED_WARN', 40: 'NEED_KEY', 41: 'NEED_WRIT
 const ADD_DETAIL = ['SSH_DETAIL', 'CLONE_FAIL', 'DIR_EXISTS', 'DIR_UNSAFE', 'HOOK_FAIL', 'URL_REWRITE', 'CRED_FAIL', 'CFG_CONFLICT', 'CFG_BROKEN', 'CLEANUP_FAIL'];
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ADD_SCRIPT = path.join(SERVER_DIR, 'fcode-add.sh'), ADD_SCRIPT_DEV = path.join(SERVER_DIR, 'box', 'fcode-add.sh'); // installed next to server.mjs, or in a checkout
+// every harness session starts through start.sh (box/start.sh; installed next to server.mjs): it takes GH_TOKEN alone from the secrets
+// env file at session start, then execs the harness (A3). Only the loader's path is on the tmux command line, never the token.
+const LOADER = [path.join(SERVER_DIR, 'start.sh'), path.join(SERVER_DIR, 'box', 'start.sh')].find((f) => fs.existsSync(f)) ?? path.join(SERVER_DIR, 'start.sh');
+const HARNESS_LAUNCH = `${HARNESS_ENV}/bin/sh ${shq(LOADER)} `;
 const GH_LIST_MS = 60e3, GH_PAGES = 3, GH_PAGE_SIZE = 100, GH_LIST_MAX = GH_PAGES * GH_PAGE_SIZE; // GET /api/github/repos: cache time, pages read, most repos listed
 // pages 1..3 of the newest-updated repos, one JSON object per line ("@json"); no --paginate (an account with thousands of repos would run out of time)
 const ghReposArgs = (page) => ['api', `/user/repos?affiliation=owner,collaborator,organization_member&sort=updated&per_page=${GH_PAGE_SIZE}&page=${page}`, '--jq',
@@ -1268,7 +1272,7 @@ export function createApp(opts = {}) {
   // runs inside a mutation job
   async function createSession(name, project, harness, ctx, command = HARNESSES[harness]) {
     try {
-      await run(ctx, ['new-session', '-d', '-s', name, '-c', cfg.projects[project], HARNESS_ENV + command]);
+      await run(ctx, ['new-session', '-d', '-s', name, '-c', cfg.projects[project], HARNESS_LAUNCH + command]);
     } catch (e) {
       if (/duplicate session/i.test(e.stderr || '')) throw new HttpErr(409, 'exists');
       throw e;
