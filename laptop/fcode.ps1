@@ -4,7 +4,8 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $arg = if ($Rest -and $Rest.Count -gt 0) { $Rest[0] } else { '' }
 # Cau hinh rieng tung may: %USERPROFILE%\.fcode\config.json (install.ps1 tao). Thieu khoa thi dung mac dinh.
-# Khoa: instabox (duong dan instabox.exe), box (ten box), syncRepos (danh sach thu muc cho fcode sync), ipaRepo, ipaTag, deployHost (ten ssh den VPS cho fcode deploy, mac dinh contabo).
+# Khoa: instabox (duong dan instabox.exe), box (ten box), syncRepos (danh sach thu muc cho fcode sync), ipaRepo, ipaTag, deployHost (ten ssh den VPS cho fcode deploy, mac dinh contabo),
+# moveTargets (moveTargets.<ten ssh>.platform_user = user dang nhap cua nen tang cua may do, de trong neu khong co; fcode move).
 $ConfigFile = Join-Path $env:USERPROFILE '.fcode\config.json'
 $Cfg = $null; $CfgBroken = $null
 if (Test-Path -LiteralPath $ConfigFile) {
@@ -1768,6 +1769,8 @@ for d in /opt /srv /usr/local; do
   find "$R$d" -xdev \( -type f -o -type l \) 2>/dev/null | while IFS= read -r p; do printf '%s\n' "${p#"$R"}"; done
 done | sort -u | comm -23 - "$owned" | while IFS= read -r p; do
   inplat "$p" && continue
+  # B.0.3 / CONTRACT §3.5 (ruling 04/11 (3) 2): base-files' link /usr/local/man, exactly with the link text share/man, is the one exemption
+  [ "$p" = /usr/local/man ] && [ -L "$R/usr/local/man" ] && [ "$(readlink "$R/usr/local/man")" = share/man ] && continue
   case $p in /usr/local/*) b=/usr/local; r=${p#/usr/local/};; /opt/*) b=/opt; r=${p#/opt/};; /srv/*) b=/srv; r=${p#/srv/};; *) continue;; esac
   printf '%s\n' "$b/${r%%/*}"
 done | sort -u | while IFS= read -r p; do echo "INV refuse target-not-empty path=${p// /_}"; done > "$owned.opt"
@@ -2329,7 +2332,7 @@ function Invoke-MoveCheckCmd {
   if (-not $oi -or -not (Test-MoveAddr $oi.HostName)) { Write-Host "lỗi: ssh -G không đọc được địa chỉ của '$oldAlias'."; return 1 }
   $mach = @{ Name = 'old'; Alias = $oldAlias; Addr = $oi.HostName; HostName = '' }
   if (Test-MoveFirstContact $oi.HostName) { $p = Invoke-MoveScript $mach (Get-MoveFactsScript) @() (Get-MoveConst 'tcp_s') -Pin -Quiet; if ($p.Code -ne 0) { Write-Host "lỗi: không nối được máy cũ '$oldAlias'."; return 1 } }
-  $r = Invoke-MoveGate $mach @('plan', '-', '--check-only') '' (Get-MoveConst 'plan_s') -Quiet
+  $r = Invoke-MoveGate $mach @('plan', '-', '--check-only') ((@(Get-MoveDefaultMap) -join "`n") + "`n") (Get-MoveConst 'plan_s') -Quiet   # D.0.9 / W1-T3-GAP-1: the default map lines only
   if (-not $r.Known) { return 1 }
   $now = @($r.Lines | Where-Object { $_ -cmatch '\A(INV (refuse|warn|host|target|inbound|os)|MOVE error) ' })
   $cp = Get-MovePath 'check.json'; $prev = @()
@@ -2347,22 +2350,34 @@ function Invoke-MoveCheckCmd {
 # ---- plan (D.2) and the re-plan of a copy refresh (D.3) ----
 # DESIGN-GAP (T10-G48, F8j): B.14.2 says the owner may remove the default lines; reading: the first plan always prepends them and writes
 # map.txt; the owner removes them by editing map.txt, which every re-plan (copy refresh) reads.
-function Get-MoveDefaultMap { @('exclude user dino', 'exclude unit velh-pilot-hourly.timer') }   # B.14.2, owner answers I.8, I.10
+function Get-MoveDefaultMap { @('exclude user dino', 'exclude unit velh-pilot-hourly.timer', 'exclude /etc/ssl/certs') }   # B.14.2, owner answers I.8, I.10; ruling 04/11 (3) 4
 # map lines of a --map file; $null (printed) when it is not usable
 function Read-MoveMapLines([string]$Path) {
   try { $t = [IO.File]::ReadAllText($Path).TrimStart([char]0xFEFF) } catch { Write-Host "lỗi: không đọc được file map $Path."; return $null }
   $l = @($t -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })
-  foreach ($x in $l) { if ($x -cmatch '\A(target-user|dial|target-addr|idmap)\b' -or $x -match '[\x00-\x1f\x7f]') { Write-MoveLines @("INV refuse map-invalid ref=$(($x -split ' ')[0])"); return $null } }   # D.0.9: the laptop's stdin lines are no map lines; a map file holding one is map-invalid
+  foreach ($x in $l) { if ($x -cmatch '\A(target-user|dial|target-addr|idmap|platform-user)\b' -or $x -match '[\x00-\x1f\x7f]') { Write-MoveLines @("INV refuse map-invalid ref=$(($x -split ' ')[0])"); return $null } }   # D.0.9 (O1: platform-user too): the laptop's stdin lines are no map lines; a map file holding one is map-invalid
   , $l
 }
 function Get-MoveMapText { $p = Get-MovePath 'map.txt'; if ([IO.File]::Exists($p)) { @([IO.File]::ReadAllText($p) -split "`r?`n" | Where-Object { $_ }) } else { @(Get-MoveDefaultMap) } }
+# O1 (ruling 04/11 (3) 5; CONTRACT §4.1 old/new.platform_user): the platform login user of a target is NAMED in the laptop's config.json,
+# `moveTargets.<ssh alias>.platform_user` (one name or empty), never guessed. '' = unset; $null = not a name (printed; the caller exits 65).
+function Get-MovePlatformUser([string]$Alias) {
+  $v = Get-MoveProp (Get-MoveProp (Get-Cfg 'moveTargets' $null) $Alias) 'platform_user'
+  if ($null -eq $v -or ($v -is [string] -and $v -ceq '')) { return '' }
+  if ($v -is [string] -and $v -cmatch '\A[a-z_][a-z0-9_.-]*\z') { return $v }   # the target-user name regex (lib/move-plan.sh stdin reader)
+  Write-Host "lỗi: platform_user của máy '$Alias' trong config.json (moveTargets) không hợp lệ: cần một tên user Linux hoặc để trống."
+  $null
+}
 # `plan <id>` on old (unrecorded, no side flags): stdin = the map lines, then one `target-user <name> <uid>` per target_users[], one
-# `dial <old addr> <new addr>`, one `target-addr <a>` per target_addrs[] and one `idmap <user|group> <name> <src_id> <dst_id>` per idmap[]
-# (D.0.9 Formats; B.14.1, B.12.5, B.6.2); `plan <id> --check-only` and `x.check` read the same stdin. @{ Code; Lines; Mf }
-function Get-MovePlanStdin($S, [string[]]$Map) {
+# `dial <old addr> <new addr>`, one `target-addr <a>` per target_addrs[], one `idmap <user|group> <name> <src_id> <dst_id>` per idmap[]
+# (D.0.9 Formats; B.14.1, B.12.5, B.6.2) and, when the source machine's ($Src) platform_user is set, one `platform-user <name>` (O1: old's
+# on old for fwd, new's on new for back); `plan <id> --check-only` and `x.check` read the same stdin. @{ Code; Lines; Mf }
+function Get-MovePlanStdin($S, [string[]]$Map, [string]$Src = 'old') {
+  $pu = [string](Get-MoveProp $(if ($Src -ceq 'new') { $S.new } else { $S.old }) 'platform_user' '')
   $in = @($Map) + @(@($S.target_users) | Where-Object { $_ } | ForEach-Object { "target-user $($_.name) $($_.uid)" }) + @("dial $($S.old.addr) $($S.new.addr)") +
     @(@(Get-MoveProp $S 'target_addrs' @()) | Where-Object { $_ } | ForEach-Object { "target-addr $_" }) +
-    @(@(Get-MoveProp $S 'idmap' @()) | Where-Object { $_ } | ForEach-Object { "idmap $($_.kind) $($_.name) $($_.src_id) $($_.dst_id)" })
+    @(@(Get-MoveProp $S 'idmap' @()) | Where-Object { $_ } | ForEach-Object { "idmap $($_.kind) $($_.name) $($_.src_id) $($_.dst_id)" }) +
+    @(if ($pu) { "platform-user $pu" })
   ($in -join "`n") + "`n"
 }
 function Invoke-MovePlanOld($S, [string[]]$Map) {
@@ -2650,12 +2665,14 @@ function Invoke-MovePlanCmd([string]$NewAlias, [string]$Addr, [string]$OldAddrAr
   if ($OldAddrArg -and -not (Test-MoveHostPort $OldAddrArg)) { Write-Host 'lỗi: --old-addr phải là host hoặc host:port.'; return 65 }
   $oldAlias = Get-DeployHost
   if (-not $oldAlias -or $oldAlias -ceq $NewAlias) { Write-Host 'lỗi: tên ssh của máy cũ (deployHost) không dùng được hoặc trùng máy mới.'; return 65 }
+  $puo = Get-MovePlatformUser $oldAlias; $pun = Get-MovePlatformUser $NewAlias
+  if ($null -eq $puo -or $null -eq $pun) { return 65 }
   $oi = Get-MoveSshInfo $oldAlias
   if (-not $oi -or -not (Test-MoveAddr $oi.HostName)) { Write-Host "lỗi: ssh -G không đọc được địa chỉ (HostName) của '$oldAlias'."; return 1 }
   $map = @(Get-MoveDefaultMap)
   if ($MapFile) { $ml = Read-MoveMapLines $MapFile; if ($null -eq $ml) { return 65 }; $map += @($ml) }
   $via = if ($OldAddrArg) { $OldAddrArg } elseif ($oi.Port -ne 22) { "$($oi.HostName):$($oi.Port)" } else { $oi.HostName }
-  $S = New-MoveState (New-MoveIdText) ([pscustomobject][ordered]@{ alias = $oldAlias; addr = $oi.HostName; hostkey_line = ''; via = $via }) ([pscustomobject][ordered]@{ alias = $NewAlias; addr = $Addr; hostkey_line = '' })
+  $S = New-MoveState (New-MoveIdText) ([pscustomobject][ordered]@{ alias = $oldAlias; addr = $oi.HostName; hostkey_line = ''; via = $via; platform_user = $puo }) ([pscustomobject][ordered]@{ alias = $NewAlias; addr = $Addr; hostkey_line = ''; platform_user = $pun })
   $script:MoveDraft = $true; $script:MoveManifest = $null
   try {
     $old = Get-MoveMachine $S 'old'; $new = Get-MoveMachine $S 'new'
@@ -2925,7 +2942,7 @@ function Test-MovePreCut($S, [switch]$BackStart) {
   # one read-only `plan <id> --check-only` on src; its duration sets the x.check budget
   $t0 = Get-MoveNow
   $cd = if ($BackStart) { 'back' } else { [string]$S.dir }; $ca = if ($BackStart) { [int]$S.attempt + 1 } else { [int]$S.attempt }
-  $r = Invoke-MoveGate (Get-MoveMachine $S $src) @('plan', [string]$S.move_id, '--dir', $cd, '--attempt', "$ca", '--sha', [string]$S.manifest_sha, '--serving', [string]$S.serving, '--check-only') (Get-MovePlanStdin $S @(Get-MoveMapText)) (Get-MoveConst 'plan_s')
+  $r = Invoke-MoveGate (Get-MoveMachine $S $src) @('plan', [string]$S.move_id, '--dir', $cd, '--attempt', "$ca", '--sha', [string]$S.manifest_sha, '--serving', [string]$S.serving, '--check-only') (Get-MovePlanStdin $S @(Get-MoveMapText) $src) (Get-MoveConst 'plan_s')
   $script:MoveCheckOnlyS = [int][Math]::Ceiling(((Get-MoveNow) - $t0).TotalSeconds)
   if (-not $r.Known) { return 1 }
   if ($r.Code -ne 0) {
@@ -2975,7 +2992,7 @@ function Invoke-MoveCutSteps($S, [int]$From, [switch]$Carry) {
     }
   }
   if ($From -le 3 -and -not $Carry) {
-    $r = Invoke-MoveCall $S $src 'x.check' @() (Get-MovePlanStdin $S @(Get-MoveMapText))
+    $r = Invoke-MoveCall $S $src 'x.check' @() (Get-MovePlanStdin $S @(Get-MoveMapText) $src)
     if ($r.Code -ne 0) { return (& $beforeStart 'x.check') }
     $mf = ConvertFrom-MoveManifestLine $r.Lines
     if ($mf) {
@@ -3461,6 +3478,8 @@ function Set-MoveRebuiltTarget($S, $T) {
 }
 function Invoke-MoveRebuild([string]$OldAlias, [string]$NewAlias) {
   if (-not (Test-MoveAlias $OldAlias) -or -not (Test-MoveAlias $NewAlias)) { Write-Host 'Cách dùng: fcode move status --rebuild <máy cũ> <máy mới>'; return 65 }
+  $puo = Get-MovePlatformUser $OldAlias; $pun = Get-MovePlatformUser $NewAlias   # O1: the same config source as plan
+  if ($null -eq $puo -or $null -eq $pun) { return 65 }
   $got = @{}
   foreach ($x in @(@('old', $OldAlias), @('new', $NewAlias))) {
     $i = Get-MoveSshInfo $x[1]; if (-not $i) { Write-Host "lỗi: ssh -G không đọc được '$($x[1])'."; return 1 }
@@ -3478,7 +3497,7 @@ function Invoke-MoveRebuild([string]$OldAlias, [string]$NewAlias) {
   if ($o.Mid['id'] -cne $n.Mid['id']) { Write-Host 'lỗi: hai máy thuộc hai lần chuyển khác nhau; không dựng lại được.'; return 1 }
   $mf = if ($o.Mf) { $o.Mf } else { $n.Mf }
   if (-not $mf) { Write-Host 'lỗi: không đọc được manifest đã ghim trên máy nào.'; return 1 }
-  $S = New-MoveState $o.Mid['id'] ([pscustomobject][ordered]@{ alias = $OldAlias; addr = [string]$o.Mid['old_addr']; hostkey_line = $o.Hk }) ([pscustomobject][ordered]@{ alias = $NewAlias; addr = [string]$o.Mid['new_addr']; hostkey_line = $n.Hk })
+  $S = New-MoveState $o.Mid['id'] ([pscustomobject][ordered]@{ alias = $OldAlias; addr = [string]$o.Mid['old_addr']; hostkey_line = $o.Hk; platform_user = $puo }) ([pscustomobject][ordered]@{ alias = $NewAlias; addr = [string]$o.Mid['new_addr']; hostkey_line = $n.Hk; platform_user = $pun })
   $att = 0; $dir = 'fwd'
   foreach ($k in $o, $n) { if ("$($k.Mid['attempt'])" -match '\A[0-9]+\z' -and [int]$k.Mid['attempt'] -ge $att) { $att = [int]$k.Mid['attempt']; $dir = [string]$k.Mid['dir'] } }
   # DESIGN-GAP (T10-G4): mark and serving from the move-ids (D.0.10): the move-id of the machine with the latest record end wins (the other one may be stale);
