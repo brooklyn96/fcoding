@@ -1310,7 +1310,8 @@ function Test-MoveAlias([string]$a) { $a -cmatch '\A[A-Za-z0-9][A-Za-z0-9._-]{0,
 function Test-MoveId([string]$i) { $i -cmatch '\Amv-[0-9]{14}-[0-9a-f]{6}\z' }
 function New-MoveIdText { 'mv-' + (Get-MoveNow).ToString('yyyyMMddHHmmss', [Globalization.CultureInfo]::InvariantCulture) + '-' + ([guid]::NewGuid().ToString('N').Substring(0, 6)) }
 # laptop exit codes (I17): 0 done, 1 failed, 10 rolled back, 65 refused, 70 needs a human, 75 busy
-function ConvertTo-MoveExit([int]$Code) { if ($Code -in 0, 65, 70, 75) { $Code } else { 1 } }
+# R10-INT-31 (B24): an unknown outcome (-1) or a transport 124/255 marks the run; the exit prints the sentence when the run ends 1
+function ConvertTo-MoveExit([int]$Code) { if ($Code -in 0, 65, 70, 75) { $Code } elseif ($Code -in -1, 124, 255) { $script:MoveNoAnswer = $true; 1 } else { 1 } }
 
 # D.0.6 numbers (W1-T10-G3: the read-only plan forms 3600 s; the plain-ssh scripts preflight, bootstrap key, bootstrap gate and rebuild
 # read 2400 s; facts, the TCP reach test and the `true` login 30 s).
@@ -1364,6 +1365,8 @@ function Get-MoveText([string]$Key, [hashtable]$F = @{}) {
     'new-down' { 'máy mới không trả lời; máy cũ chạy lại' }
     'rsync-remedy' { 'cài rsync <CONTRACT version> trên máy mới, hoặc chụp lại T0b và phát hành gate' }
     'acl-remedy' { 'gỡ mục ACL đó trên máy cũ rồi chạy lại' }
+    'pkg-extra-remedy' { 'xóa file mặc định đó rồi chạy lại' }
+    'rerun' { 'Chạy lại khi máy nối lại được.' }
     'rewrites-remedy' { 'ghi rõ `<from>=<to>`' }
     'ingress-remedy' { 'đổi service của tên đó trong cấu hình tunnel sang 127.0.0.1 hoặc tên container' }
     'connector-remedy' { 'kiểm tra cổng metrics của connector rồi chạy lại' }
@@ -1444,6 +1447,7 @@ warn item-gone | Thư mục không còn trên máy mới, giữ bản trên máy
 warn back-new-only | Chỉ có trên máy mới, không mang về máy cũ
 warn rsync-version | Bản rsync trên máy cũ khác bản đã ghi
 warn ufw-lockout | Tường lửa máy mới để tắt vì luật hiện tại sẽ khóa phiên ssh; cần bật lại bằng tay
+warn pkg-extra | Có file lạ trong thư mục được chuyển, chưa bị xóa; chỉ xóa nếu chắc đây là file mặc định của gói vừa cài (vd sites-enabled/default); KHÔNG xóa file của chính máy mới (vd sudoers.d/90-cloud-init-users, netplan/50-cloud-init.yaml) — xóa nhầm có thể mất sudo hoặc mạng
 error busy | Máy đang chạy một lệnh chuyển khác
 error no-manifest | Máy chưa có danh sách chuyển
 error no-move | Máy này chưa thuộc lần chuyển nào
@@ -1488,7 +1492,32 @@ function Format-MoveLine([string]$Line) {
   if ($l -cmatch '\A(INV|MOVE) ') { return $l }
   ''
 }
-function Write-MoveLines($Lines) { foreach ($l in @($Lines)) { $f = Format-MoveLine "$l"; if ($f) { Write-Host $f } } }
+# CONTRACT §7.5 (ruling 05/11 (15), B22): `INV warn pkg-extra` (c.adopt.N, x.adopt) is shown with its cautious §8.3.3 label only;
+# `MOVE item <id> kind=adopt state=failed why=no-install-end` (c.prepare.N) is shown, then the §8.3.2 remedy once per call
+# (the server's own remedy is a LOG line, which the laptop never shows)
+function Write-MoveLines($Lines) {
+  $rem = $false
+  foreach ($l in @($Lines)) {
+    $f = Format-MoveLine "$l"; if ($f) { Write-Host $f }
+    if ("$l" -cmatch '\AMOVE item \S+ kind=adopt state=failed(\s.*)? why=no-install-end(\s|\z)') { $rem = $true }
+  }
+  if ($rem) { Write-Host ('  ' + (Get-MoveText 'pkg-extra-remedy')) }
+}
+# B24/B25 (R10-INT-26, DG6): the no-answer line, head and last sentence together: "lỗi: máy '<alias>' không trả lời <khi …> (mã <n>). Chạy lại khi máy
+# nối lại được." It is printed by every exit that gives up because a machine did not answer and knows the step; a run that ends 1 after a marked
+# loss without this line gets the bare sentence from the exit (Invoke-Move); an exit that is not 1 keeps its own text (CONTRACT §7.5). Returns 1.
+function Write-MoveNoAnswer([string]$Alias, [string]$When, $Code) { $script:MoveNoAnswer = $true; $script:MoveNoAnswerShown = $true; Write-Host "lỗi: máy '$Alias' không trả lời $When (mã $Code). $(Get-MoveText 'rerun')"; 1 }
+# the first machine of a gate-ids read whose status did not answer GATE_EXIT 0 (old first)
+function Write-MoveIdsNoAnswer($S, $Ids) {
+  $m = if (-not $Ids.StOld.Known) { 'old' } else { 'new' }; $st = if ($m -ceq 'old') { $Ids.StOld } else { $Ids.StNew }
+  Write-MoveNoAnswer ([string]$(if ($m -ceq 'old') { $S.old.alias } else { $S.new.alias })) 'khi đọc status' $st.Transport
+}
+# a status that answered but is not GATE_EXIT 0 with a state line is never a no-answer (R10-INT-31 item 10): its lines with their labels, and its own code
+function Write-MoveStatusFail($S, [string]$M, $St) {
+  Write-MoveLines $St.Lines; $c = ConvertTo-MoveExit $St.Code
+  if ($c -eq 0) { Write-Host "lỗi: máy '$(if ($M -ceq 'old') { $S.old.alias } else { $S.new.alias })' trả lời status không đọc được (mã $($St.Code))."; $c = 1 }
+  $c
+}
 # "MOVE state a=1 b=2" -> @{ a = '1'; b = '2' } (k=v splits at the first =)
 function ConvertFrom-MoveKv([string]$Line) {
   $kv = @{}
@@ -1504,7 +1533,7 @@ function Invoke-MoveTool([string]$Tool, [string[]]$ToolArgs, [string]$Stdin = $n
   } catch { $o = @("$($_.Exception.Message)"); $code = 1 } finally { $ErrorActionPreference = $old }
   @{ Code = $code; Out = $o }
 }
-# a program with a hard deadline: @{ Code; Out }; 124 = killed at the deadline, -1 = could not start. stdin is written as UTF-8 and closed.
+# a program with a hard deadline: @{ Code; Out; Err }; 124 = killed at the deadline, -1 = could not start. stdin is written as UTF-8 and closed.
 function Invoke-MoveTimedExe([string]$Exe, [string[]]$ExeArgs, [string]$StdinText, [int]$TimeoutSec) {
   $psi = New-Object Diagnostics.ProcessStartInfo
   $psi.FileName = $Exe; $psi.Arguments = (@($ExeArgs | ForEach-Object { ConvertTo-PhienArg ([string]$_) }) -join ' ')
@@ -1521,7 +1550,7 @@ function Invoke-MoveTimedExe([string]$Exe, [string[]]$ExeArgs, [string]$StdinTex
     $lines = New-Object System.Collections.Generic.List[string]
     if ($o.IsCompleted -and -not $o.IsFaulted) { $lines.AddRange([string[]]@($o.Result -split "`r?`n")) }
     if ($lines.Count -and $lines[$lines.Count - 1] -eq '') { $lines.RemoveAt($lines.Count - 1) }
-    @{ Code = $p.ExitCode; Out = [string[]]$lines.ToArray() }
+    @{ Code = $p.ExitCode; Out = [string[]]$lines.ToArray(); Err = $(if ($e.IsCompleted -and -not $e.IsFaulted) { $e.Result } else { '' }) }
   } finally { $p.Dispose() }
 }
 
@@ -1633,7 +1662,7 @@ function Get-MoveMachine($S, [string]$M) {
   if ($M -ceq 'old') { $i = Get-MoveSshInfo $alias; if ($i -and $i.HostName -cne $addr) { $hn = $addr } }   # D.0.7: the alias now points to new
   @{ Name = $M; Alias = $alias; Addr = $addr; HostName = $hn }
 }
-# one ssh to a machine with a deadline: @{ Code; Out }. -Pin: the first contact takes the ed25519 key into the move's known_hosts (accept-new).
+# one ssh to a machine with a deadline: @{ Code; Out; Err }. -Pin: the first contact takes the ed25519 key into the move's known_hosts (accept-new).
 function Invoke-MoveRemote($Mach, [string]$Remote, [string]$Stdin, [int]$TimeoutSec, [switch]$Pin) {
   $o = @('-o', 'ConnectTimeout=10', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=4', '-o', 'BatchMode=yes',
     '-o', "UserKnownHostsFile=$(Get-MoveKnownFile)", '-o', "StrictHostKeyChecking=$(if ($Pin) { 'accept-new' } else { 'yes' })", '-o', "HostKeyAlias=$($Mach.Addr)")
@@ -1674,7 +1703,8 @@ function Invoke-MoveScript($Mach, [string]$Script, [string[]]$ScriptArgs = @(), 
   $t = Invoke-MoveRemote $Mach 'f=$(mktemp) && base64 -di >$f && bash $f </dev/null; rc=$?; rm -f $f; exit $rc' ($b64 + "`n") $to -Pin:$Pin
   $lines = @($t.Out | ForEach-Object { "$_" })
   if (-not $Quiet) { Write-MoveLines $lines }
-  if ($t.Code -in 124, 255, -1) { Write-Host "lỗi: không chạy được lệnh trên máy '$($Mach.Alias)' qua ssh (mã $($t.Code))." }
+  # every plain-ssh script exits with its own explicit codes, never 124/255 (the tcp script: `|| exit 1`), so these three are the transport
+  if ($t.Code -in 124, 255, -1) { $script:MoveNoAnswer = $true; Write-Host "lỗi: không chạy được lệnh trên máy '$($Mach.Alias)' qua ssh (mã $($t.Code))." }
   @{ Code = [int]$t.Code; Lines = $lines }
 }
 # the box (coder) through instabox: @{ Code; Lines }
@@ -1943,12 +1973,12 @@ done
 echo "MOVE facts os=$os arch=$(uname -m) systemd=${sd:-0} epoch=$(date +%s)"
 '@
 }
-# new's TCP connect to an address (D.2 step 3b, 0c): exit 0 = reachable
+# new's TCP connect to an address (D.2 step 3b, 0c): exit 0 = reachable, 1 = not (refused, or no answer in 8 s); 124/255 therefore come only from the transport
 function Get-MoveTcpScript {
 @'
 #!/bin/bash
 # fcode move: tcp
-timeout 8 bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$1" "$2" 2>/dev/null
+timeout 8 bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$1" "$2" 2>/dev/null || exit 1
 '@
 }
 # D.0.10 (W1-T10-G4, W1-T11-DG-T11-6): `rebuild read`, the read-only plain-ssh script on each machine; `MOVE target` on new only, when
@@ -2142,10 +2172,10 @@ function Invoke-MoveCall($S, [string]$Machine, [string]$Step, [string[]]$VArgs =
     $st = Get-MoveStatus $S $Machine -Quiet
     $so = Get-MoveStatus $S $other -Quiet
     foreach ($l in @(@($st.Lines) + @($so.Lines) | Where-Object { "$_" -cmatch '\AMOVE state ' })) { Write-Host "  $l" }
-    if (-not $st.Ok) { return @{ Code = -1; Lines = $r.Lines; Id = $id; Known = $false } }
+    if (-not $st.Ok) { $script:MoveNoAnswer = $true; return @{ Code = -1; Lines = $r.Lines; Id = $id; Known = $false } }
     if ([string]$st.Kv['call'] -ceq $id -and [string]$st.Kv['call_state'] -ceq 'failed') { return @{ Code = $(if ("$($st.Kv['rc'])" -match '\A[0-9]+\z') { [int]$st.Kv['rc'] } else { 1 }); Lines = $r.Lines; Id = $id; Known = $true } }
   }
-  if (-not $r.Known) { return @{ Code = -1; Lines = $r.Lines; Id = $id; Known = $false } }
+  if (-not $r.Known) { $script:MoveNoAnswer = $true; return @{ Code = -1; Lines = $r.Lines; Id = $id; Known = $false } }
   foreach ($l in $r.Lines) {
     if ("$l" -cmatch '\AMOVE call id=(\S+) rc=([0-9]+) dur_s=([0-9]+)\z' -and $Matches[1] -ceq $id) {
       $o = Get-MoveProp $S.dur $Step; if ($null -eq $o) { $o = [pscustomobject]@{}; Set-MoveMapVal $S.dur $Step $o }
@@ -2185,8 +2215,9 @@ function Sync-MoveAgreement($S) {
     for ($i = 2; $m -ceq 'new' -and -not $st.Known -and $st.Transport -in 124, 255, -1 -and $i -le (Get-MoveConst 'retries'); $i++) { Wait-Move 5; $st = Get-MoveStatus $S $m -Quiet }
     if (-not $st.Ok) {
       if (-not $st.Known -and $st.Transport -notin 124, 255, -1) { continue }   # no gate answer there yet (new before `bootstrap gate`): it holds no move-id
-      if ($m -ceq 'new' -and -not $st.Known) { $script:MoveNewDown = $true; Write-Host "máy mới '$((Get-MoveMachine $S 'new').Alias)' không trả lời (mã $($st.Transport)); bỏ qua máy mới trong lệnh này."; continue }
-      Write-Host "lỗi: máy '$((Get-MoveMachine $S $m).Alias)' không trả lời status (mã $($st.Code)). Chạy lại khi máy nối lại được."; return 1
+      if ($m -ceq 'new' -and -not $st.Known) { $script:MoveNewDown = $true; $script:MoveNewDownCode = $st.Transport; Write-Host "máy mới '$((Get-MoveMachine $S 'new').Alias)' không trả lời (mã $($st.Transport)); bỏ qua máy mới trong lệnh này."; continue }
+      if ($st.Known) { return (Write-MoveStatusFail $S $m $st) }   # R10-INT-31 item 10: an answer that is not GATE_EXIT 0 is never a no-answer
+      return (Write-MoveNoAnswer ([string]$(if ($m -ceq 'old') { $S.old.alias } else { $S.new.alias })) 'khi đọc status' $st.Transport)
     }
     $script:MoveSeen[$m] = $st
     if ([string]$st.Kv['move_id'] -cne [string]$S.move_id -or [string]$st.Kv['state'] -cne 'open') { continue }   # no move-id, another or a closed one: nothing of this move runs there (no re-init, no fence)
@@ -2331,9 +2362,9 @@ function Invoke-MoveCheckCmd {
   $oi = Get-MoveSshInfo $oldAlias
   if (-not $oi -or -not (Test-MoveAddr $oi.HostName)) { Write-Host "lỗi: ssh -G không đọc được địa chỉ của '$oldAlias'."; return 1 }
   $mach = @{ Name = 'old'; Alias = $oldAlias; Addr = $oi.HostName; HostName = '' }
-  if (Test-MoveFirstContact $oi.HostName) { $p = Invoke-MoveScript $mach (Get-MoveFactsScript) @() (Get-MoveConst 'tcp_s') -Pin -Quiet; if ($p.Code -ne 0) { Write-Host "lỗi: không nối được máy cũ '$oldAlias'."; return 1 } }
+  if (Test-MoveFirstContact $oi.HostName) { $p = Invoke-MoveScript $mach (Get-MoveFactsScript) @() (Get-MoveConst 'tcp_s') -Pin -Quiet; if ($p.Code -ne 0) { if ($p.Code -in 124, 255, -1) { return (Write-MoveNoAnswer $oldAlias 'khi nối' $p.Code) }; Write-Host "lỗi: không đọc được dữ kiện máy cũ '$oldAlias' (mã $($p.Code))."; return 1 } }
   $r = Invoke-MoveGate $mach @('plan', '-', '--check-only') ((@(Get-MoveDefaultMap) -join "`n") + "`n") (Get-MoveConst 'plan_s') -Quiet   # D.0.9 / W1-T3-GAP-1: the default map lines only
-  if (-not $r.Known) { return 1 }
+  if (-not $r.Known) { return (Write-MoveNoAnswer $oldAlias 'khi kiểm tra' $r.Transport) }
   $now = @($r.Lines | Where-Object { $_ -cmatch '\A(INV (refuse|warn|host|target|inbound|os)|MOVE error) ' })
   $cp = Get-MovePath 'check.json'; $prev = @()
   if ([IO.File]::Exists($cp)) { try { $prev = @((ConvertFrom-Json ([IO.File]::ReadAllText($cp))).lines) } catch { $prev = @() } }
@@ -2395,7 +2426,7 @@ function Get-MovePlanStdin($S, [string[]]$Map, [string]$Src = 'old') {
 function Invoke-MovePlanOld($S, [string[]]$Map) {
   $r = Invoke-MoveGate (Get-MoveMachine $S 'old') @('plan', [string]$S.move_id) (Get-MovePlanStdin $S $Map) (Get-MoveConst 'plan_s') -Quiet
   $mf = ConvertFrom-MoveManifestLine $r.Lines
-  @{ Code = $r.Code; Known = $r.Known; Lines = $r.Lines; Mf = $mf }
+  @{ Code = $r.Code; Known = $r.Known; Lines = $r.Lines; Mf = $mf; Transport = $r.Transport }
 }
 # DESIGN-GAP (DG-R1, CONTRACT §4.1 OPEN): a rebuilt state has no source for target_platform (target.json and D.0.10 name none); this one
 # spot reads the stored value; a rebuilt state keeps New-MoveState's 0, and a state without the field counts as 0.
@@ -2463,8 +2494,10 @@ function Test-MoveReach($S, $M, $Lines) {
   $new = Get-MoveMachine $S 'new'
   foreach ($pp in $pairs) {
     $r = Invoke-MoveScript $new (Get-MoveTcpScript) @($pp[0], $pp[1]) (Get-MoveConst 'tcp_s') -Quiet
+    if ($r.Code -in 124, 255, -1) { return (Write-MoveNoAnswer ([string]$S.new.alias) 'khi kiểm tra kết nối ra ngoài' $r.Code) }   # item 12: only the transport; a refused or silent connect is exit 1 = warn egress
     if ($r.Code -ne 0) { Write-MoveLines @("INV warn egress addr=$($pp[0]) port=$($pp[1])") }
   }
+  0
 }
 # D.2 step 4 / 0c: gh admin on the state's legacy_push[] repos (B.10.4). Refusal lines.
 function Get-MoveGhRefusals($S) {
@@ -2483,8 +2516,9 @@ function Get-MoveGhRefusals($S) {
 # old (`MOVE legacy` lines of old's facts, read here at every scan); `project` = that legacy name. Every other match is ssh-push (Q-sshpush).
 # DESIGN-GAP (T10d-LP-slug, P3): "slug" form not given; reading: ConvertTo-MoveSlug (host not checked), case ignored (as GitHub names).
 function Get-MovePushScan($S) {
+  $script:MoveFactsDown = $null
   $fo = Get-MoveFacts (Get-MoveMachine $S 'old')
-  if (-not $fo) { Write-Host "lỗi: không đọc được dữ kiện máy cũ '$($S.old.alias)' (origin của project cũ)."; return @{ Ok = $false } }
+  if (-not $fo) { if ($script:MoveFactsDown) { [void](Write-MoveNoAnswer ([string]$S.old.alias) 'khi đọc dữ kiện' $script:MoveFactsDown.Code) } else { Write-Host "lỗi: không đọc được dữ kiện máy cũ '$($S.old.alias)' (mã $script:MoveFactsCode)." }; return @{ Ok = $false } }
   $ls = Invoke-MoveTool 'gh' @('repo', 'list', '--limit', '1000', '--json', 'nameWithOwner')
   if ($ls.Code -ne 0) { Write-Host 'lỗi: gh không liệt kê được repo (gh auth login?).'; return @{ Ok = $false } }
   try { $repos = @(ConvertFrom-Json ($ls.Out -join "`n") | ForEach-Object { [string]$_.nameWithOwner }) } catch { Write-Host 'lỗi: gh trả danh sách repo không đọc được.'; return @{ Ok = $false } }
@@ -2534,7 +2568,7 @@ function Invoke-MovePlanLoop($S, [string[]]$Map) {
   $map = @($Map); $asked = @{}   # each question once per plan run; a re-plan asks again (D.3)
   for ($round = 1; $round -le 6; $round++) {
     $p = Invoke-MovePlanOld $S $map
-    if (-not $p.Known) { return @{ Code = 1 } }
+    if (-not $p.Known) { [void](Write-MoveNoAnswer ([string]$S.old.alias) 'khi lập manifest' $p.Transport); return @{ Code = 1 } }
     $mErr = @($p.Lines | Where-Object { $_ -cmatch '\AMOVE error ' })
     if (-not $p.Mf) {
       Write-MoveLines $p.Lines
@@ -2559,7 +2593,7 @@ function Invoke-MovePlanLoop($S, [string[]]$Map) {
     Write-MoveLines (@($p.Lines | Where-Object { $_ -cnotmatch '\AINV refuse ' }) + $refs)
     if (@($refs | Where-Object { $_ -cmatch '\AINV refuse uid-collision ' }).Count) { foreach ($x in $refs) { if ($x -cmatch '\AINV refuse uid-collision .*\bholder=(\S+)') { Write-Host ('  ' + (Get-MoveText 'uid-remedy' @{ h = $Matches[1] })) } } }
     Write-MoveTunnelRemedies $refs
-    Test-MoveReach $S $M $p.Lines
+    $x = Test-MoveReach $S $M $p.Lines; if ($x) { return @{ Code = $x } }
     # D.2 step 5: the questions, in this order; each answer writes a map line or runs its p.* call, then plan runs again
     $again = $false
     $kv = { param($l) ConvertFrom-MoveKv $l }
@@ -2640,6 +2674,7 @@ function Invoke-MovePlanLoop($S, [string[]]$Map) {
 function Get-MoveFacts($Mach, [switch]$Pin) {
   $t0 = Get-MoveNow
   $r = Invoke-MoveScript $Mach (Get-MoveFactsScript) @() (Get-MoveConst 'tcp_s') -Pin:$Pin -Quiet
+  $script:MoveFactsCode = $r.Code
   $t1 = Get-MoveNow
   $lg = @(foreach ($l in $r.Lines) { if ("$l" -cmatch '\AMOVE legacy project=(deal-sync|vps-scraper) origin=(\S+)\z') { @{ Project = $Matches[1]; Slug = (ConvertTo-MoveSlug $Matches[2]) } } })
   foreach ($l in $r.Lines) {
@@ -2651,6 +2686,7 @@ function Get-MoveFacts($Mach, [switch]$Pin) {
       return @{ Os = [string]$k['os']; Arch = [string]$k['arch']; Systemd = [string]$k['systemd']; Off = $off; Skew = [Math]::Abs($off); Slack = ($t1 - $t0).TotalSeconds / 2; Legacy = $lg }
     }
   }
+  if (($r.Code -in 124, 255, -1) -and -not $script:MoveFactsDown) { $script:MoveFactsDown = @{ Alias = [string]$Mach.Alias; Code = $r.Code } }   # DG6: no answer (no `MOVE facts`, ssh lost): the callers say "không trả lời", never `refuse clock`
   $null
 }
 # `<owner>/<repo>` of a git remote url (ssh `git@host:o/r.git`, `https://host/o/r`): its last two path parts, `.git` and a trailing `/`
@@ -2688,9 +2724,11 @@ function Invoke-MovePlanCmd([string]$NewAlias, [string]$Addr, [string]$OldAddrAr
   $script:MoveDraft = $true; $script:MoveManifest = $null
   try {
     $old = Get-MoveMachine $S 'old'; $new = Get-MoveMachine $S 'new'
+    $script:MoveFactsDown = $null
     $fo = Get-MoveFacts $old -Pin:(Test-MoveFirstContact $S.old.addr)
     $okey = Get-MovePinnedKey $S.old.addr
-    if (-not $fo -or -not $okey) { Write-Host "lỗi: không nối được máy cũ '$oldAlias' hoặc nó không có khoá máy ed25519."; return 1 }
+    if (-not $fo) { if ($script:MoveFactsDown) { return (Write-MoveNoAnswer $oldAlias 'khi đọc dữ kiện' $script:MoveFactsDown.Code) }; Write-Host "lỗi: không đọc được dữ kiện máy cũ '$oldAlias' (mã $script:MoveFactsCode)."; return 1 }
+    if (-not $okey) { Write-Host "lỗi: máy cũ '$oldAlias' không có khoá máy ed25519 hoặc không đọc được khoá."; return 1 }
     $S.old.hostkey_line = $okey
     # D.2 step 2: preflight on new; the first contact pins new's key (B.11.3: a new plan replaces the pin stored for --addr)
     Remove-MovePin $Addr
@@ -2716,7 +2754,9 @@ function Invoke-MovePlanCmd([string]$NewAlias, [string]$Addr, [string]$OldAddrAr
       elseif ("$l" -cmatch '\AINV target stop_budget_s=([0-9]+)\z') { $sb = [int]$Matches[1] }
     }
     foreach ($kv in @{ target_users = @($tu); target_groups = @($tg); target_subids = @($ts); target_addrs = @($ta); target_stop_budget_s = $sb; target_platform = $tp }.GetEnumerator()) { Set-MoveProp $S $kv.Key $kv.Value }
+    $script:MoveFactsDown = $null
     $fn = Get-MoveFacts $new
+    if ($script:MoveFactsDown) { return (Write-MoveNoAnswer $script:MoveFactsDown.Alias 'khi đọc dữ kiện' $script:MoveFactsDown.Code) }   # DG6: a drop is no clock refusal
     $clk = @(Get-MoveClockRefusals @{ old = $fo; new = $fn })
     if ($clk.Count) { Write-MoveLines $clk; return 65 }
     # D.2 steps 3-5
@@ -2783,6 +2823,8 @@ function Invoke-MoveVerify($S, [switch]$Final) {
 function Test-MoveLogin($S, [string]$M) {
   $t = Invoke-MoveRemote (Get-MoveMachine $S $M) 'true' '' (Get-MoveConst 'tcp_s')
   if ($t.Code -eq 0) { return 0 }
+  # DG6: ssh 255 / a deadline without an authentication refusal is "no answer", never a lockout; 1 = re-run (the line is shown here)
+  if (($t.Code -in 124, 255, -1) -and "$($t.Err)" -cnotmatch 'Permission denied|Too many authentication failures') { return (Write-MoveNoAnswer ([string]$(if ($M -ceq 'old') { $S.old.alias } else { $S.new.alias })) 'khi kiểm tra đăng nhập' $t.Code) }
   Write-MoveLines @("MOVE error lockout side=$M"); 70
 }
 # D.3 steps 6-8 with the pass counter raised: transfer, verify (informational), adopt; then the estimates of step 9
@@ -2845,7 +2887,7 @@ function Invoke-MoveCopyFull($S) {
     $g = Invoke-MoveScript $new (Get-MoveBootstrapGateScript) @('--old-addr', (Get-MoveOldAddrForNew $S))
     if ($g.Code -ne 0) { return (ConvertTo-MoveExit $g.Code) }
     $ids = Get-MoveGateIds $S
-    if (-not $ids.Ok) { Write-Host 'lỗi: một máy không trả lời status.'; return 1 }
+    if (-not $ids.Ok) { return (Write-MoveIdsNoAnswer $S $ids) }
     if ($ids.Old -and $ids.Old -ceq $ids.New) { break }
     $fresh = $ids.NewMove -in '', '-', [string]$S.move_id
     if ($i -eq 2 -or -not $fresh) { Write-MoveLines @('INV refuse gate-version side=new'); return 65 }   # E-G1: refresh once
@@ -2931,7 +2973,9 @@ function Test-MovePreCut($S, [switch]$BackStart) {
   # DESIGN-GAP (T10-G42, F8f): D.8's 0c lists status, gate ids, check-only and Q-back only; reading: a back start also runs the fwd 0c
   # checks that need no new data (dst free_mb, clock, gh-permission).
   $ids = Get-MoveGateIds $S
-  if (-not ($ids.StOld.Ok -and $ids.StNew.Ok)) { Write-Host 'lỗi: một máy không trả lời status (cần GATE_EXIT 0 ở cả hai). Chưa làm gì.'; return 1 }
+  if (-not ($ids.StOld.Known -and $ids.StNew.Known)) { return (Write-MoveIdsNoAnswer $S $ids) }
+  if (-not $ids.StOld.Ok) { return (Write-MoveStatusFail $S 'old' $ids.StOld) }
+  if (-not $ids.StNew.Ok) { return (Write-MoveStatusFail $S 'new' $ids.StNew) }
   if (-not $ids.Old -or $ids.Old -cne $ids.New) {
     if ($backish) { Write-MoveLines @('INV refuse gate-version side=old'); Write-Host ('  ' + (Get-MoveText 'same-gate')) }   # E-G4
     else { Write-MoveLines @('INV refuse gate-version side=new'); Write-Host ('  ' + (Get-MoveText 'copy-again')) }   # E-G3
@@ -2948,7 +2992,10 @@ function Test-MovePreCut($S, [switch]$BackStart) {
   }
   # DESIGN-GAP (T10-G14): "fresh space" at 0c has no formula once dst holds the copy; reading: dst free_mb >= 2048 (the B.14.8 reserve floor)
   if ("$($dk['free_mb'])" -match '\A[0-9]+\z' -and [int]$dk['free_mb'] -lt 2048) { Write-MoveLines @("INV refuse disk free_mb=$($dk['free_mb'])"); return 65 }
-  $clk = @(Get-MoveClockRefusals @{ old = (Get-MoveFacts (Get-MoveMachine $S 'old')); new = (Get-MoveFacts (Get-MoveMachine $S 'new')) })
+  $script:MoveFactsDown = $null
+  $fo0 = Get-MoveFacts (Get-MoveMachine $S 'old'); $fn0 = Get-MoveFacts (Get-MoveMachine $S 'new')
+  if ($script:MoveFactsDown) { return (Write-MoveNoAnswer $script:MoveFactsDown.Alias 'khi đọc dữ kiện' $script:MoveFactsDown.Code) }   # DG6: a drop is no clock refusal
+  $clk = @(Get-MoveClockRefusals @{ old = $fo0; new = $fn0 })
   if ($clk.Count) { Write-MoveLines $clk; return 65 }
   $gh = @(Get-MoveGhRefusals $S); if ($gh.Count) { Write-MoveLines $gh; return 65 }
   # one read-only `plan <id> --check-only` on src; its duration sets the x.check budget
@@ -2956,7 +3003,7 @@ function Test-MovePreCut($S, [switch]$BackStart) {
   $cd = if ($BackStart) { 'back' } else { [string]$S.dir }; $ca = if ($BackStart) { [int]$S.attempt + 1 } else { [int]$S.attempt }
   $r = Invoke-MoveGate (Get-MoveMachine $S $src) @('plan', [string]$S.move_id, '--dir', $cd, '--attempt', "$ca", '--sha', [string]$S.manifest_sha, '--serving', [string]$S.serving, '--check-only') (Get-MovePlanStdin $S @(Get-MoveMapText) $src) (Get-MoveConst 'plan_s')
   $script:MoveCheckOnlyS = [int][Math]::Ceiling(((Get-MoveNow) - $t0).TotalSeconds)
-  if (-not $r.Known) { return 1 }
+  if (-not $r.Known) { return (Write-MoveNoAnswer ([string](Get-MoveMachine $S $src).Alias) 'khi kiểm tra trước' $r.Transport) }
   if ($r.Code -ne 0) {
     if (@($r.Lines | Where-Object { $_ -cmatch '\AMOVE error manifest-stale ' }).Count) { Write-Host (Get-MoveText 'copy-again') }
     if (@($r.Lines | Where-Object { $_ -cmatch '\AMOVE error acl-mapped-id ' }).Count) { Write-Host (Get-MoveText 'acl-remedy') }
@@ -2968,7 +3015,7 @@ function Test-MovePreCut($S, [switch]$BackStart) {
   $script:MoveBackNewOnly = $back
   $u = @(Get-MoveUserRefusals $S $M | Where-Object { $_ -cmatch 'uid-collision' })
   if (-not $backish -and $u.Count) { Write-MoveLines $u; return 65 }
-  if (-not $backish) { Test-MoveReach $S $M $r.Lines }
+  if (-not $backish) { $x = Test-MoveReach $S $M $r.Lines; if ($x) { return $x } }
   0
 }
 # a definite failure, an exceeded deadline or a transport loss of a cutover call: @{ Code; Fail = rb|carry|human|e-r19|discard; Why }
@@ -3052,7 +3099,9 @@ function Invoke-MoveCutSteps($S, [int]$From, [switch]$Carry) {
     $r = Invoke-MoveCall $S $dst 'x.adopt'
     foreach ($l in $r.Lines) { if ("$l" -cmatch '\AINV warn ufw-lockout addr=(\S+)') { Set-MoveAnswer $S 'ufw-lockout' $Matches[1]; Save-MoveState $S } }   # DESIGN-GAP (T10-G15): kept for the step-11 list
     if ($r.Code -ne 0) { if ($fwd -and -not $Carry) { return (New-MoveFail 'rb' 'x.adopt') }; return (New-MoveFail 'human' 'x.adopt' 70) }
-    if ((Test-MoveLogin $S $dst) -ne 0) { return (New-MoveFail 'human' 'lockout' 70) }
+    $lg = Test-MoveLogin $S $dst
+    if ($lg -eq 70) { return (New-MoveFail 'human' 'lockout' 70) }
+    if ($lg -ne 0) { return (New-MoveFail 'no-answer' 'x.login' 1) }   # DG6: Test-MoveLogin has shown the no-answer line
   }
   if ($From -le 8) {
     # R5-3 (D.4 step 8, D.0.9) with the DG-R5-1 reading (t11/review-r5.md:131; DESIGN-GAP, one spot): dst_started_at = now only on the
@@ -3131,10 +3180,11 @@ function Write-MoveVerifyReport($S, $V) {
 }
 # D.5.2 carry-back: write-ahead, b.init-*, then D.8 steps 2, 5, 6-10 with the fwd mark kept; Q-discard before x.final
 function Invoke-MoveCarryBack($S, [switch]$Resume) {
+  $script:MoveNoAnswer = $false   # D.5.2: the loss that led here was resolved by new's status answer (Complete-MoveCutFail 'carry'); this carry-back's own exit decides (B24)
   if (-not $Resume) {
     Write-Host 'Lỗi sau khi máy mới đã chạy: chép ngược dữ liệu về máy cũ (tự động)...'
     $w = Set-MoveWriteAhead $S @{ dir = 'back'; attempt = [int]$S.attempt + 1; phase = 'planned'; carry = $true }
-    if ($w -ne 0) { return 70 }
+    if ($w -ne 0) { return $(if ($w -eq 1 -and $script:MoveNoAnswer) { 1 } else { 70 }) }   # this write-ahead's own loss; a definite b.init failure stays 70
   }
   if ($script:MoveNewDown) {   # F2: a carry-back resumed while new is down; no call to new
     if (Test-MoveFinalSent $S) { return (Invoke-MoveCarryFail $S (New-MoveFail 'human' 'x.final' 70)) }   # E-R5: resume only
@@ -3186,6 +3236,7 @@ function Write-MoveBothStatus($S) {
   }
 }
 function Invoke-MoveCarryFail($S, $F) {
+  if ($F.Fail -ceq 'no-answer') { return 1 }   # DG6: the no-answer line is the last line
   if ($F.Fail -ceq 'chore0') { Write-MoveReturnOld $S; Write-Host (Get-MoveText 'cutover-again'); return 1 }   # F11, E-R25: old serves after x.switch
   if ($F.Fail -cne 'discard') {   # after x.final started (E-R5, E-R23): resume only
     Write-MoveBothStatus $S
@@ -3238,6 +3289,7 @@ function Complete-MoveCutFail($S, $F) {
     'e-r19' { return (Invoke-MoveER19 $S) }
     'abandon' { return (Invoke-MoveAbandonStart $S $F.Code) }
     'chore0' { Write-Host (Get-MoveText 'cutover-again'); return 1 }
+    'no-answer' { return 1 }   # DG6: Test-MoveLogin has shown the no-answer line, the last line
     default { Write-Host "Cần người xem: lỗi ở $($F.Why); chạy lại lệnh khi đã sửa."; return $(if ($F.Code) { $F.Code } else { 70 }) }
   }
 }
@@ -3409,6 +3461,7 @@ function Invoke-MoveBackRun($S) {
 # frozen=0, and hold_active equal to the number of non-follower holds of hold_sets.start
 function Test-MoveFinishHealth($S) {
   $st = Get-MoveStatus $S 'new' -Quiet
+  if (-not $st.Known) { [void](Write-MoveNoAnswer ([string]$S.new.alias) 'khi kiểm tra sức khỏe' $st.Transport); return $false }   # a Known non-zero status stays "Kiểm tra sức khỏe không đạt"
   $M = Get-MoveManifestObj; $fol = @(Get-MoveProp $M 'followers' @() | ForEach-Object { [string]$_ })
   $need = @(@(Get-MoveProp (Get-MoveProp $M 'hold_sets') 'start' @()) | Where-Object { $fol -cnotcontains [string]$_ }).Count
   $ok = [bool]($st.Ok -and [string]$st.Kv['call_state'] -cne 'running' -and -not (Test-MoveFrozen $st.Kv) -and "$($st.Kv['hold_active'])" -match '\A[0-9]+\z' -and [int]$st.Kv['hold_active'] -eq $need)
@@ -3473,6 +3526,7 @@ function Read-MoveRebuildFacts($Mach) {
     elseif ("$l" -cmatch '\AMOVE record ') { $recs += , (ConvertFrom-MoveKv $l) }
     elseif ("$l" -cmatch '\AMOVE target (.+)\z') { try { $tg = ConvertFrom-Json $Matches[1] } catch { $tg = $null } }
   }
+  if ($r.Code -in 124, 255, -1) { return @{ Down = $r.Code } }   # the transport lost: the caller says "không trả lời", never "không có move-id"
   if ($r.Code -ne 0 -or -not $mid['id']) { return $null }
   @{ Mid = $mid; Recs = $recs; Hk = $hk; Mf = (ConvertFrom-MoveManifestLine $r.Lines); Target = $tg }
 }
@@ -3496,10 +3550,12 @@ function Invoke-MoveRebuild([string]$OldAlias, [string]$NewAlias) {
   foreach ($x in @(@('old', $OldAlias), @('new', $NewAlias))) {
     $i = Get-MoveSshInfo $x[1]; if (-not $i) { Write-Host "lỗi: ssh -G không đọc được '$($x[1])'."; return 1 }
     $g = Read-MoveRebuildFacts @{ Name = $x[0]; Alias = $x[1]; Addr = $i.HostName; HostName = '' }
+    if ($g -and $g.Down) { return (Write-MoveNoAnswer $x[1] 'khi đọc lại trạng thái' $g.Down) }
     # F3 (D.0.7, D.0.10): after the step-11 swap the old alias reaches new; read old again through Reach-Old (its move-id's old_addr)
     if ($x[0] -ceq 'old' -and $g -and [string]$g.Mid['role'] -ceq 'new' -and (Test-MoveAddr ([string]$g.Mid['old_addr']))) {
       $oa = [string]$g.Mid['old_addr']
       $g = Read-MoveRebuildFacts @{ Name = 'old'; Alias = $x[1]; Addr = $oa; HostName = $oa }
+      if ($g -and $g.Down) { return (Write-MoveNoAnswer $x[1] 'khi đọc lại trạng thái' $g.Down) }
     }
     if (-not $g) { Write-Host "lỗi: máy '$($x[1])' không có move-id đọc được."; return 1 }
     if ([string]$g.Mid['role'] -cne $x[0]) { Write-Host "lỗi: '$($x[1])' trả về move-id của máy $($g.Mid['role']), không phải máy $(if ($x[0] -ceq 'old') { 'cũ' } else { 'mới' }); không dựng lại, chưa ghi gì."; return 1 }
@@ -3537,7 +3593,7 @@ function Invoke-MoveRebuild([string]$OldAlias, [string]$NewAlias) {
   Set-MoveRebuiltTarget $S $n.Target
   Set-MoveProp $S 'idmap' @(@(Get-MoveProp $mf.Obj 'idmap' @()) | Where-Object { $_ })   # D.0.10: idmap[] from the manifest
   # DESIGN-GAP (DG-R5-2, the Architect's): D.0.10 names neither pass{} nor last_copy_at; a rebuilt state keeps them empty.
-  $scan = Get-MovePushScan $S; if (-not $scan.Ok) { Write-Host 'lỗi: không quét lại được repo (D.0.10: legacy_push[] từ một lần quét mới); chưa ghi gì.'; return 1 }
+  $scan = Get-MovePushScan $S; if (-not $scan.Ok) { if (-not $script:MoveNoAnswerShown) { Write-Host 'lỗi: không quét lại được repo (D.0.10: legacy_push[] từ một lần quét mới); chưa ghi gì.' }; return 1 }
   Set-MoveProp $S 'legacy_push' @($scan.Legacy)
   $co = Get-MoveRebuiltCutOff $o.Recs; if ($co) { Set-MoveAnswer $S 'Q-cut' ([pscustomobject]@{ a = 'có'; ts = $co }) }   # R2-4 (T10-G36): step 11's since
   Set-MoveProp $S 'dst_started_at' (Get-MoveRebuiltDstStartedAt $S $n.Recs)   # R5-1
@@ -3562,7 +3618,7 @@ function Invoke-MoveRebuild([string]$OldAlias, [string]$NewAlias) {
 }
 
 # ---- the entry ----
-function Invoke-Move([string[]]$MoveArgs) {
+function Invoke-MoveRun([string[]]$MoveArgs) {
   $a = @($MoveArgs); $verb = if ($a.Count) { [string]$a[0] } else { '' }
   $usage = { Write-Host 'Cách dùng: fcode move check | plan <máy mới> --addr <ipv4|tên> [--old-addr <host[:port]>] [--map <file>] | copy | cutover | finish | back | abort | status [--rebuild <máy cũ> <máy mới>]'; Write-Host '  Chi tiết: fcode help move' }
   if ($verb -cnotin 'check', 'plan', 'copy', 'cutover', 'finish', 'back', 'abort', 'status') { & $usage; return 65 }
@@ -3596,14 +3652,14 @@ function Invoke-Move([string[]]$MoveArgs) {
     $down = [bool]$script:MoveNewDown
     # D.5.3 / E-R4: new unreachable after dst_started in a fwd cutover in flight: no automatic action; Q-newlost
     if ($down -and $verb -ceq 'cutover' -and [string]$S.dir -ceq 'fwd' -and $S.mark -and $S.dst_started -eq $true -and $S.carry -ne $true) { return [int]@(Invoke-MoveNewLost $S)[-1] }
-    if ($down -and [string]$S.serving -ceq 'new') { Write-Host "lỗi: máy mới đang phục vụ nhưng không trả lời; chạy lại khi máy mới nối lại được."; return 1 }
+    if ($down -and [string]$S.serving -ceq 'new') { return (Write-MoveNoAnswer ([string]$S.new.alias) 'khi đang phục vụ' $script:MoveNewDownCode) }
     $c = Invoke-MovePreRule $S; if ($c -ne 0) { return $c }
     $row = Resolve-MoveRow $verb $S
     if ($row.Do -ceq 'refuse') { Write-Host "lỗi: $($row.Msg)"; return 1 }
     if ($row.Do -ceq 'idem') { Write-Host "Lần chuyển này đã $($S.phase)."; return 0 }
     if ($down) {   # F2: only the rows that need nothing from new go on; none of them sends a call to new
       $ok = $row.Do -cin 'abort', 'rb-continue', 'carry-resume' -or ($row.Do -ceq 'cut-resume' -and [string]$S.dir -ceq 'fwd' -and $S.dst_started -ne $true)
-      if (-not $ok) { Write-Host "lỗi: máy mới không trả lời; lệnh '$verb' cần máy mới. Chạy lại khi máy mới nối lại được."; return 1 }
+      if (-not $ok) { return (Write-MoveNoAnswer ([string]$S.new.alias) "khi lệnh '$verb' cần máy mới" $script:MoveNewDownCode) }
     }
     $res = switch -CaseSensitive ($row.Do) {
       'copy-first' { $w = Wait-MoveRunning $S; if ($w -ne 0) { $w } else { Invoke-MoveCopyFull $S } }
@@ -3630,6 +3686,17 @@ function Invoke-Move([string[]]$MoveArgs) {
     Write-Host "lỗi: $($_.Exception.Message)"
     return 1
   } finally { $lock.Dispose() }
+}
+
+# B24: the one exit of `fcode move`. MoveNoAnswer is set by four places — Invoke-MoveCall's -1 returns, Invoke-MoveScript's 124/255/-1,
+# ConvertTo-MoveExit, Write-MoveNoAnswer — and cleared only at the carry-back's start (D.5.2: that loss was resolved by new's status answer).
+# A run that ends 1 with it set prints the re-run sentence last, once: bare here unless Write-MoveNoAnswer already printed it with its head.
+# Never on 0, 10, 65, 70, 75.
+function Invoke-Move([string[]]$MoveArgs) {
+  $script:MoveNoAnswer = $false; $script:MoveNoAnswerShown = $false
+  $c = [int]@(Invoke-MoveRun $MoveArgs)[-1]
+  if ($c -eq 1 -and $script:MoveNoAnswer -and -not $script:MoveNoAnswerShown) { Write-Host (Get-MoveText 'rerun') }
+  $c
 }
 
 # fcode pair [ten thiet bi]: tao ma ghep 1 lan (kem ma QR) tren box cho iPhone moi
