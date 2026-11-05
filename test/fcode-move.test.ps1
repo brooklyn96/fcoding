@@ -1731,6 +1731,36 @@ T 'L.no-answer-call-unknown: c.transfer.N and c.init-old with an unknown outcome
   Reset-World; Fx-Planned; Add-Fault -M new -Key '-c\.transfer\.1$' -Rc 1
   [void](Do-Copy 1); NoText $Rerun
 }
+# ---- ruling 05/11 (20) (B26, F-T13-fwd5c): a transfer (c.transfer.N, any pass) that fails with why=net is a no-answer of the sending side: the head keeps "mạng đứt", the sentence is last ----
+$NetOut = @('MOVE error rsync-failed why=net')
+T 'L.no-answer-copy-why-net: c.transfer.N failing with why=net (first pass, refresh pass, the back direction) ends exit 1 with the "mạng đứt" head and the re-run sentence once as the last line; another failed transfer (rc=23, disk) has none (ruling 05/11 (20))' {
+  Fx-Planned; Add-Fault -M new -Key '-c\.transfer\.1$' -Rc 1 -Out $NetOut
+  [void](Do-Copy 1); EndsBareRerun; HasText 'mạng đứt'
+  $t = $script:Last.Text; Ok ($t.IndexOf('mạng đứt') -ge 0 -and $t.IndexOf('mạng đứt') -lt $t.LastIndexOf($Rerun)) "the head comes before the sentence: $t"
+  Eq (SentAny '-c\.adopt\.') 0 'nothing adopted after the failed transfer'
+  Reset-World; Fx-Copied; Add-Fault -M new -Key '-c\.transfer\.[0-9]+$' -Rc 1 -Out $NetOut
+  [void](Do-Copy 1); EndsBareRerun; HasText 'mạng đứt'
+  Reset-World; Fx-Cut; Add-Fault -M new -Key '-c\.transfer\.[0-9]+$' -Rc 1 -Out $NetOut; Ans 'YES'
+  $r = Run-Move @('back'); Eq $r.Code 1 "back exit ($($r.Text))"; EndsBareRerun; HasText 'Chép dữ liệu bị lỗi: why=net'; NoText 'chạy fcode move copy lại'   # the back's pre-copy shows the label only: "copy lại" would be wrong advice on `back`
+  foreach ($o in @(@('MOVE error rsync-failed rc=23'), @('MOVE error disk'))) {
+    Reset-World; Fx-Planned; Add-Fault -M new -Key '-c\.transfer\.1$' -Rc 1 -Out $o
+    [void](Do-Copy -1); NoText $Rerun
+  }
+}
+T 'L.no-answer-copy-why-net-status-failed: c.transfer.N whose stream is lost (no GATE_EXIT) while new''s status says call_state=failed and the partial lines hold the why=net line ends exit 1 with the re-run sentence once as the last line (the status-failed branch of Invoke-MoveCall marks the run; RV12-a)' {
+  Fx-Planned; Add-Fault -M new -Key '-c\.transfer\.1$' -Rc 1 -Out $NetOut -Mode noexit
+  [void](Do-Copy 1); EndsBareRerun; HasText 'mạng đứt'; HasText 'call_state=failed'
+  Reset-World; Fx-Planned; Add-Fault -M new -Key '-c\.transfer\.1$' -Rc 1 -Out @('MOVE error rsync-failed rc=23') -Mode noexit
+  [void](Do-Copy 1); NoText $Rerun
+}
+T 'L.no-answer-final-why-net: x.final failing with why=net keeps the exit codes of the code: a forward cutover rolls back (exit 10), a carry-back or a manual back ends 70; neither carries the re-run sentence (only exit 1 does; ruling 05/11 (20))' {
+  Fx-Copied; Add-Fault -M new -Key '-x\.final$' -Rc 1 -Out $NetOut
+  [void](Do-Cutover -1); Assert-Rb; NoText $Rerun
+  Reset-World; Start-Carry; Add-Fault -M new -Key '^back-2-x\.final$' -Rc 1 -Out $NetOut; Ans 'có'
+  $r = Run-Move @('cutover'); Eq $r.Code 70 "carry-back exit ($($r.Text))"; NoText $Rerun
+  Reset-World; Fx-Cut; Add-Fault -M new -Key '^back-2-x\.final$' -Rc 1 -Out $NetOut; Ans 'YES'
+  $r = Run-Move @('back'); Eq $r.Code 70 "back exit ($($r.Text))"; NoText $Rerun
+}
 T 'L.no-answer-check-plan: check, plan and the 0c check-only that get no answer from old (no GATE_EXIT, or no facts / key) end with the re-run sentence, exit 1 (R10-INT-31)' {
   Add-Fault -M old -Key 'plan:check' -Mode noexit; $r = Run-Move @('check'); Eq $r.Code 1 "check exit ($($r.Text))"; EndsRerun "máy '$OldAlias' không trả lời khi kiểm tra (mã 0)."
   Reset-World; Add-Fault -M old -Key '^script:facts$' -Rc 255 -Out @(); $r = Run-Move @('check'); Eq $r.Code 1 "check, first contact lost ($($r.Text))"; EndsRerun "máy '$OldAlias' không trả lời khi nối (mã 255)."
