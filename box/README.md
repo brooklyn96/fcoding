@@ -108,15 +108,17 @@ fcode-notify <project> <kind> "<nội dung>" [link]
 | Dòng in ra | Mã thoát | Ý nghĩa |
 |---|---|---|
 | `notify: queued <id>` | 0 | đã ghi |
-| `notify: duplicate` | 0 | cùng project + kind + nội dung + link đã ghi trong 30 phút qua; không ghi thêm |
+| `notify: duplicate` | 0 | cùng project + kind + nội dung + link + phiên đã ghi trong 30 phút qua; không ghi thêm (cùng nội dung từ hai phiên khác nhau thì không bị coi là trùng) |
 | `error: usage` / `bad-project` / `bad-kind` / `bad-text` / `bad-link` | 65 | bị từ chối, không ghi gì |
 | `error: rate-limited` | 75 | quá 6 tin cho project này hoặc quá 15 tin tổng trong 60 phút qua; không ghi gì |
 | `error: io` | 1 | lỗi khoá hoặc ghi; file cũ giữ nguyên |
 
-- Hộp thư: `~/.local/state/fcode/notify/outbox.tsv` (thư mục 700, file 600), mỗi tin một dòng, 6 cột cách nhau bằng TAB: `id  epoch  project  kind  nội_dung  link`. Chỉ giữ 50 dòng mới nhất; mỗi lần ghi là file tạm + `mv` dưới `flock` (`outbox.lock`). Hermes đọc bằng `tail -c 65536` của file này và tự kiểm tra lại từng dòng.
+- Hộp thư: `~/.local/state/fcode/notify/outbox.tsv` (thư mục 700, file 600), mỗi tin một dòng, 7 cột cách nhau bằng TAB: `id  epoch  project  kind  nội_dung  link  phiên`. Cột `link` và cột `phiên` có thể rỗng. Chỉ giữ 50 dòng mới nhất; mỗi lần ghi là file tạm + `mv` dưới `flock` (`outbox.lock`). Hermes đọc bằng `tail -c 65536` của file này và tự kiểm tra lại từng dòng; dòng cũ 6 cột (không có cột `phiên`) vẫn hợp lệ.
+- Cột `phiên` là tên phiên tmux của chính pane đang gọi: khi có `$TMUX` và `$TMUX_PANE`, script chạy `tmux display-message -p -t "$TMUX_PANE" '#S'`. Cú pháp `^[a-z0-9][a-z0-9._-]{0,63}$`; ngoài tmux, hoặc tên không khớp, thì cột để rỗng và không báo lỗi. Cách gọi không đổi (không có đối số phiên): Hermes dùng cột này để ghi `[<project> · phiên <phiên>]` trong tin Zalo.
+- **Thứ tự cài đặt:** không chạy `install.sh` trên box với bản này cho đến khi Hermes trên contabo đã có bản phát hành chấp nhận cột thứ 7 (README hermes-ops, mục "Coder notes", phần thứ tự triển khai). Hermes cũ bỏ mọi dòng 7 cột, nên cài box trước sẽ làm mất toàn bộ tin báo.
 - `install.sh` cài `fcode-notify` vào `~/.local/bin`, và tạo sẵn thư mục hộp thư (700) cùng một file `outbox.tsv` **rỗng** (600) bằng `: >>` (không bao giờ cắt file đang có), để lần kéo đầu tiên của Hermes đọc được file thay vì báo lỗi; file rỗng là hợp lệ, `fcode-notify` ghi tiếp vào đó.
 - Lệnh cố định chạy qua bash của user (`/bin/bash`), bash này đọc `~/.bashrc` cả với lệnh ssh không tương tác. `~/.bashrc` **không được in gì** cho shell không tương tác (giữ đoạn chặn `case $- in *i*) ;; *) return;; esac` ở đầu file): mọi chữ in thêm sẽ nối vào dữ liệu và làm Hermes bỏ mất tin.
 - Luật cho agent (khi nào được gọi) nằm ở `box/agents-notify.md`; người quản trị tự đưa vào `~/.omp/agent/AGENTS.md`, như `box/agents-git.md`.
-- Biến thử nghiệm `FCODE_NOTIFY_DIR` và `FCODE_NOTIFY_NOW` chỉ có tác dụng khi `FCODE_NOTIFY_TEST=1`.
+- Biến thử nghiệm `FCODE_NOTIFY_DIR`, `FCODE_NOTIFY_NOW` và `FCODE_NOTIFY_SESSION` (ghi đè tên phiên) chỉ có tác dụng khi `FCODE_NOTIFY_TEST=1`.
 
 Kiểm thử (thư mục tạm, không đụng hộp thư thật): `bash test/fcode-notify.test.sh`.

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Tests for box/fcode-notify.sh (the coder box's one-way notice to the owner): every output line and exit code, the outbox format, the
-# sanitizing, injection-style text, the 30-minute duplicate rule, the rate limits, the 50-line cap and the test hooks.
+# sanitizing, injection-style text, the 30-minute duplicate rule, the rate limits, the 50-line cap, the test hooks, and the 7th field (the
+# tmux session name, found from $TMUX/$TMUX_PANE through a fake tmux on PATH, checked against its regex, test override, duplicate key).
 # Everything runs under a temporary HOME: the real ~/.local/state/fcode is never touched. Needs: bash, node, flock, od, mktemp.
 # Usage: bash test/fcode-notify.test.sh
 set -u
@@ -11,7 +12,7 @@ T=$(mktemp -d) || exit 1
 trap 'chmod -R u+rwx "$T" 2>/dev/null; rm -rf "$T"' EXIT
 export HOME="$T/home"
 mkdir -p "$HOME"
-unset FCODE_NOTIFY_DIR FCODE_NOTIFY_NOW FCODE_NOTIFY_TEST
+unset FCODE_NOTIFY_DIR FCODE_NOTIFY_NOW FCODE_NOTIFY_TEST FCODE_NOTIFY_SESSION TMUX TMUX_PANE   # never inherit a real tmux or hook
 PASS=0; FAIL=0
 ok() { PASS=$((PASS + 1)); echo "ok   $1"; }
 no() { FAIL=$((FAIL + 1)); echo "FAIL $1"; }
@@ -23,7 +24,9 @@ BASE=1900000000                 # a fixed "now"
 n=0
 fresh() { n=$((n + 1)); D="$T/box$n"; }
 # note [args...]: runs the script with the hooks pointing at $D and $NOW (default $BASE); sets OUT (stdout) and RC
-note() { [ "${AUTOBUMP:-0}" = 1 ] && NOW=$(( ${NOW:-$BASE} + 4000 )); OUT=$(FCODE_NOTIFY_DIR="$D" FCODE_NOTIFY_NOW="${NOW:-$BASE}" bash "$FN" "$@"); RC=$?; }
+# note also captures the script's stderr in ERR: the producer must never write anything there (it runs inside the agent's session)
+note() { [ "${AUTOBUMP:-0}" = 1 ] && NOW=$(( ${NOW:-$BASE} + 4000 )); OUT=$(FCODE_NOTIFY_DIR="$D" FCODE_NOTIFY_NOW="${NOW:-$BASE}" bash "$FN" "$@" 2>"$T/err"); RC=$?; ERR=$(cat "$T/err"); }
+noerr() { eq "$1: stderr empty" "$ERR" ''; }
 file() { echo "$D/outbox.tsv"; }
 lines() { if [ -f "$(file)" ]; then wc -l <"$(file)" | tr -d ' '; else echo 0; fi; }
 field() { sed -n "${1}p" "$(file)" | cut -f"$2"; }   # field <line> <n>
@@ -33,6 +36,22 @@ expect() { local name=$1 want=$2 wrc=$3; shift 3; note "$@"; if [ "$OUT" = "$wan
 chars() { node -e 'const b=require("fs").readFileSync(process.argv[1]);const t=new TextDecoder("utf-8",{fatal:true}).decode(b).replace(/\n$/,"").split("\t")[4];console.log(Array.from(t).length)' "$1"; }
 valid_utf8() { node -e 'new TextDecoder("utf-8",{fatal:true}).decode(require("fs").readFileSync(process.argv[1]))' "$1" 2>/dev/null; }
 U() { printf "$1"; }   # printf escapes -> bytes
+# A fake tmux on PATH (only the session rows put it there): answers exactly `display-message -p -t $TMUX_PANE #S` with $FAKE_TMUX_NAME
+# (exit 1 with FAKE_TMUX_FAIL=1 and a message on stderr, exit 2 with a message for any other call) and logs every call to $FAKE_TMUX_LOG.
+FB="$T/fakebin"; SLOG="$T/tmux.log"; mkdir -p "$FB"
+cat >"$FB/tmux" <<'EOF'
+#!/bin/sh
+echo "$*" >>"$FAKE_TMUX_LOG"
+[ "${FAKE_TMUX_FAIL:-0}" = 1 ] && { echo "no server running on /tmp/fake-tmux" >&2; exit 1; }
+[ "$*" = "display-message -p -t $TMUX_PANE #S" ] || { echo "unexpected call: $*" >&2; exit 2; }
+printf '%s\n' "$FAKE_TMUX_NAME"
+EOF
+chmod +x "$FB/tmux"
+# snote [args...]: note with the fake tmux first on PATH and an empty call log; the caller adds TMUX= TMUX_PANE= FAKE_TMUX_NAME= before it
+snote() { : >"$SLOG"; FAKE_TMUX_LOG="$SLOG" PATH="$FB:$PATH" note "$@"; }
+# tnote <session> [args...]: note from inside tmux (pane %7) whose session is called <session>
+tnote() { local nm=$1; shift; TMUX=/tmp/fake-tmux,1,0 TMUX_PANE=%7 FAKE_TMUX_NAME="$nm" snote "$@"; }
+nf() { sed -n "${1}p" "$(file)" | awk -F'\t' '{print NF}'; }   # nf <line>: number of TAB fields
 
 bash -n "$FN" && ok "syntax" || no "syntax"
 [ -x "$FN" ] && ok "script is executable" || no "script is executable"
@@ -90,7 +109,8 @@ eq "field 3 project" "$(field 1 3)" shop
 eq "field 4 kind" "$(field 1 4)" merge-ready
 eq "field 5 text" "$(field 1 5)" 'PR ready'
 eq "field 6 link empty (3 args)" "$(field 1 6)" ''
-eq "6 fields (5 tabs)" "$(sed -n 1p "$(file)" | tr -cd '\t' | wc -c | tr -d ' ')" 5
+eq "field 7 session empty (outside tmux)" "$(field 1 7)" ''
+eq "7 fields (6 tabs)" "$(sed -n 1p "$(file)" | tr -cd '\t' | wc -c | tr -d ' ')" 6
 eq "outbox mode" "$(stat -c %a "$(file)")" 600
 eq "dir mode" "$(stat -c %a "$D")" 700
 eq "lock mode" "$(stat -c %a "$D/outbox.lock")" 600
@@ -130,7 +150,7 @@ VN='Tiếng Việt: đã sẵn sàng 🚀 ❓ ⚠️ ℹ️'
 note shop info "$VN"
 eq "Vietnamese and emoji intact" "$(field 7 5)" "$VN"
 valid_utf8 "$(file)" && ok "file stays valid UTF-8" || no "file stays valid UTF-8"
-eq "every line has 6 fields" "$(awk -F'\t' 'NF!=6' "$(file)" | wc -l | tr -d ' ')" 0
+eq "every line has 7 fields" "$(awk -F'\t' 'NF!=7' "$(file)" | wc -l | tr -d ' ')" 0
 
 fresh
 note shop info "$(printf 'ệ%.0s' $(seq 305))"
@@ -188,6 +208,109 @@ note shop info 'same text'; eq "no link vs link: queued" "$RC" 0
 expect "duplicate after sanitizing the text" 'notify: duplicate' 0 shop info "same  text "
 NOW=
 
+# ---------- session: the 7th field comes from tmux ($TMUX and $TMUX_PANE set), never from the arguments ----------
+AUTOBUMP=1
+fresh
+tnote work-1 shop merge-ready 'PR ready' 'https://github.com/acme/shop/pull/12'
+[[ $OUT =~ ^notify:\ queued\ ([0-9]{10}-[0-9a-f]{8})$ ]] && ok "in tmux: queued line shape" || no "in tmux: queued line shape ('$OUT')"
+ID=${BASH_REMATCH[1]:-}
+eq "in tmux: exit 0" "$RC" 0
+eq "in tmux: record order id epoch project kind text link session" "$(sed -n 1p "$(file)")" "$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' "$ID" "$NOW" shop merge-ready 'PR ready' 'https://github.com/acme/shop/pull/12' work-1)"
+eq "in tmux: 7 fields" "$(nf 1)" 7
+eq "in tmux: tmux asked once, for the pane" "$(cat "$SLOG")" 'display-message -p -t %7 #S'
+noerr "in tmux"
+tnote work-2 shop info 'no link, with session'
+eq "session with an empty link: field 6 empty" "$(field 2 6)" ''
+eq "session with an empty link: field 7 is the session" "$(field 2 7)" work-2
+eq "session with an empty link: 7 fields" "$(nf 2)" 7
+tnote work-3 shop info 'text stays whole' 'https://a.io/x'
+eq "session does not leak into the text" "$(field 3 5)" 'text stays whole'
+
+# outside tmux the session is empty, no error, and tmux is not even called
+fresh
+snote shop info 'plain'
+eq "no TMUX, no TMUX_PANE: queued rc 0" "$RC/$([[ $OUT =~ ^notify:\ queued\  ]] && echo y)" 0/y
+eq "no TMUX, no TMUX_PANE: session empty, 7 fields" "$(field 1 7)/$(nf 1)" /7
+eq "no TMUX, no TMUX_PANE: tmux not called" "$(wc -c <"$SLOG" | tr -d ' ')" 0
+noerr "no TMUX, no TMUX_PANE"
+TMUX_PANE=%7 FAKE_TMUX_NAME=work-1 snote shop info 'pane only'
+eq "TMUX_PANE without TMUX: session empty, 7 fields" "$RC/$(field 2 7)/$(nf 2)" 0//7
+eq "TMUX_PANE without TMUX: tmux not called" "$(wc -c <"$SLOG" | tr -d ' ')" 0
+noerr "TMUX_PANE without TMUX"
+TMUX=/tmp/fake-tmux,1,0 FAKE_TMUX_NAME=work-1 snote shop info 'tmux only'
+eq "TMUX without TMUX_PANE: session empty, 7 fields" "$RC/$(field 3 7)/$(nf 3)" 0//7
+eq "TMUX without TMUX_PANE: tmux not called" "$(wc -c <"$SLOG" | tr -d ' ')" 0
+noerr "TMUX without TMUX_PANE"
+TMUX=/tmp/fake-tmux,1,0 TMUX_PANE=%7 FAKE_TMUX_FAIL=1 snote shop info 'tmux fails'
+eq "tmux exits 1: session empty, queued, rc 0" "$RC/$(field 4 7)/$(nf 4)/$([[ $OUT =~ ^notify:\ queued\  ]] && echo y)" 0//7/y
+eq "tmux exits 1: tmux was asked" "$(wc -l <"$SLOG" | tr -d ' ')" 1
+noerr "tmux exits 1"
+tnote '' shop info 'tmux prints nothing'
+eq "tmux prints an empty name: session empty, rc 0" "$RC/$(field 5 7)/$(nf 5)" 0//7
+noerr "tmux prints an empty name"
+
+# a name that fails ^[a-z0-9][a-z0-9._-]{0,63}$ gives an empty session (the note itself is still queued)
+fresh
+i=0
+for bad in '' Work -work .work _work 'a b' 'a;b' 'a/b' 'a:b' 'a$(touch '"$T"'/pwn7)' 'a`touch '"$T"'/pwn8`' $'a\tb' $'a\rb' ' work' 'work ' "$(U 'ph\xc3\xaan')" "$(U 'a\xe2\x80\xaeb')" "$(printf 'a%.0s' $(seq 65))"; do
+  i=$((i + 1)); tnote "$bad" shop info "bad session $i"
+  eq "bad session name '$(printf %q "$bad")': queued with an empty session" "$RC/$(field $i 7)/$(nf $i)/$([[ $OUT =~ ^notify:\ queued\  ]] && echo y)" 0//7/y
+  noerr "bad session name $i"
+done
+ls "$T"/pwn* >/dev/null 2>&1 && no "session name: nothing executed" || ok "session name: nothing executed"
+eq "bad names: every line has 7 fields" "$(awk -F'\t' 'NF!=7' "$(file)" | wc -l | tr -d ' ')" 0
+# valid names pass through unchanged (boundaries: 1 and 64 characters, . _ - inside)
+fresh
+i=0
+for good in a 0 work-1 a.b_c-d ops-2.x "$(printf 'a%.0s' $(seq 64))"; do
+  i=$((i + 1)); tnote "$good" shop info "good session $i"
+  eq "good session name '$good' kept" "$(field $i 7)" "$good"
+done
+
+# FCODE_NOTIFY_SESSION overrides tmux, with the test flag only (the flag is on here; the flag-off rows are with the other hook rows)
+fresh
+FCODE_NOTIFY_SESSION=forced-1 snote shop info 'override outside tmux'
+eq "override outside tmux (flag on)" "$RC/$(field 1 7)/$(nf 1)" 0/forced-1/7
+noerr "override outside tmux"
+FCODE_NOTIFY_SESSION=forced-2 tnote work-1 shop info 'override inside tmux'
+eq "override beats the tmux name (flag on)" "$(field 2 7)" forced-2
+FCODE_NOTIFY_SESSION='Bad Name' snote shop info 'bad override'
+eq "bad override value is never stored" "$RC/$(field 3 7)/$(nf 3)" 0//7
+noerr "bad override"
+FCODE_NOTIFY_SESSION= tnote work-1 shop info 'empty override'
+eq "an empty override (set, flag on) gives an empty session even inside tmux" "$(field 4 7)/$(nf 4)" /7
+AUTOBUMP=0
+
+# ---------- duplicates also compare the session ----------
+fresh
+NOW=$BASE; FCODE_NOTIFY_SESSION=alpha note shop info 'same text' 'https://a.io/x'
+eq "dup: first from alpha queued, session alpha" "$RC/$(field 1 7)" 0/alpha
+NOW=$((BASE + 60)); FCODE_NOTIFY_SESSION=alpha expect "dup: same text, same session: duplicate" 'notify: duplicate' 0 shop info 'same text' 'https://a.io/x'
+eq "dup: duplicate writes nothing" "$(lines)" 1
+FCODE_NOTIFY_SESSION=beta note shop info 'same text' 'https://a.io/x'
+[[ $OUT =~ ^notify:\ queued\  ]] && ok "dup: same text from another session: queued" || no "dup: same text from another session: queued ('$OUT')"
+eq "dup: the other session is stored" "$(field 2 7)" beta
+note shop info 'same text' 'https://a.io/x'
+[[ $OUT =~ ^notify:\ queued\  ]] && ok "dup: same text without session vs with: queued" || no "dup: same text without session vs with: queued ('$OUT')"
+eq "dup: 3 lines now" "$(lines)" 3
+expect "dup: same text without session again: duplicate" 'notify: duplicate' 0 shop info 'same text' 'https://a.io/x'
+FCODE_NOTIFY_SESSION=alpha expect "dup: alpha again (older copy in the file): duplicate" 'notify: duplicate' 0 shop info 'same text' 'https://a.io/x'
+FCODE_NOTIFY_SESSION=beta expect "dup: beta again: duplicate" 'notify: duplicate' 0 shop info 'same text' 'https://a.io/x'
+NOW=$((BASE + 1860)); FCODE_NOTIFY_SESSION=alpha note shop info 'same text' 'https://a.io/x'
+[[ $OUT =~ ^notify:\ queued\  ]] && ok "dup: alpha after 31 min: queued" || no "dup: alpha after 31 min: queued ('$OUT')"
+NOW=
+# an old 6-field line (written before the 7th field existed) still takes part: equal to a note without session, different from one with
+fresh; mkdir -p "$D"
+OLD=$(printf '%s\t%s\t%s\t%s\t%s\t%s' 1899999990-deadbeef 1899999990 shop info 'old text' '')
+printf '%s\n' "$OLD" >"$(file)"
+expect "old 6-field line = same note without session: duplicate" 'notify: duplicate' 0 shop info 'old text'
+eq "old 6-field line: duplicate writes nothing" "$(lines)" 1
+FCODE_NOTIFY_SESSION=alpha note shop info 'old text'
+[[ $OUT =~ ^notify:\ queued\  ]] && ok "old 6-field line vs a note with a session: queued" || no "old 6-field line vs a note with a session: queued ('$OUT')"
+eq "old 6-field line kept byte for byte" "$(sed -n 1p "$(file)")" "$OLD"
+eq "old 6-field line then new 7-field line" "$(nf 1)/$(nf 2)/$(field 2 7)" 6/7/alpha
+eq "old 6-field line then the new line: 2 lines" "$(lines)" 2
+
 # ---------- rate limits: 6 per project / 15 in total per 60 min ----------
 fresh
 NOW=$BASE
@@ -221,6 +344,7 @@ eq "newest is note 55" "$(field 50 5)" 'note 55'
 eq "mode still 600 after rewrites" "$(stat -c %a "$(file)")" 600
 eq "ids unique" "$(cut -f1 "$(file)" | sort -u | wc -l | tr -d ' ')" 50
 eq "all ids shaped <epoch>-<hex8>, epoch equal field 2" "$(awk -F'\t' '$1 !~ /^[0-9]{10}-[0-9a-f]{8}$/ || substr($1,1,10) != $2' "$(file)" | wc -l | tr -d ' ')" 0
+eq "cap: every kept line has 7 fields" "$(awk -F'\t' 'NF!=7' "$(file)" | wc -l | tr -d ' ')" 0
 NOW=
 
 # ---------- no hooks without FCODE_NOTIFY_TEST=1 ----------
@@ -242,6 +366,17 @@ for tv in unset 0 ''; do
 done
 OUT=$(HOME="$H2" FCODE_NOTIFY_TEST=1 FCODE_NOTIFY_NOW=abc bash "$FN" shop info 'bad now'); RC=$?
 eq "invalid FCODE_NOTIFY_NOW with the flag: io" "$OUT/$RC" 'error: io/1'
+# the session override is a test hook too: ignored unless FCODE_NOTIFY_TEST=1 (outside tmux: empty; inside tmux: the tmux name)
+for tv in unset 0 ''; do
+  if [ "$tv" = unset ]; then E=(env -u FCODE_NOTIFY_TEST); else E=(env "FCODE_NOTIFY_TEST=$tv"); fi
+  W="$H2/.local/state/fcode/notify/outbox.tsv"
+  rm -rf "$H2/.local"
+  OUT=$("${E[@]}" HOME="$H2" FCODE_NOTIFY_SESSION=forced-x bash "$FN" shop info 'no session hook'); RC=$?
+  eq "FCODE_NOTIFY_TEST=$tv: FCODE_NOTIFY_SESSION ignored outside tmux" "$RC/$(cut -f7 "$W")/$(awk -F'\t' '{print NF}' "$W")" 0//7
+  rm -rf "$H2/.local"; : >"$SLOG"
+  OUT=$("${E[@]}" HOME="$H2" FCODE_NOTIFY_SESSION=forced-x TMUX=/tmp/fake-tmux,1,0 TMUX_PANE=%7 FAKE_TMUX_NAME=real-1 FAKE_TMUX_LOG="$SLOG" PATH="$FB:$PATH" bash "$FN" shop info 'no session hook'); RC=$?
+  eq "FCODE_NOTIFY_TEST=$tv: FCODE_NOTIFY_SESSION ignored in tmux, the tmux name is used" "$RC/$(cut -f7 "$W")/$(awk -F'\t' '{print NF}' "$W")" 0/real-1/7
+done
 rm -rf "$H2"
 
 # ---------- io: old file unchanged ----------
