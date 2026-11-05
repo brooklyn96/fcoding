@@ -2173,7 +2173,7 @@ function Invoke-MoveCall($S, [string]$Machine, [string]$Step, [string[]]$VArgs =
     $so = Get-MoveStatus $S $other -Quiet
     foreach ($l in @(@($st.Lines) + @($so.Lines) | Where-Object { "$_" -cmatch '\AMOVE state ' })) { Write-Host "  $l" }
     if (-not $st.Ok) { $script:MoveNoAnswer = $true; return @{ Code = -1; Lines = $r.Lines; Id = $id; Known = $false } }
-    if ([string]$st.Kv['call'] -ceq $id -and [string]$st.Kv['call_state'] -ceq 'failed') { return @{ Code = $(if ("$($st.Kv['rc'])" -match '\A[0-9]+\z') { [int]$st.Kv['rc'] } else { 1 }); Lines = $r.Lines; Id = $id; Known = $true } }
+    if ([string]$st.Kv['call'] -ceq $id -and [string]$st.Kv['call_state'] -ceq 'failed') { Set-MoveNetLoss $r.Lines; return @{ Code = $(if ("$($st.Kv['rc'])" -match '\A[0-9]+\z') { [int]$st.Kv['rc'] } else { 1 }); Lines = $r.Lines; Id = $id; Known = $true } }
   }
   if (-not $r.Known) { $script:MoveNoAnswer = $true; return @{ Code = -1; Lines = $r.Lines; Id = $id; Known = $false } }
   foreach ($l in $r.Lines) {
@@ -2182,8 +2182,12 @@ function Invoke-MoveCall($S, [string]$Machine, [string]$Step, [string[]]$VArgs =
       Set-MoveProp $o $Machine ([int]$Matches[3]); Save-MoveState $S
     }
   }
+  if ($r.Code -ne 0) { Set-MoveNetLoss $r.Lines }
   @{ Code = $r.Code; Lines = $r.Lines; Id = $id; Known = $true }
 }
+# B26 (ruling 05/11 (20)): a copy that failed with `MOVE error rsync-failed why=net` (any c.transfer.N, x.final) is a no-answer of the sending
+# side: it marks the run like a lost call, so the one exit of `fcode move` (Invoke-Move) ends an exit 1 with the re-run sentence. Set-only.
+function Set-MoveNetLoss($Lines) { if (@($Lines | Where-Object { "$_" -cmatch '\AMOVE error rsync-failed why=net' }).Count) { $script:MoveNoAnswer = $true } }
 # DESIGN-GAP (T10-G46, F8g): D.15 fixes "không = exit 0, nothing written" for Q-cut only; reading: Q-cut and Q-abort "không" end 0,
 # while a data-loss question (Q-back, Q-finish) answered with anything but YES ends 65 (refused, nothing done).
 function Get-MoveDeclinedExit { 65 }
@@ -3688,8 +3692,8 @@ function Invoke-MoveRun([string[]]$MoveArgs) {
   } finally { $lock.Dispose() }
 }
 
-# B24: the one exit of `fcode move`. MoveNoAnswer is set by four places — Invoke-MoveCall's -1 returns, Invoke-MoveScript's 124/255/-1,
-# ConvertTo-MoveExit, Write-MoveNoAnswer — and cleared only at the carry-back's start (D.5.2: that loss was resolved by new's status answer).
+# B24: the one exit of `fcode move`. MoveNoAnswer is set by five places — Invoke-MoveCall's -1 returns, Set-MoveNetLoss (a failed copy with
+# why=net, B26), Invoke-MoveScript's 124/255/-1, ConvertTo-MoveExit, Write-MoveNoAnswer — and cleared only at the carry-back's start (D.5.2: that loss was resolved by new's status answer).
 # A run that ends 1 with it set prints the re-run sentence last, once: bare here unless Write-MoveNoAnswer already printed it with its head.
 # Never on 0, 10, 65, 70, 75.
 function Invoke-Move([string[]]$MoveArgs) {
