@@ -967,6 +967,66 @@ T 'L.pre-platform-mixed: a D.3 copy re-run checks its re-plan against the stored
   $W.Mf.items = @($W.Mf.items) + $node
   [void](Do-Copy 0); Ok ((Sent 'old' '-c\.repin\.1$') -eq 1) "the re-plan went on to c.repin.1: $(LogNow)"; Eq (@(LogNow | Where-Object { $_ -match 'script:preflight' }).Count) 0 'new not asked again'
 }
+$PlatformEtc = @('/etc/instabox', '/etc/profile.d/instabox-universal.sh', '/etc/profile.d/instabox-tmpdir.sh', '/etc/profile.d/zz-instabox-secrets.sh', '/etc/profile.d/instabox-npm.sh', '/etc/sudoers.d/90-instabox-sudo', '/etc/sysctl.d/60-instabox-ping.conf', '/etc/tmpfiles.d/instabox-data-tmp.conf', '/etc/ssl/certs/instabox-proxy.pem')   # CONTRACT §3.5 LIST platform-etc (rulings 05/11 (22), (24); no glob)
+T 'L.pre-platform-etc: every path of LIST platform-etc (/etc/instabox and the eight instabox files in /etc) is a platform path: with platform=1 a source outside the platform scope that emits it as a tree, a file, a files entry, or something under /etc/instabox is refused at 3b (target-not-empty, nothing written); with platform=0 the same manifest passes (B.5.2 mixed pair, CONTRACT §3.5; the list itself is compared with CONTRACT in L.platform-lists-match-contract)' {
+  $pf = { param($p) @('INV target user=quoc uid=1000 home-nonskel=1', "INV target platform=$p", 'INV target stop_budget_s=120') }
+  $cases = @(
+    @([ordered]@{ id = 'tree-etc-instabox-keys'; root = '/etc/instabox/keys'; kind = 'tree'; bytes_apparent = 1000; inodes = 3 }, '/etc/instabox/keys'),
+    @([ordered]@{ id = 'files-etc-instabox-gw'; root = '/etc'; kind = 'files'; files_from = @('instabox/gateway.key'); bytes_apparent = 100; inodes = 1 }, '/etc/instabox/gateway.key'))
+  foreach ($e in $PlatformEtc) {
+    $dir = $e.Substring(0, $e.LastIndexOf('/')); $leaf = $e.Substring($e.LastIndexOf('/') + 1)
+    $cases += , @([ordered]@{ id = "tree-$($leaf)"; root = $e; kind = 'tree'; bytes_apparent = 1000; inodes = 3 }, $e)
+    $cases += , @([ordered]@{ id = "file-$($leaf)"; root = $e; kind = 'file'; bytes_apparent = 100; inodes = 1 }, $e)
+    $cases += , @([ordered]@{ id = "files-$($leaf)"; root = $dir; kind = 'files'; files_from = @($leaf); bytes_apparent = 100; inodes = 1 }, $e)
+  }
+  foreach ($c in $cases) {
+    Reset-World; $W.Pf = & $pf 1; $W.Mf.items = @($W.Mf.items) + $c[0]
+    [void](Do-Plan -Want 65); HasText 'Máy mới không trống'; HasText $c[1]; NothingWritten "[$($c[1])] nothing written"; Eq (@(RecCalls -All).Count) 0 'no recorded call'
+    Reset-World; $W.Pf = & $pf 0; $W.Mf.items = @($W.Mf.items) + $c[0]
+    [void](Do-Plan -Want 0)
+  }
+  Reset-World; $W.Pf = & $pf 1; $W.Mf.items = @($W.Mf.items) + [ordered]@{ id = 'tree-etc-instabox-other'; root = '/etc/instabox-other'; kind = 'tree'; bytes_apparent = 1000; inodes = 3 }
+  [void](Do-Plan -Want 0)   # a sibling name is no prefix match
+  Reset-World; $W.Pf = & $pf 1; $W.Mf.items = @($W.Mf.items) + [ordered]@{ id = 'files-etc-profile-d-other'; root = '/etc/profile.d'; kind = 'files'; files_from = @('mine.sh'); bytes_apparent = 100; inodes = 1 }
+  [void](Do-Plan -Want 0)   # a neighbour in the same directory is no platform path
+}
+# ---- ruling 05/11 (25) (B31): the 3b guard also refuses an item root or files name that HOLDS a platform path (an ancestor) and a deleted_conffiles entry at or under one ----
+T 'L.pre-platform-ancestor: with platform=1 an item root (tree) or a files name that is an ancestor of a platform path (/etc, /etc/profile.d, /etc/sudoers.d, /etc/ssl/certs, /etc/systemd/system, /usr/local/bin, /opt: its transfer would overwrite or --delete new''s platform files) is refused at 3b with the standard target-not-empty text, nothing written; with platform=0 the same manifest passes; a sibling with a longer name and a files item whose root is only the base directory pass (ruling 05/11 (25) R11-INT-ancestor)' {
+  $pf = { param($p) @('INV target user=quoc uid=1000 home-nonskel=1', "INV target platform=$p", 'INV target stop_budget_s=120') }
+  $cases = @()
+  foreach ($r in '/etc', '/etc/profile.d', '/etc/sudoers.d', '/etc/sysctl.d', '/etc/tmpfiles.d', '/etc/ssl', '/etc/ssl/certs', '/etc/systemd/system', '/usr/local', '/usr/local/bin', '/usr/local/share', '/opt') {
+    $cases += , @([ordered]@{ id = "tree-anc$($r.Replace('/', '-'))"; root = $r; kind = 'tree'; bytes_apparent = 1000; inodes = 3 }, $r)
+  }
+  foreach ($n in @(@('/etc', 'profile.d'), @('/etc', 'sudoers.d'), @('/etc', 'ssl/certs'), @('/etc/systemd', 'system'), @('/usr/local', 'bin'), @('/', 'opt'))) {
+    $path = if ($n[0] -ceq '/') { "/$($n[1])" } else { "$($n[0])/$($n[1])" }
+    $cases += , @([ordered]@{ id = "files-anc$($path.Replace('/', '-'))"; root = $n[0]; kind = 'files'; files_from = @($n[1]); bytes_apparent = 100; inodes = 1 }, $path)
+  }
+  foreach ($c in $cases) {
+    Reset-World; $W.Pf = & $pf 1; $W.Mf.items = @($W.Mf.items) + $c[0]
+    [void](Do-Plan -Want 65); HasText 'Máy mới không trống'; HasText "path=$($c[1])"; NothingWritten "[$($c[1])] nothing written"; Eq (@(RecCalls -All).Count) 0 'no recorded call'
+    Reset-World; $W.Pf = & $pf 0; $W.Mf.items = @($W.Mf.items) + $c[0]
+    [void](Do-Plan -Want 0)
+  }
+  foreach ($ok in @([ordered]@{ id = 'tree-etc-profile-dx'; root = '/etc/profile.dx'; kind = 'tree'; bytes_apparent = 1000; inodes = 3 },
+                    [ordered]@{ id = 'tree-etc-nginx'; root = '/etc/nginx'; kind = 'tree'; bytes_apparent = 1000; inodes = 3 },
+                    [ordered]@{ id = 'files-etc-hosts'; root = '/etc'; kind = 'files'; files_from = @('hosts'); bytes_apparent = 100; inodes = 1 })) {
+    Reset-World; $W.Pf = & $pf 1; $W.Mf.items = @($W.Mf.items) + $ok
+    [void](Do-Plan -Want 0)   # [$($ok.root)]: no platform path under it, and a files root is only a base directory
+  }
+}
+T 'L.pre-platform-delconf: with platform=1 a deleted_conffiles entry at or under a platform path (/etc/sudoers.d/90-instabox-sudo, a file under /etc/instabox, a platform unit file, /usr/local/bin/node) is refused at 3b with the standard target-not-empty text, nothing written (the conffile delete would remove new''s file); with platform=0, or an entry outside the platform paths, the plan passes (ruling 05/11 (25) R11-INT-delconf)' {
+  $pf = { param($p) @('INV target user=quoc uid=1000 home-nonskel=1', "INV target platform=$p", 'INV target stop_budget_s=120') }
+  foreach ($p in '/etc/sudoers.d/90-instabox-sudo', '/etc/instabox/identity', '/etc/profile.d/instabox-npm.sh', '/etc/systemd/system/sshd.service', '/usr/local/bin/node', '/opt/npm/etc/npmrc') {
+    Reset-World; $W.Pf = & $pf 1; $W.Mf.deleted_conffiles = @($p)
+    [void](Do-Plan -Want 65); HasText 'Máy mới không trống'; HasText "path=$p"; NothingWritten "[$p] nothing written"; Eq (@(RecCalls -All).Count) 0 'no recorded call'
+    Reset-World; $W.Pf = & $pf 0; $W.Mf.deleted_conffiles = @($p)
+    [void](Do-Plan -Want 0)
+  }
+  Reset-World; $W.Pf = & $pf 1; $W.Mf.deleted_conffiles = @('/etc/nginx/nginx.conf', '/etc/profile.d/mine.sh')
+  [void](Do-Plan -Want 0)
+  Reset-World; $W.Pf = & $pf 1; $W.Mf.deleted_conffiles = @('/etc/nginx/nginx.conf', '/etc/sudoers.d/90-instabox-sudo')
+  [void](Do-Plan -Want 65); HasText 'path=/etc/sudoers.d/90-instabox-sudo'; NoText 'path=/etc/nginx/nginx.conf'
+}
 T 'L.pre-reach: preflight refusing old-unreachable, new-unreachable or dns ends plan with 65 and the label' {
   foreach ($c in @(@('old-unreachable', 'Máy mới không kết nối được máy cũ'), @('new-unreachable host=github.com', 'Máy mới không kết nối được tới địa chỉ cần thiết'), @('dns why=unreachable', 'Không tra được DNS qua DoH'))) {
     Reset-World; $W.Pf = @("INV refuse $($c[0])"); $W.PfCode = 65
@@ -1066,6 +1126,21 @@ T 'L.pre-rsync-argv: the preflight script refuses a client argv that is not its 
 # ============================== the shipped preflight script, run for real (G.2, W1-T11-DG-R11-3; bash cases) ==============================
 $PfArgs = @('--old-addr', $OldAddr, '--addr', $NewAddr, '--src-os', 'debian-13', '--src-arch', 'x86_64', '--src-systemd', '257')
 $PlatformUnits = @('instabox-data-init.service', 'instabox-guest-agent.service', 'instabox-guest-reboot.service', 'instabox-identity.service', 'instabox-ssh-hostkeys.service', 'instabox-user.service', 'sshd.service')   # CONTRACT §3.5 LIST platform-units
+T 'L.platform-lists-match-contract: the laptop lists (Get-MovePlatformUnits, the /etc and /opt entries of Get-MovePlatformPaths) and the suite''s pinned $PlatformEtc / $PlatformUnits equal CONTRACT `LIST platform-units`, `LIST platform-etc` and `LIST platform-opt`, in order (CONTRACT §3, §3.5; MV_CONTRACT)' {
+  $p = $env:MV_CONTRACT
+  Ok ($p -and (Test-Path -LiteralPath $p)) "MV_CONTRACT must name deploy-gate docs/move/CONTRACT.md (got [$p])"
+  $ct = [IO.File]::ReadAllText($p) -replace "`r`n", "`n"
+  $list = { param($n) $m = [regex]::Match($ct, "(?m)^LIST $n`: (.+)$"); if ($m.Success) { @($m.Groups[1].Value.Trim() -split '\s+') } else { @() } }
+  $units = & $list 'platform-units'; $etc = & $list 'platform-etc'; $opt = & $list 'platform-opt'
+  Ok ($units.Count -gt 0 -and $etc.Count -gt 0 -and $opt.Count -gt 0) "CONTRACT carries the three platform lists (units $($units.Count), etc $($etc.Count), opt $($opt.Count))"
+  $pp = @(Get-MovePlatformPaths)
+  Eq (@(Get-MovePlatformUnits) -join ' ') ($units -join ' ') 'laptop units = LIST platform-units'
+  Eq ($PlatformUnits -join ' ') ($units -join ' ') 'suite $PlatformUnits = LIST platform-units'
+  Eq (@($pp | Where-Object { $_.StartsWith('/etc/') }) -join ' ') ($etc -join ' ') 'laptop /etc entries = LIST platform-etc'
+  Eq ($PlatformEtc -join ' ') ($etc -join ' ') 'suite $PlatformEtc = LIST platform-etc'
+  Eq (@($pp | Where-Object { $_.StartsWith('/opt/') }) -join ' ') ($opt -join ' ') 'laptop /opt entries = LIST platform-opt'
+  Eq (@($pp | Select-Object -First ($etc.Count + $opt.Count)) -join ' ') ((@($etc) + @($opt)) -join ' ') 'the list starts with platform-etc then platform-opt (MV_PLATFORM order)'
+}
 function Fx-File([string]$R, [string]$P, [string]$Text = "x`n") { $f = Join-Path $R $P.TrimStart('/'); [void](New-Item -ItemType Directory -Force -Path (Split-Path -Parent $f)); [IO.File]::WriteAllText($f, $Text, $utf8) }
 # a fixture root: dpkg lists, /etc/skel, /etc/subuid, /etc/subgid, and fx-passwd / fx-group (what the getent stub answers)
 function Pf-Root {
