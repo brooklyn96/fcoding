@@ -4,6 +4,9 @@
 # ~/.omp and the real box are never touched. Everything lives in a temp folder that is removed at the end.
 #   FCODE_TEST_BOX=1   also run one end-to-end pass on the real Oracle box over `ssh oracle` (throwaway HOME there; laptop side = temp USERPROFILE).
 #   FCODE_TEST_ONLY=<regex>   run only the tests whose name matches (used for the mutant runs)
+#   FCODE_TEST_CLIPBOARD=1   Windows only: also run the clipboard server tests that replace or hold the real clipboard (204 / 200 / 413 / 500, cache and change). Every clipboard
+#   format is saved first and put back afterwards; without this variable the clipboard is never changed or held (those tests print SKIP). The server child itself only READS it
+#   while it runs (its idle sequence-number poll and pre-encode, see "clip server speed"); the stub-clipboard tests of the same name need neither Windows nor the variable.
 # Test-only overrides of fcode.ps1 used by the 1.3.3 tests (`phien --nhanh`, `moc`): FCODE_PHIEN_CAP_SEC (the 20 s cap of --nhanh), FCODE_DOCUMENTS
 # (stands for [Environment]::GetFolderPath('MyDocuments'), where `fcode moc` keeps the PowerShell profiles), FCODE_PHIEN_LOCK (the lock name),
 # FCODE_MOC_DELAY (read by `fcode phien <p> --nhanh --nen`, the hook's run after the agent ends: seconds it waits first; 35 by default, the tests use 4).
@@ -40,7 +43,8 @@ $wanted = 'Test-WinPath', 'Resolve-OmpPath', 'Get-OmpUnder', 'Join-OmpName', 'Ge
   'Test-PhienTimeUp', 'Get-PhienChildMs', 'Stop-PhienProc', 'ConvertTo-PhienArg', 'Invoke-PhienExe',
   'Write-PhienText', 'Test-PhienReparse', 'Get-PhienLockName', 'Add-PhienLog', 'Write-PhienOut', 'Get-PhienCapSec', 'Get-PhienNenDelaySec', 'Invoke-PhienBounded',
   'Clear-PhienPartFiles', 'Test-PhienOwnerGone', 'Get-PhienMarkRx', 'Test-PhienMarkedLine', 'ConvertTo-PhienLatin1', 'Read-PhienExcludeText', 'Get-PhienRepoId', 'Get-PhienRepoIdNow', 'Test-PhienSharedNote', 'Get-PhienLaptopRelease',
-  'Get-PrefsPath', 'Get-PrefsMap', 'Get-PrefsNames', 'Get-ProjectAliases', 'Save-PrefsCache', 'Resolve-ProjectName', 'Format-ProjectName', 'Get-PhienKeyOf', 'Get-LocalRepoKey', 'Get-BareScript'
+  'Get-PrefsPath', 'Get-PrefsMap', 'Get-PrefsNames', 'Get-ProjectAliases', 'Save-PrefsCache', 'Resolve-ProjectName', 'Format-ProjectName', 'Get-PhienKeyOf', 'Get-LocalRepoKey', 'Get-BareScript',
+  'New-FcodeHex', 'New-FcodeClipSock', 'Invoke-FcodeClipServe', 'Start-FcodeClipServer', 'Stop-FcodeClipServer'
 foreach ($fn in $ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in $wanted }, $true)) { . ([scriptblock]::Create($fn.Extent.Text)) }
 # the git half and the file half that Install-PhienNote uses (git first, then the move, then the line), as one call for the exclude tests below
 function Add-PhienNoteExclude([string]$Dir, [string]$Name) { $f = Get-PhienExcludeFile $Dir $Name; [bool]($f -and (Add-PhienExcludeLine $f $Name)) }
@@ -3747,9 +3751,23 @@ a = sys.argv[1:]
 if 'base64 -d' in a[-1] and 'python3' not in a[-1]:
     open(os.environ['BARE_LOG'], 'a', encoding='utf-8').write(a[-1] + '\n')
     open(os.environ['BARE_LOG'] + '.argv', 'a', encoding='utf-8').write(' '.join(a[:-1]) + '\n')   # the options and the host, as fcode gave them
+    open(os.environ['BARE_LOG'] + '.tok', 'a', encoding='utf-8').write('bare:' + os.environ.get('LC_FCODE_CLIP_TOKEN', '') + '\n')   # the token env ssh was started with (empty: none)
     t = gzip.decompress(base64.b64decode(re.search(r'echo (\S+) \|', a[-1]).group(1))).decode('utf-8')
     w = re.search(r"(?m)^set -- '(.*)'", t).group(1)
+    if os.environ.get('BARE_PROBE'):   # BARE_PROBE=1: ask the laptop's clipboard server through the -R port while "ssh" runs (no token: the answer is the status line, no clipboard is touched)
+        import socket
+        m = re.search(r'-R \S+:127\.0\.0\.1:(\d+)', ' '.join(a[:-1]))
+        if m:
+            s = socket.create_connection(('127.0.0.1', int(m.group(1))), 10); s.settimeout(20)
+            s.sendall(b'GET /image HTTP/1.0\r\n\r\n'); d = b''
+            while True:
+                c = s.recv(4096)
+                if not c: break
+                d += c
+            s.close()
+            open(os.environ['BARE_LOG'] + '.probe', 'a', encoding='utf-8').write(d.split(b'\r\n')[0].decode('latin-1') + '\n')
     sys.exit(78 if w in os.environ.get('BARE_FAIL', '').split(',') else 255 if w in os.environ.get('BARE_DROP', '').split(',') else 0)
+if os.environ.get('BARE_LOG'): open(os.environ['BARE_LOG'] + '.tok', 'a', encoding='utf-8').write('other:' + os.environ.get('LC_FCODE_CLIP_TOKEN', '') + '\n')   # any other ssh call (a box ask): the token env must be gone by now
 sys.exit(subprocess.call([sys.executable, r'@@FAKE@@'] + a))
 '@
   [IO.File]::WriteAllText($py, $src.Replace('@@FAKE@@', $fake), $utf8)
@@ -3770,20 +3788,642 @@ T 'alias e2e: the bare form turns an alias into the real name before the script 
   Eq ((Get-BareArgs $w) -join '|') 'proj|proj|proj|2|omp-1'
   Eq (Calls $w 'projects') 0 'the cache was there: no extra call'
 }
+# the options of one logged ssh call (BareLog.argv line) without the clipboard forward: the rest, and what the forward was
+function Split-ClipArgv([string]$Line) {
+  $m = [regex]::Match($Line, ' -R (/tmp/fcode-clip-[0-9a-f]{16}\.sock):127\.0\.0\.1:(\d+)(?= )')
+  $o = ' -o StreamLocalBindUnlink=yes'; $se = ' -o SendEnv=LC_FCODE_CLIP_TOKEN'
+  $rest = $Line; if ($m.Success) { $rest = $rest.Replace($m.Value, '') }
+  $un = $rest.Contains($o); if ($un) { $rest = $rest.Replace($o, '') }
+  $sd = $rest.Contains($se); if ($sd) { $rest = $rest.Replace($se, '') }
+  [pscustomobject]@{ Rest = $rest; Sock = $m.Groups[1].Value; Port = $m.Groups[2].Value; Unlink = $un; SendEnv = $sd }
+}
+function Get-TokLog($w) { if (Test-Path ($w.BareLog + '.tok')) { @(Get-Content ($w.BareLog + '.tok')) } else { @() } }   # 'bare:<token or empty>' per interactive/--list script call, 'other:<...>' per any other ssh call
 T 'bare form: `ssh -q -tt <host> <script>` with the host from config (default oracle), FCODE_HOST wins; `--list` has no tty option; no wake, no instabox' {
   $w = New-W2 'al6h'; Use-BareSsh $w; Set-AliasCache $w '{"order":[],"aliases":{}}'
   $r = Invoke-Fcode $w @('omp-1') @{ BARE_LOG = $w.BareLog }; Eq $r.Code 0 $r.Out
   $r = Invoke-Fcode $w @('omp-2') @{ BARE_LOG = $w.BareLog; FCODE_HOST = 'oracle-ubuntu' }; Eq $r.Code 0 $r.Out
   $r = Invoke-Fcode $w @('--list') @{ BARE_LOG = $w.BareLog }; Eq $r.Code 0 $r.Out
-  Eq ((Get-Content ($w.BareLog + '.argv')) -join '|') '-q -tt oracle|-q -tt oracle-ubuntu|oracle'
-  $rem = @(Get-Content $w.BareLog)[0]
-  Ok ($rem -match '\Abash <\(echo [A-Za-z0-9+/=]+ \| base64 -d \| gunzip\)\z' -and $rem.Length -lt 6000) ("the script travels gzip+base64, well under cmd.exe's 8191 limit (a .cmd ssh wrapper); length " + $rem.Length)
+  $ar = @(Get-Content ($w.BareLog + '.argv') | ForEach-Object { Split-ClipArgv $_ })
+  Eq (($ar | ForEach-Object { $_.Rest }) -join '|') '-q -tt oracle|-q -tt oracle-ubuntu|oracle' 'the old options and the host are unchanged'
+  Ok ($ar[0].Sock -and $ar[0].Unlink -and $ar[0].SendEnv -and $ar[1].Sock -and $ar[1].Unlink -and $ar[1].SendEnv) 'the interactive attach carries the clipboard forward and -o SendEnv=LC_FCODE_CLIP_TOKEN'
+  Ok (-not $ar[2].Sock -and -not $ar[2].Unlink -and -not $ar[2].SendEnv) '--list carries no forward and no SendEnv'
+  $rems = @(Get-Content $w.BareLog)
+  Ok ($rems[0] -match '\AFCODE_CLIP_SOCK=\S+ bash <\(echo [A-Za-z0-9+/=]+ \| base64 -d \| gunzip\)\z' -and $rems[0] -notmatch 'TOKEN' -and $rems[0].Length -lt 6000) ("the script travels gzip+base64, well under cmd.exe's 8191 limit (a .cmd ssh wrapper); only the socket path in the env prefix, no token; length " + $rems[0].Length)
+  Ok ($rems[2] -match '\Abash <\(echo [A-Za-z0-9+/=]+ \| base64 -d \| gunzip\)\z') '--list: no env prefix'
   $cfg = Join-Path $w.U '.fcode\config.json'; $c = Get-Content $cfg -Raw | ConvertFrom-Json
   [IO.File]::WriteAllText($cfg, (@{ ssh = $c.ssh; host = 'other-alias'; box = 'ignored'; syncRepos = @($w.LP) } | ConvertTo-Json -Compress))
   Remove-Item ($w.BareLog + '.argv')
   $env:FCODE_BOX = 'ignored-too'
   try { $r = Invoke-Fcode $w @('omp-3') @{ BARE_LOG = $w.BareLog }; Eq $r.Code 0 $r.Out } finally { Remove-Item Env:\FCODE_BOX }
-  Eq ((Get-Content ($w.BareLog + '.argv')) -join '|') '-q -tt other-alias' 'config host is used; config box and FCODE_BOX are not'
+  Eq ((Get-Content ($w.BareLog + '.argv') | ForEach-Object { (Split-ClipArgv $_).Rest }) -join '|') '-q -tt other-alias' 'config host is used; config box and FCODE_BOX are not'
+}
+T 'clip attach: the interactive attach forwards a remote socket to a loopback clipboard server (-R + StreamLocalBindUnlink); the token goes only in the LC_FCODE_CLIP_TOKEN environment of ssh (-o SendEnv), never in an argv or the remote command; the socket is in the box env; random per run; the server is gone when ssh returns; --list has none' {
+  $w = New-W2 'clip1'; Use-BareSsh $w; Set-AliasCache $w '{"order":[],"aliases":{}}'
+  $e = @{ BARE_LOG = $w.BareLog; WT_SESSION = 'wt-test'; BARE_PROBE = '1' }
+  $r = Invoke-Fcode $w @('omp-1') $e; Eq $r.Code 0 $r.Out
+  $r = Invoke-Fcode $w @('omp-1') $e; Eq $r.Code 0 $r.Out
+  $r = Invoke-Fcode $w @('--list') $e; Eq $r.Code 0 $r.Out
+  $ar = @(Get-Content ($w.BareLog + '.argv') | ForEach-Object { Split-ClipArgv $_ })
+  Eq $ar.Count 3
+  Eq (($ar | ForEach-Object { $_.Rest }) -join '|') '-q -tt oracle|-q -tt oracle|oracle'
+  foreach ($i in 0, 1) { Ok ($ar[$i].Sock -and [int]$ar[$i].Port -gt 0 -and $ar[$i].Unlink -and $ar[$i].SendEnv) "call $i : -R /tmp/fcode-clip-<16 hex>.sock:127.0.0.1:<port>, -o StreamLocalBindUnlink=yes and -o SendEnv=LC_FCODE_CLIP_TOKEN" }
+  Ok (-not $ar[2].Sock -and -not $ar[2].Unlink -and -not $ar[2].SendEnv) '--list: no forward'
+  Ok ($ar[0].Sock -ne $ar[1].Sock) 'a new socket name every run'
+  $rems = @(Get-Content $w.BareLog)
+  $m0 = [regex]::Match($rems[0], '\AFCODE_CLIP_SOCK=(\S+) bash <\(echo [A-Za-z0-9+/=]+ \| base64 -d \| gunzip\)\z')
+  $m1 = [regex]::Match($rems[1], '\AFCODE_CLIP_SOCK=(\S+) bash <\(')
+  Ok ($m0.Success -and $m1.Success) ("the env prefix; got: " + $rems[0].Substring(0, [Math]::Min(120, $rems[0].Length)))
+  Eq $m0.Groups[1].Value $ar[0].Sock 'the env socket is the -R socket'
+  Eq $m1.Groups[1].Value $ar[1].Sock 'the env socket is the -R socket (2nd run)'
+  $tk = @(Get-TokLog $w | Where-Object { $_ -like 'bare:*' })
+  Eq $tk.Count 3 'one token log line per ssh call'
+  Ok ($tk[0] -match '\Abare:[0-9a-f]{32}\z' -and $tk[1] -match '\Abare:[0-9a-f]{32}\z') ("ssh was started with LC_FCODE_CLIP_TOKEN = 32 hex; got [$($tk[0])] [$($tk[1])]")
+  Ok ($tk[0] -ne $tk[1]) 'a new token every run'
+  Eq $tk[2] 'bare:' '--list: no token in the environment'
+  $argvLines = @(Get-Content ($w.BareLog + '.argv'))
+  foreach ($i in 0, 1) {
+    $tok = $tk[$i].Substring(5)
+    Ok (-not $argvLines[$i].Contains($tok) -and -not $rems[$i].Contains($tok)) "call $i : the token is in no ssh argument and not in the remote command"
+    Ok ($argvLines[$i] -notmatch 'LC_FCODE_CLIP_TOKEN=' -and $rems[$i] -notmatch 'TOKEN') "call $i : no NAME=value for the token anywhere on the command line"
+  }
+  Ok ($rems[2] -notmatch 'FCODE_CLIP') '--list: no env'
+  $probe = @(Get-Content ($w.BareLog + '.probe'))
+  Eq $probe.Count 2 'the server answered while ssh was running (once per attach; none for --list)'
+  foreach ($p in $probe) { Ok ($p -match '\AHTTP/1\.[01] 403\b') "no token: 403; got [$p]" }
+  foreach ($i in 0, 1) {
+    $up = $true; $c = New-Object Net.Sockets.TcpClient
+    try { $c.Connect('127.0.0.1', [int]$ar[$i].Port) } catch { $up = $false } finally { $c.Close() }
+    Ok (-not $up) "call $i : nothing listens on port $($ar[$i].Port) after ssh returned"
+  }
+}
+T 'clip attach: the rc-78 alias retry runs ssh again with a FRESH -R socket path (sshd never removes a stale one), the env socket is that call''s -R socket, one listener serves both calls' {
+  $w = New-W2 'clip3'; Use-BareSsh $w; Set-AliasCache $w '{"order":[],"names":["proj","other"],"aliases":{},"repos":{}}'
+  Set-BoxPrefs $w '{"aliases":{"proj":"pj"}}'
+  $e = @{ BARE_LOG = $w.BareLog; BARE_FAIL = 'pj'; WT_SESSION = 'wt-test'; BARE_PROBE = '1' }
+  $r = Invoke-Fcode $w @('pj') $e; Eq $r.Code 0 $r.Out
+  Eq ((Get-BareArgs $w) -join '|') 'pj|proj' 'the box refused pj (78), the retry ran the real name'
+  $ar = @(Get-Content ($w.BareLog + '.argv') | ForEach-Object { Split-ClipArgv $_ })
+  Eq $ar.Count 2 'two ssh calls'
+  foreach ($i in 0, 1) { Ok ($ar[$i].Sock -and [int]$ar[$i].Port -gt 0 -and $ar[$i].Unlink -and $ar[$i].SendEnv) "call $i carries -R /tmp/fcode-clip-<16 hex>.sock:127.0.0.1:<port>, StreamLocalBindUnlink and SendEnv=LC_FCODE_CLIP_TOKEN" }
+  Ok ($ar[0].Sock -ne $ar[1].Sock) ("a fresh socket path on the retry; both were " + $ar[0].Sock)
+  $rems = @(Get-Content $w.BareLog)
+  $m0 = [regex]::Match($rems[0], '\AFCODE_CLIP_SOCK=(\S+) bash <\(')
+  $m1 = [regex]::Match($rems[1], '\AFCODE_CLIP_SOCK=(\S+) bash <\(')
+  Ok ($m0.Success -and $m1.Success) 'both calls carry the env prefix'
+  Eq $m0.Groups[1].Value $ar[0].Sock 'call 0: the env socket is its -R socket'
+  Eq $m1.Groups[1].Value $ar[1].Sock 'call 1: the env socket is its -R socket (not the first one)'
+  $tk = @(Get-TokLog $w)
+  $bare = @($tk | Where-Object { $_ -like 'bare:*' }); $other = @($tk | Where-Object { $_ -like 'other:*' })
+  Eq $bare.Count 2 'one token log line per script call'
+  Ok ($bare[0] -match '\Abare:[0-9a-f]{32}\z' -and $bare[0] -eq $bare[1]) ("both calls were started with the token env, the same one (one token per listener); got [$($bare[0])] [$($bare[1])]")
+  Ok ($tk[0] -like 'bare:*' -and $tk[1] -like 'other:*') 'order: the first script call, then the box ask (the box refused pj), then the retry'
+  Ok ($other.Count -ge 1 -and @($other | Where-Object { $_ -ne 'other:' }).Count -eq 0) ("the token env is gone right after the first ssh returned: the box ask that follows has none; got " + ($other -join ','))
+  $argvLines = @(Get-Content ($w.BareLog + '.argv')); $tok = $bare[0].Substring(5)
+  foreach ($i in 0, 1) { Ok (-not $argvLines[$i].Contains($tok) -and -not $rems[$i].Contains($tok) -and $rems[$i] -notmatch 'TOKEN') "call $i : the token is in no argument and not in the remote command" }
+  $probe = @(Get-Content ($w.BareLog + '.probe'))
+  Eq $probe.Count 2 'the clipboard server answered during each of the two calls'
+  foreach ($p in $probe) { Ok ($p -match '\AHTTP/1\.[01] 403\b') "no token: 403; got [$p]" }
+  $up = $true; $c = New-Object Net.Sockets.TcpClient
+  try { $c.Connect('127.0.0.1', [int]$ar[1].Port) } catch { $up = $false } finally { $c.Close() }
+  Ok (-not $up) 'nothing listens after the retry returned'
+}
+T 'clip attach: the clipboard server child is stopped when ssh fails too (a dropped ssh, exit 255): nothing listens on its port afterwards' {
+  $w = New-W2 'clip4'; Use-BareSsh $w; Set-AliasCache $w '{"order":[],"aliases":{}}'
+  $e = @{ BARE_LOG = $w.BareLog; WT_SESSION = 'wt-test'; BARE_DROP = 'omp-1'; BARE_PROBE = '1' }
+  $r = Invoke-Fcode $w @('omp-1') $e; Eq $r.Code 255 $r.Out
+  $ar = @(Get-Content ($w.BareLog + '.argv') | ForEach-Object { Split-ClipArgv $_ })
+  Eq $ar.Count 1 'one ssh call'
+  Ok ($ar[0].Sock -and [int]$ar[0].Port -gt 0) 'it carried the forward'
+  Eq @(Get-Content ($w.BareLog + '.probe')).Count 1 'the server answered while ssh was running'
+  $up = $true; $c = New-Object Net.Sockets.TcpClient
+  try { $c.Connect('127.0.0.1', [int]$ar[0].Port) } catch { $up = $false } finally { $c.Close() }
+  Ok (-not $up) "nothing listens on port $($ar[0].Port) after the failed ssh"
+  $tk = @(Get-TokLog $w); Eq $tk.Count 1 'one ssh call'; Ok ($tk[0] -match '\Abare:[0-9a-f]{32}\z') 'the dropped ssh was started with the token env'
+}
+T 'clip hint: outside Windows Terminal (no WT_SESSION) one Vietnamese hint before the attach; inside Windows Terminal none; --list none' {
+  $w = New-W2 'clip2'; Use-BareSsh $w; Set-AliasCache $w '{"order":[],"aliases":{}}'
+  $r = Invoke-Fcode $w @('omp-1') @{ BARE_LOG = $w.BareLog; WT_SESSION = '' }; Eq $r.Code 0 $r.Out
+  Eq (Count-Of $r.Out 'không chạy trong Windows Terminal') 1 $r.Out
+  Ok ($r.Out -match 'Alt\+V') ('the hint names Alt+V; out: ' + $r.Out)
+  $r = Invoke-Fcode $w @('omp-1') @{ BARE_LOG = $w.BareLog; WT_SESSION = 'wt-test' }; Eq $r.Code 0 $r.Out
+  Eq (Count-Of $r.Out 'Windows Terminal') 0 ('inside Windows Terminal: no hint; out: ' + $r.Out)
+  $r = Invoke-Fcode $w @('--list') @{ BARE_LOG = $w.BareLog; WT_SESSION = '' }; Eq $r.Code 0 $r.Out
+  Eq (Count-Of $r.Out 'Windows Terminal') 0 ('--list: no hint; out: ' + $r.Out)
+}
+T 'clip box script text: the attach hint line, the drag binding and the Alt+V binding with --clip are in the script that goes to the box' {
+  Ok ($FcodeSh -match 'MouseDrag1Pane') 'drag binding'
+  Ok ($FcodeSh -match "copy-mode -M" -and $FcodeSh -match "send-keys -M" -and $FcodeSh -match '#\{pane_in_mode\}') 'drag binding body'
+  Ok ($FcodeSh -match 'bind-key -n M-v run-shell -b' -and $FcodeSh -match '--clip' -and $FcodeSh -match '#\{q:client_tty\}' -and $FcodeSh -match '#\{q:session_name\}') 'Alt+V binding: shell-escaped #{q:client_tty} #{q:session_name}'
+  Ok ($FcodeSh -notmatch '--clip[^\r\n]*#\{(client_tty|session_name)\}') 'Alt+V binding: no unescaped #{client_tty} / #{session_name} after --clip'
+  Ok ($FcodeSh -notmatch "--clip[^\r\n]*[`"']#\{q:") 'Alt+V binding: the #{q:...} formats are not inside quotes'
+  Ok ($FcodeSh -match 'FCODE_CLIP_SOCK' -and $FcodeSh -match 'LC_FCODE_CLIP_TOKEN') 'env names: the socket in FCODE_CLIP_SOCK, the token in LC_FCODE_CLIP_TOKEN'
+  Ok ($FcodeSh -notmatch '(?<!LC_)FCODE_CLIP_TOKEN') 'the token is never named without the LC_ prefix (sshd AcceptEnv LANG LC_*)'
+  $iu = $FcodeSh.IndexOf('unset LC_FCODE_CLIP_TOKEN'); $ie = $FcodeSh.IndexOf('exec tmux -u attach')
+  Ok ($iu -ge 0 -and $ie -gt $iu) 'the token is unset before exec tmux (tmux and the agents never inherit it)'
+  Ok ($FcodeSh -match 'kéo chuột' -and $FcodeSh -match 'Alt\+V' -and $FcodeSh -match 'Ctrl\+V') 'the hint line'
+}
+# ---- the clipboard server (Start-FcodeClipServer): plain HTTP over loopback TCP. Start / stop, 403 / 404, warm-up and the deadline tests need no clipboard change.
+# 204 / 200 / 413 / 500 and the cache / change tests replace or hold the real Windows clipboard (System.Windows.Forms, STA): they run on Windows only AND only with FCODE_TEST_CLIPBOARD=1 (the owner's
+# clipboard is never changed otherwise); then every clipboard format is saved first and put back in finally (Save-TestClip / Restore-TestClip).
+$IsWinHost = [Environment]::OSVersion.Platform -eq 'Win32NT'
+function Invoke-ClipReq([int]$Port, [string]$Method, [string]$Path, [string]$Token) {
+  $c = New-Object Net.Sockets.TcpClient('127.0.0.1', $Port)
+  try {
+    $c.ReceiveTimeout = 30000; $s = $c.GetStream()
+    $q = [Text.Encoding]::ASCII.GetBytes($Method + ' ' + $Path + " HTTP/1.0`r`n" + $(if ($Token) { 'X-Fcode-Token: ' + $Token + "`r`n" } else { '' }) + "`r`n")
+    $s.Write($q, 0, $q.Length)
+    $ms = New-Object IO.MemoryStream; $s.CopyTo($ms); $b = $ms.ToArray()
+  } finally { $c.Close() }
+  $t = [Text.Encoding]::GetEncoding(28591).GetString($b); $i = $t.IndexOf("`r`n`r`n")
+  Ok ($i -ge 0) 'a complete HTTP head'
+  $n = $b.Length - ($i + 4); $body = New-Object byte[] $n; [Array]::Copy($b, $i + 4, $body, 0, $n)
+  [pscustomobject]@{ Code = [int][regex]::Match($t.Substring(0, $i), '\AHTTP/1\.[01] (\d{3})').Groups[1].Value; Head = $t.Substring(0, $i); Body = $body }
+}
+function Invoke-Sta([scriptblock]$Sb, [object[]]$ArgList = @()) {   # run $Sb in a fresh STA runspace (the clipboard needs STA); errors throw
+  $rs = [runspacefactory]::CreateRunspace(); $rs.ApartmentState = 'STA'; $rs.Open(); $rs.SessionStateProxy.SetVariable('ErrorActionPreference', 'Stop')
+  $ps = [powershell]::Create(); $ps.Runspace = $rs
+  try { [void]$ps.AddScript($Sb.ToString()); foreach ($a in $ArgList) { [void]$ps.AddArgument($a) }; $ps.Invoke() } finally { $ps.Dispose(); $rs.Dispose() }
+}
+function Set-TestClipImage([int]$W, [int]$H, [bool]$Noise, [string]$Text = '') {   # a test picture on the clipboard: a small colour grid, or incompressible noise (its PNG is over 10 MB); $Text: also a text format next to it (like Excel / Office copies)
+  [void](Invoke-Sta {
+    param($W, $H, $Noise, $Text)
+    Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+    $bmp = New-Object System.Drawing.Bitmap $W, $H, ([System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+    if ($Noise) {
+      $d = $bmp.LockBits((New-Object System.Drawing.Rectangle 0, 0, $W, $H), [System.Drawing.Imaging.ImageLockMode]::WriteOnly, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+      $buf = New-Object byte[] ($d.Stride * $H); (New-Object Random 7).NextBytes($buf)
+      [Runtime.InteropServices.Marshal]::Copy($buf, 0, $d.Scan0, $buf.Length); $bmp.UnlockBits($d)
+    } else { for ($y = 0; $y -lt $H; $y++) { for ($x = 0; $x -lt $W; $x++) { $bmp.SetPixel($x, $y, [System.Drawing.Color]::FromArgb($x * 40, $y * 60, 200)) } } }
+    if ($Text) { $do = New-Object System.Windows.Forms.DataObject; $do.SetImage($bmp); $do.SetText($Text); [System.Windows.Forms.Clipboard]::SetDataObject($do, $true, 10, 100) }
+    else { [System.Windows.Forms.Clipboard]::SetDataObject($bmp, $true, 10, 100) }
+  } @($W, $H, $Noise, $Text))
+}
+function Test-ClipOptIn {   # $true when a clipboard test may run; prints the SKIP line otherwise
+  if (-not $IsWinHost) { Write-Host 'SKIP (Windows only: clipboard)'; return $false }
+  if ($env:FCODE_TEST_CLIPBOARD -ne '1') { Write-Host 'SKIP (set FCODE_TEST_CLIPBOARD=1 to run: it uses the clipboard for a moment and puts every format back)'; return $false }
+  $true
+}
+function Save-TestClip {   # every format of the clipboard data object, read into memory (throws before anything is changed when the clipboard cannot be read); Items is empty for an empty clipboard
+  [pscustomobject]@{ Items = @(Invoke-Sta {
+    Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+    $do = [System.Windows.Forms.Clipboard]::GetDataObject()
+    if ($do) {
+      foreach ($f in $do.GetFormats($false)) {
+        try { $v = $do.GetData($f, $false) } catch { continue }
+        if ($null -eq $v) { continue }
+        if ($v -is [IO.Stream]) {
+          $ms = New-Object IO.MemoryStream; if ($v.CanSeek) { $v.Position = 0 }; $v.CopyTo($ms)
+          [pscustomobject]@{ Fmt = $f; Kind = 'stream'; Val = $ms.ToArray() }
+        } elseif ($v -is [System.Drawing.Image]) { [pscustomobject]@{ Fmt = $f; Kind = 'obj'; Val = (New-Object System.Drawing.Bitmap $v) } }
+        else { [pscustomobject]@{ Fmt = $f; Kind = 'obj'; Val = $v } }
+      }
+    }
+  }) }
+}
+function Restore-TestClip($Saved) {   # put the saved formats back (an empty save: an empty clipboard)
+  [void](Invoke-Sta {
+    param($items)
+    Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+    if (-not $items -or @($items).Count -eq 0) { [System.Windows.Forms.Clipboard]::Clear(); return }
+    $do = New-Object System.Windows.Forms.DataObject
+    foreach ($i in $items) {
+      $v = $i.Val; if ($i.Kind -eq 'stream') { $v = New-Object IO.MemoryStream (, [byte[]]$v) }
+      $do.SetData($i.Fmt, $false, $v)
+    }
+    [System.Windows.Forms.Clipboard]::SetDataObject($do, $true, 10, 100)
+  } @(, $Saved.Items))
+}
+function Set-TestClipText($Text) {   # $null clears it
+  [void](Invoke-Sta { param($t) Add-Type -AssemblyName System.Windows.Forms; if ($null -eq $t) { [System.Windows.Forms.Clipboard]::Clear() } else { [System.Windows.Forms.Clipboard]::SetDataObject($t, $true, 10, 100) } } @(, $Text))
+}
+function New-ClipSocket([int]$Port) { $s = New-Object Net.Sockets.Socket([Net.Sockets.AddressFamily]::InterNetwork, [Net.Sockets.SocketType]::Stream, [Net.Sockets.ProtocolType]::Tcp); $s.Connect('127.0.0.1', $Port); $s }
+# watch a connected raw socket for up to $MaxSec seconds: every second send one more header byte (so only an ABSOLUTE deadline can end it, not a per-read timeout).
+# Returns the seconds until the server closed the connection (a response before the close is fine), or -1 when it was still open after $MaxSec
+function Wait-ClipCut([Net.Sockets.Socket]$Sk, [int]$MaxSec) {
+  $sw = [Diagnostics.Stopwatch]::StartNew(); $buf = New-Object byte[] 4096
+  while ($sw.Elapsed.TotalSeconds -lt $MaxSec) {
+    if ($Sk.Poll(1000000, [Net.Sockets.SelectMode]::SelectRead)) {   # data, FIN or RST
+      $k = 0; try { $k = $Sk.Receive($buf) } catch { $k = 0 }
+      if ($k -eq 0) { return $sw.Elapsed.TotalSeconds }
+    } else { try { [void]$Sk.Send([byte[]]@(0x61)) } catch { return $sw.Elapsed.TotalSeconds } }
+  }
+  -1
+}
+function Stop-ClipServerWatched($Srv) {   # Stop-FcodeClipServer with a second handle on the child (Stop disposes the server's own): returns how long Stop took and whether the child is gone
+  $w = [Diagnostics.Process]::GetProcessById($Srv.Proc.Id)
+  try { $sw = [Diagnostics.Stopwatch]::StartNew(); Stop-FcodeClipServer $Srv; $took = $sw.Elapsed.TotalSeconds; [pscustomobject]@{ Took = $took; Gone = $w.HasExited } } finally { $w.Dispose() }
+}
+function Get-ProcCmdline([int]$ProcId) {   # the command line of a running process (what `ps` / Task Manager would show)
+  if ($IsWinHost) { return [string](Get-CimInstance Win32_Process -Filter "ProcessId=$ProcId").CommandLine }
+  [IO.File]::ReadAllText("/proc/$ProcId/cmdline").Replace([char]0, ' ')
+}
+T 'clip server: a CHILD process on loopback only, 32-hex token random per start and never on its command line, remote socket names (New-FcodeClipSock) /tmp/fcode-clip-<16 hex>.sock random per call, a stopped server is gone and no longer listens, stopping $null or twice is harmless; windows only' {
+  if (-not $IsWinHost) { Write-Host 'SKIP (Windows only: the server needs System.Windows.Forms)'; return }
+  $a = Start-FcodeClipServer; $b = Start-FcodeClipServer
+  try {
+    Ok ($a -and $b) 'both servers started'
+    Ok ($a.Proc -is [Diagnostics.Process] -and $b.Proc -is [Diagnostics.Process]) 'the server is a Process object'
+    Ok ($a.Proc.Id -ne $b.Proc.Id -and $a.Proc.Id -ne $PID) 'a separate process per server, not this one'
+    Ok (-not $a.Proc.HasExited -and -not $b.Proc.HasExited) 'both children are running'
+    Ok ($a.Token -cmatch '\A[0-9a-f]{32}\z') ('token ' + $a.Token)
+    $k1 = New-FcodeClipSock; $k2 = New-FcodeClipSock
+    Ok ($k1 -cmatch '\A/tmp/fcode-clip-[0-9a-f]{16}\.sock\z' -and $k2 -cmatch '\A/tmp/fcode-clip-[0-9a-f]{16}\.sock\z') "socket names $k1 $k2"
+    Ok ($k1 -ne $k2) 'a new socket name every call'
+    Ok ([int]$a.Port -gt 0 -and $a.Port -ne $b.Port) 'the OS picks a free port each time'
+    Ok ($a.Token -ne $b.Token) 'token differs per start'
+    $cl = Get-ProcCmdline $a.Proc.Id
+    Ok ($cl -match '(?i)-EncodedCommand') ('the child is started with -EncodedCommand; command line: ' + $cl)
+    Ok ($cl -notmatch [regex]::Escape($a.Token) -and $cl -notmatch [regex]::Escape($b.Token)) 'the token is not in the child command line (it goes through stdin)'
+    # loopback only: a connection to this host's own non-loopback address must be refused
+    $ext = @([Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() | ForEach-Object { $_.GetIPProperties().UnicastAddresses } | ForEach-Object { $_.Address } | Where-Object { $_.AddressFamily -eq 'InterNetwork' -and -not [Net.IPAddress]::IsLoopback($_) })
+    foreach ($ip in $ext | Select-Object -First 1) {
+      $c = New-Object Net.Sockets.TcpClient; $up = $true
+      try { $c.Connect($ip, [int]$a.Port) } catch { $up = $false } finally { $c.Close() }
+      Ok (-not $up) "the server does not listen on $ip"
+    }
+    $c = New-Object Net.Sockets.TcpClient
+    try { $c.Connect('127.0.0.1', [int]$a.Port) } finally { $c.Close() }
+    $ra = Stop-ClipServerWatched $a; $rb = Stop-ClipServerWatched $b
+    Ok ($ra.Gone -and $rb.Gone) 'both child processes are gone after Stop'
+    Ok ($ra.Took -lt 2.5 -and $rb.Took -lt 2.5) "Stop is bounded; took $($ra.Took) s and $($rb.Took) s"
+  } finally { Stop-FcodeClipServer $a; Stop-FcodeClipServer $b }
+  Stop-FcodeClipServer $null
+  Stop-FcodeClipServer $a   # a second Stop on a stopped server
+  foreach ($s in $a, $b) {
+    $up = $true; $c = New-Object Net.Sockets.TcpClient
+    try { $c.Connect('127.0.0.1', [int]$s.Port) } catch { $up = $false } finally { $c.Close() }
+    Ok (-not $up) "nothing listens on port $($s.Port) after Stop"
+  }
+}
+T 'clip server: the child exits by itself when its stdin closes (the laptop process died), no Kill needed; windows only' {
+  if (-not $IsWinHost) { Write-Host 'SKIP (Windows only: the server needs System.Windows.Forms)'; return }
+  $s = Start-FcodeClipServer; $watch = $null
+  try {
+    Ok ($s -and -not $s.Proc.HasExited) 'started'
+    $watch = [Diagnostics.Process]::GetProcessById($s.Proc.Id)
+    try { $s.Proc.StandardInput.Close() } catch { }
+    Ok ($watch.WaitForExit(8000)) 'the child ended after stdin EOF'
+  } finally { if ($watch) { $watch.Dispose() }; Stop-FcodeClipServer $s }
+}
+T 'clip server: a wrong or missing token is 403, any other path or method is 404 (never anything else), and it keeps answering after each; the clipboard is not touched; windows only (the server loads System.Windows.Forms)' {
+  if (-not $IsWinHost) { Write-Host 'SKIP (Windows only: the server needs System.Windows.Forms)'; return }
+  $s = Start-FcodeClipServer
+  try {
+    Eq (Invoke-ClipReq $s.Port 'GET' '/image' '').Code 403 'no token'
+    Eq (Invoke-ClipReq $s.Port 'GET' '/image' ('0' * 32)).Code 403 'wrong token'
+    Eq (Invoke-ClipReq $s.Port 'GET' '/image' ($s.Token + '0')).Code 403 'token with a tail'
+    Eq (Invoke-ClipReq $s.Port 'GET' '/image' $s.Token.Substring(1)).Code 403 'token with a missing character'
+    Eq (Invoke-ClipReq $s.Port 'POST' '/image' $s.Token).Code 404 'POST'
+    Eq (Invoke-ClipReq $s.Port 'GET' '/' $s.Token).Code 404 'root'
+    Eq (Invoke-ClipReq $s.Port 'GET' '/images' $s.Token).Code 404 'other path'
+    Eq (Invoke-ClipReq $s.Port 'GET' '/image/x' $s.Token).Code 404 'longer path'
+    Ok ((Invoke-ClipReq $s.Port 'GET' '/other' ('0' * 32)).Code -in 403, 404) 'other path, wrong token'
+    Eq (Invoke-ClipReq $s.Port 'GET' '/image' '').Code 403 'still serving after the others'
+  } finally { Stop-FcodeClipServer $s }
+}
+T 'clip server: no image on the clipboard (empty or text only) is 204 with no body; windows only; FCODE_TEST_CLIPBOARD=1' {
+  if (-not (Test-ClipOptIn)) { return }
+  $keep = $null; $s = $null
+  try {
+    $keep = Save-TestClip; $s = Start-FcodeClipServer
+    Set-TestClipText $null
+    $r = Invoke-ClipReq $s.Port 'GET' '/image' $s.Token; Eq $r.Code 204 'empty clipboard'; Eq $r.Body.Length 0 'no body'
+    Set-TestClipText 'only text'
+    $r = Invoke-ClipReq $s.Port 'GET' '/image' $s.Token; Eq $r.Code 204 'text is not an image'
+  } finally { Stop-FcodeClipServer $s; if ($keep) { Restore-TestClip $keep } }
+}
+T 'clip server: an image on the clipboard is 200 image/png with the picture as PNG bytes; windows only; FCODE_TEST_CLIPBOARD=1' {
+  if (-not (Test-ClipOptIn)) { return }
+  $keep = $null; $s = $null
+  try {
+    $keep = Save-TestClip; $s = Start-FcodeClipServer
+    Set-TestClipImage 6 4 $false
+    $r = Invoke-ClipReq $s.Port 'GET' '/image' $s.Token
+    Eq $r.Code 200 'image'
+    Ok ($r.Head -match '(?im)^Content-Type:\s*image/png\s*$') ('Content-Type; head: ' + $r.Head)
+    Eq (($r.Body[0..7] | ForEach-Object { '{0:x2}' -f $_ }) -join '') '89504e470d0a1a0a' 'PNG magic'
+    $cl = [regex]::Match($r.Head, '(?im)^Content-Length:\s*(\d+)'); if ($cl.Success) { Eq $cl.Groups[1].Value $r.Body.Length 'Content-Length' }
+    Add-Type -AssemblyName System.Drawing
+    $img = [System.Drawing.Image]::FromStream((New-Object IO.MemoryStream (, $r.Body)))
+    try {
+      Eq "$($img.Width)x$($img.Height)" '6x4' 'size'
+      $px = $img.GetPixel(5, 3); Eq "$($px.R),$($px.G),$($px.B)" '200,180,200' 'the pixel survived the round trip'
+    } finally { $img.Dispose() }
+  } finally { Stop-FcodeClipServer $s; if ($keep) { Restore-TestClip $keep } }
+}
+T 'clip server: a PNG over 10485760 bytes is 413; windows only; FCODE_TEST_CLIPBOARD=1' {
+  if (-not (Test-ClipOptIn)) { return }
+  $keep = $null; $s = $null
+  try {
+    $keep = Save-TestClip; $s = Start-FcodeClipServer
+    Set-TestClipImage 2200 2200 $true   # random pixels do not compress: the PNG is about 14 MB
+    $r = Invoke-ClipReq $s.Port 'GET' '/image' $s.Token
+    Eq $r.Code 413 'too big'; Ok ($r.Body.Length -lt 10485760) 'the oversize picture is not sent'
+  } finally { Stop-FcodeClipServer $s; if ($keep) { Restore-TestClip $keep } }
+}
+# ---- speed (contract Amendment 4, items 16-18): warm-up before the first answer; one cached PNG, pre-encoded while idle ONLY for an image-only clipboard, served while the clipboard sequence number is unchanged.
+# The child adds a test-only reply header `X-Fcode-Debug: encodes=<n> warm=<0|1>` ONLY when FCODE_CLIP_DEBUG=1 is in its environment (never in production).
+function Start-ClipServerDebug { $env:FCODE_CLIP_DEBUG = '1'; try { Start-FcodeClipServer } finally { Remove-Item Env:\FCODE_CLIP_DEBUG -ErrorAction SilentlyContinue } }
+function Get-ClipDbg($R) {
+  $m = [regex]::Match($R.Head, '(?im)^X-Fcode-Debug: encodes=(\d+) warm=([01])\s*$')
+  Ok $m.Success ('the debug header is missing; head: ' + $R.Head)
+  [pscustomobject]@{ Encodes = [int]$m.Groups[1].Value; Warm = [int]$m.Groups[2].Value }
+}
+function Get-PngSize([byte[]]$B) { (([int]$B[16] -shl 24) + ([int]$B[17] -shl 16) + ([int]$B[18] -shl 8) + $B[19]).ToString() + 'x' + (([int]$B[20] -shl 24) + ([int]$B[21] -shl 16) + ([int]$B[22] -shl 8) + $B[23]).ToString() }
+T 'clip server speed: the warm-up (WinForms, Drawing, one PNG encode, the sequence-number call) is finished before the first answer: the very first reply, sent at once, carries warm=1; windows only' {
+  if (-not $IsWinHost) { Write-Host 'SKIP (Windows only: the warm-up loads System.Windows.Forms)'; return }
+  $s = Start-ClipServerDebug
+  try {
+    $r = Invoke-ClipReq $s.Port 'GET' '/image' ''   # sent while the child is still warming up: it waits in the backlog, it does not fail
+    Eq $r.Code 403 'no token'
+    Eq (Get-ClipDbg $r).Warm 1 'the first answer came after the warm-up'
+    Eq (Get-ClipDbg (Invoke-ClipReq $s.Port 'GET' '/other' '')).Warm 1 'and so does the next'
+  } finally { Stop-FcodeClipServer $s }
+}
+T 'clip server speed: an image already on the clipboard is pre-encoded while idle (before any authorised request) and a second request with the clipboard unchanged returns the cached bytes with no new encode; windows only; FCODE_TEST_CLIPBOARD=1' {
+  if (-not (Test-ClipOptIn)) { return }
+  $keep = $null; $s = $null
+  try {
+    $keep = Save-TestClip; $s = Start-ClipServerDebug
+    Set-TestClipImage 6 4 $false
+    Start-Sleep -Milliseconds 1500   # the idle poll (every 250 ms) sees the new sequence number and encodes
+    $pre = Get-ClipDbg (Invoke-ClipReq $s.Port 'GET' '/image' ('0' * 32))   # wrong token: nothing is read for it
+    Ok ($pre.Encodes -ge 1) ("encoded before any authorised request; encodes=" + $pre.Encodes)
+    $r1 = Invoke-ClipReq $s.Port 'GET' '/image' $s.Token; Eq $r1.Code 200 'first request'
+    $d1 = Get-ClipDbg $r1; Eq $d1.Encodes $pre.Encodes 'the first request used the pre-encoded copy'
+    $r2 = Invoke-ClipReq $s.Port 'GET' '/image' $s.Token; Eq $r2.Code 200 'second request'
+    Eq (Get-ClipDbg $r2).Encodes $d1.Encodes 'unchanged clipboard: no second encode'
+    Eq ([Convert]::ToBase64String($r2.Body)) ([Convert]::ToBase64String($r1.Body)) 'the same bytes'
+    Eq (Get-PngSize $r2.Body) '6x4' 'the picture'
+  } finally { Stop-FcodeClipServer $s; if ($keep) { Restore-TestClip $keep } }
+}
+T 'clip server speed: a clipboard change between two requests returns the NEW image (never the cached one); image then text is 204, then an image again is 200; windows only; FCODE_TEST_CLIPBOARD=1' {
+  if (-not (Test-ClipOptIn)) { return }
+  $keep = $null; $s = $null
+  try {
+    $keep = Save-TestClip; $s = Start-ClipServerDebug
+    $last = -1
+    foreach ($sz in @(@(6, 4), @(5, 3), @(4, 6), @(6, 4))) {
+      Set-TestClipImage $sz[0] $sz[1] $false   # asked at once: either the idle poll or the request itself encodes, never a stale copy
+      $r = Invoke-ClipReq $s.Port 'GET' '/image' $s.Token
+      Eq $r.Code 200 "image $($sz[0])x$($sz[1])"
+      Eq (Get-PngSize $r.Body) "$($sz[0])x$($sz[1])" 'the new image, not the cached one'
+      $e = (Get-ClipDbg $r).Encodes; Ok ($e -gt $last) "a new encode for the new image; encodes $last -> $e"; $last = $e
+    }
+    Set-TestClipText 'text now'
+    $r = Invoke-ClipReq $s.Port 'GET' '/image' $s.Token
+    Eq $r.Code 204 'image then text: no image'; Eq $r.Body.Length 0 'no body'
+    Eq (Invoke-ClipReq $s.Port 'GET' '/image' $s.Token).Code 204 'and it stays 204'
+    Set-TestClipImage 5 3 $false
+    $r = Invoke-ClipReq $s.Port 'GET' '/image' $s.Token
+    Eq $r.Code 200 'an image again'; Eq (Get-PngSize $r.Body) '5x3' 'the image after the text'
+  } finally { Stop-FcodeClipServer $s; if ($keep) { Restore-TestClip $keep } }
+}
+T 'clip server speed: an image copied together with text (Excel / Office style) is NOT pre-encoded while idle but Alt+V still returns it (encoded on demand); an image-only clipboard is pre-encoded; windows only; FCODE_TEST_CLIPBOARD=1' {
+  if (-not (Test-ClipOptIn)) { return }
+  $keep = $null; $s = $null
+  try {
+    $keep = Save-TestClip; $s = Start-ClipServerDebug
+    Set-TestClipText $null
+    Start-Sleep -Milliseconds 800
+    $e0 = (Get-ClipDbg (Invoke-ClipReq $s.Port 'GET' '/image' ('0' * 32))).Encodes   # wrong token: nothing is read for it
+    Set-TestClipImage 6 4 $false 'cells A1:B2'
+    Start-Sleep -Milliseconds 1500   # several idle polls
+    Eq (Get-ClipDbg (Invoke-ClipReq $s.Port 'GET' '/image' ('0' * 32))).Encodes $e0 'image + text: the idle poll did not encode'
+    $r = Invoke-ClipReq $s.Port 'GET' '/image' $s.Token
+    Eq $r.Code 200 'Alt+V returns the image'; Eq (Get-PngSize $r.Body) '6x4' 'the picture'
+    Eq (Get-ClipDbg $r).Encodes ($e0 + 1) 'encoded on demand'
+    $r = Invoke-ClipReq $s.Port 'GET' '/image' $s.Token
+    Eq $r.Code 200 'again'; Eq (Get-ClipDbg $r).Encodes ($e0 + 1) 'the on-demand copy is cached: no second encode'
+    Set-TestClipImage 5 3 $false   # image only
+    Start-Sleep -Milliseconds 1500
+    Eq (Get-ClipDbg (Invoke-ClipReq $s.Port 'GET' '/image' ('0' * 32))).Encodes ($e0 + 2) 'an image-only clipboard is pre-encoded while idle'
+    $r = Invoke-ClipReq $s.Port 'GET' '/image' $s.Token
+    Eq $r.Code 200 'image-only request'; Eq (Get-PngSize $r.Body) '5x3' 'the new picture'; Eq (Get-ClipDbg $r).Encodes ($e0 + 2) 'used the pre-encoded copy'
+  } finally { Stop-FcodeClipServer $s; if ($keep) { Restore-TestClip $keep } }
+}
+# the same logic with a stub clipboard (a counted PNG + a sequence number) in a background runspace: no System.Windows.Forms, no real clipboard, any host
+function Start-ClipStub {
+  $st = [hashtable]::Synchronized(@{ Seq = [uint32]1; Png = $null; Text = $false; Busy = $false; Reads = 0 })
+  $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0); $l.Start()
+  $done = New-Object Threading.Tasks.TaskCompletionSource[int]
+  $tok = ('0' * 31) + 'a'
+  $rs = [runspacefactory]::CreateRunspace(); $rs.Open()
+  $ps = [powershell]::Create(); $ps.Runspace = $rs
+  [void]$ps.AddScript({
+    param($fn, $l, $tok, $task, $st)
+    Invoke-Expression ("function Invoke-FcodeClipServe {`n" + $fn + "`n}")
+    $getSeq = { $st.Seq }.GetNewClosure()
+    $readPng = { param([bool]$Idle); if ($Idle -and $st.Text) { return }; $st.Reads = $st.Reads + 1; if ($st.Busy) { throw 'busy' }; if ($st.Png) { , $st.Png } }.GetNewClosure()   # Text = a text format next to the image: the idle read is refused (not counted), a request read is not
+    Invoke-FcodeClipServe $l $tok $task $getSeq $readPng @{ Warm = $true }
+  }.ToString()).AddArgument(${function:Invoke-FcodeClipServe}.ToString()).AddArgument($l).AddArgument($tok).AddArgument($done.Task).AddArgument($st)
+  [pscustomobject]@{ St = $st; Port = ([Net.IPEndPoint]$l.LocalEndpoint).Port; Token = $tok; L = $l; Done = $done; Rs = $rs; Ps = $ps; Ar = $ps.BeginInvoke() }
+}
+function Stop-ClipStub($H) {
+  if (-not $H) { return }
+  try { $H.Done.SetResult(0) } catch { }
+  try { [void]$H.Ar.AsyncWaitHandle.WaitOne(5000) } catch { }
+  try { $H.L.Stop() } catch { }
+  try { $H.Ps.Dispose(); $H.Rs.Dispose() } catch { }
+}
+function New-StubPng([int]$N, [byte]$Tag) { $b = New-Object byte[] $N; $m = 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a; for ($i = 0; $i -lt 8; $i++) { $b[$i] = $m[$i] }; $b[8] = $Tag; $b }
+function Set-StubClip($H, $Png, [uint32]$Seq, [bool]$Text = $false) { $H.St.Png = $Png; $H.St.Text = $Text; $H.St.Seq = $Seq }   # content first, then the sequence number: the order a real clipboard change is seen in
+function Test-SameBytes([byte[]]$A, [byte[]]$B) { [Convert]::ToBase64String($A) -ceq [Convert]::ToBase64String($B) }
+T 'clip server speed (stub clipboard): the idle poll pre-encodes a changed image once, requests with an unchanged sequence number are answered from the cached bytes (no read, no encode), a text-only clipboard is looked at once per change' {
+  $h = Start-ClipStub
+  try {
+    $a = New-StubPng 2000 1
+    Set-StubClip $h $a 2
+    Start-Sleep -Milliseconds 1000
+    $reads = $h.St.Reads
+    Ok ($reads -ge 1) 'the idle poll read the clipboard before any request'
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token
+    Eq $r.Code 200 'first request'; Ok (Test-SameBytes $r.Body $a) 'the pre-encoded bytes'
+    Eq (Get-ClipDbg $r).Encodes 1 'one encode in total'
+    Eq $h.St.Reads $reads 'the first request read nothing: it used the pre-encoded copy'
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token
+    Eq $r.Code 200 'second request'; Ok (Test-SameBytes $r.Body $a) 'the cached bytes'
+    Eq (Get-ClipDbg $r).Encodes 1 'still one encode'
+    Eq $h.St.Reads $reads 'the second request read nothing either'
+    Start-Sleep -Milliseconds 800
+    Eq $h.St.Reads $reads 'an unchanged sequence number is not read again while idle'
+    Eq (Invoke-ClipReq $h.Port 'GET' '/image' '').Code 403 'a wrong token still reads nothing'
+    Eq $h.St.Reads $reads 'no read for a refused request'
+    Set-StubClip $h $null 3   # text only
+    Start-Sleep -Milliseconds 800
+    $reads = $h.St.Reads
+    Start-Sleep -Milliseconds 800
+    Eq $h.St.Reads $reads 'a text-only clipboard is looked at once per change, not every 250 ms'
+  } finally { Stop-ClipStub $h }
+}
+T 'clip server speed (stub clipboard): an image next to a text format is never pre-encoded by the idle poll, only on demand (then cached, and a changed image-only clipboard is pre-encoded again)' {
+  $h = Start-ClipStub
+  try {
+    $a = New-StubPng 2500 1; $b = New-StubPng 2500 2
+    Start-Sleep -Milliseconds 700   # the first idle poll (the empty starting clipboard) has run
+    $base = $h.St.Reads
+    Set-StubClip $h $a 2 $true   # image + text (Excel / Office style)
+    Start-Sleep -Milliseconds 1200
+    Eq $h.St.Reads $base 'the idle poll did not read (render) a clipboard that also holds text'
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' ('0' * 32)
+    Eq (Get-ClipDbg $r).Encodes 0 'no pre-encode'
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token
+    Eq $r.Code 200 'Alt+V still returns the image'; Ok (Test-SameBytes $r.Body $a) 'the image bytes'
+    Eq (Get-ClipDbg $r).Encodes 1 'encoded on demand'
+    $reads = $h.St.Reads
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token
+    Eq $r.Code 200 'second request'; Eq (Get-ClipDbg $r).Encodes 1 'answered from the cache: still one encode'
+    Eq $h.St.Reads $reads 'no read for the second request'
+    Set-StubClip $h $b 3 $false   # image only (a screenshot)
+    Start-Sleep -Milliseconds 1000
+    $pre = Get-ClipDbg (Invoke-ClipReq $h.Port 'GET' '/image' ('0' * 32))
+    Eq $pre.Encodes 2 'an image-only clipboard is pre-encoded while idle'
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token
+    Eq $r.Code 200 'image-only request'; Ok (Test-SameBytes $r.Body $b) 'the new image'; Eq (Get-ClipDbg $r).Encodes 2 'used the pre-encoded copy'
+  } finally { Stop-ClipStub $h }
+}
+T 'clip server speed (stub clipboard): a changed sequence number is never answered from the cache (busy clipboard: 500, not the old image); alternating images always come back as the latest; image -> text is 204 and drops the cache; sequence 0 (unknown) is never cached' {
+  $h = Start-ClipStub
+  try {
+    $a = New-StubPng 3000 1; $b = New-StubPng 3000 2
+    Set-StubClip $h $a 2
+    Start-Sleep -Milliseconds 800
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token; Eq $r.Code 200 'a'; Ok (Test-SameBytes $r.Body $a) 'image a'
+    $h.St.Busy = $true   # the idle poll can no longer read: the cache still holds a
+    Set-StubClip $h $b 3
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token
+    Eq $r.Code 500 'sequence changed and the clipboard is busy: 500 (the cached a is stale and not sent)'
+    $h.St.Busy = $false
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token; Eq $r.Code 200 'b'; Ok (Test-SameBytes $r.Body $b) 'image b once the clipboard is free'
+    $seq = 10
+    foreach ($x in $a, $b, $a, $b, $b, $a) {   # a request straight after each change: the poll may or may not have run first
+      $seq++; Set-StubClip $h $x ([uint32]$seq)
+      $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token
+      Eq $r.Code 200 "change $seq"; Ok (Test-SameBytes $r.Body $x) "change $seq returned the latest image"
+    }
+    $seq++; Set-StubClip $h $null ([uint32]$seq)
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token
+    Eq $r.Code 204 'image then text: 204'; Eq $r.Body.Length 0 'no body'
+    $h.St.Busy = $true
+    Eq (Invoke-ClipReq $h.Port 'GET' '/image' $h.Token).Code 500 'the cache was dropped: a busy clipboard is 500, the old image is not sent'
+    $h.St.Busy = $false
+    $seq++; Set-StubClip $h $a ([uint32]$seq)
+    Eq (Invoke-ClipReq $h.Port 'GET' '/image' $h.Token).Code 200 'an image again after the text'
+    Set-StubClip $h $a 0   # the sequence number is unknown: every request reads
+    Start-Sleep -Milliseconds 600
+    $e0 = (Get-ClipDbg (Invoke-ClipReq $h.Port 'GET' '/image' $h.Token)).Encodes
+    $e1 = (Get-ClipDbg (Invoke-ClipReq $h.Port 'GET' '/image' $h.Token)).Encodes
+    Eq $e1 ($e0 + 1) 'sequence 0: a new encode for every request'
+  } finally { Stop-ClipStub $h }
+}
+T 'clip server speed (stub clipboard): the 10485760 byte limit applies to the cached copy too: over it is 413 from the cache without a second encode and without the bytes in memory; exactly the limit is 200' {
+  $h = Start-ClipStub
+  try {
+    $big = New-StubPng 10485761 1
+    Set-StubClip $h $big 2
+    Start-Sleep -Milliseconds 1200
+    $reads = $h.St.Reads
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token; Eq $r.Code 413 'over the limit'; Eq $r.Body.Length 0 'no body'
+    Eq (Get-ClipDbg $r).Encodes 1 'one encode'
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token; Eq $r.Code 413 'over the limit again'; Eq (Get-ClipDbg $r).Encodes 1 'answered from the cache: no second encode'
+    Eq $h.St.Reads $reads 'no read for either request'
+    $ok = New-StubPng 10485760 2
+    Set-StubClip $h $ok 3
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token; Eq $r.Code 200 'exactly the limit'; Eq $r.Body.Length 10485760 'whole body'
+  } finally { Stop-ClipStub $h }
+}
+function Start-ClipHold {   # a second thread (own window) holds the clipboard open, like a clipboard manager would; nothing is written to it. Returns the handle for Stop-ClipHold
+  $h = [pscustomobject]@{ Rel = (New-Object Threading.ManualResetEventSlim $false); Ready = (New-Object Threading.ManualResetEventSlim $false); St = [hashtable]::Synchronized(@{ Opened = $false }); Rs = $null; Ps = $null; Ar = $null }
+  $h.Rs = [runspacefactory]::CreateRunspace(); $h.Rs.ApartmentState = 'STA'; $h.Rs.Open()
+  $h.Ps = [powershell]::Create(); $h.Ps.Runspace = $h.Rs
+  [void]$h.Ps.AddScript({
+    param($ready, $rel, $st)
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -Namespace FcodeTest -Name ClipHold -MemberDefinition '[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError=true)] public static extern bool OpenClipboard(System.IntPtr h); [System.Runtime.InteropServices.DllImport("user32.dll")] public static extern bool CloseClipboard();'
+    $f = New-Object System.Windows.Forms.Form; $hd = $f.Handle
+    for ($i = 0; $i -lt 50 -and -not $st.Opened; $i++) { $st.Opened = [FcodeTest.ClipHold]::OpenClipboard($hd); if (-not $st.Opened) { Start-Sleep -Milliseconds 100 } }
+    $ready.Set()
+    if ($st.Opened) { [void]$rel.Wait(60000); [void][FcodeTest.ClipHold]::CloseClipboard() }
+    $f.Dispose()
+  }.ToString()).AddArgument($h.Ready).AddArgument($h.Rel).AddArgument($h.St)
+  $h.Ar = $h.Ps.BeginInvoke()
+  $h
+}
+function Stop-ClipHold($H) {   # release and clean up (safe on $null); returns $true when the holder thread ended in time
+  if (-not $H) { return $true }
+  $H.Rel.Set(); $ok = $true
+  if ($H.Ar) { $ok = $H.Ar.AsyncWaitHandle.WaitOne(10000) }
+  if ($H.Ps) { $H.Ps.Dispose() }; if ($H.Rs) { $H.Rs.Dispose() }
+  $ok
+}
+T 'clip server: a clipboard another program keeps open is 500 (after its retries, inside the 5 s deadline), and the server answers normally once it is free; windows only; FCODE_TEST_CLIPBOARD=1' {
+  if (-not (Test-ClipOptIn)) { return }
+  $keep = $null; $s = $null; $hold = $null
+  try {
+    $keep = Save-TestClip; $s = Start-FcodeClipServer
+    Set-TestClipText 'busy test: text, so the server has no cached image to answer from while the clipboard is held'
+    $hold = Start-ClipHold
+    Ok ($hold.Ready.Wait(15000) -and $hold.St.Opened) 'the test thread opened the clipboard'
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $r = Invoke-ClipReq $s.Port 'GET' '/image' $s.Token
+    Eq $r.Code 500 'clipboard busy'
+    Ok ($sw.Elapsed.TotalSeconds -lt 5.5) ("answered inside the 5 s deadline; took " + $sw.Elapsed.TotalSeconds)
+    Eq $r.Body.Length 0 'no body'
+    Ok (Stop-ClipHold $hold) 'the holder released the clipboard'; $hold = $null
+    $r = Invoke-ClipReq $s.Port 'GET' '/image' $s.Token
+    Ok ($r.Code -in 200, 204, 413) ("free again: not 500; got " + $r.Code)
+  } finally {
+    [void](Stop-ClipHold $hold)
+    Stop-FcodeClipServer $s; if ($keep) { Restore-TestClip $keep }
+  }
+}
+T 'clip server: stopping the server while it is inside a clipboard call that is blocked (another program holds the clipboard) still ends the child at once (bounded teardown); windows only; FCODE_TEST_CLIPBOARD=1' {
+  if (-not (Test-ClipOptIn)) { return }
+  $keep = $null; $s = $null; $hold = $null; $sk = $null
+  try {
+    $keep = Save-TestClip; $s = Start-FcodeClipServer
+    Set-TestClipText 'blocked test: text, so the server has no cached image and must enter the clipboard call'
+    $hold = Start-ClipHold
+    Ok ($hold.Ready.Wait(15000) -and $hold.St.Opened) 'the test thread opened the clipboard'
+    $sk = New-ClipSocket $s.Port   # a real request with the right token: the child enters the clipboard call and retries against the held clipboard
+    [void]$sk.Send([Text.Encoding]::ASCII.GetBytes("GET /image HTTP/1.0`r`nX-Fcode-Token: " + $s.Token + "`r`n`r`n"))
+    Start-Sleep -Milliseconds 200
+    $r = Stop-ClipServerWatched $s
+    Ok ($r.Took -lt 2.5) "Stop returned within the bound; took $($r.Took) s"
+    Ok ($r.Gone) 'the child process is gone'
+    Ok ((Wait-ClipCut $sk 4) -ge 0) 'the client was closed by the shutdown'
+  } finally {
+    if ($sk) { $sk.Close() }
+    [void](Stop-ClipHold $hold)
+    Stop-FcodeClipServer $s; if ($keep) { Restore-TestClip $keep }
+  }
+}
+T 'clip server: a client that never finishes its headers (one byte a second, so no per-read timeout can fire) is cut by the absolute 5 s deadline, and the next client is served; windows only (the server loads System.Windows.Forms)' {
+  if (-not $IsWinHost) { Write-Host 'SKIP (Windows only: the server needs System.Windows.Forms)'; return }
+  $s = Start-FcodeClipServer; $sk = $null
+  try {
+    $sk = New-ClipSocket $s.Port
+    [void]$sk.Send([Text.Encoding]::ASCII.GetBytes("GET /image HTTP/1.0`r`nX-Fcode-Token: "))
+    $cut = Wait-ClipCut $sk 14
+    Ok ($cut -ge 0) 'the server cut the stalled client'
+    Ok ($cut -ge 3.5) ("not cut early (the deadline is 5 s); cut after $cut s")
+    Ok ($cut -le 8) ("cut by the 5 s deadline, not later; cut after $cut s")
+    Eq (Invoke-ClipReq $s.Port 'GET' '/image' '').Code 403 'the next client is served'
+  } finally { if ($sk) { $sk.Close() }; Stop-FcodeClipServer $s }
+}
+T 'clip server: stopping the server kills the child at once and so closes a client it already accepted (a stalled one); it waits neither for the deadline nor for the child to finish; windows only' {
+  if (-not $IsWinHost) { Write-Host 'SKIP (Windows only: the server needs System.Windows.Forms)'; return }
+  $s = Start-FcodeClipServer; $sk = $null
+  try {
+    $sk = New-ClipSocket $s.Port
+    [void]$sk.Send([Text.Encoding]::ASCII.GetBytes("GET /image HTTP/1.0`r`n"))
+    Start-Sleep -Milliseconds 500   # the server has accepted it and waits for the rest of the headers
+    $r = Stop-ClipServerWatched $s
+    Ok ($r.Took -lt 2.5) "Stop returned at once, not after the 5 s deadline; took $($r.Took) s"
+    Ok ($r.Gone) 'the child process is gone'
+    $cut = Wait-ClipCut $sk 4
+    Ok ($cut -ge 0) 'the accepted client was closed by the shutdown'
+  } finally { if ($sk) { $sk.Close() }; Stop-FcodeClipServer $s }
 }
 T 'phien: the reachability check is `ssh -o BatchMode=yes -o ConnectTimeout=8 <host> true`, the sync calls are `ssh -o BatchMode=yes <host> <command>`; FCODE_HOST picks the host' {
   $w = New-W2 'q1h'

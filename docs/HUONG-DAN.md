@@ -20,6 +20,7 @@
    - [Deploy từ box (`fcode-deploy`)](#deploy-từ-box-fcode-deploy)
 8. [Dùng từ laptop](#8-dùng-từ-laptop)
    - [Lệnh `fcode` (tùy chọn)](#lệnh-fcode-tùy-chọn)
+   - [Chép chữ và dán ảnh từ laptop](#chép-chữ-và-dán-ảnh-từ-laptop)
    - [Đồng bộ phiên chat omp giữa laptop và box (`fcode phien`)](#đồng-bộ-phiên-chat-omp-giữa-laptop-và-box-fcode-phien)
    - [Tự đồng bộ khi mở agent (`fcode moc`)](#tự-đồng-bộ-khi-mở-agent-fcode-moc)
    - [Cài lệnh fcode trên máy Windows khác](#cài-lệnh-fcode-trên-máy-windows-khác)
@@ -45,6 +46,7 @@ Tính năng chính:
 - Box **tự cập nhật** omp, Claude Code và Codex mỗi 6 giờ, không làm hỏng phiên đang mở.
 - **Gửi ảnh trong chat** (v1.3.3): chụp ảnh hoặc chọn ảnh từ thư viện rồi gửi cho trợ lý ([xem mục 7](#gửi-ảnh-trong-chat)).
 - **Laptop tự đồng bộ khi mở agent** (v1.3.3): bật một lần bằng `fcode moc bat` ([xem mục 8](#tự-đồng-bộ-khi-mở-agent-fcode-moc)).
+- **Chép chữ và dán ảnh từ laptop**: kéo chuột là chép vào clipboard laptop, **Alt+V** dán ảnh từ clipboard laptop vào phiên, **Ctrl+V** vẫn dán chữ; cần Windows Terminal ([xem mục 8](#chép-chữ-và-dán-ảnh-từ-laptop)).
 - Chưa có: hội thoại **Claude Code** và **Codex** chưa được mang qua lại giữa laptop và box (hiện chỉ phiên omp và ghi chú dự án đi theo).
 
 ## 2. Cách hoạt động
@@ -489,7 +491,76 @@ fcode new       # mở phiên mới: chọn dự án và harness (hoặc gõ 0 t
 - `fcode pair [tên thiết bị]`: tạo mã ghép kèm mã QR cho iPhone mới (cần `publicUrl`, xem [mục 6](#ghép-thêm-iphone-bằng-mã-qr)).
 - `fcode ipa`: tải bản app mới nhất về `Downloads\fcode.ipa`. Khi có bản mới, kéo file này vào Sideloadly và bấm Start; việc tự ký lại 7 ngày của Sideloadly chỉ gia hạn bản đang cài, không tự cập nhật. Không có `fcode` thì tải `fcode.ipa` từ **Releases** trên GitHub.
 
-Thoát bằng **Ctrl+B** rồi **D**, phiên vẫn chạy tiếp. Khi vào từ laptop, phiên tự chỉnh cho vừa cửa sổ laptop (kể cả khi vừa mở trên điện thoại); lần sau mở lại trên điện thoại, app tự chỉnh lại theo màn hình điện thoại. Lăn chuột để cuộn lên xem lại; bấm **q** (hoặc lăn xuống tới cuối) để về chỗ đang chạy. Khi bật cuộn bằng chuột, muốn bôi đen chữ để chép thì giữ **Shift** trong lúc kéo chuột.
+Thoát bằng **Ctrl+B** rồi **D**, phiên vẫn chạy tiếp. Khi vào từ laptop, phiên tự chỉnh cho vừa cửa sổ laptop (kể cả khi vừa mở trên điện thoại); lần sau mở lại trên điện thoại, app tự chỉnh lại theo màn hình điện thoại. Lăn chuột để cuộn lên xem lại; bấm **q** (hoặc lăn xuống tới cuối) để về chỗ đang chạy. Kéo chuột để bôi đen chữ là chép luôn, không cần giữ **Shift** nữa (xem mục ngay dưới).
+
+### Chép chữ và dán ảnh từ laptop
+
+Khi bạn vào phiên bằng lệnh `fcode` trên laptop Windows, có ba thao tác dưới đây. **Alt+V** chỉ dán được ảnh khi phiên được mở bằng `fcode` (vào bằng `ssh` gõ tay như đầu mục này thì Alt+V báo `Chưa nối clipboard laptop…` hoặc không có gì). Kéo chuột để chép thì đã cài vào tmux trên box ở lần vào bằng `fcode`, nên sau đó cửa sổ `ssh` gõ tay cũng chép được, cho tới khi tmux trên box khởi động lại.
+
+| Bạn muốn | Làm gì | Kết quả |
+|---|---|---|
+| **Chép chữ** trên màn hình | **Kéo chuột** qua chữ rồi thả ra | Chữ được bôi đen và chép luôn vào clipboard của **laptop**. Không cần giữ Shift, không cần bấm Ctrl+C. Muốn dán thì bấm **Ctrl+V** ở bất kỳ đâu trên laptop. |
+| **Dán chữ** vào phiên | **Ctrl+V** | Giống mọi chương trình Windows: Windows Terminal dán chữ trong clipboard laptop vào phiên. |
+| **Dán ảnh** vào phiên | **Alt+V** (giữ phím Alt rồi bấm V) | Ảnh đang nằm trong clipboard laptop (ví dụ vừa chụp màn hình bằng **Win+Shift+S**) được chuyển lên box, đường dẫn của ảnh được gõ sẵn vào ô nhập của trợ lý. |
+
+**Vì sao ảnh dùng Alt+V mà không phải Ctrl+V?** Windows Terminal giữ Ctrl+V cho việc dán chữ của chính nó, phím này không bao giờ tới được phiên. Claude Code và omp trên Windows cũng dùng Alt+V cho ảnh vì lý do đó. Bạn không cần đổi cài đặt nào của Windows Terminal.
+
+**Dán ảnh, từng bước:**
+
+1. Chụp màn hình bằng **Win+Shift+S** (khoanh vùng cần chụp), hoặc chép một ảnh bất kỳ (chuột phải vào ảnh, **Copy**).
+2. Mở phiên bằng `fcode` như thường lệ.
+3. Bấm **Alt+V** trong phiên. Sau chừng một hai giây, một dòng báo hiện ở đáy màn hình: `Đã dán ảnh vào phiên (đường dẫn đã gõ, chưa gửi)`.
+4. Đường dẫn ảnh đã nằm trong ô nhập của trợ lý nhưng **chưa gửi** (FCode không tự bấm Enter). Gõ lời nhắn của bạn, ví dụ "sửa lỗi trong ảnh này", rồi bấm Enter như thường.
+
+Ảnh được lưu trên box ở thư mục `.fcode/uploads` trong dự án của phiên, cùng chỗ và cùng luật với ảnh gửi từ iPhone (xem [Gửi ảnh trong chat](#gửi-ảnh-trong-chat): tối đa 10 MB, ảnh cũ hơn 7 ngày bị xoá, thư mục được giấu khỏi git). Chỉ nhận ảnh PNG hoặc JPEG; ảnh chụp màn hình Windows là PNG nên dùng được ngay. Bấm Alt+V khi clipboard đang chứa **chữ** (không có ảnh) thì chỉ hiện một thông báo (bảng bên dưới), không gõ gì vào phiên.
+
+**Điều kiện:**
+
+- **Phải dùng Windows Terminal.** Đó là cửa sổ có thể mở nhiều thẻ; trên Windows 11 thường là chương trình tên **Terminal** (bấm Start, gõ `Terminal`); Windows 10 thì cài **Windows Terminal** từ Microsoft Store. Cửa sổ PowerShell cũ màu xanh (console cũ, `conhost`) **không chép được** bằng cách kéo chuột. Nếu mở `fcode` ngoài Windows Terminal, `fcode` in một dòng nhắc trước khi vào phiên.
+- **Cập nhật cả hai đầu, box trước.** Trên laptop chạy lại đúng một dòng lệnh ở mục [Cài lệnh fcode trên máy Windows khác](#cài-lệnh-fcode-trên-máy-windows-khác); trên box làm như mục 3, phần "Cập nhật" (`git pull` rồi `bash install.sh`). Laptop mới mà box chưa cập nhật: bấm Alt+V hiện dòng `Box chưa cập nhật: cd ~/fcode-src && git pull && bash install.sh`; làm đúng như dòng đó trên box rồi vào lại phiên bằng `fcode`. Laptop chưa cập nhật thì không dán được ảnh, và cách báo phụ thuộc vào box: chưa có lần nào một `fcode` bản mới (của máy khác) vào phiên trên box thì phím Alt+V chưa được gắn, bấm không hiện gì (phím đó có thể đến thẳng trợ lý, ví dụ Claude Code tự dán ảnh từ clipboard của box); sau khi bất kỳ `fcode` bản mới nào đã vào phiên, phím Alt+V được gắn cho cả box, nên bấm từ laptop cũ hiện `Chưa nối clipboard laptop…`. Cả hai trường hợp cách sửa như nhau: cập nhật `fcode` trên laptop đó rồi vào lại phiên.
+- **Mở phiên bằng `fcode` sau khi cập nhật.** Cửa sổ `fcode` đã mở từ trước chưa có tính năng này: thoát (**Ctrl+B** rồi **D**) và vào lại.
+- Clipboard laptop chỉ đi sang box **khi bạn bấm Alt+V**, và chỉ là ảnh. Chữ bạn chép trên laptop không bao giờ bị gửi lên box khi bạn không dán. Đường nối này chỉ sống khi cửa sổ `fcode` còn mở, đóng cửa sổ là hết.
+
+**Thông báo và cách xử lý** (hiện ở đáy màn hình vài giây, chỉ trong cửa sổ của bạn, không làm hỏng phiên):
+
+| Thông báo | Ý nghĩa và cách xử lý |
+|---|---|
+| `Đã dán ảnh vào phiên (đường dẫn đã gõ, chưa gửi)` | Thành công. Gõ lời nhắn rồi Enter. |
+| `Clipboard laptop không có ảnh` | Clipboard đang chứa chữ hoặc trống. Chụp màn hình (**Win+Shift+S**) hoặc chép ảnh lại rồi bấm Alt+V. |
+| `Chưa nối clipboard laptop: mở phiên bằng fcode trên laptop (bản mới)` | Phiên này không được mở bằng `fcode` bản mới (vào bằng `ssh` tay, hoặc `fcode` ở laptop chưa cập nhật). Cập nhật rồi vào lại bằng `fcode`. |
+| `Không nối được clipboard laptop (phiên mở bằng fcode đã thoát?)` | Cửa sổ `fcode` đã đóng, máy ngủ hoặc mất mạng nên đường nối sang laptop đã đứt. Vào lại phiên bằng `fcode` rồi bấm Alt+V. |
+| `Không lấy được ảnh từ laptop (mã N)` | Laptop không đưa ảnh ra được. Mã 413 là ảnh lớn hơn 10 MB: chụp vùng nhỏ hơn. Mã khác: vào lại phiên bằng `fcode` rồi thử lại. |
+| `Clipboard laptop đang bận, thử lại` | Một chương trình khác trên laptop đang giữ clipboard. Đợi một chút rồi bấm Alt+V lại. |
+| `Ảnh lớn quá (tối đa 10 MB)` | Ảnh vượt giới hạn của box; chụp vùng nhỏ hơn. |
+| `Ảnh từ laptop không phải PNG hoặc JPEG` / `Ảnh lấy từ laptop không đọc được` | Chép lại ảnh rồi thử lần nữa; vẫn lỗi thì vào lại phiên bằng `fcode`. |
+| `Thư mục tạm của FCode trên box không an toàn (<thư mục>): xoá nó rồi thử lại` | Thư mục tạm của FCode trên box (`clip` hoặc `clip-in`, tên đầy đủ nằm trong dòng báo) đã bị đổi thành một liên kết, hoặc không phải của bạn, hoặc quyền không phải 700, nên FCode không dùng nó (để không đọc hay xoá nhầm chỗ khác). Chép ảnh lại không sửa được. Trên box gõ `rm -rf '<thư mục>'` với đúng đường dẫn trong dòng báo (thư mục chỉ chứa ảnh và ghi nhớ tạm, FCode tự tạo lại; nếu là liên kết thì chỉ liên kết bị bỏ), rồi vào lại phiên bằng `fcode` và bấm Alt+V. |
+| `Phiên này không còn nữa, chưa dán được ảnh` | Phiên đã đóng; mở phiên khác. |
+| `Phiên chưa gắn dự án nào, chưa dán được ảnh` | Chỉ dán ảnh được vào phiên của một dự án; mở phiên từ một dự án (nút **+** hoặc `fcode new`). |
+| `Không lưu được ảnh trên box` | Box không ghi được ảnh (ổ đĩa đầy hoặc thư mục dự án bị khoá quyền); kiểm tra trên box. |
+| `Đã lưu ảnh nhưng chưa gắn được vào phiên: <đường dẫn>` | Ảnh đã nằm trên box nhưng đường dẫn chưa gõ vào được ô nhập (thường vì đường dẫn dự án có dấu cách). Nhờ trợ lý đọc đúng đường dẫn trong thông báo. |
+| `Server FCode chưa chạy trên box` | Dịch vụ `fcoding` đang tắt: `systemctl --user status fcoding` trên box (xem mục 3). |
+| `Server FCode trên box là bản cũ: chạy lại bash install.sh` | Box chưa cập nhật: `git pull` rồi `bash install.sh` trên box. |
+| `Server FCode không trả lời kịp, thử lại` | Box đang bận; đợi vài giây rồi bấm Alt+V lại. |
+| `Không nói chuyện được với server FCode` | Box có server nhưng không nói chuyện được với nhau; chạy lại `bash install.sh` trên box (xem mục 3), rồi thử lại. |
+| `Box chưa cập nhật: cd ~/fcode-src && git pull && bash install.sh` | Box chưa có bản mới của FCode. Làm đúng như dòng hiện ra trên box, rồi vào lại phiên bằng `fcode`. |
+| `Không dán được ảnh, thử lại` | Lỗi khác; thử lại, vẫn lỗi thì vào lại phiên bằng `fcode`. |
+
+**Bấm Alt+V mà không thấy gì?**
+
+- Bạn đang ở ngoài Windows Terminal, hoặc một phần mềm khác (ví dụ chương trình gõ tiếng Việt) đang giữ tổ hợp Alt+V. Thử trong Windows Terminal, hoặc tắt tổ hợp đó.
+- Phiên đang ở chế độ cuộn (bạn vừa lăn chuột lên xem lại): bấm **q** để về chỗ đang chạy rồi bấm Alt+V.
+- Laptop chưa cập nhật lệnh `fcode`, hoặc chưa vào lại phiên bằng `fcode` sau khi cập nhật: Alt+V không dán được ảnh. Nếu box chưa có phiên nào được mở bằng `fcode` bản mới thì phím chưa được gắn nên không hiện gì; nếu đã có thì hiện `Chưa nối clipboard laptop…`. Cập nhật rồi vào lại (xem "Điều kiện").
+- Nếu chỉ box chưa cập nhật thì Alt+V không im lặng mà hiện dòng `Box chưa cập nhật: ...` ở đáy màn hình (xem bảng trên).
+- Máy công ty có phần mềm bảo mật (EDR, Windows Defender) chặn tiến trình `powershell.exe` chạy ẩn mà `fcode` bật để đọc clipboard: `fcode` vẫn vào phiên bình thường nhưng không có Alt+V (bấm thì hiện `Chưa nối clipboard laptop…`); kéo chuột chép chữ vẫn dùng được. Nhờ bộ phận IT cho phép, hoặc dùng laptop khác.
+- Sshd trên box không nhận biến `LC_*` (dòng `AcceptEnv` trong `/etc/ssh/sshd_config` không có `LC_*`; Ubuntu mặc định có): `fcode` không gửi được khóa phiên lên box nên Alt+V hiện `Chưa nối clipboard laptop…` dù laptop và box đều đã cập nhật. Nhờ người quản trị box thêm `AcceptEnv LANG LC_*` rồi nạp lại sshd.
+
+**Alt+V dán chậm hơn bình thường?**
+- Ảnh chép cùng lúc với chữ (chép ô trong Excel, Word, qua Remote Desktop, hoặc "Copy image" trong trình duyệt) không được `fcode` mã hóa sẵn như ảnh chụp màn hình (**Win+Shift+S**), nên bấm Alt+V lần đó chậm hơn một chút; dán vẫn đúng. Ảnh chụp màn hình thì mã hóa sẵn nên dán nhanh.
+- Máy chặn `csc.exe` (AppLocker hoặc phần mềm bảo mật): `fcode` không theo dõi được clipboard để mã hóa trước, nên mọi lần Alt+V đều chậm hơn nhưng vẫn dán được ảnh, không cần làm gì thêm.
+
+**Kéo chuột không chép được chữ?** Thường do console cũ (xem "Điều kiện"). Thử mở `fcode` trong Windows Terminal. Cách cũ vẫn dùng được: giữ **Shift** khi kéo để Windows Terminal tự bôi đen, rồi bấm **Ctrl+C** để chép (cách này chép thẳng bằng Windows Terminal, không qua box).
+
+**Một điều nhỏ cần biết:** trong omp, Claude Code hay Codex, kéo chuột để chép có thể làm chương trình thấy một cú bấm chuột mà không thấy thả ra (nó đang bôi đen theo cách riêng); bấm chuột một lần nữa là hết.
 
 ### Đồng bộ phiên chat omp giữa laptop và box (`fcode phien`)
 
@@ -682,6 +753,7 @@ node -e 'console.log(require("crypto").randomBytes(32).toString("base64"))'
 
 - Máy chủ dùng **Node 22**, chỉ thư viện có sẵn (không `npm install`). Toàn bộ nằm trong `server.mjs`.
 - Hợp đồng giữa máy chủ và app nằm trong [`CONTRACT.md`](../CONTRACT.md) (các mục A1 trở đi là các thay đổi theo thời gian; ví dụ A4 thay mật khẩu bằng ghép máy, A5 thêm hộp thư tổng quan, A6 thêm màu cho màn hình, A7 ghép thêm máy bằng mã QR, A9 phiên omp của dự án, A10 đồng bộ phiên omp giữa laptop và box, A11 thêm dự án từ app, A16 bỏ vòng giờ box; sau đó thẻ trên cùng hiện lời chào và giờ Việt Nam).
+- Chép chữ và dán ảnh từ laptop là mục A17 của [`CONTRACT.md`](../CONTRACT.md): cầu clipboard giữa `fcode` trên laptop (`laptop/fcode.ps1`) và box (lệnh `server.mjs --clip`, lệnh quản trị `image`); file nối nằm ở `<thư mục cấu hình>/clip/` và `clip-in/`.
 - Chạy thử trên máy bất kỳ, kể cả Windows (dùng tmux giả, không cần tmux):
 
   ```sh

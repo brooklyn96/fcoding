@@ -7553,3 +7553,810 @@ for (const toolDir of ['.local/bin', '.bun/bin']) {
     }
   });
 }
+
+// ======================= laptop clipboard: admin `image`, the `--clip` CLI (Alt+V), and the attach bindings (drag-to-copy, Alt+V) =======================
+// admin `image` {session, file}: a PNG/JPEG the CLI left in <configDir>/clip-in/ goes through the SAME store code as the HTTP upload, then the path is typed into the session
+const NO_SOCK = process.platform === 'win32' && 'unix sockets';
+const NO_BASH = process.platform === 'win32' && 'bash';
+const clipInDir = (c) => path.join(c.configDir, 'clip-in');
+const clipInLeft = (c) => { try { return fs.readdirSync(clipInDir(c)); } catch { return []; } };
+const clipFile = (c, name, body) => { fs.mkdirSync(clipInDir(c), { recursive: true, mode: 0o700 }); const f = path.join(clipInDir(c), name); fs.writeFileSync(f, body, { mode: 0o600 }); return f; };
+const imageReq = (c, session, file) => adminRequest(c.configDir, { cmd: 'image', session, file }, 15000);
+const upDirOf = (dirs, p = 'alpha') => path.join(dirs[p], '.fcode', 'uploads');
+const inputCalls = (c) => c.calls().filter((x) => ['send-keys', 'load-buffer', 'paste-buffer'].includes(x.argv[0]));
+const addFakeSession = (name, project) => { // a session made outside the app: only @pc_project (or nothing) says which project it is
+  const state = path.join(process.env.FAKE_TMUX_DIR, 'state.json');
+  const st = JSON.parse(fs.readFileSync(state, 'utf8'));
+  st.sessions[name] = { created: 1700000000, dir: ABS, cmd: 'x', opts: project === undefined ? {} : { '@pc_project': project } };
+  fs.writeFileSync(state, JSON.stringify(st));
+};
+const OLD = (f) => { fs.writeFileSync(f, 'x'); const t = (Date.now() - 30 * 86400e3) / 1000; fs.utimesSync(f, t, t); return f; };
+
+test('admin image: the same store path as the HTTP upload (name, modes, O_EXCL, .gitignore, sweep); the path alone goes into the input, no Enter; the clip-in file is deleted', { skip: NO_SOCK }, () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 'work', 'claude');
+  const up = upDirOf(dirs); fs.mkdirSync(up, { recursive: true, mode: 0o700 }); // the store creates the folders with 0700; mine must not say otherwise
+  const old = OLD(path.join(up, '20260101-010101-abcdef.png')); // older than 7 days: the sweep of any store removes it
+  const opened = []; const orig = fs.promises.open;
+  fs.promises.open = (f, flags, mode) => { if (String(f).includes('.fcode') && !String(f).includes('.gitignore')) opened.push([String(f), flags, mode]); return orig.call(fs.promises, f, flags, mode); };
+  const before = c.calls().length;
+  let a, b, h;
+  try {
+    a = await imageReq(c, 'work', clipFile(c, 'a.png', PNG));
+    b = await imageReq(c, 'work', clipFile(c, 'b.jpg', JPG));
+    h = await upPost(c, cookie, 'alpha', PNG, { type: 'image/png' });
+  } finally { fs.promises.open = orig; }
+  assert.equal(h.status, 200, h.text);
+  for (const [r, ext, body] of [[a, 'png', PNG], [b, 'jpg', JPG]]) {
+    assert.deepEqual(Object.keys(r).sort(), ['attached', 'ok', 'path'], JSON.stringify(r));
+    assert.deepEqual([r.ok, r.attached], [true, true]);
+    assert.ok(path.isAbsolute(r.path));
+    assert.equal(path.dirname(r.path), up);
+    assert.match(path.basename(r.path), NAME_UP);
+    assert.equal(path.extname(r.path), `.${ext}`);
+    assert.deepEqual(fs.readFileSync(r.path), body);
+    assert.equal(fs.statSync(r.path).mode & 0o777, 0o600);
+  }
+  assert.equal(new Set([a.path, b.path, h.json.path]).size, 3);
+  const K = fs.constants, want = K.O_WRONLY | K.O_CREAT | K.O_EXCL | (K.O_NOFOLLOW ?? 0); // the very flags of the HTTP upload: never overwrite, never follow a link
+  assert.deepEqual(opened.map(([, flags, mode]) => [flags, mode]), [[want, 0o600], [want, 0o600], [want, 0o600]]);
+  assert.equal(fs.statSync(up).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(path.join(dirs.alpha, '.fcode')).mode & 0o777, 0o700);
+  assert.equal(fs.readFileSync(path.join(dirs.alpha, '.fcode', '.gitignore'), 'utf8'), '*\n'); // hideFromGit ran
+  assert.equal(fs.existsSync(old), false); // the sweep ran
+  assert.deepEqual(fs.readdirSync(dirs.alpha), ['.fcode']);
+  assert.deepEqual(clipInLeft(c), []); // the clip-in files are gone
+  // the path alone is typed, as for the phone: leave a pane mode, bracketed paste, no Enter
+  const calls = c.calls().slice(before).filter((x) => x.argv[0] !== 'list-sessions');
+  const quit = ['copy-mode', '-q', '-t', '=work:'], paste = ['paste-buffer', '-p', '-d', '-b', 'pc', '-t', '=work:'], load = ['load-buffer', '-b', 'pc', '-'];
+  assert.deepEqual(calls.map((x) => x.argv), [quit, load, paste, quit, load, paste]);
+  assert.deepEqual([calls[1], calls[4]].map((x) => Buffer.from(x.stdin, 'base64').toString()), [a.path, b.path]);
+  assert.ok(!calls.flatMap((x) => x.argv).includes('Enter'));
+}));
+
+test('admin image: two at once store two different files; a codex session gets the path by send-keys -l', { skip: NO_SOCK }, () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 'cx', 'codex');
+  const [a, b] = await Promise.all([imageReq(c, 'cx', clipFile(c, 'a.png', PNG)), imageReq(c, 'cx', clipFile(c, 'b.png', PNG))]);
+  assert.deepEqual([a.ok, b.ok, a.attached, b.attached], [true, true, true, true], JSON.stringify([a, b]));
+  assert.notEqual(a.path, b.path);
+  assert.deepEqual(fs.readdirSync(upDirOf(dirs)).sort(), [a.path, b.path].map((p) => path.basename(p)).sort());
+  const typed = c.calls().filter((x) => x.argv[0] === 'send-keys').map((x) => x.argv);
+  assert.deepEqual(typed.map((x) => x.slice(0, 5)), [['send-keys', '-t', '=cx:', '-l', '--'], ['send-keys', '-t', '=cx:', '-l', '--']]);
+  assert.deepEqual(typed.map((x) => x[5]).sort(), [a.path, b.path].sort());
+  assert.deepEqual(clipInLeft(c), []);
+}));
+
+test('admin image: a path with a space is saved but not attached (ok true, attached false, no input call); the clip-in file is deleted', { skip: NO_SOCK }, () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 'sp', 'claude', 'spaced');
+  const r = await imageReq(c, 'sp', clipFile(c, 'a.png', PNG));
+  assert.deepEqual([r.ok, r.attached], [true, false], JSON.stringify(r));
+  assert.equal(path.dirname(r.path), upDirOf(dirs, 'spaced'));
+  assert.deepEqual(fs.readFileSync(r.path), PNG); // the file is kept
+  assert.deepEqual(inputCalls(c), []);
+  assert.deepEqual(clipInLeft(c), []);
+}));
+
+test('admin image: when tmux refuses the input the file is still saved and attached is false', { skip: NO_SOCK }, () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 'dies', 'claude');
+  const state = path.join(process.env.FAKE_TMUX_DIR, 'state.json'); // the session is listed, then gone when the paste runs
+  const orig = fs.promises.open;
+  fs.promises.open = async (...a) => { const fh = await orig.apply(fs.promises, a); if (String(a[0]).includes('.fcode')) fs.writeFileSync(state, JSON.stringify({ sessions: {} })); return fh; };
+  let r;
+  try { r = await imageReq(c, 'dies', clipFile(c, 'a.png', PNG)); } finally { fs.promises.open = orig; }
+  assert.deepEqual([r.ok, r.attached], [true, false], JSON.stringify(r));
+  assert.ok(fs.existsSync(r.path));
+  assert.deepEqual(clipInLeft(c), []);
+}));
+
+test('admin image: no_session (not live, empty, not a name) and no_project (unknown project, folder gone, no @pc_project): nothing is stored or typed, the clip-in file is deleted; a session that is no string is refused', { skip: NO_SOCK }, () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 'work', 'claude');
+  addFakeSession('s-unknown', 'nope'); addFakeSession('s-gone', 'gone'); addFakeSession('s-none');
+  for (const session of ['ghost', '', 'Bad Name', '../x', 'a'.repeat(40)]) {
+    const r = await imageReq(c, session, clipFile(c, 'a.png', PNG));
+    assert.deepEqual(r, { ok: false, error: 'no_session' }, String(session));
+    assert.deepEqual(clipInLeft(c), [], String(session));
+  }
+  for (const session of [7, null, undefined]) { // the CLI always sends a string: a malformed request is refused
+    const r = await imageReq(c, session, clipFile(c, 'a.png', PNG));
+    assert.equal(r.ok, false, String(session));
+    assert.ok(['bad_file', 'no_session'].includes(r.error), JSON.stringify(r));
+  }
+  fs.rmSync(clipInDir(c), { recursive: true });
+  for (const session of ['s-unknown', 's-gone', 's-none']) {
+    const r = await imageReq(c, session, clipFile(c, 'a.png', PNG));
+    assert.deepEqual(r, { ok: false, error: 'no_project' }, session);
+    assert.deepEqual(clipInLeft(c), [], session);
+  }
+  assert.equal(fs.existsSync(path.join(dirs.alpha, '.fcode')), false);
+  assert.deepEqual(inputCalls(c), []);
+}));
+
+test('admin image: bad_file for anything that is not a regular file directly inside clip-in (other folder, .., link, folder, subfolder, relative, not a string); a file outside is never deleted', { skip: process.platform === 'win32' && 'unix sockets, symlinks' }, () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 'work', 'claude');
+  fs.mkdirSync(clipInDir(c), { recursive: true, mode: 0o700 });
+  const outside = path.join(c.configDir, 'outside.png'); fs.writeFileSync(outside, PNG);
+  const link = path.join(clipInDir(c), 'link.png'); fs.symlinkSync(outside, link);
+  const folder = path.join(clipInDir(c), 'folder.png'); fs.mkdirSync(folder);
+  const nested = path.join(clipInDir(c), 'sub', 'n.png'); fs.mkdirSync(path.dirname(nested)); fs.writeFileSync(nested, PNG);
+  const cases = [path.join(clipInDir(c), 'nope.png'), outside, `${clipInDir(c)}/../outside.png`, link, folder, nested, 'clip-in/a.png', '', undefined, 42, { x: 1 }];
+  for (const file of cases) {
+    const r = await imageReq(c, 'work', file);
+    assert.deepEqual(r, { ok: false, error: 'bad_file' }, JSON.stringify(file));
+  }
+  assert.deepEqual(fs.readFileSync(outside), PNG); // the target of the link and a file outside clip-in are untouched
+  assert.equal(fs.existsSync(path.join(dirs.alpha, '.fcode')), false);
+  assert.deepEqual(inputCalls(c), []);
+}));
+
+test('admin image: bad_type (no PNG/JPEG magic: text, GIF, WebP, truncated magic, empty) and too_big (10 MiB + 1; exactly 10 MiB is stored); the clip-in file is deleted each time', { skip: NO_SOCK }, () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 'work', 'claude');
+  const bad = [['text', Buffer.from('hello, not an image')], ['gif', Buffer.from('GIF89a\x01\x00\x01\x00')], ['webp', Buffer.from('RIFF\x00\x00\x00\x00WEBPVP8 ')],
+    ['short png', PNG.subarray(0, 7)], ['short jpeg', JPG.subarray(0, 2)]];
+  for (const [name, body] of bad) {
+    const r = await imageReq(c, 'work', clipFile(c, 'a.png', body)); // the name says png: the bytes decide
+    assert.deepEqual(r, { ok: false, error: 'bad_type' }, name);
+    assert.deepEqual(clipInLeft(c), [], name);
+  }
+  const empty = await imageReq(c, 'work', clipFile(c, 'a.png', Buffer.alloc(0)));
+  assert.equal(empty.ok, false);
+  assert.ok(['bad_type', 'bad_file'].includes(empty.error), JSON.stringify(empty));
+  assert.deepEqual(clipInLeft(c), []);
+  const big = clipFile(c, 'big.png', PNG); fs.truncateSync(big, UPLOAD_MAX + 1);
+  assert.deepEqual(await imageReq(c, 'work', big), { ok: false, error: 'too_big' });
+  assert.deepEqual(clipInLeft(c), []);
+  assert.equal(fs.existsSync(path.join(dirs.alpha, '.fcode', 'uploads')), false); // nothing of the refused ones was stored
+  const exact = await imageReq(c, 'work', clipFile(c, 'max.png', sized(PNG, UPLOAD_MAX)));
+  assert.equal(exact.ok, true, JSON.stringify(exact));
+  assert.equal(fs.statSync(exact.path).size, UPLOAD_MAX);
+  assert.deepEqual(clipInLeft(c), []);
+  assert.equal(inputCalls(c).filter((x) => x.argv[0] === 'load-buffer').length, 1); // only the stored one was typed
+}));
+
+test('admin image: a symlinked .fcode or uploads folder is not followed (storage, nothing written through it, nothing typed); the clip-in file is deleted', { skip: process.platform === 'win32' && 'unix sockets, symlinks' }, () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 'work', 'claude');
+  const elsewhere = path.join(dirs.beta, 'target'); fs.mkdirSync(elsewhere);
+  fs.symlinkSync(elsewhere, path.join(dirs.alpha, '.fcode'));
+  assert.deepEqual(await imageReq(c, 'work', clipFile(c, 'a.png', PNG)), { ok: false, error: 'storage' });
+  assert.deepEqual(fs.readdirSync(elsewhere), []);
+  assert.deepEqual(clipInLeft(c), []);
+  fs.unlinkSync(path.join(dirs.alpha, '.fcode')); fs.mkdirSync(path.join(dirs.alpha, '.fcode'));
+  fs.symlinkSync(elsewhere, path.join(dirs.alpha, '.fcode', 'uploads'));
+  assert.deepEqual(await imageReq(c, 'work', clipFile(c, 'a.png', PNG)), { ok: false, error: 'storage' });
+  assert.deepEqual(fs.readdirSync(elsewhere), []);
+  assert.deepEqual(clipInLeft(c), []);
+  assert.deepEqual(inputCalls(c), []);
+  fs.rmSync(path.join(dirs.alpha, '.fcode'), { recursive: true }); // a repaired project works at once
+  assert.equal((await imageReq(c, 'work', clipFile(c, 'a.png', PNG))).ok, true);
+}));
+
+// ---- `server.mjs --clip <client_tty> <session>`: what Alt+V runs on the box (tmux run-shell -b) ----
+const M_NONE = 'Chưa nối clipboard laptop: mở phiên bằng fcode trên laptop (bản mới)';
+const M_NOIMG = 'Clipboard laptop không có ảnh';
+const M_GONE = 'Không nối được clipboard laptop (phiên mở bằng fcode đã thoát?)';
+const M_OK = 'Đã dán ảnh vào phiên (đường dẫn đã gõ, chưa gửi)';
+const TTY = '/dev/pts/3';
+const ttyKey = (tty) => tty.replace(/\//g, '_');
+const mapTty = (cfg, tty, sock, token) => { // the mapping the box attach script writes
+  const d = path.join(cfg, 'clip'); fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(d, `${ttyKey(tty)}.json`), JSON.stringify({ sock, token }), { mode: 0o600 });
+};
+// the laptop's clipboard server, as a unix-socket HTTP server: handler(req, res); seen = what it was asked
+async function clipServer(dir, handler) {
+  const sock = path.join(dir, `s${crypto.randomBytes(3).toString('hex')}.sock`);
+  const seen = []; const conns = new Set();
+  const srv = http.createServer((req, res) => { seen.push({ method: req.method, url: req.url, token: req.headers['x-fcode-token'] }); handler(req, res); });
+  srv.on('connection', (s) => { conns.add(s); s.on('close', () => conns.delete(s)); });
+  await new Promise((resolve, reject) => { srv.once('error', reject); srv.listen(sock, resolve); });
+  return { sock, seen, close: () => { for (const s of conns) s.destroy(); return new Promise((r) => srv.close(r)); } };
+}
+const sendBody = (status, body, type = 'image/png') => (req, res) => { res.writeHead(status, { 'Content-Type': type, 'Content-Length': body.length }); res.end(body); };
+const TOKEN = 'a'.repeat(32);
+
+// withClip: a project session 'work' (alpha) and 'sp' (a folder with a space); run(args) = the CLI child with a recording tmux (PC_TMUX), shown() = what it asked tmux
+async function withClip(fn) {
+  await withUpload(async (c, dirs, cookie, base) => {
+    await mkAgent(c, cookie, 'work', 'claude'); await mkAgent(c, cookie, 'sp', 'claude', 'spaced');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-clip-'));
+    const rec = path.join(tmp, 'rec.mjs'), recLog = path.join(tmp, 'rec.jsonl');
+    fs.writeFileSync(rec, "import fs from 'node:fs';\nfs.appendFileSync(process.env.REC_LOG, JSON.stringify(process.argv.slice(2)) + '\\n');\n");
+    const servers = [];
+    const k = {
+      c, dirs, cookie, tmp,
+      serve: async (handler) => { const s = await clipServer(tmp, handler); servers.push(s); return s; },
+      run: (args = [TTY, 'work'], { env = {}, cfg = c.configDir, timeout = 30000 } = {}) => new Promise((resolve) => {
+        const t0 = Date.now();
+        execFile(process.execPath, [SERVER, '--clip', ...args], { env: { ...process.env, PC_CONFIG_DIR: cfg, PC_TMUX: JSON.stringify([process.execPath, rec]), REC_LOG: recLog, ...env }, encoding: 'utf8', timeout, windowsHide: true },
+          (err, stdout, stderr) => resolve({ status: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stdout, stderr, ms: Date.now() - t0 }));
+      }),
+      shown: () => { try { return fs.readFileSync(recLog, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } },
+      // exit 0 and nothing on stdout (run-shell would print it into the pane); tmux is asked exactly once: display-message -c <tty> <text>
+      expect: (r, tty, text) => {
+        assert.equal(r.status, 0, r.stderr); assert.equal(r.stdout, '');
+        assert.deepEqual(k.shown(), [['display-message', '-d', '5000', '-c', tty, text]]);
+      },
+      uploads: (p = 'alpha') => { try { return fs.readdirSync(upDirOf(dirs, p)); } catch { return []; } },
+    };
+    try { await fn(k); } finally { for (const s of servers) await s.close(); fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+}
+
+test('--clip 200: GET /image with the token over the unix socket; the PNG is stored, typed into the session, the clip-in file is gone; only that client is told (display-message -c)', { skip: NO_SOCK }, () => withClip(async (k) => {
+  const s = await k.serve(sendBody(200, PNG));
+  mapTty(k.c.configDir, TTY, s.sock, TOKEN);
+  const before = k.c.calls().length;
+  const r = await k.run();
+  k.expect(r, TTY, M_OK);
+  assert.deepEqual(s.seen, [{ method: 'GET', url: '/image', token: TOKEN }]); // one request, and only that one
+  const files = k.uploads(); assert.equal(files.length, 1);
+  const stored = path.join(upDirOf(k.dirs), files[0]);
+  assert.match(files[0], NAME_UP);
+  assert.deepEqual(fs.readFileSync(stored), PNG);
+  assert.deepEqual(clipInLeft(k.c), []);
+  assert.equal(fs.statSync(clipInDir(k.c)).mode & 0o777, 0o700);
+  const typed = k.c.calls().slice(before).filter((x) => x.argv[0] === 'load-buffer');
+  assert.deepEqual(typed.map((x) => Buffer.from(x.stdin, 'base64').toString()), [stored]); // the path alone, no Enter
+  assert.ok(!k.c.calls().slice(before).some((x) => x.argv.includes('Enter')));
+}));
+
+test('--clip 200 into a project whose path has a space: the image is saved, not typed, and the message says where', { skip: NO_SOCK }, () => withClip(async (k) => {
+  const s = await k.serve(sendBody(200, JPG, 'image/jpeg'));
+  mapTty(k.c.configDir, TTY, s.sock, TOKEN);
+  const r = await k.run([TTY, 'sp']);
+  const files = k.uploads('spaced'); assert.equal(files.length, 1);
+  k.expect(r, TTY, `Đã lưu ảnh nhưng chưa gắn được vào phiên: ${path.join(upDirOf(k.dirs, 'spaced'), files[0])}`);
+  assert.deepEqual(inputCalls(k.c), []);
+  assert.deepEqual(clipInLeft(k.c), []);
+}));
+
+test('--clip: the mapping is looked up by the client tty (slashes become _): another tty has none, and then nothing connects', { skip: NO_SOCK }, () => withClip(async (k) => {
+  const s = await k.serve(sendBody(200, PNG));
+  mapTty(k.c.configDir, '/dev/pts/9', s.sock, TOKEN);
+  assert.ok(fs.existsSync(path.join(k.c.configDir, 'clip', '_dev_pts_9.json')));
+  k.expect(await k.run([TTY, 'work']), TTY, M_NONE);
+  assert.deepEqual(s.seen, []);
+  assert.deepEqual(k.uploads(), []);
+}));
+
+test('--clip with no mapping at all: the "open the session with the new fcode" message, exit 0, nothing stored', { skip: NO_SOCK }, () => withClip(async (k) => {
+  k.expect(await k.run(), TTY, M_NONE);
+  assert.deepEqual(k.uploads(), []);
+}));
+
+test('--clip 204: the laptop clipboard has no image; nothing stored or typed', { skip: NO_SOCK }, () => withClip(async (k) => {
+  const s = await k.serve((req, res) => { res.writeHead(204); res.end(); });
+  mapTty(k.c.configDir, TTY, s.sock, TOKEN);
+  k.expect(await k.run(), TTY, M_NOIMG);
+  assert.equal(s.seen.length, 1);
+  assert.deepEqual(k.uploads(), []);
+  assert.deepEqual(inputCalls(k.c), []);
+}));
+
+test('--clip 403 (wrong token) and 413: "không lấy được ảnh (mã N)"; 500 (laptop clipboard busy): "đang bận, thử lại"; nothing stored', { skip: NO_SOCK }, () => withClip(async (k) => {
+  let status = 0;
+  const s = await k.serve((req, res) => { if (req.headers['x-fcode-token'] !== TOKEN) { res.writeHead(403); res.end(); } else { res.writeHead(status); res.end('x'); } });
+  mapTty(k.c.configDir, TTY, s.sock, 'b'.repeat(32)); // the box has another token than the laptop: 403 from the server
+  k.expect(await k.run(), TTY, 'Không lấy được ảnh từ laptop (mã 403)');
+  assert.deepEqual(s.seen, [{ method: 'GET', url: '/image', token: 'b'.repeat(32) }]);
+  for (const [code, text] of [[413, 'Không lấy được ảnh từ laptop (mã 413)'], [500, 'Clipboard laptop đang bận, thử lại']]) {
+    fs.rmSync(path.join(k.tmp, 'rec.jsonl'), { force: true });
+    mapTty(k.c.configDir, TTY, s.sock, TOKEN);
+    status = code;
+    k.expect(await k.run([TTY, 'work']), TTY, text);
+  }
+  assert.deepEqual(k.uploads(), []);
+  assert.deepEqual(clipInLeft(k.c), []);
+  assert.deepEqual(inputCalls(k.c), []);
+}));
+
+test('--clip: a socket that is gone, a path that is no socket (refused) and a folder that is gone all say the laptop is not connected; exit 0', { skip: NO_SOCK }, () => withClip(async (k) => {
+  mapTty(k.c.configDir, TTY, path.join(k.tmp, 'gone.sock'), TOKEN);
+  k.expect(await k.run(), TTY, M_GONE);
+  const dead = path.join(k.tmp, 'dead.sock'); fs.writeFileSync(dead, ''); // a leftover that nobody listens on
+  mapTty(k.c.configDir, TTY, dead, TOKEN);
+  fs.rmSync(path.join(k.tmp, 'rec.jsonl'));
+  k.expect(await k.run(), TTY, M_GONE);
+  mapTty(k.c.configDir, TTY, path.join(k.tmp, 'no', 'such', 'dir.sock'), TOKEN);
+  fs.rmSync(path.join(k.tmp, 'rec.jsonl'));
+  k.expect(await k.run(), TTY, M_GONE);
+  assert.deepEqual(k.uploads(), []);
+}));
+
+test('--clip: a laptop that never answers is given up after 10 s (same "not connected" message)', { skip: NO_SOCK }, () => withClip(async (k) => {
+  const s = await k.serve(() => {}); // accepts, never answers
+  mapTty(k.c.configDir, TTY, s.sock, TOKEN);
+  const r = await k.run();
+  k.expect(r, TTY, M_GONE);
+  assert.ok(r.ms >= 9000 && r.ms < 20000, `${r.ms} ms`);
+  assert.equal(s.seen.length, 1);
+}));
+
+test('--clip: a body over 10 MiB is cut off by the CLI itself (its own "mã 413" text, no staging file, the server is never asked), exit 0', { skip: NO_SOCK }, () => withClip(async (k) => {
+  const s = await k.serve((req, res) => { // PNG head, then 10 MiB + 1 in all, in chunks
+    res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': UPLOAD_MAX + 1 });
+    res.write(PNG);
+    let left = UPLOAD_MAX + 1 - PNG.length; const chunk = Buffer.alloc(1 << 16);
+    const pump = () => { while (left > 0) { const n = Math.min(left, chunk.length); left -= n; if (!res.write(n === chunk.length ? chunk : chunk.subarray(0, n))) return res.once('drain', pump); } res.end(); };
+    pump();
+  });
+  mapTty(k.c.configDir, TTY, s.sock, TOKEN);
+  const stage = clipInDir(k.c);
+  // the text is the CLI's: without its cap the whole body would reach the server, whose answer is "Ảnh lớn quá" (too_big), a different text
+  k.expect(await k.run(), TTY, 'Không lấy được ảnh từ laptop (mã 413)');
+  assert.equal(fs.existsSync(stage), false); // nothing was staged, so the admin socket was never used for an image
+  assert.deepEqual(inputCalls(k.c), []);
+  assert.deepEqual(k.uploads(), []);
+}));
+
+test('--clip: an answer that is no image, a session that is gone, and a broken mapping: exit 0, a failure text, nothing stored, no clip-in file left', { skip: NO_SOCK }, () => withClip(async (k) => {
+  const s = await k.serve(sendBody(200, Buffer.from('this is not an image')));
+  mapTty(k.c.configDir, TTY, s.sock, TOKEN);
+  const failed = async (args, what) => {
+    fs.rmSync(path.join(k.tmp, 'rec.jsonl'), { force: true });
+    const r = await k.run(args);
+    assert.equal(r.status, 0, `${what}: ${r.stderr}`); assert.equal(r.stdout, '', what);
+    const shown = k.shown(); assert.equal(shown.length, 1, what);
+    assert.deepEqual(shown[0].slice(0, 5), ['display-message', '-d', '5000', '-c', args[0]], what);
+    assert.ok(shown[0][5] && shown[0][5] !== M_OK, what);
+  };
+  await failed([TTY, 'work'], 'bad type');
+  s.seen.length = 0;
+  const good = await k.serve(sendBody(200, PNG));
+  mapTty(k.c.configDir, TTY, good.sock, TOKEN);
+  await failed([TTY, 'ghost'], 'no session');
+  fs.writeFileSync(path.join(k.c.configDir, 'clip', `${ttyKey(TTY)}.json`), '{not json');
+  await failed([TTY, 'work'], 'broken mapping');
+  fs.writeFileSync(path.join(k.c.configDir, 'clip', `${ttyKey(TTY)}.json`), JSON.stringify({ sock: good.sock }));
+  await failed([TTY, 'work'], 'mapping without a token');
+  assert.deepEqual(k.uploads(), []);
+  assert.deepEqual(clipInLeft(k.c), []);
+}));
+
+test('--clip with no FCode server running: exit 0 and a failure text (the laptop answered with an image)', { skip: NO_SOCK }, () => withClip(async (k) => {
+  const cfg = path.join(k.tmp, 'cfg-noserver'); fs.mkdirSync(cfg, { mode: 0o700 });
+  const s = await k.serve(sendBody(200, PNG));
+  mapTty(cfg, TTY, s.sock, TOKEN);
+  const r = await k.run([TTY, 'work'], { cfg });
+  assert.equal(r.status, 0, r.stderr); assert.equal(r.stdout, '');
+  k.expect(r, TTY, 'Server FCode chưa chạy trên box');
+  assert.deepEqual(fs.readdirSync(path.join(cfg, 'clip-in')), []); // the staging file the CLI wrote is deleted by the CLI itself
+  assert.equal(s.seen.length, 1); // the laptop did answer: the image was staged
+}));
+
+// ---- round 2 (Amendment 1): the staging folders are never followed; the CLI deletes its staging file after every admin answer ----
+const NO_LINK = process.platform === 'win32' && 'unix sockets, symlinks';
+const NO_IMG = 'Ảnh lấy từ laptop không đọc được';
+const UNSAFE = (p) => `Thư mục tạm của FCode trên box không an toàn (${p}): xoá nó rồi thử lại`; // Amendment 2 item 12: the CLI names the folder to remove
+
+test('--clip: a symlinked or loose (not 700) clip folder (the mappings) is refused with the "không an toàn" text naming it (laptop never asked); a symlinked mapping file is "Chưa nối"', { skip: NO_LINK }, () => withClip(async (k) => {
+  const s = await k.serve(sendBody(200, PNG));
+  const real = path.join(k.tmp, 'real-clip'); fs.mkdirSync(real, { mode: 0o700 });
+  const key = `${ttyKey(TTY)}.json`, mapping = path.join(real, key);
+  fs.writeFileSync(mapping, JSON.stringify({ sock: s.sock, token: TOKEN }), { mode: 0o600 });
+  const clipDir = path.join(k.c.configDir, 'clip');
+  const refused = async (what, want = UNSAFE(clipDir)) => { fs.rmSync(path.join(k.tmp, 'rec.jsonl'), { force: true }); k.expect(await k.run(), TTY, want); assert.deepEqual(s.seen, [], what); };
+  fs.symlinkSync(real, clipDir); // the whole folder is a link to a folder that holds a good mapping
+  await refused('symlinked folder');
+  fs.unlinkSync(clipDir);
+  for (const mode of [0o755, 0o750, 0o770, 0o777]) { // ours, but others could add or swap files in it
+    fs.mkdirSync(clipDir, { mode: 0o700 }); fs.copyFileSync(mapping, path.join(clipDir, key)); fs.chmodSync(clipDir, mode);
+    await refused(`mode ${mode.toString(8)}`);
+    fs.rmSync(clipDir, { recursive: true });
+  }
+  fs.mkdirSync(clipDir, { mode: 0o700 }); fs.symlinkSync(mapping, path.join(clipDir, key)); // a proper folder, but the mapping file is a link
+  await refused('symlinked mapping file', M_NONE);
+  fs.rmSync(clipDir, { recursive: true });
+  fs.mkdirSync(clipDir, { mode: 0o700 }); fs.copyFileSync(mapping, path.join(clipDir, key)); // control: the same mapping in a proper folder is used
+  fs.rmSync(path.join(k.tmp, 'rec.jsonl'), { force: true });
+  k.expect(await k.run(), TTY, M_OK);
+  assert.equal(s.seen.length, 1);
+  assert.equal(k.uploads().length, 1);
+}));
+
+test('--clip: a symlinked or loose (not 700) clip-in folder is refused by the CLI itself with the "không an toàn" text naming it (the admin socket is never asked, nothing is written through the link or deleted in the folder)', { skip: NO_LINK }, () => withClip(async (k) => {
+  const cfg = path.join(k.tmp, 'cfg-ci'); fs.mkdirSync(cfg, { mode: 0o700 }); // a fake admin server records every request: the CLI must not even stage the file
+  const s = await k.serve(sendBody(200, PNG)); mapTty(cfg, TTY, s.sock, TOKEN);
+  const asked = [];
+  const adm = await fakeAdmin(cfg, (req, c) => { seenByAdmin(asked)(req); c.end(`${JSON.stringify({ ok: true, path: '/x/y.png', attached: true })}\n`); });
+  const inDir = path.join(cfg, 'clip-in');
+  try {
+    const target = path.join(k.tmp, 'target'); fs.mkdirSync(target, { mode: 0o700 });
+    fs.writeFileSync(path.join(target, 'keep.png'), PNG);
+    const refused = async (what) => {
+      fs.rmSync(path.join(k.tmp, 'rec.jsonl'), { force: true });
+      k.expect(await k.run([TTY, 'work'], { cfg }), TTY, UNSAFE(inDir));
+      assert.deepEqual(asked, [], what);
+    };
+    fs.symlinkSync(target, inDir);
+    await refused('symlinked folder');
+    assert.deepEqual(fs.readdirSync(target), ['keep.png']); // nothing was written through the link, the file in it is intact
+    assert.deepEqual(fs.readFileSync(path.join(target, 'keep.png')), PNG);
+    fs.unlinkSync(inDir);
+    fs.mkdirSync(inDir, { mode: 0o700 }); fs.writeFileSync(path.join(inDir, 'old.png'), PNG);
+    for (const mode of [0o755, 0o750, 0o770, 0o777]) {
+      fs.chmodSync(inDir, mode);
+      await refused(`mode ${mode.toString(8)}`);
+      assert.deepEqual(fs.readdirSync(inDir), ['old.png'], `mode ${mode.toString(8)}`); // neither a new image nor the old file was touched
+    }
+    fs.chmodSync(inDir, 0o700); // control: a proper folder is used, the image is staged and handed over (only the CLI's own file is deleted)
+    fs.rmSync(path.join(k.tmp, 'rec.jsonl'), { force: true });
+    k.expect(await k.run([TTY, 'work'], { cfg }), TTY, M_OK);
+    assert.equal(asked.length, 1); assert.equal(asked[0].there, true);
+    assert.deepEqual(fs.readdirSync(inDir), ['old.png']);
+  } finally { fs.chmodSync(inDir, 0o700); await adm.close(); }
+}));
+
+test('--clip: a clip-in that is a dangling symlink or a regular file is refused with the "không an toàn" text naming it (item 15): nothing is created through the link or in its place, the admin socket is never asked; an absent one is created 700', { skip: NO_LINK }, () => withClip(async (k) => {
+  const cfg = path.join(k.tmp, 'cfg-dl'); fs.mkdirSync(cfg, { mode: 0o700 });
+  const s = await k.serve(sendBody(200, PNG)); mapTty(cfg, TTY, s.sock, TOKEN);
+  const asked = [];
+  const adm = await fakeAdmin(cfg, (req, c) => { seenByAdmin(asked)(req); c.end(`${JSON.stringify({ ok: true, path: '/x/y.png', attached: true })}\n`); });
+  const inDir = path.join(cfg, 'clip-in');
+  const refused = async (what) => {
+    fs.rmSync(path.join(k.tmp, 'rec.jsonl'), { force: true });
+    k.expect(await k.run([TTY, 'work'], { cfg }), TTY, UNSAFE(inDir));
+    assert.deepEqual(asked, [], what);
+  };
+  try {
+    const nowhere = path.join(k.tmp, 'nowhere'), target = path.join(nowhere, 'deeper');
+    fs.symlinkSync(target, inDir); // dangling: neither the target nor its parent exists
+    await refused('dangling symlink');
+    assert.equal(fs.existsSync(nowhere), false); // nothing was created through the link
+    assert.equal(fs.lstatSync(inDir).isSymbolicLink(), true); // and the link itself was left alone
+    assert.equal(fs.readlinkSync(inDir), target);
+    fs.unlinkSync(inDir);
+    fs.writeFileSync(inDir, 'not a folder', { mode: 0o600 });
+    await refused('regular file');
+    assert.equal(fs.lstatSync(inDir).isFile(), true); // not replaced by a folder, not deleted
+    assert.equal(fs.readFileSync(inDir, 'utf8'), 'not a folder');
+    fs.unlinkSync(inDir);
+    fs.rmSync(path.join(k.tmp, 'rec.jsonl'), { force: true }); // control: absent -> the CLI creates it 700 and hands the image over
+    k.expect(await k.run([TTY, 'work'], { cfg }), TTY, M_OK);
+    assert.equal(asked.length, 1); assert.equal(asked[0].there, true);
+    assert.equal(fs.lstatSync(inDir).isDirectory(), true);
+    assert.equal(fs.statSync(inDir).mode & 0o777, 0o700);
+  } finally { await adm.close(); }
+}));
+
+// a stand-in for the FCode server's admin socket: onReq(request, connection) per request line
+async function fakeAdmin(cfg, onReq) {
+  const conns = new Set();
+  const srv = net.createServer((c) => {
+    conns.add(c); c.on('close', () => conns.delete(c)); c.on('error', () => {});
+    let b = '', seen = false;
+    c.on('data', (d) => { b += d; if (!seen && b.includes('\n')) { seen = true; onReq(JSON.parse(b.split('\n')[0]), c); } });
+  });
+  await new Promise((resolve, reject) => { srv.once('error', reject); srv.listen(adminPath(cfg), resolve); });
+  return { close: () => { for (const c of conns) c.destroy(); return new Promise((r) => srv.close(r)); } };
+}
+const seenByAdmin = (asked) => (req) => { // what the admin server saw: the staging file must exist, in clip-in, with the image in it
+  const there = fs.existsSync(String(req.file));
+  asked.push({ cmd: req.cmd, session: req.session, dir: path.dirname(String(req.file)), there, body: there ? fs.readFileSync(req.file) : null });
+};
+
+test('--clip: the CLI deletes its staging file after any admin answer: an old server\'s `unknown command`, a reply that never touches the file, garbage, a refusal', { skip: NO_SOCK }, () => withClip(async (k) => {
+  const cfg = path.join(k.tmp, 'cfg-fake'); fs.mkdirSync(cfg, { mode: 0o700 });
+  const s = await k.serve(sendBody(200, PNG)); mapTty(cfg, TTY, s.sock, TOKEN);
+  const asked = []; let reply = null;
+  const adm = await fakeAdmin(cfg, (req, c) => { seenByAdmin(asked)(req); c.end(`${reply}\n`); });
+  try {
+    const cases = [
+      ['old server', JSON.stringify({ ok: false, error: 'unknown command' }), /bản cũ/],
+      ['ok, file left alone by the server', JSON.stringify({ ok: true, path: '/x/y.png', attached: true }), M_OK],
+      ['garbage', 'not json', 'Không nói chuyện được với server FCode'],
+      ['refusal', JSON.stringify({ ok: false, error: 'bad_file' }), NO_IMG],
+    ];
+    for (const [what, text, want] of cases) {
+      reply = text;
+      fs.rmSync(path.join(k.tmp, 'rec.jsonl'), { force: true });
+      const r = await k.run([TTY, 'work'], { cfg });
+      assert.equal(r.status, 0, `${what}: ${r.stderr}`); assert.equal(r.stdout, '', what);
+      const shown = k.shown(); assert.equal(shown.length, 1, what);
+      assert.deepEqual(shown[0].slice(0, 5), ['display-message', '-d', '5000', '-c', TTY], what);
+      if (typeof want === 'string') assert.equal(shown[0][5], want, what); else assert.match(shown[0][5], want, what);
+      assert.deepEqual(fs.readdirSync(path.join(cfg, 'clip-in')), [], what); // the staging file is gone whatever the server did
+    }
+    assert.equal(asked.length, cases.length);
+    for (const a of asked) assert.deepEqual([a.cmd, a.session, a.dir, a.there, a.body?.equals(PNG)], ['image', 'work', path.join(cfg, 'clip-in'), true, true]); // it was staged, in clip-in, with the image
+  } finally { await adm.close(); }
+}));
+
+test('--clip: an admin server that never answers is given up after 15 s ("không trả lời kịp") and the staging file is deleted anyway', { skip: NO_SOCK }, () => withClip(async (k) => {
+  const cfg = path.join(k.tmp, 'cfg-hang'); fs.mkdirSync(cfg, { mode: 0o700 });
+  const s = await k.serve(sendBody(200, PNG)); mapTty(cfg, TTY, s.sock, TOKEN);
+  const asked = [];
+  const adm = await fakeAdmin(cfg, seenByAdmin(asked));
+  try {
+    const r = await k.run([TTY, 'work'], { cfg });
+    k.expect(r, TTY, 'Server FCode không trả lời kịp, thử lại');
+    assert.ok(r.ms >= 14000 && r.ms < 25000, `${r.ms} ms`);
+    assert.equal(asked.length, 1); assert.equal(asked[0].there, true);
+    assert.deepEqual(fs.readdirSync(path.join(cfg, 'clip-in')), []);
+  } finally { await adm.close(); }
+}));
+
+test('admin image: a symlinked or loose (not 700) clip-in folder is refused (bad_file): nothing in it is read, stored or deleted', { skip: NO_LINK }, () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 'work', 'claude');
+  const real = path.join(c.configDir, 'real-in'); fs.mkdirSync(real, { mode: 0o700 });
+  const f = path.join(real, 'a.png'); fs.writeFileSync(f, PNG);
+  fs.symlinkSync(real, clipInDir(c)); // the folder the CLI would name is a link to a folder that holds a good PNG
+  assert.deepEqual(await imageReq(c, 'work', path.join(clipInDir(c), 'a.png')), { ok: false, error: 'bad_file' });
+  assert.deepEqual(fs.readFileSync(f), PNG); // not read-and-unlinked through the link
+  fs.unlinkSync(clipInDir(c));
+  for (const mode of [0o755, 0o750, 0o770, 0o777]) {
+    fs.mkdirSync(clipInDir(c), { mode: 0o700 });
+    const g = path.join(clipInDir(c), 'a.png'); fs.writeFileSync(g, PNG);
+    fs.chmodSync(clipInDir(c), mode);
+    assert.deepEqual(await imageReq(c, 'work', g), { ok: false, error: 'bad_file' }, mode.toString(8));
+    assert.deepEqual(fs.readFileSync(g), PNG, mode.toString(8)); // refused, not deleted
+    if (mode === 0o777) { fs.chmodSync(clipInDir(c), 0o700); const ok = await imageReq(c, 'work', g); assert.equal(ok.ok, true, JSON.stringify(ok)); } // control: 700 is accepted
+    fs.chmodSync(clipInDir(c), 0o700); fs.rmSync(clipInDir(c), { recursive: true });
+  }
+  assert.equal(fs.existsSync(path.join(dirs.alpha, '.fcode', 'uploads')), true); // only the control stored anything
+  assert.equal(fs.readdirSync(upDirOf(dirs)).length, 1);
+  assert.equal(inputCalls(c).filter((x) => x.argv[0] === 'load-buffer').length, 1);
+}));
+
+// ---- the box attach script ($FcodeSh in laptop/fcode.ps1): two global tmux bindings before the attach, and the clip mapping when the laptop forwards its clipboard ----
+const fcodeShScript = () => {
+  const ps1 = fs.readFileSync(path.join(here, '..', 'laptop', 'fcode.ps1'), 'utf8');
+  const m = /\$FcodeSh = \(@'\r?\n([\s\S]*?)\r?\n'@\)/.exec(ps1);
+  assert.ok(m, '$FcodeSh here-string not found in laptop/fcode.ps1');
+  return m[1].replace(/\r\n/g, '\n') + '\n';
+};
+// runs `bash <script> work` with a fake tmux (records every call but list-sessions, and the content of $PC_CONFIG_DIR/clip at that moment), tty, sleep and a node.
+// The script is patched in two ways so the test never touches the real box: /tmp (the stale-socket sweep and the previous-socket removal) becomes <root>/tmp,
+// and the installed server.mjs the Alt+V guard greps (/data/home/fcoding/server.mjs) becomes `server`: this repo's server.mjs (default), 'old' (no --clip; running
+// it leaves a marker file) or 'none' (no file).
+function attachRun(t, { env = {}, node = true, tty = '/dev/pts/7', cfgName = 'cfg', binName = 'bin', server = SERVER } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-att-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const bin = path.join(root, binName), home = path.join(root, 'home'), cfg = path.join(root, cfgName), tmp = path.join(root, 'tmp'), log = path.join(root, 'tmux.log');
+  const marker = path.join(root, 'old-server-ran');
+  for (const d of [bin, home, tmp]) fs.mkdirSync(d);
+  fs.mkdirSync(cfg, { mode: 0o700 });
+  let srv = server;
+  if (server === 'old') { srv = path.join(root, 'old-server.mjs'); fs.writeFileSync(srv, `import fs from 'node:fs';\nfs.writeFileSync(${JSON.stringify(marker)}, 'ran');\n// an older server: --new, --pair, --devices, --revoke\n`); }
+  if (server === 'none') srv = path.join(root, 'no-such-server.mjs');
+  const stub = (name, body) => fs.writeFileSync(path.join(bin, name), `#!/bin/bash\n${body}\n`, { mode: 0o755 });
+  stub('tmux', `if [ "$1" = list-sessions ]; then echo 'work|0|alpha|claude'; exit 0; fi
+{ for a in "$@"; do printf '%s\\n' "$a"; done; printf '@@clip=%s\\n' "$(ls "$PC_CONFIG_DIR/clip" 2>/dev/null | tr '\\n' ,)"; printf '@@tok=%s\\n' "$(env | grep -c 'CLIP_TOKEN=')"; echo '-----'; } >> "$TMUX_LOG"`);
+  stub('sleep', 'exit 0');
+  stub('tty', 'echo "$FAKE_TTY"');
+  if (node) fs.symlinkSync(process.execPath, path.join(bin, 'node'));
+  const text = fcodeShScript();
+  assert.ok(text.includes('srv=/data/home/fcoding/server.mjs') && text.includes('find /tmp -maxdepth 1'), 'the attach script no longer has the two places this test patches');
+  const script = path.join(root, 'fcode.sh'); fs.writeFileSync(script, text.replaceAll('/tmp', tmp).replace('srv=/data/home/fcoding/server.mjs', `srv='${srv}'`));
+  const run = (more = {}) => {
+    const r = spawnSync('bash', ['-c', 'umask 0; exec bash "$0" "$@"', script, 'work'], { encoding: 'utf8', timeout: 20000,
+      env: { PATH: `${bin}:/usr/bin:/bin`, HOME: home, LANG: 'C.UTF-8', PC_CONFIG_DIR: cfg, TMUX_LOG: log, FAKE_TTY: tty, ...env, ...more } });
+    let out = ''; try { out = fs.readFileSync(log, 'utf8'); } catch {}
+    const calls = out.split('-----\n').filter(Boolean).map((blk) => { const l = blk.split('\n').slice(0, -1); const tok = l.pop(); const last = l.pop(); return { args: l, clip: last.slice('@@clip='.length), tok: Number(tok.slice('@@tok='.length)) }; }); // tok = how many CLIP_TOKEN= variables (any name) tmux was started with
+    try { fs.rmSync(log); } catch {}
+    return { ...r, calls, flat: calls.flatMap((x) => [...x.args, '\0']) };
+  };
+  return { run, root, cfg, bin, home, tmp, marker, srv };
+}
+const seqAt = (flat, seq) => { for (let i = 0; i + seq.length <= flat.length; i++) if (seq.every((s, j) => flat[i + j] === s)) return i; return -1; };
+const DRAG = ['bind-key', '-n', 'MouseDrag1Pane', 'if-shell', '-F', '#{pane_in_mode}', 'send-keys -M', 'copy-mode -M'];
+// #{q:...} (tmux escapes the value for the shell at run time), never a raw '#{...}' inside quotes
+const ALT_V = /^PC_CONFIG_DIR='([^']*)' '([^']*)' '([^']*)' --clip #\{q:client_tty\} #\{q:session_name\}$/;
+const OLD_BOX = 'Box chưa cập nhật: cd ~/fcode-src && git pull && bash install.sh';
+
+test('laptop $FcodeSh attach: the drag binding and the hint are set before tmux attaches, also with no clipboard forwarded; no mapping without the two env vars (the token is LC_FCODE_CLIP_TOKEN, the old FCODE_CLIP_TOKEN is not read)', { skip: NO_BASH }, (t) => {
+  const a = attachRun(t);
+  for (const env of [{}, { FCODE_CLIP_SOCK: '/tmp/x.sock' }, { LC_FCODE_CLIP_TOKEN: TOKEN }, { FCODE_CLIP_SOCK: '', LC_FCODE_CLIP_TOKEN: '' }, { FCODE_CLIP_SOCK: '/tmp/fcode-clip-0123456789abcdef.sock', FCODE_CLIP_TOKEN: TOKEN }]) {
+    const r = a.run(env);
+    assert.equal(r.status, 0, r.stderr);
+    const drag = seqAt(r.flat, DRAG), att = r.flat.indexOf('attach');
+    assert.ok(drag >= 0, `no drag binding in ${JSON.stringify(r.flat)}`);
+    assert.ok(att > drag, 'the binding is set before the attach');
+    assert.deepEqual(r.flat.slice(att - 1, att + 3), ['-u', 'attach', '-t', '=work']);
+    assert.equal(fs.existsSync(path.join(a.cfg, 'clip')), false, JSON.stringify(env)); // no mapping, not even the folder
+  }
+  const r = a.run();
+  assert.match(r.stdout, /kéo chuột/); assert.match(r.stdout, /clipboard laptop/); assert.match(r.stdout, /Alt\+V/); assert.match(r.stdout, /Ctrl\+V/);
+  assert.doesNotMatch(r.stdout, /giữ Shift/);
+  assert.match(fcodeShScript(), /\/data\/home\/\.fcoding/); // the default config dir when PC_CONFIG_DIR is not set, as server.mjs defaultConfigDir
+});
+
+test('laptop $FcodeSh attach: with the clipboard env it writes clip/<tty with / as _>.json (folder 700, file 600, {sock, token}, no temp file left) before the Alt+V binding, which runs server.mjs --clip', { skip: NO_BASH }, (t) => {
+  const a = attachRun(t);
+  const sock = '/tmp/fcode-clip-0123456789abcdef.sock';
+  const r = a.run({ FCODE_CLIP_SOCK: sock, LC_FCODE_CLIP_TOKEN: TOKEN });
+  assert.equal(r.status, 0, r.stderr);
+  const dir = path.join(a.cfg, 'clip'), file = path.join(dir, '_dev_pts_7.json');
+  assert.deepEqual(fs.readdirSync(dir), ['_dev_pts_7.json']);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { sock, token: TOKEN });
+  assert.equal(fs.statSync(dir).mode & 0o777, 0o700); // explicit modes: the test runs under umask 0
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  const i = r.flat.indexOf('M-v');
+  assert.ok(i >= 2, JSON.stringify(r.flat));
+  assert.deepEqual(r.flat.slice(i - 2, i + 2), ['bind-key', '-n', 'M-v', 'run-shell']);
+  assert.equal(r.flat[i + 2], '-b');
+  const m = ALT_V.exec(r.flat[i + 3]);
+  assert.ok(m, r.flat[i + 3]);
+  assert.deepEqual([m[1], m[2], m[3]], [a.cfg, path.join(a.bin, 'node'), SERVER]); // PC_CONFIG_DIR, the login shell's node and the installed server.mjs
+  assert.doesNotMatch(r.flat[i + 3], /'#\{/); // no raw '#{client_tty}': a quote in a renamed session must not break out of the shell string
+  assert.ok(!r.flat.includes('display-message')); // the "box not updated" message is only for a server.mjs without --clip
+  const bindCall = r.calls.find((x) => x.args.includes('M-v'));
+  assert.equal(bindCall.clip, '_dev_pts_7.json,', 'the mapping exists when the binding is set');
+  const att = r.flat.indexOf('attach');
+  assert.ok(i < att && seqAt(r.flat, DRAG) < att, 'both bindings come before the attach');
+  // Amendment 3: the token came in as LC_FCODE_CLIP_TOKEN, it is in the mapping file only; tmux (the attach and its server) is started without it, and it is in no argv
+  assert.equal(r.calls.find((x) => x.args.includes('attach')).tok, 0, 'the attach tmux still has the token in its environment');
+  assert.ok(!r.calls.some((x) => x.tok > 0), 'some tmux call was started with the token in its environment');
+  assert.ok(!r.flat.some((x) => x.includes(TOKEN)), 'the token is in a tmux argv');
+  assert.ok(!r.stdout.includes(TOKEN) && !r.stderr.includes(TOKEN));
+  // a new attach from the same tty replaces the mapping (atomically: one file, no temp left); another tty gets its own
+  const sock2 = '/tmp/fcode-clip-fedcba9876543210.sock', token2 = 'c'.repeat(32);
+  const r2 = a.run({ FCODE_CLIP_SOCK: sock2, LC_FCODE_CLIP_TOKEN: token2 });
+  assert.equal(r2.status, 0, r2.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { sock: sock2, token: token2 });
+  assert.deepEqual(fs.readdirSync(dir), ['_dev_pts_7.json']);
+  assert.ok(seqAt(r2.flat, DRAG) >= 0 && r2.flat.includes('M-v')); // the bindings are set again on every attach
+  const other = attachRun(t, { tty: '/dev/pts/12' });
+  other.run({ FCODE_CLIP_SOCK: sock, LC_FCODE_CLIP_TOKEN: TOKEN });
+  assert.deepEqual(fs.readdirSync(path.join(other.cfg, 'clip')), ['_dev_pts_12.json']);
+});
+
+test('laptop $FcodeSh attach: without node on the PATH the Alt+V binding is skipped, the drag binding and the attach still happen', { skip: NO_BASH || (spawnSync('/bin/sh', ['-c', 'command -v node'], { env: { PATH: '/usr/bin:/bin' } }).status === 0 && 'node is in /usr/bin or /bin here') }, (t) => {
+  const a = attachRun(t, { node: false });
+  const r = a.run({ FCODE_CLIP_SOCK: '/tmp/fcode-clip-0123456789abcdef.sock', LC_FCODE_CLIP_TOKEN: TOKEN });
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!r.flat.includes('M-v'));
+  const att = r.flat.indexOf('attach');
+  assert.ok(seqAt(r.flat, DRAG) >= 0 && seqAt(r.flat, DRAG) < att);
+  assert.ok(att > 0);
+});
+
+// ---- round 2 (Amendment 1): the attach script's guards ----
+const bindsAt = (r) => { const att = r.flat.indexOf('attach'); return att > 0 && seqAt(r.flat, DRAG) >= 0 && seqAt(r.flat, DRAG) < att; }; // the drag binding came first and the attach still happens
+const mkSock = async (t, p) => { // a real unix socket file that stays until the test ends (find -type s)
+  const s = net.createServer();
+  await new Promise((resolve, reject) => { s.once('error', reject); s.listen(p, resolve); });
+  t.after(() => new Promise((r) => s.close(() => r())));
+  return p;
+};
+const age = (p, days) => { const when = (Date.now() - days * 86400e3) / 1000; fs.utimesSync(p, when, when); return p; };
+
+test('laptop $FcodeSh attach: a server.mjs without --clip (an old box, or none) gets an "update the box" message on Alt+V; server.mjs is never run and run-shell is never bound', { skip: NO_BASH }, (t) => {
+  for (const server of ['old', 'none']) {
+    const a = attachRun(t, { server });
+    const r = a.run({ FCODE_CLIP_SOCK: '/tmp/fcode-clip-0123456789abcdef.sock', LC_FCODE_CLIP_TOKEN: TOKEN });
+    assert.equal(r.status, 0, `${server}: ${r.stderr}`);
+    const i = r.flat.indexOf('M-v');
+    assert.ok(i >= 2, `${server}: ${JSON.stringify(r.flat)}`);
+    assert.deepEqual(r.flat.slice(i - 2, i + 5), ['bind-key', '-n', 'M-v', 'display-message', '-d', '5000', OLD_BOX], server);
+    assert.ok(!r.flat.includes('run-shell'), server);
+    assert.ok(!r.flat.some((x) => x.includes('--clip')), server);
+    assert.equal(fs.existsSync(a.marker), false, `${server}: the old server.mjs was run by the attach`);
+    assert.ok(bindsAt(r), server);
+  }
+  // the guard is the quoted flag in the installed server.mjs, and this repo's server.mjs has it (the other tests bind M-v to run-shell against the real file)
+  assert.match(fcodeShScript(), /grep -q -- "'--clip'" "\$srv"/);
+  assert.match(fs.readFileSync(SERVER, 'utf8'), /'--clip'/);
+});
+
+test('laptop $FcodeSh attach: an attach with no (or half) clipboard env removes that tty\'s old mapping and no other', { skip: NO_BASH }, (t) => {
+  const a = attachRun(t);
+  const env = { FCODE_CLIP_SOCK: `${a.tmp}/fcode-clip-aaaaaaaaaaaaaaaa.sock`, LC_FCODE_CLIP_TOKEN: TOKEN };
+  const clip = path.join(a.cfg, 'clip');
+  for (const tty of ['/dev/pts/7', '/dev/pts/12']) assert.equal(a.run({ ...env, FAKE_TTY: tty }).status, 0);
+  assert.deepEqual(fs.readdirSync(clip).sort(), ['_dev_pts_12.json', '_dev_pts_7.json']);
+  const r = a.run(); // tty 7 again, now without the clipboard
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(fs.readdirSync(clip), ['_dev_pts_12.json']); // the stale mapping is gone (Alt+V says "Chưa nối"), the other tty's stays
+  assert.ok(bindsAt(r));
+  for (const half of [{ FCODE_CLIP_SOCK: env.FCODE_CLIP_SOCK }, { LC_FCODE_CLIP_TOKEN: TOKEN }, { FCODE_CLIP_SOCK: '', LC_FCODE_CLIP_TOKEN: TOKEN }]) {
+    assert.equal(a.run({ ...env, FAKE_TTY: '/dev/pts/7' }).status, 0);
+    assert.deepEqual(fs.readdirSync(clip).sort(), ['_dev_pts_12.json', '_dev_pts_7.json']);
+    assert.equal(a.run({ FCODE_CLIP_SOCK: '', LC_FCODE_CLIP_TOKEN: '', ...half }).status, 0);
+    assert.deepEqual(fs.readdirSync(clip), ['_dev_pts_12.json'], JSON.stringify(half));
+  }
+  assert.deepEqual(fs.readdirSync(clip), ['_dev_pts_12.json']);
+});
+
+test('laptop $FcodeSh attach: a socket path or token with a char outside [A-Za-z0-9/._-] is never written into the mapping (the attach goes on); plain ones are', { skip: NO_BASH }, (t) => {
+  const good = '/tmp/fcode-clip-0123456789abcdef.sock';
+  const a = attachRun(t);
+  const bad = [['space', '/tmp/a b.sock', TOKEN], ['single quote', "/tmp/a'b.sock", TOKEN], ['double quote', '/tmp/a"b.sock', TOKEN], ['dollar', '/tmp/$(id).sock', TOKEN],
+    ['semicolon', '/tmp/a;b.sock', TOKEN], ['backtick', '/tmp/a`b.sock', TOKEN], ['newline', '/tmp/a\nb.sock', TOKEN], ['backslash', '/tmp/a\\b.sock', TOKEN],
+    ['non-ASCII', '/tmp/é.sock', TOKEN], ['token with a quote', good, 'a"b'], ['token with a space', good, 'a b'], ['token with a newline', good, 'a\nb'], ['token with a brace', good, '{x}']];
+  for (const [what, sock, token] of bad) {
+    const r = a.run({ FCODE_CLIP_SOCK: sock, LC_FCODE_CLIP_TOKEN: token });
+    assert.equal(r.status, 0, `${what}: ${r.stderr}`);
+    assert.ok(bindsAt(r), what);
+    assert.equal(fs.existsSync(path.join(a.cfg, 'clip')), false, `${what}: a mapping (or its folder) was written`);
+  }
+  const r = a.run({ FCODE_CLIP_SOCK: '/tmp/Fcode_clip-1.2.sock', LC_FCODE_CLIP_TOKEN: 'Ab-c_d.9' }); // control: every allowed class
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(a.cfg, 'clip', '_dev_pts_7.json'), 'utf8')), { sock: '/tmp/Fcode_clip-1.2.sock', token: 'Ab-c_d.9' });
+});
+
+test('laptop $FcodeSh attach: the previous mapping\'s socket of this tty is removed and old (> 1 day) fcode-clip sockets nobody names are swept; recent ones, ones a mapping names, non-sockets and other names stay', { skip: NO_BASH }, async (t) => {
+  const a = attachRun(t);
+  const name = (c) => path.join(a.tmp, `fcode-clip-${c.repeat(16)}.sock`);
+  const prev = await mkSock(t, name('1')), named = await mkSock(t, name('2'));
+  assert.equal(a.run({ FCODE_CLIP_SOCK: named, LC_FCODE_CLIP_TOKEN: TOKEN, FAKE_TTY: '/dev/pts/12' }).status, 0); // another live session's mapping
+  assert.equal(a.run({ FCODE_CLIP_SOCK: prev, LC_FCODE_CLIP_TOKEN: TOKEN }).status, 0); // this tty's previous attach (/dev/pts/7)
+  age(named, 3); // a long-lived session: old, but a mapping names it
+  const stale = age(await mkSock(t, name('3')), 3), fresh = age(await mkSock(t, name('4')), 0.5), other = age(await mkSock(t, path.join(a.tmp, 'other-5555555555555555.sock')), 3); // fresh: 12 hours, under the 1-day limit
+  const plain = name('6'); fs.writeFileSync(plain, ''); age(plain, 3); // old, right name, but not a socket
+  const r = a.run({ FCODE_CLIP_SOCK: name('7'), LC_FCODE_CLIP_TOKEN: TOKEN }); // the new attach of tty 7
+  assert.equal(r.status, 0, r.stderr);
+  const alive = (p) => fs.existsSync(p);
+  assert.deepEqual([alive(prev), alive(stale)], [false, false]); // the previous socket of tty 7 and the old orphan are gone
+  assert.deepEqual([alive(named), alive(fresh), alive(other), alive(plain)], [true, true, true, true]);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(a.cfg, 'clip', '_dev_pts_7.json'), 'utf8')), { sock: name('7'), token: TOKEN });
+  // an attach without the clipboard also removes the previous socket of its tty, and still leaves the others alone
+  const again = await mkSock(t, name('8'));
+  assert.equal(a.run({ FCODE_CLIP_SOCK: again, LC_FCODE_CLIP_TOKEN: TOKEN }).status, 0);
+  assert.equal(alive(again), true);
+  assert.equal(a.run().status, 0);
+  assert.deepEqual([alive(again), alive(named), alive(fresh)], [false, true, true]);
+  assert.deepEqual(fs.readdirSync(path.join(a.cfg, 'clip')), ['_dev_pts_12.json']);
+});
+
+test('laptop $FcodeSh attach: the previous mapping\'s socket is only removed when it is /tmp/fcode-clip-<plain name>.sock itself: a path that leaves the folder, or lies elsewhere, survives', { skip: NO_BASH }, (t) => {
+  const a = attachRun(t);
+  fs.mkdirSync(path.join(a.tmp, 'fcode-clip-dir')); // so that fcode-clip-dir/../victim.sock resolves
+  const victim = path.join(a.tmp, 'victim.sock'); fs.writeFileSync(victim, 'x');
+  const outside = path.join(a.root, 'outside'); fs.mkdirSync(outside);
+  const far = path.join(outside, 'fcode-clip-9999999999999999.sock'); fs.writeFileSync(far, 'x');
+  for (const sock of [`${a.tmp}/fcode-clip-dir/../victim.sock`, far]) {
+    assert.equal(a.run({ FCODE_CLIP_SOCK: sock, LC_FCODE_CLIP_TOKEN: TOKEN }).status, 0); // the filter lets these chars through: the mapping names them
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(a.cfg, 'clip', '_dev_pts_7.json'), 'utf8')).sock, sock);
+    assert.equal(a.run({ FCODE_CLIP_SOCK: `${a.tmp}/fcode-clip-bbbbbbbbbbbbbbbb.sock`, LC_FCODE_CLIP_TOKEN: TOKEN }).status, 0); // the next attach tries to remove it
+    assert.equal(fs.existsSync(victim), true, sock);
+    assert.equal(fs.existsSync(far), true, sock);
+  }
+});
+
+test('laptop $FcodeSh attach: a quote or # in the config dir or in the node path leaves Alt+V unbound (it would break the tmux command string); a space is fine', { skip: NO_BASH }, (t) => {
+  const env = { FCODE_CLIP_SOCK: '/tmp/fcode-clip-0123456789abcdef.sock', LC_FCODE_CLIP_TOKEN: TOKEN };
+  for (const [what, opts] of [['quote in the config dir', { cfgName: "it's" }], ['# in the config dir', { cfgName: 'a#b' }], ['quote in the node dir', { binName: "b'in" }], ['# in the node dir', { binName: 'b#in' }]]) {
+    const a = attachRun(t, opts);
+    const r = a.run(env);
+    assert.equal(r.status, 0, `${what}: ${r.stderr}`);
+    assert.ok(!r.flat.includes('M-v'), what);
+    assert.ok(bindsAt(r), what); // the drag binding and the attach are not affected
+  }
+  const a = attachRun(t, { cfgName: 'my cfg' });
+  const r = a.run(env);
+  const i = r.flat.indexOf('M-v');
+  assert.ok(i >= 0, JSON.stringify(r.flat));
+  const m = ALT_V.exec(r.flat[i + 3]);
+  assert.ok(m, r.flat[i + 3]);
+  assert.equal(m[1], a.cfg);
+});
+
+test('laptop $FcodeSh attach: a symlinked clip folder is not written through (the attach goes on); a loose one is tightened to 700 and used', { skip: NO_BASH }, (t) => {
+  const env = { FCODE_CLIP_SOCK: '/tmp/fcode-clip-0123456789abcdef.sock', LC_FCODE_CLIP_TOKEN: TOKEN };
+  const a = attachRun(t);
+  const outside = path.join(a.root, 'outside'); fs.mkdirSync(outside, { mode: 0o700 });
+  fs.symlinkSync(outside, path.join(a.cfg, 'clip'));
+  const r = a.run(env);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(fs.readdirSync(outside), []); // no mapping, no .tmp file behind the link
+  assert.ok(bindsAt(r));
+  const b = attachRun(t);
+  fs.mkdirSync(path.join(b.cfg, 'clip'), { mode: 0o755 }); fs.chmodSync(path.join(b.cfg, 'clip'), 0o755);
+  assert.equal(b.run(env).status, 0);
+  assert.equal(fs.statSync(path.join(b.cfg, 'clip')).mode & 0o777, 0o700);
+  assert.deepEqual(fs.readdirSync(path.join(b.cfg, 'clip')), ['_dev_pts_7.json']);
+});
+
+test('laptop $FcodeSh attach: a symlinked clip folder and an attach WITHOUT the env: the link target\'s mapping file and the socket it names survive (nothing is read or removed through the link)', { skip: NO_BASH }, async (t) => {
+  const a = attachRun(t);
+  const outside = path.join(a.root, 'outside'); fs.mkdirSync(outside, { mode: 0o700 });
+  const sock = await mkSock(t, path.join(a.tmp, 'fcode-clip-cccccccccccccccc.sock'));
+  const mapping = path.join(outside, '_dev_pts_7.json'); // this tty's key
+  const body = JSON.stringify({ sock, token: TOKEN }) + '\n';
+  fs.writeFileSync(mapping, body, { mode: 0o600 });
+  fs.symlinkSync(outside, path.join(a.cfg, 'clip'));
+  const r = a.run(); // no FCODE_CLIP_SOCK / LC_FCODE_CLIP_TOKEN: the real-dir guard is the only thing between the rm and the link target
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(bindsAt(r)); // the attach goes on
+  assert.equal(fs.readFileSync(mapping, 'utf8'), body); // the mapping behind the link is not deleted
+  assert.equal(fs.existsSync(sock), true); // nor the socket it names
+  assert.deepEqual(fs.readdirSync(outside), ['_dev_pts_7.json']);
+});

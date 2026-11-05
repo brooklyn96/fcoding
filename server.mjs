@@ -218,6 +218,15 @@ export function secureConfigDir(dir) {
   };
   if (check(dir, true)) for (const f of ['config.json', 'devices.json']) check(path.join(dir, f), false);
 }
+// <configDir>/clip (the tty -> laptop socket mappings) and <configDir>/clip-in (laptop clipboard images on their way in) must be a real directory (never a
+// link), ours, mode 700: a link or a foreign folder would let a read or an unlink reach outside. Checked before every read, write and unlink through them.
+function privateDir(p) {
+  try {
+    const st = fs.lstatSync(p);
+    if (!st.isDirectory()) return false; // lstat: a link is never a directory here
+    return process.platform === 'win32' || (st.uid === process.getuid() && (st.mode & 0o777) === 0o700);
+  } catch { return false; }
+}
 // The server origin the app accepts in a pairing link. ONE rule shared with the iOS PairLink parser: the "rule" field and the vectors in
 // test/origin-vectors.json (the same file is in the iOS tree). Raw input printable ASCII only, then lower-cased as a whole; "https://" + host
 // [+ ":" port, 1-65535 without a leading zero] [+ "/"], nothing else; host = LDH name with a dot (no "xn--" label, last label not a number) OR dotted IPv4
@@ -1185,6 +1194,7 @@ export function createApp(opts = {}) {
       try { return { ok: true, name: await openFresh(req.project, req.harness, ctx) }; }
       catch (e) { return { ok: false, error: e instanceof HttpErr ? e.code : 'internal' }; }
     }
+    if (req?.cmd === 'image') return imageCmd(req, ctx); // Alt+V from a laptop: fcode --clip hands over a PNG/JPEG it saved under <configDir>/clip-in
     return { ok: false, error: 'unknown command' };
   }
   const adminServer = net.createServer((sock) => {
@@ -2007,6 +2017,58 @@ export function createApp(opts = {}) {
       return false;
     }
   }
+  // the shared store of an uploaded image (HTTP upload and admin `image`): <dir>/.fcode/uploads/<stamp>-<6hex>.<ext>, mode 600, O_EXCL, then the sweep.
+  // Returns the absolute path; any failure is HttpErr(500, 'storage') and leaves no half file.
+  async function storeImage(dir, buf, type) {
+    const up = path.join(dir, '.fcode', 'uploads');
+    const stamp = new Date(now()).toISOString().replace(/[-:]/g, '').slice(0, 15).replace('T', '-'); // UTC: YYYYMMDD-HHMMSS
+    let file;
+    try {
+      for (const d of [path.dirname(up), up]) { // one level at a time: a symlink in place of either is refused before anything is made through it
+        await fs.promises.mkdir(d, { recursive: true, mode: 0o700 });
+        if (!(await fs.promises.lstat(d)).isDirectory()) throw new Error('not a directory');
+      }
+      await hideFromGit(path.dirname(up));
+      let fh;
+      for (let i = 0; !fh; i++) {
+        file = path.join(up, `${stamp}-${crypto.randomBytes(3).toString('hex')}.${type.ext}`);
+        try { fh = await fs.promises.open(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NOFOLLOW, 0o600); } catch (e) { if (e.code !== 'EEXIST' || i >= 4) throw e; }
+      }
+      try { await fh.writeFile(buf); } catch (e) { await fh.close(); await fs.promises.unlink(file).catch(() => {}); throw e; }
+      await fh.close();
+    } catch { throw new HttpErr(500, 'storage'); }
+    await sweepUploads(up);
+    return file;
+  }
+  // admin `image` {session, file}: the laptop clipboard image that `fcode --clip` saved as a regular file directly in <configDir>/clip-in. Stored with
+  // the same code as the HTTP upload and typed into the session as its path (never Enter). The clip-in file is deleted on every way out.
+  // {ok:true, path, attached} or {ok:false, error: no_session | no_project | bad_file | bad_type | too_big | storage}
+  async function imageCmd(req, ctx) {
+    const { session, file } = req;
+    if (typeof session !== 'string' || typeof file !== 'string' || !path.isAbsolute(file) || path.resolve(file) !== file
+      || path.dirname(file) !== path.resolve(configDir, 'clip-in') || !privateDir(path.dirname(file))) return { ok: false, error: 'bad_file' }; // not ours: never touched, never deleted
+    ctx.gen = gen; // after refreshConfig in adminCmd, as for `new`
+    try {
+      let buf;
+      try {
+        const st = await fs.promises.lstat(file);
+        if (!st.isFile()) return { ok: false, error: 'bad_file' };
+        if (st.size > UPLOAD_LIMIT) return { ok: false, error: 'too_big' };
+        const fh = await fs.promises.open(file, fs.constants.O_RDONLY | NOFOLLOW);
+        try { buf = await fh.readFile(); } finally { await fh.close(); }
+      } catch { return { ok: false, error: 'bad_file' }; }
+      if (buf.length > UPLOAD_LIMIT) return { ok: false, error: 'too_big' };
+      const type = [...UPLOAD_TYPES.values()].find((t) => buf.subarray(0, t.magic.length).equals(t.magic));
+      if (!type) return { ok: false, error: 'bad_type' };
+      const found = (await listSessions(ctx)).find((x) => x.name === session);
+      if (!found) return { ok: false, error: 'no_session' };
+      const dir = validProject(found.project) ? cfg.projects[found.project] : null;
+      if (!dir || !(await fs.promises.stat(dir).then((s) => s.isDirectory(), () => false))) return { ok: false, error: 'no_project' };
+      let stored;
+      try { stored = await storeImage(dir, buf, type); } catch { return { ok: false, error: 'storage' }; }
+      return { ok: true, path: stored, attached: await attachPath(found, stored, ctx) };
+    } finally { await fs.promises.unlink(file).catch(() => {}); }
+  }
   // admission first: at most UPLOAD_SLOTS in flight, counted before any body byte is read (the 429 reads nothing; the handler closes the connection
   // after every refused upload, so the unread body is never drained); the slot is freed in this one finally, on every way out
   let uploads = 0;
@@ -2039,24 +2101,7 @@ export function createApp(opts = {}) {
     if (!valid(ctx)) throw gateErr(ctx); // the device may have been revoked while the body came in
     if (!buf.length) throw new HttpErr(400, 'empty');
     if (!buf.subarray(0, type.magic.length).equals(type.magic)) throw new HttpErr(415, 'bad_type');
-    const up = path.join(dir, '.fcode', 'uploads');
-    const stamp = new Date(now()).toISOString().replace(/[-:]/g, '').slice(0, 15).replace('T', '-'); // UTC: YYYYMMDD-HHMMSS
-    let file;
-    try {
-      for (const d of [path.dirname(up), up]) { // one level at a time: a symlink in place of either is refused before anything is made through it
-        await fs.promises.mkdir(d, { recursive: true, mode: 0o700 });
-        if (!(await fs.promises.lstat(d)).isDirectory()) throw new Error('not a directory');
-      }
-      await hideFromGit(path.dirname(up));
-      let fh;
-      for (let i = 0; !fh; i++) {
-        file = path.join(up, `${stamp}-${crypto.randomBytes(3).toString('hex')}.${type.ext}`);
-        try { fh = await fs.promises.open(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NOFOLLOW, 0o600); } catch (e) { if (e.code !== 'EEXIST' || i >= 4) throw e; }
-      }
-      try { await fh.writeFile(buf); } catch (e) { await fh.close(); await fs.promises.unlink(file).catch(() => {}); throw e; }
-      await fh.close();
-    } catch { throw new HttpErr(500, 'storage'); }
-    await sweepUploads(up);
+    const file = await storeImage(dir, buf, type); // throws HttpErr(500, 'storage')
     return json(res, 200, { path: file, attached: found ? await attachPath(found, file, ctx) : false });
   }
 
@@ -2507,9 +2552,87 @@ async function newCli(dir, args) {
   if (!r.ok) fail(NEW_ERRORS[r.error] ?? 'Không tạo được phiên. Thử lại sau ít giây.');
   for (const line of meta ? (args[0] === '--projects' ? r.projects : r.harnesses) : [r.name]) console.log(line);
 }
+// fcode --clip <client_tty> <session> (tmux M-v binding from the laptop attach, run by run-shell -b): fetch the image on the LAPTOP clipboard over the
+// ssh -R unix socket the attach script recorded for this client tty, save it under <configDir>/clip-in and let the running server store and type it
+// into the session (admin `image`). Every outcome is a tmux message to that one client; exit 0 always (run-shell must not print into the pane).
+const CLIP_MS = 10000;
+function clipFetch(sock, token) { // -> {status, body}; rejects when the socket is gone, refuses, or the whole answer takes over CLIP_MS
+  return new Promise((resolve, reject) => {
+    const req = http.request({ socketPath: sock, path: '/image', method: 'GET', headers: { 'X-Fcode-Token': token }, signal: AbortSignal.timeout(CLIP_MS) }, (res) => {
+      const parts = []; let n = 0;
+      res.on('error', reject);
+      res.on('data', (c) => {
+        n += c.length;
+        if (n > UPLOAD_LIMIT) { res.destroy(); resolve({ status: 413 }); } else parts.push(c);
+      });
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(parts) }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+function clipShow(tty, text) { // tmux display-message to that client only; '#' doubled (display-message expands formats)
+  return new Promise((resolve) => {
+    try {
+      let spec = process.env.PC_TMUX ?? 'tmux';
+      spec = spec.startsWith('[') ? JSON.parse(spec) : [spec];
+      const [cmd, ...pre] = spec;
+      execFile(cmd, [...pre, 'display-message', '-d', '5000', '-c', tty, text.replaceAll('#', '##')], { timeout: 5000, windowsHide: true }, () => resolve());
+    } catch { resolve(); }
+  });
+}
+const CLIP_ERRORS = {
+  no_session: 'Phiên này không còn nữa, chưa dán được ảnh',
+  no_project: 'Phiên chưa gắn dự án nào, chưa dán được ảnh',
+  bad_file: 'Ảnh lấy từ laptop không đọc được',
+  bad_type: 'Ảnh từ laptop không phải PNG hoặc JPEG',
+  too_big: 'Ảnh lớn quá (tối đa 10 MB)',
+  storage: 'Không lưu được ảnh trên box',
+  'unknown command': 'Server FCode trên box là bản cũ: chạy lại bash install.sh',
+};
+const unsafeDir = (p) => `Thư mục tạm của FCode trên box không an toàn (${p}): xoá nó rồi thử lại`;
+async function clipCli(dir, args) {
+  const [tty, session] = args;
+  const say = (text) => clipShow(tty, text);
+  let clipFile = null;
+  try {
+    if (!tty || !session) return;
+    let map = null;
+    const mapDir = path.join(dir, 'clip');
+    if (privateDir(mapDir)) {
+      try { map = JSON.parse(fs.readFileSync(path.join(mapDir, `${tty.replaceAll('/', '_')}.json`), { encoding: 'utf8', flag: fs.constants.O_RDONLY | NOFOLLOW })); } catch {}
+    } else if (fs.lstatSync(mapDir, { throwIfNoEntry: false })) return await say(unsafeDir(mapDir)); // there, but a link / a foreign folder / a loose mode
+    if (!map || typeof map.sock !== 'string' || typeof map.token !== 'string' || !map.sock || !map.token) return await say('Chưa nối clipboard laptop: mở phiên bằng fcode trên laptop (bản mới)');
+    let got;
+    try { got = await clipFetch(map.sock, map.token); } catch { return await say('Không nối được clipboard laptop (phiên mở bằng fcode đã thoát?)'); }
+    if (got.status === 204) return await say('Clipboard laptop không có ảnh');
+    if (got.status === 500) return await say('Clipboard laptop đang bận, thử lại');
+    if (got.status !== 200) return await say(`Không lấy được ảnh từ laptop (mã ${got.status})`);
+    const inDir = path.join(dir, 'clip-in');
+    if (!fs.lstatSync(inDir, { throwIfNoEntry: false })) { // absent: create it 700 (never recursive: that would follow a link); anything there is checked below
+      try { fs.mkdirSync(inDir, { mode: 0o700 }); } catch (e) { if (e.code !== 'EEXIST') throw e; }
+    }
+    if (!privateDir(inDir)) return await say(unsafeDir(inDir)); // a link, a foreign folder or a loose mode: nothing is written or deleted through it
+    clipFile = path.join(inDir, `${crypto.randomBytes(8).toString('hex')}.png`);
+    fs.writeFileSync(clipFile, got.body, { flag: fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | NOFOLLOW, mode: 0o600 });
+    let r;
+    try { r = await adminRequest(dir, { cmd: 'image', session, file: clipFile }, 15000); }
+    catch (e) {
+      return await say(e.code === 'ENOSERVER' ? 'Server FCode chưa chạy trên box' : e.message === 'admin socket timeout' ? 'Server FCode không trả lời kịp, thử lại' : 'Không nói chuyện được với server FCode');
+    }
+    if (!r.ok) return await say(CLIP_ERRORS[r.error] ?? 'Không dán được ảnh, thử lại');
+    await say(r.attached ? 'Đã dán ảnh vào phiên (đường dẫn đã gõ, chưa gửi)' : `Đã lưu ảnh nhưng chưa gắn được vào phiên: ${r.path}`);
+  } catch (e) {
+    console.error(`fcode --clip: ${e.code || e.name}`); // run-shell -b drops it; never a stack or data
+    await say('Không dán được ảnh, thử lại');
+  } finally {
+    if (clipFile) fs.rmSync(clipFile, { force: true }); // ours to delete after any reply, timeout or error (the server unlinks too; ENOENT is fine)
+  }
+}
 async function main() {
   const dir = defaultConfigDir();
   if (process.argv[2] === '--new') return newCli(dir, process.argv.slice(3)); // the wrapper puts it first; "fcode-pair --new" is a pairing name
+  if (process.argv[2] === '--clip') return clipCli(dir, process.argv.slice(3)); // exit code stays 0 whatever happens
   const arg = (f) => { const i = process.argv.indexOf(f); return i < 0 ? undefined : process.argv[i + 1] ?? ''; };
   const qr = process.argv.includes('--qr');
   const req = process.argv.includes('--pair') ? { cmd: 'pair', name: arg('--pair') === '--qr' ? '' : arg('--pair'), ...(qr && { links: true }) }

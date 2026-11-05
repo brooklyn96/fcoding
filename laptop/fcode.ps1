@@ -1295,6 +1295,11 @@ function Invoke-Pair {
 #   at the attach-time size). The app sets its own size again (resize-window, manual) when the phone opens the session.
 # - set-option mouse on, for this session only (the server's tmux default is off): the wheel scrolls the pane history in copy mode.
 #   A pane the laptop leaves in copy mode would swallow the app's input, so the server quits any pane mode before it sends text or keys.
+# Before the attach, attach() also sets two global tmux bindings (idempotent, every attach) and, when the laptop passed FCODE_CLIP_SOCK (a path, in the remote command) and LC_FCODE_CLIP_TOKEN (ssh SendEnv, never argv),
+# writes $PC_CONFIG_DIR/clip/<client tty with / as _>.json (see the clipboard server functions below the script):
+# - MouseDrag1Pane: a drag always starts a tmux selection (tmux's default hands it to the app when the app asked for the mouse); on release tmux
+#   copies and writes the laptop clipboard with OSC 52 (set-clipboard external, Windows Terminal accepts it).
+# - M-v (Alt+V): runs server.mjs --clip, which fetches the image on the laptop clipboard through the reverse unix socket and types its path into the session.
 $FcodeSh = (@'
 #!/bin/bash
 # fcode (chay tren box): liet ke / chon / vao phien tmux. Dung: fcode.sh [--list | so | ten]
@@ -1345,10 +1350,56 @@ resolve() { # $1 = so hoac ten (hoac dau ten) -> dat $sel
   return 1
 }
 
+# clip_map: remember where the laptop clipboard server is reachable (remote unix socket + token) for THIS client tty; Alt+V (server.mjs --clip) reads it.
+# The socket name is new for every ssh call (sshd never unlinks a -R socket when the session ends), so the old files are cleaned here: the one the previous
+# mapping of this tty names, and this user's fcode-clip-*.sock older than a day that no mapping names (a live session keeps its socket).
+clip_map() { # $1 = config dir
+  local tt key f tmp old s
+  tt=$(tty 2>/dev/null) || return 0
+  key="${tt//\//_}"; f="$1/clip/$key.json"
+  # the clip dir must be a real dir of ours before anything is read or removed through it (a symlink there could point the rm elsewhere)
+  if [ -e "$1/clip" ] || [ -L "$1/clip" ]; then { [ -d "$1/clip" ] && [ ! -L "$1/clip" ] && [ -O "$1/clip" ]; } || return 0; fi
+  if [ -f "$f" ] && [ ! -L "$f" ]; then
+    old=$(sed -n 's/.*"sock": "\([^"]*\)".*/\1/p' "$f" 2>/dev/null)
+    case "$old" in /tmp/fcode-clip-*.sock) case "${old#/tmp/}" in */*|*[!A-Za-z0-9._-]*) ;; *) rm -f -- "$old" 2>/dev/null ;; esac ;; esac
+  fi
+  find /tmp -maxdepth 1 -type s -name 'fcode-clip-*.sock' -user "$(id -u)" -mmin +1440 2>/dev/null | while IFS= read -r s; do
+    grep -rqF -- "$s" "$1/clip" 2>/dev/null || rm -f -- "$s" 2>/dev/null
+  done
+  if [ -z "${FCODE_CLIP_SOCK:-}" ] || [ -z "${LC_FCODE_CLIP_TOKEN:-}" ]; then rm -f "$f" 2>/dev/null; return 0; fi
+  case "$FCODE_CLIP_SOCK$LC_FCODE_CLIP_TOKEN" in *[!A-Za-z0-9/._-]*) return 0 ;; esac
+  (
+    umask 077
+    mkdir -p "$1/clip" && chmod 700 "$1/clip" && [ -d "$1/clip" ] && [ ! -L "$1/clip" ] && [ -O "$1/clip" ] || exit 0   # a real dir of ours, never a symlink
+    tmp=$(mktemp "$1/clip/.tmp.XXXXXX") || exit 0
+    { printf '{"sock": "%s", "token": "%s"}\n' "$FCODE_CLIP_SOCK" "$LC_FCODE_CLIP_TOKEN" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$f"; } || rm -f "$tmp"
+  ) 2>/dev/null
+  return 0
+}
+
 attach() {
-  echo "Thoát mà không tắt phiên: bấm Ctrl+B rồi D. Lăn chuột để cuộn, bấm q để về cuối; giữ Shift khi kéo chuột để bôi đen chữ"
+  echo "Thoát mà không tắt phiên: bấm Ctrl+B rồi D. Lăn chuột để cuộn, bấm q để về cuối; kéo chuột để bôi đen là chép luôn vào clipboard laptop; Alt+V dán ảnh từ clipboard laptop; Ctrl+V vẫn dán chữ"
   sleep 2
   case "${TERM:-}" in ""|dumb) export TERM=xterm-256color ;; esac
+  # the laptop token arrives in LC_FCODE_CLIP_TOKEN (ssh SendEnv): write the mapping, then drop it from the environment so tmux and every pane never inherit it
+  local cdir="${PC_CONFIG_DIR:-/data/home/.fcoding}" node srv=/data/home/fcoding/server.mjs
+  clip_map "$cdir"
+  unset LC_FCODE_CLIP_TOKEN
+  # a drag always starts a tmux selection (default: handed to the app when the app asked for the mouse); release copies, tmux sends it to the laptop by OSC 52
+  # Known trade-off: tmux's default MouseDown1Pane still sends the PRESS to an app that asked for the mouse, while the drag and release go to copy mode;
+  # a TUI that started its own selection on that press resets on the next click.
+  tmux bind-key -n MouseDrag1Pane if-shell -F '#{pane_in_mode}' 'send-keys -M' 'copy-mode -M' 2>/dev/null
+  if ! grep -q -- "'--clip'" "$srv" 2>/dev/null; then
+    # box not updated: its server.mjs does not know --clip and would start a server of its own under run-shell, so Alt+V never runs it
+    tmux bind-key -n M-v display-message -d 5000 'Box chưa cập nhật: cd ~/fcode-src && git pull && bash install.sh' 2>/dev/null
+  else
+    node=$(command -v node) || node=""
+    case "$cdir$node" in
+      *"'"*|*"#"*) ;;   # a quote or # would break the tmux command string: no binding
+      # client_tty / session_name change at run time: #{q:...} escapes them for the shell (never inside quotes; a renamed session may hold a quote)
+      *) [ -n "$node" ] && tmux bind-key -n M-v run-shell -b "PC_CONFIG_DIR='$cdir' '$node' '$srv' --clip #{q:client_tty} #{q:session_name}" 2>/dev/null ;;
+    esac
+  fi
   exec tmux -u attach -t "=$1" \; set-option -w window-size latest \; set-option mouse on
 }
 
@@ -1425,6 +1476,202 @@ function Get-BareScript([string]$Arg) {
   $rows = @(foreach ($k in @($al.Keys | Where-Object { $_ -match '\A[A-Za-z0-9._-]+\z' } | Sort-Object | Select-Object -First 100)) { $k + "`t" + ($al[$k] -replace '[\p{Cc}\p{Cf}]', '?') })
   $data = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($rows -join "`n"))
   "set -- '$Arg'`naliases_b64='$data'`n" + $FcodeSh
+}
+
+# --- clipboard cua laptop cho Alt+V (anh): may chu nho tren 127.0.0.1 (tien trinh con), ssh -R noi o unix cua box toi no ---
+# Box (server.mjs --clip) goi GET /image kem header X-Fcode-Token. Dung System.Windows.Forms.Clipboard nen tien trinh con chay -STA.
+# Tra loi (HTTP/1.0, mot yeu cau mot ket noi): sai phuong thuc hay duong dan 404; thieu / sai token 403; khong co anh 204; PNG qua 10485760 byte 413;
+# clipboard ban sau 3 lan thu 500; co anh 200 image/png. Moi ket noi co han 5 giay (doc dau yeu cau + tra loi); rieng than anh 200 (toi 10 MiB,
+# chi gui cho ben co token) han la "5 giay khong tien trien": dong ho chay lai moi khoi 64 KiB, de duong mang cham van chay duoc. Qua han thi dong ket noi.
+# Toc do (hop dong A4 muc 16-17): truoc khi nhan yeu cau dau tien tien trinh con nap WinForms / Drawing va ma hoa thu mot PNG 1x1 (khoi dong nguoi); luc ranh no
+# ma hoa truoc anh moi tren clipboard va giu mot ban (xem Invoke-FcodeClipServe). Con chi DOC clipboard, khong bao gio ghi.
+function New-FcodeHex([int]$Bytes) {
+  $b = New-Object byte[] $Bytes
+  $r = [Security.Cryptography.RandomNumberGenerator]::Create(); $r.GetBytes($b); $r.Dispose()
+  -join ($b | ForEach-Object { $_.ToString('x2') })
+}
+# ten o unix tren box cho MOI lan goi ssh (ke ca chay lai khi ma 78): sshd khong bao gio go o -R khi phien ket thuc, dung lai ten cu thi -R sau bi tu choi
+function New-FcodeClipSock { '/tmp/fcode-clip-' + (New-FcodeHex 8) + '.sock' }
+# vong lap cua may chu: chay trong tien trinh CON (Start-FcodeClipServer gui NGUYEN van ban ham nay sang do), nen phai tu du, khong goi ham khac
+# $StdinTask = viec doc stdin cua tien trinh con: xong (cha dong ong / bi giet) thi thoat, de khong mo coi
+# $GetSeq = so thu tu clipboard (GetClipboardSequenceNumber, uint32; 0 / loi = khong biet); $ReadPng = doc clipboard: $null khi khong co anh, byte[] PNG khi co, nem loi khi clipboard ban.
+# $ReadPng nhan mot doi so: $true = luc ranh (chi ma hoa truoc khi clipboard co dinh dang anh va KHONG co dinh dang chu nao: kiem tra bang ContainsImage / ContainsText, khong
+# render; clipboard co ca chu (Excel, Office, RDP...) thi tra $null, chi ma hoa khi Alt+V hoi), $false = luc co yeu cau (luon ma hoa neu co anh).
+# Hai ham do duoc truyen vao (tien trinh con dung ban that, test dung ban gia). $Dbg khac $null (chi test dat FCODE_CLIP_DEBUG=1): moi tra loi them dong X-Fcode-Debug.
+# Ma hoa truoc: luc ranh (moi 250 ms) so thu tu doi va clipboard chi co anh thi ma hoa PNG ngay va giu DUNG MOT ban trong bo nho (so thu tu + byte; anh qua 10 MiB chi giu co "Big").
+# GET /image doc lai so thu tu: bang ban giu thi tra byte da giu, khac (hoac chua co) thi ma hoa luc do roi giu. Khong co anh thi bo ban giu (204). Khong ghi dia.
+function Invoke-FcodeClipServe {
+  param([System.Net.Sockets.TcpListener]$Listener, [string]$Token, $StdinTask, [scriptblock]$GetSeq, [scriptblock]$ReadPng, $Dbg = $null)
+  $ErrorActionPreference = 'Continue'
+  $max = 10485760
+  $limit = 5000
+  $enc = [Text.Encoding]::ASCII
+  $reasons = @{ 200 = 'OK'; 204 = 'No Content'; 403 = 'Forbidden'; 404 = 'Not Found'; 413 = 'Payload Too Large'; 500 = 'Internal Server Error' }
+  $acc = $null
+  $cache = $null; $polled = $null; $encodes = 0
+  while ($true) {
+    if ($StdinTask.IsCompleted) { break }
+    $c = $null
+    try {
+      if (-not $acc) { $acc = $Listener.AcceptTcpClientAsync() }
+      if (-not $acc.Wait(250)) {
+        # ranh: ma hoa truoc neu clipboard doi (loi / ban thi bo qua, lan sau thu lai)
+        try {
+          $sq = & $GetSeq
+          if ($sq) { $sq = [uint32]$sq } else { $sq = $null }
+          if ($null -ne $sq -and $sq -ne $polled) {
+            $pp = & $ReadPng $true
+            if ($pp) { $encodes++ }
+            $big = $false
+            if ($pp -and $pp.Length -gt $max) { $big = $true; $pp = $null }
+            if ($pp -or $big) { $cache = @{ Seq = $sq; Png = $pp; Big = $big } } else { $cache = $null }
+            $polled = $sq
+          }
+        } catch { }
+        continue
+      }
+      $c = $acc.Result; $acc = $null
+    } catch { break }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    try {
+      $ns = $c.GetStream()
+      $buf = New-Object byte[] 8192; $n = 0; $head = ''
+      while ($n -lt 8192) {
+        $left = $limit - [int]$sw.ElapsedMilliseconds
+        if ($left -le 0) { throw 'deadline' }
+        $rt = $ns.ReadAsync($buf, $n, 8192 - $n)
+        if (-not $rt.Wait($left)) { throw 'deadline' }   # qua han: bo, finally dong ket noi
+        $k = $rt.Result
+        if ($k -le 0) { break }
+        $n += $k
+        $head = $enc.GetString($buf, 0, $n)
+        if ($head.Contains("`r`n`r`n")) { break }
+      }
+      $code = 404; $type = $null; $body = $null
+      $lines = $head -split "`r`n"
+      if ($head.Contains("`r`n`r`n") -and $lines[0] -cmatch '\AGET /image HTTP/1\.[01]\z') {
+        $tok = ''
+        for ($i = 1; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '\AX-Fcode-Token:[ \t]*(.*?)[ \t]*\z') { $tok = $Matches[1]; break } }
+        if ($Token.Length -eq 0 -or $tok -cne $Token) { $code = 403 }
+        else {
+          # so thu tu doc TRUOC khi doc anh: clipboard doi giua chung thi ban giu mang so cu va lan sau bi coi la cu (khong bao gio tra anh cu)
+          $sq = $null; try { $sq = & $GetSeq; if ($sq) { $sq = [uint32]$sq } else { $sq = $null } } catch { $sq = $null }
+          $png = $null; $big = $false; $got = $false
+          if ($null -ne $sq -and $cache -and $cache.Seq -eq $sq) { $png = $cache.Png; $big = $cache.Big; $got = $true }
+          else {
+            for ($t = 0; $t -lt 3 -and -not $got; $t++) {   # the clipboard can be busy for a moment (another program holds it)
+              try { $png = & $ReadPng $false; $got = $true } catch { Start-Sleep -Milliseconds 150 }
+            }
+            if ($got) {
+              if ($png) { $encodes++ }
+              if ($png -and $png.Length -gt $max) { $big = $true; $png = $null }
+              if ($png -or $big) { $cache = @{ Seq = $sq; Png = $png; Big = $big } } else { $cache = $null }
+              if ($null -ne $sq) { $polled = $sq }
+            }
+          }
+          if (-not $got) { $code = 500 }
+          elseif ($big) { $code = 413 }
+          elseif (-not $png) { $code = 204 }
+          else { $code = 200; $type = 'image/png'; $body = $png }
+        }
+      }
+      $h = "HTTP/1.0 $code $($reasons[$code])`r`n"
+      if ($code -ne 204) { $len = 0; if ($body) { $len = $body.Length }; $h += "Content-Length: $len`r`n" }
+      if ($type) { $h += "Content-Type: $type`r`n" }
+      if ($Dbg) { $h += "X-Fcode-Debug: encodes=$encodes warm=$([int][bool]$Dbg.Warm)`r`n" }
+      $h += "Connection: close`r`n`r`n"
+      $parts = @(, $enc.GetBytes($h))
+      if ($body) { $parts += , $body }
+      foreach ($part in $parts) {
+        $off = 0
+        while ($off -lt $part.Length) {
+          if ($code -eq 200) { $sw.Restart() }   # image body: 5 s per 64 KiB chunk (see the note above)
+          $left = $limit - [int]$sw.ElapsedMilliseconds
+          if ($left -le 0) { throw 'deadline' }
+          $len = [Math]::Min(65536, $part.Length - $off)
+          $wt = $ns.WriteAsync($part, $off, $len)
+          if (-not $wt.Wait($left)) { throw 'deadline' }
+          $off += $len
+        }
+      }
+      $ns.Flush()
+    } catch { }
+    finally { try { $c.Close() } catch { } }
+  }
+}
+# bat may chu clipboard trong tien trinh CON: powershell.exe -STA (System.Windows.Forms.Clipboard can STA) -EncodedCommand. Token di vao stdin cua con (khong len dong lenh),
+# con in cong (do he dieu hanh chon, 127.0.0.1) o dong dau cua stdout. Tra $null khi khong bat duoc (khi do vao phien khong co -R, Alt+V bao laptop chua noi).
+# Con tu thoat khi stdin dong (fcode bi giet); Stop-FcodeClipServer giet con ngay.
+function Start-FcodeClipServer([string]$Shell = 'powershell.exe') {
+  $p = $null
+  try {
+    $token = New-FcodeHex 16
+    $script = "`$ProgressPreference = 'SilentlyContinue'; `$ErrorActionPreference = 'Stop'`n" +
+      "function Invoke-FcodeClipServe {`n" + ${function:Invoke-FcodeClipServe}.ToString() + "`n}`n" + @'
+$in = [Console]::OpenStandardInput()
+$tb = New-Object Collections.Generic.List[byte]
+while ($tb.Count -lt 128) { $x = $in.ReadByte(); if ($x -lt 0 -or $x -eq 10) { break }; $tb.Add([byte]$x) }
+$token = [Text.Encoding]::ASCII.GetString($tb.ToArray()) -replace '[^0-9a-f]', ''
+if ($token.Length -ne 32) { exit 1 }
+$l = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+$l.Start()
+[Console]::Out.WriteLine([string]$l.LocalEndpoint.Port); [Console]::Out.Flush()
+# the port line comes first (the parent waits for it); a request that arrives during the warm-up waits in the listener's backlog until the loop starts, it never fails.
+# warm-up: load WinForms / Drawing, JIT one PNG encode of a 1x1 bitmap, load the sequence-number P/Invoke and touch the clipboard read path once; a load that fails leaves the
+# server up: the clipboard read then fails and every image request answers 500
+$warm = $false
+try {
+  Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing
+  $wb = New-Object System.Drawing.Bitmap 1, 1
+  try { $wm = New-Object IO.MemoryStream; $wb.Save($wm, [System.Drawing.Imaging.ImageFormat]::Png) } finally { $wb.Dispose() }
+  Add-Type -Namespace FcodeClip -Name Native -MemberDefinition '[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();'
+  [void][FcodeClip.Native]::GetClipboardSequenceNumber()
+  try { [void][System.Windows.Forms.Clipboard]::ContainsImage() } catch { }
+  $warm = $true
+} catch { }
+$getSeq = { [FcodeClip.Native]::GetClipboardSequenceNumber() }
+$readPng = {   # $null: no image (or, with $Idle, not an image-only clipboard); byte[]: the PNG; throws when the clipboard is busy
+  param([bool]$Idle)
+  if (-not [System.Windows.Forms.Clipboard]::ContainsImage()) { return }
+  if ($Idle) {   # idle pre-encode: only an image-only clipboard (a screenshot); a text format next to the image means a source that renders on demand, so leave it to Alt+V
+    foreach ($f in [Enum]::GetValues([System.Windows.Forms.TextDataFormat])) { if ([System.Windows.Forms.Clipboard]::ContainsText($f)) { return } }
+  }
+  $img = [System.Windows.Forms.Clipboard]::GetImage()
+  if (-not $img) { return }
+  try { $ms = New-Object IO.MemoryStream; $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); , $ms.ToArray() } finally { $img.Dispose() }
+}
+$dbg = $null; if ($env:FCODE_CLIP_DEBUG -eq '1') { $dbg = @{ Warm = $warm } }   # tests only: a debug header (encode count, warm-up done) on every reply
+$buf = New-Object byte[] 64
+Invoke-FcodeClipServe $l $token ($in.ReadAsync($buf, 0, 64)) $getSeq $readPng $dbg
+'@
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = $Shell
+    $psi.Arguments = '-NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+    $p = [Diagnostics.Process]::Start($psi)
+    [void]$p.StandardError.BaseStream.CopyToAsync([IO.Stream]::Null)   # ong stderr khong bao gio day (con bi chan)
+    $tb = [Text.Encoding]::ASCII.GetBytes($token + "`n")
+    $si = $p.StandardInput.BaseStream; $si.Write($tb, 0, $tb.Length); $si.Flush()   # ghi byte tho: khong co BOM
+    $rt = $p.StandardOutput.ReadLineAsync()
+    $line = $null
+    if ($rt.Wait(15000)) { $line = $rt.Result }
+    if ($line -notmatch '\A[0-9]{1,5}\z' -or [int]$line -lt 1 -or [int]$line -gt 65535) { throw 'no port' }
+    [pscustomobject]@{ Port = [int]$line; Token = $token; Proc = $p }
+  } catch {
+    try { if ($p -and -not $p.HasExited) { $p.Kill() } } catch { }
+    try { if ($p) { $p.Dispose() } } catch { }
+    $null
+  }
+}
+# dong may chu (khi ssh tra ve, ke ca khi loi): Kill tien trinh con, cho toi da 2 giay
+function Stop-FcodeClipServer($Srv) {
+  if (-not $Srv -or -not $Srv.Proc) { return }
+  $p = $Srv.Proc
+  try { if (-not $p.HasExited) { $p.Kill() } } catch { }
+  try { [void]$p.WaitForExit(2000) } catch { }
+  try { $p.StandardInput.Close() } catch { }
+  try { $p.Dispose() } catch { }
 }
 
 # fcode add chay script DA CAI tren box (box/fcode-add.sh, install.sh dat o /data/home/fcoding/fcode-add.sh): mot nguon duy nhat cho ca app va laptop.
@@ -4297,23 +4544,42 @@ if ($arg -and $arg -ne '--list' -and $arg -ne '--new' -and $arg -notmatch '\A[A-
 }
 if (-not $arg) { $pw = Get-PhienWarning; if ($pw) { Write-Host $pw -ForegroundColor Yellow } }
 $ssh = Get-SshExe
-while ($true) {
-  # tham so $1 di cung script (set -- '..'), khong nam tren dong lenh ssh. Script nen gzip roi base64: dong lenh ngan (cmd.exe/wrapper .cmd gioi han 8191 ky tu)
-  $gzIn = [Text.Encoding]::UTF8.GetBytes((Get-BareScript $arg))
-  $gzMs = New-Object IO.MemoryStream
-  $gz = New-Object IO.Compression.GZipStream($gzMs, [IO.Compression.CompressionMode]::Compress)
-  $gz.Write($gzIn, 0, $gzIn.Length); $gz.Close()
-  $b64 = [Convert]::ToBase64String($gzMs.ToArray())
-  $remote = "bash <(echo $b64 | base64 -d | gunzip)"
-  if ($arg -eq '--list') { & $ssh $box $remote } else { & $ssh -q -tt $box $remote }
-  $rc = $LASTEXITCODE
-  if ($rc -eq 78 -and $bareWord -and -not $asked) {   # box bao khong co phien nao ten nay (ma 78; ssh dut, 255, thi khong): co the la ten goi moi dat trong app. Hoi box mot lan; doi duoc ra ten that thi chay lai
-    $asked = $true
-    $new = Resolve-ProjectArg $arg @(Get-PrefsNames) $true
-    if ($new -cne $arg -and $new -match '\A[A-Za-z0-9._-]+\z') { $arg = $new; continue }
-  }
-  break
+# vao phien (khong phai --list): may chu clipboard cho Alt+V dan anh, dong khi ssh tra ve (ke ca khi loi); keo chuot de chep va Alt+V can Windows Terminal
+$clip = $null
+if ($arg -ne '--list') {
+  if (-not $env:WT_SESSION) { Write-Host 'Lưu ý: không chạy trong Windows Terminal: kéo chuột để chép và Alt+V dán ảnh cần Windows Terminal.' -ForegroundColor Yellow }
+  $clip = Start-FcodeClipServer
 }
+try {
+  while ($true) {
+    # tham so $1 di cung script (set -- '..'), khong nam tren dong lenh ssh. Script nen gzip roi base64: dong lenh ngan (cmd.exe/wrapper .cmd gioi han 8191 ky tu)
+    $gzIn = [Text.Encoding]::UTF8.GetBytes((Get-BareScript $arg))
+    $gzMs = New-Object IO.MemoryStream
+    $gz = New-Object IO.Compression.GZipStream($gzMs, [IO.Compression.CompressionMode]::Compress)
+    $gz.Write($gzIn, 0, $gzIn.Length); $gz.Close()
+    $b64 = [Convert]::ToBase64String($gzMs.ToArray())
+    $remote = "bash <(echo $b64 | base64 -d | gunzip)"
+    if ($arg -eq '--list') { & $ssh $box $remote }
+    elseif ($clip) {
+      # -R: o unix tren box -> may chu clipboard o day (ssh loi khi chuyen tiep thi van vao phien: khong dat ExitOnForwardFailure).
+      # Ten o MOI cho moi lan goi ssh (chay lai khi ma 78 cung vay): sshd khong go o -R khi phien ket thuc nen ten cu se bi tu choi.
+      # Token khong bao gio len dong lenh (ssh.exe hay box): di bang bien moi truong LC_FCODE_CLIP_TOKEN + -o SendEnv (sshd cua box nhan LC_*); dong lenh tren box chi mang duong o (khong phai bi mat).
+      # Script tren box doc bien roi unset truoc khi exec tmux; day xoa bien khoi moi truong cua fcode ngay khi ssh tra ve (hop dong A3 muc 13).
+      $sock = New-FcodeClipSock
+      $env:LC_FCODE_CLIP_TOKEN = $clip.Token
+      try { & $ssh -q -tt -R "${sock}:127.0.0.1:$($clip.Port)" -o StreamLocalBindUnlink=yes -o SendEnv=LC_FCODE_CLIP_TOKEN $box "FCODE_CLIP_SOCK=$sock $remote" }
+      finally { $env:LC_FCODE_CLIP_TOKEN = $null }
+    }
+    else { & $ssh -q -tt $box $remote }
+    $rc = $LASTEXITCODE
+    if ($rc -eq 78 -and $bareWord -and -not $asked) {   # box bao khong co phien nao ten nay (ma 78; ssh dut, 255, thi khong): co the la ten goi moi dat trong app. Hoi box mot lan; doi duoc ra ten that thi chay lai
+      $asked = $true
+      $new = Resolve-ProjectArg $arg @(Get-PrefsNames) $true
+      if ($new -cne $arg -and $new -match '\A[A-Za-z0-9._-]+\z') { $arg = $new; continue }
+    }
+    break
+  }
+} finally { Stop-FcodeClipServer $clip }
 if ($rc -eq 78) { $rc = 1 }   # 78 chi la tin hieu giua script tren box va laptop; nguoi dung van thay ma 1
 if ($rc -eq 77 -and -not $arg) { exit (Invoke-PhienMenu) }
 # tham so khong khop phien nao (hoac loi) thi nhac lenh help
