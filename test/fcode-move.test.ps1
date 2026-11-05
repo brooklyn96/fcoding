@@ -699,20 +699,41 @@ T 'L.plan-state: plan writes the D.2 step 6 state and the manifest, sends the de
   $mp = Join-Path (MoveDir) 'manifest.json'; Ok (Test-Path -LiteralPath $mp) 'manifest.json kept'
   Eq (Get-Sha256Hex ([IO.File]::ReadAllBytes($mp))) $W.LastSha 'manifest.json bytes = the pinned sha'
   $in = @($W.PlanStdin[-1])
-  foreach ($l in 'exclude user dino', 'exclude unit velh-pilot-hourly.timer', 'exclude /etc/ssl/certs', 'target-user quoc 1000') { Ok ($in -ccontains $l) "plan stdin lacks [$l]: $($in -join ' | ')" }
+  foreach ($l in 'exclude user dino', 'exclude unit velh-pilot-hourly.timer', 'target-user quoc 1000') { Ok ($in -ccontains $l) "plan stdin lacks [$l]: $($in -join ' | ')" }
   Ok ([Array]::IndexOf($in, 'target-user quoc 1000') -gt [Array]::IndexOf($in, 'exclude unit velh-pilot-hourly.timer')) 'target-user lines come after the map lines'
   Ordered @('^new script:preflight', '^old plan:full') -All
   Eq (@(RecCalls -All | Where-Object { $_.Call -notmatch '-p\.' }).Count) 0 'plan sends no recorded call but p.*'
 }
-T 'L.plan-state: with --map <file> the laptop still prepends every default line (exclude /etc/ssl/certs included) before the file''s lines, map.txt keeps them and the copy re-plan sends them again (B.14.2, CONTRACT LIST map-defaults; ruling 04/11 (3) 4)' {
+T 'L.plan-state: with --map <file> the laptop still prepends every default line before the file''s lines, map.txt keeps them and the copy re-plan sends them again (B.14.2, CONTRACT LIST map-defaults; ruling 05/11 (27) 2: no certs exclude)' {
   $mf = Join-Path $Root ('map-' + [guid]::NewGuid().ToString('N') + '.txt'); [IO.File]::WriteAllText($mf, "exclude pkg chromium`n", $utf8)
   [void](Do-Plan -Extra @('--map', $mf)); Remove-Item -LiteralPath $mf -Force
-  $in = @($W.PlanStdin[-1]); $d = @('exclude user dino', 'exclude unit velh-pilot-hourly.timer', 'exclude /etc/ssl/certs')
+  $in = @($W.PlanStdin[-1]); $d = @('exclude user dino', 'exclude unit velh-pilot-hourly.timer')
   foreach ($l in $d) { Ok ($in -ccontains $l) "plan stdin lacks the default [$l]: $($in -join ' | ')"; Ok ([Array]::IndexOf($in, $l) -lt [Array]::IndexOf($in, 'exclude pkg chromium')) "the default [$l] comes before the map file's lines: $($in -join ' | ')" }
   $mt = @([IO.File]::ReadAllText((Join-Path (MoveDir) 'map.txt')) -split "`r?`n")
   foreach ($l in @($d) + 'exclude pkg chromium') { Ok ($mt -ccontains $l) "map.txt lacks [$l]: $($mt -join ' | ')" }
   [void](Do-Copy); $n0 = $W.PlanStdin.Count; [void](Do-Copy 0); Ok ($W.PlanStdin.Count -gt $n0) 'the copy re-run re-plans (D.3)'
   $in = @($W.PlanStdin[-1]); foreach ($l in @($d) + 'exclude pkg chromium') { Ok ($in -ccontains $l) "re-plan stdin lacks [$l]: $($in -join ' | ')" }
+}
+T 'L.plan-default-map: the default map equals CONTRACT `LIST map-defaults` (MV_CONTRACT) and is exactly `exclude user dino` and `exclude unit velh-pilot-hourly.timer`: no `exclude /etc/ssl/certs` (nor any /etc/ssl/certs line) in Get-MoveDefaultMap, in the plan stdin, in map.txt, in the copy re-plan or with --map (B.14.2, ruling 05/11 (27) F-T13-fwd6-snakeoil: the snakeoil pem travels with its key)' {
+  $p = $env:MV_CONTRACT
+  Ok ($p -and (Test-Path -LiteralPath $p)) "MV_CONTRACT must name deploy-gate docs/move/CONTRACT.md (got [$p])"
+  $cm = [regex]::Match(([IO.File]::ReadAllText($p) -replace "`r`n", "`n"), '(?m)^LIST map-defaults: (.+)$'); Ok $cm.Success 'CONTRACT has no LIST map-defaults'
+  $want = (@($cm.Groups[1].Value.Trim() -split '\s*\|\s*') -join '|')
+  Eq $want 'exclude user dino|exclude unit velh-pilot-hourly.timer' 'CONTRACT LIST map-defaults'
+  $dm = @(Get-MoveDefaultMap)
+  Eq ($dm -join '|') $want 'Get-MoveDefaultMap = CONTRACT LIST map-defaults'
+  [void](Do-Plan)
+  $in = @($W.PlanStdin[-1]); $pre = @($in | Where-Object { $_ -cmatch '\Aexclude ' })
+  Eq ($pre -join '|') $want "plan stdin map lines: $($in -join ' | ')"
+  Ok (@($in | Where-Object { $_ -match 'ssl/certs' }).Count -eq 0) "plan stdin names /etc/ssl/certs: $($in -join ' | ')"
+  $mt = @([IO.File]::ReadAllText((Join-Path (MoveDir) 'map.txt')) -split "`r?`n" | Where-Object { $_ })
+  Eq ($mt -join '|') $want 'map.txt'
+  Reset-World
+  $mf = Join-Path $Root ('map-' + [guid]::NewGuid().ToString('N') + '.txt'); [IO.File]::WriteAllText($mf, "exclude pkg chromium`n", $utf8)
+  [void](Do-Plan -Extra @('--map', $mf)); Remove-Item -LiteralPath $mf -Force
+  $in = @($W.PlanStdin[-1]); Ok (@($in | Where-Object { $_ -match 'ssl/certs' }).Count -eq 0) "plan --map stdin names /etc/ssl/certs: $($in -join ' | ')"
+  [void](Do-Copy); $n0 = $W.PlanStdin.Count; [void](Do-Copy 0); Ok ($W.PlanStdin.Count -gt $n0) 'the copy re-run re-plans (D.3)'
+  $in = @($W.PlanStdin[-1]); Ok (@($in | Where-Object { $_ -match 'ssl/certs' }).Count -eq 0) "re-plan stdin names /etc/ssl/certs: $($in -join ' | ')"
 }
 # O1 (ruling 04/11 (3) 5, CONTRACT §4.1): the laptop's config.json key moveTargets.<ssh alias>.platform_user, as ConvertFrom-Json gives it
 function Set-PlatformUser($Old, $New) {
@@ -1266,8 +1287,8 @@ T 'L.check-diff: check is zero-write, sends plan - --check-only, shows new refus
   Eq (@(RecCalls -All).Count) 0 'check sends no recorded call'; Ok ($null -eq (Get-St)) 'check writes no state.json'
   Ok (@(LogNow -All | Where-Object { $_ -notmatch '^old (plan:check|status|script:facts)$' }).Count -eq 0) "check talks to old's plan - --check-only (and read-only facts) only: $(LogNow -All)"
 }
-T 'L.check-diff: check''s plan - --check-only stdin is exactly the default map lines (exclude user dino, exclude unit velh-pilot-hourly.timer, exclude /etc/ssl/certs) and nothing else: no platform-user line with platform_user set, no map.txt line after a plan with --map (GAP-RULINGS-3 W1-T3-GAP-1, D.0.9; ruling 04/11 (3) 4, review t10f F1/F3)' {
-  $want = "exclude user dino`nexclude unit velh-pilot-hourly.timer`nexclude /etc/ssl/certs`n"
+T 'L.check-diff: check''s plan - --check-only stdin is exactly the default map lines (exclude user dino, exclude unit velh-pilot-hourly.timer) and nothing else: no /etc/ssl/certs line, no platform-user line with platform_user set, no map.txt line after a plan with --map (GAP-RULINGS-3 W1-T3-GAP-1, D.0.9; ruling 05/11 (27) 2, review t10f F1/F3)' {
+  $want = "exclude user dino`nexclude unit velh-pilot-hourly.timer`n"
   foreach ($c in 'plain', 'platform_user', 'after plan --map') {
     Reset-World
     if ($c -cne 'plain') { Set-PlatformUser 'quoc' 'quoc' }
@@ -2095,26 +2116,51 @@ T 'L.carry-init-old-passes: the carry-back''s b.init-old carries the fwd mark, s
   $bi = @(RecCalls | Where-Object { $_.Call -ceq 'back-2-b.init-old' })[0]; Ok ($null -ne $bi) 'b.init-old sent'; Ok ($bi.Flags['mark'] -in 'cutting', 'switching') "b.init-old --mark $($bi.Flags['mark'])"
   Eq (@(LogNow | Where-Object { $_ -match 'init-serving' }).Count) 0 'no init-serving refusal'; Eq (Sent 'new' '^back-2-x\.final$') 1 'x.final reached'
 }
+# D.5.2 / E-R23, ruling 05/11 (27) F-T13-fwd6-text: exit 70 after x.final ends with ONE last line: when new answered status the generic resume line,
+# when new did not answer (down, or the status call got no gate answer) the carry-half sentence; never both
+$CarryResume = 'Chạy lại fcode move cutover để tiếp tục chép ngược.'; $CarryHalf = 'dữ liệu máy cũ đang dở; chỉ tiếp tục được khi máy mới nối lại'
+function CarryEnd([bool]$Answered, [string]$What = '') {
+  $ll = @(Lines -Last | Where-Object { "$_".Trim() -ne '' }); $last = if ($ll.Count) { "$($ll[-1])" } else { '' }
+  $want = if ($Answered) { $CarryResume } else { $CarryHalf }; $other = if ($Answered) { $CarryHalf } else { $CarryResume }
+  Eq $last $want "$What last output line (new $(if ($Answered) { 'answered' } else { 'did not answer' }))"
+  NoText $other
+}
 T 'L.carry-fail: a carry-back failure before x.final offers Q-discard (no answer: exit 70); after x.final started: exit 70, resume only' {
   Start-Carry; Add-Fault -M old -Key '^back-2-x\.stop-dst$' -Rc 1; Ans 'có'
   $r = Run-Move @('cutover'); Eq $r.Code 70 'exit'
   Ok (@(Lines | Where-Object { $_ -match '\AChép ngược tự động bị lỗi trước khi chép dữ liệu\. Chạy lại máy cũ với dữ liệu của nó\? Mọi thay đổi trên máy mới từ .* sẽ mất\. Gõ YES để xác nhận\.\z' }).Count -ge 1) "Q-discard text: $(Lines)"
+  $ll = @(Lines | Where-Object { "$_".Trim() -ne '' }); Eq "$($ll[-1])" 'Chưa làm gì thêm. Chạy lại fcode move cutover để tiếp tục chép ngược.' 'Q-discard unanswered: last line (single spaces, the carry-resume text; review r12 P3)'
   Reset-World; Start-Carry; Add-Fault -M new -Key '^back-2-x\.final$' -Rc 1; Ans 'có'
-  $r = Run-Move @('cutover'); Eq $r.Code 70 'exit after x.final'; HasText 'dữ liệu máy cũ đang dở; chỉ tiếp tục được khi máy mới nối lại'
+  $r = Run-Move @('cutover'); Eq $r.Code 70 'exit after x.final'; CarryEnd $true 'carry-fail'
   Ok (@(Lines -Last | Where-Object { $_ -match 'Gõ YES' }).Count -eq 0) 'no Q-discard after x.final'
 }
 T 'L.carry-after-final-70: a carry-back failing after x.final started ends exit 70 with both status, never starts old' {
   Start-Carry; Add-Fault -M new -Key '^back-2-x\.final$' -Rc 1 -Mode noexit; Ans 'có'
-  $r = Run-Move @('cutover'); Eq $r.Code 70 'exit'; Eq (SentAny '-r\.start-src$') 0 'old not started'; HasText 'dữ liệu máy cũ đang dở; chỉ tiếp tục được khi máy mới nối lại'
+  $r = Run-Move @('cutover'); Eq $r.Code 70 'exit'; Eq (SentAny '-r\.start-src$') 0 'old not started'; CarryEnd $true 'noexit'
   $l = LogNow; $i = [Array]::IndexOf($l, 'new back-2-x.final'); $after = @($l[($i + 1)..($l.Count - 1)])
   Ok ((@($after | Where-Object { $_ -ceq 'old status' }).Count -ge 1) -and (@($after | Where-Object { $_ -ceq 'new status' }).Count -ge 1)) "both status answers read: $($after -join ' ; ')"
 }
+T 'L.carry-after-final-70: new up but its status call gets no gate answer after x.final failed (exit 70): new did not answer, the carry-half sentence ends the output, never the resume line' {
+  Start-Carry
+  $W.Hooks['x.final'] = { param($m, $e) if ($e.Call -ceq 'back-2-x.final') { Add-Fault -M new -Key '^status$' -Mode timeout -N 5 } }
+  Add-Fault -M new -Key '^back-2-x\.final$' -Rc 1; Ans 'có'
+  $r = Run-Move @('cutover'); Eq $r.Code 70 "exit ($($r.Text))"; Eq (SentAny '-r\.start-src$') 0 'old not started'; CarryEnd $false 'status without gate answer'
+  Ok (@(Lines -Last | Where-Object { $_ -match 'Gõ YES' }).Count -eq 0) 'no Q-discard after x.final'
+}
+T 'L.carry-after-final-70: new answers status with a gate answer that is not ok (GATE_EXIT 65, no MOVE state line) after x.final failed (exit 70): that is an answer, the resume line ends the output, never the carry-half sentence (the answered boundary is a gate answer, not an ok status; review r12 RV12L-1)' {
+  Start-Carry
+  $W.Hooks['x.final'] = { param($m, $e) if ($e.Call -ceq 'back-2-x.final') { Add-Fault -M new -Key '^status$' -Mode nomove -N 5 } }
+  Add-Fault -M new -Key '^back-2-x\.final$' -Rc 1; Ans 'có'
+  $r = Run-Move @('cutover'); Eq $r.Code 70 "exit ($($r.Text))"; Eq (SentAny '-r\.start-src$') 0 'old not started'
+  Ok (@(Lines -Last | Where-Object { $_ -match '^\s*MOVE state ' }).Count -eq 1) "only old's MOVE state line: $(Lines -Last)"
+  CarryEnd $true 'gate answer, not ok'
+}
 T 'L.carry-after-final-70: new unreachable after the carry-back''s x.final (at x.verify): exit 70, no YES question, old never started, also on the next cutover with new still down' {
   Start-Carry; Add-Fault -M new -Key '^back-2-x\.verify$' -Mode down; Ans 'có', 'YES', 'YES'
-  $r = Run-Move @('cutover'); Eq $r.Code 70 "exit ($($r.Text))"; HasText 'dữ liệu máy cũ đang dở; chỉ tiếp tục được khi máy mới nối lại'
+  $r = Run-Move @('cutover'); Eq $r.Code 70 "exit ($($r.Text))"; CarryEnd $false 'x.verify down'
   Ok (@(Lines | Where-Object { $_ -match 'Gõ YES' }).Count -eq 0) "no YES question: $(Lines)"
   Eq (SentAny '-r\.start-src$') 0 'old not started'; Ok ((Get-St).new_lost -ne $true) 'no new_lost'
-  $r = Run-Move @('cutover'); Ok ($r.Code -ne 10) "next cutover, new down: exit $($r.Code)"
+  $r = Run-Move @('cutover'); Eq $r.Code 70 "next cutover, new down: exit $($r.Code)"; CarryEnd $false 'next cutover, new still down'
   Eq (SentAny '-r\.start-src$' -All) 0 'old never started'; Ok ((Get-St).new_lost -ne $true) 'no new_lost'
 }
 T 'L.carry-resume: after a carry-back stopped before x.final, cutover resumes it to back-done (exit 10); phase cut is never written' {
@@ -2417,7 +2463,7 @@ T 'L.suite-windows: without bash (Windows) a bash case is skipped and counted, n
 # ============================== a down new, rebuild after the swap, the cut-off time (T10 review r1 F1–F6) ==============================
 T 'L.carry-after-final-70: PROBE.er5-final-new-down — an x.final whose outcome stays unknown (new drops during it) has started (D.5.2, W1-T11-DG-R11-1): exit 70, no Q-discard, old never started' {
   Start-Carry; Add-Fault -M new -Key '^back-2-x\.final$' -Mode down; Ans 'có', 'YES'
-  $r = Run-Move @('cutover'); Eq $r.Code 70 "exit ($($r.Text))"; Eq (SentAny '-r\.start-src$') 0 'old not started'
+  $r = Run-Move @('cutover'); Eq $r.Code 70 "exit ($($r.Text))"; Eq (SentAny '-r\.start-src$') 0 'old not started'; CarryEnd $false 'x.final down'
   Ok (@(Lines -Last | Where-Object { $_ -match 'Gõ YES' }).Count -eq 0) 'no Q-discard after x.final started'
 }
 T 'L.abort-new-unreachable: after Q-newlost YES (new powered off), abort skips new and aborts old' {
@@ -2518,11 +2564,11 @@ T 'L.carry-after-final-70: new misses one status after an x.final with no GATE_E
   Add-Fault -M new -Key '^back-2-x\.final$' -Rc 0 -Mode noexit; Ans 'có', 'YES'
   $r = Run-Move @('cutover'); Eq (SentAny '-r\.start-src$') 0 "old started over the copy x.final wrote (exit $($r.Code))"; Eq $r.Code 70 'exit'
 }
-T 'L.carry-after-final-70: a carry-back failing after x.final shows both MOVE state lines with the carry-half text (exit 70)' {
+T 'L.carry-after-final-70: a carry-back failing after x.final shows both MOVE state lines and, new having answered status, ends with the resume line (exit 70)' {
   Start-Carry; Add-Fault -M new -Key '^back-2-x\.final$' -Rc 1; Ans 'có'
   $r = Run-Move @('cutover'); Eq $r.Code 70 "exit ($($r.Text))"
   Eq @(Lines -Last | Where-Object { $_ -match '^\s*MOVE state ' }).Count 2 "both MOVE state lines: $(Lines -Last)"
-  HasText 'dữ liệu máy cũ đang dở; chỉ tiếp tục được khi máy mới nối lại'; Eq (SentAny '-r\.start-src$') 0 'old not started'
+  CarryEnd $true 'MOVE state lines'; Eq (SentAny '-r\.start-src$') 0 'old not started'
 }
 T 'L.step10-fail-no-carry: chore 0 failing at the end of a carry-back prints the return-to-old text and the remedy (exit 1)' {
   Start-Carry; Add-Fault -M old -Key '^back-2-x\.enable\.' -Rc 1; Ans 'có'
