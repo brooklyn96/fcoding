@@ -2757,6 +2757,33 @@ T 'L.budget-stop: x.stop-src, x.stop-dst and r.stop-dst --budget = Σ stop_budge
   Eq (Budget-Of 'old' 'fwd-1-x.stop-src') 1930 'x.stop-src = 1000 + 30 + 600 + 60 + 240'; Eq (Budget-Of 'new' 'fwd-1-x.stop-dst') 1930 'x.stop-dst'
   Reset-World; & $fx; Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.final$' -Rc 1; [void](Do-Cutover 10); Eq (Budget-Of 'new' 'fwd-1-r.stop-dst') 1930 'r.stop-dst'
 }
+function Fx-StartBudget([int[]]$ConnListen = @(), [int]$Other = 0, [string]$Extra = '') {   # $ConnListen = |listen[]| of each unit connector hold of the start set; $Other = |listen[]| of every other hold
+  $mk = { param($n) @(for ($i = 1; $i -le $n; $i++) { [ordered]@{ proto = 'tcp'; port = 9000 + $i } }) }
+  $h = @($W.Mf.holds); foreach ($x in $h) { $x['listen'] = @(& $mk $Other) }
+  $ids = @($W.Mf.hold_sets.start); $conn = @()
+  for ($i = 0; $i -lt $ConnListen.Count; $i++) { $c = New-Hold "cloudflared$($i + 1).service" 30; $c['listen'] = @(& $mk $ConnListen[$i]); $h += $c; $ids += $c.id; $conn += [ordered]@{ id = $c.id; kind = 'unit' } }
+  if ($Extra -ceq 'container') { $c = New-Hold 'container:tunnel' 30 'container'; $c['listen'] = @(& $mk 3); $h += $c; $ids += $c.id; $conn += [ordered]@{ id = $c.id; kind = 'container' } }
+  if ($Extra -ceq 'unit-off-start') { $c = New-Hold 'cf-off.service' 30; $c['listen'] = @(& $mk 3); $h += $c; $conn += [ordered]@{ id = $c.id; kind = 'unit' } }   # a unit connector the start set does not hold
+  Set-Holds $h $ids @($W.Mf.hold_sets.stop); $W.Mf.connectors = @($conn)
+}
+T 'L.budget-start: x.start, x.enable.N and r.start-src --budget = Σ start_budget_s of hold_sets.start + 60, + 60 when the start set holds a unit connector (connectors[] kind unit, id in hold_sets.start) + 20 per listener after the first, the listeners of a connector = max(1, |its hold''s listen[]|); boundary 0 / 1 / 3 listeners (ruling 06/11 (30), B36): one connector with 3 listeners +100, two connectors with one each +80; a container connector, a unit connector outside hold_sets.start and the listen[] of other holds add nothing' {
+  $cases = @(
+    @{ C = @(); O = 0; X = ''; T = 0 }, @{ C = @(); O = 3; X = ''; T = 0 },                                   # no unit connector: no term, whatever the listeners
+    @{ C = @(0); O = 0; X = ''; T = 60 }, @{ C = @(1); O = 0; X = ''; T = 60 }, @{ C = @(0); O = 3; X = ''; T = 60 },   # one listener (an unpinned connector has its metrics listener)
+    @{ C = @(3); O = 0; X = ''; T = 100 },                                                                   # one connector, three listeners
+    @{ C = @(0, 0); O = 0; X = ''; T = 80 }, @{ C = @(1, 1); O = 0; X = ''; T = 80 },                          # two connectors, one listener each
+    @{ C = @(3, 1); O = 0; X = ''; T = 120 }, @{ C = @(0, 0, 0); O = 0; X = ''; T = 100 }, @{ C = @(1, 1, 1); O = 0; X = ''; T = 100 },
+    @{ C = @(); O = 0; X = 'container'; T = 0 }, @{ C = @(1); O = 0; X = 'container'; T = 60 },
+    @{ C = @(); O = 0; X = 'unit-off-start'; T = 0 }, @{ C = @(3); O = 0; X = 'unit-off-start'; T = 100 })
+  foreach ($c in $cases) {
+    $term = $c.T; $tag = "[connector listen[] $(@($c.C) -join ','), others $($c.O), extra '$($c.X)']"
+    $sum = (3 + @($c.C).Count + $(if ($c.X -ceq 'container') { 1 } else { 0 })) * 60   # every hold of hold_sets.start has start_budget_s 60 (a unit connector too)
+    Reset-World; Fx-StartBudget @($c.C) $c.O $c.X; Fx-Copied; [void](Do-Cutover -1)
+    Eq (Budget-Of 'new' 'fwd-1-x.start') ($sum + 60 + $term) "$tag x.start = Σ + 60 + $term"; Eq (Budget-Of 'new' 'fwd-1-x.enable.1') ($sum + 60 + $term) "$tag x.enable.1"
+    Reset-World; Fx-StartBudget @($c.C) $c.O $c.X; Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.final$' -Rc 1; [void](Do-Cutover 10)
+    Eq (Budget-Of 'old' 'fwd-1-r.start-src') ($sum + 60 + $term) "$tag r.start-src"
+  }
+}
 T 'L.call-key-sites: every call id the laptop sent in this run is in the closed step list' {
   Ok ($script:AllCalls.Count -gt 0) 'no recorded call was seen in this run'
   $bad = @($script:AllCalls | Where-Object { $_ -notmatch $CallRx } | Select-Object -Unique); Ok ($bad.Count -eq 0) "ids outside the closed list: $($bad -join ', ')"
