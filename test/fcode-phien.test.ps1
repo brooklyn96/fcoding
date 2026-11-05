@@ -17,7 +17,7 @@ $Repo = Split-Path -Parent $PSScriptRoot
 $Fcode = Join-Path $Repo 'laptop\fcode.ps1'
 $Root = Join-Path ([IO.Path]::GetTempPath()) ('fcode-phien-test-' + [guid]::NewGuid().ToString('N'))
 [void](New-Item -ItemType Directory -Path $Root)
-Set-Location -LiteralPath $Root   # stray files from child processes (e.g. PowerShell's module cache) land here and are removed with it
+Set-Location -LiteralPath $Root; [Environment]::CurrentDirectory = $Root   # stray files from child processes (e.g. PowerShell's module cache) land here and are removed with it; Set-Location alone does not move the working folder that Process.Start children inherit, they would write into the repo
 $script:pass = 0; $script:fail = 0
 # a lock name of our own: never the real `Local\fcode-phien` (the user's task or a second suite run would collide)
 $env:FCODE_PHIEN_LOCK = 'Local\fcode-phien-test-' + [guid]::NewGuid().ToString('N')
@@ -4652,7 +4652,7 @@ T 'alias e2e: a dropped ssh (255) or any other failure is not "no such session":
   Eq $r.Code 1 'no such session: the user still sees exit code 1'
   Eq (Calls $w 'projects') 1 'asked now'
 }
-if ($env:FCODE_TEST_KEEP) { Write-Host "kept: $Root" } else { for ($i = 0; $i -lt 4 -and (Test-Path -LiteralPath $Root); $i++) { Set-Location -LiteralPath $env:TEMP; Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue; if (Test-Path -LiteralPath $Root) { Start-Sleep -Seconds 3 } } }   # omp may still hold its native addon for a moment
+if ($env:FCODE_TEST_KEEP) { Write-Host "kept: $Root" } else { for ($i = 0; $i -lt 4 -and (Test-Path -LiteralPath $Root); $i++) { Set-Location -LiteralPath $env:TEMP; [Environment]::CurrentDirectory = $env:TEMP; Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue; if (Test-Path -LiteralPath $Root) { Start-Sleep -Seconds 3 } } }   # omp may still hold its native addon for a moment
 Write-Host ''
 Write-Host "passed $script:pass, failed $script:fail"
 exit $(if ($script:fail) { 1 } else { 0 })
