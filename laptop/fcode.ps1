@@ -1652,7 +1652,7 @@ Invoke-FcodeClipServe $l $token ($in.ReadAsync($buf, 0, 64)) $getSeq $readPng $d
     $p = [Diagnostics.Process]::Start($psi)
     [void]$p.StandardError.BaseStream.CopyToAsync([IO.Stream]::Null)   # ong stderr khong bao gio day (con bi chan)
     $tb = [Text.Encoding]::ASCII.GetBytes($token + "`n")
-    $si = $p.StandardInput.BaseStream; $si.Write($tb, 0, $tb.Length); $si.Flush()   # ghi byte tho: khong co BOM
+    $si = $p.StandardInput.BaseStream; $si.Write($tb, 0, $tb.Length); $si.Flush()   # ghi byte tho; khi trang ma nhap cua console la 65001, Process.Start da ghi BOM vao ong truoc byte nay (server --clip bo ky tu khong phai hex)
     $rt = $p.StandardOutput.ReadLineAsync()
     $line = $null
     if ($rt.Wait(15000)) { $line = $rt.Result }
@@ -3245,7 +3245,7 @@ function Invoke-PhienExe([string]$Exe, [string[]]$ExeArgs, [string]$StdinText) {
   try { $p = [Diagnostics.Process]::Start($psi) } catch { return [pscustomobject]@{ Code = -1; Out = [string[]]@(); Err = "$($_.Exception.Message)" } }
   try {
     try {
-      if ($StdinText) { $sb = [Text.Encoding]::UTF8.GetBytes($StdinText); $p.StandardInput.BaseStream.Write($sb, 0, $sb.Length); $p.StandardInput.BaseStream.Flush() }   # raw UTF-8 bytes (no BOM; 5.1 has no StandardInputEncoding)
+      if ($StdinText) { $sb = [Text.Encoding]::UTF8.GetBytes($StdinText); $p.StandardInput.BaseStream.Write($sb, 0, $sb.Length); $p.StandardInput.BaseStream.Flush() }   # raw UTF-8 bytes; not BOM-free: with console input code page 65001 Windows PowerShell 5.1's Process.Start makes StandardInput a StreamWriter with the UTF-8 preamble and AutoFlush, so a BOM is already in the pipe before this write (5.1 has no StandardInputEncoding); see the --stdin note near check-ignore
       $p.StandardInput.Close()
     } catch { }
     $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
