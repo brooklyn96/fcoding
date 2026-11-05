@@ -571,9 +571,9 @@ function Invoke-Fcode($World, [string[]]$FArgs, [hashtable]$ExtraEnv = @{}, [str
       $psi = New-Object Diagnostics.ProcessStartInfo 'powershell.exe'
       $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $Fcode + '" ' + ($FArgs -join ' ')
       $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
-      if ($Async) { $psi.RedirectStandardOutput = $true; $psi.StandardOutputEncoding = $utf8 }
+      if ($Async) { $psi.RedirectStandardOutput = $true; $psi.StandardOutputEncoding = $utf8; $psi.RedirectStandardError = $true; $psi.StandardErrorEncoding = $utf8 }
       $p = [Diagnostics.Process]::Start($psi)
-      if ($Async) { return [pscustomobject]@{ P = $p; Out = $p.StandardOutput.ReadToEndAsync() } }
+      if ($Async) { return [pscustomobject]@{ P = $p; Out = $p.StandardOutput.ReadToEndAsync(); Err = $p.StandardError.ReadToEndAsync() } }
       return $p
     }
     $out = if ($InText) { $InText | & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Fcode @FArgs 2>&1 | Out-String } else { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Fcode @FArgs 2>&1 | Out-String }
@@ -1368,7 +1368,7 @@ T 'e2e: the auto deadline holds while stdin is blocked: the stalled call is kill
   $r = Invoke-Fcode $w @('phien', '--tu-dong') @{ FCODE_PHIEN_TIMEOUT = '25'; FAKE_SSH_CUT = 'put:1:0:stall' }
   $sec = ((Get-Date) - $t0).TotalSeconds
   Eq $r.Code 1 $r.Out; Ok ($sec -lt 45) "ended at the deadline ($([Math]::Round($sec)) s, stall is 60 s)"
-  Eq (Calls $w 'put') 1 'no batch is started after the deadline'
+  Eq (Calls $w 'put') 1 ('no batch is started after the deadline; ' + $r.Diag)
   Ok (-not (Test-Path (Join-Path $w.BS (Split-Path $a -Leaf))) -and -not (Test-Path (Join-Path $w.BS (Split-Path $b -Leaf)))) 'nothing half-sent is placed'
   Ok ((Get-Content (Join-Path $w.U '.fcode\phien.log') -Raw) -match 'gửi phiên lên box không thành công') 'logged'
   Ok (-not (Get-ChildItem (Join-Path $w.U 'AppData\Local\Temp') -Directory -Filter 'fcode-phien-*' -ErrorAction SilentlyContinue)) 'staging removed'
@@ -1801,28 +1801,51 @@ function Use-LoggedSsh($w, [string]$Stall = '') {
   $hang = switch ($Stall) {
     'check' { "if `"%K%`"==`"true`" ping -n 60 127.0.0.1 >nul`r`n" }
     'put2' { "if `"%K%`"==`"true`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`nfindstr /c:`"ssh put`" `"%FAKE_SSH_LOG%`" >nul 2>&1 || goto run`r`nping -n 60 127.0.0.1 >nul`r`n:run`r`n" }
-    # 'put1late': the first `ssh ... put` waits until the epoch second that the file named by FAKE_PUT_UNTIL holds (it appears once the test knows when the run started: Invoke-FcodePutLate),
-    # then runs as the fake decides (an item still under way when the deadline passes)
-    'put1late' { "if `"%K%`"==`"true`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`nfindstr /c:`"ssh put`" `"%FAKE_SSH_LOG%`" >nul 2>&1 && goto run`r`npython -c `"import os,time;f=os.environ['FAKE_PUT_UNTIL'];[time.sleep(0.05) for _ in iter(lambda: os.path.exists(f), True)];time.sleep(max(0,float(open(f).read())-time.time()))`"`r`n:run`r`n" }
+    # 'put1late': the first `ssh ... put` waits until the epoch second that the file named by FAKE_PUT_UNTIL holds (it appears once the test knows when the run started: Invoke-FcodePutLate; put1late-wait.py
+    # also writes the epoch at which the wait ended to <FAKE_PUT_UNTIL>.end), then runs as the fake decides (an item still under way when the deadline passes). A wait that fails (python error, no target within 120 s)
+    # is loud: the call exits 98 and leaves <FAKE_SSH_LOG>.err behind, which Invoke-FcodePutLate turns into a test failure; it never falls through to an early put
+    'put1late' { "if `"%K%`"==`"true`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`nfindstr /c:`"ssh put`" `"%FAKE_SSH_LOG%`" >nul 2>&1 && goto run`r`npython `"$($w.W)\put1late-wait.py`"`r`nif errorlevel 1 (echo put1late-wait-failed>>`"%FAKE_SSH_LOG%.err`" & exit /b 98)`r`n:run`r`n" }
     # 'gitbreak': before an `ssh ... put` the box project's .git is renamed to .git-x (FAKE_BP = that folder, Windows form; unset = off): the box can no longer find its exclude file
     'gitbreak' { "if `"%FAKE_BP%`"==`"`" goto run`r`nif `"%K%`"==`"true`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`nif exist `"%FAKE_BP%\.git`" attrib -h `"%FAKE_BP%\.git`" & ren `"%FAKE_BP%\.git`" .git-x`r`n:run`r`n" }   # .git is hidden: ren does not see it
     # 'exclbreak': before an `ssh ... put` the box project's .git/info/exclude becomes a folder (FAKE_BP as above; unset = off): reading it fails with an OSError
     'exclbreak' { "if `"%FAKE_BP%`"==`"`" goto run`r`nif `"%K%`"==`"true`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`ndel /q `"%FAKE_BP%\.git\info\exclude`" >nul 2>&1`r`nmd `"%FAKE_BP%\.git\info\exclude`" >nul 2>&1`r`n:run`r`n" }
     default { '' }
   }
+  if ($Stall -eq 'put1late') {
+    [IO.File]::WriteAllText((Join-Path $w.W 'put1late-wait.py'), (@'
+import os, sys, time
+f = os.environ['FAKE_PUT_UNTIL']
+t0 = time.time()
+until = None
+while until is None:   # the target file appears once the test knows when the run started; a scanner may hold it for a moment
+    try:
+        until = float(open(f).read())
+    except (OSError, ValueError):
+        if time.time() - t0 > 120:
+            sys.exit(1)
+        time.sleep(0.05)
+time.sleep(max(0, until - time.time()))
+open(f + '.end', 'w').write(repr(time.time()))
+'@ -replace "`r`n", "`n"), $utf8)
+  }
   [IO.File]::WriteAllText($wrap, "@echo off`r`nset K=ssh`r`necho %*| findstr /e /c:`" true`" >nul && set K=true`r`necho %K% >>`"$($w.SshCallLog)`"`r`n${hang}call `"$Cmd`" %*`r`nexit /b %errorlevel%`r`n")
   [IO.File]::WriteAllText((Join-Path $w.U '.fcode\config.json'), (@{ ssh = $wrap; host = 'oracle'; syncRepos = @($w.LP, (Join-Path $w.U 'Desktop\other'), (Join-Path $w.U 'Desktop\notonbox')) } | ConvertTo-Json -Compress))
 }
-# Run `fcode phien --nhanh` (cap $Cap s) in a world set up with Use-LoggedSsh 'put1late' so that its first put ends 1 s after "time is up" (1 s before the deadline: at the deadline itself), measured from the
-# run's real start, whatever the machine speed. The run must reach its first put before then ($Cap - 1 s of room); the put has 5 s left until the child limit (deadline + 5 s). Returns {Code; Out}
+# Run `fcode phien --nhanh` (cap $Cap s) in a world set up with Use-LoggedSsh 'put1late' so that its first put ends at the deadline (the run's real start + $Cap; time is up from deadline - 1 s; the child limit is
+# deadline + 5 s), whatever the machine speed. Two limits stay: the run must reach its first put within $Cap - 1 s of its start, and that put (its bytes only flow after the wait) must finish within 5 s after the
+# deadline, or it is killed with 124 (the product's 5 s grace). Out = stdout + stderr (like `2>&1`). A failed wait (put1late-wait.py) throws. Returns {Code; Out; Diag}
 function Invoke-FcodePutLate($w, [string[]]$FArgs, [int]$Cap, [hashtable]$ExtraEnv = @{}) {
   $f = Join-Path $w.W 'put-until.txt'
   $ExtraEnv['FCODE_PHIEN_CAP_SEC'] = "$Cap"; $ExtraEnv['FAKE_PUT_UNTIL'] = $f
   $h = Invoke-Fcode $w $FArgs $ExtraEnv -Async
-  $until = (ConvertTo-Epoch $h.P.StartTime) + $Cap
+  $start = ConvertTo-Epoch $h.P.StartTime; $until = $start + $Cap
   [IO.File]::WriteAllText("$f.tmp", $until.ToString([Globalization.CultureInfo]::InvariantCulture)); Move-Item -LiteralPath "$f.tmp" -Destination $f
   if (-not $h.P.WaitForExit(180000)) { $h.P.Kill(); throw 'the run did not end' }
-  [pscustomobject]@{ Code = $h.P.ExitCode; Out = $h.Out.Result }
+  $inv = [Globalization.CultureInfo]::InvariantCulture
+  $endF = "$f.end"; $end = if (Test-Path -LiteralPath $endF) { (Get-Content -LiteralPath $endF -Raw).Trim() } else { 'none (no put waited)' }
+  $diag = "start $($start.ToString($inv)), target $($until.ToString($inv)), wait ended $end"
+  Ok (-not (Test-Path -LiteralPath "$($w.Log).err")) "the put1late wait failed ($diag)"
+  [pscustomobject]@{ Code = $h.P.ExitCode; Out = ($h.Out.Result + $h.Err.Result); Diag = $diag }
 }
 function SshCalls($w) { if (Test-Path $w.SshCallLog) { @(Get-Content $w.SshCallLog | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } else { @() } }
 function BoxSessions($w) { if (Test-Path $w.BH) { @(Get-ChildItem (Join-Path $w.BH '.omp\agent\sessions') -Recurse -File -Filter '*.jsonl' -ErrorAction SilentlyContinue).Count } else { 0 } }
@@ -2088,7 +2111,7 @@ T 'nhanh r3: a batch still under way when the deadline passes ends whole (placed
   $b = New-Sess $w.LS 'bbbb1414-it02' $w.LP @('b'); Grow-Sess $b 30
   $r = Invoke-FcodePutLate $w @('phien', 'proj', '--nhanh') 30
   Eq $r.Code 0 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $CapMsg 'the cap line only'
-  Eq (Calls $w 'put') 1 'no batch is started after the deadline'
+  Eq (Calls $w 'put') 1 ('no batch is started after the deadline; ' + $r.Diag)
   $on = @($a, $b | Where-Object { Test-Path (Join-Path $w.BS (Split-Path $_ -Leaf)) })
   Eq $on.Count 1 'the batch under way at the deadline was placed, the next one was not started'
   Eq (Body-Sha (Join-Path $w.BS (Split-Path $on[0] -Leaf))) (Body-Sha $on[0]) 'placed whole'
@@ -2103,7 +2126,7 @@ T 'nhanh r3: an earlier batch failure, then the deadline at the next safe point:
   $b = New-Sess $w.LS 'bbbb1515-ef02' $w.LP @('b'); Grow-Sess $b 30
   $r = Invoke-FcodePutLate $w @('phien', 'proj', '--nhanh') 30 @{ FAKE_SSH_CUT = 'put:1:0:fail' }
   Eq $r.Code 1 $r.Out; Eq ((Screen-Lines $r.Out) -join '|') $FailMsg 'the failure line only'
-  Eq (Calls $w 'put') 1 'the run stopped at the safe point after the failed batch'
+  Eq (Calls $w 'put') 1 ('the run stopped at the safe point after the failed batch; ' + $r.Diag)
   $log = Read-PhienLog $w
   Ok ($log -match 'gửi phiên lên box không thành công') 'the failure is logged'; Ok ($log -match [regex]::Escape($CapMsg)) 'and the cap'
 }
