@@ -4555,14 +4555,15 @@ case "$1" in
 esac
 '@.Replace("`r`n", "`n"), $utf8)
   $sf = Join-Path $d 'script.sh'; [IO.File]::WriteAllText($sf, $Text.Replace("`r`n", "`n"), $utf8)
+  # stdin comes from a file, not from a redirected pipe: Windows PowerShell 5.1 starts the pipe's writer with the console input code page, and with 65001 that writer sends a UTF-8 BOM first, which the script read as part of the first answer
+  $inf = Join-Path $d 'stdin.txt'; [IO.File]::WriteAllText($inf, $Stdin, $utf8)
   $psi = New-Object Diagnostics.ProcessStartInfo $GitBash
-  $psi.Arguments = '"' + ($sf -replace '\\', '/') + '"'
-  $psi.UseShellExecute = $false; $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
+  $psi.Arguments = '-c "bash \"' + ($sf -replace '\\', '/') + '\" < \"' + ($inf -replace '\\', '/') + '\""'
+  $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
   $psi.StandardOutputEncoding = $utf8
   $psi.EnvironmentVariables['PATH'] = $bin + ';' + $env:PATH; $psi.EnvironmentVariables['FAKE_LOG'] = $log; if ($Sessions) { $psi.EnvironmentVariables['FAKE_SESSIONS'] = $Sessions }
   $p = [Diagnostics.Process]::Start($psi)
   $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
-  $p.StandardInput.Write($Stdin); $p.StandardInput.Close()
   if (-not $p.WaitForExit(60000)) { $p.Kill(); throw 'the box script timed out' }
   [pscustomobject]@{ Code = $p.ExitCode; Out = $o.Result; Err = $e.Result; Log = $(if (Test-Path $log) { [IO.File]::ReadAllText($log) } else { '' }) }
 }
