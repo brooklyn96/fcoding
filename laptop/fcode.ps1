@@ -1745,13 +1745,14 @@ function Get-MoveRsyncShapes {
     }
   }
 }
-# CONTRACT §3.5 (B.5.2; W1-T7-DG-T7-1): the `platform` units (LIST platform-units) and paths (LIST platform-opt + the /usr/local list,
-# each by its exact path; a directory entry covers what lies under it). One copy here: `preflight` and the 3b mixed-pair check read it.
+# CONTRACT §3.5 (B.5.2; W1-T7-DG-T7-1; rulings 05/11 (22), (24)): the `platform` units (LIST platform-units) and paths (LIST platform-etc = /etc/instabox and the eight instabox files in /etc, no glob,
+# LIST platform-opt + the /usr/local list, in the order of MV_PLATFORM, each by its exact path; a directory entry covers what lies under it). One copy here: `preflight` and the 3b mixed-pair check read it.
 function Get-MovePlatformUnits { @('instabox-data-init.service', 'instabox-guest-agent.service', 'instabox-guest-reboot.service', 'instabox-identity.service', 'instabox-ssh-hostkeys.service', 'instabox-user.service', 'sshd.service') }
 function Get-MovePlatformPaths {
   $bin = 'bun bunx cargo cargo-clippy cargo-fmt cargo-miri claude clippy-driver codex corepack go gofmt instabox instabox-computer-use instabox-computer-use-proxy instabox-desktop instabox-mcp instabox-port mkswap node npm npx ocu opencode open-codex-computer-use-mcp open-computer-use open-computer-use-mcp pnpm pnpx rls rust-analyzer rustc rustdoc rustfmt rust-gdb rust-gdbgui rust-lldb rustup swapoff swapon uv uvx yarn yarnpkg'
   $sbin = 'instabox-data-init instabox-guest-agent instabox-identity instabox-preboot instabox-user'
-  @('/opt/containerd', '/opt/npm', '/opt/rust') + @($bin -split ' ' | ForEach-Object { "/usr/local/bin/$_" }) + @('/usr/local/etc/npmrc') + @($sbin -split ' ' | ForEach-Object { "/usr/local/sbin/$_" }) +
+  $etc = @('/etc/instabox', '/etc/profile.d/instabox-universal.sh', '/etc/profile.d/instabox-tmpdir.sh', '/etc/profile.d/zz-instabox-secrets.sh', '/etc/profile.d/instabox-npm.sh', '/etc/sudoers.d/90-instabox-sudo', '/etc/sysctl.d/60-instabox-ping.conf', '/etc/tmpfiles.d/instabox-data-tmp.conf', '/etc/ssl/certs/instabox-proxy.pem')
+  $etc + @('/opt/containerd', '/opt/npm', '/opt/rust') + @($bin -split ' ' | ForEach-Object { "/usr/local/bin/$_" }) + @('/usr/local/etc/npmrc') + @($sbin -split ' ' | ForEach-Object { "/usr/local/sbin/$_" }) +
     @('/usr/local/share/ca-certificates/instabox-proxy.crt', '/usr/local/go', '/usr/local/include/node', '/usr/local/lib/instabox', '/usr/local/lib/node_modules', '/usr/local/share/doc', '/usr/local/share/instabox', '/usr/local/share/man/man1')
 }
 # `preflight` is a bash script the laptop ships and runs on new by plain ssh (B.0.2; W1-T10-G21).
@@ -2436,21 +2437,29 @@ function Invoke-MovePlanOld($S, [string[]]$Map) {
 # spot reads the stored value; a rebuilt state keeps New-MoveState's 0, and a state without the field counts as 0.
 function Get-MoveTargetPlatform($S) { [int](Get-MoveProp $S 'target_platform' 0) }
 # D.2 step 3b and the D.3 re-plan's 3b: the B.5.2 mixed-pair check against the stored target_platform (GAP-RULINGS-3 §16.5, §16.7 T-4).
-# With platform=1 on new: every item root or `files` name that is a platform path or lies under one, and every unit file
-# /etc/systemd/system/<u> of a platform unit, refuses target-not-empty path=<p>. Refusal lines.
+# With platform=1 on new, refuses target-not-empty path=<p> (ruling 05/11 (25), B31) for: (1) every item root (tree, file) or `files` name
+# that is a platform path, lies under one, or HOLDS one (an ancestor, e.g. a tree /etc/profile.d: its transfer would overwrite or, with
+# --delete, delete new's platform files; a `files` item's own root is only its base directory and is not tested); (2) every
+# `deleted_conffiles` entry at or under a platform path (the conffile delete would remove new's file); (3) every unit file
+# /etc/systemd/system/<u> of a platform unit among those. Refusal lines.
 function Get-MovePlatformRefusals($S, $M) {
   if ((Get-MoveTargetPlatform $S) -ne 1) { return @() }
-  $pp = @(Get-MovePlatformPaths); $pu = @(Get-MovePlatformUnits | ForEach-Object { "/etc/systemd/system/$_" }); $out = @()
+  $pp = @(Get-MovePlatformPaths); $pu = @(Get-MovePlatformUnits | ForEach-Object { "/etc/systemd/system/$_" }); $all = @($pp) + @($pu); $hit = @()
+  $isAt = { param($p) ($pu -ccontains $p) -or @($pp | Where-Object { $p -ceq $_ -or $p.StartsWith("$_/", [StringComparison]::Ordinal) }).Count }
   foreach ($it in @(Get-MoveProp $M 'items' @())) {
     if (-not $it) { continue }
-    $root = ([string]$it.root).TrimEnd('/'); $paths = @($root)
-    if ([string]$it.kind -ceq 'files') { $paths += @(@(Get-MoveProp $it 'files_from' @()) | ForEach-Object { "$root/$(([string]$_).TrimEnd('/'))" }) }
-    foreach ($p in $paths) {
-      $hit = ($pu -ccontains $p) -or @($pp | Where-Object { $p -ceq $_ -or $p.StartsWith("$_/", [StringComparison]::Ordinal) }).Count
-      if ($hit -and $out -cnotcontains "INV refuse target-not-empty path=$p") { $out += "INV refuse target-not-empty path=$p" }
-    }
+    $root = ([string]$it.root).TrimEnd('/')
+    if ([string]$it.kind -ceq 'files') {   # the root is only the base directory: tested as a platform path, never as an ancestor
+      if (& $isAt $root) { $hit += $root }
+      $names = @(@(Get-MoveProp $it 'files_from' @()) | ForEach-Object { "$root/$(([string]$_).TrimEnd('/'))" })
+    } else { $names = @($root) }
+    foreach ($p in $names) { if ((& $isAt $p) -or @($all | Where-Object { $_.StartsWith("$p/", [StringComparison]::Ordinal) }).Count) { $hit += $p } }
   }
-  $out
+  foreach ($c in @(Get-MoveProp $M 'deleted_conffiles' @())) {
+    $p = ([string]$(if ($c -is [string]) { $c } else { Get-MoveProp $c 'path' '' })).TrimEnd('/')
+    if ($p -and (& $isAt $p)) { $hit += $p }
+  }
+  @($hit | Select-Object -Unique | ForEach-Object { "INV refuse target-not-empty path=$_" })
 }
 # D.2 step 3b: the B.0.3 user clause and the B.6.2 / K7 compare (users, groups, subid ranges; W1-T11-DG-T11-4, W1-T10-G25) against
 # preflight's stored target_* values. Refusal lines. `<home>` = /home/<user> (W1-T10-G11).
