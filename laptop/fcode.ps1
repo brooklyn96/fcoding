@@ -2103,6 +2103,24 @@ function Get-MoveSwitchBudget($M) {
   $c = @(@(Get-MoveProp $M 'connectors' @()) | Where-Object { $_ -and [string]$_.kind -cin 'unit', 'container' }).Count
   60 + 140 * $c + 20 * (Get-MoveTunnelCount $M)
 }
+# K1 start row (x.start, x.enable.N, r.start-src; ruling 06/11 (30), B36): Σ start_budget_s of hold_sets.start + 60, + 60 when the start set
+# holds a unit connector (a connectors[] entry of kind unit whose id is in hold_sets.start), + 20 per listener after the first. N, the listeners
+# the rollback's ready check probes (lib/move-hold.sh _mvh_conn_check), = Σ over those connector holds of max(1, |holds[].listen[]|): the
+# entries pinned in the manifest, and at least the one metrics listener each connector has when none is pinned
+function Get-MoveStartBudget($M) {
+  $ids = @(Get-MoveProp (Get-MoveProp $M 'hold_sets') 'start' @())
+  $cid = @(@(Get-MoveProp $M 'connectors' @()) | Where-Object { $_ -and [string]$_.kind -ceq 'unit' -and $ids -ccontains [string]$_.id } | ForEach-Object { [string]$_.id })
+  $t = (Get-MoveSetBudget $M 'start' 'start_budget_s') + 60
+  if ($cid.Count) {
+    $n = 0
+    foreach ($c in $cid) {
+      $h = @(Get-MoveProp $M 'holds' @()) | Where-Object { $_ -and [string]$_.id -ceq $c } | Select-Object -First 1
+      $n += [Math]::Max(1, @(Get-MoveProp $h 'listen' @()).Count)
+    }
+    $t += 60 + 20 * ($n - 1)
+  }
+  $t
+}
 # K1 stop row (x.stop-src, x.stop-dst, r.stop-dst): Σ stop_budget_s of hold_sets.stop + 30 + 600 per Redis hold (counted as the redis[]
 # entries, D.0.6) + 60 per pm2 hold (pm2-*.service, B.5.9) + 120 per container/user-container hold of the stop set
 function Get-MoveStopBudget($M) {
@@ -2125,7 +2143,7 @@ function Get-MoveBudget($S, [string]$Step, [string]$Machine) {
     'x.final' { if ($null -ne $ts) { 2 * [int]$ts + 300 } else { Get-MoveConst 'first_transfer_s' }; break }
     { $_ -in 'c.verify.N', 'x.verify' } { if ($null -ne $vs) { 2 * [int]$vs + 120 } else { Get-MoveConst 'first_verify_s' }; break }
     { $_ -in 'c.adopt.N', 'x.adopt' } { Get-MoveConst 'adopt_s'; break }
-    { $_ -in 'x.start', 'x.enable.N', 'r.start-src' } { (Get-MoveSetBudget $M 'start' 'start_budget_s') + 60; break }
+    { $_ -in 'x.start', 'x.enable.N', 'r.start-src' } { Get-MoveStartBudget $M; break }
     'x.switch' { Get-MoveSwitchBudget $M; break }
     'c.init-new' { [int](Get-MoveTargetStopBudget $S) + 60; break }
     'x.check' { if ($script:MoveCheckOnlyS) { 3 * [int]$script:MoveCheckOnlyS + 60 } else { Get-MoveConst 'other_s' }; break }
