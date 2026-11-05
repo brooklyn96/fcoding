@@ -557,7 +557,7 @@ exit "$rc"
     BS = Join-Path $bh ('.omp\agent\sessions\' + (Get-OmpEncodedDir $bp ($bh -replace '\\', '/') (Join-Path $u 'AppData\Local\Temp')))
     LBlobs = Join-Path $u '.omp\agent\blobs'; BBlobs = Join-Path $bh '.omp\agent\blobs'; Log = Join-Path $w 'ssh.log' }
 }
-# -NoWait: start it hidden and return the process (for the kill test); -Async: the same with the screen output captured, returns {P; Out = task};
+# -NoWait: start it hidden and return the process (for the kill test); -Async: the same with the screen output captured, returns {P; Out = task; Err = task (stderr, drained at once)};
 # otherwise run it and return {Code; Out}
 function Invoke-Fcode($World, [string[]]$FArgs, [hashtable]$ExtraEnv = @{}, [string]$InText = $null, [switch]$NoWait, [switch]$Async) {
   $ErrorActionPreference = 'Continue'   # Windows PowerShell 5.1 turns native stderr into errors under Stop
@@ -1368,7 +1368,7 @@ T 'e2e: the auto deadline holds while stdin is blocked: the stalled call is kill
   $r = Invoke-Fcode $w @('phien', '--tu-dong') @{ FCODE_PHIEN_TIMEOUT = '25'; FAKE_SSH_CUT = 'put:1:0:stall' }
   $sec = ((Get-Date) - $t0).TotalSeconds
   Eq $r.Code 1 $r.Out; Ok ($sec -lt 45) "ended at the deadline ($([Math]::Round($sec)) s, stall is 60 s)"
-  Eq (Calls $w 'put') 1 ('no batch is started after the deadline; ' + $r.Diag)
+  Eq (Calls $w 'put') 1 'no batch is started after the deadline'
   Ok (-not (Test-Path (Join-Path $w.BS (Split-Path $a -Leaf))) -and -not (Test-Path (Join-Path $w.BS (Split-Path $b -Leaf)))) 'nothing half-sent is placed'
   Ok ((Get-Content (Join-Path $w.U '.fcode\phien.log') -Raw) -match 'gửi phiên lên box không thành công') 'logged'
   Ok (-not (Get-ChildItem (Join-Path $w.U 'AppData\Local\Temp') -Directory -Filter 'fcode-phien-*' -ErrorAction SilentlyContinue)) 'staging removed'
@@ -1802,8 +1802,8 @@ function Use-LoggedSsh($w, [string]$Stall = '') {
     'check' { "if `"%K%`"==`"true`" ping -n 60 127.0.0.1 >nul`r`n" }
     'put2' { "if `"%K%`"==`"true`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`nfindstr /c:`"ssh put`" `"%FAKE_SSH_LOG%`" >nul 2>&1 || goto run`r`nping -n 60 127.0.0.1 >nul`r`n:run`r`n" }
     # 'put1late': the first `ssh ... put` waits until the epoch second that the file named by FAKE_PUT_UNTIL holds (it appears once the test knows when the run started: Invoke-FcodePutLate; put1late-wait.py
-    # also writes the epoch at which the wait ended to <FAKE_PUT_UNTIL>.end), then runs as the fake decides (an item still under way when the deadline passes). A wait that fails (python error, no target within 120 s)
-    # is loud: the call exits 98 and leaves <FAKE_SSH_LOG>.err behind, which Invoke-FcodePutLate turns into a test failure; it never falls through to an early put
+    # also writes the epoch at which the wait ended to <FAKE_PUT_UNTIL>.end), then runs as the fake decides (an item still under way when the deadline passes). A wait that fails (a python error)
+    # is loud (a wait for a target that never comes is ended by fcode's child limit, deadline + 5 s, which kills the wrapper): the call exits 98 and leaves <FAKE_SSH_LOG>.err behind, which Invoke-FcodePutLate turns into a test failure; it never falls through to an early put
     'put1late' { "if `"%K%`"==`"true`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`nfindstr /c:`"ssh put`" `"%FAKE_SSH_LOG%`" >nul 2>&1 && goto run`r`npython `"$($w.W)\put1late-wait.py`"`r`nif errorlevel 1 (echo put1late-wait-failed>>`"%FAKE_SSH_LOG%.err`" & exit /b 98)`r`n:run`r`n" }
     # 'gitbreak': before an `ssh ... put` the box project's .git is renamed to .git-x (FAKE_BP = that folder, Windows form; unset = off): the box can no longer find its exclude file
     'gitbreak' { "if `"%FAKE_BP%`"==`"`" goto run`r`nif `"%K%`"==`"true`" goto run`r`necho %* | findstr /c:`"' put`" >nul || goto run`r`nif exist `"%FAKE_BP%\.git`" attrib -h `"%FAKE_BP%\.git`" & ren `"%FAKE_BP%\.git`" .git-x`r`n:run`r`n" }   # .git is hidden: ren does not see it
@@ -1813,16 +1813,13 @@ function Use-LoggedSsh($w, [string]$Stall = '') {
   }
   if ($Stall -eq 'put1late') {
     [IO.File]::WriteAllText((Join-Path $w.W 'put1late-wait.py'), (@'
-import os, sys, time
+import os, time
 f = os.environ['FAKE_PUT_UNTIL']
-t0 = time.time()
 until = None
 while until is None:   # the target file appears once the test knows when the run started; a scanner may hold it for a moment
     try:
         until = float(open(f).read())
     except (OSError, ValueError):
-        if time.time() - t0 > 120:
-            sys.exit(1)
         time.sleep(0.05)
 time.sleep(max(0, until - time.time()))
 open(f + '.end', 'w').write(repr(time.time()))
