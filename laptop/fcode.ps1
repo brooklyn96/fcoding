@@ -1350,6 +1350,7 @@ function Get-MoveText([string]$Key, [hashtable]$F = @{}) {
     'cutover-again' { 'chạy lại fcode move cutover' }
     'cutover-now' { 'chạy lại fcode move cutover ngay' }
     'carry-half' { 'dữ liệu máy cũ đang dở; chỉ tiếp tục được khi máy mới nối lại' }
+    'carry-resume' { 'Chạy lại fcode move cutover để tiếp tục chép ngược.' }   # ruling 05/11 (27) F4: after x.final in a carry-back, new answered status (also the Q-discard "không" line)
     'back-stays' { 'những thứ này ở lại máy mới, không chạy trên máy cũ' }
     'abort-text' { 'máy mới đang giữ bản sao của mọi dữ liệu và bí mật; xóa hoặc cài lại máy mới trước khi plan lại' }
     'copy-first' { 'chạy copy trước' }
@@ -2386,7 +2387,7 @@ function Invoke-MoveCheckCmd {
 # ---- plan (D.2) and the re-plan of a copy refresh (D.3) ----
 # DESIGN-GAP (T10-G48, F8j): B.14.2 says the owner may remove the default lines; reading: the first plan always prepends them and writes
 # map.txt; the owner removes them by editing map.txt, which every re-plan (copy refresh) reads.
-function Get-MoveDefaultMap { @('exclude user dino', 'exclude unit velh-pilot-hourly.timer', 'exclude /etc/ssl/certs') }   # B.14.2, owner answers I.8, I.10; ruling 04/11 (3) 4
+function Get-MoveDefaultMap { @('exclude user dino', 'exclude unit velh-pilot-hourly.timer') }   # B.14.2, owner answers I.8, I.10; ruling 05/11 (27) B33 dropped `exclude /etc/ssl/certs` (T3's B.13 certs rule decides the files under it)
 # map lines of a --map file; $null (printed) when it is not usable
 function Read-MoveMapLines([string]$Path) {
   try { $t = [IO.File]::ReadAllText($Path).TrimStart([char]0xFEFF) } catch { Write-Host "lỗi: không đọc được file map $Path."; return $null }
@@ -3239,27 +3240,32 @@ function Get-MoveRebuiltDstStartedAt($S, $Recs) {
   foreach ($rr in @($Recs)) { if ([string]$rr['id'] -ceq "fwd-$a-x.start" -and (ConvertTo-MoveTime $rr['start'])) { return [string]$rr['start'] } }
   ''
 }
-# both `MOVE state` lines as the machines print them (D.5.2 "exit 70 with both status answers"); a down new is not asked
+# both `MOVE state` lines as the machines print them (D.5.2 "exit 70 with both status answers"); a down new is not asked.
+# Returns $true when new answered status (a gate answer, any exit), $false when it did not (down, or no answer): ruling 05/11 (27) F4
 function Write-MoveBothStatus($S) {
+  $newAnswered = $false
   foreach ($m in 'old', 'new') {
     if ($m -ceq 'new' -and $script:MoveNewDown) { Write-Host "  máy mới: không trả lời"; continue }
     $st = Get-MoveStatus $S $m -Quiet
+    if ($m -ceq 'new') { $newAnswered = [bool]$st.Known }
     foreach ($l in @($st.Lines | Where-Object { "$_" -cmatch '\AMOVE state ' })) { Write-Host "  $l" }
     if (-not $st.Ok) { Write-Host "  máy $(if ($m -ceq 'old') { 'cũ' } else { 'mới' }): không đọc được trạng thái (mã $($st.Code))" }
   }
+  $newAnswered
 }
 function Invoke-MoveCarryFail($S, $F) {
   if ($F.Fail -ceq 'no-answer') { return 1 }   # DG6: the no-answer line is the last line
   if ($F.Fail -ceq 'chore0') { Write-MoveReturnOld $S; Write-Host (Get-MoveText 'cutover-again'); return 1 }   # F11, E-R25: old serves after x.switch
-  if ($F.Fail -cne 'discard') {   # after x.final started (E-R5, E-R23): resume only
-    Write-MoveBothStatus $S
-    Write-Host (Get-MoveText 'carry-half'); return 70
+  $resume = Get-MoveText 'carry-resume'
+  if ($F.Fail -cne 'discard') {   # after x.final started (E-R5, E-R23): resume only; ruling 05/11 (27) F4: new answered status -> the resume line, else the carry-half sentence
+    if (Write-MoveBothStatus $S) { Write-Host $resume } else { Write-Host (Get-MoveText 'carry-half') }
+    return 70
   }
   # Q-discard: the clean form only when new's x.stop-src returned 0 and new shows hold_active=0
   $clean = $false
   if (-not $script:MoveNewDown) { $st = Get-MoveStatus $S 'new' -Quiet; $clean = [bool]($script:MoveSrcStopped -and $st.Ok -and [string]$st.Kv['hold_active'] -ceq '0') }
   $a = Read-MoveAnswer (Get-MoveText $(if ($clean) { 'Q-discard' } else { 'Q-newlost' }) @{ 'giờ' = (Get-MoveCutOff $S) }) @('YES')
-  if ($a -cne 'YES') { Write-Host "Chưa làm gì thêm. Chạy lại  fcode move cutover  để tiếp tục chép ngược."; return 70 }
+  if ($a -cne 'YES') { Write-Host "Chưa làm gì thêm. $resume"; return 70 }
   Invoke-MoveOldBack $S $(if ($clean) { 'new_discarded' } else { 'new_lost' })
 }
 # Q-discard / Q-newlost YES: old r.start-src, r.unfreeze-src, r.health-src; rolled-back, serving old, carry false; exit 10
