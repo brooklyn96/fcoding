@@ -156,7 +156,7 @@ function Reset-World {
     BoxLog = (New-Object Collections.ArrayList); Mf = (New-Manifest); PlanStdin = (New-Object Collections.ArrayList); PlanN = 0
     Pf = @('INV target user=quoc uid=1000 home-nonskel=1', 'INV target addr=198.51.100.20', 'INV target platform=0', 'INV target stop_budget_s=120'); PfCode = 0
     CheckOut = @('INV ok'); CheckCode = 0; CheckOnlyOut = @('INV ok'); CheckOnlyCode = 0; PlanHook = $null; PlanOut = @('INV ok'); PlanCode = 0
-    NewGate = (New-Object Collections.Queue); TcpFail = @{}; LoginRc = 0; CoderUp = $true; Dur = @{}; Sleeps = 0
+    NewGate = (New-Object Collections.Queue); TcpFail = @{}; LoginRc = 0; LoginErr = ''; CoderUp = $true; Dur = @{}; Sleeps = 0
     Violations = (New-Object Collections.ArrayList); Runaway = $null; StateSeen = (New-Object Collections.ArrayList); Hooks = @{}; Out = (New-Object Collections.ArrayList); OutFrom = 0; BoxStates = (New-Object Collections.ArrayList)
   }
 }
@@ -173,11 +173,11 @@ function Read-SyncLine([string]$Prompt) {
 function Ans([string[]]$A) { foreach ($x in $A) { $script:W.Answers.Enqueue($x) } }
 function Log([string]$s) { [void]$script:W.Log.Add($s) }
 function New-Res([int]$Code, [string[]]$Out) { @{ Code = $Code; Out = [string[]]@($Out); Err = '' } }
-function Add-Fault([string]$M = '.', [string]$Key, [int]$Rc = 1, [string[]]$Out = $null, [int]$N = 1, [string]$Mode = '', [scriptblock]$Do = $null, [switch]$Effect, [int]$Left = 2) {
-  [void]$script:W.Faults.Add(@{ M = $M; Key = $Key; Rc = $Rc; Out = $Out; N = $N; Mode = $Mode; Do = $Do; Effect = [bool]$Effect; Left = $Left })
+function Add-Fault([string]$M = '.', [string]$Key, [int]$Rc = 1, [string[]]$Out = $null, [int]$N = 1, [string]$Mode = '', [scriptblock]$Do = $null, [switch]$Effect, [int]$Left = 2, [int]$Skip = 0) {
+  [void]$script:W.Faults.Add(@{ Skip = $Skip; Seen = 0; M = $M; Key = $Key; Rc = $Rc; Out = $Out; N = $N; Mode = $Mode; Do = $Do; Effect = [bool]$Effect; Left = $Left })
 }
 function Get-Fault([string]$M, [string]$Key) {
-  foreach ($f in $script:W.Faults) { if ($f.N -ne 0 -and $M -match "\A(?:$($f.M))\z" -and $Key -match $f.Key) { if ($f.N -gt 0) { $f.N-- }; return $f } }
+  foreach ($f in $script:W.Faults) { if ($f.N -ne 0 -and $M -match "\A(?:$($f.M))\z" -and $Key -match $f.Key) { $f.Seen++; if ($f.Skip -gt 0) { $f.Skip--; continue }; if ($f.N -gt 0) { $f.N-- }; return $f } }
   $null
 }
 function Decode-B64([string]$t) {
@@ -242,7 +242,7 @@ function Invoke-MoveTimedExe([string]$Exe, [string[]]$ExeArgs, [string]$StdinTex
   if (-not (Test-HostKey $m $o $hostArg $addr)) { $e.Kind = 'hostkey'; Log "$($m.Name) hostkey-fail"; $e.Code = 255; return (New-Res 255 @('Host key verification failed.')) }
   if ($remote -cmatch '\A(?:base64 -di \| )?/usr/local/sbin/fcode-deploy-gate --move (.*)\z') { $r = Fake-Gate $m $Matches[1] (Decode-B64 $StdinText) $e }
   elseif ($remote -cmatch 'f=\$\(mktemp\)') { $r = Fake-Script $m (Decode-B64 $StdinText) $e }
-  elseif ($remote -ceq 'true') { $e.Kind = 'login'; Log "$($m.Name) login"; $r = New-Res $W.LoginRc @() }
+  elseif ($remote -ceq 'true') { $e.Kind = 'login'; Log "$($m.Name) login"; $lf = Get-Fault $m.Name 'login'; $r = if ($lf -and $lf.Mode -eq 'down') { New-Res 255 @() } else { New-Res $W.LoginRc @() }; if ($W.LoginErr) { $r.Err = $W.LoginErr } }
   else { [void]$W.Violations.Add("unexpected ssh remote command: $remote"); $r = New-Res 1 @() }
   $e.Code = $r.Code; $e.Out = $r.Out
   $r
@@ -288,7 +288,7 @@ function Fake-Gate($m, [string]$Cmd, [string]$Stdin, $e) {
   if ($verb -ceq 'status') {
     $e.Step = 'status'; Log "$($m.Name) status$(if ($f['lst']) { ' --lst ' + $f['lst'] })"
     $flt = Get-Fault $m.Name 'status'
-    if ($flt) { if ($flt.Mode -eq 'timeout') { return (New-Res 124 @()) }; if ($flt.Mode -eq 'down') { return (New-Res 255 @()) } }
+    if ($flt) { if ($flt.Mode -eq 'timeout') { return (New-Res 124 @()) }; if ($flt.Mode -eq 'down') { return (New-Res 255 @()) }; if ($flt.Mode -eq 'nomove') { return (New-Res 65 @('GATE_ERROR gate installed without exactly one project argument', 'GATE_EXIT 65')) } }   # nomove: this machine's gate has no --move
     if ($m.Running) { $m.Running.Left--; if ($m.Running.Left -lt 0) { Complete-Running $m } }
     if ($f['lst']) { $o = @(foreach ($l in @($m.Lst[$f['lst']])) { if ($null -ne $l) { "MOVE lst $l" } }); return (New-Res 0 ($o + 'GATE_EXIT 0')) }
     $sf = Get-StatusFields $m
@@ -311,13 +311,13 @@ function Fake-Gate($m, [string]$Cmd, [string]$Stdin, $e) {
     if ($sw['check-only'] -and $id -ceq '-') {
       $e.Step = 'plan:check'; Log "$($m.Name) plan:check"
       foreach ($k in 'dir', 'attempt', 'sha', 'serving') { if ($f.ContainsKey($k)) { [void]$W.Violations.Add("plan - --check-only carries --$k (D.0.1)") } }
-      $flt = Get-Fault $m.Name 'plan:check'; if ($flt) { if ($flt.Mode -eq 'noexit') { return (New-Res 0 @($flt.Out)) }; return (New-Res $flt.Rc (@($flt.Out) + "GATE_EXIT $($flt.Rc)")) }
+      $flt = Get-Fault $m.Name 'plan:check'; if ($flt) { if ($flt.Mode -eq 'down') { return (New-Res 255 @()) }; if ($flt.Mode -eq 'noexit') { return (New-Res 0 @($flt.Out)) }; return (New-Res $flt.Rc (@($flt.Out) + "GATE_EXIT $($flt.Rc)")) }
       return (New-Res $W.CheckCode (@($W.CheckOut) + "GATE_EXIT $($W.CheckCode)"))
     }
     if ($sw['check-only']) {
       $e.Step = 'plan:check-only'; Log "$($m.Name) plan:check-only"; $script:Clock = $script:Clock.AddSeconds(7)
       foreach ($k in 'dir', 'attempt', 'sha', 'serving') { if (-not $f.ContainsKey($k)) { [void]$W.Violations.Add("plan <id> --check-only lacks --$k (D.0.1)") } }
-      $flt = Get-Fault $m.Name 'plan:check-only'; if ($flt) { return (New-Res $flt.Rc (@($flt.Out) + "GATE_EXIT $($flt.Rc)")) }
+      $flt = Get-Fault $m.Name 'plan:check-only'; if ($flt) { if ($flt.Mode -eq 'down') { return (New-Res 255 @()) }; if ($flt.Mode -eq 'noexit') { return (New-Res 0 @($flt.Out)) }; return (New-Res $flt.Rc (@($flt.Out) + "GATE_EXIT $($flt.Rc)")) }
       return (New-Res $W.CheckOnlyCode (@($W.CheckOnlyOut) + "GATE_EXIT $($W.CheckOnlyCode)"))
     }
     $e.Step = 'plan:full'; $W.PlanN++; Log "$($m.Name) plan:full"
@@ -330,7 +330,7 @@ function Fake-Gate($m, [string]$Cmd, [string]$Stdin, $e) {
     $W.Mf.idmap = @(foreach ($l in $lines) { if ($l -cmatch '\Aidmap (user|group) (\S+) ([0-9]+) ([0-9]+)\z') { [ordered]@{ kind = $Matches[1]; name = $Matches[2]; src_id = [int]$Matches[3]; dst_id = [int]$Matches[4] } } })
     $out = @($W.PlanOut); $code = $W.PlanCode
     if ($W.PlanHook) { $h = & $W.PlanHook $W.PlanN $mapl; if ($h) { $out = @($h.Out); $code = $h.Code } }
-    $flt = Get-Fault $m.Name 'plan:full'; if ($flt) { $out = @($flt.Out); $code = $flt.Rc; if ($flt.Mode -ceq 'nomanifest') { return (New-Res $code (@($out) + "GATE_EXIT $code")) } }   # nomanifest: a refusal the server prints without a manifest (map-invalid, _mvp_finalize)
+    $flt = Get-Fault $m.Name 'plan:full'; if ($flt) { $out = @($flt.Out); $code = $flt.Rc; if ($flt.Mode -ceq 'down') { return (New-Res 255 @()) }; if ($flt.Mode -ceq 'noexit') { return (New-Res 0 @($out)) }; if ($flt.Mode -ceq 'nomanifest') { return (New-Res $code (@($out) + "GATE_EXIT $code")) } }   # nomanifest: a refusal the server prints without a manifest (map-invalid, _mvp_finalize)
     return (New-Res $code (@($out) + (Get-ManifestLine $tu) + "GATE_EXIT $code"))
   }
   # a recorded call
@@ -1623,6 +1623,33 @@ T 'L.chore-ufw-lockout: an adopt warning ufw-lockout is shown at copy and repeat
   Ok (@($t.Substring($i) -split "`n")[0] -match '22' -or $t.Substring($i) -match 'ufw enable') 'detail: port 22 / ufw enable'
   Eq (Get-St).phase 'cut' 'no rollback'
 }
+T 'L.pkg-extra-label: INV warn pkg-extra (c.adopt.N, x.adopt) is shown with the cautious CONTRACT 8.3.3 label per line and no 8.3.2 remedy line (R10-INT-23, B22)' {
+  $rem = 'xóa file mặc định đó rồi chạy lại'
+  $lab = 'Có file lạ trong thư mục được chuyển, chưa bị xóa; chỉ xóa nếu chắc đây là file mặc định của gói vừa cài (vd sites-enabled/default); KHÔNG xóa file của chính máy mới (vd sudoers.d/90-cloud-init-users, netplan/50-cloud-init.yaml) — xóa nhầm có thể mất sudo hoặc mạng'
+  Fx-Planned; [void](Do-Copy 0); NoText $rem; NoText 'Có file lạ trong thư mục được chuyển'
+  Reset-World; Fx-Planned
+  Add-Fault -M new -Key '-c\.adopt\.1$' -Rc 0 -Out @('INV warn pkg-extra path=/etc/nginx/sites-enabled/default', 'INV warn pkg-extra path=/etc/nginx/conf.d/default.conf')
+  [void](Do-Copy 0)
+  HasText "${lab}: path=/etc/nginx/sites-enabled/default"; HasText "${lab}: path=/etc/nginx/conf.d/default.conf"
+  NoText $rem
+  Add-Fault -M new -Key '-x\.adopt$' -Rc 0 -Out @('INV warn pkg-extra path=/etc/nginx/sites-enabled/default')
+  [void](Do-Cutover 0)
+  HasText "${lab}: path=/etc/nginx/sites-enabled/default"
+  NoText $rem
+  Eq (Get-St).phase 'cut' 'report-only: no rollback'
+}
+T 'L.no-install-end-remedy: MOVE item <id> kind=adopt state=failed why=no-install-end (c.prepare.N) is shown and then the CONTRACT 8.3.2 remedy once per call (R10-INT-23, B18/B20)' {
+  $rem = 'xóa file mặc định đó rồi chạy lại'
+  $l1 = 'MOVE item nginx kind=adopt state=failed why=no-install-end path=/etc/nginx/sites-enabled/default'
+  $l2 = 'MOVE item nginx kind=adopt state=failed why=no-install-end path=/etc/nginx/conf.d/default.conf'
+  Fx-Planned; Add-Fault -M new -Key '-c\.prepare\.1$' -Rc 1 -Out @($l1, $l2)
+  $r = Do-Copy -1; Ok ($r.Code -ne 0) "copy stops ($($r.Text))"; $t = $script:Last.Text
+  HasText $l1; HasText $l2
+  Eq ([regex]::Matches($t, [regex]::Escape($rem)).Count) 1 "the remedy once (two failed items, one call): $t"
+  Ok ($t.LastIndexOf($rem) -gt $t.LastIndexOf($l2)) 'the remedy follows the lines'
+  Reset-World; Fx-Planned; Add-Fault -M new -Key '-c\.prepare\.1$' -Rc 1 -Out @('MOVE item nginx kind=apt state=failed')
+  [void](Do-Copy -1); NoText $rem
+}
 T 'L.step10-fail-no-carry: chore 0 failing after the proof ends exit 1 with new serving (no carry-back); the next verb runs chore 0 first with a raised N' {
   Fx-Copied; Add-Fault -M new -Key '-x\.enable\.1$' -Rc 1
   [void](Do-Cutover 1); $s = Get-St; Eq $s.phase 'cut' 'phase'; Eq $s.serving 'new' 'serving'; Eq $s.enabled $false 'enabled'
@@ -1631,6 +1658,232 @@ T 'L.step10-fail-no-carry: chore 0 failing after the proof ends exit 1 with new 
   Ok ((Sent 'new' '^fwd-1-x\.enable\.2$') -eq 1) 'x.enable.2 runs'; Eq (Get-St).enabled $true 'enabled after the repair'; Eq $W.new.Frozen $false 'new unfrozen'
 }
 
+# ---- B24 (R10-INT-26, DG6): an exit that gives up because a machine did not answer ends with the re-run sentence, once; a drop is never a clock refusal or a lockout ----
+$Rerun = 'Chạy lại khi máy nối lại được.'
+function LastLine { @(@($script:Last.Text -split '\r?\n') | Where-Object { "$_".Trim() }) | Select-Object -Last 1 }
+function EndsRerun([string]$Head) {
+  Eq "$(LastLine)" "lỗi: $Head $Rerun" "the last line (output: $($script:Last.Text))"
+  Eq ([regex]::Matches($script:Last.Text, [regex]::Escape($Rerun)).Count) 1 'the re-run sentence once'
+}
+T 'L.no-answer-copy-gate-ids: copy (4) with a machine that does not answer status ends with the re-run sentence (once), exit 1, no gate-version refusal (B24)' {
+  foreach ($c in @(@('old', 1), @('new', 0))) {   # status order of a first copy: old (agreement), new (agreement: nogate, never faulted), then (4): old, new
+    Reset-World; Fx-Planned; Add-Fault -M $c[0] -Key '^status$' -Mode down -N -1 -Skip $c[1]
+    [void](Do-Copy 1); EndsRerun "máy '$(if ($c[0] -ceq 'old') { $OldAlias } else { $NewAlias })' không trả lời khi đọc status (mã 255)."; NoText 'INV refuse gate-version'; Eq (SentAny '-c\.prepare\.') 0 "[$($c[0])] no prepare"
+  }
+}
+T 'L.no-answer-cutover-0c: the 0c status read, the agreement check and the verb rows that need a machine end with the re-run sentence (once), exit 1, nothing frozen (B24)' {
+  Fx-Copied; Add-Fault -M new -Key '^status$' -Mode down -N -1 -Skip 1   # the second status of new is 0c's gate-id read
+  [void](Do-Cutover 1); EndsRerun "máy '$NewAlias' không trả lời khi đọc status (mã 255)."; Eq (Sent 'old' '-x\.freeze$') 0 'nothing frozen (0c)'
+  Reset-World; Fx-Copied; Add-Fault -M old -Key '^status$' -Mode down -N -1
+  [void](Do-Cutover 1); EndsRerun "máy '$OldAlias' không trả lời khi đọc status (mã 255)."; Eq (Sent 'old' '-x\.freeze$') 0 'nothing frozen (agreement)'
+  Reset-World; Fx-Copied; $W.new.Up = $false
+  [void](Do-Cutover 1); EndsRerun "máy '$NewAlias' không trả lời khi lệnh 'cutover' cần máy mới (mã 255)."; Eq (Sent 'old' '-x\.freeze$') 0 'nothing frozen (row)'
+  Reset-World; Fx-Planned; $W.new.Up = $false
+  [void](Do-Copy 1); EndsRerun "máy '$NewAlias' không trả lời khi lệnh 'copy' cần máy mới (mã 255)."
+  Reset-World; Fx-Cut; $W.new.Up = $false
+  $r = Run-Move @('finish'); Eq $r.Code 1 "finish exit ($($r.Text))"; EndsRerun "máy '$NewAlias' không trả lời khi đang phục vụ (mã 255)."
+}
+T 'L.no-answer-facts-255: no answer (255 or the deadline) at the 0c facts read and at the plan facts read of new is "không trả lời" with the re-run sentence, exit 1, never a clock refusal (B24, DG6)' {
+  foreach ($mach in 'old', 'new') { foreach ($rc in 255, 124) {
+    Reset-World; Fx-Copied; Add-Fault -M $mach -Key '^script:facts$' -Rc $rc -Out @()
+    [void](Do-Cutover 1); EndsRerun "máy '$(if ($mach -ceq 'old') { $OldAlias } else { $NewAlias })' không trả lời khi đọc dữ kiện (mã $rc)."; NoText 'Đồng hồ các máy lệch nhau'; NoText 'skew_s'; Eq (Sent 'old' '-x\.freeze$') 0 "[$mach $rc] nothing frozen"
+  } }
+  Reset-World; Add-Fault -M new -Key '^script:facts$' -Rc 255 -Out @(); $r = Do-Plan -Want 1
+  EndsRerun "máy '$NewAlias' không trả lời khi đọc dữ kiện (mã 255)."; NoText 'Đồng hồ các máy lệch nhau'; NothingWritten 'plan wrote nothing'
+  Reset-World; Fx-Copied; Add-Fault -M new -Key '^script:facts$' -Rc 1 -Out @(); [void](Do-Cutover 65); HasText 'Đồng hồ các máy lệch nhau quá 5 giây'; NoText $Rerun
+}
+T 'L.login-no-answer: ssh 255 or the deadline at the post-adopt login check (copy, cutover, back) without an authentication refusal is "không trả lời" with the re-run sentence, exit 1, no lockout; a refusal or another code stays lockout, exit 70 (B24, DG6)' {
+  $lockLab = 'Mất quyền đăng nhập vào máy đích'
+  foreach ($c in @(@(255, ''), @(124, ''), @(255, 'ssh: connect to host 192.0.2.1 port 22: Connection timed out'))) {
+    Reset-World; Fx-Planned; $W.LoginRc = $c[0]; $W.LoginErr = $c[1]
+    [void](Do-Copy 1); EndsRerun "máy '$NewAlias' không trả lời khi kiểm tra đăng nhập (mã $($c[0]))."; NoText $lockLab; NoText 'MOVE error lockout'
+  }
+  foreach ($c in @(@(255, 'new@192.0.2.1: Permission denied (publickey).'), @(255, 'Received disconnect: Too many authentication failures'), @(124, 'Permission denied (publickey).'), @(1, ''), @(2, 'Connection timed out'))) {
+    Reset-World; Fx-Planned; $W.LoginRc = $c[0]; $W.LoginErr = $c[1]
+    [void](Do-Copy 70); HasText $lockLab; NoText $Rerun
+  }
+  Reset-World; Fx-Copied; $W.LoginRc = 255
+  [void](Do-Cutover 1); EndsRerun "máy '$NewAlias' không trả lời khi kiểm tra đăng nhập (mã 255)."; NoText $lockLab; Eq (SentAny '-r\.') 0 'no rollback after a login that did not answer'
+  Reset-World; Fx-Copied; $W.LoginRc = 255; $W.LoginErr = 'Permission denied (publickey).'
+  [void](Do-Cutover 70); HasText $lockLab; NoText $Rerun
+  Reset-World; Fx-Cut; $W.LoginRc = 255; Ans 'YES'
+  $r = Run-Move @('back'); Eq $r.Code 1 "back exit ($($r.Text))"; EndsRerun "máy '$OldAlias' không trả lời khi kiểm tra đăng nhập (mã 255)."; NoText $lockLab
+  Reset-World; Fx-Cut; $W.LoginRc = 255; $W.LoginErr = 'Permission denied (publickey).'; Ans 'YES'
+  $r = Run-Move @('back'); Eq $r.Code 70 "back lockout exit ($($r.Text))"; HasText $lockLab; NoText $Rerun
+  foreach ($err in @('', 'Permission denied (publickey).')) {   # a carry-back (failed x.health): the login of its x.adopt on old
+    $script:CarryLoginErr = $err
+    Reset-World; Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.health$' -Rc 69 -Out @('MOVE item app.service kind=unit state=failed ActiveState=failed') -Do { $W.LoginRc = 255; $W.LoginErr = $script:CarryLoginErr }
+    if ($err) { [void](Do-Cutover 70); HasText $lockLab; NoText $Rerun }
+    else { [void](Do-Cutover 1); EndsRerun "máy '$OldAlias' không trả lời khi kiểm tra đăng nhập (mã 255)."; NoText $lockLab }
+  }
+}
+# ---- R10-INT-31 (B24): an unknown outcome of a call (-1 / 124 / 255) ends the run with the re-run sentence once, exit 1; a plain failed call (rc 1) has none ----
+function EndsBareRerun {
+  Eq "$(LastLine)" $Rerun "the last line is the re-run sentence (output: $($script:Last.Text))"
+  Eq ([regex]::Matches($script:Last.Text, [regex]::Escape($Rerun)).Count) 1 'the re-run sentence once'
+}
+T 'L.no-answer-call-unknown: c.transfer.N and c.init-old with an unknown outcome (machine lost) end the copy with the re-run sentence once as the last line, exit 1 (net-drop text first); a failed call (rc 1) has no sentence (R10-INT-31)' {
+  Fx-Planned; Add-Fault -M new -Key '-c\.transfer\.1$' -Mode down
+  [void](Do-Copy 1); EndsBareRerun
+  $t = $script:Last.Text; Ok ($t.IndexOf('mạng đứt; chạy fcode move copy lại') -ge 0 -and $t.IndexOf('mạng đứt; chạy fcode move copy lại') -lt $t.LastIndexOf($Rerun)) "the net-drop text comes before the sentence: $t"
+  Reset-World; Fx-Planned; Add-Fault -M old -Key '-c\.init-old$' -Mode down
+  [void](Do-Copy 1); EndsBareRerun
+  Reset-World; Fx-Planned; Add-Fault -M new -Key '-c\.transfer\.1$' -Rc 1
+  [void](Do-Copy 1); NoText $Rerun
+}
+T 'L.no-answer-check-plan: check, plan and the 0c check-only that get no answer from old (no GATE_EXIT, or no facts / key) end with the re-run sentence, exit 1 (R10-INT-31)' {
+  Add-Fault -M old -Key 'plan:check' -Mode noexit; $r = Run-Move @('check'); Eq $r.Code 1 "check exit ($($r.Text))"; EndsRerun "máy '$OldAlias' không trả lời khi kiểm tra (mã 0)."
+  Reset-World; Add-Fault -M old -Key '^script:facts$' -Rc 255 -Out @(); $r = Run-Move @('check'); Eq $r.Code 1 "check, first contact lost ($($r.Text))"; EndsRerun "máy '$OldAlias' không trả lời khi nối (mã 255)."
+  Reset-World; Add-Fault -M old -Key '^script:facts$' -Rc 255 -Out @(); $r = Do-Plan -Want 1; EndsRerun "máy '$OldAlias' không trả lời khi đọc dữ kiện (mã 255)."
+  Reset-World; Add-Fault -M old -Key '^script:facts$' -Rc 255 -Out @() -Skip 1; $r = Do-Plan -Want -1; Ok ($r.Code -ne 0) "plan stops ($($r.Text))"; EndsRerun "máy '$OldAlias' không trả lời khi đọc dữ kiện (mã 255)."
+  Reset-World; Add-Fault -M old -Key 'plan:full' -Mode noexit; $r = Do-Plan -Want -1; Ok ($r.Code -ne 0) "plan stops ($($r.Text))"; EndsRerun "máy '$OldAlias' không trả lời khi lập manifest (mã 0)."
+  Reset-World; Fx-Copied; Add-Fault -M old -Key 'plan:check-only' -Mode noexit
+  [void](Do-Cutover 1); EndsRerun "máy '$OldAlias' không trả lời khi kiểm tra trước (mã 0)."; Eq (Sent 'old' '-x\.freeze$') 0 'nothing frozen (0c check-only)'
+}
+# ---- DECISION-r2 (R10-INT-31, the count-free rule): the re-run sentence ends a run exactly when it ends 1 after a machine did not answer ----
+function EndsWithRerunOnce {
+  Ok ("$(LastLine)".EndsWith($Rerun)) "the last line ends with the re-run sentence (output: $($script:Last.Text))"
+  Eq ([regex]::Matches($script:Last.Text, [regex]::Escape($Rerun)).Count) 1 'the re-run sentence once'
+}
+function Set-RebuildAddrs { foreach ($n in 'old', 'new') { $script:W[$n].MoveId.old_addr = $OldAddr; $script:W[$n].MoveId.new_addr = $NewAddr } }
+# one fixture per verb's normal row (a refused row is never a fixture): Setup runs after Reset-World, Run is the verb
+$SweepFx = [ordered]@{
+  'check'        = @{ Setup = { };                                                                    Run = { Run-Move @('check') } }
+  'plan'         = @{ Setup = { };                                                                    Run = { Do-Plan -Want -1 } }
+  'copy-first'   = @{ Setup = { Fx-Planned };                                                         Run = { Run-Move @('copy') } }
+  'copy-refresh' = @{ Setup = { Fx-Copied };                                                          Run = { Run-Move @('copy') } }
+  'cutover'      = @{ Setup = { Fx-Copied };                                                          Run = { Ans 'có'; Run-Move @('cutover') } }
+  'carry-resume' = @{ Setup = { Start-Carry };                                                        Run = { Ans 'có'; Run-Move @('cutover') } }
+  'back'         = @{ Setup = { Fx-Cut };                                                             Run = { Ans 'YES'; Run-Move @('back') } }
+  'finish'       = @{ Setup = { Fx-Cut };                                                             Run = { Ans 'YES'; Run-Move @('finish') } }
+  'abort'        = @{ Setup = { Fx-Copied };                                                          Run = { Ans 'có'; Run-Move @('abort') } }
+  'rebuild'      = @{ Setup = { Fx-Copied; [IO.File]::Delete((StatePath)); Set-RebuildAddrs };        Run = { Run-Move @('status', '--rebuild', $OldAlias, $NewAlias) } }
+}
+T 'L.no-answer-sweep: for every verb row, every machine and every position k at which the machine goes down for good (k = number of consults answered first): exit 1 ends with the re-run sentence once as the last line; exit 0, 10, 65, 70 and 75 never carry it; no other exit; no contract violation (R10-INT-31, DECISION-r2)' {
+  $n = 0; $bad = New-Object Collections.ArrayList
+  foreach ($fx in $SweepFx.Keys) { foreach ($m in 'old', 'new') {
+    for ($k = 0; $k -le 400; $k++) {
+      Reset-World; & $SweepFx[$fx].Setup
+      Add-Fault -M $m -Key '.' -Mode down -N -1 -Skip $k
+      $fault = $script:W.Faults[$script:W.Faults.Count - 1]
+      $r = & $SweepFx[$fx].Run; $n++
+      $tag = "[$fx, $m down from consult $k]"
+      if ($script:W.Runaway) { [void]$bad.Add("$tag runaway: $($script:W.Runaway)") }
+      if ($script:W.Violations.Count) { [void]$bad.Add("$tag contract violations: $(@($script:W.Violations | Select-Object -First 3) -join ' ; ')") }
+      $cnt = [regex]::Matches($r.Text, [regex]::Escape($Rerun)).Count
+      if ($r.Code -eq 1) {
+        if (-not "$(LastLine)".EndsWith($Rerun) -or $cnt -ne 1) { [void]$bad.Add("$tag exit 1 without the sentence once as the last line (sentences $cnt; last line: $(LastLine))") }
+      } elseif ($r.Code -in 0, 10, 65, 70, 75) {
+        if ($cnt -ne 0) { [void]$bad.Add("$tag exit $($r.Code) carries the re-run sentence (last line: $(LastLine))") }
+      } else { [void]$bad.Add("$tag exit $($r.Code) is not one of 0, 1, 10, 65, 70, 75 (last line: $(LastLine))") }
+      if ($fault.Seen -le $k) { break }   # the machine was consulted at most k times: the fault never fired, the next k is the same run
+    }
+  } }
+  Ok ($bad.Count -eq 0) "$($bad.Count) of $n sweep runs fail: $(@($bad | Select-Object -First 12) -join ' || ')"
+  Ok ($n -gt 100) "the sweep ran ($n runs)"
+}
+T 'L.no-answer-copy-bootstrap-key: new dropped at copy (2) bootstrap key ends exit 1 with the bare re-run sentence last, no c.init-old (R10-INT-31, L11)' {
+  Fx-Planned; Add-Fault -M new -Key '^script:bootstrap key$' -Mode down -N -1
+  [void](Do-Copy 1); EndsBareRerun; Eq (SentAny '-c\.init-old') 0 'no c.init-old'
+}
+T 'L.no-answer-rebuild: status --rebuild with a machine (or the Reach-Old re-read) that does not answer ends with the B25 line "khi đọc lại trạng thái", exit 1, nothing written; old facts lost at the push scan end with the B25 line, no trailer (R10-INT-31, L12, L13)' {
+  foreach ($m in @(@('old', $OldAlias), @('new', $NewAlias))) {
+    Reset-World; Fx-Copied; [IO.File]::Delete((StatePath)); Set-RebuildAddrs; Add-Fault -M $m[0] -Key '^script:rebuild' -Mode down -N -1
+    $r = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $r.Code 1 "[$($m[0])] exit ($($r.Text))"
+    EndsRerun "máy '$($m[1])' không trả lời khi đọc lại trạng thái (mã 255)."; Ok (-not (Test-Path -LiteralPath (StatePath))) "[$($m[0])] nothing written"
+  }
+  Reset-World; Fx-Cut; [IO.File]::Delete((StatePath)); Set-RebuildAddrs   # after the step-11 swap the old alias reaches the machine new: its first read answers role=new, the re-read goes to old through Reach-Old
+  Add-Fault -M old -Key '^script:rebuild' -Mode down -N -1
+  $r = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $r.Code 1 "Reach-Old re-read exit ($($r.Text))"
+  EndsRerun "máy '$OldAlias' không trả lời khi đọc lại trạng thái (mã 255)."; Ok (-not (Test-Path -LiteralPath (StatePath))) 'Reach-Old: nothing written'
+  Reset-World; Fx-Copied; [IO.File]::Delete((StatePath)); Set-RebuildAddrs; Add-Fault -M old -Key '^script:facts$' -Mode down -N -1
+  $r = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $r.Code 1 "push scan exit ($($r.Text))"
+  EndsRerun "máy '$OldAlias' không trả lời khi đọc dữ kiện (mã 255)."; NoText 'không quét lại được repo'; Ok (-not (Test-Path -LiteralPath (StatePath))) 'push scan: nothing written'
+}
+T 'L.no-answer-chore0: the pre-rule chore 0 whose call is lost (the call itself, or its one status read) ends exit 1 with the re-run sentence last, once (R10-INT-31, L14)' {
+  foreach ($shape in 1, 2) {
+    Reset-World; Fx-Cut; [void](Patch-St @{ enabled = $false })
+    if ($shape -eq 1) { Add-Fault -M new -Key '^fwd-1-x\.enable\.2$' -Mode down }
+    else { Add-Fault -M new -Key '^fwd-1-x\.enable\.2$' -Mode noexit -Rc 0; Add-Fault -M new -Key '^status$' -Mode down -N 1 -Skip 1 }
+    $r = Run-Move @('cutover'); Eq $r.Code 1 "[shape $shape] exit ($($r.Text))"; HasText "lỗi: chưa bật lại được máy đang phục vụ ('$NewAlias'); chạy lại lệnh vừa rồi để sửa."; EndsBareRerun; Eq (Get-St).enabled $false "[shape $shape] chore 0 not done"
+  }
+}
+T 'L.no-answer-chore0-in-run: a chore 0 lost inside a cutover (step 10) ends with the generic line, "chạy lại fcode move cutover", then the bare re-run sentence last; inside a carry-back the return-to-old text comes first (R10-INT-31, RV10h3-1)' {
+  $generic = "lỗi: chưa bật lại được máy đang phục vụ ('$NewAlias'); chạy lại lệnh vừa rồi để sửa."
+  Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.enable\.1$' -Mode down; Ans 'có'
+  $r = Run-Move @('cutover'); Eq $r.Code 1 "cutover exit ($($r.Text))"; EndsBareRerun; $t = $r.Text
+  Ok ($t.IndexOf($generic) -ge 0 -and $t.IndexOf($generic) -lt $t.IndexOf('chạy lại fcode move cutover') -and $t.IndexOf('chạy lại fcode move cutover') -lt $t.LastIndexOf($Rerun)) "generic line, then the cutover-again text, then the sentence: $t"
+  Reset-World; Start-Carry; Add-Fault -M old -Key '^back-2-x\.enable\.1$' -Mode down; Ans 'có'
+  $r = Run-Move @('cutover'); Eq $r.Code 1 "carry-back exit ($($r.Text))"; EndsBareRerun; $t = $r.Text
+  $g2 = "lỗi: chưa bật lại được máy đang phục vụ ('$OldAlias'); chạy lại lệnh vừa rồi để sửa."
+  Ok ($t.IndexOf($g2) -ge 0 -and $t.IndexOf($g2) -lt $t.IndexOf('Đã quay về máy cũ; máy cũ đang phục vụ.') -and $t.IndexOf('Đã quay về máy cũ; máy cũ đang phục vụ.') -lt $t.IndexOf('chạy lại fcode move cutover') -and $t.IndexOf('chạy lại fcode move cutover') -lt $t.LastIndexOf($Rerun)) "generic line, return-to-old, cutover-again, sentence: $t"
+}
+T 'L.no-answer-finish-health: finish whose health read of new does not answer ends exit 1 with the B25 line "khi kiểm tra sức khỏe", no f.* call; a Known hold_active mismatch stays the health refusal without the sentence (R10-INT-31, L15)' {
+  Fx-Cut; Add-Fault -M new -Key '^status$' -Mode down -N -1 -Skip 1; Ans 'YES'
+  $r = Run-Move @('finish'); Eq $r.Code 1 "exit ($($r.Text))"; EndsRerun "máy '$NewAlias' không trả lời khi kiểm tra sức khỏe (mã 255)."; NoText 'Kiểm tra sức khỏe không đạt'; Eq (SentAny '-f\.(old|new)$') 0 'no f.* call'
+  Reset-World; Fx-Cut; $W.new.Active = 1; Ans 'YES'
+  $r = Run-Move @('finish'); Eq $r.Code 1 "mismatch exit ($($r.Text))"; HasText 'Kiểm tra sức khỏe không đạt'; NoText $Rerun; Eq (SentAny '-f\.(old|new)$') 0 'no f.* call'
+}
+T 'L.no-answer-carry-writeahead: a carry-back whose write-ahead agreement check finds old silent ends exit 1 with the B25 line last; a definite b.init-new failure at the write-ahead stays exit 70 (R10-INT-31, L16)' {
+  Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.health$' -Rc 69 -Out @('MOVE item app.service kind=unit state=failed ActiveState=failed') -Do { Add-Fault -M old -Key '^status$' -Mode down -N -1 }
+  Ans 'có'; $r = Run-Move @('cutover'); Eq $r.Code 1 "exit ($($r.Text))"; EndsRerun "máy '$OldAlias' không trả lời khi đọc status (mã 255)."
+  Reset-World; Start-Carry; Add-Fault -M new -Key '^back-2-b\.init-new$' -Rc 1   # a definite failure at the write-ahead: no no-answer, so exit 70 and no sentence
+  Ans 'có'; $r = Run-Move @('cutover'); Eq $r.Code 70 "definite b.init-new failure ($($r.Text))"; NoText $Rerun
+}
+T 'L.no-answer-carry-binit: a carry-back whose b.init-old is lost asks Q-newlost with no re-run sentence before it: exit 70 without an answer, 10 with YES (R10-INT-31, L17)' {
+  $hook = { Add-Fault -M old -Key '^back-2-b\.init-old$' -Rc 0 -Do { $W.new.Up = $false } }
+  Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.health$' -Rc 69 -Out @('MOVE item app.service kind=unit state=failed ActiveState=failed') -Do $hook
+  Ans 'có'; $r = Run-Move @('cutover'); Eq $r.Code 70 "no answer to Q-newlost ($($r.Text))"; HasText 'Máy mới không trả lời. Trước khi trả lời'; NoText $Rerun
+  Reset-World; Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.health$' -Rc 69 -Out @('MOVE item app.service kind=unit state=failed ActiveState=failed') -Do $hook
+  Ans 'có', 'YES'; $r = Run-Move @('cutover'); Eq $r.Code 10 "Q-newlost YES ($($r.Text))"; NoText $Rerun
+}
+T 'L.no-answer-back-er19: a manual back whose x.freeze outcome stays unknown ends the E-R19 return with exit 1, "Chuyển ngược không xong", then the bare re-run sentence last; a definite x.freeze failure has no sentence (R10-INT-31, PR4)' {
+  Fx-Cut; Add-Fault -M new -Key '^back-2-x\.freeze$' -Mode noexit -Rc 0; Add-Fault -M new -Key '^status$' -Mode down -N 1 -Skip 2; Ans 'YES'
+  $r = Run-Move @('back'); Eq $r.Code 1 "exit ($($r.Text))"; EndsBareRerun; HasText 'Chuyển ngược không xong'
+  Ok ($script:Last.Text.IndexOf('Chuyển ngược không xong') -lt $script:Last.Text.LastIndexOf($Rerun)) 'the sentence follows the E-R19 text'
+  Reset-World; Fx-Cut; Add-Fault -M new -Key '^back-2-x\.freeze$' -Rc 1; Ans 'YES'
+  $r = Run-Move @('back'); Eq $r.Code 1 "definite failure exit ($($r.Text))"; NoText $Rerun
+}
+T 'L.status-known-not-ok: a machine that answers status with GATE_EXIT 65 is shown with its label and ends by that code, never as a no-answer: the agreement check, the 0c gate-id read; with old Known-not-Ok and new unknown at 0c the B25 line names new (R10-INT-31 item 10, PR1, RV10h-5)' {
+  Fx-Copied; $W.old.NoMove = $true; Ans 'có'
+  $r = Run-Move @('cutover'); Eq $r.Code 65 "agreement exit ($($r.Text))"; HasText 'Máy cũ chưa cài bản gate có lệnh chuyển máy'; NoText $Rerun
+  Reset-World; Fx-Copied; Add-Fault -M old -Key '^status$' -Mode nomove -Skip 1; Ans 'có'
+  $r = Run-Move @('cutover'); Eq $r.Code 65 "0c exit ($($r.Text))"; HasText 'Máy cũ chưa cài bản gate có lệnh chuyển máy'; NoText $Rerun; Eq (Sent 'old' '-x\.freeze$') 0 'nothing frozen'
+  Reset-World; Fx-Copied; Add-Fault -M old -Key '^status$' -Mode nomove -Skip 1; Add-Fault -M new -Key '^status$' -Mode down -N -1 -Skip 1; Ans 'có'
+  $r = Run-Move @('cutover'); Eq $r.Code 1 "old Known-not-Ok and new unknown ($($r.Text))"; EndsRerun "máy '$NewAlias' không trả lời khi đọc status (mã 255)."; Eq (Sent 'old' '-x\.freeze$') 0 'nothing frozen'
+}
+T 'L.facts-rc1-plain: old facts that answered with rc 1 (no MOVE facts line, no transport loss) are "không đọc được dữ kiện máy cũ" with exit 1 and no re-run sentence: plan, check, rebuild push scan (R10-INT-31 item 11, RV10h-4)' {
+  Add-Fault -M old -Key '^script:facts$' -Rc 1 -Out @(); $r = Do-Plan -Want 1; HasText "không đọc được dữ kiện máy cũ '$OldAlias' (mã 1)."; NoText $Rerun
+  Reset-World; Add-Fault -M old -Key '^script:facts$' -Rc 1 -Out @(); $r = Run-Move @('check'); Eq $r.Code 1 "check exit ($($r.Text))"; HasText "không đọc được dữ kiện máy cũ '$OldAlias' (mã 1)."; NoText $Rerun
+  Reset-World; Fx-Copied; [IO.File]::Delete((StatePath)); Set-RebuildAddrs; Add-Fault -M old -Key '^script:facts$' -Rc 1 -Out @()
+  $r = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $r.Code 1 "rebuild exit ($($r.Text))"; HasText "không đọc được dữ kiện máy cũ '$OldAlias' (mã 1)."; NoText $Rerun
+}
+T 'L.no-answer-reach: the reach script lost at plan step 3b and at 0c (ssh 255) is the B25 line "khi kiểm tra kết nối ra ngoài", exit 1, nothing written / nothing frozen; a refused or silent connect (rc 1) is warn egress and the run goes on (R10-INT-31 item 12, O1)' {
+  $W.Mf.egress = @([ordered]@{ addr = '192.0.2.50'; port = 443 }); Add-Fault -M new -Key '^script:tcp$' -Mode down -N -1
+  $r = Do-Plan -Want 1; EndsRerun "máy '$NewAlias' không trả lời khi kiểm tra kết nối ra ngoài (mã 255)."; NothingWritten 'plan wrote nothing'
+  Reset-World; $W.Mf.egress = @([ordered]@{ addr = '192.0.2.50'; port = 443 }); Fx-Copied; Add-Fault -M new -Key '^script:tcp$' -Mode down -N -1; Ans 'có'
+  $r = Run-Move @('cutover'); Eq $r.Code 1 "0c exit ($($r.Text))"; EndsRerun "máy '$NewAlias' không trả lời khi kiểm tra kết nối ra ngoài (mã 255)."; Eq (Sent 'old' '-x\.freeze$') 0 'nothing frozen'
+  Reset-World; $W.Mf.egress = @([ordered]@{ addr = '192.0.2.50'; port = 443 }); $W.TcpFail['192.0.2.50:443'] = $true
+  [void](Do-Plan -Want 0); HasText 'Máy mới không kết nối ra được địa chỉ này'; NoText $Rerun; [void](Do-Copy 0); [void](Do-Cutover 0); HasText 'Máy mới không kết nối ra được địa chỉ này'; NoText $Rerun
+}
+T 'L.no-answer-never-at-skip: a verb that skips a silent new and then refuses or fails for its own reason has no re-run sentence (R10-INT-31, PR7, PR8)' {
+  Fx-Planned; $W.new.Up = $false; Ans 'có'; $r = Run-Move @('cutover'); Eq $r.Code 1 "PR7 exit ($($r.Text))"; HasText 'chạy copy trước'; NoText $Rerun
+  Reset-World; Fx-Copied; $W.new.Up = $false; Add-Fault -M old -Key '\.a\.old$|a\.old$' -Rc 1; Ans 'có'
+  $r = Run-Move @('abort'); Ok ($r.Code -ne 0) "PR8 exit ($($r.Text))"; NoText $Rerun
+}
+T 'L.no-answer-never-after-recovery: a carry-back that resolved a lost x.health and then ends 1 or 70 for its own reason carries no re-run sentence; the carry-back start clears the mark (R10-INT-31 item B, O2)' {
+  $lost = { Add-Fault -M new -Key '^status$' -Mode down -N 1 }
+  Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.health$' -Rc 69 -Mode noexit -Do $lost; Add-Fault -M new -Key '^back-2-b\.init-new$' -Rc 1
+  Ans 'có'; $r = Run-Move @('cutover'); Eq $r.Code 70 "A: a definite b.init-new failure ($($r.Text))"; NoText $Rerun
+  Reset-World; Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.health$' -Rc 69 -Mode noexit -Do $lost; Add-Fault -M old -Key '^back-2-x\.enable\.1$' -Rc 1
+  Ans 'có'; $r = Run-Move @('cutover'); Eq $r.Code 1 "B: the back's chore 0 fails ($($r.Text))"; Eq "$(LastLine)" 'chạy lại fcode move cutover' 'B: the last line'; NoText $Rerun
+}
+T 'L.pre-egress-timeout: the reach script returns 1 for a connect that does not finish (timeout 124) and 1 for a refused one, 0 for a connect that works; 124 and 255 come only from the transport (R10-INT-31 item A, O1)' {
+  $fr = New-FcmRoot
+  foreach ($c in @(@(124, 1), @(1, 1), @(0, 0))) {
+    $r = Run-Bash (Get-MoveTcpScript) @('192.0.2.50', '443') $fr (New-Stubs @{ timeout = "exit $($c[0])" }); Eq $r.Code $c[1] "timeout stub rc $($c[0]) -> script rc ($($r.Text))"
+  }
+} -NeedsBash
 # ============================== finish (D.7) ==============================
 T 'L.finish-health: finish refuses (exit 1) when new is not healthy now (D.7: new''s status shows fewer active holds than the non-follower holds of the start set); no f.* call' {
   Fx-Cut; $W.new.Active = 1; Ans 'YES'; $r = Run-Move @('finish'); Eq $r.Code 1 'exit'; Eq (SentAny '-f\.(old|new)$') 0 'no finish call'
@@ -2204,7 +2457,7 @@ T 'L.resume-table: machines disagree on (dir, attempt), copy with new_lost set: 
   $r = Run-Move @('copy'); Eq $r.Code 0 "copy ($($r.Text))"; Eq (@(LogNow | Where-Object { $_ -match ' mismatch$' }).Count) 0 "a call before the re-init: $(LogNow)"
 }
 T 'L.abort-new-unreachable: new answers again after a carry-back''s Q-newlost (its move-id lags the state): abort runs (exit 0)' {
-  Start-Carry; Add-Fault -M new -Key '^back-2-b\.init-new$' -Mode down; Ans 'có'; $r1 = Run-Move @('cutover')
+  Start-Carry; Add-Fault -M new -Key '^back-2-b\.init-new$' -Mode down; Ans 'có'; $r1 = Run-Move @('cutover'); Eq $r1.Code 1 "r1 exit ($($r1.Text))"; EndsBareRerun   # R10-INT-31: the lost b.init-new ends the carry-back with the bare sentence last
   Ans 'YES'; $r2 = Run-Move @('cutover'); Eq $r2.Code 10 "Q-newlost after power-off (first run $($r1.Code): $($r1.Text) || second: $($r2.Text))"; Eq (Get-St).new_lost $true 'new_lost'
   $script:W.new.Up = $true; Ans 'có'; $r = Run-Move @('abort'); Eq $r.Code 0 "abort once new answers again ($($r.Text)) log: $(LogNow)"
 }
