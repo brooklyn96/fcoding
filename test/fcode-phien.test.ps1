@@ -4,8 +4,9 @@
 # ~/.omp and the real box are never touched. Everything lives in a temp folder that is removed at the end.
 #   FCODE_TEST_BOX=1   also run one end-to-end pass on the real Oracle box over `ssh oracle` (throwaway HOME there; laptop side = temp USERPROFILE).
 #   FCODE_TEST_ONLY=<regex>   run only the tests whose name matches (used for the mutant runs)
-#   FCODE_TEST_CLIPBOARD=1   Windows only: also run the clipboard server tests that read, replace or hold the real clipboard (204 / 200 / 413 / 500). Every clipboard
-#   format is saved first and put back afterwards; without this variable the clipboard is never touched (those tests print SKIP).
+#   FCODE_TEST_CLIPBOARD=1   Windows only: also run the clipboard server tests that replace or hold the real clipboard (204 / 200 / 413 / 500, cache and change). Every clipboard
+#   format is saved first and put back afterwards; without this variable the clipboard is never changed or held (those tests print SKIP). The server child itself only READS it
+#   while it runs (its idle sequence-number poll and pre-encode, see "clip server speed"); the stub-clipboard tests of the same name need neither Windows nor the variable.
 # Test-only overrides of fcode.ps1 used by the 1.3.3 tests (`phien --nhanh`, `moc`): FCODE_PHIEN_CAP_SEC (the 20 s cap of --nhanh), FCODE_DOCUMENTS
 # (stands for [Environment]::GetFolderPath('MyDocuments'), where `fcode moc` keeps the PowerShell profiles), FCODE_PHIEN_LOCK (the lock name),
 # FCODE_MOC_DELAY (read by `fcode phien <p> --nhanh --nen`, the hook's run after the agent ends: seconds it waits first; 35 by default, the tests use 4).
@@ -3921,9 +3922,9 @@ T 'clip box script text: the attach hint line, the drag binding and the Alt+V bi
   Ok ($iu -ge 0 -and $ie -gt $iu) 'the token is unset before exec tmux (tmux and the agents never inherit it)'
   Ok ($FcodeSh -match 'kéo chuột' -and $FcodeSh -match 'Alt\+V' -and $FcodeSh -match 'Ctrl\+V') 'the hint line'
 }
-# ---- the clipboard server (Start-FcodeClipServer): plain HTTP over loopback TCP. Start / stop, 403 / 404 and the deadline tests need no clipboard.
-# 204 / 200 / 413 / 500 read or hold the real Windows clipboard (System.Windows.Forms, STA): they run on Windows only AND only with FCODE_TEST_CLIPBOARD=1 (the owner's
-# clipboard is never touched otherwise); then every clipboard format is saved first and put back in finally (Save-TestClip / Restore-TestClip).
+# ---- the clipboard server (Start-FcodeClipServer): plain HTTP over loopback TCP. Start / stop, 403 / 404, warm-up and the deadline tests need no clipboard change.
+# 204 / 200 / 413 / 500 and the cache / change tests replace or hold the real Windows clipboard (System.Windows.Forms, STA): they run on Windows only AND only with FCODE_TEST_CLIPBOARD=1 (the owner's
+# clipboard is never changed otherwise); then every clipboard format is saved first and put back in finally (Save-TestClip / Restore-TestClip).
 $IsWinHost = [Environment]::OSVersion.Platform -eq 'Win32NT'
 function Invoke-ClipReq([int]$Port, [string]$Method, [string]$Path, [string]$Token) {
   $c = New-Object Net.Sockets.TcpClient('127.0.0.1', $Port)
@@ -3943,9 +3944,9 @@ function Invoke-Sta([scriptblock]$Sb, [object[]]$ArgList = @()) {   # run $Sb in
   $ps = [powershell]::Create(); $ps.Runspace = $rs
   try { [void]$ps.AddScript($Sb.ToString()); foreach ($a in $ArgList) { [void]$ps.AddArgument($a) }; $ps.Invoke() } finally { $ps.Dispose(); $rs.Dispose() }
 }
-function Set-TestClipImage([int]$W, [int]$H, [bool]$Noise) {   # a test picture on the clipboard: a small colour grid, or incompressible noise (its PNG is over 10 MB)
+function Set-TestClipImage([int]$W, [int]$H, [bool]$Noise, [string]$Text = '') {   # a test picture on the clipboard: a small colour grid, or incompressible noise (its PNG is over 10 MB); $Text: also a text format next to it (like Excel / Office copies)
   [void](Invoke-Sta {
-    param($W, $H, $Noise)
+    param($W, $H, $Noise, $Text)
     Add-Type -AssemblyName System.Windows.Forms, System.Drawing
     $bmp = New-Object System.Drawing.Bitmap $W, $H, ([System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
     if ($Noise) {
@@ -3953,8 +3954,9 @@ function Set-TestClipImage([int]$W, [int]$H, [bool]$Noise) {   # a test picture 
       $buf = New-Object byte[] ($d.Stride * $H); (New-Object Random 7).NextBytes($buf)
       [Runtime.InteropServices.Marshal]::Copy($buf, 0, $d.Scan0, $buf.Length); $bmp.UnlockBits($d)
     } else { for ($y = 0; $y -lt $H; $y++) { for ($x = 0; $x -lt $W; $x++) { $bmp.SetPixel($x, $y, [System.Drawing.Color]::FromArgb($x * 40, $y * 60, 200)) } } }
-    [System.Windows.Forms.Clipboard]::SetDataObject($bmp, $true, 10, 100)
-  } @($W, $H, $Noise))
+    if ($Text) { $do = New-Object System.Windows.Forms.DataObject; $do.SetImage($bmp); $do.SetText($Text); [System.Windows.Forms.Clipboard]::SetDataObject($do, $true, 10, 100) }
+    else { [System.Windows.Forms.Clipboard]::SetDataObject($bmp, $true, 10, 100) }
+  } @($W, $H, $Noise, $Text))
 }
 function Test-ClipOptIn {   # $true when a clipboard test may run; prints the SKIP line otherwise
   if (-not $IsWinHost) { Write-Host 'SKIP (Windows only: clipboard)'; return $false }
@@ -4119,6 +4121,217 @@ T 'clip server: a PNG over 10485760 bytes is 413; windows only; FCODE_TEST_CLIPB
     Eq $r.Code 413 'too big'; Ok ($r.Body.Length -lt 10485760) 'the oversize picture is not sent'
   } finally { Stop-FcodeClipServer $s; if ($keep) { Restore-TestClip $keep } }
 }
+# ---- speed (contract Amendment 4, items 16-18): warm-up before the first answer; one cached PNG, pre-encoded while idle ONLY for an image-only clipboard, served while the clipboard sequence number is unchanged.
+# The child adds a test-only reply header `X-Fcode-Debug: encodes=<n> warm=<0|1>` ONLY when FCODE_CLIP_DEBUG=1 is in its environment (never in production).
+function Start-ClipServerDebug { $env:FCODE_CLIP_DEBUG = '1'; try { Start-FcodeClipServer } finally { Remove-Item Env:\FCODE_CLIP_DEBUG -ErrorAction SilentlyContinue } }
+function Get-ClipDbg($R) {
+  $m = [regex]::Match($R.Head, '(?im)^X-Fcode-Debug: encodes=(\d+) warm=([01])\s*$')
+  Ok $m.Success ('the debug header is missing; head: ' + $R.Head)
+  [pscustomobject]@{ Encodes = [int]$m.Groups[1].Value; Warm = [int]$m.Groups[2].Value }
+}
+function Get-PngSize([byte[]]$B) { (([int]$B[16] -shl 24) + ([int]$B[17] -shl 16) + ([int]$B[18] -shl 8) + $B[19]).ToString() + 'x' + (([int]$B[20] -shl 24) + ([int]$B[21] -shl 16) + ([int]$B[22] -shl 8) + $B[23]).ToString() }
+T 'clip server speed: the warm-up (WinForms, Drawing, one PNG encode, the sequence-number call) is finished before the first answer: the very first reply, sent at once, carries warm=1; windows only' {
+  if (-not $IsWinHost) { Write-Host 'SKIP (Windows only: the warm-up loads System.Windows.Forms)'; return }
+  $s = Start-ClipServerDebug
+  try {
+    $r = Invoke-ClipReq $s.Port 'GET' '/image' ''   # sent while the child is still warming up: it waits in the backlog, it does not fail
+    Eq $r.Code 403 'no token'
+    Eq (Get-ClipDbg $r).Warm 1 'the first answer came after the warm-up'
+    Eq (Get-ClipDbg (Invoke-ClipReq $s.Port 'GET' '/other' '')).Warm 1 'and so does the next'
+  } finally { Stop-FcodeClipServer $s }
+}
+T 'clip server speed: an image already on the clipboard is pre-encoded while idle (before any authorised request) and a second request with the clipboard unchanged returns the cached bytes with no new encode; windows only; FCODE_TEST_CLIPBOARD=1' {
+  if (-not (Test-ClipOptIn)) { return }
+  $keep = $null; $s = $null
+  try {
+    $keep = Save-TestClip; $s = Start-ClipServerDebug
+    Set-TestClipImage 6 4 $false
+    Start-Sleep -Milliseconds 1500   # the idle poll (every 250 ms) sees the new sequence number and encodes
+    $pre = Get-ClipDbg (Invoke-ClipReq $s.Port 'GET' '/image' ('0' * 32))   # wrong token: nothing is read for it
+    Ok ($pre.Encodes -ge 1) ("encoded before any authorised request; encodes=" + $pre.Encodes)
+    $r1 = Invoke-ClipReq $s.Port 'GET' '/image' $s.Token; Eq $r1.Code 200 'first request'
+    $d1 = Get-ClipDbg $r1; Eq $d1.Encodes $pre.Encodes 'the first request used the pre-encoded copy'
+    $r2 = Invoke-ClipReq $s.Port 'GET' '/image' $s.Token; Eq $r2.Code 200 'second request'
+    Eq (Get-ClipDbg $r2).Encodes $d1.Encodes 'unchanged clipboard: no second encode'
+    Eq ([Convert]::ToBase64String($r2.Body)) ([Convert]::ToBase64String($r1.Body)) 'the same bytes'
+    Eq (Get-PngSize $r2.Body) '6x4' 'the picture'
+  } finally { Stop-FcodeClipServer $s; if ($keep) { Restore-TestClip $keep } }
+}
+T 'clip server speed: a clipboard change between two requests returns the NEW image (never the cached one); image then text is 204, then an image again is 200; windows only; FCODE_TEST_CLIPBOARD=1' {
+  if (-not (Test-ClipOptIn)) { return }
+  $keep = $null; $s = $null
+  try {
+    $keep = Save-TestClip; $s = Start-ClipServerDebug
+    $last = -1
+    foreach ($sz in @(@(6, 4), @(5, 3), @(4, 6), @(6, 4))) {
+      Set-TestClipImage $sz[0] $sz[1] $false   # asked at once: either the idle poll or the request itself encodes, never a stale copy
+      $r = Invoke-ClipReq $s.Port 'GET' '/image' $s.Token
+      Eq $r.Code 200 "image $($sz[0])x$($sz[1])"
+      Eq (Get-PngSize $r.Body) "$($sz[0])x$($sz[1])" 'the new image, not the cached one'
+      $e = (Get-ClipDbg $r).Encodes; Ok ($e -gt $last) "a new encode for the new image; encodes $last -> $e"; $last = $e
+    }
+    Set-TestClipText 'text now'
+    $r = Invoke-ClipReq $s.Port 'GET' '/image' $s.Token
+    Eq $r.Code 204 'image then text: no image'; Eq $r.Body.Length 0 'no body'
+    Eq (Invoke-ClipReq $s.Port 'GET' '/image' $s.Token).Code 204 'and it stays 204'
+    Set-TestClipImage 5 3 $false
+    $r = Invoke-ClipReq $s.Port 'GET' '/image' $s.Token
+    Eq $r.Code 200 'an image again'; Eq (Get-PngSize $r.Body) '5x3' 'the image after the text'
+  } finally { Stop-FcodeClipServer $s; if ($keep) { Restore-TestClip $keep } }
+}
+T 'clip server speed: an image copied together with text (Excel / Office style) is NOT pre-encoded while idle but Alt+V still returns it (encoded on demand); an image-only clipboard is pre-encoded; windows only; FCODE_TEST_CLIPBOARD=1' {
+  if (-not (Test-ClipOptIn)) { return }
+  $keep = $null; $s = $null
+  try {
+    $keep = Save-TestClip; $s = Start-ClipServerDebug
+    Set-TestClipText $null
+    Start-Sleep -Milliseconds 800
+    $e0 = (Get-ClipDbg (Invoke-ClipReq $s.Port 'GET' '/image' ('0' * 32))).Encodes   # wrong token: nothing is read for it
+    Set-TestClipImage 6 4 $false 'cells A1:B2'
+    Start-Sleep -Milliseconds 1500   # several idle polls
+    Eq (Get-ClipDbg (Invoke-ClipReq $s.Port 'GET' '/image' ('0' * 32))).Encodes $e0 'image + text: the idle poll did not encode'
+    $r = Invoke-ClipReq $s.Port 'GET' '/image' $s.Token
+    Eq $r.Code 200 'Alt+V returns the image'; Eq (Get-PngSize $r.Body) '6x4' 'the picture'
+    Eq (Get-ClipDbg $r).Encodes ($e0 + 1) 'encoded on demand'
+    $r = Invoke-ClipReq $s.Port 'GET' '/image' $s.Token
+    Eq $r.Code 200 'again'; Eq (Get-ClipDbg $r).Encodes ($e0 + 1) 'the on-demand copy is cached: no second encode'
+    Set-TestClipImage 5 3 $false   # image only
+    Start-Sleep -Milliseconds 1500
+    Eq (Get-ClipDbg (Invoke-ClipReq $s.Port 'GET' '/image' ('0' * 32))).Encodes ($e0 + 2) 'an image-only clipboard is pre-encoded while idle'
+    $r = Invoke-ClipReq $s.Port 'GET' '/image' $s.Token
+    Eq $r.Code 200 'image-only request'; Eq (Get-PngSize $r.Body) '5x3' 'the new picture'; Eq (Get-ClipDbg $r).Encodes ($e0 + 2) 'used the pre-encoded copy'
+  } finally { Stop-FcodeClipServer $s; if ($keep) { Restore-TestClip $keep } }
+}
+# the same logic with a stub clipboard (a counted PNG + a sequence number) in a background runspace: no System.Windows.Forms, no real clipboard, any host
+function Start-ClipStub {
+  $st = [hashtable]::Synchronized(@{ Seq = [uint32]1; Png = $null; Text = $false; Busy = $false; Reads = 0 })
+  $l = New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback, 0); $l.Start()
+  $done = New-Object Threading.Tasks.TaskCompletionSource[int]
+  $tok = ('0' * 31) + 'a'
+  $rs = [runspacefactory]::CreateRunspace(); $rs.Open()
+  $ps = [powershell]::Create(); $ps.Runspace = $rs
+  [void]$ps.AddScript({
+    param($fn, $l, $tok, $task, $st)
+    Invoke-Expression ("function Invoke-FcodeClipServe {`n" + $fn + "`n}")
+    $getSeq = { $st.Seq }.GetNewClosure()
+    $readPng = { param([bool]$Idle); if ($Idle -and $st.Text) { return }; $st.Reads = $st.Reads + 1; if ($st.Busy) { throw 'busy' }; if ($st.Png) { , $st.Png } }.GetNewClosure()   # Text = a text format next to the image: the idle read is refused (not counted), a request read is not
+    Invoke-FcodeClipServe $l $tok $task $getSeq $readPng @{ Warm = $true }
+  }.ToString()).AddArgument(${function:Invoke-FcodeClipServe}.ToString()).AddArgument($l).AddArgument($tok).AddArgument($done.Task).AddArgument($st)
+  [pscustomobject]@{ St = $st; Port = ([Net.IPEndPoint]$l.LocalEndpoint).Port; Token = $tok; L = $l; Done = $done; Rs = $rs; Ps = $ps; Ar = $ps.BeginInvoke() }
+}
+function Stop-ClipStub($H) {
+  if (-not $H) { return }
+  try { $H.Done.SetResult(0) } catch { }
+  try { [void]$H.Ar.AsyncWaitHandle.WaitOne(5000) } catch { }
+  try { $H.L.Stop() } catch { }
+  try { $H.Ps.Dispose(); $H.Rs.Dispose() } catch { }
+}
+function New-StubPng([int]$N, [byte]$Tag) { $b = New-Object byte[] $N; $m = 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a; for ($i = 0; $i -lt 8; $i++) { $b[$i] = $m[$i] }; $b[8] = $Tag; $b }
+function Set-StubClip($H, $Png, [uint32]$Seq, [bool]$Text = $false) { $H.St.Png = $Png; $H.St.Text = $Text; $H.St.Seq = $Seq }   # content first, then the sequence number: the order a real clipboard change is seen in
+function Test-SameBytes([byte[]]$A, [byte[]]$B) { [Convert]::ToBase64String($A) -ceq [Convert]::ToBase64String($B) }
+T 'clip server speed (stub clipboard): the idle poll pre-encodes a changed image once, requests with an unchanged sequence number are answered from the cached bytes (no read, no encode), a text-only clipboard is looked at once per change' {
+  $h = Start-ClipStub
+  try {
+    $a = New-StubPng 2000 1
+    Set-StubClip $h $a 2
+    Start-Sleep -Milliseconds 1000
+    $reads = $h.St.Reads
+    Ok ($reads -ge 1) 'the idle poll read the clipboard before any request'
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token
+    Eq $r.Code 200 'first request'; Ok (Test-SameBytes $r.Body $a) 'the pre-encoded bytes'
+    Eq (Get-ClipDbg $r).Encodes 1 'one encode in total'
+    Eq $h.St.Reads $reads 'the first request read nothing: it used the pre-encoded copy'
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token
+    Eq $r.Code 200 'second request'; Ok (Test-SameBytes $r.Body $a) 'the cached bytes'
+    Eq (Get-ClipDbg $r).Encodes 1 'still one encode'
+    Eq $h.St.Reads $reads 'the second request read nothing either'
+    Start-Sleep -Milliseconds 800
+    Eq $h.St.Reads $reads 'an unchanged sequence number is not read again while idle'
+    Eq (Invoke-ClipReq $h.Port 'GET' '/image' '').Code 403 'a wrong token still reads nothing'
+    Eq $h.St.Reads $reads 'no read for a refused request'
+    Set-StubClip $h $null 3   # text only
+    Start-Sleep -Milliseconds 800
+    $reads = $h.St.Reads
+    Start-Sleep -Milliseconds 800
+    Eq $h.St.Reads $reads 'a text-only clipboard is looked at once per change, not every 250 ms'
+  } finally { Stop-ClipStub $h }
+}
+T 'clip server speed (stub clipboard): an image next to a text format is never pre-encoded by the idle poll, only on demand (then cached, and a changed image-only clipboard is pre-encoded again)' {
+  $h = Start-ClipStub
+  try {
+    $a = New-StubPng 2500 1; $b = New-StubPng 2500 2
+    Start-Sleep -Milliseconds 700   # the first idle poll (the empty starting clipboard) has run
+    $base = $h.St.Reads
+    Set-StubClip $h $a 2 $true   # image + text (Excel / Office style)
+    Start-Sleep -Milliseconds 1200
+    Eq $h.St.Reads $base 'the idle poll did not read (render) a clipboard that also holds text'
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' ('0' * 32)
+    Eq (Get-ClipDbg $r).Encodes 0 'no pre-encode'
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token
+    Eq $r.Code 200 'Alt+V still returns the image'; Ok (Test-SameBytes $r.Body $a) 'the image bytes'
+    Eq (Get-ClipDbg $r).Encodes 1 'encoded on demand'
+    $reads = $h.St.Reads
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token
+    Eq $r.Code 200 'second request'; Eq (Get-ClipDbg $r).Encodes 1 'answered from the cache: still one encode'
+    Eq $h.St.Reads $reads 'no read for the second request'
+    Set-StubClip $h $b 3 $false   # image only (a screenshot)
+    Start-Sleep -Milliseconds 1000
+    $pre = Get-ClipDbg (Invoke-ClipReq $h.Port 'GET' '/image' ('0' * 32))
+    Eq $pre.Encodes 2 'an image-only clipboard is pre-encoded while idle'
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token
+    Eq $r.Code 200 'image-only request'; Ok (Test-SameBytes $r.Body $b) 'the new image'; Eq (Get-ClipDbg $r).Encodes 2 'used the pre-encoded copy'
+  } finally { Stop-ClipStub $h }
+}
+T 'clip server speed (stub clipboard): a changed sequence number is never answered from the cache (busy clipboard: 500, not the old image); alternating images always come back as the latest; image -> text is 204 and drops the cache; sequence 0 (unknown) is never cached' {
+  $h = Start-ClipStub
+  try {
+    $a = New-StubPng 3000 1; $b = New-StubPng 3000 2
+    Set-StubClip $h $a 2
+    Start-Sleep -Milliseconds 800
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token; Eq $r.Code 200 'a'; Ok (Test-SameBytes $r.Body $a) 'image a'
+    $h.St.Busy = $true   # the idle poll can no longer read: the cache still holds a
+    Set-StubClip $h $b 3
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token
+    Eq $r.Code 500 'sequence changed and the clipboard is busy: 500 (the cached a is stale and not sent)'
+    $h.St.Busy = $false
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token; Eq $r.Code 200 'b'; Ok (Test-SameBytes $r.Body $b) 'image b once the clipboard is free'
+    $seq = 10
+    foreach ($x in $a, $b, $a, $b, $b, $a) {   # a request straight after each change: the poll may or may not have run first
+      $seq++; Set-StubClip $h $x ([uint32]$seq)
+      $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token
+      Eq $r.Code 200 "change $seq"; Ok (Test-SameBytes $r.Body $x) "change $seq returned the latest image"
+    }
+    $seq++; Set-StubClip $h $null ([uint32]$seq)
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token
+    Eq $r.Code 204 'image then text: 204'; Eq $r.Body.Length 0 'no body'
+    $h.St.Busy = $true
+    Eq (Invoke-ClipReq $h.Port 'GET' '/image' $h.Token).Code 500 'the cache was dropped: a busy clipboard is 500, the old image is not sent'
+    $h.St.Busy = $false
+    $seq++; Set-StubClip $h $a ([uint32]$seq)
+    Eq (Invoke-ClipReq $h.Port 'GET' '/image' $h.Token).Code 200 'an image again after the text'
+    Set-StubClip $h $a 0   # the sequence number is unknown: every request reads
+    Start-Sleep -Milliseconds 600
+    $e0 = (Get-ClipDbg (Invoke-ClipReq $h.Port 'GET' '/image' $h.Token)).Encodes
+    $e1 = (Get-ClipDbg (Invoke-ClipReq $h.Port 'GET' '/image' $h.Token)).Encodes
+    Eq $e1 ($e0 + 1) 'sequence 0: a new encode for every request'
+  } finally { Stop-ClipStub $h }
+}
+T 'clip server speed (stub clipboard): the 10485760 byte limit applies to the cached copy too: over it is 413 from the cache without a second encode and without the bytes in memory; exactly the limit is 200' {
+  $h = Start-ClipStub
+  try {
+    $big = New-StubPng 10485761 1
+    Set-StubClip $h $big 2
+    Start-Sleep -Milliseconds 1200
+    $reads = $h.St.Reads
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token; Eq $r.Code 413 'over the limit'; Eq $r.Body.Length 0 'no body'
+    Eq (Get-ClipDbg $r).Encodes 1 'one encode'
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token; Eq $r.Code 413 'over the limit again'; Eq (Get-ClipDbg $r).Encodes 1 'answered from the cache: no second encode'
+    Eq $h.St.Reads $reads 'no read for either request'
+    $ok = New-StubPng 10485760 2
+    Set-StubClip $h $ok 3
+    $r = Invoke-ClipReq $h.Port 'GET' '/image' $h.Token; Eq $r.Code 200 'exactly the limit'; Eq $r.Body.Length 10485760 'whole body'
+  } finally { Stop-ClipStub $h }
+}
 function Start-ClipHold {   # a second thread (own window) holds the clipboard open, like a clipboard manager would; nothing is written to it. Returns the handle for Stop-ClipHold
   $h = [pscustomobject]@{ Rel = (New-Object Threading.ManualResetEventSlim $false); Ready = (New-Object Threading.ManualResetEventSlim $false); St = [hashtable]::Synchronized(@{ Opened = $false }); Rs = $null; Ps = $null; Ar = $null }
   $h.Rs = [runspacefactory]::CreateRunspace(); $h.Rs.ApartmentState = 'STA'; $h.Rs.Open()
@@ -4148,6 +4361,7 @@ T 'clip server: a clipboard another program keeps open is 500 (after its retries
   $keep = $null; $s = $null; $hold = $null
   try {
     $keep = Save-TestClip; $s = Start-FcodeClipServer
+    Set-TestClipText 'busy test: text, so the server has no cached image to answer from while the clipboard is held'
     $hold = Start-ClipHold
     Ok ($hold.Ready.Wait(15000) -and $hold.St.Opened) 'the test thread opened the clipboard'
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -4168,6 +4382,7 @@ T 'clip server: stopping the server while it is inside a clipboard call that is 
   $keep = $null; $s = $null; $hold = $null; $sk = $null
   try {
     $keep = Save-TestClip; $s = Start-FcodeClipServer
+    Set-TestClipText 'blocked test: text, so the server has no cached image and must enter the clipboard call'
     $hold = Start-ClipHold
     Ok ($hold.Ready.Wait(15000) -and $hold.St.Opened) 'the test thread opened the clipboard'
     $sk = New-ClipSocket $s.Port   # a real request with the right token: the child enters the clipboard call and retries against the held clipboard

@@ -554,6 +554,10 @@ Khi bạn vào phiên bằng lệnh `fcode` trên laptop Windows, có ba thao t�
 - Máy công ty có phần mềm bảo mật (EDR, Windows Defender) chặn tiến trình `powershell.exe` chạy ẩn mà `fcode` bật để đọc clipboard: `fcode` vẫn vào phiên bình thường nhưng không có Alt+V (bấm thì hiện `Chưa nối clipboard laptop…`); kéo chuột chép chữ vẫn dùng được. Nhờ bộ phận IT cho phép, hoặc dùng laptop khác.
 - Sshd trên box không nhận biến `LC_*` (dòng `AcceptEnv` trong `/etc/ssh/sshd_config` không có `LC_*`; Ubuntu mặc định có): `fcode` không gửi được khóa phiên lên box nên Alt+V hiện `Chưa nối clipboard laptop…` dù laptop và box đều đã cập nhật. Nhờ người quản trị box thêm `AcceptEnv LANG LC_*` rồi nạp lại sshd.
 
+**Alt+V dán chậm hơn bình thường?**
+- Ảnh chép cùng lúc với chữ (chép ô trong Excel, Word, qua Remote Desktop, hoặc "Copy image" trong trình duyệt) không được `fcode` mã hóa sẵn như ảnh chụp màn hình (**Win+Shift+S**), nên bấm Alt+V lần đó chậm hơn một chút; dán vẫn đúng. Ảnh chụp màn hình thì mã hóa sẵn nên dán nhanh.
+- Máy chặn `csc.exe` (AppLocker hoặc phần mềm bảo mật): `fcode` không theo dõi được clipboard để mã hóa trước, nên mọi lần Alt+V đều chậm hơn nhưng vẫn dán được ảnh, không cần làm gì thêm.
+
 **Kéo chuột không chép được chữ?** Thường do console cũ (xem "Điều kiện"). Thử mở `fcode` trong Windows Terminal. Cách cũ vẫn dùng được: giữ **Shift** khi kéo để Windows Terminal tự bôi đen, rồi bấm **Ctrl+C** để chép (cách này chép thẳng bằng Windows Terminal, không qua box).
 
 **Một điều nhỏ cần biết:** trong omp, Claude Code hay Codex, kéo chuột để chép có thể làm chương trình thấy một cú bấm chuột mà không thấy thả ra (nó đang bôi đen theo cách riêng); bấm chuột một lần nữa là hết.

@@ -1483,6 +1483,8 @@ function Get-BareScript([string]$Arg) {
 # Tra loi (HTTP/1.0, mot yeu cau mot ket noi): sai phuong thuc hay duong dan 404; thieu / sai token 403; khong co anh 204; PNG qua 10485760 byte 413;
 # clipboard ban sau 3 lan thu 500; co anh 200 image/png. Moi ket noi co han 5 giay (doc dau yeu cau + tra loi); rieng than anh 200 (toi 10 MiB,
 # chi gui cho ben co token) han la "5 giay khong tien trien": dong ho chay lai moi khoi 64 KiB, de duong mang cham van chay duoc. Qua han thi dong ket noi.
+# Toc do (hop dong A4 muc 16-17): truoc khi nhan yeu cau dau tien tien trinh con nap WinForms / Drawing va ma hoa thu mot PNG 1x1 (khoi dong nguoi); luc ranh no
+# ma hoa truoc anh moi tren clipboard va giu mot ban (xem Invoke-FcodeClipServe). Con chi DOC clipboard, khong bao gio ghi.
 function New-FcodeHex([int]$Bytes) {
   $b = New-Object byte[] $Bytes
   $r = [Security.Cryptography.RandomNumberGenerator]::Create(); $r.GetBytes($b); $r.Dispose()
@@ -1492,20 +1494,42 @@ function New-FcodeHex([int]$Bytes) {
 function New-FcodeClipSock { '/tmp/fcode-clip-' + (New-FcodeHex 8) + '.sock' }
 # vong lap cua may chu: chay trong tien trinh CON (Start-FcodeClipServer gui NGUYEN van ban ham nay sang do), nen phai tu du, khong goi ham khac
 # $StdinTask = viec doc stdin cua tien trinh con: xong (cha dong ong / bi giet) thi thoat, de khong mo coi
+# $GetSeq = so thu tu clipboard (GetClipboardSequenceNumber, uint32; 0 / loi = khong biet); $ReadPng = doc clipboard: $null khi khong co anh, byte[] PNG khi co, nem loi khi clipboard ban.
+# $ReadPng nhan mot doi so: $true = luc ranh (chi ma hoa truoc khi clipboard co dinh dang anh va KHONG co dinh dang chu nao: kiem tra bang ContainsImage / ContainsText, khong
+# render; clipboard co ca chu (Excel, Office, RDP...) thi tra $null, chi ma hoa khi Alt+V hoi), $false = luc co yeu cau (luon ma hoa neu co anh).
+# Hai ham do duoc truyen vao (tien trinh con dung ban that, test dung ban gia). $Dbg khac $null (chi test dat FCODE_CLIP_DEBUG=1): moi tra loi them dong X-Fcode-Debug.
+# Ma hoa truoc: luc ranh (moi 250 ms) so thu tu doi va clipboard chi co anh thi ma hoa PNG ngay va giu DUNG MOT ban trong bo nho (so thu tu + byte; anh qua 10 MiB chi giu co "Big").
+# GET /image doc lai so thu tu: bang ban giu thi tra byte da giu, khac (hoac chua co) thi ma hoa luc do roi giu. Khong co anh thi bo ban giu (204). Khong ghi dia.
 function Invoke-FcodeClipServe {
-  param([System.Net.Sockets.TcpListener]$Listener, [string]$Token, $StdinTask)
+  param([System.Net.Sockets.TcpListener]$Listener, [string]$Token, $StdinTask, [scriptblock]$GetSeq, [scriptblock]$ReadPng, $Dbg = $null)
   $ErrorActionPreference = 'Continue'
   $max = 10485760
   $limit = 5000
   $enc = [Text.Encoding]::ASCII
   $reasons = @{ 200 = 'OK'; 204 = 'No Content'; 403 = 'Forbidden'; 404 = 'Not Found'; 413 = 'Payload Too Large'; 500 = 'Internal Server Error' }
   $acc = $null
+  $cache = $null; $polled = $null; $encodes = 0
   while ($true) {
     if ($StdinTask.IsCompleted) { break }
     $c = $null
     try {
       if (-not $acc) { $acc = $Listener.AcceptTcpClientAsync() }
-      if (-not $acc.Wait(500)) { continue }
+      if (-not $acc.Wait(250)) {
+        # ranh: ma hoa truoc neu clipboard doi (loi / ban thi bo qua, lan sau thu lai)
+        try {
+          $sq = & $GetSeq
+          if ($sq) { $sq = [uint32]$sq } else { $sq = $null }
+          if ($null -ne $sq -and $sq -ne $polled) {
+            $pp = & $ReadPng $true
+            if ($pp) { $encodes++ }
+            $big = $false
+            if ($pp -and $pp.Length -gt $max) { $big = $true; $pp = $null }
+            if ($pp -or $big) { $cache = @{ Seq = $sq; Png = $pp; Big = $big } } else { $cache = $null }
+            $polled = $sq
+          }
+        } catch { }
+        continue
+      }
       $c = $acc.Result; $acc = $null
     } catch { break }
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -1530,25 +1554,31 @@ function Invoke-FcodeClipServe {
         for ($i = 1; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '\AX-Fcode-Token:[ \t]*(.*?)[ \t]*\z') { $tok = $Matches[1]; break } }
         if ($Token.Length -eq 0 -or $tok -cne $Token) { $code = 403 }
         else {
-          $png = $null; $got = $false
-          for ($t = 0; $t -lt 3 -and -not $got; $t++) {   # the clipboard can be busy for a moment (another program holds it)
-            try {
-              if ([System.Windows.Forms.Clipboard]::ContainsImage()) {
-                $img = [System.Windows.Forms.Clipboard]::GetImage()
-                if ($img) { try { $ms = New-Object IO.MemoryStream; $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); $png = $ms.ToArray() } finally { $img.Dispose() } }
-              }
-              $got = $true
-            } catch { Start-Sleep -Milliseconds 150 }
+          # so thu tu doc TRUOC khi doc anh: clipboard doi giua chung thi ban giu mang so cu va lan sau bi coi la cu (khong bao gio tra anh cu)
+          $sq = $null; try { $sq = & $GetSeq; if ($sq) { $sq = [uint32]$sq } else { $sq = $null } } catch { $sq = $null }
+          $png = $null; $big = $false; $got = $false
+          if ($null -ne $sq -and $cache -and $cache.Seq -eq $sq) { $png = $cache.Png; $big = $cache.Big; $got = $true }
+          else {
+            for ($t = 0; $t -lt 3 -and -not $got; $t++) {   # the clipboard can be busy for a moment (another program holds it)
+              try { $png = & $ReadPng $false; $got = $true } catch { Start-Sleep -Milliseconds 150 }
+            }
+            if ($got) {
+              if ($png) { $encodes++ }
+              if ($png -and $png.Length -gt $max) { $big = $true; $png = $null }
+              if ($png -or $big) { $cache = @{ Seq = $sq; Png = $png; Big = $big } } else { $cache = $null }
+              if ($null -ne $sq) { $polled = $sq }
+            }
           }
           if (-not $got) { $code = 500 }
+          elseif ($big) { $code = 413 }
           elseif (-not $png) { $code = 204 }
-          elseif ($png.Length -gt $max) { $code = 413 }
           else { $code = 200; $type = 'image/png'; $body = $png }
         }
       }
       $h = "HTTP/1.0 $code $($reasons[$code])`r`n"
       if ($code -ne 204) { $len = 0; if ($body) { $len = $body.Length }; $h += "Content-Length: $len`r`n" }
       if ($type) { $h += "Content-Type: $type`r`n" }
+      if ($Dbg) { $h += "X-Fcode-Debug: encodes=$encodes warm=$([int][bool]$Dbg.Warm)`r`n" }
       $h += "Connection: close`r`n`r`n"
       $parts = @(, $enc.GetBytes($h))
       if ($body) { $parts += , $body }
@@ -1586,10 +1616,33 @@ if ($token.Length -ne 32) { exit 1 }
 $l = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
 $l.Start()
 [Console]::Out.WriteLine([string]$l.LocalEndpoint.Port); [Console]::Out.Flush()
-# the port line comes first (the parent waits for it); a WinForms / Drawing load that fails leaves the server up: the clipboard read then fails and every image request answers 500
-try { Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing } catch { }
+# the port line comes first (the parent waits for it); a request that arrives during the warm-up waits in the listener's backlog until the loop starts, it never fails.
+# warm-up: load WinForms / Drawing, JIT one PNG encode of a 1x1 bitmap, load the sequence-number P/Invoke and touch the clipboard read path once; a load that fails leaves the
+# server up: the clipboard read then fails and every image request answers 500
+$warm = $false
+try {
+  Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing
+  $wb = New-Object System.Drawing.Bitmap 1, 1
+  try { $wm = New-Object IO.MemoryStream; $wb.Save($wm, [System.Drawing.Imaging.ImageFormat]::Png) } finally { $wb.Dispose() }
+  Add-Type -Namespace FcodeClip -Name Native -MemberDefinition '[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();'
+  [void][FcodeClip.Native]::GetClipboardSequenceNumber()
+  try { [void][System.Windows.Forms.Clipboard]::ContainsImage() } catch { }
+  $warm = $true
+} catch { }
+$getSeq = { [FcodeClip.Native]::GetClipboardSequenceNumber() }
+$readPng = {   # $null: no image (or, with $Idle, not an image-only clipboard); byte[]: the PNG; throws when the clipboard is busy
+  param([bool]$Idle)
+  if (-not [System.Windows.Forms.Clipboard]::ContainsImage()) { return }
+  if ($Idle) {   # idle pre-encode: only an image-only clipboard (a screenshot); a text format next to the image means a source that renders on demand, so leave it to Alt+V
+    foreach ($f in [Enum]::GetValues([System.Windows.Forms.TextDataFormat])) { if ([System.Windows.Forms.Clipboard]::ContainsText($f)) { return } }
+  }
+  $img = [System.Windows.Forms.Clipboard]::GetImage()
+  if (-not $img) { return }
+  try { $ms = New-Object IO.MemoryStream; $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); , $ms.ToArray() } finally { $img.Dispose() }
+}
+$dbg = $null; if ($env:FCODE_CLIP_DEBUG -eq '1') { $dbg = @{ Warm = $warm } }   # tests only: a debug header (encode count, warm-up done) on every reply
 $buf = New-Object byte[] 64
-Invoke-FcodeClipServe $l $token ($in.ReadAsync($buf, 0, 64))
+Invoke-FcodeClipServe $l $token ($in.ReadAsync($buf, 0, 64)) $getSeq $readPng $dbg
 '@
     $psi = New-Object Diagnostics.ProcessStartInfo
     $psi.FileName = $Shell
