@@ -115,7 +115,7 @@ $LegacyRepo = 'brooklyn96/BD-Team-Project'
 function New-Machine([string]$Name, [string]$Addr, [string]$Key, [string]$Hn, [bool]$Serving) {
   @{ Name = $Name; Addr = $Addr; Key = $Key; Hostname = $Hn; Up = $true; HasGate = $Serving; NoMove = $false; Gate = $GateA
      MoveId = $null; Frozen = $false; Holds = $Holds; Active = $(if ($Serving) { $Holds } else { 0 }); Enabled = $Serving
-     Rec = @{}; Order = (New-Object Collections.ArrayList); Last = $null; Running = $null; Skew = 0; Digest = @{}; Lst = @{}; Os = 'debian-13'; Sha = ''; Legacy = @() }
+     Rec = @{}; Order = (New-Object Collections.ArrayList); Last = $null; Running = $null; Skew = 0; Digest = @{}; Lst = @{}; Content = (New-Object Collections.Hashtable ([StringComparer]::Ordinal)); NoAcl = $false; LstOld = $false; Drop = (New-Object Collections.Hashtable ([StringComparer]::Ordinal)); Extra = @(); Os = 'debian-13'; Sha = ''; Legacy = @() }   # Content/Drop: paths are case-sensitive, like Linux
 }
 function New-Manifest {
   [ordered]@{
@@ -397,7 +397,15 @@ function Get-DefaultOut($m, [string]$Step, [string]$Call) {
     foreach ($it in @($script:W.Mf.items)) {
       $d = $m.Digest[$it.id]; $l = if ($d) { $d } else { 'aaaaaaaaaaaa' }
       $o += "MOVE digest item=$($it.id) n=$($it.inodes) list=$l sum=bbbbbbbbbbbb"
-      $lst += "# item=$($it.id)"; for ($k = 1; $k -le 25; $k++) { $lst += ("$($it.root)/f$k`tf`t10`t0644`troot`troot`t1700000000000000000`t`t" + $(if ($d -and $k -eq 3) { 'user:bob:r--' } else { '' })) }
+      # ruling 06/11 (32): the last field is the file's sha256 for the sum set (here f1..f5), empty for the rest; Content[path] overrides it, LstOld drops the field (an older server)
+      $lst += "# item=$($it.id)"
+      $names = @(1..25 | ForEach-Object { "f$_" }) + @($m.Extra | Where-Object { $_.StartsWith("$($it.root)/", [StringComparison]::Ordinal) } | ForEach-Object { $_.Substring($it.root.Length + 1) })
+      foreach ($nm in $names) {
+        $pa = "$($it.root)/$nm"; if ($m.Drop.ContainsKey($pa)) { continue }
+        $ln = "$pa`tf`t10`t0644`troot`troot`t1700000000000000000`t`t" + $(if ($d -and $nm -ceq 'f3' -and -not $m.NoAcl) { 'user:bob:r--' } else { '' })
+        if (-not $m.LstOld) { $sh = if ($m.Content.ContainsKey($pa)) { [string]$m.Content[$pa] } elseif ($nm -cin 'f1', 'f2', 'f3', 'f4', 'f5' -or $m.Extra -ccontains $pa) { ('ab') * 32 } else { '' }; $ln += "`t$sh" }
+        $lst += $ln
+      }
     }
     $m.Lst[$Call] = $lst; return $o
   }
@@ -1518,6 +1526,76 @@ T 'L.verify-compare: a digest difference at x.verify rolls back first, then fetc
   Ok (@(LogNow | Where-Object { $_ -match '^(old|new) status --lst fwd-1-x\.verify$' }).Count -ge 2) 'both verify.lst fetched'
   HasText 'Dữ liệu hai máy khác nhau'; HasText 'opt-app'; HasText '/opt/app/f3'
   Reset-World; Fx-Planned; $W.new.Digest['opt-app'] = 'cccccccccccc'; [void](Do-Copy 0)
+}
+# ruling 06/11 (32): verify.lst has a last field sha256 (sum set only, empty otherwise); a line pair that differs only there is named by the laptop; an older line (no field) reads as "no hash"
+function SumPaths { @(Lines | Where-Object { $_ -match 'Dữ liệu hai máy khác nhau: item=(\S+) path=(.*)\z' } | ForEach-Object { "$($Matches[1])`t$($Matches[2])" }) }
+function Dig-Diff { $script:W.new.Digest['opt-app'] = 'cccccccccccc'; $script:W.new.NoAcl = $true }   # a digest difference at x.verify with identical lines
+function Content-Flip([string]$Sha = 'ee') { Dig-Diff; $script:W.new.Content['/opt/app/f2'] = $Sha * 32 }
+T 'L.verify-compare-sha256: two verify.lst lines that differ only in the last field (sha256) are reported as MOVE error sum-mismatch item= path= after the rollback' {
+  Fx-Copied; Content-Flip; [void](Do-Cutover -1); Assert-Rb
+  Before '^old fwd-1-r\.unfreeze-src$' '^(old|new) status --lst fwd-1-x\.verify$'
+  Ok (@(LogNow | Where-Object { $_ -match '^(old|new) status --lst fwd-1-x\.verify$' }).Count -ge 2) 'both verify.lst fetched'
+  $lo = $W.old.Lst['fwd-1-x.verify']; $ln = $W.new.Lst['fwd-1-x.verify']
+  Ok ((@($lo | Where-Object { $_ -like '/opt/app/*' }).Count) -eq 25 -and (@($ln | Where-Object { $_ -like '/opt/app/*' }).Count) -eq 25) 'fixture: 25 lines per item'
+  Ok (@($ln | Where-Object { $_ -like "/opt/app/f2`t*" })[0].EndsWith("`t" + ('ee' * 32))) 'fixture: sha256 is the last field'
+  Ok (@($ln | Where-Object { $_ -like "/opt/app/f9`t*" })[0].EndsWith("`t")) 'fixture: a file outside the sum set has an empty last field'
+  $sp = @(SumPaths); Eq $sp.Count 1 "one path ($($sp -join ' | '))"; Eq $sp[0] "opt-app`t/opt/app/f2" 'the flipped file'
+  HasText 'Dữ liệu hai máy khác nhau'
+}
+T 'L.verify-compare-sha256-cap: at most 20 differing paths are printed (B.8.6)' {
+  Fx-Copied; Content-Flip
+  foreach ($k in 1..25) { $W.old.Content["/opt/app/f$k"] = 'dd' * 32; $W.new.Content["/opt/app/f$k"] = 'ee' * 32 }
+  [void](Do-Cutover -1); Assert-Rb
+  $sp = @(SumPaths); Eq $sp.Count 20 'exactly 20 paths of 25'; Eq (@($sp | Sort-Object -Unique).Count) 20 'distinct'
+}
+T 'L.verify-compare-sha256-oldformat: a line without the field (older server) against one with it reads as no hash: not an error, and the other fields are still compared' {
+  Fx-Copied; Content-Flip; $W.old.LstOld = $true; [void](Do-Cutover -1); Assert-Rb
+  Ok (@($W.old.Lst['fwd-1-x.verify'] | Where-Object { $_ -like "/opt/app/f2`t*" })[0].Split("`t").Count -eq 9) 'fixture: old line has 9 fields'
+  Ok (@($W.new.Lst['fwd-1-x.verify'] | Where-Object { $_ -like "/opt/app/f2`t*" })[0].Split("`t").Count -eq 10) 'fixture: new line has 10 fields'
+  Eq (@(SumPaths).Count) 0 'no path for a pair that differs only by the missing hash'
+  Reset-World; Fx-Copied; $W.new.Digest['opt-app'] = 'cccccccccccc'; $W.old.LstOld = $true; $W.new.Content['/opt/app/f2'] = 'ee' * 32   # f3 acl differs too
+  [void](Do-Cutover -1); Assert-Rb; $sp = @(SumPaths); Eq $sp.Count 1 "only the real difference ($($sp -join ' | '))"; Eq $sp[0] "opt-app`t/opt/app/f3" 'acl difference still named'
+  Reset-World; Fx-Copied; Content-Flip; $W.new.LstOld = $true; [void](Do-Cutover -1); Assert-Rb
+  Eq (@(SumPaths).Count) 0 'new without the field against old with it: also no hash'
+}
+T 'L.verify-compare-sha256-empty: empty against a hash (either side), and empty against empty, is no difference; two different non-empty hashes, and a literal - against a hash, are named; the other fields are still compared' {
+  Fx-Copied; Content-Flip; $W.old.Content['/opt/app/f2'] = ''; [void](Do-Cutover -1); Assert-Rb
+  Eq (@(SumPaths).Count) 0 'old empty vs new hash'
+  Reset-World; Fx-Copied; Content-Flip; $W.new.Content['/opt/app/f2'] = ''; [void](Do-Cutover -1); Assert-Rb
+  Eq (@(SumPaths).Count) 0 'new empty vs old hash'
+  Reset-World; Fx-Copied; Content-Flip; $W.old.Content['/opt/app/f2'] = ''; $W.new.Content['/opt/app/f2'] = ''; [void](Do-Cutover -1); Assert-Rb
+  Eq (@(SumPaths).Count) 0 'empty vs empty'
+  Reset-World; Fx-Copied; Content-Flip; $W.old.Content['/opt/app/f2'] = 'dd' * 32; [void](Do-Cutover -1); Assert-Rb
+  $sp = @(SumPaths); Eq $sp.Count 1 'two different hashes'; Eq $sp[0] "opt-app`t/opt/app/f2" 'named'
+  Reset-World; Fx-Copied; Content-Flip; $W.new.Content['/opt/app/f2'] = '-'; [void](Do-Cutover -1); Assert-Rb
+  $sp = @(SumPaths); Eq $sp.Count 1 '- vs hash'; Eq $sp[0] "opt-app`t/opt/app/f2" 'unreadable marker is not "no hash"'
+  Reset-World; Fx-Copied; $W.new.Digest['opt-app'] = 'cccccccccccc'; $W.old.Content['/opt/app/f2'] = ''   # f3 acl differs, f2 empty vs hash
+  [void](Do-Cutover -1); Assert-Rb; $sp = @(SumPaths); Eq $sp.Count 1 "only the acl difference ($($sp -join ' | '))"; Eq $sp[0] "opt-app`t/opt/app/f3" 'fields 1-9 compared'
+}
+T 'L.verify-compare-onesided: a path present on one machine only is reported (missing on new, missing on old, with an old-format line on either side)' {
+  Fx-Copied; Dig-Diff; $W.new.Drop['/opt/app/f7'] = $true; [void](Do-Cutover -1); Assert-Rb
+  $sp = @(SumPaths); Eq $sp.Count 1 "missing on new ($($sp -join ' | '))"; Eq $sp[0] "opt-app`t/opt/app/f7" 'f7'
+  Reset-World; Fx-Copied; Dig-Diff; $W.old.Drop['/opt/app/f7'] = $true; [void](Do-Cutover -1); Assert-Rb
+  $sp = @(SumPaths); Eq $sp.Count 1 "missing on old ($($sp -join ' | '))"; Eq $sp[0] "opt-app`t/opt/app/f7" 'f7'
+  Reset-World; Fx-Copied; Dig-Diff; $W.old.LstOld = $true; $W.new.Drop['/opt/app/f7'] = $true; [void](Do-Cutover -1); Assert-Rb
+  $sp = @(SumPaths); Eq $sp.Count 1 "old-format old, missing on new ($($sp -join ' | '))"; Eq $sp[0] "opt-app`t/opt/app/f7" 'f7'
+  Reset-World; Fx-Copied; Dig-Diff; $W.new.LstOld = $true; $W.old.Drop['/opt/app/f7'] = $true; [void](Do-Cutover -1); Assert-Rb
+  $sp = @(SumPaths); Eq $sp.Count 1 "old-format new, missing on old ($($sp -join ' | '))"; Eq $sp[0] "opt-app`t/opt/app/f7" 'f7'
+  Reset-World; Fx-Copied; Dig-Diff; $W.new.Extra = @('/opt/app/extra'); [void](Do-Cutover -1); Assert-Rb
+  $sp = @(SumPaths); Eq $sp.Count 1 "extra on new ($($sp -join ' | '))"; Eq $sp[0] "opt-app`t/opt/app/extra" 'extra'
+}
+T 'L.verify-compare-case-only: paths that differ only in case stay two paths (a flip in either is named, a flip in both names both)' {
+  Fx-Copied; Dig-Diff; foreach ($m in 'old', 'new') { $W[$m].Extra = @('/opt/app/README', '/opt/app/Readme') }
+  $W.new.Content['/opt/app/README'] = 'ee' * 32; [void](Do-Cutover -1); Assert-Rb
+  $sp = @(SumPaths); Eq $sp.Count 1 "flip in README only ($($sp -join ' | '))"; Eq $sp[0] "opt-app`t/opt/app/README" 'README named'
+  Reset-World; Fx-Copied; Dig-Diff; foreach ($m in 'old', 'new') { $W[$m].Extra = @('/opt/app/README', '/opt/app/Readme') }
+  $W.new.Content['/opt/app/Readme'] = 'ee' * 32; [void](Do-Cutover -1); Assert-Rb
+  $sp = @(SumPaths); Eq $sp.Count 1 "flip in Readme only ($($sp -join ' | '))"; Eq $sp[0] "opt-app`t/opt/app/Readme" 'Readme named'
+  Reset-World; Fx-Copied; Dig-Diff; foreach ($m in 'old', 'new') { $W[$m].Extra = @('/opt/app/README', '/opt/app/Readme') }
+  $W.new.Content['/opt/app/README'] = 'ee' * 32; $W.new.Content['/opt/app/Readme'] = 'ee' * 32; [void](Do-Cutover -1); Assert-Rb
+  $sp = @(SumPaths | Sort-Object -CaseSensitive); Eq $sp.Count 2 "both flipped ($($sp -join ' | '))"
+  Reset-World; Fx-Copied; Dig-Diff; $W.old.Extra = @('/opt/app/README'); $W.new.Extra = @('/opt/app/Readme'); [void](Do-Cutover -1); Assert-Rb
+  $sp = @(SumPaths | Sort-Object -CaseSensitive); Eq $sp.Count 2 "README on old only + Readme on new only ($($sp -join ' | '))"
 }
 # R5-4: "sent with the call" (D.4 step 8) is the existing --dst-started 1 flag; no new argv token (the argv contract check is unchanged)
 T 'L.dst-started-before-start: dst_started=true and dst_started_at are saved in state.json before x.start is sent, and x.start carries --dst-started 1 (R5-3, R5-4)' {
