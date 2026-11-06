@@ -3187,11 +3187,21 @@ function Invoke-MoveRollback($S, $Fail) {
   Write-MoveReturnOld $S
   10
 }
+# ruling 06/11 (32), B38: a verify.lst line is path, type, size, mode, owner, group, mtime, link, acl, then (new servers) sha256, the last field,
+# empty for a file outside the sum set. A path on one side only is a difference. Fields 1-9 always decide; the sha256 decides only when both
+# lines carry a non-empty one (an older server's line has no field 10, an empty one means "no hash": never a difference), and then two
+# different hashes are a difference.
+function Test-MoveLstSame($A, $B) {
+  if ($null -eq $A -or $null -eq $B) { return ($null -eq $A -and $null -eq $B) }
+  $fa = @($A -split "`t"); $fb = @($B -split "`t")
+  if ($fa.Count -gt 9 -and $fb.Count -gt 9 -and $fa[9] -and $fb[9] -and $fa[9] -cne $fb[9]) { return $false }
+  ($fa[0..8] -join "`t") -ceq ($fb[0..8] -join "`t")
+}
 # B.8.6 / E-T12: after the rollback, both verify.lst (status --lst) and the first 20 differing paths
 function Write-MoveVerifyReport($S, $V) {
   $lst = @{}
   foreach ($m in 'old', 'new') {
-    $lst[$m] = @{}
+    $lst[$m] = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::Ordinal)   # Linux paths differing only in case stay distinct
     if (-not $V.Id[$m]) { continue }
     $st = Get-MoveStatus $S $m @('--lst', [string]$V.Id[$m]) -Quiet
     $item = ''
@@ -3203,8 +3213,9 @@ function Write-MoveVerifyReport($S, $V) {
     }
   }
   $n = 0
-  foreach ($k in @(@($lst['old'].Keys) + @($lst['new'].Keys) | Sort-Object -Unique)) {
-    if ($lst['old'][$k] -ceq $lst['new'][$k]) { continue }
+  foreach ($k in @(@($lst['old'].Keys) + @($lst['new'].Keys) | Sort-Object -CaseSensitive -Unique)) {
+    $a = $null; $b = $null; [void]$lst['old'].TryGetValue($k, [ref]$a); [void]$lst['new'].TryGetValue($k, [ref]$b)
+    if (Test-MoveLstSame $a $b) { continue }
     $ip = $k -split "`t", 2
     Write-MoveLines @("MOVE error sum-mismatch item=$($ip[0]) path=$($ip[1])")
     if (++$n -ge 20) { break }
