@@ -153,7 +153,7 @@ function Reset-World {
     Log = (New-Object Collections.ArrayList); Calls = (New-Object Collections.ArrayList); From = 0
     Faults = (New-Object Collections.ArrayList); Answers = (New-Object Collections.Queue); Prompts = (New-Object Collections.ArrayList)
     Gh = (New-Object Collections.ArrayList); GhLog = (New-Object Collections.ArrayList); KeygenLog = (New-Object Collections.ArrayList); ToolLog = (New-Object Collections.ArrayList)
-    BoxLog = (New-Object Collections.ArrayList); Mf = (New-Manifest); PlanStdin = (New-Object Collections.ArrayList); PlanN = 0
+    BoxLog = (New-Object Collections.ArrayList); Mf = (New-Manifest); Mfs = @{}; StoredLf = $false; CheckProjects = @(); PlanStdin = (New-Object Collections.ArrayList); PlanN = 0
     Pf = @('INV target user=quoc uid=1000 home-nonskel=1', 'INV target addr=198.51.100.20', 'INV target platform=0', 'INV target stop_budget_s=120'); PfCode = 0
     CheckOut = @('INV ok'); CheckCode = 0; CheckOnlyOut = @('INV ok'); CheckOnlyCode = 0; PlanHook = $null; PlanOut = @('INV ok'); PlanCode = 0
     NewGate = (New-Object Collections.Queue); TcpFail = @{}; LoginRc = 0; LoginErr = ''; CoderUp = $true; Dur = @{}; Sleeps = 0
@@ -249,8 +249,9 @@ function Invoke-MoveTimedExe([string]$Exe, [string[]]$ExeArgs, [string]$StdinTex
 }
 
 function Get-StatusFields($m) {
-  $mi = $m.MoveId; $last = $m.Last; $cs = '-'; $rc = '-'
-  if ($last) { $rec = $m.Rec[$last]; if ($m.Running -and $m.Running.Call -ceq $last) { $cs = 'running' } elseif ($null -eq $rec.Rc) { $cs = 'interrupted' } elseif ([int]$rec.Rc -eq 0) { $cs = 'done'; $rc = '0' } else { $cs = 'failed'; $rc = "$($rec.Rc)" } }
+  # R16 r8 (server status rule): `call` / `call_state` name the RUNNING call whenever a unit runs, whatever the record timestamps say (same-second ties); otherwise the latest record
+  $mi = $m.MoveId; $last = $(if ($m.Running) { $m.Running.Call } else { $m.Last }); $cs = '-'; $rc = '-'
+  if ($last) { $rec = $m.Rec[$last]; if ($m.Running -and $m.Running.Call -ceq $last) { $cs = 'running'; if ($m.Running.RcRecorded) { $rc = "$($m.Running.Rc)" } } elseif ($null -eq $rec.Rc) { $cs = 'interrupted' } elseif ([int]$rec.Rc -eq 0) { $cs = 'done'; $rc = '0' } else { $cs = 'failed'; $rc = "$($rec.Rc)" } }   # a unit that has written its rc but not yet exited (_mvr_unit_end) is `running` WITH its rc (the completion window)
   $v = { param($x) if ($null -eq $x -or "$x" -eq '' -or "$x" -ceq 'null') { '-' } else { "$x" } }
   [ordered]@{ move_id = (& $v $(if ($mi) { $mi.id })); role = (& $v $(if ($mi) { $mi.role })); dir = (& $v $(if ($mi) { $mi.dir })); attempt = (& $v $(if ($mi) { $mi.attempt }))
     state = (& $v $(if ($mi) { $mi.state })); frozen = $(if ($m.Frozen) { '1' } else { '0' }); call = (& $v $last); call_state = $cs; rc = $rc; last_final = (& $v (@($m.Order | Where-Object { $_ -match '-x\.final$' }) | Select-Object -Last 1))
@@ -269,7 +270,7 @@ function Get-ManifestLine([string[]]$TargetUsers) {
   if ($null -ne $TargetUsers) { $mf.same_users = @($same) }
   $json = ConvertTo-Json -InputObject $mf -Depth 12 -Compress
   $b = $utf8.GetBytes($json)
-  $script:W.LastSha = Get-Sha256Hex $b; $script:W.LastManifest = $json
+  $script:W.LastSha = Get-Sha256Hex $b; $script:W.LastManifest = $json; $script:W.Mfs[$script:W.LastSha] = $json
   "MOVE manifest sha=$($script:W.LastSha) gz64=$(Get-Gz64 $b)"
 }
 
@@ -317,6 +318,14 @@ function Fake-Gate($m, [string]$Cmd, [string]$Stdin, $e) {
     if ($sw['check-only']) {
       $e.Step = 'plan:check-only'; Log "$($m.Name) plan:check-only"; $script:Clock = $script:Clock.AddSeconds(7)
       foreach ($k in 'dir', 'attempt', 'sha', 'serving') { if (-not $f.ContainsKey($k)) { [void]$W.Violations.Add("plan <id> --check-only lacks --$k (D.0.1)") } }
+      # D.0.1 / move-run.sh (W1-T10-G16): `mv_moveid check call <id> <dir> <attempt> <sha>` against the stored move-id; the only exemption is a manual back's 0c (--dir back --attempt <stored + 1>) against a stored FWD move-id,
+      # which is then compared as (fwd, stored). Any other dir/attempt is compared in full: other-move / no-move, what=dir, what=attempt, what=sha. A machine with no move-id answers no-move (mode call); an empty pin never matches a sha.
+      if ($m.MoveId) {
+        $mi0 = $m.MoveId; $cd = [string]$f['dir']; $ca = [string]$f['attempt']
+        if ($cd -ceq 'back' -and [string]$mi0.dir -ceq 'fwd' -and "$($mi0.attempt)" -match '\A[0-9]+\z' -and $ca -ceq "$([int]$mi0.attempt + 1)") { $cd = [string]$mi0.dir; $ca = "$($mi0.attempt)" }
+        $why = if ($mi0.id -cne $id) { if ($mi0.state -ceq 'open') { "other-move id=$($mi0.id)" } else { 'no-move' } } elseif ([string]$mi0.dir -cne $cd) { 'move-id-mismatch what=dir' } elseif ("$($mi0.attempt)" -cne $ca) { 'move-id-mismatch what=attempt' } elseif ([string]$f['sha'] -cne [string]$m.Sha) { 'move-id-mismatch what=sha' } else { $null }
+        if ($why) { Log "$($m.Name) plan:check-only refused $why"; return (New-Res 65 @("MOVE error $why", 'GATE_EXIT 65')) }
+      } else { Log "$($m.Name) plan:check-only refused no-move"; return (New-Res 65 @('MOVE error no-move', 'GATE_EXIT 65')) }
       $flt = Get-Fault $m.Name 'plan:check-only'; if ($flt) { if ($flt.Mode -eq 'down') { return (New-Res 255 @()) }; if ($flt.Mode -eq 'noexit') { return (New-Res 0 @($flt.Out)) }; return (New-Res $flt.Rc (@($flt.Out) + "GATE_EXIT $($flt.Rc)")) }
       return (New-Res $W.CheckOnlyCode (@($W.CheckOnlyOut) + "GATE_EXIT $($W.CheckOnlyCode)"))
     }
@@ -367,13 +376,26 @@ function Fake-Gate($m, [string]$Cmd, [string]$Stdin, $e) {
   if ($verb -ceq 'init' -and $sw['repin']) {
     if (($step -like 'c.repin.*' -and -not $markNull) -or ($step -ceq 'x.repin' -and $mark -cne 'cutting') -or ($step -notlike 'c.repin.*' -and $step -cne 'x.repin')) { Log "$tag repin-step"; return (New-Res 65 @('MOVE error bad-request why=repin-step', 'GATE_EXIT 65')) }
   }
-  $norm = @(); for ($i = 0; $i -lt $wd.Count; $i++) { $x = [string]$wd[$i]; if ($x.StartsWith('--') -and $x.Substring(2) -in $IgnoredFlags) { $i++; continue }; $norm += $x }
+  # D.0.1 / K1 (ruling 06/11 (33)): a call that executes carries the sha of the manifest THIS machine holds (mode call; init, init --repin and p.* are not compared).
+  # A re-sent id whose record is done is a replay: it executes nothing, so only id/dir/attempt are compared (above) and --sha is ignored, in the gate and in the argv compare.
+  $recDone = ($m.Rec.ContainsKey($call) -and $null -ne $m.Rec[$call].Rc -and [int]$m.Rec[$call].Rc -eq 0)
+  if (-not $isInit -and -not ($verb -ceq 'init' -and $sw['repin']) -and $step -notlike 'p.*' -and -not $recDone -and $f['sha'] -cne [string]$m.Sha) { Log "$tag sha"; return (New-Res 65 @('MOVE error move-id-mismatch what=sha', 'GATE_EXIT 65')) }   # a machine with no pin refuses every sha (cur="" in mv_moveid check)
+  $norm = @(); for ($i = 0; $i -lt $wd.Count; $i++) { $x = [string]$wd[$i]; if ($x.StartsWith('--') -and ($x.Substring(2) -in $IgnoredFlags -or ($recDone -and $x -ceq '--sha'))) { $i++; continue }; $norm += $x }
   $normS = $norm -join ' '
   if ($m.Rec.ContainsKey($call)) {
     $rec = $m.Rec[$call]
-    if ($rec.Argv -cne '?' -and $rec.Argv -cne $normS) { Log "$tag call-argv"; return (New-Res 65 @('MOVE error bad-request why=call-argv', 'GATE_EXIT 65')) }
-    if ($null -ne $rec.Rc -and [int]$rec.Rc -eq 0) { $e.Replay = $true; Log "$tag (replay)"; return (New-Res 0 (@($rec.Out) + "MOVE call id=$call rc=0 dur_s=$($rec.Dur)" + 'GATE_EXIT 0')) }
+    $recArgv = if ($recDone) { [string]$rec.Argv -replace ' --sha [0-9a-f]+', '' } else { $rec.Argv }
+    if ($rec.Argv -cne '?' -and $recArgv -cne $normS) { Log "$tag call-argv"; return (New-Res 65 @('MOVE error bad-request why=call-argv', 'GATE_EXIT 65')) }
+    if ($recDone) { $e.Replay = $true; Log "$tag (replay)"; return (New-Res 0 (@($rec.Out) + "MOVE call id=$call rc=0 dur_s=$($rec.Dur)" + 'GATE_EXIT 0')) }
   }
+  # S4 (R16 rework): init and init --repin pin the --sha flag; the flag must be the sha256 of the stdin manifest (bad-request why=manifest-sha, 65, nothing written)
+  if ($isInit -or ($verb -ceq 'init' -and $sw['repin'])) {
+    $ok = $false; $ref = $W.Mfs[[string]$f['sha']]
+    if ($ref) { try { $sm = ($Stdin | ConvertFrom-Json).manifest; $ok = ((ConvertTo-Json -InputObject $sm -Depth 12 -Compress) -ceq (ConvertTo-Json -InputObject (ConvertFrom-Json $ref) -Depth 12 -Compress)) } catch { $ok = $false } }
+    if (-not $ok) { Log "$tag manifest-sha"; return (New-Res 65 @('MOVE error bad-request why=manifest-sha', 'GATE_EXIT 65')) }
+  }
+  # Mode never: the laptop died before the call reached the machine; nothing is written (no move-id flag, no record, no hook), and the call is not counted as sent
+  foreach ($nf in @($W.Faults)) { if ($nf.Mode -ceq 'never' -and $nf.N -ne 0 -and $m.Name -match "\A(?:$($nf.M))\z" -and $call -match $nf.Key) { if ($nf.N -gt 0) { $nf.N-- }; [void]$W.Calls.Remove($e); throw "laptop gone: $call never reached $($m.Name)" } }
   Log $tag
   if ($mi) { if ($f.ContainsKey('mark')) { $mi.mark = $(if ($markNull) { $null } else { $mark }) }; foreach ($k in 'phase', 'serving', 'dst-started') { if ($f.ContainsKey($k)) { $mi[$k.Replace('-', '_')] = $f[$k] } } }
   $hk = $W.Hooks[$step]; if ($hk) { & $hk $m $e }
@@ -389,6 +411,7 @@ function Fake-Gate($m, [string]$Cmd, [string]$Stdin, $e) {
   if ($flt -and $flt.Mode -ceq 'noexit') { return (New-Res 255 @($out)) }
   if ($flt -and $flt.Mode -ceq 'timeout') { $rec.Rc = 143; return (New-Res 124 @()) }
   if ($flt -and $flt.Mode -ceq 'down') { $m.Up = $false; return (New-Res 255 @()) }
+  if ($flt -and $flt.Mode -ceq 'kill') { throw 'laptop gone: the call ran to the end on the machine, its answer never arrived' }
   New-Res $rc (@($out) + "MOVE call id=$call rc=$rc dur_s=$dur" + "GATE_EXIT $rc")
 }
 function Get-DefaultOut($m, [string]$Step, [string]$Call) {
@@ -409,7 +432,10 @@ function Get-DefaultOut($m, [string]$Step, [string]$Call) {
     }
     $m.Lst[$Call] = $lst; return $o
   }
-  if ($Step -ceq 'x.check') { return @(Get-ManifestLine $null) }
+  if ($Step -ceq 'x.check') {   # the re-pin (B.14.6): the manifest of the frozen machine differs from the pinned one (hold states, sizes after the freeze), so every x.check that returns 0 changes the sha
+    $h = @($script:W.Mf.holds); if ($h.Count) { $h[0].n_restarts = [int]$h[0].n_restarts + 1 } else { $script:W.Mf.identity.swap_mb = [int]$script:W.Mf.identity.swap_mb + 1 }
+    return @(@(Get-ManifestLine $null) + @($script:W.CheckProjects | ForEach-Object { "INV warn back-new-only kind=project name=$_" }))   # CheckProjects: the project registry names new lists at x.check (a back)
+  }
   @("LOG $Step done")
 }
 function Apply-Effects($m, [string]$Step, [string]$Verb, $f, $sw, [string]$Id, [string]$Stdin) {
@@ -421,7 +447,11 @@ function Apply-Effects($m, [string]$Step, [string]$Verb, $f, $sw, [string]$Id, [
       if ($Step -ceq 'c.init-new' -and $j -and $j.PSObject.Properties['target'] -and -not $m.Target) { $m.Target = ConvertTo-Json -InputObject $j.target -Depth 10 -Compress }   # MV_DIR/target.json, written only when absent (D.0.9)
       if ($f['role'] -ceq 'new' -and $f['dir'] -ceq 'fwd') { $m.Frozen = $true; $m.Active = 0; $m.Enabled = $false }
     }
-    '^(c\.repin\.[0-9]+|x\.repin)$' { $m.Sha = $f['sha']; try { $m.RepinStdin = $Stdin | ConvertFrom-Json } catch { [void]$script:W.Violations.Add('repin stdin is not JSON') } }
+    '^(c\.repin\.[0-9]+|x\.repin)$' {   # _mvr_put_manifest stores the --sha FLAG as manifest.json.sha256 (the gate has refused a flag that is not the sha256 of the stdin manifest, S4)
+      $m.Sha = $f['sha']
+      try { $m.RepinStdin = $Stdin | ConvertFrom-Json } catch { [void]$script:W.Violations.Add('repin stdin is not JSON') }
+    }
+    '^x\.check$' { $m.Sha = $script:W.LastSha }   # x.check rc 0 writes the re-pinned manifest and its sha on the machine that ran it
     '^(c\.prepare\.[0-9]+|x\.prepare-id)$' { $m.Hostname = $script:W.Mf.identity.hostname }
     '^x\.freeze$' { $m.Frozen = $true }
     '^(x\.unfreeze\.[0-9]+|r\.unfreeze-src)$' { $m.Frozen = $false }
@@ -454,7 +484,9 @@ function Fake-Script($m, [string]$Text, $e) {
       $mi = $m.MoveId; $o = @('MOVE moveid ' + (@(foreach ($k in 'id', 'role', 'dir', 'attempt', 'state', 'mark', 'dst_started', 'phase', 'serving', 'old_addr', 'new_addr') { "$k=$(if ($null -ne $mi[$k]) { $mi[$k] })" }) -join ' '))
       $o += "MOVE hostkey ssh-ed25519 $($m.Key)"
       foreach ($c in $m.Order) { $r = $m.Rec[$c]; $o += "MOVE record id=$c start=$(if ($r.Start) { $r.Start } else { '-' }) end=$(if ($r.End) { $r.End } else { '-' }) rc=$(if ($null -ne $r.Rc) { $r.Rc } else { '-' })" }
-      $o += (Get-ManifestLine $null)
+      # the machine's own pin (manifest.json + manifest.json.sha256, D.0.10): the manifest whose sha it pinned; the plan's last one when it pinned none
+      # the stored manifest.json holds exactly the hashed bytes (R16 r4 server); StoredLf = an older machine: the text plus a final LF (jsontool's output) under the sha256 of the text without it
+      if ($m.Sha -and $W.Mfs.ContainsKey($m.Sha)) { $mb = $utf8.GetBytes([string]$W.Mfs[$m.Sha] + $(if ($W.StoredLf) { "`n" } else { '' })); $o += "MOVE manifest sha=$($m.Sha) gz64=$(Get-Gz64 $mb)" } else { $o += (Get-ManifestLine $null) }
       if ($m.Target) { $o += "MOVE target $($m.Target)" }   # new only: c.init-new kept it (D.0.10)
       return (New-Res 0 $o)
     }
@@ -582,10 +614,10 @@ function Fx-Copied { [void](Do-Plan); [void](Do-Copy) }
 function Fx-Cut { Fx-Copied; [void](Do-Cutover) }
 function Fx-BackDone { Fx-Cut; Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "back exit ($($r.Text))"; Eq (Get-St).phase 'back-done' 'fixture back-done' }
 # a recorded call whose unit still runs (its record has no rc yet); the fake attaches when the same id comes again
-function Set-Running([string]$M, [string]$Call) {
+function Set-Running([string]$M, [string]$Call, [int]$Left = 1000, [int]$Rc = 0, [switch]$Tie, [switch]$RcRecorded) {   # Left = the status polls the unit survives (each status answer of the machine counts one); Rc = its rc when it ends; -Tie = a same-second tie: the call before it stays `Last`; -RcRecorded = the completion window: the unit has written its rc but still runs, status shows call_state=running AND the rc
   $mc = $script:W[$M]; $st = $Call -replace '^(fwd|back)-[0-9]+-', ''
-  $mc.Rec[$Call] = @{ Rc = $null; Out = @("LOG $Call"); Dur = 5; Argv = '?'; Start = ''; End = '' }; [void]$mc.Order.Add($Call); $mc.Last = $Call
-  $mc.Running = @{ Call = $Call; Left = 1000; Rc = 0; Step = $st; Verb = ''; F = @{}; Sw = @{}; Id = (Id); Stdin = '' }
+  $mc.Rec[$Call] = @{ Rc = $null; Out = @("LOG $Call"); Dur = 5; Argv = '?'; Start = ''; End = '' }; [void]$mc.Order.Remove($Call); [void]$mc.Order.Add($Call); if (-not $Tie) { $mc.Last = $Call }
+  $mc.Running = @{ Call = $Call; Left = $Left; Rc = $Rc; Step = $st; Verb = ''; F = @{}; Sw = @{}; Id = (Id); Stdin = ''; RcRecorded = [bool]$RcRecorded }
 }
 function Fx-RolledBack { Fx-Copied; Add-Fault -M new -Key '-x\.final$' -Rc 1; [void](Do-Cutover 10); Eq (Get-St).phase 'rolled-back' 'fixture rolled-back' }
 function Id { (Get-St).move_id }
@@ -1435,7 +1467,7 @@ T 'L.copy-after-collision-remedy: c.init-new wrote the move-id, then failed (hol
   $r2 = Run-Move @('copy'); Eq $r2.Code 0 "second copy exit ($($r2.Text))"; Eq (Get-St).phase 'copied' 'phase'
   Eq (Sent 'new' '^fwd-1-c\.init-new$') 1 "the half-done c.init-new runs again on the re-run: $((LogNow) -join ' ; ')"; Before '^new fwd-1-c\.init-new$' '^new fwd-1-c\.transfer\.[0-9]+$'
 }
-T 'L.copy-after-collision-remedy: c.init-new wrote the move-id and was still running when ssh dropped; the next copy''s status shows it running, it ends failed while copy waits (Wait-MoveRunning keeps the stale status), and the copy re-sends c.init-new under the same id before any transfer (DESIGN-GAP T10d-NEW2-halfdone: only a done init counts as seen)' {
+T 'L.copy-after-collision-remedy: c.init-new wrote the move-id and was still running when ssh dropped; the next copy''s status shows it running, it ends failed while copy waits (Wait-MoveRunning stores the refreshed Ok status, which shows failed), and the copy re-sends c.init-new under the same id before any transfer (DESIGN-GAP T10d-NEW2-halfdone: only a done init counts as seen)' {
   Fx-Planned; Add-Fault -M new -Key '-c\.init-new$' -Rc 1 -Out @('LOG holds-off pending') -Effect -Mode down
   $r1 = Run-Move @('copy'); Ok ($r1.Code -ne 0) "first copy fails ($($r1.Text))"
   Ok ($null -ne $W.new.MoveId -and "$($W.new.MoveId.attempt)" -ceq '1') 'new holds the move-id of the half-done init'
@@ -2296,6 +2328,345 @@ T 'L.resume-old-reboot-after-stop: old rebooted after step 5 (holds disabled, no
 }
 T 'L.resume-mid-cutover-no-chore0: resuming a cutover (mark set) while old holds its marker never runs chore 0 on old' {
   Fx-Cutting0; $r = Run-Move @('cutover'); Eq $r.Code 0 'resume'; Eq (Sent 'old' '-x\.(enable|unfreeze)\.') 0 'no chore 0 on old'
+}
+# ============================== DECISION-r5 (T1/T5/T10): every resume first waits for a running call of its attempt ==============================
+# The fake models the server's lock: a machine whose unit runs answers 75 `busy` to EVERY other call, a re-sent done call (a replay) included; the status answers (Set-Running -Left = the polls it survives)
+# are what the laptop waits on. A status fault is checked before the unit's Left is spent. The resume rows (cut-resume, carry-resume, rb-continue) wait first, never re-send a done call into the busy.
+function NoBusy([string]$What) { $b = @(LogNow -All | Where-Object { $_ -match ' busy$' }); Eq $b.Count 0 "$What : no call answered busy: $($b -join ', ')" }
+T 'L.fake-busy-on-done-replay: while another call''s unit runs, a re-sent DONE call answers 75 busy (nothing replayed, record untouched); with no unit running the same call is a replay' {
+  Fx-Cutting0; Set-Running 'new' 'fwd-1-x.final'; $S = Read-MoveState
+  $r = Invoke-MoveCall $S 'new' 'x.stop-dst' -Quiet; Eq $r.Code 75 "busy ($($r.Lines -join ' '))"; Ok (@(LogNow | Where-Object { $_ -match '^new fwd-1-x\.stop-dst busy$' }).Count -eq 1) "busy logged: $(LogNow)"
+  Eq ([int]$W.new.Rec['fwd-1-x.stop-dst'].Rc) 0 'the done record is untouched'; Eq (Sent 'new' '^fwd-1-x\.stop-dst$') 1 'sent (counted: it was not a replay)'
+  $W.new.Running = $null; $r = Invoke-MoveCall $S 'new' 'x.stop-dst' -Quiet; Eq $r.Code 0 'replay'; Ok (@(Calls | Where-Object { $_.Call -ceq 'fwd-1-x.stop-dst' -and $_.Replay }).Count -eq 1) 'a replay'
+}
+T 'L.resume-waits-for-running-call: cutover resumes a cutting run whose x.check unit still runs on old: the laptop prints the wait line and waits, no call answered busy, x.freeze / x.check are replayed, exit 0 phase cut' {
+  Fx-Cutting0; Set-Running 'old' 'fwd-1-x.check' 2
+  $r = Run-Move @('cutover'); Eq $r.Code 0 "resume ($($r.Text))"; Eq (Get-St).phase 'cut' 'phase'; HasText 'đợi fwd-1-x.check'; NoBusy 'cut-resume'
+  Eq (Sent 'old' '^fwd-1-x\.freeze$') 0 'x.freeze replayed'; Eq (SentAny '^fwd-1-x\.freeze$') 1 'x.freeze sent again'; Eq (Sent 'old' '^fwd-1-x\.check$') 0 'x.check replayed, not run'; Eq (SentAny '^fwd-1-x\.check$') 1 'x.check sent again'
+}
+T 'L.resume-waits-then-failed: the running x.check ends rc 1: after the wait the resume rolls back (10) from the status it refreshed; the failed call is not re-sent' {
+  Fx-Cutting0; Set-Running 'old' 'fwd-1-x.check' 2 1
+  $r = Run-Move @('cutover'); Eq $r.Code 10 "plain rollback ($($r.Text))"; Eq (Get-St).phase 'rolled-back' 'phase'; HasText 'đợi fwd-1-x.check'; NoBusy 'cut-resume'
+  Eq (SentAny '^fwd-1-x\.check$') 0 'the failed x.check is not sent again'; Eq (Sent 'old' '^fwd-1-r\.start-src$') 1 'old restarted'
+}
+T 'L.resume-started-waits: dst started (x.start done), new''s x.health unit still runs: the resume waits, no call answered busy, no back-* call (no carry-back), exit 0 phase cut' {
+  Fx-CuttingStarted; Add-Rec 'new' 'fwd-1-x.start' 0; Set-Running 'new' 'fwd-1-x.health' 2
+  $r = Run-Move @('cutover'); Eq $r.Code 0 "resume ($($r.Text))"; Eq (Get-St).phase 'cut' 'phase'; HasText 'đợi fwd-1-x.health'; NoBusy 'cut-resume (dst started)'; Eq (SentAny '^back-') 0 'no back-* call'
+}
+T 'L.carry-resume-waits: a carry-back stopped while new''s x.stop-src unit still runs: `cutover` waits, never re-sends b.init-new into the busy, no Q-newlost / Q-discard question, ends back-done (10)' {
+  Fx-Carry; Set-Running 'new' 'back-2-x.stop-src' 2
+  $r = Run-Move @('cutover'); Eq $r.Code 10 "resume ($($r.Text))"; Eq (Get-St).phase 'back-done' 'phase'; HasText 'đợi back-2-x.stop-src'; NoBusy 'carry-resume'; Eq $W.Prompts.Count 0 "no question asked: $($W.Prompts -join ' | ')"
+}
+T 'L.carry-resume-final-running: the carry-back''s x.final unit still runs on new (steps up to x.stop-dst done): carry-resume waits for it too (the b.init-* go to new before it), no busy, ends 10' {
+  Fx-Carry; Add-Rec 'new' 'back-2-x.freeze'; Add-Rec 'new' 'back-2-x.stop-src'; Add-Rec 'old' 'back-2-x.stop-dst'; Set-Running 'new' 'back-2-x.final' 2
+  $r = Run-Move @('cutover'); Eq $r.Code 10 "resume ($($r.Text))"; Eq (Get-St).phase 'back-done' 'phase'; HasText 'đợi back-2-x.final'; NoBusy 'carry-resume (x.final)'; Eq $W.Prompts.Count 0 'no question asked'
+}
+T 'L.rb-continue-waits: a plain rollback under way while old''s r.unfreeze-src unit still runs: the continuation waits, no busy, ends 10 with enabled true' {
+  Fx-RollingBack; Add-Rec 'old' 'fwd-1-r.start-src' 0; Set-Running 'old' 'fwd-1-r.unfreeze-src' 2
+  $r = Run-Move @('cutover'); Eq $r.Code 10 "continued rollback ($($r.Text))"; Eq (Get-St).phase 'rolled-back' 'phase'; HasText 'đợi fwd-1-r.unfreeze-src'; NoBusy 'rb-continue'; Eq (Get-St).enabled $true 'enabled'
+}
+# a status poll inside the wait that fails is retried (never "not running"). $AgreeReads = the status answers a machine gives before the wait's first poll: the agreement check reads each machine once (it retries only a not-Known answer) and a resumed run has its mark set, so no pre-rule runs; Skip 1 makes the FIRST poll inside the wait fail
+$AgreeReads = 1
+T 'L.resume-wait-status-blip: the first status poll INSIDE the wait fails (one transport loss): the wait retries and goes on, never reads it as "not running": no busy, no Q-newlost / Q-discard, carry-back ends back-done (10)' {
+  Fx-Carry; Set-Running 'new' 'back-2-x.stop-src' 3; Add-Fault -M new -Key '^status$' -Mode down -N 1 -Skip $AgreeReads
+  $r = Run-Move @('cutover'); Eq $r.Code 10 "resume ($($r.Text))"; Eq (Get-St).phase 'back-done' 'phase'; HasText 'đợi back-2-x.stop-src'; NoBusy 'blip'; Eq $W.Prompts.Count 0 "no question asked: $($W.Prompts -join ' | ')"
+  Eq $W.Faults[$W.Faults.Count - 1].N 0 'the status fault was used (inside the wait)'
+}
+T 'L.resume-wait-status-lost: the status of new stays unreadable inside the wait: the wait retries `retries` times, then the run ends 1 as a no-answer, nothing written, no call sent to new' {
+  Fx-Carry; Set-Running 'new' 'back-2-x.stop-src' 3; Add-Fault -M new -Key '^status$' -Mode down -N -1 -Skip $AgreeReads
+  $r = Run-Move @('cutover'); Eq $r.Code 1 "no-answer ($($r.Text))"; Eq @(RecCalls | Where-Object { $_.M -ceq 'new' }).Count 0 "no call sent to new: $(@(RecCalls | ForEach-Object { $_.M + ' ' + $_.Call }) -join ', ')"
+  Eq $W.Prompts.Count 0 'no question asked'; Ok (@(Lines -Last | Where-Object { $_ -match 'khi đợi lệnh đang chạy' }).Count -ge 1) "the no-answer line names the wait: $(Lines -Last)"; Eq (Get-St).phase 'planned' 'nothing written'
+}
+T 'L.resume-wait-status-refused: inside the wait the status of new is answered by a refusal (a gate with no --move, Known but not Ok): the run ends as the agreement check does (a refusal), never reads it as "not running"; nothing written, no call sent to new, no question' {
+  Fx-Carry; Set-Running 'new' 'back-2-x.stop-src' 3; Add-Fault -M new -Key '^status$' -Mode nomove -N -1 -Skip $AgreeReads
+  $r = Run-Move @('cutover'); Ok ($r.Code -ne 0 -and $r.Code -ne 10) "the run ends with a refusal, not a success ($($r.Code): $($r.Text))"; Eq @(RecCalls | Where-Object { $_.M -ceq 'new' }).Count 0 "no call sent to new: $(@(RecCalls | ForEach-Object { $_.M + ' ' + $_.Call }) -join ', ')"
+  Eq $W.Prompts.Count 0 "no question asked: $($W.Prompts -join ' | ')"; Eq (Get-St).phase 'planned' 'nothing written'; NoBusy 'refused'
+}
+T 'L.resume-wait-status-blip-cut: the same blip on a cut-resume (x.check running on old): the resume waits on, no Q-drain, the failed status is not stored (the failed-call check still sees the real status), ends cut' {
+  Fx-Cutting0; Set-Running 'old' 'fwd-1-x.check' 3; Add-Fault -M old -Key '^status$' -Mode down -N 1 -Skip $AgreeReads
+  $r = Run-Move @('cutover'); Eq $r.Code 0 "resume ($($r.Text))"; Eq (Get-St).phase 'cut' 'phase'; NoBusy 'cut blip'; Eq $W.Prompts.Count 0 "no question asked: $($W.Prompts -join ' | ')"
+  Eq $W.Faults[$W.Faults.Count - 1].N 0 'the status fault was used (inside the wait)'
+}
+# a same-second tie: the unit's record does not sort last (its `start` equals the call before it): the server names the RUNNING call anyway (status rule, R16 r8), so the resume still waits
+T 'L.resume-waits-same-second-tie: old''s x.check unit runs but the latest record is the call before it (x.stop-src stays `Last`, a same-second tie): status still names the running call, `cutover` waits for it, no call answered busy, exit 0 phase cut' {
+  Fx-Cutting0; Set-Running 'old' 'fwd-1-x.check' 3 -Tie; Eq $W.old.Last 'fwd-1-x.stop-src' 'fixture: the running call is not Last'
+  $s0 = Get-MoveStatus (Read-MoveState) 'old' -Quiet; Eq ([string]$s0.Kv['call']) 'fwd-1-x.check' 'status names the running call'; Eq ([string]$s0.Kv['call_state']) 'running' 'call_state'; Eq ([string]$s0.Kv['rc']) '-' 'rc empty while running'
+  $r = Run-Move @('cutover'); Eq $r.Code 0 "resume ($($r.Text))"; Eq (Get-St).phase 'cut' 'phase'; HasText 'đợi fwd-1-x.check'; NoBusy 'cut-resume (tie)'
+}
+T 'L.resume-started-waits-same-second-tie: dst started, new''s x.health unit runs and x.start (done) stays `Last` (the x.start -> x.health tie): the resume waits, no busy, no carry-back (no back-* call), exit 0 phase cut' {
+  Fx-CuttingStarted; Add-Rec 'new' 'fwd-1-x.start' 0; Set-Running 'new' 'fwd-1-x.health' 3 -Tie; Eq $W.new.Last 'fwd-1-x.start' 'fixture: x.start is Last'
+  $r = Run-Move @('cutover'); Eq $r.Code 0 "resume ($($r.Text))"; Eq (Get-St).phase 'cut' 'phase'; HasText 'đợi fwd-1-x.health'; NoBusy 'cut-resume (dst started, tie)'; Eq (SentAny '^back-') 0 'no back-* call'
+}
+# the wait is bounded (first_transfer_s + 60 s = 21660 s, polls 10 s apart): a unit that outlives it ends the run 75 "chạy lại sau" with nothing written; Left 2200 polls = 22000 s
+T 'L.resume-wait-deadline: old''s x.check unit outlives the wait''s deadline: the run ends 75 with the "vẫn đang chạy ... chạy lại sau" line, state.json unchanged, no call sent to either machine, no question' {
+  Fx-Cutting0; Set-Running 'old' 'fwd-1-x.check' 2200; $t0 = [IO.File]::ReadAllText((StatePath))
+  $r = Run-Move @('cutover'); Eq $r.Code 75 "deadline ($($r.Text))"; HasText 'vẫn đang chạy fwd-1-x.check'; HasText 'chạy lại sau'
+  Eq ([IO.File]::ReadAllText((StatePath))) $t0 'state.json unchanged'; Eq @(RecCalls).Count 0 "no recorded call: $(@(RecCalls | ForEach-Object { $_.M + ' ' + $_.Call }) -join ', ')"; Eq $W.Prompts.Count 0 'no question asked'; NoBusy 'deadline'
+}
+# the completion window: `_mvr_unit_end` writes the unit's rc before the unit exits, so a status can read call_state=running WITH an rc; the unit still holds the call lock, so the wait keeps waiting (the rc is not "done")
+T 'L.resume-wait-completion-window: old''s x.check unit has written its rc 0 but still runs (status: call_state=running, rc=0): the wait does not read the rc as "finished" - it waits until the unit is done, no call answered busy, x.freeze / x.check replayed, exit 0 phase cut' {
+  Fx-Cutting0; Set-Running 'old' 'fwd-1-x.check' 3 -RcRecorded
+  $s0 = Get-MoveStatus (Read-MoveState) 'old' -Quiet; Eq ([string]$s0.Kv['call_state']) 'running' 'call_state'; Eq ([string]$s0.Kv['rc']) '0' 'rc already recorded while running'
+  $r = Run-Move @('cutover'); Eq $r.Code 0 "resume ($($r.Text))"; Eq (Get-St).phase 'cut' 'phase'; HasText 'đợi fwd-1-x.check'; NoBusy 'cut-resume (completion window)'
+  Eq (Sent 'old' '^fwd-1-x\.check$') 0 'x.check replayed, not run again'
+}
+T 'L.resume-wait-completion-window-failed: the unit has written rc 1 but still runs (call_state=running, rc=1): the wait waits for it to end, then the resume rolls back (10) from the refreshed status; nothing is re-sent into the busy' {
+  Fx-Cutting0; Set-Running 'old' 'fwd-1-x.check' 3 1 -RcRecorded
+  $r = Run-Move @('cutover'); Eq $r.Code 10 "plain rollback ($($r.Text))"; Eq (Get-St).phase 'rolled-back' 'phase'; HasText 'đợi fwd-1-x.check'; NoBusy 'cut-resume (completion window, failed)'; Eq (SentAny '^fwd-1-x\.check$') 0 'the failed x.check is not sent again'
+}
+T 'L.carry-resume-completion-window: a carry-back whose new x.stop-src unit has written its rc but still runs: carry-resume waits, never re-sends b.init-new into the busy, no question, ends back-done (10)' {
+  Fx-Carry; Set-Running 'new' 'back-2-x.stop-src' 3 0 -RcRecorded
+  $r = Run-Move @('cutover'); Eq $r.Code 10 "resume ($($r.Text))"; Eq (Get-St).phase 'back-done' 'phase'; HasText 'đợi back-2-x.stop-src'; NoBusy 'carry-resume (completion window)'; Eq $W.Prompts.Count 0 "no question asked: $($W.Prompts -join ' | ')"
+}
+# ============================== ruling 06/11 (33): the sha across the step-3 re-pin (manifest_sha_prev) and the replay of a done call ==============================
+# The fake gate models what the server does (D.0.1, K1; T1/T5 R16): x.check rc 0 re-pins the manifest of the machine that ran it (new sha B); a machine holds ITS pin
+# (A on dst until x.repin) and refuses an executing call whose --sha is not that pin (65 what=sha, a "<machine> <call> sha" log line); a re-sent id whose record
+# is done is a replay (id/dir/attempt compared, --sha ignored, nothing executed, no state written). Mode kill = the call ran to the end, the laptop died before its answer.
+function CallShas([string]$M, [string]$Rx) { @(RecCalls | Where-Object { $_.M -ceq $M -and $_.Call -match $Rx } | ForEach-Object { [string]$_.Flags['sha'] }) }
+function ShaRefusals { @(LogNow -All | Where-Object { $_ -match ' sha$' }) }
+# one step 3 that went through (S4, rework L3): x.repin on dst PINS the --sha flag, so it carries the sha of the manifest it ships (B), as does every call after it; every call
+# before it carries A (the laptop's sha before x.check; -Before). A non-pinning call to dst while manifest_sha_prev is set carries A: see L.repin-dst-fail-rollback.
+function Assert-ShaFlow([string]$Dst, [string]$A, [string]$B, [switch]$Before) {
+  $c = @(RecCalls | Where-Object { -not $_.Replay }); $i = -1
+  for ($k = 0; $k -lt $c.Count; $k++) { if ($c[$k].M -ceq $Dst -and $c[$k].Call -match '-x\.repin$') { $i = $k; break } }
+  Ok ($i -ge 0) "x.repin was sent to $Dst : $(@($c | ForEach-Object { $_.M + ' ' + $_.Call }) -join ', ')"
+  Eq $c[$i].Flags['sha'] $B "x.repin on $Dst pins its --sha flag: it carries the sha of the manifest it ships"
+  for ($k = 0; $k -lt $c.Count; $k++) {
+    if ($k -gt $i) { Eq $c[$k].Flags['sha'] $B "sha of $($c[$k].M) $($c[$k].Call) after x.repin on dst" }
+    elseif ($k -lt $i -and $Before) { Eq $c[$k].Flags['sha'] $A "sha of $($c[$k].M) $($c[$k].Call) before x.repin on dst" }
+  }
+}
+T 'L.manifest-sha-prev: x.check rc 0 saves manifest_sha = B and manifest_sha_prev = A before x.repin goes out; while it is set a call to dst that pins no manifest carries A, src and every pinning call (x.repin) carry B (the server pins the --sha flag); it is cleared when x.repin on dst returns 0, so every later call carries B; the same in a manual back (dst = old)' {
+  Fx-Copied; $A = (Get-St).manifest_sha
+  $script:SeenR = @{}; $W.Hooks['x.repin'] = { param($m, $e) $script:SeenR[$m.Name] = Get-St }
+  [void](Do-Cutover); $B = $W.LastSha; Ok ($B -cne $A) 'fixture: x.check changes the sha'
+  $d = $script:SeenR['new']; Ok ($null -ne $d) 'x.repin reached new'; Eq $d.manifest_sha $B 'saved before x.repin: manifest_sha = B'; Eq $d.manifest_sha_prev $A 'saved before x.repin: manifest_sha_prev = A'
+  Assert-ShaFlow 'new' $A $B -Before
+  Eq (ShaRefusals).Count 0 "no what=sha refusal: $(ShaRefusals)"
+  $s = Get-St; Eq $s.phase 'cut' 'phase'; Eq $s.manifest_sha $B 'manifest_sha'; Ok (-not [string]$s.manifest_sha_prev) "manifest_sha_prev cleared after x.repin on dst: [$($s.manifest_sha_prev)]"
+  Eq $W.old.Sha $B 'old pinned B'; Eq $W.new.Sha $B 'new pinned B'
+  # a manual back re-pins too (B.14.6, dir=back: src = new runs x.check, dst = old)
+  Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "back ($($r.Text))"; $B2 = $W.LastSha; Ok ($B2 -cne $B) 'fixture: the back''s x.check changes the sha again'
+  Assert-ShaFlow 'old' $B $B2 -Before
+  Eq (ShaRefusals).Count 0 "back: no what=sha refusal: $(ShaRefusals)"
+  $s = Get-St; Eq $s.manifest_sha $B2 'back: manifest_sha'; Ok (-not [string]$s.manifest_sha_prev) 'back: manifest_sha_prev cleared'
+}
+# the laptop died while x.check ran (A in the state) or after it saved B, before x.repin reached dst: `cutover` resumes (D.11 cutting, dst_started false) across the re-pin
+function Resume-AfterCheck([string]$A, [string]$B, [string]$What) {
+  $s0 = Get-St; Eq $s0.mark 'cutting' "$What : the kill left the cutover open"; Eq $s0.dst_started $false "$What : dst_started"
+  Ok ([int]$W.old.Rec['fwd-1-x.check'].Rc -eq 0 -and $null -ne $W.old.Rec['fwd-1-x.check'].Rc) "$What : x.check is done on old"
+  Eq $W.old.Sha $B "$What : old holds the re-pinned manifest"; Eq $W.new.Sha $A "$What : new still holds the first pin"
+  $r = Run-Move @('cutover'); Eq $r.Code 0 "$What : resume ($($r.Text))"; Eq (Get-St).phase 'cut' "$What : phase"
+  foreach ($st in 'x.freeze', 'x.check') {
+    Eq (Sent 'old' "^fwd-1-$([regex]::Escape($st))$") 0 "$What : $st is replayed, not run again"; Eq (SentAny "^fwd-1-$([regex]::Escape($st))$") 1 "$What : $st is sent again (D.0.5)"
+  }
+  Eq (Sent 'new' '^fwd-1-x\.repin$') 1 "$What : x.repin on new"; Eq (Sent 'old' '^fwd-1-x\.repin$') 1 "$What : x.repin on old"
+  Eq (ShaRefusals).Count 0 "$What : no what=sha refusal: $(ShaRefusals)"; Eq (SentAny '-r\.') 0 "$What : no rollback"
+  Assert-ShaFlow 'new' $A $B
+  $s = Get-St; Eq $s.manifest_sha $B "$What : manifest_sha"; Ok (-not [string]$s.manifest_sha_prev) "$What : manifest_sha_prev cleared [$($s.manifest_sha_prev)]"
+  Eq $W.old.Sha $B "$What : old pinned B"; Eq $W.new.Sha $B "$What : new pinned B"
+  Eq (Get-Sha256Hex ([IO.File]::ReadAllBytes((Join-Path (MoveDir) 'manifest.json')))) $B "$What : manifest.json = B"
+}
+T 'L.resume-cutting-after-x.check: the laptop died while x.check ran (the unit finished, manifest_sha still A): `cutover` replays x.freeze and x.check (done records; their sha A is no longer old''s pin), takes B from the replayed x.check, re-pins new with x.repin (carrying B, the manifest it ships) and ends cut, exit 0; no rollback, no what=sha (ruling 06/11 (33), T13 triage-kill1 D1)' {
+  Fx-Copied; $A = (Get-St).manifest_sha
+  Add-Fault -M old -Key '^fwd-1-x\.check$' -Rc 0 -Mode kill; Ans 'có'; $r1 = Run-Move @('cutover'); Ok ($r1.Code -ne 0) "the laptop died ($($r1.Text))"
+  $B = $W.LastSha; Ok ($B -cne $A) 'fixture: x.check re-pinned old'; Eq (Get-St).manifest_sha $A 'the laptop never saw B'
+  Resume-AfterCheck $A $B 'B unsaved'
+}
+T 'L.resume-cutting-after-x.check-saved: the laptop died after x.check saved B (manifest_sha = B, manifest_sha_prev = A), before x.repin reached new: `cutover` replays x.freeze and x.check with B (done records), x.repin on new carries B, ends cut, exit 0 (ruling 06/11 (33))' {
+  Fx-Copied; $A = (Get-St).manifest_sha
+  Add-Fault -M new -Key '^fwd-1-x\.repin$' -Mode never; Ans 'có'; $r1 = Run-Move @('cutover'); Ok ($r1.Code -ne 0) "the laptop died ($($r1.Text))"
+  $B = $W.LastSha; Ok ($B -cne $A) 'fixture: x.check re-pinned old'; $s = Get-St; Eq $s.manifest_sha $B 'B saved'; Eq $s.manifest_sha_prev $A 'A kept with it'
+  Resume-AfterCheck $A $B 'B saved'
+  # the same death, then the resume's x.repin on new fails: the plain rollback's r.stop-dst on new still carries A (the replayed x.check must not overwrite the saved manifest_sha_prev with B)
+  Reset-World; Fx-Copied; $A = (Get-St).manifest_sha
+  Add-Fault -M new -Key '^fwd-1-x\.repin$' -Mode never; Ans 'có'; $r1 = Run-Move @('cutover'); Ok ($r1.Code -ne 0) "the laptop died again ($($r1.Text))"; $B = $W.LastSha
+  Add-Fault -M new -Key '^fwd-1-x\.repin$' -Rc 1; $r = Run-Move @('cutover'); Eq $r.Code 10 "resume, x.repin on new fails: plain rollback ($($r.Text))"
+  Eq (Sent 'new' '^fwd-1-r\.stop-dst$') 1 'r.stop-dst on new'; Eq (@(CallShas 'new' '^fwd-1-r\.stop-dst$')[0]) $A 'r.stop-dst on new carries A'; Eq (@(CallShas 'old' '^fwd-1-r\.start-src$')[0]) $B 'r.start-src on old carries B'
+  Eq (@(LogNow -All | Where-Object { $_ -match ' (manifest-sha|sha)$' })).Count 0 "no refusal: $(@(LogNow -All | Where-Object { $_ -match ' (manifest-sha|sha)$' }))"; Eq (Get-St).phase 'rolled-back' 'phase'
+}
+T 'L.repin-pinning-dst-call-with-prev: manifest_sha_prev is still set after a failed x.repin on new (new pins A): the copy after the rollback sends c.init-new (and c.repin.N) to new with manifest_sha = the sha of the manifest they ship (the server pins the --sha flag and refuses another: bad-request why=manifest-sha), never A; new then pins that sha and manifest_sha_prev is cleared by the first init on dst that returns 0 (rework R16 L3)' {
+  Fx-Copied; $A = (Get-St).manifest_sha
+  Add-Fault -M new -Key '^fwd-1-x\.repin$' -Rc 1; Ans 'có'; $r = Run-Move @('cutover'); Eq $r.Code 10 "plain rollback ($($r.Text))"
+  $B = $W.LastSha; $s = Get-St; Eq $s.manifest_sha $B 'manifest_sha = B'; Eq $s.manifest_sha_prev $A 'manifest_sha_prev = A is still set after the rollback'; Eq $W.new.Sha $A 'new still pins A'
+  # the next copy: a new attempt re-inits new (Sync-MoveAgreement, a pinning call to dst while prev is set)
+  $r = Run-Move @('copy'); Eq $r.Code 0 "copy ($($r.Text))"
+  $ini = @(RecCalls | Where-Object { $_.M -ceq 'new' -and $_.Call -match '-c\.(init-new|repin\.[0-9]+)$' -and -not $_.Replay })
+  Ok ($ini.Count -ge 1) "a pinning call reached new: $(@(RecCalls | ForEach-Object { $_.M + ' ' + $_.Call }) -join ', ')"
+  foreach ($c in $ini) { Eq $c.Flags['sha'] $B "$($c.Call) on new carries the sha of the manifest it ships, not A" }
+  $ref = @(LogNow -All | Where-Object { $_ -match ' (manifest-sha|sha)$' }); Eq $ref.Count 0 "no refusal: $ref"
+  $s = Get-St; Eq $s.phase 'copied' 'phase'; Eq $W.new.Sha $s.manifest_sha 'new pins manifest_sha'; Ok (-not [string]$s.manifest_sha_prev) "manifest_sha_prev cleared by the init on dst [$($s.manifest_sha_prev)]"
+}
+T 'L.repin-flag-is-the-manifest-sha: the fake gate pins the --sha flag of init / init --repin and refuses (65 bad-request why=manifest-sha, nothing pinned) a flag that is not the sha256 of the stdin manifest (S4)' {
+  Fx-Copied; $A = (Get-St).manifest_sha; $S = Read-MoveState
+  $mk = { param($sha, $call) @('init', (Id), '--repin', '--dir', 'fwd', '--attempt', '1', '--sha', $sha, '--call', $call, '--budget', '10', '--serving', 'old', '--mark', 'null', '--dst-started', '0', '--phase', 'copied') }
+  $in = '{"manifest":' + (Get-Content -LiteralPath (Join-Path (MoveDir) 'manifest.json') -Raw).Trim() + '}'
+  $bad = 'e' * 64; $r = Invoke-MoveGate (Get-MoveMachine $S 'new') (& $mk $bad 'fwd-1-c.repin.7') $in 60 -Quiet
+  Eq $r.Code 65 "an unknown sha is refused ($($r.Lines -join ' '))"; Ok (($r.Lines -join ' ') -match 'why=manifest-sha') "why=manifest-sha: $($r.Lines -join ' ')"; Eq $W.new.Sha $A 'nothing pinned'
+  Ok (-not $W.new.Rec.ContainsKey('fwd-1-c.repin.7')) 'the refused call left no record'
+  # the sha of ANOTHER known manifest (B) with the stdin manifest A is refused too; the flag A with the manifest A is accepted and pinned
+  $W.Mf.holds[0].n_restarts = 7; [void](Get-ManifestLine $null); $B = $W.LastSha; Ok ($B -cne $A) 'fixture: a second manifest'
+  $r = Invoke-MoveGate (Get-MoveMachine $S 'new') (& $mk $B 'fwd-1-c.repin.8') $in 60 -Quiet
+  Eq $r.Code 65 "the flag B with the manifest A ($($r.Lines -join ' '))"; Ok (($r.Lines -join ' ') -match 'why=manifest-sha') 'why=manifest-sha (B with A)'; Eq $W.new.Sha $A 'nothing pinned'
+  $r = Invoke-MoveGate (Get-MoveMachine $S 'new') (& $mk $A 'fwd-1-c.repin.9') $in 60 -Quiet
+  Eq $r.Code 0 "the flag A with the manifest A ($($r.Lines -join ' '))"; Eq $W.new.Sha $A 'pinned the flag'
+}
+T 'L.rebuild-sha-prev: state.json lost inside the x.check .. x.repin-on-dst window (old pins B, new still pins A): `status --rebuild` reads each machine''s own pin (`MOVE manifest sha=` of rebuild read), sets manifest_sha = the src machine''s (B) and manifest_sha_prev = the dst machine''s (A); outside the window (both pin the same sha) manifest_sha_prev stays empty; the resumed cutover then goes through with no what=sha (rework R16 L2)' {
+  Fx-Copied; $A = (Get-St).manifest_sha
+  Add-Fault -M new -Key '^fwd-1-x\.repin$' -Mode never; Ans 'có'; $r1 = Run-Move @('cutover'); Ok ($r1.Code -ne 0) "the laptop died ($($r1.Text))"
+  $B = $W.LastSha; Ok ($B -cne $A) 'fixture: x.check re-pinned old'; Eq $W.old.Sha $B 'old pins B'; Eq $W.new.Sha $A 'new pins A'
+  [IO.File]::Delete((StatePath)); foreach ($n in 'old', 'new') { $W[$n].MoveId.old_addr = $OldAddr; $W[$n].MoveId.new_addr = $NewAddr }
+  $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild ($($rr.Text))"
+  $s = Get-St; Eq $s.manifest_sha $B 'manifest_sha = the src machine''s pin'; Eq $s.manifest_sha_prev $A 'manifest_sha_prev = the dst machine''s pin'; Eq $s.mark 'cutting' 'mark'
+  $r = Run-Move @('cutover'); Eq $r.Code 0 "resume ($($r.Text))"; Eq (Get-St).phase 'cut' 'phase'
+  Eq (@(LogNow -All | Where-Object { $_ -match ' (manifest-sha|sha)$' })).Count 0 "no refusal: $(@(LogNow -All | Where-Object { $_ -match ' (manifest-sha|sha)$' }))"
+  $s = Get-St; Eq $W.new.Sha $s.manifest_sha 'new pins manifest_sha'; Ok (-not [string]$s.manifest_sha_prev) 'manifest_sha_prev cleared'
+  # outside the window: both machines pin the same sha
+  Reset-World; Fx-Cut; $prep = { [IO.File]::Delete((StatePath)); foreach ($n in 'old', 'new') { if ($W[$n].MoveId) { $W[$n].MoveId.old_addr = $OldAddr; $W[$n].MoveId.new_addr = $NewAddr } } }
+  & $prep; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild at cut ($($rr.Text))"; $s = Get-St; Eq $s.manifest_sha $W.old.Sha 'manifest_sha'; Ok (-not [string]$s.manifest_sha_prev) "no manifest_sha_prev outside the window [$($s.manifest_sha_prev)]"
+  # a manual back (src = new, dst = old): the laptop dies after the back's x.check, before x.repin on old; the rebuild reads new's pin (C) as manifest_sha and old's (B) as manifest_sha_prev
+  Reset-World; Fx-Cut; $B0 = $W.old.Sha
+  Add-Fault -M old -Key '^back-2-x\.repin$' -Mode never; Ans 'YES'; $r1 = Run-Move @('back'); Ok ($r1.Code -ne 0) "the laptop died in the back ($($r1.Text))"
+  $C = $W.LastSha; Ok ($C -cne $B0) 'fixture: the back''s x.check re-pinned new'; Eq $W.new.Sha $C 'new pins C'; Eq $W.old.Sha $B0 'old still pins B'
+  & $prep; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild in the back ($($rr.Text))"
+  $s = Get-St; Eq $s.dir 'back' 'dir'; Eq $s.manifest_sha $C 'back: manifest_sha = the src machine''s (new) pin'; Eq $s.manifest_sha_prev $B0 'back: manifest_sha_prev = the dst machine''s (old) pin'
+  Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "resume of the back ($($r.Text))"; Eq (ShaRefusals).Count 0 "back: no what=sha refusal: $(ShaRefusals)"
+  $s = Get-St; Eq $W.old.Sha $s.manifest_sha 'back: old pins manifest_sha'; Ok (-not [string]$s.manifest_sha_prev) 'back: manifest_sha_prev cleared'
+}
+# the server stores manifest.json as jsontool wrote it (the text + a final LF) next to a sha256 of the text without it; `rebuild read` gzips the stored bytes. The laptop's rebuild must accept both that form and a
+# stored form with no LF (exact bytes), so the pins of both machines are read and manifest_sha_prev is recovered (R16 round 4, Astra P2)
+foreach ($lf in $true, $false) {
+  T "L.rebuild-manifest-forms: stored manifest $(if ($lf) { 'with' } else { 'without' }) a final LF: the rebuild in the x.check .. x.repin-on-dst window reads both pins (manifest_sha = old's B, manifest_sha_prev = new's A); a failed x.repin on new in the resume ends in the plain rollback whose r.stop-dst on new carries A (no what=sha); after both repins the rebuild still reads the pin" {
+    $W.StoredLf = $lf; Fx-Copied; $A = (Get-St).manifest_sha
+    Add-Fault -M new -Key '^fwd-1-x\.repin$' -Mode never; Ans 'có'; $r1 = Run-Move @('cutover'); Ok ($r1.Code -ne 0) "the laptop died ($($r1.Text))"
+    $B = $W.LastSha; Ok ($B -cne $A) 'fixture: x.check re-pinned old'; Eq $W.new.Sha $A 'new pins A (x.repin never reached it)'
+    [IO.File]::Delete((StatePath)); foreach ($n in 'old', 'new') { $W[$n].MoveId.old_addr = $OldAddr; $W[$n].MoveId.new_addr = $NewAddr }
+    $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild ($($rr.Text))"
+    $s = Get-St; Eq $s.manifest_sha $B 'manifest_sha = the src pin'; Eq $s.manifest_sha_prev $A 'manifest_sha_prev = the dst pin (the LF form is validated)'
+    Add-Fault -M new -Key '^fwd-1-x\.repin$' -Rc 1; $r = Run-Move @('cutover'); Eq $r.Code 10 "resume, x.repin on new fails: plain rollback ($($r.Text))"
+    Eq (@(CallShas 'new' '^fwd-1-r\.stop-dst$')[0]) $A 'r.stop-dst on new carries A'; Eq (ShaRefusals).Count 0 "no what=sha refusal: $(ShaRefusals)"
+    # both machines pinned B (a second cutover to the end), the state lost again: the rebuild reads the pin of each
+    Reset-World; $W.StoredLf = $lf; Fx-Cut; $B2 = $W.old.Sha; Eq $W.new.Sha $B2 'both machines pin the same sha after the cutover'
+    [IO.File]::Delete((StatePath)); foreach ($n in 'old', 'new') { $W[$n].MoveId.old_addr = $OldAddr; $W[$n].MoveId.new_addr = $NewAddr }
+    $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild at cut ($($rr.Text))"; $s = Get-St; Eq $s.manifest_sha $B2 'manifest_sha = the pin'; Ok (-not [string]$s.manifest_sha_prev) 'no manifest_sha_prev'
+  }
+}
+# P1 chain (review-rest-r3): after a fwd cutover the laptop state keeps dst_started=true; a back's write-ahead must clear it for the back (its dst has not started), so b.init-old is sent with --dst-started 0 and a back
+# rebuilt between x.freeze and x.repin resumes at step 2 (x.check ... x.final), never at step 8 (old started while new still runs its holds)
+T 'L.back-rebuild-resume-step: b.init-new / b.init-old of a manual back carry --dst-started 0; the laptop dies after the back''s x.freeze, state.json lost, `status --rebuild` then `back`: dst_started is false, the resume runs x.check, x.repin, x.stop-src, x.stop-dst and x.final on new BEFORE old''s x.start, and ends back-done' {
+  Fx-Cut; Eq (Get-St).dst_started $true 'fixture: the fwd cutover leaves dst_started=true in the laptop state'
+  Add-Fault -M new -Key '^back-2-x\.freeze$' -Rc 0 -Mode kill; Ans 'YES'; $r1 = Run-Move @('back'); Ok ($r1.Code -ne 0) "the laptop died after x.freeze ($($r1.Text))"
+  foreach ($c in 'b.init-new', 'b.init-old') { $x = @(RecCalls -All | Where-Object { $_.Call -ceq "back-2-$c" })[0]; Ok ($null -ne $x) "$c was sent"; Eq $x.Flags['dst-started'] '0' "$c carries --dst-started 0" }
+  Eq $W.old.MoveId.dst_started '0' 'old''s move-id: the back''s dst has not started'; Eq $W.new.MoveId.dst_started '0' 'new''s move-id'
+  [IO.File]::Delete((StatePath)); foreach ($n in 'old', 'new') { $W[$n].MoveId.old_addr = $OldAddr; $W[$n].MoveId.new_addr = $NewAddr }
+  $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild ($($rr.Text))"
+  $s = Get-St; Eq $s.dir 'back' 'dir'; Eq $s.mark 'cutting' 'mark'; Eq $s.dst_started $false 'rebuilt dst_started = false'
+  $script:FinalFirst = $null; $W.Hooks['x.start'] = { param($m, $e) if ($m.Name -ceq 'old') { $script:FinalFirst = ($W.new.Rec.ContainsKey('back-2-x.final') -and [int]$W.new.Rec['back-2-x.final'].Rc -eq 0 -and [int]$W.new.Active -eq 0) } }
+  Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "resume ($($r.Text))"
+  Eq $script:FinalFirst $true 'old''s x.start came after new''s x.final, new stopped'
+  foreach ($c in 'x.check', 'x.repin', 'x.stop-src', 'x.final') { Ok ((SentAny "^back-2-$([regex]::Escape($c))$") -ge 1) "$c ran in the resume" }
+  Eq (ShaRefusals).Count 0 "no what=sha refusal: $(ShaRefusals)"; Eq (Get-St).phase 'back-done' 'phase'
+}
+T 'L.repin-dst-fail-rollback: x.check rc 0 (old pinned B), x.repin on new fails (new still holds A): the plain rollback sends r.stop-dst to new with A and old''s r.* with B, so no what=sha; ends exit 10, rolled-back, old serving (ruling 06/11 (33), D1b)' {
+  Fx-Copied; $A = (Get-St).manifest_sha
+  Add-Fault -M new -Key '^fwd-1-x\.repin$' -Rc 1; Ans 'có'; $r = Run-Move @('cutover'); Eq $r.Code 10 "plain rollback ($($r.Text))"
+  $B = $W.LastSha; Ok ($B -cne $A) 'fixture: x.check re-pinned old'; Eq $W.old.Sha $B 'old holds B'; Eq $W.new.Sha $A 'new still holds A'
+  Eq (Sent 'old' '^fwd-1-x\.repin$') 0 'x.repin on src is never sent after dst failed'
+  $s = Get-St; Eq $s.phase 'rolled-back' 'phase'; Eq $s.serving 'old' 'serving'
+  Eq (Sent 'new' '^fwd-1-r\.stop-dst$') 1 'r.stop-dst on new'; Eq (@(CallShas 'new' '^fwd-1-r\.stop-dst$')[0]) $A 'r.stop-dst on new carries A'
+  foreach ($st in 'r.start-src', 'r.unfreeze-src', 'r.health-src') { Eq (@(CallShas 'old' "^fwd-1-$([regex]::Escape($st))$")[0]) $B "$st on old carries B" }
+  Eq (ShaRefusals).Count 0 "no what=sha refusal: $(ShaRefusals)"
+  Eq $W.old.Active $Holds 'old serves again'; Eq $W.old.Frozen $false 'old unfrozen'; Eq $W.new.Active 0 'new stays stopped'
+  # the move is not wedged: the next copy and cutover go through (nothing refused what=sha, new ends pinned to the manifest of the second x.check)
+  $r = Run-Move @('copy'); Eq $r.Code 0 "copy after the rollback ($($r.Text))"; Eq (Get-St).phase 'copied' 'copied again'
+  Ans 'có'; $r = Run-Move @('cutover'); Eq $r.Code 0 "second cutover ($($r.Text))"; Eq (Get-St).phase 'cut' 'cut'
+  Eq (ShaRefusals).Count 0 "second try: no what=sha refusal: $(ShaRefusals)"; $s = Get-St; Eq $W.old.Sha $s.manifest_sha 'old pinned to the saved sha'; Eq $W.new.Sha $s.manifest_sha 'new pinned to the saved sha'; Ok (-not [string]$s.manifest_sha_prev) 'manifest_sha_prev cleared'
+}
+# ============================== DECISION-r2 (B41): the Q-back project list against the back's x.check ==============================
+# Q-back shows the `INV warn back-new-only kind=project name=<n>` names of 0c; the laptop stores them (answers{'back-new-projects'}). The back's x.check lists the names again
+# (the registry files of new, pinned by the back); a name it lists that Q-back did not show stops the back after the re-pin is saved, as E-R19 (new restarted and unfrozen,
+# phase=cut serving=new mark=null, exit 1, no x.repin). A name Q-back showed and x.check no longer lists never stops; no stored list (rebuilt state) = no compare.
+function Back-Projects([string[]]$Qback, [string[]]$Check) {
+  Fx-Cut; $W.CheckOnlyOut = @('INV ok') + @($Qback | ForEach-Object { "INV warn back-new-only kind=project name=$_" }); $W.CheckProjects = @($Check)
+}
+$DriftLine = 'Máy mới có dự án đăng ký sau khi hỏi Q-back: {0}; chạy lại  fcode move back  để xem lại danh sách.'
+T 'L.back-new-projects-drift: Q-back showed app9, the back''s x.check lists app9 and app10: the laptop saves the re-pin, prints the drift line naming app10, then ends as E-R19 (r.start-src + r.unfreeze-src on new carrying the re-pin sha, phase=cut serving=new mark=null, exit 1), no x.repin sent; `back` again shows both names at Q-back and goes through (DECISION-r2 T10.2)' {
+  Back-Projects @('app9') @('app9', 'app10')
+  Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code 1 "the back stops ($($r.Text))"
+  $d = $DriftLine -f 'app10'; HasText $d; HasText 'Chuyển ngược không xong; máy mới vẫn phục vụ như trước.'
+  Ok ($r.Text.IndexOf($d) -lt $r.Text.IndexOf('Chuyển ngược không xong')) 'the drift line comes before the E-R19 line'
+  Eq (SentAny '-x\.repin$') 0 'no x.repin sent'; $C = $W.LastSha
+  $s = Get-St; Eq $s.manifest_sha $C 'the re-pin of x.check is saved'; Eq ([string]$s.answers.'back-new-projects') 'app9' 'the stored Q-back list'
+  Eq $s.phase 'cut' 'phase'; Eq $s.serving 'new' 'serving'; Ok ($null -eq $s.mark) 'mark'; Eq $s.dir 'back' 'dir'
+  foreach ($st in 'r.start-src', 'r.unfreeze-src') { Eq (Sent 'new' "^back-2-$([regex]::Escape($st))$") 1 "$st on new"; Eq (@(CallShas 'new' "^back-2-$([regex]::Escape($st))$")[0]) $C "$st carries the x.check re-pin sha" }
+  Eq (ShaRefusals).Count 0 "no what=sha refusal: $(ShaRefusals)"; Eq $W.new.Frozen $false 'new unfrozen'; Eq $W.new.Active $Holds 'new serves'
+  # `back` again: Q-back lists both names (0c sees app10 now), the back goes through
+  $W.CheckOnlyOut = @('INV ok', 'INV warn back-new-only kind=project name=app9', 'INV warn back-new-only kind=project name=app10')
+  Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "back again ($($r.Text))"; Eq (Get-St).phase 'back-done' 'phase'; Eq ([string](Get-St).answers.'back-new-projects') 'app10 app9' 'the stored list is the new one (sorted)'
+  Eq (Sent 'old' '^back-3-x\.repin$') 1 'x.repin on old in the second back'
+}
+T 'L.back-new-projects-retry-precheck: a drift stop leaves the machines at back/N (b.init-* carried N); `back` again sends its 0c `plan <id> --check-only` with --dir back --attempt N (the server exempts back/N+1 only against a stored fwd), reaches Q-back (both names listed) with no what=attempt refusal, then b.init-* carry N+1 and the back ends back-done' {
+  Back-Projects @('app9') @('app9', 'app10')
+  Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code 1 "the first back stops on the drift ($($r.Text))"
+  $p1 = @(Calls | Where-Object { $_.Step -ceq 'plan:check-only' }); Ok ($p1.Count -ge 1) 'the first 0c was sent'; Eq $p1[0].Flags['attempt'] '2' 'the first 0c: attempt = stored fwd attempt + 1'; Eq $p1[0].Flags['dir'] 'back' 'the first 0c: dir back'
+  Eq $W.new.MoveId.dir 'back' 'new holds back'; Eq "$($W.new.MoveId.attempt)" '2' 'new holds attempt 2'
+  $W.CheckOnlyOut = @('INV ok', 'INV warn back-new-only kind=project name=app9', 'INV warn back-new-only kind=project name=app10'); $n0 = $W.Prompts.Count
+  Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "back again ($($r.Text))"
+  $p2 = @(Calls | Where-Object { $_.Step -ceq 'plan:check-only' }); Ok ($p2.Count -ge 1) 'the 0c was sent again'; Eq $p2[0].Flags['dir'] 'back' 'dir'; Eq $p2[0].Flags['attempt'] '2' 'the 0c carries the stored back attempt N, not N+1'
+  Eq @(LogNow -All | Where-Object { $_ -match 'plan:check-only refused' }).Count 0 "no precheck refusal: $(@(LogNow -All | Where-Object { $_ -match 'plan:check-only refused' }))"
+  $q = @(Lines -Last | Where-Object { $_ -match '\AChuyển ngược về máy cũ' }); Eq $q.Count 1 'Q-back was asked'; Ok ($q[0] -match 'name=app9' -and $q[0] -match 'name=app10') "Q-back lists both names: $($q[0])"
+  foreach ($c in 'b.init-new', 'b.init-old') { $x = @(RecCalls | Where-Object { $_.Call -ceq "back-3-$c" }); Eq $x.Count 1 "$c of attempt 3 sent" }
+  Eq (Get-St).phase 'back-done' 'phase'; Eq (Get-St).attempt 3 'attempt'
+}
+T 'L.precheck-identity: the fake gate compares the 0c `plan <id> --check-only` like the server: back/stored+1 is exempt only against a stored fwd; every other dir/attempt, another id and another sha are refused 65 (what=dir, what=attempt, other-move, what=sha), and nothing is written' {
+  Fx-Cut; $S = Read-MoveState; $id = Id; $sha = $W.new.Sha
+  $go = { param($dir, $att, $mid, $sh) Invoke-MoveGate (Get-MoveMachine $S 'new') @('plan', $mid, '--dir', $dir, '--attempt', "$att", '--sha', $sh, '--serving', 'new', '--check-only') '' 60 -Quiet }
+  $chk = { param($r, $code, $why, $what) Eq $r.Code $code "$what ($($r.Lines -join ' '))"; if ($why) { Ok (($r.Lines -join ' ') -match [regex]::Escape($why)) "$what : [$why] in $($r.Lines -join ' ')" } }
+  # stored fwd/1
+  & $chk (& $go 'back' 2 $id $sha) 0 $null 'back/2 against fwd/1 (the exemption)'
+  & $chk (& $go 'back' 3 $id $sha) 65 'what=dir' 'back/3 against fwd/1'
+  & $chk (& $go 'back' 1 $id $sha) 65 'what=dir' 'back/1 against fwd/1 (dir differs)'
+  & $chk (& $go 'fwd' 2 $id $sha) 65 'what=attempt' 'fwd/2 against fwd/1'
+  & $chk (& $go 'fwd' 1 $id $sha) 0 $null 'fwd/1 against fwd/1'
+  & $chk (& $go 'back' 2 'mv-20260101000000-abcdef' $sha) 65 'other-move' 'another move-id'
+  & $chk (& $go 'back' 2 $id ('e' * 64)) 65 'what=sha' 'another sha'
+  # stored back/2 (after a drift stop): the exemption is gone
+  $W.new.MoveId.dir = 'back'; $W.new.MoveId.attempt = 2
+  & $chk (& $go 'back' 3 $id $sha) 65 'what=attempt' 'back/3 against back/2 (no exemption against a stored back)'
+  & $chk (& $go 'back' 2 $id $sha) 0 $null 'back/2 against back/2'
+  & $chk (& $go 'fwd' 2 $id $sha) 65 'what=dir' 'fwd/2 against back/2'
+  Eq $W.new.MoveId.dir 'back' 'nothing written'; Eq "$($W.new.MoveId.attempt)" '2' 'nothing written (attempt)'
+  # a machine with an empty pin refuses every sha (the server reads cur=""), a machine with no move-id answers no-move (mode call)
+  $W.new.Sha = ''; & $chk (& $go 'back' 2 $id $sha) 65 'what=sha' 'a move-id with no pin'
+  $W.new.MoveId = $null; & $chk (& $go 'back' 2 $id $sha) 65 'no-move' 'a machine with no move-id'
+}
+T 'L.back-new-projects-same: Q-back and x.check list the same names: no stop, x.repin and on, back-done; answers{back-new-projects} holds the sorted names' {
+  Back-Projects @('app9', 'app10') @('app10', 'app9')
+  Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "back ($($r.Text))";
+  Ok (-not ($r.Text -match 'Máy mới có dự án đăng ký sau khi hỏi Q-back')) 'no drift line'; Eq (Sent 'old' '^back-2-x\.repin$') 1 'x.repin on old'
+  Eq ([string](Get-St).answers.'back-new-projects') 'app10 app9' 'stored list'
+}
+T 'L.back-new-projects-none: Q-back showed no project and x.check lists none: the stored list is empty and nothing stops' {
+  Back-Projects @() @()
+  Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "back ($($r.Text))"; Eq @((Get-St).answers.'back-new-projects').Count 0 'empty stored list'
+}
+T 'L.back-new-projects-removed: Q-back showed app9 and app8, x.check lists app9 only: nothing new, no stop (subset, not equality), x.repin sent' {
+  Back-Projects @('app9', 'app8') @('app9')
+  Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "back ($($r.Text))"; Ok (-not ($r.Text -match 'Máy mới có dự án đăng ký sau khi hỏi Q-back')) 'no drift line'; Eq (Sent 'old' '^back-2-x\.repin$') 1 'x.repin on old'
+}
+T 'L.back-new-projects-resume: the laptop died after the back''s x.check rc 0 (the same names as Q-back): `back` replays x.check, the stored list leaves nothing new, no stop, the back goes through' {
+  Back-Projects @('app9') @('app9')
+  Add-Fault -M new -Key '^back-2-x\.check$' -Rc 0 -Mode kill; Ans 'YES'; $r1 = Run-Move @('back'); Ok ($r1.Code -ne 0) "the laptop died ($($r1.Text))"
+  Eq ([string](Get-St).answers.'back-new-projects') 'app9' 'the list survived in the state'
+  Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "resume ($($r.Text))"; Eq (Sent 'new' '^back-2-x\.check$') 0 'x.check replayed, not run'; Eq (SentAny '^back-2-x\.check$') 1 'x.check sent again'
+  Ok (-not ($r.Text -match 'Máy mới có dự án đăng ký sau khi hỏi Q-back')) 'no drift line'; Eq (ShaRefusals).Count 0 "no what=sha refusal: $(ShaRefusals)"
+}
+T 'L.back-new-projects-rebuilt: a rebuilt state has no stored list (rebuild cannot know what Q-back showed): the resumed back compares nothing and goes through even though x.check lists a name' {
+  Back-Projects @('app9') @('app9', 'app10')
+  Add-Fault -M new -Key '^back-2-x\.check$' -Rc 0 -Mode kill; Ans 'YES'; $r1 = Run-Move @('back'); Ok ($r1.Code -ne 0) "the laptop died ($($r1.Text))"
+  [IO.File]::Delete((StatePath)); foreach ($n in 'old', 'new') { $W[$n].MoveId.old_addr = $OldAddr; $W[$n].MoveId.new_addr = $NewAddr }
+  $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild ($($rr.Text))"; Ok ($null -eq (Get-St).answers.'back-new-projects') 'no stored list after the rebuild'
+  Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "resume ($($r.Text))"; Ok (-not ($r.Text -match 'Máy mới có dự án đăng ký sau khi hỏi Q-back')) 'no drift line'; Eq (Sent 'old' '^back-2-x\.repin$') 1 'x.repin on old'
 }
 T 'L.status-no-init: status and check never run the agreement check: no init or other recorded call even when the machines disagree' {
   Fx-RolledBack; [void](Patch-St @{ attempt = 2 })   # the write-ahead of a new attempt, then a crash: both machines still hold attempt 1
