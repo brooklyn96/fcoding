@@ -1371,6 +1371,7 @@ function Get-MoveText([string]$Key, [hashtable]$F = @{}) {
     'rewrites-remedy' { 'ghi rõ `<from>=<to>`' }
     'ingress-remedy' { 'đổi service của tên đó trong cấu hình tunnel sang 127.0.0.1 hoặc tên container' }
     'connector-remedy' { 'kiểm tra cổng metrics của connector rồi chạy lại' }
+    'root-link' { 'Đường <đường dẫn> là symlink ngay dưới / nằm trong phần chuyển; hãy chuyển thư mục đích thay cho link, hoặc tạo lại link bằng tay trên máy mới' }   # B45 (ruling 06/11 (a)): `MOVE error bad-request why=root-link path=<p>`
     default { throw "Get-MoveText: $Key" }
   }
   foreach ($k in $F.Keys) { $t = $t.Replace("<$k>", [string]$F[$k]) }
@@ -1481,6 +1482,8 @@ error keys-race | File authorized_keys bị sửa cùng lúc
 # one INV / MOVE / GATE_ERROR line as the owner reads it ('' = not shown)
 function Format-MoveLine([string]$Line) {
   $l = "$Line"
+  # B45: a symlink directly under / that the plan would move is refused (the server's own `LOG remedy root-link` line is never shown): the owner label carries the remedy
+  if ($l -cmatch '\AMOVE error bad-request why=root-link path=(\S+)\z') { return (Get-MoveText 'root-link' @{ 'đường dẫn' = $Matches[1] }) }
   if ($l -cmatch '\AINV (refuse|warn) (\S+)(.*)\z' -or $l -cmatch '\AMOVE (error) (\S+)(.*)\z') {
     $lab = (Get-MoveLabels)["$($Matches[1]) $($Matches[2])"]; $rest = $Matches[3].Trim()
     if (-not $lab) { return $l }
@@ -2149,6 +2152,7 @@ function Get-MoveBudget($S, [string]$Step, [string]$Machine) {
     { $_ -in 'x.start', 'x.enable.N', 'r.start-src' } { Get-MoveStartBudget $M; break }
     'x.switch' { Get-MoveSwitchBudget $M; break }
     'c.init-new' { [int](Get-MoveTargetStopBudget $S) + 60; break }
+    'c.prepare.N' { (Get-MoveConst 'other_s') + 1800; break }   # D.0.6 / CONTRACT §5: 300 + the apt-get bound 1800 (B.7.3 installs the manual packages in prepare); x.prepare-id stays 300
     'x.check' { if ($script:MoveCheckOnlyS) { 3 * [int]$script:MoveCheckOnlyS + 60 } else { Get-MoveConst 'other_s' }; break }
     default { Get-MoveConst 'other_s' }
   }
@@ -2203,6 +2207,31 @@ function Invoke-MoveCall($S, [string]$Machine, [string]$Step, [string[]]$VArgs =
     if ([string]$st.Kv['call'] -ceq $id -and [string]$st.Kv['call_state'] -ceq 'failed') { Set-MoveNetLoss $r.Lines; return @{ Code = $(if ("$($st.Kv['rc'])" -match '\A[0-9]+\z') { [int]$st.Kv['rc'] } else { 1 }); Lines = $r.Lines; Id = $id; Known = $true } }
   }
   if (-not $r.Known) { $script:MoveNoAnswer = $true; return @{ Code = -1; Lines = $r.Lines; Id = $id; Known = $false } }
+  # a dst call that carried manifest_sha_prev (A) and was refused `what=sha`: dst already pins B (a lost x.repin that ran to the end: the ssh dropped, the
+  # unit did not stop). The refusal leaves no record, so the same id is sent once more with manifest_sha; any answer but that refusal shows dst pins it and clears prev
+  if ($sha -cne [string]$S.manifest_sha -and $r.Code -eq 65 -and @($r.Lines | Where-Object { "$_" -cmatch '\AMOVE error move-id-mismatch what=sha\b' }).Count) {
+    $w2 = @($words); $w2[[Array]::IndexOf($w2, '--sha') + 1] = [string]$S.manifest_sha
+    $r2 = Invoke-MoveGate $mach $w2 $Stdin ($budget + 60) -Quiet:$Quiet
+    Add-MoveLog $mach.Alias $id $r2.Lines
+    if ($r2.Known) {
+      $r = $r2
+      if (-not @($r2.Lines | Where-Object { "$_" -cmatch '\AMOVE error move-id-mismatch what=sha\b' }).Count) { Set-MoveProp $S 'manifest_sha_prev' ''; Save-MoveState $S }
+    }
+  }
+  # a call to the SRC machine refused `what=sha` (it carried manifest_sha A): an x.check whose answer was lost (no GATE_EXIT, the one I16 status failed) may
+  # have run to the end and pinned B on src (`ssh loss never stops the unit`), and the rollback that follows would be refused on every r.* call. The refusal leaves
+  # no record, so this attempt's x.check id is replayed (a done record answers with its stored out, whatever sha it carries; not done = refused again, nothing
+  # runs), B is taken from its `MOVE manifest` line (prev := A, as at the x.check rc 0), and the refused call is re-sent once with the new sha. B39: a src call
+  # carries the manifest it was refused for only after the laptop saw the pin
+  if ($Step -cne 'x.check' -and $verb[0] -cne 'init' -and $r.Code -eq 65 -and $Machine -ceq (Get-MoveSide $S 'src') -and @($r.Lines | Where-Object { "$_" -cmatch '\AMOVE error move-id-mismatch what=sha\b' }).Count) {
+    $xc = Invoke-MoveCall $S $Machine 'x.check' @() (Get-MovePlanStdin $S @(Get-MoveMapText) $Machine) -Quiet
+    if ($xc.Code -eq 0 -and (Set-MoveCheckManifest $S $xc.Lines)) {
+      $w3 = @($words); $w3[[Array]::IndexOf($w3, '--sha') + 1] = (Get-MoveCallSha $S $Machine $false)
+      $r3 = Invoke-MoveGate $mach $w3 $Stdin ($budget + 60) -Quiet:$Quiet
+      Add-MoveLog $mach.Alias $id $r3.Lines
+      if ($r3.Known) { $r = $r3 }
+    }
+  }
   foreach ($l in $r.Lines) {
     if ("$l" -cmatch '\AMOVE call id=(\S+) rc=([0-9]+) dur_s=([0-9]+)\z' -and $Matches[1] -ceq $id) {
       $o = Get-MoveProp $S.dur $Step; if ($null -eq $o) { $o = [pscustomobject]@{}; Set-MoveMapVal $S.dur $Step $o }
@@ -2212,6 +2241,17 @@ function Invoke-MoveCall($S, [string]$Machine, [string]$Step, [string[]]$VArgs =
   if ($r.Code -eq 0 -and $verb[0] -ceq 'init' -and (Get-MoveProp $S 'manifest_sha_prev' '') -and $Machine -ceq (Get-MoveSide $S 'dst')) { Set-MoveProp $S 'manifest_sha_prev' ''; Save-MoveState $S }   # dst now pins manifest_sha
   if ($r.Code -ne 0) { Set-MoveNetLoss $r.Lines }
   @{ Code = $r.Code; Lines = $r.Lines; Id = $id; Known = $true }
+}
+# x.check rc 0's `MOVE manifest` line (D.4 step 3): src re-pinned it, so manifest_sha = B and the manifest is saved; manifest_sha_prev = the sha dst still pins
+# (set only when empty and the sha changes: a resumed or replayed x.check, B already saved, never overwrites A); the `INV warn transient-excluded` names are kept.
+# $false when the lines carry no usable manifest line (missing, bad gzip/base64, sha mismatch): nothing is changed then
+function Set-MoveCheckManifest($S, $Lines) {
+  $mf = ConvertFrom-MoveManifestLine $Lines
+  if (-not $mf) { return $false }
+  if (-not (Get-MoveProp $S 'manifest_sha_prev' '') -and [string]$S.manifest_sha -cne $mf.Sha) { Set-MoveProp $S 'manifest_sha_prev' ([string]$S.manifest_sha) }
+  Set-MoveProp $S 'manifest_sha' $mf.Sha; Save-MoveManifest $mf.Text; $script:MoveManifest = @{ Text = $mf.Text; Obj = $mf.Obj }; Save-MoveState $S
+  $tr = @($Lines | Where-Object { $_ -cmatch '\AINV warn transient-excluded unit=' } | ForEach-Object { if ($_ -cmatch 'unit=(\S+)') { $Matches[1] } }); if ($tr.Count) { Set-MoveAnswer $S 'transient-excluded' @($tr); Save-MoveState $S }
+  $true
 }
 # the --sha of a call to $Machine: manifest_sha_prev (A) for a dst call that pins no manifest while it is set, else manifest_sha
 function Get-MoveCallSha($S, [string]$Machine, [bool]$Pins) {
@@ -2258,8 +2298,13 @@ function Sync-MoveAgreement($S) {
       return (Write-MoveNoAnswer ([string]$(if ($m -ceq 'old') { $S.old.alias } else { $S.new.alias })) 'khi đọc status' $st.Transport)
     }
     $script:MoveSeen[$m] = $st
-    if ([string]$st.Kv['move_id'] -cne [string]$S.move_id -or [string]$st.Kv['state'] -cne 'open') { continue }   # no move-id, another or a closed one: nothing of this move runs there (no re-init, no fence)
-    if ([string]$st.Kv['dir'] -cne [string]$S.dir -or [string]$st.Kv['attempt'] -cne "$($S.attempt)") {
+    # D.11 last row (W1-T10-G9): in phase planned a machine without a move-id is not a disagreement (copy's own c.init-* create it); in every other phase it is
+    # re-init-ed like one (a wiped or restored box); another or a closed move-id: nothing of this move runs there (no re-init, no fence)
+    if ([string]$st.Kv['move_id'] -ceq '-' -and [string]$S.phase -cne 'planned') {
+      $c = Invoke-MoveInit $S $m
+      if ($c -ne 0) { return $c }
+    } elseif ([string]$st.Kv['move_id'] -cne [string]$S.move_id -or [string]$st.Kv['state'] -cne 'open') { continue }
+    elseif ([string]$st.Kv['dir'] -cne [string]$S.dir -or [string]$st.Kv['attempt'] -cne "$($S.attempt)") {
       $c = Invoke-MoveInit $S $m
       if ($c -ne 0) { return $c }
     }
@@ -3115,13 +3160,7 @@ function Invoke-MoveCutSteps($S, [int]$From, [switch]$Carry) {
   if ($From -le 3 -and -not $Carry) {
     $r = Invoke-MoveCall $S $src 'x.check' @() (Get-MovePlanStdin $S @(Get-MoveMapText) $src)
     if ($r.Code -ne 0) { return (& $beforeStart 'x.check') }
-    $mf = ConvertFrom-MoveManifestLine $r.Lines
-    if ($mf) {
-      # the first re-pin of this cutover keeps the sha dst still holds; a resumed x.check (replay, B already saved) or a later one leaves it
-      if (-not (Get-MoveProp $S 'manifest_sha_prev' '') -and [string]$S.manifest_sha -cne $mf.Sha) { Set-MoveProp $S 'manifest_sha_prev' ([string]$S.manifest_sha) }
-      Set-MoveProp $S 'manifest_sha' $mf.Sha; Save-MoveManifest $mf.Text; $script:MoveManifest = @{ Text = $mf.Text; Obj = $mf.Obj }; Save-MoveState $S
-      $tr = @($r.Lines | Where-Object { $_ -cmatch '\AINV warn transient-excluded unit=' } | ForEach-Object { if ($_ -cmatch 'unit=(\S+)') { $Matches[1] } }); if ($tr.Count) { Set-MoveAnswer $S 'transient-excluded' @($tr); Save-MoveState $S }
-    }
+    if (-not (Set-MoveCheckManifest $S $r.Lines)) { Write-Host 'lỗi: x.check không trả manifest đọc được (thiếu dòng MOVE manifest, hoặc sha không khớp).'; return (& $beforeStart 'x.check') }   # never re-pin the stale plan over x.check's
     # B41: a project name x.check lists that Q-back did not show is never moved aside on old; stop as E-R19 (new restarted and unfrozen), after the re-pin
     # above is saved so that r.start-src / r.unfreeze-src carry new's pin. A name Q-back showed that is gone needs no stop; no stored list (rebuilt state) = no compare
     if ([string]$S.dir -ceq 'back' -and $S.answers.PSObject.Properties['back-new-projects']) {
@@ -3268,6 +3307,7 @@ function Invoke-MoveCarryBack($S, [switch]$Resume) {
   $script:MoveNoAnswer = $false   # D.5.2: the loss that led here was resolved by new's status answer (Complete-MoveCutFail 'carry'); this carry-back's own exit decides (B24)
   if (-not $Resume) {
     Write-Host 'Lỗi sau khi máy mới đã chạy: chép ngược dữ liệu về máy cũ (tự động)...'
+    [void]$S.answers.PSObject.Properties.Remove('back-new-projects')   # CONTRACT §4.1: a carry-back has no Q-back list (it runs no x.check); the write-ahead below saves it
     $w = Set-MoveWriteAhead $S @{ dir = 'back'; attempt = [int]$S.attempt + 1; phase = 'planned'; carry = $true }
     if ($w -ne 0) { return $(if ($w -eq 1 -and $script:MoveNoAnswer) { 1 } else { 70 }) }   # this write-ahead's own loss; a definite b.init failure stays 70
   }
@@ -3550,6 +3590,11 @@ function Invoke-MoveBackRun($S) {
   if ($f.Code -eq 0) { $c = Invoke-MoveChores $S; if ($c -ne 0) { return $c }; return 0 }
   Complete-MoveCutFail $S $f
 }
+# a fresh unrecorded status of $Machine: its move-id is this move's and `finished`
+function Test-MoveSideFinished($S, [string]$Machine) {
+  $st = Get-MoveStatus $S $Machine -Quiet
+  [bool]($st.Ok -and [string]$st.Kv['move_id'] -ceq [string]$S.move_id -and [string]$st.Kv['state'] -ceq 'finished')
+}
 # D.7 finish, "new healthy now" (I27; W1-T10-G18, W1-T11-DG-T11-5): new's unrecorded status answers GATE_EXIT 0, no call running,
 # frozen=0, and hold_active equal to the number of non-follower holds of hold_sets.start
 function Test-MoveFinishHealth($S) {
@@ -3568,8 +3613,19 @@ function Invoke-MoveFinishCmd($S) {
   $a = Read-MoveAnswer (Get-MoveText 'Q-finish') @('YES')
   if ($a -cne 'YES') { Write-Host 'Đã hủy, chưa làm gì.'; return (Get-MoveDeclinedExit) }
   Set-MoveAnswer $S 'Q-finish' 'YES'
-  $r = Invoke-MoveCall $S 'old' 'f.old'; if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
-  $r = Invoke-MoveCall $S 'new' 'f.new'; if ($r.Code -ne 0) { return (ConvertTo-MoveExit $r.Code) }
+  # D.11 `finished: finish idempotent`: a finish that ran f.old (or f.new) but did not record the end is re-run; the door of a finished old answers only
+  # `--move status` (`moved`), so a machine whose move-id is already this move's finished is skipped, and a refusal / lost answer from one that
+  # turns out finished is the call done
+  if (Test-MoveSideFinished $S 'old') { Write-Host "máy '$($S.old.alias)' đã kết thúc (f.old); bỏ qua." }
+  else {
+    $r = Invoke-MoveCall $S 'old' 'f.old'
+    if ($r.Code -ne 0 -and -not (Test-MoveSideFinished $S 'old')) { return (ConvertTo-MoveExit $r.Code) }
+  }
+  if (Test-MoveSideFinished $S 'new') { Write-Host "máy '$($S.new.alias)' đã kết thúc (f.new); bỏ qua." }
+  else {
+    $r = Invoke-MoveCall $S 'new' 'f.new'
+    if ($r.Code -ne 0 -and -not (Test-MoveSideFinished $S 'new')) { return (ConvertTo-MoveExit $r.Code) }
+  }
   Set-MoveProp $S 'phase' 'finished'; Save-MoveState $S
   Write-Host "Đã kết thúc chuyển máy. Máy mới '$($S.new.alias)' đang phục vụ; máy cũ '$($S.old.alias)' đã tắt ứng dụng (giữ 7 ngày rồi hủy)."
   0
