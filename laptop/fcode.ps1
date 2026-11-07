@@ -1762,13 +1762,14 @@ function Get-MoveRsyncShapes {
     }
   }
 }
-# CONTRACT §3.5 (B.5.2; W1-T7-DG-T7-1; rulings 05/11 (22), (24)): the `platform` units (LIST platform-units) and paths (LIST platform-etc = /etc/instabox and the eight instabox files in /etc, no glob,
+# CONTRACT §3.5 (B.5.2; W1-T7-DG-T7-1; rulings 05/11 (22), (24), 07/11 B66 (a)): the `platform` units (LIST platform-units) and paths (LIST platform-etc = /etc/instabox, the eight instabox files in /etc and the six instabox.conf systemd drop-ins, no glob,
 # LIST platform-opt + the /usr/local list, in the order of MV_PLATFORM, each by its exact path; a directory entry covers what lies under it). One copy here: `preflight` and the 3b mixed-pair check read it.
 function Get-MovePlatformUnits { @('instabox-data-init.service', 'instabox-guest-agent.service', 'instabox-guest-reboot.service', 'instabox-identity.service', 'instabox-ssh-hostkeys.service', 'instabox-user.service', 'sshd.service') }
 function Get-MovePlatformPaths {
   $bin = 'bun bunx cargo cargo-clippy cargo-fmt cargo-miri claude clippy-driver codex corepack go gofmt instabox instabox-computer-use instabox-computer-use-proxy instabox-desktop instabox-mcp instabox-port mkswap node npm npx ocu opencode open-codex-computer-use-mcp open-computer-use open-computer-use-mcp pnpm pnpx rls rust-analyzer rustc rustdoc rustfmt rust-gdb rust-gdbgui rust-lldb rustup swapoff swapon uv uvx yarn yarnpkg'
   $sbin = 'instabox-data-init instabox-guest-agent instabox-identity instabox-preboot instabox-user'
-  $etc = @('/etc/instabox', '/etc/profile.d/instabox-universal.sh', '/etc/profile.d/instabox-tmpdir.sh', '/etc/profile.d/zz-instabox-secrets.sh', '/etc/profile.d/instabox-npm.sh', '/etc/sudoers.d/90-instabox-sudo', '/etc/sysctl.d/60-instabox-ping.conf', '/etc/tmpfiles.d/instabox-data-tmp.conf', '/etc/ssl/certs/instabox-proxy.pem')
+  $etc = @('/etc/instabox', '/etc/profile.d/instabox-universal.sh', '/etc/profile.d/instabox-tmpdir.sh', '/etc/profile.d/zz-instabox-secrets.sh', '/etc/profile.d/instabox-npm.sh', '/etc/sudoers.d/90-instabox-sudo', '/etc/sysctl.d/60-instabox-ping.conf', '/etc/tmpfiles.d/instabox-data-tmp.conf', '/etc/ssl/certs/instabox-proxy.pem') +
+    @('halt.target.d', 'poweroff.target.d', 'systemd-halt.service.d', 'systemd-poweroff.service.d', 'tmp.mount.d', 'user@1000.service.d' | ForEach-Object { "/etc/systemd/system/$_/instabox.conf" })
   $etc + @('/opt/containerd', '/opt/npm', '/opt/rust') + @($bin -split ' ' | ForEach-Object { "/usr/local/bin/$_" }) + @('/usr/local/etc/npmrc') + @($sbin -split ' ' | ForEach-Object { "/usr/local/sbin/$_" }) +
     @('/usr/local/share/ca-certificates/instabox-proxy.crt', '/usr/local/go', '/usr/local/include/node', '/usr/local/lib/instabox', '/usr/local/lib/node_modules', '/usr/local/share/doc', '/usr/local/share/instabox', '/usr/local/share/man/man1')
 }
@@ -2312,13 +2313,13 @@ function Test-MoveFrozen($Kv) { $f = [string]$Kv['frozen']; [bool]($f -and $f -c
 # F2 (D.5.1-D.5.3, D.9, E-R2, E-R4, E-R15): a new that does not answer status after the bounded retries (transport 255/124/-1) is marked
 # down ($script:MoveNewDown) and skipped, never a failure here; no other call goes to it in this verb (Invoke-Move picks the rows that
 # go on without it). Old not answering stays a failure.
-function Sync-MoveAgreement($S) {
+function Sync-MoveAgreement($S, [string]$Verb = '') {
   $script:MoveSeen = @{}; $script:MoveNewDown = $false
   if ([string]$S.phase -cin 'finished', 'aborted') { return 0 }
   $order = if ([string]$S.dir -ceq 'back') { @('new', 'old') } else { @('old', 'new') }   # b.init-new, b.init-old (D.5.2, D.8); c.init-old, c.init-new (D.3)
   foreach ($m in $order) {
-    # the first copy's probe of new: fwd, phase planned and no gate_id yet (copy (4) stores it) = the gate is not installed yet
-    $pre = [bool]($m -ceq 'new' -and [string]$S.dir -ceq 'fwd' -and [string]$S.phase -ceq 'planned' -and -not [string](Get-MoveProp $S 'gate_id' ''))
+    # the first copy's probe of new: verb copy, fwd, phase planned and no gate_id yet (copy (4) stores it) = the gate is not installed yet
+    $pre = [bool]($m -ceq 'new' -and $Verb -ceq 'copy' -and [string]$S.dir -ceq 'fwd' -and [string]$S.phase -ceq 'planned' -and -not [string](Get-MoveProp $S 'gate_id' ''))
     $st = Get-MoveStatus $S $m -Quiet -PreInstall:$pre
     for ($i = 2; $m -ceq 'new' -and -not $st.Known -and $st.Transport -in 124, 255, -1 -and $i -le (Get-MoveConst 'retries'); $i++) { Wait-Move 5; $st = Get-MoveStatus $S $m -Quiet -PreInstall:$pre }
     if (-not $st.Ok) {
@@ -3968,7 +3969,7 @@ function Invoke-MoveRun([string[]]$MoveArgs) {
     if (-not $S) { Write-Host 'Chưa có lần chuyển nào: chạy  fcode move plan <máy mới> --addr <địa chỉ>  trước.'; return 1 }
     if ($S.rebuilt -eq $true) { Write-Host "Trạng thái được dựng lại: giai đoạn $($S.phase), hướng $($S.dir), lần thử $($S.attempt)." }
     # D.11 order: (1) the K1 agreement check, (2) unknown outcomes by real state (inside each call), (3) the chore-0 pre-rule, (4) the row
-    $c = Sync-MoveAgreement $S; if ($c -ne 0) { return $c }
+    $c = Sync-MoveAgreement $S $verb; if ($c -ne 0) { return $c }
     $down = [bool]$script:MoveNewDown
     # D.5.3 / E-R4: new unreachable after dst_started in a fwd cutover in flight: no automatic action; Q-newlost. Not while a return to old is under way (`rolling-back`): then
     # `cutover` continues that return (rb-continue) instead of asking again
