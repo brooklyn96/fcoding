@@ -53,4 +53,4 @@ Cài đặt từng bước, ghép máy, mã QR, màn hình chính, lệnh laptop
 
 - Máy chủ: Node 22, chỉ thư viện có sẵn, toàn bộ trong `server.mjs`; hợp đồng máy chủ - app ở [CONTRACT.md](CONTRACT.md).
 - Thử: `node --test test/server.test.mjs` (không cần tmux) và `bash test/tmux-integration.sh` (cần tmux thật).
-- App iOS ở `ios/` (SwiftUI, XcodeGen); GitHub Actions dựng `fcode.ipa` không ký và đăng lên bản phát hành `latest`.
+- App iOS ở `ios/` (SwiftUI, XcodeGen); GitHub Actions dựng `fcode.ipa` không ký và đăng lên bản phát hành `latest` cùng mọi bản phát hành có số phiên bản (vX.Y.Z).
