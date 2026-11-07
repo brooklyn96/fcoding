@@ -1696,15 +1696,19 @@ function Complete-MoveResult($T, $Mach) {
   }
   @{ Code = $code; Known = $known; Lines = $lines; Transport = [int]$T.Code }
 }
-# `fcode-deploy-gate --move <words>` on a machine; $Stdin (text) travels as one base64 line
-function Invoke-MoveGate($Mach, [string[]]$Words, [string]$Stdin, [int]$TimeoutSec, [switch]$Quiet) {
+# `fcode-deploy-gate --move <words>` on a machine; $Stdin (text) travels as one base64 line. -PreInstall: the call is the agreement probe of a new
+# that has no gate yet (copy step 1, before copy (4) installs it): ssh's 127 (command not found) is then expected, not an unclear answer
+function Invoke-MoveGate($Mach, [string[]]$Words, [string]$Stdin, [int]$TimeoutSec, [switch]$Quiet, [switch]$PreInstall) {
   foreach ($w in $Words) { if (-not (Test-MoveWord $w)) { Write-Host "lỗi: tham số '$("$w" -replace '[\x00-\x1f\x7f]', '?')' không hợp lệ."; return @{ Code = 65; Known = $true; Lines = @(); Transport = 65 } } }
   $cmd = '/usr/local/sbin/fcode-deploy-gate --move ' + ($Words -join ' ')
   $in = ''
   if ($Stdin) { $cmd = 'base64 -di | ' + $cmd; $in = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Stdin)) + "`n" }
   $r = Complete-MoveResult (Invoke-MoveRemote $Mach $cmd $in $TimeoutSec) $Mach
   if (-not $Quiet) { Write-MoveLines $r.Lines }
-  if (-not $r.Known) { Write-Host "máy '$($Mach.Alias)' không trả lời rõ (không có GATE_EXIT; mã $($r.Transport))." }
+  if (-not $r.Known) {
+    if ($PreInstall -and $r.Transport -eq 127) { Write-Host "máy '$($Mach.Alias)' chưa có công cụ chuyển máy; sẽ cài ngay bây giờ." }
+    else { Write-Host "máy '$($Mach.Alias)' không trả lời rõ (không có GATE_EXIT; mã $($r.Transport))." }
+  }
   $r
 }
 # a bash script over plain ssh (before the gate exists on new): arguments in a `set --` line of the payload, never on the ssh command line
@@ -2290,10 +2294,10 @@ function Set-MoveNetLoss($Lines) { if (@($Lines | Where-Object { "$_" -cmatch '\
 # while a data-loss question (Q-back, Q-finish) answered with anything but YES ends 65 (refused, nothing done).
 function Get-MoveDeclinedExit { 65 }
 # `status` (unrecorded, 60 s), with the state's four side flags (D.0.1): @{ Ok; Code; Kv (the MOVE state words); Lines; Known; Transport }
-function Get-MoveStatus($S, [string]$Machine, [string[]]$Extra = @(), [switch]$Quiet) {
+function Get-MoveStatus($S, [string]$Machine, [string[]]$Extra = @(), [switch]$Quiet, [switch]$PreInstall) {
   $Mach = Get-MoveMachine $S $Machine
   $w = @('status', [string]$S.move_id, '--dir', [string]$S.dir, '--attempt', "$($S.attempt)", '--sha', (Get-MoveCallSha $S $Machine $false), '--serving', [string]$S.serving)
-  $r = Invoke-MoveGate $Mach (@($w) + @($Extra)) '' (Get-MoveConst 'status_s') -Quiet
+  $r = Invoke-MoveGate $Mach (@($w) + @($Extra)) '' (Get-MoveConst 'status_s') -Quiet -PreInstall:$PreInstall
   $kv = @{}; $line = @($r.Lines | Where-Object { $_ -cmatch '\AMOVE state ' } | Select-Object -First 1)
   if ($line.Count) { $kv = ConvertFrom-MoveKv $line[0] }
   if (-not $Quiet) { Write-MoveLines $r.Lines }
@@ -2313,8 +2317,10 @@ function Sync-MoveAgreement($S) {
   if ([string]$S.phase -cin 'finished', 'aborted') { return 0 }
   $order = if ([string]$S.dir -ceq 'back') { @('new', 'old') } else { @('old', 'new') }   # b.init-new, b.init-old (D.5.2, D.8); c.init-old, c.init-new (D.3)
   foreach ($m in $order) {
-    $st = Get-MoveStatus $S $m -Quiet
-    for ($i = 2; $m -ceq 'new' -and -not $st.Known -and $st.Transport -in 124, 255, -1 -and $i -le (Get-MoveConst 'retries'); $i++) { Wait-Move 5; $st = Get-MoveStatus $S $m -Quiet }
+    # the first copy's probe of new: fwd, phase planned and no gate_id yet (copy (4) stores it) = the gate is not installed yet
+    $pre = [bool]($m -ceq 'new' -and [string]$S.dir -ceq 'fwd' -and [string]$S.phase -ceq 'planned' -and -not [string](Get-MoveProp $S 'gate_id' ''))
+    $st = Get-MoveStatus $S $m -Quiet -PreInstall:$pre
+    for ($i = 2; $m -ceq 'new' -and -not $st.Known -and $st.Transport -in 124, 255, -1 -and $i -le (Get-MoveConst 'retries'); $i++) { Wait-Move 5; $st = Get-MoveStatus $S $m -Quiet -PreInstall:$pre }
     if (-not $st.Ok) {
       if (-not $st.Known -and $st.Transport -notin 124, 255, -1) { continue }   # no gate answer there yet (new before `bootstrap gate`): it holds no move-id
       if ($m -ceq 'new' -and -not $st.Known) { $script:MoveNewDown = $true; $script:MoveNewDownCode = $st.Transport; Write-Host "máy mới '$((Get-MoveMachine $S 'new').Alias)' không trả lời (mã $($st.Transport)); bỏ qua máy mới trong lệnh này."; continue }

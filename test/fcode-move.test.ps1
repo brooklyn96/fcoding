@@ -1475,6 +1475,12 @@ T 'L.copy-first-gate-equal: a new whose gate id differs after bootstrap gate is 
   Reset-World; Fx-Planned; $W.NewGate.Enqueue($GateB); $W.NewGate.Enqueue($GateB)
   [void](Do-Copy 65); HasText 'Hai máy chạy bản gate khác nhau'; Eq (Sent 'new' '-c\.init-new$') 0 'nothing on new after the refusal'
 }
+T 'L.copy-first-preinstall-probe: the first copy''s status probe of a new without a gate (127) prints the calm "chưa có công cụ chuyển máy" line, never the unclear-answer line; any other 127 (gate_id already stored, or a later phase) keeps the old line' {
+  $Calm = "máy '$NewAlias' chưa có công cụ chuyển máy; sẽ cài ngay bây giờ."; $Unclear = "máy '$NewAlias' không trả lời rõ (không có GATE_EXIT; mã 127)."
+  Fx-Planned; [void](Do-Copy 0); HasText $Calm; NoText 'không trả lời rõ'
+  Reset-World; Fx-Planned; [void](Patch-St @{ gate_id = 'abc' }); [void](Do-Copy -1); HasText $Unclear; NoText $Calm
+  Reset-World; Fx-Copied; $W.new.HasGate = $false; [void](Do-Copy -1); HasText $Unclear; NoText $Calm
+}
 T 'L.copy-refresh-transfers-again: a copy re-run is a full re-plan from the stored target_users, then c.repin.1 on both, c.prepare.2 and steps 6–8 under new ids' {
   Fx-Copied
   $W.Pf = @('INV target user=zed uid=1700 home-nonskel=0', 'INV target stop_budget_s=1')
