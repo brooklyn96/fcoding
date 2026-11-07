@@ -1239,7 +1239,7 @@ test('hook 1a [astra r3]: removing the .github/ a base has is a change: refused 
   } finally { done(e); }
 });
 
-test('hook 1b: a repo listed in ~/.config/fcode/no-secret-repos (any case, # comments) pushes .github/ changes; no file or another slug: refused', { skip }, () => {
+test('hook 1b: a repo listed in ~/.config/fcode/no-secret-repos (any case, # comments) pushes .github/ changes; no file, another slug, a NUL byte, a directory or an unreadable file: refused', { skip }, () => {
   const e = hookWorld(DEPLOY_WF);
   try {
     e.git('switch', '-q', '-c', 'box/l');
@@ -1247,6 +1247,19 @@ test('hook 1b: a repo listed in ~/.config/fcode/no-secret-repos (any case, # com
     refused(e.push('origin', 'box/l'), sha); // no list file: nothing is allowed
     e.list('o/r2\nx/o/r\nother/repo # o/r\n');
     refused(e.push('origin', 'box/l'), sha); // listed under other slugs only
+    // astra r4: a malformed list allows nothing (grep would split lines at a NUL); a list that is not a readable regular file neither
+    const listFile = path.join(e.home, '.config', 'fcode', 'no-secret-repos');
+    const bad = [['NUL', () => e.list('other/repo\0o/r\n')], ['NUL beside a valid line', () => e.list('other/repo\0\nO/R\n')],
+      ['directory', () => { e.list(undefined); fs.mkdirSync(listFile); }]];
+    if (process.getuid?.() !== 0) bad.push(['unreadable', () => { fs.rmSync(listFile, { recursive: true, force: true }); e.list('o/r\n'); fs.chmodSync(listFile, 0); }]);
+    for (const [what, make] of bad) {
+      make();
+      const r = e.push('origin', 'box/l');
+      assert.ok(r.status !== 0 && r.stderr.includes(GH_MSG(sha)), `${what}: ${r.stderr}`);
+    }
+    fs.rmSync(listFile, { recursive: true, force: true });
+    e.list('other/repo\no/r\n'); // the same bytes without the NUL: listed
+    pushed(e.push('origin', 'HEAD:refs/heads/box/l2'));
     e.list('# repos whose Actions secrets page the owner saw empty\nother/repo\n  O/R  # this one\n');
     pushed(e.push('origin', 'box/l'));
     pushed(e.push('origin', 'HEAD:refs/tags/l1'));

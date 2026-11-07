@@ -454,7 +454,7 @@ Token `gh` của box có quyền sửa workflow (`.github/workflows`). Ở repo 
 **Danh sách repo không có secret:** file `~/.config/fcode/no-secret-repos` trên box, mỗi dòng một tên repo trên GitHub dạng `chủ/repo` (ví dụ `brooklyn96/VPS-Tracker`, không phải tên dự án; hoa thường gì cũng được; `#` là chú thích). Quy tắc:
 
 - Chỉ ghi một repo khi trang GitHub của repo đó, mục **Settings → Secrets and variables → Actions → Repository secrets**, **trống hẳn**. Secret còn sót lại từ một workflow đã xoá vẫn tính là có secret. Chỉ bạn xem và thêm được secret, nên chỉ bạn trả lời được câu này.
-- Không có file = không repo nào được tự sửa `.github/`. Repo mới thêm bằng `fcode add` bắt đầu ở ngoài danh sách.
+- Không có file = không repo nào được tự sửa `.github/`. File không đọc được, không phải file thường, hay có byte NUL cũng tính như không có file. Repo mới thêm bằng `fcode add` bắt đầu ở ngoài danh sách.
 - Ngày nào bạn thêm secret vào một repo trong danh sách, xoá dòng của repo đó ngay hôm đó.
 
 Box chặn ở hai chỗ:

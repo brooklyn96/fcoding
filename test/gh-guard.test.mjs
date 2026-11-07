@@ -30,7 +30,7 @@ echo "out:$*"; echo "err:$*" >&2; exit "\${STUB_RC:-0}"
 const H = 'a1'.repeat(20); // the PR head the guard inspects
 const H2 = 'b2'.repeat(20);
 const HINT = '(trợ giúp: gh help pr merge)';
-const NO_SECRET_LINE = 'no_secret() { [ -f "$HOME/.config/fcode/no-secret-repos" ] && sed \'s/#.*//; s/[[:space:]]//g\' "$HOME/.config/fcode/no-secret-repos" | grep -qixF -- "$1"; }';
+const NO_SECRET_LINE = String.raw`no_secret() { nsf=$HOME/.config/fcode/no-secret-repos; [ -f "$nsf" ] && [ -r "$nsf" ] && [ "$(wc -c <"$nsf")" -eq "$(tr -d '\000' <"$nsf" | wc -c)" ] && sed 's/#.*//; s/[[:space:]]//g' "$nsf" | grep -qixF -- "$1"; }`;
 const MSG = (n, url = `https://github.com/o/r/pull/${n}`, head = H) =>
   `gh-guard: PR #${n} sửa .github/ ở repo không có trong ~/.config/fcode/no-secret-repos (head ${head}); box không merge — gọi fcode-notify <dự án> merge-ready "<một dòng>" ${url}, chủ merge trên GitHub.\n`;
 const API_MSG = (m, ep) => `gh-guard: gh api ${m} ${ep} bị chặn trên box (chỉ lệnh đọc GET đi qua); dùng lệnh gh tương ứng (gh pr / issue / release / workflow …) — báo fcoding nếu thật cần.\n`;
@@ -139,6 +139,23 @@ test('gh-guard 3c: pr merge in a listed repo (any case, # comments) runs exactly
     e.list('o/r2\nx/o/r\n');
     const r = e.run(['pr', 'merge', '5', '-R', 'o/r'], { STUB_PR: PR(5, 'o/r', 1), STUB_FILES: FILES('.github/workflows/ci.yml') });
     assert.deepEqual([r.code, r.stderr], [65, MSG(5)]);
+    // astra r4: a malformed list allows nothing (grep would split lines at a NUL); a list that is not a readable regular file neither
+    const listFile = path.join(e.home, '.config', 'fcode', 'no-secret-repos');
+    const bad = [['NUL', () => e.list('other/repo\0o/r\n')], ['NUL beside a valid line', () => e.list('other/repo\0\nO/R\n')],
+      ['directory', () => { e.list(undefined); fs.mkdirSync(listFile); }]];
+    if (process.getuid?.() !== 0) bad.push(['unreadable', () => { fs.rmSync(listFile, { recursive: true, force: true }); e.list('o/r\n'); fs.chmodSync(listFile, 0); }]);
+    for (const [what, make] of bad) {
+      make();
+      e.reset();
+      const m = e.run(['pr', 'merge', '5', '-R', 'o/r'], { STUB_PR: PR(5, 'o/r', 1), STUB_FILES: FILES('.github/workflows/ci.yml') });
+      assert.deepEqual([m.code, m.stderr], [65, MSG(5)], what);
+      noMerge(e, what);
+    }
+    fs.rmSync(listFile, { recursive: true, force: true });
+    e.list('other/repo\no/r\n'); // the same bytes without the NUL: listed
+    e.reset();
+    const ok = e.run(['pr', 'merge', '5', '-R', 'o/r'], { STUB_PR: PR(5, 'o/r', 1), STUB_FILES: FILES('.github/workflows/ci.yml') });
+    assert.deepEqual([ok.code, e.calls().at(-1)], [0, 'pr merge 5 -R o/r']);
   } finally { done(e); }
 });
 

@@ -37,8 +37,9 @@ hook_text() {
 # ~/.config/fcode/no-secret-repos (the owner confirmed it has no Actions repository secret) or the owner approved that exact commit
 # (guard_allow). A tree that cannot be compared counts as different.
 # Deletes push. Not a security boundary (git push --no-verify skips it): it stops mistakes and shortcuts.
-# no_secret <owner/repo>: 0 = listed in ~/.config/fcode/no-secret-repos (one GitHub slug per line, any case, # comments); the same line is in box/gh-guard.sh
-no_secret() { [ -f "$HOME/.config/fcode/no-secret-repos" ] && sed 's/#.*//; s/[[:space:]]//g' "$HOME/.config/fcode/no-secret-repos" | grep -qixF -- "$1"; }
+# no_secret <owner/repo>: 0 = listed in ~/.config/fcode/no-secret-repos (one GitHub slug per line, any case, # comments); a list that is not a
+# regular readable file or holds a NUL byte (grep would split lines there) allows nothing; the same line is in box/gh-guard.sh
+no_secret() { nsf=$HOME/.config/fcode/no-secret-repos; [ -f "$nsf" ] && [ -r "$nsf" ] && [ "$(wc -c <"$nsf")" -eq "$(tr -d '\000' <"$nsf" | wc -c)" ] && sed 's/#.*//; s/[[:space:]]//g' "$nsf" | grep -qixF -- "$1"; }
 # default_ref: $db = origin's default branch (origin/HEAD, else origin/main, else origin/master); 1 = none
 default_ref() {
   db=$(git symbolic-ref -q refs/remotes/origin/HEAD) || db=

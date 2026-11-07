@@ -18,8 +18,9 @@
 real="${FCODE_GH_REAL:-/usr/bin/gh}"
 if [ ! -x "$real" ] || [ -d "$real" ] || [ "$(readlink -f "$real")" = "$(readlink -f "$0")" ]; then echo "gh-guard: real gh not found ($real)" >&2; exit 127; fi
 
-# no_secret <owner/repo>: 0 = listed in ~/.config/fcode/no-secret-repos (one GitHub slug per line, any case, # comments); the same line is in the hook
-no_secret() { [ -f "$HOME/.config/fcode/no-secret-repos" ] && sed 's/#.*//; s/[[:space:]]//g' "$HOME/.config/fcode/no-secret-repos" | grep -qixF -- "$1"; }
+# no_secret <owner/repo>: 0 = listed in ~/.config/fcode/no-secret-repos (one GitHub slug per line, any case, # comments); a list that is not a
+# regular readable file or holds a NUL byte (grep would split lines there) allows nothing; the same line is in the hook
+no_secret() { nsf=$HOME/.config/fcode/no-secret-repos; [ -f "$nsf" ] && [ -r "$nsf" ] && [ "$(wc -c <"$nsf")" -eq "$(tr -d '\000' <"$nsf" | wc -c)" ] && sed 's/#.*//; s/[[:space:]]//g' "$nsf" | grep -qixF -- "$1"; }
 refuse() { echo "$1" >&2; exit 65; }
 
 # ---- parse like gh (pflag). The flags of gh pr merge and gh api (gh 2.103): ..B = no value, ..V = takes a value; no flag is a value flag in
