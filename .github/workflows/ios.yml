@@ -2,6 +2,14 @@ name: iOS build (FCode)
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional release tag (vX.Y.Z): build that tag and attach fcode.ipa to its release. Empty = normal build."
+        required: false
+        default: ""
+  # A versioned release was published: build its tag and attach fcode.ipa to it.
+  release:
+    types: [published]
   push:
     branches: [main]
     paths:
@@ -18,8 +26,8 @@ permissions:
   contents: write
 
 concurrency:
-  # Per branch: a feature-branch build never cancels a main build.
-  group: ios-build-${{ github.ref }}
+  # Per branch (and per tag for a tag build): a feature-branch or tag build never cancels a main build.
+  group: ios-build-${{ github.ref }}-${{ inputs.tag }}
   cancel-in-progress: true
 
 jobs:
@@ -27,13 +35,36 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 30
     steps:
+      # Release event or dispatch with a tag: only vX.Y.Z tags may get an IPA (never `latest`); runs before the build to fail fast.
+      - name: Check release tag
+        if: github.event_name == 'release' || inputs.tag != ''
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '$TAG' is not a version tag (vX.Y.Z): no IPA is attached to it."
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
+        with:
+          # Release / tag dispatch: build that tag (full ref, so a same-named branch cannot win). Empty = the event's default ref.
+          ref: ${{ (github.event.release.tag_name || inputs.tag) && format('refs/tags/{0}', github.event.release.tag_name || inputs.tag) || '' }}
 
       # The app has no test target: build Links.swift + PairLink.swift + HomeLogic.swift + ResponseCache.swift + LaunchFetch.swift + ScreenFeed.swift + MenuLogic.swift for macOS with a tiny main, run their selfTests and the shared origin vectors.
+      # Older tags (v1.3.18-v1.3.20, tag backfill) have no MenuLogic.swift: that part is skipped, everything else is unchanged.
       - name: Links + PairLink + HomeLogic + ResponseCache + LaunchFetch + ScreenFeed + MenuLogic self-test
         run: |
           T=$(mktemp -d)
-          cp ios/fcoding/Links.swift ios/fcoding/PairLink.swift ios/fcoding/HomeLogic.swift ios/fcoding/ResponseCache.swift ios/fcoding/LaunchFetch.swift ios/fcoding/ScreenFeed.swift ios/fcoding/MenuLogic.swift "$T/"
+          SRC="Links.swift PairLink.swift HomeLogic.swift ResponseCache.swift LaunchFetch.swift ScreenFeed.swift"
+          HAS_MENU=0
+          if [ -f ios/fcoding/MenuLogic.swift ]; then
+            HAS_MENU=1
+            SRC="$SRC MenuLogic.swift"
+          else
+            echo "::notice::ios/fcoding/MenuLogic.swift is not in this tree: MenuLogic self-test skipped."
+          fi
+          for f in $SRC; do cp "ios/fcoding/$f" "$T/"; done
           cat > "$T/main.swift" <<'EOF'
           import Foundation
           var failures = Links.selfTest() + PairLink.selfTest().map { "PairLink " + $0 }
@@ -52,8 +83,9 @@ jobs:
           print(failures.isEmpty ? "Self-test: all passed" : "Self-test: \(failures.count) failed")
           exit(failures.isEmpty ? 0 : 1)
           EOF
+          if [ "$HAS_MENU" = 0 ]; then grep -v MenuLogic "$T/main.swift" > "$T/main.tmp" && mv "$T/main.tmp" "$T/main.swift"; fi
           cd "$T"
-          xcrun -sdk macosx swiftc -o linktest Links.swift PairLink.swift HomeLogic.swift ResponseCache.swift LaunchFetch.swift ScreenFeed.swift MenuLogic.swift main.swift
+          xcrun -sdk macosx swiftc -o linktest $SRC main.swift
           ./linktest "$GITHUB_WORKSPACE/test/origin-vectors.json"
 
       - name: Install XcodeGen
@@ -92,7 +124,7 @@ jobs:
           if-no-files-found: error
 
       - name: Publish pre-release "latest"
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        if: github.event_name != 'pull_request' && github.event_name != 'release' && inputs.tag == '' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
@@ -104,7 +136,15 @@ jobs:
           overwrite_files: true
 
       - name: Remove old fcoding.ipa asset
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        if: github.event_name != 'pull_request' && github.event_name != 'release' && inputs.tag == '' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release delete-asset latest fcoding.ipa -y || true
+
+      - name: Attach fcode.ipa to the release
+        if: github.event_name == 'release' || inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: gh release upload "$TAG" ios/fcode.ipa --clobber
