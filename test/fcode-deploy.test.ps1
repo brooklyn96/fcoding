@@ -156,9 +156,16 @@ T 'refusals: bad name, unknown verb or an unsafe word never reach ssh (rc 65)' {
   }
 }
 T 'refusals: `fcode deploy add` with the wrong arguments is refused before any call' {
-  foreach ($w in @(@('add'), @('add', 'brooklyn96/task'), @('add', 'brooklyn96/task', 'task'), @('add', 'nope', 'task', $Draft), @('add', 'a/b', 'Task', $Draft), @('add', 'a/b/c', 'task', $Draft), @('add', '../b', 'task', $Draft), @('add', 'a/b', 'task', $Draft, 'extra'), @('add', 'brooklyn96/task', 'shopee_dashboard', $Draft), @('add', 'brooklyn96/task', 'a.b', $Draft), @('add', 'brooklyn96/task', '1abc', $Draft), @('add', 'brooklyn96/task', 'a', $Draft), @('add', 'brooklyn96/task', ('a' * 29), $Draft), @('add', 'brooklyn96/task', ('a' * 64), $Draft), @('add', 'brooklyn96/task', 'deal-sync', $Draft), @('add', 'brooklyn96/task', 'gate', $Draft), @('add', 'brooklyn96/task', 'legacy', $Draft))) {
+  foreach ($w in @(@('add'), @('add', 'brooklyn96/task'), @('add', 'brooklyn96/task', 'task'), @('add', 'nope', 'task', $Draft), @('add', 'a/b', 'Task', $Draft), @('add', 'a/b/c', 'task', $Draft), @('add', '../b', 'task', $Draft), @('add', 'a/b', 'task', $Draft, 'extra'), @('add', 'brooklyn96/task', 'shopee_dashboard', $Draft), @('add', 'brooklyn96/task', 'a.b', $Draft), @('add', 'brooklyn96/task', '1abc', $Draft), @('add', 'brooklyn96/task', 'a', $Draft), @('add', 'brooklyn96/task', ('a' * 29), $Draft), @('add', 'brooklyn96/task', ('a' * 64), $Draft), @('add', 'brooklyn96/task', 'gate', $Draft), @('add', 'brooklyn96/task', 'legacy', $Draft), @('add', 'brooklyn96/task', 'registry', $Draft), @('add', 'brooklyn96/task', 'all', $Draft), @('add', 'brooklyn96/task', 'slot', $Draft))) {
     Reset-World; Add-Rule 'ssh' '.' @(Ans @('ok') 0); Add-Rule 'gh' '.' @(Ans @('[]') 0)
     $r = Run-Fcode $w; Eq $r.Code 65 ('[' + ($w -join '|') + '] code'); Eq $r.Calls.Count 0 'no call'
+  }
+}
+T 'add: deal-sync and vps-scraper are NOT reserved (the gate registers them since M8): the name rule lets them through to the draft check; `registry` is reserved' {
+  foreach ($n in 'deal-sync', 'vps-scraper') {
+    $f = Join-Path $Root "$n.json"; [IO.File]::WriteAllBytes($f, $utf8.GetBytes('{"draft_version":1,"registry":{"name":"' + $n + '","repo":"brooklyn96/' + $n + '"}}'))
+    Reset-World; Add-Rule 'ssh' '.' @(Ans @('x') 99); Add-Rule 'gh' '.' @(Ans @('[]') 0); $r = Run-Fcode @('add', "brooklyn96/$n", $n, $f)
+    Ok ($r.Calls.Count -gt 0) "$n gets past the local refusals (calls were made)"; Ok ($r.Text -notmatch 'Cách dùng') "${n}: no usage refusal"
   }
 }
 
