@@ -2460,6 +2460,62 @@ T 'L.resume-mid-cutover-no-chore0: resuming a cutover (mark set) while old holds
 # The fake models the server's lock: a machine whose unit runs answers 75 `busy` to EVERY other call, a re-sent done call (a replay) included; the status answers (Set-Running -Left = the polls it survives)
 # are what the laptop waits on. A status fault is checked before the unit's Left is spent. The resume rows (cut-resume, carry-resume, rb-continue) wait first, never re-send a done call into the busy.
 function NoBusy([string]$What) { $b = @(LogNow -All | Where-Object { $_ -match ' busy$' }); Eq $b.Count 0 "$What : no call answered busy: $($b -join ', ')" }
+$TxtBusy = 'Máy cũ còn đang chạy lệnh trước; chạy lại  fcode move cutover , lệnh sẽ đợi lệnh đó xong.'; $TxtIncomplete = 'Máy cũ chưa chạy lại đủ: cần người xem (70). Sau khi sửa, chạy lại  fcode move cutover  để hoàn tất quay lại.'
+# ruling B59 (a): a return to old (Q-discard YES, Q-newlost YES, a plain rollback, rb-continue: ONE path, Invoke-MoveRollback) first fences new, then WAITS, bounded, for a call still running on old (it would answer r.start-src busy):
+# the resume rows' wait (polls 10 s, budget first_transfer_s + 60 = 21660 s); past the budget, 70 with the usual text, the state stays rolling-back (old not started) and `cutover` continues
+function Hold-OldDo([string]$Call, [int]$Left) { $script:HoldCall = $Call; $script:HoldLeft = $Left; { Set-Running 'old' $script:HoldCall $script:HoldLeft } }   # the fault's side effect: old's call <Call> is still running (its unit survives <Left> status polls)
+function Setup-HeldReturn([string]$Leg, [int]$Left) {   # Reset-World + the fixture of one leg up to (not including) the run that returns to old
+  Reset-World
+  switch ($Leg) {
+    'carry-discard' { Start-Carry; Add-Fault -M old -Key '^back-2-x\.stop-dst$' -Rc 1 -Do (Hold-OldDo 'back-2-x.baseline' $Left); Ans 'có', 'YES'; return 'back-2' }
+    'newlost'       { Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.health$' -Mode down -Do (Hold-OldDo 'fwd-1-x.stop-src' $Left); [void](Do-Cutover 70); Ans 'YES'; return 'fwd-1' }
+    'plain'         { Fx-Copied; Add-Fault -M new -Key '-x\.final$' -Rc 1 -Do (Hold-OldDo 'fwd-1-x.stop-src' $Left); Ans 'có'; return 'fwd-1' }
+  }
+}
+T 'L.return-waits-for-old-call: a call still running on old when the return to old starts (carry-back Q-discard YES, fwd Q-newlost YES, a plain rollback): the return fences new first, waits for it (the "đợi <call>" line, polls of old, no call answered busy), then r.start-src / r.unfreeze-src / r.health-src, and ends rolled-back, exit 10, old serving and enabled' {
+  foreach ($leg in 'carry-discard', 'newlost', 'plain') {
+    $p = Setup-HeldReturn $leg 3; $r = Run-Move @('cutover'); Eq $r.Code 10 "[$leg] the return completes ($($r.Text))"
+    Ok (@(Lines | Where-Object { $_ -match '\Ađợi (fwd|back)-[0-9]+-\S+ trên ' }).Count -ge 1) "[$leg] the wait line is printed: $(Lines)"; NoBusy $leg
+    foreach ($c in 'start', 'unfreeze', 'health') { Eq (Sent 'old' "^$p-r\.$c-src`$") 1 "[$leg] r.$c-src sent once" }
+    if ($leg -cne 'newlost') { Ordered @("^new $p-r\.stop-dst`$", '^old status$', "^old $p-r\.start-src`$"); Eq (Sent 'new' "^$p-r\.stop-dst`$") 1 "[$leg] new fenced once" } else { Eq (Sent 'new' "^$p-r\.stop-dst`$") 0 "[$leg] new is down: no fence"; Ordered @('^old status$', "^old $p-r\.start-src`$") }
+    $s = Get-St; Eq $s.phase 'rolled-back' "[$leg] phase"; Ok ($null -eq $s.mark) "[$leg] mark"; Eq $s.serving 'old' "[$leg] serving"; Eq $s.enabled $true "[$leg] enabled"; if ($leg -ne 'plain') { Eq $s.new_discarded ($leg -ceq 'carry-discard') "[$leg] new_discarded" }
+    Eq $W.old.Active $Holds "[$leg] old serves"; Eq $W.old.Frozen $false "[$leg] old unfrozen"
+  }
+}
+T 'L.return-busy-past-budget: the call on old outlives the wait (21660 s): the return ends 70 with "vẫn đang chạy <call>; chạy lại sau" and "Máy cũ chưa chạy lại đủ", sends no r.start-src / r.unfreeze-src / r.health-src, new was already fenced, the state stays rolling-back (serving old, enabled false, never rolled-back); once the call ended, `cutover` continues the return and ends 10' {
+  foreach ($leg in 'carry-discard', 'newlost', 'plain') {
+    $p = Setup-HeldReturn $leg 2400; $r = Run-Move @('cutover'); Eq $r.Code 70 "[$leg] ends 70 ($($r.Text))"
+    HasText 'vẫn đang chạy'; HasText 'chạy lại sau'; HasText $TxtBusy; NoText $TxtIncomplete; Eq (SentAny "-r\.(start|unfreeze|health)-src`$") 0 "[$leg] no return call was sent into the busy"; NoBusy $leg
+    if ($leg -cne 'newlost') { Eq (Sent 'new' "^$p-r\.stop-dst`$") 1 "[$leg] new was fenced before the wait" }
+    $s = Get-St; Eq $s.mark 'rolling-back' "[$leg] mark kept"; Eq $s.serving 'old' "[$leg] serving"; Eq $s.enabled $false "[$leg] enabled"; Eq $s.carry $false "[$leg] carry"; Ok ($s.phase -cne 'rolled-back') "[$leg] never rolled-back"
+    $W.old.Running = $null; $r = Run-Move @('cutover'); Eq $r.Code 10 "[$leg] cutover continues the return once the call ended ($($r.Text))"; Assert-OldServes $leg -NewDown:($leg -ceq 'newlost')
+  }
+}
+# ruling B60 (a): the wait reads old's status FRESH (the agreement check's snapshot is stale: old was idle then), a wait that ends 75 (busy past the budget) or 1 (status unreadable) after the write-ahead cannot be returned: 70, state rolling-back, enabled
+# false, no r.* sent; the texts: return-busy "Máy cũ còn đang chạy lệnh trước; chạy lại  fcode move cutover , lệnh sẽ đợi lệnh đó xong." (only busy 75 answers) vs return-incomplete "Máy cũ chưa chạy lại đủ: cần người xem (70)..." (a real failure)
+T 'L.return-fresh-status: the agreement check saw old idle, then a call starts on old before the return reaches it: the return reads old''s status fresh, waits for that call (the "đợi" line, polls) and ends 10; a stale snapshot would send r.start-src into the busy' {
+  $p = Setup-HeldReturn 'plain' 3; $r = Run-Move @('cutover'); Eq $r.Code 10 "plain rollback ($($r.Text))"
+  Ok (@(Lines | Where-Object { $_ -match '\Ađợi fwd-1-x\.stop-src trên ' }).Count -ge 1) "the wait fired from the fresh status: $(Lines)"; NoBusy 'fresh'; NoText $TxtBusy; Assert-OldServes 'fresh'
+  # one or two lost status answers (< retries = 3) are retried: the fresh read succeeds, the return goes on and ends 10 (never read as "not running", never 70)
+  Reset-World; Fx-Copied; Add-Fault -M new -Key '-x\.final$' -Rc 1; Add-Fault -M new -Key '^fwd-1-r\.stop-dst$' -Rc 0 -Do { Add-Fault -M old -Key '^status$' -Mode down -N 2 }; Ans 'có'; $r = Run-Move @('cutover'); Eq $r.Code 10 "[blip] two lost status answers are retried ($($r.Text))"; NoText $TxtIncomplete; Assert-OldServes 'blip'
+}
+T 'L.return-busy-vs-failed-text: after the write-ahead a return that cannot finish ends 70 with the state rolling-back and enabled false, and names the cause: busy (75 only: the wait past the budget, r.start-src or r.unfreeze-src answering busy) prints the return-busy text, a real failure (rc 1, an unreadable fresh status, busy mixed with a failure) the return-incomplete text; `cutover` then continues and ends 10' {
+  $legs = [ordered]@{
+    'start busy'        = @{ Fault = { Add-Fault -M old -Key '^fwd-1-r\.start-src$' -Rc 75 -N 1 }; Busy = $true; Sent = $true }
+    'unfreeze busy'     = @{ Fault = { Add-Fault -M old -Key '^fwd-1-r\.unfreeze-src$' -Rc 75 -N 1 }; Busy = $true; Sent = $true }
+    'start rc 1'        = @{ Fault = { Add-Fault -M old -Key '^fwd-1-r\.start-src$' -Rc 1 -N 1 }; Busy = $false; Sent = $true }
+    'busy and failure'  = @{ Fault = { Add-Fault -M old -Key '^fwd-1-r\.start-src$' -Rc 75 -N 1; Add-Fault -M old -Key '^fwd-1-r\.unfreeze-src$' -Rc 1 -N 1 }; Busy = $false; Sent = $true }
+    'status unreadable' = @{ Fault = { Add-Fault -M new -Key '^fwd-1-r\.stop-dst$' -Rc 0 -Do { Add-Fault -M old -Key '^status$' -Mode down -N 3 } }; Busy = $false; Sent = $false }
+  }
+  foreach ($k in $legs.Keys) {
+    Reset-World; Fx-Copied; Add-Fault -M new -Key '-x\.final$' -Rc 1 -Do $legs[$k].Fault; Ans 'có'
+    $r = Run-Move @('cutover'); Eq $r.Code 70 "[$k] ends 70 ($($r.Text))"
+    if ($legs[$k].Busy) { HasText $TxtBusy; NoText $TxtIncomplete } else { HasText $TxtIncomplete; NoText $TxtBusy }
+    if (-not $legs[$k].Sent) { Eq (SentAny "-r\.(start|unfreeze|health)-src`$") 0 "[$k] nothing sent to old after the unreadable status" }
+    $s = Get-St; Eq $s.mark 'rolling-back' "[$k] mark kept"; Eq $s.serving 'old' "[$k] serving"; Eq $s.enabled $false "[$k] enabled"; Ok ($s.phase -cne 'rolled-back') "[$k] never rolled-back"
+    $r = Run-Move @('cutover'); Eq $r.Code 10 "[$k] cutover continues ($($r.Text))"; Assert-OldServes $k
+  }
+}
 T 'L.fake-busy-on-done-replay: while another call''s unit runs, a re-sent DONE call answers 75 busy (nothing replayed, record untouched); with no unit running the same call is a replay' {
   Fx-Cutting0; Set-Running 'new' 'fwd-1-x.final'; $S = Read-MoveState
   $r = Invoke-MoveCall $S 'new' 'x.stop-dst' -Quiet; Eq $r.Code 75 "busy ($($r.Lines -join ' '))"; Ok (@(LogNow | Where-Object { $_ -match '^new fwd-1-x\.stop-dst busy$' }).Count -eq 1) "busy logged: $(LogNow)"
