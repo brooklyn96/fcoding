@@ -80,8 +80,45 @@ Một timer thứ hai (`fcode-git-sync.timer`, cài cùng `install-autoupdate.sh
 
 Ứng dụng đọc file này và hiện "chậm N commit" (`behindDefault` > 0), "N commit chưa đẩy" (`aheadOfOrigin` > 0) hoặc "có sửa chưa lưu" (`dirty`). Timer chỉ đưa nhánh mặc định của project **đang rảnh và sạch** lên mới; còn lại **cập nhật code vẫn là việc của agent**, theo luật "Sync first" trong `box/agents-git.md`: đầu mỗi task và trước `gh pr create` chạy `git fetch origin` rồi cập nhật nhánh từ `origin/main` (rebase nếu nhánh chưa đẩy, merge nếu đã đẩy). **Box không bao giờ tự đẩy (push) hộ**: nếu thấy "chưa đẩy" / "chưa lưu", hãy nhờ agent commit và push nhánh của nó.
 
-Một project lỗi không làm dừng các project khác; chỉ một lượt chạy tại một thời điểm (`flock`); không in gì ra màn hình. Chạy tay: `fcode-git-sync` hoặc `systemctl --user start fcode-git-sync.service`. Chạy riêng một project: `fcode-git-sync <tên project>` (server gọi lệnh này ngay trước khi tạo phiên mới): chỉ project đó được fetch và đếm (**không bao giờ kéo nhanh**: `autoUpdated` luôn `false`, `autoSkip` luôn `null`), chỉ mục của nó trong `git-sync.json` được cập nhật (các mục khác giữ nguyên), toàn bộ lượt chạy xong trong khoảng 55 giây (chờ khoá tối đa 15 giây + fetch 30 giây + 5 giây chờ tắt + đếm) và luôn thoát với mã 0; lỗi chỉ nằm trong mục của project. Tên không có trong cấu hình: in một dòng ra stderr, không đổi state. Khi nhận TERM/INT/HUP script dọn file tạm rồi thoát; file state luôn ghi bằng file tạm rồi đổi tên. Timer không có `GH_TOKEN` của riêng nó (unit systemd không có môi trường đăng nhập), nên khi `GH_TOKEN` trống nó chỉ đọc đúng dòng `GH_TOKEN=` của file vault instabox (`/run/instabox/secrets/env`) như dạng văn bản (không `source`, giá trị phải giống token, không lấy biến nào khác như `INSTABOX_API_KEY`), để fetch được project private thêm bằng đường token (origin https + `!gh auth git-credential`); token chỉ nằm trong môi trường của tiến trình, không ghi ra file hay log.
+Một project lỗi không làm dừng các project khác; chỉ một lượt chạy tại một thời điểm (`flock`); không in gì ra màn hình. Chạy tay: `fcode-git-sync` hoặc `systemctl --user start fcode-git-sync.service`. Chạy riêng một project: `fcode-git-sync <tên project>` (server gọi lệnh này ngay trước khi tạo phiên mới): chỉ project đó được fetch và đếm (**không bao giờ kéo nhanh**: `autoUpdated` luôn `false`, `autoSkip` luôn `null`), chỉ mục của nó trong `git-sync.json` được cập nhật (các mục khác giữ nguyên), toàn bộ lượt chạy xong trong khoảng 55 giây (chờ khoá tối đa 15 giây + fetch 30 giây + 5 giây chờ tắt + đếm) và luôn thoát với mã 0; lỗi chỉ nằm trong mục của project. Tên không có trong cấu hình: in một dòng ra stderr, không đổi state. Khi nhận TERM/INT/HUP script dọn file tạm rồi thoát; file state luôn ghi bằng file tạm rồi đổi tên. Timer không có `GH_TOKEN` của riêng nó (unit systemd không có môi trường đăng nhập), nên để fetch được project private thêm bằng đường token (origin https + `!gh auth git-credential`) nó lấy `GH_TOKEN` chỉ qua đoạn khởi động chung `start.sh` (bản đã cài ở `~/fcoding/start.sh`, hoặc `start.sh` cạnh script khi chạy từ bản checkout; chính `start.sh` chỉ đọc nội dung chữ trong file, không chạy file, không lấy biến nào khác như `INSTABOX_API_KEY`; script này không tự đọc file). File bí mật phải chỉ gồm các dòng đơn giản dạng `TÊN=giá trị` (có thể có `export` ở đầu; dòng trống và dòng bắt đầu bằng `#` được bỏ qua; không dùng tên OPTIND, HISTCMD, MAILCHECK, RANDOM, SRANDOM, SECONDS):
+
+- giá trị viết trần chỉ được gồm chữ, số và các dấu `_ . / : @ % + , = ~ ^ -`; có dấu cách hoặc ký tự khác (như `!`, `?`, `&`, `$`) thì đặt cả giá trị trong nháy đơn `'...'` (trong đó không có `'`); trong nháy kép `"..."` không có `$`, dấu huyền (`` ` ``) hay `\`;
+- giá trị của `GH_TOKEN` dài 1 đến 255 ký tự, chỉ gồm chữ cái không dấu (a-z, A-Z), số và `_`;
+- file là file bình thường (không phải thư mục), tối đa 64 KB, chỉ là văn bản thuần, không có ký tự điều khiển (dòng `#` cũng vậy);
+- chỉ một dòng sai là không có token. Khi không có token, dòng `start.sh -v` trong `journalctl --user -u fcoding` cho biết lý do (lệnh và các từ trạng thái: `docs/HUONG-DAN.md`, mục 3).
+
+Không có `start.sh` hoặc không có token thì fetch chạy không token; timer luôn bỏ `GH_TOKEN` và `GITHUB_TOKEN` kế thừa từ môi trường (gh sẽ dùng `GITHUB_TOKEN` nếu còn). Token chỉ nằm trong môi trường của tiến trình, không ghi ra file hay log.
 
 `install-autoupdate.sh` chỉ cài script và hai unit rồi bật timer; nó **không** sửa file hướng dẫn của agent. Nội dung luật Git cho agent nằm ở `box/agents-git.md` (nguồn duy nhất); người quản trị tự đưa mục đó vào `~/.omp/agent/AGENTS.md`, `~/.claude/CLAUDE.md` và `~/AGENTS.md`.
 
 Kiểm thử (thư mục tạm, không đụng box thật): `bash test/git-sync.test.sh`.
+
+## Báo chủ: fcode-notify
+
+Phiên omp chính (main session) để lại một tin một chiều cho chủ máy. `fcode-notify` chỉ **ghi thêm một dòng vào file hộp thư** trên box; nó không gửi gì, không gọi mạng, không chạy nội dung tin. Một máy khác (Hermes) tự kéo file này **chỉ-đọc** qua ssh bằng một khoá riêng chỉ chạy được một lệnh cố định (đọc cuối file) rồi chuyển tin sang Zalo của chủ. Tin chỉ để báo, không phải lệnh: không có đường nào từ tin sang hành động.
+
+```bash
+fcode-notify <project> <kind> "<nội dung>" [link]
+```
+
+- `<project>`: `^[a-z0-9][a-z0-9._-]{0,39}$`. `<kind>`: `merge-ready`, `needs-yes`, `stuck` hoặc `info`. `[link]`: để trống hoặc URL `https://…` tối đa 160 ký tự.
+- Nội dung: ký tự điều khiển và ký tự vô hình (ESC, TAB/CR/LF thành một dấu cách, U+200B, U+202E…) bị bỏ; dấu cách liền nhau gộp thành một; cắt còn tối đa 300 **ký tự** (không cắt giữa một chữ). UTF-8 sai hoặc rỗng sau khi làm sạch thì bị từ chối. Tiếng Việt và emoji giữ nguyên.
+- Mỗi lần gọi in đúng một dòng rồi thoát:
+
+| Dòng in ra | Mã thoát | Ý nghĩa |
+|---|---|---|
+| `notify: queued <id>` | 0 | đã ghi |
+| `notify: duplicate` | 0 | cùng project + kind + nội dung + link + phiên đã ghi trong 30 phút qua; không ghi thêm (cùng nội dung từ hai phiên khác nhau thì không bị coi là trùng) |
+| `error: usage` / `bad-project` / `bad-kind` / `bad-text` / `bad-link` | 65 | bị từ chối, không ghi gì |
+| `error: rate-limited` | 75 | quá 6 tin cho project này hoặc quá 15 tin tổng trong 60 phút qua; không ghi gì |
+| `error: io` | 1 | lỗi khoá hoặc ghi; file cũ giữ nguyên |
+
+- Hộp thư: `~/.local/state/fcode/notify/outbox.tsv` (thư mục 700, file 600), mỗi tin một dòng, 7 cột cách nhau bằng TAB: `id  epoch  project  kind  nội_dung  link  phiên`. Cột `link` và cột `phiên` có thể rỗng. Chỉ giữ 50 dòng mới nhất; mỗi lần ghi là file tạm + `mv` dưới `flock` (`outbox.lock`). Hermes đọc bằng `tail -c 65536` của file này và tự kiểm tra lại từng dòng; dòng cũ 6 cột (không có cột `phiên`) vẫn hợp lệ.
+- Cột `phiên` là tên phiên tmux của chính pane đang gọi: khi có `$TMUX` và `$TMUX_PANE`, script chạy `tmux display-message -p -t "$TMUX_PANE" '#S'`. Cú pháp `^[a-z0-9][a-z0-9._-]{0,63}$`; ngoài tmux, hoặc tên không khớp, thì cột để rỗng và không báo lỗi. Cách gọi không đổi (không có đối số phiên): Hermes dùng cột này để ghi `[<project> · phiên <phiên>]` trong tin Zalo.
+- **Thứ tự cài đặt:** không chạy `install.sh` trên box với bản này cho đến khi Hermes trên contabo đã có bản phát hành chấp nhận cột thứ 7 (README hermes-ops, mục "Coder notes", phần thứ tự triển khai). Hermes cũ bỏ mọi dòng 7 cột, nên cài box trước sẽ làm mất toàn bộ tin báo.
+- `install.sh` cài `fcode-notify` vào `~/.local/bin`, và tạo sẵn thư mục hộp thư (700) cùng một file `outbox.tsv` **rỗng** (600) bằng `: >>` (không bao giờ cắt file đang có), để lần kéo đầu tiên của Hermes đọc được file thay vì báo lỗi; file rỗng là hợp lệ, `fcode-notify` ghi tiếp vào đó.
+- Lệnh cố định chạy qua bash của user (`/bin/bash`), bash này đọc `~/.bashrc` cả với lệnh ssh không tương tác. `~/.bashrc` **không được in gì** cho shell không tương tác (giữ đoạn chặn `case $- in *i*) ;; *) return;; esac` ở đầu file): mọi chữ in thêm sẽ nối vào dữ liệu và làm Hermes bỏ mất tin.
+- Luật cho agent (khi nào được gọi) nằm ở `box/agents-notify.md`; người quản trị tự đưa vào `~/.omp/agent/AGENTS.md`, như `box/agents-git.md`.
+- Biến thử nghiệm `FCODE_NOTIFY_DIR`, `FCODE_NOTIFY_NOW` và `FCODE_NOTIFY_SESSION` (ghi đè tên phiên) chỉ có tác dụng khi `FCODE_NOTIFY_TEST=1`.
+
+Kiểm thử (thư mục tạm, không đụng hộp thư thật): `bash test/fcode-notify.test.sh`.

@@ -7,6 +7,8 @@
 // windowActivity (window_activity, default 0), screen (capture-pane text).
 // FAKE_TMUX_DELAYS: JSON {command: ms}, overrides FAKE_TMUX_DELAY_MS per command ("capture-pane -S": only captures with history).
 // FAKE_TMUX_DUP_ONCE: new-session for that name answers "duplicate session" once, as if created outside the server.
+// FAKE_TMUX_FAIL_ON: that command (e.g. paste-buffer) answers "can't find session", as if the session died at that step.
+// Global env (set-environment -g): only which names are set, never values; each new session records globalToken (GH_TOKEN or GITHUB_TOKEN set).
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -23,14 +25,18 @@ const fail = (msg) => { process.stderr.write(msg + '\n'); process.exit(1); };
 const t0 = Date.now();
 let stdin = null;
 if (cmd === 'load-buffer') stdin = fs.readFileSync(0).toString('base64');
-// logged on exit (success or failure) with start/end times so tests can measure overlap and ordering
-process.on('exit', () => fs.appendFileSync(path.join(dir, 'log.jsonl'), JSON.stringify({ argv, stdin, t0, t1: Date.now() }) + '\n'));
+// logged on exit (success or failure) with start/end times so tests can measure overlap and ordering.
+// hasGhToken: whether this call's environment holds GH_TOKEN or GITHUB_TOKEN (a real tmux server would copy it into its global env); never the value
+const hasGhToken = 'GH_TOKEN' in process.env || 'GITHUB_TOKEN' in process.env;
+process.on('exit', () => fs.appendFileSync(path.join(dir, 'log.jsonl'), JSON.stringify({ argv, stdin, t0, t1: Date.now(), hasGhToken }) + '\n'));
 const delays = JSON.parse(process.env.FAKE_TMUX_DELAYS || '{}'); // per command, e.g. {"capture-pane": 300}
 const delay = Number((argv.includes('-S') ? delays[`${cmd} -S`] : undefined) ?? delays[cmd] ?? process.env.FAKE_TMUX_DELAY_MS ?? 0);
 if (delay) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
 
 // like real tmux 3.x: these commands take a target-pane, and a bare "=name" does not resolve one ("can't find pane"); "=name:" does
-if (['capture-pane', 'display-message', 'send-keys', 'paste-buffer', 'resize-window', 'set-option'].includes(cmd) && /^=[^:]*$/.test(arg('-t') || '')) fail(`can't find pane: ${arg('-t').slice(1)}`);
+if (['capture-pane', 'display-message', 'send-keys', 'paste-buffer', 'resize-window', 'set-option', 'copy-mode'].includes(cmd) && /^=[^:]*$/.test(arg('-t') || '')) fail(`can't find pane: ${arg('-t').slice(1)}`);
+
+if (process.env.FAKE_TMUX_FAIL_ON === cmd) fail(`can't find session: ${target()}`);
 
 const st = load();
 const needSession = () => { if (!st.sessions[target()]) fail(`can't find session: ${target()}`); };
@@ -45,7 +51,16 @@ switch (cmd) {
     }
     if (process.env.FAKE_TMUX_EXIT) break; // the pane's command died: the session is already gone
     const after = Number(process.env.FAKE_TMUX_EXIT_AFTER_MS || 0); // the harness exits this long after start
-    st.sessions[name] = { created: 1700000000, dir: arg('-c'), cmd: argv[argv.length - 1], opts: {}, ...(after && { diesAt: Date.now() + after }) };
+    // globalToken: the session would inherit a GH_TOKEN / GITHUB_TOKEN from the server's global env (see set-environment)
+    const globalToken = !!(st.globalEnv?.GH_TOKEN || st.globalEnv?.GITHUB_TOKEN);
+    st.sessions[name] = { created: 1700000000, dir: arg('-c'), cmd: argv[argv.length - 1], opts: {}, globalToken, ...(after && { diesAt: Date.now() + after }) };
+    save(st);
+    break;
+  }
+  case 'set-environment': { // only -g: `-g NAME VALUE` marks NAME as set (the value is never kept), `-g -u NAME` unsets it
+    if (!argv.includes('-g')) break;
+    st.globalEnv ??= {};
+    if (argv.includes('-u')) delete st.globalEnv[argv.at(-1)]; else st.globalEnv[argv.at(-2)] = true;
     save(st);
     break;
   }
@@ -94,6 +109,6 @@ switch (cmd) {
     break;
   }
   case 'display-message': needSession(); console.log(`80 24 ${st.sessions[target()].cursor || '3 5'}`); break; // cursor: "x y", set by a test
-  case 'send-keys': case 'paste-buffer': case 'resize-window': needSession(); break;
+  case 'send-keys': case 'paste-buffer': case 'resize-window': case 'copy-mode': needSession(); break;
   default: break; // load-buffer, delete-buffer: ok
 }

@@ -4,12 +4,12 @@
 
 ## FCode là gì
 
-FCode là một app iPhone kèm một máy chủ nhỏ. Máy chủ chạy trên **box** (máy Linux đám mây của instabox); mỗi trợ lý chạy trong một phiên tmux nên vẫn sống khi bạn khóa điện thoại. Bạn trò chuyện với trợ lý, trả lời y/n, xem hạn mức và chi phí ngay trên điện thoại, và vào lại đúng phiên đó từ laptop.
+FCode là một app iPhone kèm một máy chủ nhỏ. Máy chủ chạy trên **box** (một máy Linux Oracle chạy liên tục); mỗi trợ lý chạy trong một phiên tmux nên vẫn sống khi bạn khóa điện thoại. Bạn trò chuyện với trợ lý, trả lời y/n, xem hạn mức và chi phí ngay trên điện thoại, và vào lại đúng phiên đó từ laptop.
 
 ## Cách hoạt động
 
 - **Box**: chạy `server.mjs` (Node 22, không cần cài thêm gói) và các phiên tmux.
-- **Link công khai**: `instabox port publish` đưa cổng 7681 của box ra một địa chỉ `https://7681-<id>.instabox.tech`.
+- **Link công khai**: Caddy trên box đưa cổng 7681 ra địa chỉ `https://fcode-quoc.duckdns.org` (HTTPS, cổng 443).
 - **App iPhone**: ghép với box bằng mã 6 số (không có mật khẩu), rồi nói chuyện với box qua link đó.
 - **Laptop**: lệnh `fcode` (tùy chọn) để vào phiên, thêm dự án, ghép iPhone và đồng bộ phiên omp.
 
@@ -17,7 +17,7 @@ FCode là một app iPhone kèm một máy chủ nhỏ. Máy chủ chạy trên 
 
 1. **Cài máy chủ trên box** (cần Node 22 và tmux):
    `git clone https://github.com/brooklyn96/fcoding.git && cd fcoding && bash install.sh`
-2. **Mở link công khai** (chạy trên laptop): `instabox port publish <tên-box> 7681`. Mở link trong trình duyệt, thấy `fcoding ok` là được.
+2. **Mở link công khai**: box cần Caddy (HTTPS, cổng 443) chuyển tên miền vào cổng 7681; máy Oracle hiện tại đã dựng sẵn Caddy và tên miền khi tạo máy. Mở `https://fcode-quoc.duckdns.org` trong trình duyệt, thấy `fcoding ok` là được.
 3. **Cài app lên iPhone**: tải `fcode.ipa` ở mục **Releases** của GitHub, cài bằng **Sideloadly** (Apple ID miễn phí chạy được 7 ngày, ký lại bằng cách cài đè).
 4. **Ghép iPhone**: trên box chạy `fcode-pair "iPhone của tôi"`, rồi nhập địa chỉ link và mã 6 số vào app.
 5. **(Tùy chọn) Lệnh `fcode` trên laptop Windows**: mở PowerShell, dán `irm https://raw.githubusercontent.com/brooklyn96/fcoding/main/laptop/install.ps1 | iex`.
@@ -28,15 +28,15 @@ FCode là một app iPhone kèm một máy chủ nhỏ. Máy chủ chạy trên 
 - **Phiên mới**: nút **+**, chọn dự án rồi chọn omp, claude hoặc codex; cũng có `fcode new` trên laptop.
 - **Thêm dự án từ app** (v1.3.2): **+** rồi **Thêm dự án**, dán link GitHub hoặc chọn trong danh sách rồi bấm **Thêm**; box tự tải về `/data/workspace/<tên>`. Chỉ cần dán khóa (Deploy key) vào GitHub khi token GitHub của box không ghi được; app hướng dẫn từng bước.
 - **Phiên omp gần đây** (v1.3.2): bấm **Tiếp tục** để mở lại một phiên omp của dự án, kể cả phiên làm từ laptop.
-- **Máy staging** (v1.3.2): thẻ dự án có nút **Bật** để đánh thức máy instabox cùng tên (cần khóa instabox trên box).
-- **Đồng bộ phiên omp laptop và box** (v1.3.2): `fcode phien` chép phiên qua lại; `fcode phien tu-dong bat` bật tự động (mỗi 10 phút, không giữ box thức). Ghi chú dự án không nằm trong git (`CLAUDE.md`, `TASK.md`...) đi theo. Phiên lớn chép dần theo từng phần; chưa xong thì chạy lại `fcode phien` khi mạng tốt.
+- **Đồng bộ phiên omp laptop và box** (v1.3.2): `fcode phien` chép phiên qua lại; `fcode phien tu-dong bat` bật tự động (mỗi 10 phút, chỉ đồng bộ khi vào được box, tối đa mỗi 40 phút một lần). Ghi chú dự án không nằm trong git (`CLAUDE.md`, `TASK.md`...) đi theo. Phiên lớn chép dần theo từng phần; chưa xong thì chạy lại `fcode phien` khi mạng tốt.
 - **Gửi ảnh trong chat** (v1.3.3): trong phiên, bấm nút ảnh, chọn **Chụp ảnh** hoặc **Chọn ảnh**, đợi app báo `Đã gắn ảnh — gõ lời nhắn rồi gửi` (trong lúc gửi ảnh, nút Gửi chờ), rồi gõ lời nhắn và gửi như bình thường. Ảnh nằm ở thư mục `.fcode/uploads` của dự án trên box; FCode luôn giấu thư mục này khỏi git bằng một file `.gitignore` chỉ có dòng `*` nằm ngay trong `.fcode` (cả khi dự án nằm trong một kho lớn hơn), và ảnh cũ hơn 7 ngày bị xoá vào lần kế tiếp bạn gửi ảnh vào dự án đó.
-- **Laptop tự đồng bộ khi mở agent** (v1.3.3): chạy `fcode moc bat` một lần; từ đó mỗi lần bạn mở `omp`, `claude` hoặc `codex` trong thư mục một dự án đã đồng bộ, FCode đồng bộ dự án đó trước khi mở và sau khi đóng. Box đang ngủ thì bỏ qua (không đánh thức box), mỗi lần dừng ở khoảng 20 giây, đồng bộ êm thì không hiện gì. Tắt bằng `fcode moc tat`; tạm tắt trong một cửa sổ PowerShell bằng `$env:FCODE_MOC = '0'` (giữ tới khi đóng cửa sổ; `Remove-Item Env:FCODE_MOC` để bật lại); nếu PowerShell chặn thì `fcode moc trang-thai` chỉ cách.
+- **Laptop tự đồng bộ khi mở agent** (v1.3.3): chạy `fcode moc bat` một lần; từ đó mỗi lần bạn mở `omp`, `claude` hoặc `codex` trong thư mục một dự án đã đồng bộ, FCode đồng bộ dự án đó trước khi mở và sau khi đóng. Không vào được box thì hiện một dòng lỗi (`phien: không đồng bộ được, xem phien.log`) và agent vẫn mở; mỗi lần dừng ở khoảng 20 giây, đồng bộ êm thì không hiện gì. Tắt bằng `fcode moc tat`; tạm tắt trong một cửa sổ PowerShell bằng `$env:FCODE_MOC = '0'` (giữ tới khi đóng cửa sổ; `Remove-Item Env:FCODE_MOC` để bật lại); nếu PowerShell chặn thì `fcode moc trang-thai` chỉ cách.
 - **Chưa có**: hội thoại Claude Code và Codex chưa được mang qua lại giữa laptop và box; hiện chỉ phiên omp và ghi chú dự án đi theo.
 - **Box tự cập nhật code** (v1.3.2): box tự kéo code mới về khi dự án đang rảnh và sạch.
 - **`fcode sync`** (v1.3.2): kéo code mới về laptop, và với project có trên box mà chưa có trên laptop thì tìm bản clone sẵn có (hoặc clone mới), thêm vào `syncRepos` rồi đồng bộ ngay.
 - **`fcode add <chủ/repo>`** (v1.3.2): thêm dự án vào box; có token GitHub ghi được thì xong ngay, không thì lệnh chỉ cách dán khóa.
 - **Từ laptop**: `fcode` liệt kê và vào phiên (thoát bằng Ctrl+B rồi D); `fcode pair` ghép iPhone mới bằng mã QR; `fcode ipa` tải app bản mới.
+- **Chép chữ và dán ảnh từ laptop** (cần Windows Terminal, vào phiên bằng `fcode`): kéo chuột để bôi đen là chép luôn vào clipboard laptop (không cần giữ Shift); **Alt+V** dán ảnh đang nằm trong clipboard laptop vào phiên (đường dẫn ảnh được gõ sẵn, chưa gửi); **Ctrl+V** vẫn dán chữ. Ảnh dùng Alt+V vì Windows Terminal giữ Ctrl+V cho việc dán chữ. Cập nhật cả laptop (chạy lại lệnh cài) và box (`git pull` rồi `bash install.sh` trong `~/fcode-src`); chi tiết và các thông báo lỗi: [docs/HUONG-DAN.md](docs/HUONG-DAN.md#chép-chữ-và-dán-ảnh-từ-laptop).
 
 ## Bảo mật
 

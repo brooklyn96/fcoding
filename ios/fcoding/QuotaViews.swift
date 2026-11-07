@@ -34,18 +34,17 @@ enum QuotaLinks {
 
 // MARK: - Top card
 
-/// Left: the box ring (tap = box info). Right: one quota account at a time, rolling to the next
-/// every 4 s (tap = Hạn mức detail).
+/// Left: the greeting, the time and the date (no tap). Right: one quota account at a time,
+/// rolling to the next every 4 s (tap = Hạn mức detail).
 struct TopCard: View {
     @ObservedObject var home: HomeModel
     /// The main screen is on top and the app active: the tile may roll.
     let visible: Bool
-    let onRing: () -> Void
     let onQuota: () -> Void
 
     var body: some View {
         HStack(spacing: 14) {
-            BoxRing(box: home.home?.box, offset: home.offset, onTap: onRing)
+            GreetingCard(home: home)
             Rectangle().fill(Color.hair).frame(width: 0.5, height: 88).accessibilityHidden(true)
             QuotaTile(home: home, visible: visible, onTap: onQuota)
         }
@@ -54,106 +53,35 @@ struct TopCard: View {
     }
 }
 
-/// 88 pt clock ring, 6 pt stroke: "Sleeps in" hh:mm while the box runs (yellow under 10 min),
-/// "Wakes in" during the cooldown. It drains continuously (1 s linear glide per tick).
-struct BoxRing: View {
-    let box: HomeBox?
-    /// Server clock minus phone clock (HomeModel.offset).
-    let offset: TimeInterval
-    let onTap: () -> Void
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+/// Left of the quota tile: a greeting for the time of day, the time in large type and the
+/// weekday and date. Always Vietnam time (HomeLogic.vietnam) on the server clock, whatever the
+/// phone's zone; it turns over on each server minute. No tap.
+struct GreetingCard: View {
+    @ObservedObject var home: HomeModel
 
     var body: some View {
-        TimelineView(.periodic(from: Date(), by: 1)) { ctx in
-            let r = HomeLogic.ring(box, now: ctx.date.addingTimeInterval(offset))
-            Button(action: onTap) { ring(r) }
-                .buttonStyle(.plain)
-                .accessibilityLabel(label(r, now: ctx.date))
-        }
-    }
-
-    private func colors(_ mode: HomeLogic.RingMode) -> (Color, Color, Color, Color) {
-        switch mode {
-        case .warn: return (.orangeTone, .yellowTone, Color(hex: 0xFFF4BF), .yellowTone)
-        case .paused: return (Color(hex: 0x5E5CE6), Color(hex: 0xA5A3FF), Color(hex: 0xE4E3FF), Color(hex: 0xA5A3FF))
-        default: return (.accentBlue, Color(hex: 0x64D2FF), Color(hex: 0xCFF3FF), .white)
-        }
-    }
-
-    /// "88:88" must fit inside the ring minus 16 % padding on each side.
-    private static let textWidth: CGFloat = 2 * 41 - 6 - 2 * 0.16 * 88
-    /// Mockup layoutRing: the time takes the size at which "88:88" fits `textWidth`; 6 pt from
-    /// the label baseline to the cap top of the digits; the pair is centred on its cap block.
-    private static let labelFont = UIFont.systemFont(ofSize: 11, weight: .medium)
-    private static let timeFont: UIFont = {
-        let base = UIFont.monospacedDigitSystemFont(ofSize: 23, weight: .semibold)
-        let width = ("88:88" as NSString).size(withAttributes: [.font: base]).width
-        return UIFont.monospacedDigitSystemFont(ofSize: 23 * min(1, textWidth / max(1, width)), weight: .semibold)
-    }()
-    /// Text frames run ascender to descender: remove the label descent and the space above the digit caps.
-    private static let textSpacing: CGFloat = 6 + labelFont.descender - (timeFont.ascender - timeFont.capHeight)
-    /// Moves the frames so the label cap top to digit baseline block sits on the ring centre.
-    private static let textOffset: CGFloat = (-timeFont.descender - (labelFont.ascender - labelFont.capHeight)) / 2
-
-    private func ring(_ r: HomeLogic.Ring) -> some View {
-        let c = colors(r.mode)
-        let f: Double = r.mode == .unknown ? 0 : r.fraction
-        return ZStack {
-            Circle().stroke(Color(hex: 0x767680, alpha: 0.22), lineWidth: 6).padding(3)
-            arc(f, mode: r.mode, g1: c.0, g2: c.1, core: c.2)
-            texts(r, color: c.3)
-        }
-        .frame(width: 88, height: 88)
-        .contentShape(Circle())
-    }
-
-    private func arc(_ f: Double, mode: HomeLogic.RingMode, g1: Color, g2: Color, core: Color) -> some View {
-        let gradient = LinearGradient(colors: [g1, g2], startPoint: .topLeading, endPoint: .bottomTrailing)
-        let angle = Angle.degrees(360 * f)
-        return ZStack {
-            Circle()
-                .trim(from: 0, to: CGFloat(f))
-                .stroke(gradient, style: StrokeStyle(lineWidth: 6, lineCap: .round))
-                .rotationEffect(.degrees(-90))
-                .padding(3)
-            if mode != .unknown {
-                ZStack {
-                    Circle().fill(g2).frame(width: 8, height: 8).shadow(color: g2, radius: 2)
-                    Circle().fill(core).frame(width: 3, height: 3)
-                }
-                .offset(y: -41)
-                .rotationEffect(angle)
+        // Server minute boundaries on the phone clock: the offset is rarely a whole minute.
+        TimelineView(.periodic(from: HomeLogic.minuteStart(phone: Date(), offset: home.offset), by: 60)) { ctx in
+            let now = HomeLogic.shownInstant(home.serverNow(ctx.date))
+            VStack(alignment: .leading, spacing: 0) {
+                Text(HomeLogic.greeting(now))
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(.l2)
+                Spacer(minLength: 0)
+                Text(HomeLogic.clockTime(now))
+                    .font(.system(size: 34, weight: .semibold).monospacedDigit())
+                    .foregroundColor(.white)
+                Spacer(minLength: 0)
+                Text(HomeLogic.dayLine(now))
+                    .font(.system(size: 12.5))
+                    .foregroundColor(.l2)
             }
-        }
-        // A change of state snaps; inside a state the ring glides 1 s per tick.
-        .animation(reduceMotion ? nil : .linear(duration: 1), value: f)
-        .id(mode)
-    }
-
-    private func texts(_ r: HomeLogic.Ring, color: Color) -> some View {
-        let unknown = r.mode == .unknown
-        let time = unknown ? "--:--" : HomeLogic.hhmm(r.seconds)
-        return VStack(spacing: BoxRing.textSpacing) {
-            Text(r.mode == .paused ? "Wakes in" : "Sleeps in")
-                .font(Font(BoxRing.labelFont as CTFont))
-                .tracking(0.22)
-                .foregroundColor(.l2)
-            Text(time)
-                .font(Font(BoxRing.timeFont as CTFont))
-                .foregroundColor(unknown ? Color.l2 : color)
-                .lineLimit(1)
-                .fixedSize()
-        }
-        .offset(y: BoxRing.textOffset)
-    }
-
-    private func label(_ r: HomeLogic.Ring, now: Date) -> String {
-        let h = r.seconds / 3600, m = r.seconds % 3600 / 60
-        let at = r.changeAt.map { HomeLogic.clock($0) } ?? ""
-        switch r.mode {
-        case .unknown: return "Chưa biết giờ box nghỉ. Chạm để xem giải thích."
-        case .paused: return "Box đang nghỉ, đánh thức lại được sau \(h) giờ \(m) phút, lúc \(at). Chạm để xem giải thích."
-        default: return "Box nghỉ sau \(h) giờ \(m) phút, lúc \(at), hoặc sớm hơn nếu rảnh 30 phút. Chạm để xem giải thích."
+            .lineLimit(1)
+            .minimumScaleFactor(0.75)
+            .padding(.vertical, 2)
+            .frame(width: 100, height: 88, alignment: .leading)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(HomeLogic.greetingSpoken(now))
         }
     }
 }

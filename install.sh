@@ -16,6 +16,12 @@ mkdir -p "$APP"
 [ ! -f "$SRC/box/fcode-add.sh" ] || install -m 755 "$SRC/box/fcode-add.sh" "$APP/fcode-add.sh"
 # the box CLI for the deploy gate's operator key: ~/.local/bin/fcode-deploy (docs/HUONG-DAN.md, "Deploy từ box")
 [ ! -f "$SRC/box/fcode-deploy.sh" ] || install -D -m 755 "$SRC/box/fcode-deploy.sh" "$HOME/.local/bin/fcode-deploy"
+# the box command that leaves a one-way notice in the outbox Hermes pulls: ~/.local/bin/fcode-notify (box/README.md)
+[ ! -f "$SRC/box/fcode-notify.sh" ] || install -D -m 755 "$SRC/box/fcode-notify.sh" "$HOME/.local/bin/fcode-notify"
+# the outbox dir (700) and an empty outbox (600), so Hermes' first pull finds a file; ">>" never truncates and is safe against fcode-notify's mv
+( umask 077; d=$HOME/.local/state/fcode/notify; mkdir -p "$d" && chmod 700 "$d" && : >>"$d/outbox.tsv" )
+# the box CLI behind the laptop's `fcode add` and the owner's manual add: ~/.local/bin/fcode-add (runs fcode-add.sh under the server's ADD_WATCHDOG)
+[ ! -f "$SRC/box/fcode-add-run.sh" ] || install -D -m 755 "$SRC/box/fcode-add-run.sh" "$HOME/.local/bin/fcode-add"
 
 mkdir -p "$CFG"
 chmod 700 "$CFG"
@@ -67,6 +73,9 @@ exec env PC_CONFIG_DIR="$CFG" "$(command -v node)" "$APP/server.mjs" --new "\$@"
 WRAP
 chmod 755 "$HOME/.local/bin/fcode-new"
 
+# the one loader of GH_TOKEN (CONTRACT A3), installed before the auto-update step: the timer it installs runs fcode-git-sync, which looks for $APP/start.sh
+install -m 755 "$SRC/box/start.sh" "$APP/start.sh"
+
 # box auto-update (omp, claude, codex timer): idempotent, runs as this user; a failure (e.g. no passwordless sudo) must not abort the install
 if [ -f "$SRC/box/install-autoupdate.sh" ]; then
   bash "$SRC/box/install-autoupdate.sh" || echo "warning: box auto-update was not installed (see box/README.md)" >&2
@@ -75,34 +84,16 @@ fi
 # KillMode=process: the tmux server (and every harness session) is started by this service;
 # restarting or crashing the service must not take it down. StartLimitIntervalSec=0: always restart.
 # An "add project" job (fcode-add.sh) is a child in its own process group: systemctl stop / restart sends SIGTERM to the server, whose handler
-# ends the job and its group (CONTRACT A11); after a crash KillMode=process leaves it alone, and the job's own timeout(1) deadline ends it.
+# ends the job and its group (CONTRACT A11); after a crash KillMode=process leaves it alone, and the job's own deadline (ADD_WATCHDOG in server.mjs) ends it.
 # PATH for the harnesses is set by server.mjs itself (~/.local/bin, ~/.bun/bin, system dirs).
-# The home screen's project list runs gh, which needs GH_TOKEN. A login shell gets it from the instabox vault file
-# (/etc/profile.d/zz-instabox-secrets.sh sources /run/instabox/secrets/env, which lives in RAM); the service takes
-# GH_TOKEN alone from the same file at each start. Nothing is copied to disk and no other variable is kept.
-cat > "$APP/start.sh" <<'START'
-#!/bin/sh
-f=${FCODE_SECRETS_ENV:-/run/instabox/secrets/env}
-if [ -z "${GH_TOKEN:-}" ] && [ -r "$f" ]; then
-  t=$(. "$f" >/dev/null 2>&1; printf '%s' "${GH_TOKEN:-}")
-  if [ -n "$t" ]; then GH_TOKEN=$t; export GH_TOKEN; fi
-  unset t
-fi
-# The staging box start button (server.mjs) needs INSTABOX_API_KEY alone, from the one line `export INSTABOX_API_KEY=...` of
-# ~/.config/fcode/instabox.env. The line is read as text (the file is never sourced), the value must look like a key, and nothing else
-# is taken. No file or no such line: the service starts without it and staging stays off.
-k=${FCODE_INSTABOX_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/fcode/instabox.env}
-if [ -z "${INSTABOX_API_KEY:-}" ] && [ -r "$k" ]; then
-  t=$(sed -n '/^export INSTABOX_API_KEY=/{s///p;q;}' "$k" 2>/dev/null | tr -d '\r')
-  case $t in \"*\") t=${t#\"}; t=${t%\"} ;; \'*\') t=${t#\'}; t=${t%\'} ;; esac
-  case $t in ''|*[!A-Za-z0-9._-]*) t= ;; esac
-  if [ -n "$t" ]; then INSTABOX_API_KEY=$t; export INSTABOX_API_KEY; fi
-  unset t
-fi
-unset k
-exec "$@"
-START
-chmod 755 "$APP/start.sh"
+# The home screen's project list runs gh, which needs GH_TOKEN. A login shell gets it from the secrets env file
+# (FCODE_SECRETS_ENV, default /run/instabox/secrets/env; on the Oracle VM a tmpfiles link to ~/.config/fcode/secrets.env);
+# the service takes GH_TOKEN alone from the same file at each start, through box/start.sh (installed above, next to server.mjs).
+# start.sh reads the file once, as data (head | awk; never sourced or run), and the whole file must pass a strict grammar or there
+# is no token (fail closed; the grammar, incl. the six names OPTIND HISTCMD MAILCHECK RANDOM SRANDOM SECONDS it refuses, is in its
+# header and CONTRACT A3). It drops an inherited GH_TOKEN and GITHUB_TOKEN. The service passes -v: the status line
+# (`journalctl --user -u fcoding | grep start.sh`) says why there is no token, never a value. server.mjs starts every harness session
+# through the same start.sh (no -v), so omp's gh and https pushes get the token too. Nothing is copied to disk and no other variable is kept.
 mkdir -p "$UNIT_DIR"
 cat > "$UNIT_DIR/fcoding.service" <<UNIT
 [Unit]
@@ -113,7 +104,7 @@ StartLimitIntervalSec=0
 [Service]
 Environment=LANG=C.UTF-8
 Environment=PC_CONFIG_DIR=$CFG
-ExecStart=/bin/sh $APP/start.sh $(command -v node) $APP/server.mjs
+ExecStart=/bin/sh $APP/start.sh -v $(command -v node) $APP/server.mjs
 KillMode=process
 Restart=always
 RestartSec=2
@@ -135,10 +126,9 @@ Pair a phone (no password): run on the box
 and type the 6-digit code into the app within 120 s. One code per issuer (the command, each paired phone), 3 at most; running it again replaces the command's own code.
   fcode-pair "iPhone" --qr     (also prints a QR of the server address and the code in big digits; needs "publicUrl" in config.json, and qrencode for the QR)
 New session:      fcode-new <project> <harness>     (fcode-new --projects, fcode-new --harnesses; prints the session name)
+Add a project by hand: fcode-add <owner/repo> <name>     (10 min limit, like the app)
 Paired devices:   PC_CONFIG_DIR=$CFG node $APP/server.mjs --devices
 Revoke a device:  PC_CONFIG_DIR=$CFG node $APP/server.mjs --revoke <id>     (or --revoke all)
 Projects: edit $CFG/config.json ("projects": {"name": "/abs/dir"}); the server reloads it by itself.
 Paired devices survive restarts. Changing cookieSecret in config.json unpairs every device.
-Publish:  instabox port publish <box> 7681
-Staging:  the app's "Bật" button runs instabox start <project>; put  export INSTABOX_API_KEY=...  in ~/.config/fcode/instabox.env (chmod 600), then systemctl --user restart fcoding
 MSG

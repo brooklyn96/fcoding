@@ -123,73 +123,6 @@ extension View {
     }
 }
 
-// MARK: - Box info (tap on the ring)
-
-struct BoxInfoSheet: View {
-    let box: HomeBox?
-    /// Server clock minus phone clock (HomeModel.offset).
-    let offset: TimeInterval
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        let maxRun = Int(box?.maxRunMinutes ?? 480), idle = Int(box?.idlePauseMinutes ?? 30), cool = Int(box?.cooldownMinutes ?? 10)
-        SheetScaffold(large: true) {
-            SheetHeader(title: "Box coder tự nghỉ", right: ("Xong", { dismiss() }))
-            Text("Để tiết kiệm, box coder tự nghỉ:").sheetBody()
-            VStack(alignment: .leading, spacing: 0) {
-                step(maxRun % 60 == 0 ? "\(maxRun / 60)h" : "\(maxRun)′", Color(hex: 0xE5C07B),
-                     Text("Khi đã chạy đủ ") + Text("\(hours(maxRun))").bold(),
-                     "Tính từ lúc box bật lên. Đồng hồ đếm ngược tới mốc này.")
-                step("\(idle)′", Color(hex: 0xE5C07B),
-                     Text("Hoặc ") + Text("sớm hơn").bold() + Text(", nếu rảnh \(idle) phút"),
-                     "Không phiên nào làm gì trong \(idle) phút. Mốc này app không đếm được.")
-                step("\(cool)′", Color(hex: 0xA5A3FF),
-                     Text("Nghỉ vì chạy đủ giờ thì ") + Text("chưa đánh thức lại được trong \(cool) phút").bold(),
-                     "Sau đó box tự dậy khi có thứ dùng tới nó (app, lệnh, SSH). Nghỉ vì rảnh thì dậy ngay ở lần dùng kế tiếp, khoảng vài giây. Bạn không cần làm gì.")
-            }
-            .padding(.bottom, 16)
-            TimelineView(.periodic(from: Date(), by: 1)) { ctx in
-                now(HomeLogic.ring(box, now: ctx.date.addingTimeInterval(offset)), maxRun: maxRun, idle: idle).sheetNote()
-            }
-            Button("Đã hiểu") { dismiss() }.buttonStyle(PrimaryButtonStyle())
-        }
-    }
-
-    private func hours(_ minutes: Int) -> String { minutes % 60 == 0 ? "\(minutes / 60) giờ" : "\(minutes) phút" }
-
-    private func step(_ tag: String, _ color: Color, _ title: Text, _ detail: String) -> some View {
-        HStack(alignment: .top, spacing: 12) {
-            Text(tag)
-                .scaledFont(13, weight: .bold)
-                .foregroundColor(color)
-                .frame(width: 30, height: 30)
-                .background(color.opacity(0.18), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-                .dynamicTypeSize(...DynamicTypeSize.large)
-            VStack(alignment: .leading, spacing: 2) {
-                title.scaledFont(14.5)
-                Text(detail).scaledFont(13).foregroundColor(.l2)
-            }
-            .fixedSize(horizontal: false, vertical: true)
-        }
-        .padding(.vertical, 8)
-        .accessibilityElement(children: .combine)
-    }
-
-    private func now(_ r: HomeLogic.Ring, maxRun: Int, idle: Int) -> Text {
-        let at = Text(r.changeAt.map { HomeLogic.clock($0) } ?? "").bold().monospacedDigit()
-        let left = Text(HomeLogic.hms(r.seconds)).bold().monospacedDigit()
-        switch r.mode {
-        case .unknown:
-            return Text("Bây giờ: chưa biết giờ box nghỉ.")
-        case .paused:
-            return Text("Bây giờ: box đang nghỉ, đánh thức lại được từ lúc ") + at + Text(" (sau ") + left + Text(").")
-        default:
-            return Text("Bây giờ: box sẽ nghỉ lúc ") + at + Text(", sau ") + left
-                + Text(" (chạy đủ \(maxRun) phút), hoặc sớm hơn nếu rảnh \(idle) phút.")
-        }
-    }
-}
-
 // MARK: - Hướng dẫn (the (?) button): one exclusive accordion, numbered steps per area
 
 struct HomeGuideView: View {
@@ -205,11 +138,16 @@ struct HomeGuideView: View {
             "Vuốt một phiên sang trái để **Đổi tên** hoặc **Đóng**.",
             "Kéo danh sách xuống để làm mới.",
         ]),
-        ("Vòng giờ box", 0x64D2FF, [
-            "**Sleeps in**: box còn chạy bao lâu rồi tự nghỉ (tối đa 8 giờ, sớm hơn nếu rảnh 30 phút).",
-            "Vòng chuyển **vàng** khi còn dưới 10 phút.",
-            "**Wakes in**: box vừa nghỉ vì đã chạy đủ 8 giờ, chưa đánh thức lại được trong khoảng 10 phút.",
-            "Chạm vào vòng để xem giờ chính xác.",
+        ("Chọn trong menu", 0xFF9F0A, [
+            "Khi phiên hỏi bạn chọn (một menu có một dòng đang được chọn), các dòng lựa chọn có nền màu nhạt và một thanh nút hiện ngay trên ô nhập.",
+            "Chạm ngay dòng trên màn hình, hoặc nút của nó trên thanh, để chọn. Ô **[ ]** chỉ được đánh dấu; chọn xong thì chạm **Submit**. Dòng **Type something** (Claude): app chỉ đưa con trỏ tới đó, bạn gõ thẳng vào rồi Enter; Esc huỷ cả câu hỏi. Dòng **Other** (omp): app bấm Enter mở ô **Custom answer**, bạn gõ rồi Enter (hoặc Ctrl+Q); Esc để quay lại.",
+            "Câu hỏi nhiều trang: nút **←** / **→**. Nút **Esc** đóng menu. Nhiều lựa chọn thì kéo thanh sang ngang.",
+            "Sau mỗi lần chạm, thanh mờ đi tới khi màn hình bạn thấy giống màn hình trên box (thường khoảng nửa giây). Nếu thanh vẫn mờ, dùng hàng phím nhanh.",
+            "Hoặc dùng các phím **↑** **↓** **Enter** ở đầu hàng phím nhanh.",
+        ]),
+        ("Lời chào và giờ", 0x64D2FF, [
+            "Bên trái thẻ trên cùng: lời chào theo buổi, giờ hiện tại và thứ, ngày hôm nay.",
+            "Giờ luôn là **giờ Việt Nam**, kể cả khi iPhone đặt múi giờ khác.",
         ]),
         ("Hạn mức", 0xD97757, [
             "Ô hạn mức tự chuyển qua từng tài khoản mỗi 4 giây. Giữ ngón tay trên ô để dừng.",
@@ -227,7 +165,6 @@ struct HomeGuideView: View {
             "Mỗi thẻ dự án cho biết số **PR** đang mở, kết quả **checks** và lần **deploy** gần nhất.",
             "Chạm vào thẻ để chỉ xem phiên của dự án đó; chạm **Tất cả** để xem lại hết.",
             "Giữ lâu một thẻ, hoặc bấm **…**, để mở phiên mới cho dự án đó.",
-            "Dòng **Staging** cho biết box staging đang chạy hay đang nghỉ; bấm **Bật** để bật nó.",
             "Trong **…** có **Phiên omp gần đây** (cả phiên từ laptop): bấm **Tiếp tục** để làm tiếp trên box.",
             "Thêm dự án: bấm **+** → **Thêm dự án**, dán link repo GitHub hoặc chọn repo trong danh sách, rồi bấm **Thêm**.",
         ]),
