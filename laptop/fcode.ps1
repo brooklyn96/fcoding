@@ -1,10 +1,10 @@
-﻿# fcode: vao phien tmux tren box instabox "coder" (1 lan ssh). Xem fcode.sh.
+﻿# fcode: vao phien tmux tren box Oracle (ssh thang, alias "oracle" trong ~/.ssh/config, 1 lan ssh). Xem fcode.sh.
 param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Rest)
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $arg = if ($Rest -and $Rest.Count -gt 0) { $Rest[0] } else { '' }
 # Cau hinh rieng tung may: %USERPROFILE%\.fcode\config.json (install.ps1 tao). Thieu khoa thi dung mac dinh.
-# Khoa: instabox (duong dan instabox.exe), box (ten box), syncRepos (danh sach thu muc cho fcode sync), ipaRepo, ipaTag, deployHost (ten ssh den VPS cho fcode deploy, mac dinh contabo),
+# Khoa: ssh (duong dan ssh.exe), host (alias ssh den box, mac dinh oracle; FCODE_HOST doi tam cho mot lan chay), syncRepos (danh sach thu muc cho fcode sync), ipaRepo, ipaTag, deployHost (ten ssh den VPS cho fcode deploy, mac dinh contabo),
 # moveTargets (moveTargets.<ten ssh>.platform_user = user dang nhap cua nen tang cua may do, de trong neu khong co; fcode move).
 $ConfigFile = Join-Path $env:USERPROFILE '.fcode\config.json'
 $Cfg = $null; $CfgBroken = $null
@@ -16,7 +16,9 @@ function Get-Cfg([string]$Key, $Default) {
   $v = if ($Cfg) { $Cfg.$Key }
   if ($null -ne $v -and "$v" -ne '') { $v } else { $Default }
 }
-$box = if ($env:FCODE_BOX) { $env:FCODE_BOX } else { Get-Cfg 'box' 'coder' }
+$box = [string]$(if ($env:FCODE_HOST) { $env:FCODE_HOST } else { Get-Cfg 'host' 'oracle' })   # alias ssh den box (ssh $box ...)
+# checked once, here, for every ssh call (-oProxyCommand=... would run a program; a quote would break the hand-built command line of Invoke-BoxPy)
+if ($box -notmatch '\A[A-Za-z0-9][A-Za-z0-9._-]*\z') { Write-Host "lỗi: tên box không hợp lệ ($(($box -replace '[^\x20-\x7e]', '?'))). Dùng tên trong ~/.ssh/config (chữ, số, dấu . _ -), đặt ở khóa host của config.json hoặc biến FCODE_HOST."; exit 1 }
 # fcode sync: cap nhat cac project tu GitHub (chi fetch + merge --ff-only), liet ke nhanh box/* va PR dang mo.
 # Danh sach project lay tu syncRepos trong config (de test: dat FCODE_SYNC_REPOS = cac duong dan cach nhau bang dau ;)
 $SyncRepos = @(Get-Cfg 'syncRepos' @()) | Where-Object { $_ }
@@ -247,11 +249,11 @@ function Get-PhienKeyOf([string]$BoxName, $Projs) {
   if ($repo) { foreach ($k in $Projs.Keys) { if ((Get-LocalRepoKey $Projs[$k]) -eq $repo) { return [string]$k } } }
   $null
 }
-# project cua box (ten + URL origin + ten goi): danh thuc box, hoi mot lan (han 60 giay, khong phai 900 giay cua mot dot chep phien, tinh tu luc box da thuc).
+# project cua box (ten + URL origin + ten goi): hoi box mot lan (han 60 giay, khong phai 900 giay cua mot dot chep phien).
 # $null neu khong doc duoc. Cung cap nhat ban sao ten goi.
 function Get-BoxProjects {
   $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-  try { & (Get-InstaboxExe) wake $box *> $null; $script:PhienDeadline = [DateTime]::UtcNow.AddSeconds([Math]::Min(60, (Get-PhienLimitSec $false))); $bp = Get-BoxJson (Invoke-BoxPy 'projects' ([byte[]]@())) } catch { $bp = $null } finally { $ErrorActionPreference = $old; $script:PhienDeadline = $null }
+  try { $script:PhienDeadline = [DateTime]::UtcNow.AddSeconds([Math]::Min(60, (Get-PhienLimitSec $false))); $bp = Get-BoxJson (Invoke-BoxPy 'projects' ([byte[]]@())) } catch { $bp = $null } finally { $ErrorActionPreference = $old; $script:PhienDeadline = $null }
   if ($bp) { Save-PrefsCache $bp.prefs }
   $bp
 }
@@ -539,13 +541,13 @@ function Invoke-IpaLocked {
   } finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
 }
 
-# duong dan instabox.exe: config > PATH > thu muc cai mac dinh
-function Get-InstaboxExe {
-  $p = Get-Cfg 'instabox' ''
+# duong dan ssh.exe: config (khoa ssh, de thu) > PATH > "ssh"
+function Get-SshExe {
+  $p = Get-Cfg 'ssh' ''
   if ($p -and (Test-Path -LiteralPath $p)) { return $p }
-  $c = Get-Command instabox -ErrorAction SilentlyContinue
+  $c = Get-Command ssh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
   if ($c) { return $c.Source }
-  Join-Path $env:LOCALAPPDATA 'Programs\instabox\instabox.exe'
+  'ssh'
 }
 
 # In mot phan cua bang help: co mau chi khi dau ra la cua so that (khong bi chuyen huong / pipe), nen khong bao gio co ky tu ESC trong van ban
@@ -765,13 +767,13 @@ function Show-Help([string]$Topic = '') {
       '    gì (chỉ ghi lại giờ vừa kết nối box).',
       '>fcode phien tu-dong bat    |    fcode phien tu-dong tat',
       '    Bật / tắt tự động đồng bộ phiên mỗi 10 phút, chạy ngầm (không hiện',
-      '    cửa sổ), chỉ khi box đang chạy, và chỉ mở kết nối khi box vừa bật',
-      '    hoặc cách lần mở trước từ 40 phút (để box tự nghỉ được).',
+      '    cửa sổ), chỉ khi vào được box, và chỉ mở kết nối lần đầu hoặc khi',
+      '    lần mở trước đã cách từ 40 phút.',
       '>fcode phien tu-dong trangthai',
       '    Xem tự động đồng bộ đang bật hay tắt.',
       '>fcode phien <project> --nhanh',
-      '    Bản nhanh cho hook (fcode moc): chỉ một project, không đánh thức',
-      '    box (box đang ngủ thì bỏ qua), tối đa 20 giây, đang có lượt đồng',
+      '    Bản nhanh cho hook (fcode moc): chỉ một project, vào box bằng ssh',
+      '    (không vào được box thì báo lỗi), tối đa 20 giây, đang có lượt đồng',
       '    bộ khác thì bỏ qua. Lần chạy nhanh chưa xong sau 30 giây thì bị',
       '    ngắt hẳn và báo lỗi (fcode phien chạy tay thì không bị ngắt như',
       '    vậy).',
@@ -791,8 +793,8 @@ function Show-Help([string]$Topic = '') {
       '#fcode moc bat    |    fcode moc tat    |    fcode moc trang-thai',
       '  Bật / tắt / xem hook trong profile PowerShell: gõ omp, claude hoặc',
       '  codex trong thư mục một project (có trong syncRepos) thì fcode đồng',
-      '  bộ nhanh phiên trước và sau khi chạy (tối đa khoảng 20 giây, box ngủ',
-      '  thì bỏ qua).',
+      '  bộ nhanh phiên trước và sau khi chạy (tối đa khoảng 20 giây; không',
+      '  vào được box thì báo một dòng lỗi).',
       '  Phiên Claude Code / Codex chưa được chép giữa hai máy, chỉ phiên omp',
       '  và ghi chú project.',
       '',
@@ -857,19 +859,17 @@ function Show-Help([string]$Topic = '') {
 
 # Chay script bash tren box. Tham so di CUNG script (dong "set -- '..'" dau payload, da kiem tra), khong bao gio nam tren dong lenh ssh.
 function Invoke-BoxScript([string]$Script, [string[]]$ScriptArgs) {
-  $ib = Get-InstaboxExe
   $pre = if ($ScriptArgs) { 'set -- ' + (($ScriptArgs | ForEach-Object { "'" + ($_ -replace "'", "'\''") + "'" }) -join ' ') + "`n" } else { '' }
   $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($pre + $Script))
   # script di qua stdin (dong lenh Windows bi gioi han ~8 KB); tren box luu ra file tam roi chay voi stdin = /dev/null
   $remote = 'f=$(mktemp) && base64 -di >$f && bash -l $f </dev/null; rc=$?; rm -f $f; exit $rc'
-  & $ib wake $box *> $null
-  $b64 | & $ib ssh $box -- $remote
+  $b64 | & (Get-SshExe) $box $remote
 }
 
 # ky tu dieu khien (ke ca xuong dong) khong bao gio duoc di vao tham so
 function Test-HasControlChar([string]$s) { $s -match '[\x00-\x1f\x7f]' }
 
-# chi de thu: FCODE_ADD_TIMEOUT_S / FCODE_ADD_KILL_AFTER_S (so nguyen duong, khong co 0: timeout 0 = khong co han) thanh bien cho $FcodeAddRun
+# chi de thu: FCODE_ADD_TIMEOUT_S / FCODE_ADD_KILL_AFTER_S (so nguyen duong 1-99999, khong co 0: watchdog tren box doc giay, 0 la het han ngay) thanh bien cho $FcodeAddRun
 function Get-FcodeAddLimitVars {
   $o = ''
   foreach ($tv in 'FCODE_ADD_TIMEOUT_S', 'FCODE_ADD_KILL_AFTER_S') { $tx = [Environment]::GetEnvironmentVariable($tv); if ("$tx" -match '\A[1-9][0-9]{0,4}\z') { $o += "$tv=$tx`n" } }
@@ -912,7 +912,7 @@ function Invoke-Add {
       $c = $Matches[1]; $d = $Matches[2]; $seen[$c] = $true
       # -Wildcard: DIR_* / HOOK_FAIL* / CLEANUP* khop theo tien to (ten ma tren box co the doi chut); cac nhan khac khop dung ten
       switch -Wildcard ($c) {
-        'NO_SCRIPT'     { Write-Host "lỗi: box chưa có script thêm dự án (bản FCode trên box đã cũ). Cập nhật box: instabox ssh $box rồi chạy: cd ~/fcode-src && git pull && bash install.sh"; Write-Host "  Xong thì chạy lại: fcode add $repo $name" }
+        'NO_SCRIPT'     { Write-Host "lỗi: box chưa có lệnh thêm dự án (fcode-add; bản FCode trên box đã cũ). Cập nhật box: ssh $box rồi chạy: cd ~/fcode-src && git pull && bash install.sh"; Write-Host "  Xong thì chạy lại: fcode add $repo $name" }
         'TOKEN_OK'      { if ($try -eq 1) { Write-Host '[1] Box dùng khoá GitHub sẵn có (token) cho repo này, không cần dán khoá' } }
         'TOKEN_FALLBACK' { Write-Host '[1] Khoá GitHub sẵn có của box không ghi được repo này, chuyển sang khoá SSH riêng cho repo' }
         'KEY_NEW'       { if ($try -eq 1) { Write-Host '[1] Đã tạo khoá SSH riêng cho repo này trên box' } }
@@ -957,15 +957,15 @@ function Invoke-Add {
         'BAD_ARGS'      { Write-Host 'lỗi: tên repo hoặc tên project không hợp lệ.' }
       }
     }
-    # timeout tren box: 124 = qua han, da dung (TERM); 137 = khong dung theo TERM nen bi KILL
-    if ($code -in 124, 137) { Write-Host "lỗi: thêm dự án trên box chạy quá 10 phút nên đã bị dừng (mã $code). Chạy lại là an toàn: fcode add $repo $name"; return 1 }
+    # watchdog tren box: qua han -> TERM ca nhom, 30 giay sau KILL ca nhom (137)
+    if ($code -eq 137) { Write-Host "lỗi: thêm dự án trên box chạy quá 10 phút nên đã bị dừng (mã $code). Chạy lại là an toàn: fcode add $repo $name"; return 1 }
     if ($code -eq 11) { Write-Host "Thư mục $name đã có trên box (hoặc không an toàn) — chọn tên khác: fcode add $repo <tên-khác>"; return 1 }
     if ($code -eq 25) { Write-Host 'lỗi: box không ghi được cấu hình đăng nhập GitHub cho repo này, nên chưa thêm project.'; return 1 }
     if ($code -eq 26) { Write-Host 'lỗi: cấu hình git trên box đang chuyển hướng địa chỉ GitHub (insteadOf / pushInsteadOf / pushurl) — cần gỡ trên box rồi chạy lại.'; return 1 }
     if ($code -eq 24) { Write-Host '[4] lỗi: không cài được chốt chặn push lên main, nên chưa thêm project.'; if ($hookD) { Write-Host "  (chi tiết: $hookD)" }; return 1 }
     if ($seen.Count -eq 0) {
       $d = ($lines | Where-Object { "$_".Trim() } | Select-Object -First 1)
-      Write-IpaError 'không nói chuyện được với box. Kiểm tra: đã chạy "instabox login" chưa, và box đang bật không.' $d
+      Write-IpaError "không nói chuyện được với box. Kiểm tra: gõ ssh $box có vào được không (alias trong ~/.ssh/config)." $d
       return 1
     }
     # loi can sua truoc (ten da dung, cau hinh hong, GitHub chan, mang, repo luu tru): thong bao cu the da in o tren, khong bao "chay lai cung lenh"
@@ -1002,7 +1002,7 @@ function Invoke-Add {
   # chi bao "Xong" khi script thoat 0 va that su qua: doc duoc + ghi duoc repo, va da vao cau hinh
   if ($code -eq 0 -and $seen.ContainsKey('READ_OK') -and $seen.ContainsKey('WRITE_OK') -and ($seen.ContainsKey('CFG_ADDED') -or $seen.ContainsKey('CFG_EXISTS'))) { }
   elseif ($code -ne 0 -and $code -ne 30) {
-    # chi noi "chay lai la an toan" khi chay lai co the giup (mang / box bi dung giua chung); 124 / 137 (qua han) da bao rieng o tren; ma la: chi bao ma
+    # chi noi "chay lai la an toan" khi chay lai co the giup (mang / box bi dung giua chung); 137 (qua han) da bao rieng o tren; ma la: chi bao ma
     if ($code -in 1, 12, 143, 255) { Write-Host "Chưa xong (mã $code). Xem thông báo ở trên rồi chạy lại cùng lệnh, chạy lại là an toàn." } else { Write-Host "Chưa xong (mã $code). Xem thông báo ở trên." }
     return 1
   }
@@ -1628,8 +1628,11 @@ function ConvertFrom-MoveManifestLine($Lines) {
 function Add-MoveLog([string]$Alias, [string]$Call, $Lines) {
   try {
     $d = Join-Path (Get-MoveDir) 'log'; [void][IO.Directory]::CreateDirectory($d)
+    # a part file left by a run killed between Write-PhienText's write and its move (one fcode move runs at a time, move.lock) is dropped first: every log has its own name, so
+    # Write-PhienText's own per-name cleanup would never see it, and it would count as a log in $n
+    foreach ($pf in @([IO.Directory]::GetFiles($d, '*.log.part-*'))) { try { [IO.File]::Delete($pf) } catch { } }
     $n = @([IO.Directory]::GetFiles($d)).Count + 1
-    [IO.File]::WriteAllText((Join-Path $d ("{0:d5}-{1}-{2}.log" -f $n, $Alias, $Call)), ((@($Lines) -join "`n") + "`n"), (New-Object Text.UTF8Encoding($false)))
+    Write-PhienText (Join-Path $d ("{0:d5}-{1}-{2}.log" -f $n, $Alias, $Call)) ((@($Lines) -join "`n") + "`n")   # main's rule (fcode-phien r4): every file write goes through Write-PhienText (UTF-8 no BOM, part file + move)
   } catch { }
 }
 
@@ -1715,7 +1718,7 @@ function Invoke-MoveScript($Mach, [string]$Script, [string[]]$ScriptArgs = @(), 
   if ($t.Code -in 124, 255, -1) { $script:MoveNoAnswer = $true; Write-Host "lỗi: không chạy được lệnh trên máy '$($Mach.Alias)' qua ssh (mã $($t.Code))." }
   @{ Code = [int]$t.Code; Lines = $lines }
 }
-# the box (coder) through instabox: @{ Code; Lines }
+# the box (coder) over plain ssh (Invoke-BoxScript, #39: `ssh <host alias>`, no instabox): @{ Code; Lines }
 function Invoke-MoveBox([string]$Script, [string[]]$ScriptArgs = @()) {
   $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
   try { $o = @(Invoke-BoxScript ($Script -replace "`r`n", "`n") $ScriptArgs 2>&1 | ForEach-Object { "$_" }); $code = [int]$LASTEXITCODE } catch { $o = @("$($_.Exception.Message)"); $code = 1 } finally { $ErrorActionPreference = $old }
@@ -2729,7 +2732,9 @@ function Invoke-MovePlanLoop($S, [string[]]$Map) {
       Set-MoveAsk $S $asked "Q-direct:$nm" $a
       if ($a -ceq 'có') { $map += "accept direct $nm"; $again = $true }
     }
-    $own = @($refs | Where-Object { $_ -cmatch '\AINV refuse own-ip\b' } | ForEach-Object { [string](& $kv $_)['path'] } | Where-Object { $_ })
+    # B.12.4 (W1-T3-GAP-17): an `own-ip path=ingress:<hostname>` hit has no file to rewrite (and `rewrite own-ip` takes an absolute path only, B.14.2): it gets no Q-ownip entry and no
+    # map line; Write-MoveTunnelRemedies above printed its remedy and the plan ends 65. The kind is matched exactly (own-ip-nat and own-ip-family are other refusals with their own label)
+    $own = @($refs | Where-Object { $_ -cmatch '\AINV refuse own-ip(\s|\z)' } | ForEach-Object { [string](& $kv $_)['path'] } | Where-Object { $_ -cmatch '\A/' })
     if ($own.Count -and -not $asked['Q-ownip']) {
       $a = Read-MoveAnswer (Get-MoveText 'Q-ownip' @{ 'danh sách' = ($own -join ', ') }) @('có', 'không')
       Set-MoveAsk $S $asked 'Q-ownip' $a
@@ -3902,7 +3907,13 @@ function Invoke-MoveRebuild([string]$OldAlias, [string]$NewAlias) {
   Set-MoveProp $S.aliases 'laptop_backup' $(if ($serv -ceq 'new' -or $phase -ceq 'back-done') { [string]$S.old.addr } else { $null })   # rebuilt from the move-ids, never from the ssh config
   Set-MoveProp $S.aliases 'coder_backup' $(if ($serv -ceq 'new' -or $phase -ceq 'back-done') { [string]$S.old.addr } else { $null })
   foreach ($lp in @(Get-MoveProp $S 'legacy_push' @())) { Set-MoveMapVal $S.legacy_known_hosts ([string]$lp.repo) "$($S.old.addr) $($o.Hk)" }
-  foreach ($k in 'old', 'new') { $m = if ($k -ceq 'old') { $S.old } else { $S.new }; if ($m.hostkey_line -and -not (Get-MovePinnedKey $m.addr)) { Add-Content -LiteralPath (Get-MoveKnownFile) -Value "$($m.addr) $($m.hostkey_line)" -Encoding ascii } }
+  foreach ($k in 'old', 'new') {
+    $m = if ($k -ceq 'old') { $S.old } else { $S.new }
+    if ($m.hostkey_line -and -not (Get-MovePinnedKey $m.addr)) {
+      $kf = Get-MoveKnownFile; $kt = if ([IO.File]::Exists($kf)) { [IO.File]::ReadAllText($kf) } else { '' }
+      Write-PhienText $kf ($kt + $(if ($kt -and -not $kt.EndsWith("`n")) { "`n" }) + "$($m.addr) $($m.hostkey_line)" + "`n") (New-Object Text.ASCIIEncoding)   # every file write goes through Write-PhienText (fcode-phien r4)
+    }
+  }
   Save-MoveManifest $mf.Text
   Save-MoveState $S
   Write-Host "Đã dựng lại trạng thái từ hai máy ($($S.move_id), giai đoạn $phase). Xem lại bằng fcode move status trước khi chạy tiếp."
@@ -4032,6 +4043,17 @@ function Invoke-Pair {
 
 # --- Hai script bash chay tren box (nhung san de chi can 1 file fcode.ps1) ---
 # fcode.sh: liet ke / chon / vao phien tmux.
+# attach() in it ends with two tmux commands after the attach (kept out of the here-string: the script travels gzip+base64 on the ssh command line):
+# - set-option -w window-size latest: the app sizes the window to the phone (window-size manual), so a laptop client would see only part of it.
+#   "latest" makes the window follow this client now and on every later resize of the laptop terminal (resize-window -A would freeze it
+#   at the attach-time size). The app sets its own size again (resize-window, manual) when the phone opens the session.
+# - set-option mouse on, for this session only (the server's tmux default is off): the wheel scrolls the pane history in copy mode.
+#   A pane the laptop leaves in copy mode would swallow the app's input, so the server quits any pane mode before it sends text or keys.
+# Before the attach, attach() also sets two global tmux bindings (idempotent, every attach) and, when the laptop passed FCODE_CLIP_SOCK (a path, in the remote command) and LC_FCODE_CLIP_TOKEN (ssh SendEnv, never argv),
+# writes $PC_CONFIG_DIR/clip/<client tty with / as _>.json (see the clipboard server functions below the script):
+# - MouseDrag1Pane: a drag always starts a tmux selection (tmux's default hands it to the app when the app asked for the mouse); on release tmux
+#   copies and writes the laptop clipboard with OSC 52 (set-clipboard external, Windows Terminal accepts it).
+# - M-v (Alt+V): runs server.mjs --clip, which fetches the image on the laptop clipboard through the reverse unix socket and types its path into the session.
 $FcodeSh = (@'
 #!/bin/bash
 # fcode (chay tren box): liet ke / chon / vao phien tmux. Dung: fcode.sh [--list | so | ten]
@@ -4082,11 +4104,57 @@ resolve() { # $1 = so hoac ten (hoac dau ten) -> dat $sel
   return 1
 }
 
+# clip_map: remember where the laptop clipboard server is reachable (remote unix socket + token) for THIS client tty; Alt+V (server.mjs --clip) reads it.
+# The socket name is new for every ssh call (sshd never unlinks a -R socket when the session ends), so the old files are cleaned here: the one the previous
+# mapping of this tty names, and this user's fcode-clip-*.sock older than a day that no mapping names (a live session keeps its socket).
+clip_map() { # $1 = config dir
+  local tt key f tmp old s
+  tt=$(tty 2>/dev/null) || return 0
+  key="${tt//\//_}"; f="$1/clip/$key.json"
+  # the clip dir must be a real dir of ours before anything is read or removed through it (a symlink there could point the rm elsewhere)
+  if [ -e "$1/clip" ] || [ -L "$1/clip" ]; then { [ -d "$1/clip" ] && [ ! -L "$1/clip" ] && [ -O "$1/clip" ]; } || return 0; fi
+  if [ -f "$f" ] && [ ! -L "$f" ]; then
+    old=$(sed -n 's/.*"sock": "\([^"]*\)".*/\1/p' "$f" 2>/dev/null)
+    case "$old" in /tmp/fcode-clip-*.sock) case "${old#/tmp/}" in */*|*[!A-Za-z0-9._-]*) ;; *) rm -f -- "$old" 2>/dev/null ;; esac ;; esac
+  fi
+  find /tmp -maxdepth 1 -type s -name 'fcode-clip-*.sock' -user "$(id -u)" -mmin +1440 2>/dev/null | while IFS= read -r s; do
+    grep -rqF -- "$s" "$1/clip" 2>/dev/null || rm -f -- "$s" 2>/dev/null
+  done
+  if [ -z "${FCODE_CLIP_SOCK:-}" ] || [ -z "${LC_FCODE_CLIP_TOKEN:-}" ]; then rm -f "$f" 2>/dev/null; return 0; fi
+  case "$FCODE_CLIP_SOCK$LC_FCODE_CLIP_TOKEN" in *[!A-Za-z0-9/._-]*) return 0 ;; esac
+  (
+    umask 077
+    mkdir -p "$1/clip" && chmod 700 "$1/clip" && [ -d "$1/clip" ] && [ ! -L "$1/clip" ] && [ -O "$1/clip" ] || exit 0   # a real dir of ours, never a symlink
+    tmp=$(mktemp "$1/clip/.tmp.XXXXXX") || exit 0
+    { printf '{"sock": "%s", "token": "%s"}\n' "$FCODE_CLIP_SOCK" "$LC_FCODE_CLIP_TOKEN" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$f"; } || rm -f "$tmp"
+  ) 2>/dev/null
+  return 0
+}
+
 attach() {
-  echo "Thoát mà không tắt phiên: bấm Ctrl+B rồi D"
+  echo "Thoát mà không tắt phiên: bấm Ctrl+B rồi D. Lăn chuột để cuộn, bấm q để về cuối; kéo chuột để bôi đen là chép luôn vào clipboard laptop; Alt+V dán ảnh từ clipboard laptop; Ctrl+V vẫn dán chữ"
   sleep 2
   case "${TERM:-}" in ""|dumb) export TERM=xterm-256color ;; esac
-  exec tmux -u attach -t "=$1"
+  # the laptop token arrives in LC_FCODE_CLIP_TOKEN (ssh SendEnv): write the mapping, then drop it from the environment so tmux and every pane never inherit it
+  local cdir="${PC_CONFIG_DIR:-/data/home/.fcoding}" node srv=/data/home/fcoding/server.mjs
+  clip_map "$cdir"
+  unset LC_FCODE_CLIP_TOKEN
+  # a drag always starts a tmux selection (default: handed to the app when the app asked for the mouse); release copies, tmux sends it to the laptop by OSC 52
+  # Known trade-off: tmux's default MouseDown1Pane still sends the PRESS to an app that asked for the mouse, while the drag and release go to copy mode;
+  # a TUI that started its own selection on that press resets on the next click.
+  tmux bind-key -n MouseDrag1Pane if-shell -F '#{pane_in_mode}' 'send-keys -M' 'copy-mode -M' 2>/dev/null
+  if ! grep -q -- "'--clip'" "$srv" 2>/dev/null; then
+    # box not updated: its server.mjs does not know --clip and would start a server of its own under run-shell, so Alt+V never runs it
+    tmux bind-key -n M-v display-message -d 5000 'Box chưa cập nhật: cd ~/fcode-src && git pull && bash install.sh' 2>/dev/null
+  else
+    node=$(command -v node) || node=""
+    case "$cdir$node" in
+      *"'"*|*"#"*) ;;   # a quote or # would break the tmux command string: no binding
+      # client_tty / session_name change at run time: #{q:...} escapes them for the shell (never inside quotes; a renamed session may hold a quote)
+      *) [ -n "$node" ] && tmux bind-key -n M-v run-shell -b "PC_CONFIG_DIR='$cdir' '$node' '$srv' --clip #{q:client_tty} #{q:session_name}" 2>/dev/null ;;
+    esac
+  fi
+  exec tmux -u attach -t "=$1" \; set-option -w window-size latest \; set-option mouse on
 }
 
 # --- mo phien moi: dung fcode-new tren box (hop dong: --projects / --harnesses / <project> <harness>) ---
@@ -4164,13 +4232,210 @@ function Get-BareScript([string]$Arg) {
   "set -- '$Arg'`naliases_b64='$data'`n" + $FcodeSh
 }
 
+# --- clipboard cua laptop cho Alt+V (anh): may chu nho tren 127.0.0.1 (tien trinh con), ssh -R noi o unix cua box toi no ---
+# Box (server.mjs --clip) goi GET /image kem header X-Fcode-Token. Dung System.Windows.Forms.Clipboard nen tien trinh con chay -STA.
+# Tra loi (HTTP/1.0, mot yeu cau mot ket noi): sai phuong thuc hay duong dan 404; thieu / sai token 403; khong co anh 204; PNG qua 10485760 byte 413;
+# clipboard ban sau 3 lan thu 500; co anh 200 image/png. Moi ket noi co han 5 giay (doc dau yeu cau + tra loi); rieng than anh 200 (toi 10 MiB,
+# chi gui cho ben co token) han la "5 giay khong tien trien": dong ho chay lai moi khoi 64 KiB, de duong mang cham van chay duoc. Qua han thi dong ket noi.
+# Toc do (hop dong A4 muc 16-17): truoc khi nhan yeu cau dau tien tien trinh con nap WinForms / Drawing va ma hoa thu mot PNG 1x1 (khoi dong nguoi); luc ranh no
+# ma hoa truoc anh moi tren clipboard va giu mot ban (xem Invoke-FcodeClipServe). Con chi DOC clipboard, khong bao gio ghi.
+function New-FcodeHex([int]$Bytes) {
+  $b = New-Object byte[] $Bytes
+  $r = [Security.Cryptography.RandomNumberGenerator]::Create(); $r.GetBytes($b); $r.Dispose()
+  -join ($b | ForEach-Object { $_.ToString('x2') })
+}
+# ten o unix tren box cho MOI lan goi ssh (ke ca chay lai khi ma 78): sshd khong bao gio go o -R khi phien ket thuc, dung lai ten cu thi -R sau bi tu choi
+function New-FcodeClipSock { '/tmp/fcode-clip-' + (New-FcodeHex 8) + '.sock' }
+# vong lap cua may chu: chay trong tien trinh CON (Start-FcodeClipServer gui NGUYEN van ban ham nay sang do), nen phai tu du, khong goi ham khac
+# $StdinTask = viec doc stdin cua tien trinh con: xong (cha dong ong / bi giet) thi thoat, de khong mo coi
+# $GetSeq = so thu tu clipboard (GetClipboardSequenceNumber, uint32; 0 / loi = khong biet); $ReadPng = doc clipboard: $null khi khong co anh, byte[] PNG khi co, nem loi khi clipboard ban.
+# $ReadPng nhan mot doi so: $true = luc ranh (chi ma hoa truoc khi clipboard co dinh dang anh va KHONG co dinh dang chu nao: kiem tra bang ContainsImage / ContainsText, khong
+# render; clipboard co ca chu (Excel, Office, RDP...) thi tra $null, chi ma hoa khi Alt+V hoi), $false = luc co yeu cau (luon ma hoa neu co anh).
+# Hai ham do duoc truyen vao (tien trinh con dung ban that, test dung ban gia). $Dbg khac $null (chi test dat FCODE_CLIP_DEBUG=1): moi tra loi them dong X-Fcode-Debug.
+# Ma hoa truoc: luc ranh (moi 250 ms) so thu tu doi va clipboard chi co anh thi ma hoa PNG ngay va giu DUNG MOT ban trong bo nho (so thu tu + byte; anh qua 10 MiB chi giu co "Big").
+# GET /image doc lai so thu tu: bang ban giu thi tra byte da giu, khac (hoac chua co) thi ma hoa luc do roi giu. Khong co anh thi bo ban giu (204). Khong ghi dia.
+function Invoke-FcodeClipServe {
+  param([System.Net.Sockets.TcpListener]$Listener, [string]$Token, $StdinTask, [scriptblock]$GetSeq, [scriptblock]$ReadPng, $Dbg = $null)
+  $ErrorActionPreference = 'Continue'
+  $max = 10485760
+  $limit = 5000
+  $enc = [Text.Encoding]::ASCII
+  $reasons = @{ 200 = 'OK'; 204 = 'No Content'; 403 = 'Forbidden'; 404 = 'Not Found'; 413 = 'Payload Too Large'; 500 = 'Internal Server Error' }
+  $acc = $null
+  $cache = $null; $polled = $null; $encodes = 0
+  while ($true) {
+    if ($StdinTask.IsCompleted) { break }
+    $c = $null
+    try {
+      if (-not $acc) { $acc = $Listener.AcceptTcpClientAsync() }
+      if (-not $acc.Wait(250)) {
+        # ranh: ma hoa truoc neu clipboard doi (loi / ban thi bo qua, lan sau thu lai)
+        try {
+          $sq = & $GetSeq
+          if ($sq) { $sq = [uint32]$sq } else { $sq = $null }
+          if ($null -ne $sq -and $sq -ne $polled) {
+            $pp = & $ReadPng $true
+            if ($pp) { $encodes++ }
+            $big = $false
+            if ($pp -and $pp.Length -gt $max) { $big = $true; $pp = $null }
+            if ($pp -or $big) { $cache = @{ Seq = $sq; Png = $pp; Big = $big } } else { $cache = $null }
+            $polled = $sq
+          }
+        } catch { }
+        continue
+      }
+      $c = $acc.Result; $acc = $null
+    } catch { break }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    try {
+      $ns = $c.GetStream()
+      $buf = New-Object byte[] 8192; $n = 0; $head = ''
+      while ($n -lt 8192) {
+        $left = $limit - [int]$sw.ElapsedMilliseconds
+        if ($left -le 0) { throw 'deadline' }
+        $rt = $ns.ReadAsync($buf, $n, 8192 - $n)
+        if (-not $rt.Wait($left)) { throw 'deadline' }   # qua han: bo, finally dong ket noi
+        $k = $rt.Result
+        if ($k -le 0) { break }
+        $n += $k
+        $head = $enc.GetString($buf, 0, $n)
+        if ($head.Contains("`r`n`r`n")) { break }
+      }
+      $code = 404; $type = $null; $body = $null
+      $lines = $head -split "`r`n"
+      if ($head.Contains("`r`n`r`n") -and $lines[0] -cmatch '\AGET /image HTTP/1\.[01]\z') {
+        $tok = ''
+        for ($i = 1; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '\AX-Fcode-Token:[ \t]*(.*?)[ \t]*\z') { $tok = $Matches[1]; break } }
+        if ($Token.Length -eq 0 -or $tok -cne $Token) { $code = 403 }
+        else {
+          # so thu tu doc TRUOC khi doc anh: clipboard doi giua chung thi ban giu mang so cu va lan sau bi coi la cu (khong bao gio tra anh cu)
+          $sq = $null; try { $sq = & $GetSeq; if ($sq) { $sq = [uint32]$sq } else { $sq = $null } } catch { $sq = $null }
+          $png = $null; $big = $false; $got = $false
+          if ($null -ne $sq -and $cache -and $cache.Seq -eq $sq) { $png = $cache.Png; $big = $cache.Big; $got = $true }
+          else {
+            for ($t = 0; $t -lt 3 -and -not $got; $t++) {   # the clipboard can be busy for a moment (another program holds it)
+              try { $png = & $ReadPng $false; $got = $true } catch { Start-Sleep -Milliseconds 150 }
+            }
+            if ($got) {
+              if ($png) { $encodes++ }
+              if ($png -and $png.Length -gt $max) { $big = $true; $png = $null }
+              if ($png -or $big) { $cache = @{ Seq = $sq; Png = $png; Big = $big } } else { $cache = $null }
+              if ($null -ne $sq) { $polled = $sq }
+            }
+          }
+          if (-not $got) { $code = 500 }
+          elseif ($big) { $code = 413 }
+          elseif (-not $png) { $code = 204 }
+          else { $code = 200; $type = 'image/png'; $body = $png }
+        }
+      }
+      $h = "HTTP/1.0 $code $($reasons[$code])`r`n"
+      if ($code -ne 204) { $len = 0; if ($body) { $len = $body.Length }; $h += "Content-Length: $len`r`n" }
+      if ($type) { $h += "Content-Type: $type`r`n" }
+      if ($Dbg) { $h += "X-Fcode-Debug: encodes=$encodes warm=$([int][bool]$Dbg.Warm)`r`n" }
+      $h += "Connection: close`r`n`r`n"
+      $parts = @(, $enc.GetBytes($h))
+      if ($body) { $parts += , $body }
+      foreach ($part in $parts) {
+        $off = 0
+        while ($off -lt $part.Length) {
+          if ($code -eq 200) { $sw.Restart() }   # image body: 5 s per 64 KiB chunk (see the note above)
+          $left = $limit - [int]$sw.ElapsedMilliseconds
+          if ($left -le 0) { throw 'deadline' }
+          $len = [Math]::Min(65536, $part.Length - $off)
+          $wt = $ns.WriteAsync($part, $off, $len)
+          if (-not $wt.Wait($left)) { throw 'deadline' }
+          $off += $len
+        }
+      }
+      $ns.Flush()
+    } catch { }
+    finally { try { $c.Close() } catch { } }
+  }
+}
+# bat may chu clipboard trong tien trinh CON: powershell.exe -STA (System.Windows.Forms.Clipboard can STA) -EncodedCommand. Token di vao stdin cua con (khong len dong lenh),
+# con in cong (do he dieu hanh chon, 127.0.0.1) o dong dau cua stdout. Tra $null khi khong bat duoc (khi do vao phien khong co -R, Alt+V bao laptop chua noi).
+# Con tu thoat khi stdin dong (fcode bi giet); Stop-FcodeClipServer giet con ngay.
+function Start-FcodeClipServer([string]$Shell = 'powershell.exe') {
+  $p = $null
+  try {
+    $token = New-FcodeHex 16
+    $script = "`$ProgressPreference = 'SilentlyContinue'; `$ErrorActionPreference = 'Stop'`n" +
+      "function Invoke-FcodeClipServe {`n" + ${function:Invoke-FcodeClipServe}.ToString() + "`n}`n" + @'
+$in = [Console]::OpenStandardInput()
+$tb = New-Object Collections.Generic.List[byte]
+while ($tb.Count -lt 128) { $x = $in.ReadByte(); if ($x -lt 0 -or $x -eq 10) { break }; $tb.Add([byte]$x) }
+$token = [Text.Encoding]::ASCII.GetString($tb.ToArray()) -replace '[^0-9a-f]', ''
+if ($token.Length -ne 32) { exit 1 }
+$l = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+$l.Start()
+[Console]::Out.WriteLine([string]$l.LocalEndpoint.Port); [Console]::Out.Flush()
+# the port line comes first (the parent waits for it); a request that arrives during the warm-up waits in the listener's backlog until the loop starts, it never fails.
+# warm-up: load WinForms / Drawing, JIT one PNG encode of a 1x1 bitmap, load the sequence-number P/Invoke and touch the clipboard read path once; a load that fails leaves the
+# server up: the clipboard read then fails and every image request answers 500
+$warm = $false
+try {
+  Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing
+  $wb = New-Object System.Drawing.Bitmap 1, 1
+  try { $wm = New-Object IO.MemoryStream; $wb.Save($wm, [System.Drawing.Imaging.ImageFormat]::Png) } finally { $wb.Dispose() }
+  Add-Type -Namespace FcodeClip -Name Native -MemberDefinition '[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();'
+  [void][FcodeClip.Native]::GetClipboardSequenceNumber()
+  try { [void][System.Windows.Forms.Clipboard]::ContainsImage() } catch { }
+  $warm = $true
+} catch { }
+$getSeq = { [FcodeClip.Native]::GetClipboardSequenceNumber() }
+$readPng = {   # $null: no image (or, with $Idle, not an image-only clipboard); byte[]: the PNG; throws when the clipboard is busy
+  param([bool]$Idle)
+  if (-not [System.Windows.Forms.Clipboard]::ContainsImage()) { return }
+  if ($Idle) {   # idle pre-encode: only an image-only clipboard (a screenshot); a text format next to the image means a source that renders on demand, so leave it to Alt+V
+    foreach ($f in [Enum]::GetValues([System.Windows.Forms.TextDataFormat])) { if ([System.Windows.Forms.Clipboard]::ContainsText($f)) { return } }
+  }
+  $img = [System.Windows.Forms.Clipboard]::GetImage()
+  if (-not $img) { return }
+  try { $ms = New-Object IO.MemoryStream; $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); , $ms.ToArray() } finally { $img.Dispose() }
+}
+$dbg = $null; if ($env:FCODE_CLIP_DEBUG -eq '1') { $dbg = @{ Warm = $warm } }   # tests only: a debug header (encode count, warm-up done) on every reply
+$buf = New-Object byte[] 64
+Invoke-FcodeClipServe $l $token ($in.ReadAsync($buf, 0, 64)) $getSeq $readPng $dbg
+'@
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = $Shell
+    $psi.Arguments = '-NoProfile -NonInteractive -STA -ExecutionPolicy Bypass -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+    $p = [Diagnostics.Process]::Start($psi)
+    [void]$p.StandardError.BaseStream.CopyToAsync([IO.Stream]::Null)   # ong stderr khong bao gio day (con bi chan)
+    $tb = [Text.Encoding]::ASCII.GetBytes($token + "`n")
+    $si = $p.StandardInput.BaseStream; $si.Write($tb, 0, $tb.Length); $si.Flush()   # ghi byte tho; khi trang ma nhap cua console la 65001, Process.Start da ghi BOM vao ong truoc byte nay (server --clip bo ky tu khong phai hex)
+    $rt = $p.StandardOutput.ReadLineAsync()
+    $line = $null
+    if ($rt.Wait(15000)) { $line = $rt.Result }
+    if ($line -notmatch '\A[0-9]{1,5}\z' -or [int]$line -lt 1 -or [int]$line -gt 65535) { throw 'no port' }
+    [pscustomobject]@{ Port = [int]$line; Token = $token; Proc = $p }
+  } catch {
+    try { if ($p -and -not $p.HasExited) { $p.Kill() } } catch { }
+    try { if ($p) { $p.Dispose() } } catch { }
+    $null
+  }
+}
+# dong may chu (khi ssh tra ve, ke ca khi loi): Kill tien trinh con, cho toi da 2 giay
+function Stop-FcodeClipServer($Srv) {
+  if (-not $Srv -or -not $Srv.Proc) { return }
+  $p = $Srv.Proc
+  try { if (-not $p.HasExited) { $p.Kill() } } catch { }
+  try { [void]$p.WaitForExit(2000) } catch { }
+  try { $p.StandardInput.Close() } catch { }
+  try { $p.Dispose() } catch { }
+}
+
 # fcode add chay script DA CAI tren box (box/fcode-add.sh, install.sh dat o /data/home/fcoding/fcode-add.sh): mot nguon duy nhat cho ca app va laptop.
-# Dong ket qua dang "R <MA> [chi tiet]" do Invoke-Add dich ra tieng Viet. Thieu script -> "R NO_SCRIPT" (box chua cap nhat).
-# Cung han voi server (server.mjs): toi da 600 giay, roi TERM, 30 giay sau KILL (124 / 137), de khoa theo ten tren box khong bi giu mai.
+# Dong ket qua dang "R <MA> [chi tiet]" do Invoke-Add dich ra tieng Viet. Thieu CLI fcode-add -> "R NO_SCRIPT" (box chua cap nhat: bash install.sh).
+# CLI fcode-add tren box chay script da cai duoi chinh watchdog cua server (cung han: 600 giay, TERM, 30 giay sau KILL ca nhom), qua han -> ma 137.
 $FcodeAddRun = (@'
-s="${FCODE_ADD_SCRIPT:-/data/home/fcoding/fcode-add.sh}"
-[ -f "$s" ] || { echo "R NO_SCRIPT"; exit 3; }
-exec env -u INSTABOX_API_KEY timeout --kill-after="${FCODE_ADD_KILL_AFTER_S:-30}" "${FCODE_ADD_TIMEOUT_S:-600}" bash "$s" "$@"
+export FCODE_ADD_SCRIPT FCODE_ADD_TIMEOUT_S FCODE_ADD_KILL_AFTER_S
+f="$HOME/.local/bin/fcode-add"
+[ -x "$f" ] || { echo "R NO_SCRIPT"; exit 3; }
+exec "$f" "$@"
 '@) -replace "`r`n", "`n"
 
 # fcode-pair tren box (server worker them --qr). $1 = ten thiet bi (co the rong).
@@ -4179,10 +4444,10 @@ name="${1:-}"
 if [ -n "$name" ]; then exec fcode-pair "$name" --qr; else exec fcode-pair --qr; fi
 '@) -replace "`r`n", "`n"
 
-# fcode phien tren box: chuong trinh python (instabox ssh chay no, yeu cau di qua stdin)
+# fcode phien tren box: chuong trinh python (ssh chay no, yeu cau di qua stdin)
 $PhienPy = (@'
 #!/usr/bin/env python3
-# fcode phien (chay tren box): doc / gui / nhan phien chat omp. Chi laptop goi lenh nay (qua instabox ssh).
+# fcode phien (chay tren box): doc / gui / nhan phien chat omp. Chi laptop goi lenh nay (qua ssh).
 # Lenh: scan | hash | get | put. Dong 1 cua stdin la chinh chuong trinh nay (deflate + base64, do lenh nap doc); phan con lai la
 # yeu cau (JSON) hoac luong tar; ket qua la dong "FCODE-JSON {...}" hoac luong tar sau dong "FCODE-TAR".
 # Chi ghi trong ~/.omp/agent/sessions/<thu-muc-du-an>/ va ~/.omp/agent/blobs/. Khong bao gio xoa, khong doc noi dung tin nhan.
@@ -5233,7 +5498,7 @@ if __name__ == '__main__':
 # --- fcode phien: dong bo phien chat omp giua laptop va box (laptop luon la ben goi; box khong the goi laptop) ---
 # Luat (mot phien = mot ma = mot file .jsonl chi noi them): chi o mot ben -> chep sang ben kia; o ca hai ben va mot ben la phan dau
 # cua ben kia (sau dong header "session") -> chep ban dai de len ban ngan; khac nhau -> khong dong vao, chi bao. Khong bao gio xoa gi.
-# Ben tren box la mot chuong trinh python nho ($PhienPy, chay qua instabox ssh); yeu cau di qua stdin, khong qua dong lenh.
+# Ben tren box la mot chuong trinh python nho ($PhienPy, chay qua ssh); yeu cau di qua stdin, khong qua dong lenh.
 $PhienBusySec = 30
 $FcodeScript = $PSCommandPath
 $PhienLog = Join-Path $env:USERPROFILE '.fcode\phien.log'
@@ -5687,16 +5952,12 @@ function Get-PhienUnitBytes([long]$Size, [string]$Rel = '', [long]$Extra = 0) {
 }
 
 # --- noi chuyen voi box ---
-# 'running' | 'stopped' | 'unknown' (instabox ls loi, JSON hong, khong thay box hoac khong co trang thai): unknown khong doi gi ca
+# 'running' (ssh vao duoc box) | 'unknown' (khong vao duoc: mang, box tat, alias sai): unknown khong doi gi ca. Box Oracle luon bat, khong co trang thai "ngu".
 function Test-BoxRunning {
   try {
-    $r = Invoke-PhienExe (Get-InstaboxExe) @('ls', '--json')
-    if ($r.Code -eq 124) { return 'timeout' }   # only while a phien deadline is set (--nhanh): `instabox ls` ran into it
-    if ($r.Code -ne 0) { return 'unknown' }
-    $list = ($r.Out -join "`n") | ConvertFrom-Json
-    $b = $null; foreach ($x in $list) { foreach ($y in @($x)) { if ($y -and $y.name -eq $box) { $b = $y } } }
-    if (-not $b -or -not "$($b.state)") { return 'unknown' }
-    if ("$($b.state)" -eq 'running') { 'running' } else { 'stopped' }
+    $r = Invoke-PhienExe (Get-SshExe) @('-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', $box, 'true')
+    if ($r.Code -eq 124) { return 'timeout' }   # only while a phien deadline is set (--nhanh): the ssh ran into it
+    if ($r.Code -eq 0) { 'running' } else { 'unknown' }
   } catch { 'unknown' }
 }
 
@@ -5718,7 +5979,7 @@ function Stop-PhienAtCap([bool]$Quick, [hashtable]$Stat) {
   if ($Quick) { Set-PhienScreen $PhienCapMsg; return 0 }
   $Stat.ok = $false; Write-PhienOut 'hết thời gian của lượt này: phần còn lại để lần sau'; 1
 }
-# dung tien trinh va moi tien trinh con cua no (instabox -> ssh); Windows PowerShell 5.1 khong co Kill($true) nen dung taskkill
+# dung tien trinh va moi tien trinh con cua no; Windows PowerShell 5.1 khong co Kill($true) nen dung taskkill
 function Stop-PhienProc($p) {
   try { $p.Kill($true) } catch { try { & taskkill.exe /PID $p.Id /T /F 2>&1 | Out-Null } catch { }; try { $p.Kill() } catch { } }
 }
@@ -5738,7 +5999,7 @@ function Invoke-PhienExe([string]$Exe, [string[]]$ExeArgs, [string]$StdinText) {
   try { $p = [Diagnostics.Process]::Start($psi) } catch { return [pscustomobject]@{ Code = -1; Out = [string[]]@(); Err = "$($_.Exception.Message)" } }
   try {
     try {
-      if ($StdinText) { $sb = [Text.Encoding]::UTF8.GetBytes($StdinText); $p.StandardInput.BaseStream.Write($sb, 0, $sb.Length); $p.StandardInput.BaseStream.Flush() }   # raw UTF-8 bytes (no BOM; 5.1 has no StandardInputEncoding)
+      if ($StdinText) { $sb = [Text.Encoding]::UTF8.GetBytes($StdinText); $p.StandardInput.BaseStream.Write($sb, 0, $sb.Length); $p.StandardInput.BaseStream.Flush() }   # raw UTF-8 bytes; not BOM-free: with console input code page 65001 Windows PowerShell 5.1's Process.Start makes StandardInput a StreamWriter with the UTF-8 preamble and AutoFlush, so a BOM is already in the pipe before this write (5.1 has no StandardInputEncoding); see the --stdin note near check-ignore
       $p.StandardInput.Close()
     } catch { }
     $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
@@ -5758,7 +6019,6 @@ function Invoke-PhienExe([string]$Exe, [string[]]$ExeArgs, [string]$StdinText) {
 # chay $PhienPy tren box. Tra ve @{Code; Out = byte[]; Err}. stdin: $InBytes hoac noi dung file $InFile.
 # Han chot tinh tu truoc khi ghi byte stdin dau tien; stdin ghi bat dong bo, nen box dung doc thi den han van dung duoc.
 function Invoke-BoxPy([string]$Cmd, [byte[]]$InBytes, [string]$InFile) {
-  if ($box -notmatch '\A[A-Za-z0-9._-]+\z') { throw "tên box '$box' không hợp lệ" }
   $sec = if ($script:PhienDeadline) { (Get-PhienChildMs) / 1000 } else { Get-PhienLimitSec $false }
   $end = [DateTime]::UtcNow.AddSeconds($sec)
   # chuong trinh python (deflate + base64) la dong dau cua stdin; dong lenh chi co lenh nap ngan (khong vuong gioi han do dai)
@@ -5777,8 +6037,8 @@ function Invoke-BoxPy([string]$Cmd, [byte[]]$InBytes, [string]$InFile) {
   }
   $remote = $pre + "python3 -c 'import base64,sys,zlib;exec(zlib.decompress(base64.b64decode(sys.stdin.buffer.readline()),-15).decode())' $Cmd"
   $psi = New-Object Diagnostics.ProcessStartInfo
-  $psi.FileName = Get-InstaboxExe
-  $psi.Arguments = 'ssh ' + $box + ' -- "' + $remote + '"'
+  $psi.FileName = Get-SshExe
+  $psi.Arguments = '-o BatchMode=yes ' + $box + ' "' + $remote + '"'
   $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
   $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
   $body = if ($InFile) { [IO.File]::OpenRead($InFile) } elseif ($InBytes) { New-Object IO.MemoryStream(, $InBytes) } else { New-Object IO.MemoryStream }
@@ -5956,7 +6216,7 @@ function Get-PhienWarning {
 # dong bo mot hay moi project. Tra ve 0 xong, 1 loi.
 # Chep theo tung FILE, tung dot <= 50 MB (mot dot = mot lan ssh), ca hai chieu: dot nao xong thi nam lai ben nhan, lan sau chi chep
 # phan con thieu. Ben nhan dat blob, file di kem, .jsonl long ben trong, roi file .jsonl chinh sau cung (khi moi thu no can da co).
-# $Quick (--nhanh, cho hook cua `fcode moc`): mot project, KHONG danh thuc box, khong cho khoa, toi da 20 s; thoat 0 khi box ngu / khoa ban / het gio.
+# $Quick (--nhanh, cho hook cua `fcode moc`): mot project, khong cho khoa, toi da 20 s; thoat 0 khi khoa ban / het gio (khong vao duoc box la loi, thoat 1).
 # Che do nhanh chi ghi phien.log; man hinh nhan toi da MOT dong (Invoke-Phien in $script:PhienScreen, hoac dong loi khi that bai); thanh cong thi im lang.
 # Han chot (--nhanh, tu dong) chi duoc xem o diem an toan, truoc moi muc (quet, hash, mot dot, mot ghi chu); mot muc da bat dau thi xong tron hoac hong tron.
 function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [bool]$BoxKnownRunning = $false, [bool]$Quick = $false) {
@@ -5964,7 +6224,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
   $capMsg = $PhienCapMsg
   $code = 0; $capHit = $false
   # lan tu dong: MOT han chot cho ca lan chay, tinh tu luc tien trinh bat dau (nhu gioi han 8 phut cua Task Scheduler)
-  $script:PhienDeadline = if ($Auto) { [Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().AddSeconds((Get-PhienLimitSec $true)) } elseif ($Quick) { [Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().AddSeconds((Get-PhienCapSec)) } else { $null }
+  $script:PhienDeadline = if ($Auto) { Get-PhienAutoDeadline } elseif ($Quick) { [Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().AddSeconds((Get-PhienCapSec)) } else { $null }
   $mx = $null; $held = $false
   if (-not $DryRun) {
     try {
@@ -5984,7 +6244,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
   }
   $stat = @{ ran = $false; ok = $true; copied = 0; skipped = 0; diverged = 0; unknown = @(); ompL = ''; ompB = ''; noteCopied = 0; noteConf = @(); noteReleased = @(); unfinished = @(); newProjects = @() }
   try {
-    if (-not $DryRun) { Clear-PhienLeftovers @() }   # the lock is held: a killed run's staging goes now, even when this run stops early (box asleep)
+    if (-not $DryRun) { Clear-PhienLeftovers @() }   # the lock is held: a killed run's staging goes now, even when this run stops early (box unreachable)
     $projs = Get-PhienProjects
     if ($projs.Count -eq 0) { Write-PhienOut "Chưa có project nào trong syncRepos ($ConfigFile)."; return 0 }
     $names = @($projs.Keys)
@@ -5993,14 +6253,12 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
       if (-not $projs.Contains($o)) { Write-PhienOut "Không thấy project '$Only' trong syncRepos. Có: $(@($names | ForEach-Object { Format-ProjectName $_ $projs[$_] }) -join ', ')"; return 1 }
       $names = @($o)
     }
-    if ($Quick) {   # only `instabox ls`: never wakes the box
+    if ($Quick) {   # one cheap reachability check first (ssh true)
       $bs = Test-BoxRunning
       if ($bs -eq 'timeout') { Set-PhienScreen $capMsg; return 0 }
-      if ($bs -eq 'unknown') { $stat.ok = $false; Write-PhienOut 'lỗi: không đọc được trạng thái box (instabox ls lỗi — đã chạy "instabox login" chưa?)'; return 1 }
-      if ($bs -ne 'running') { Set-PhienScreen 'phien: box đang ngủ, bỏ qua'; return 0 }
+      if ($bs -ne 'running') { $stat.ok = $false; Write-PhienOut "lỗi: không vào được box (ssh $box lỗi — kiểm tra mạng và alias ssh)"; return 1 }
     }
     elseif ($Auto) { if (-not $BoxKnownRunning -and (Test-BoxRunning) -ne 'running') { return 0 } }
-    else { & (Get-InstaboxExe) wake $box *> $null }
     $stat.ran = $true; $stat.ompL = Get-OmpVersion
     # moc cho lan tu dong sau: ghi truoc khi mo ssh (lan loi, bi dung giua chung hay chay thu cung tinh: ssh nao cung la hoat dong cua box)
     # a quick run (the hook) does not count: a cut or failed one must not push the next 10-minute auto run behind the 40-minute gap
@@ -6019,7 +6277,7 @@ function Invoke-PhienSync([string]$Only, [bool]$Auto, [bool]$DryRun = $false, [b
     if (-not $scan) {
       if ($Quick -and $r.Code -eq 124) { Set-PhienScreen $capMsg; return 0 }   # the deadline ended the call: a cap hit, not an error
       $stat.ok = $false
-      Write-PhienOut 'lỗi: không nói chuyện được với box. Kiểm tra: đã chạy "instabox login" chưa, và box đang bật không.'
+      Write-PhienOut "lỗi: không nói chuyện được với box. Kiểm tra: gõ ssh $box có vào được không (alias trong ~/.ssh/config)."
       $d = ("$($r.Err)" -split "`n" | Where-Object { $_.Trim() } | Select-Object -Last 1); if ($d) { Write-PhienOut "  (chi tiết: $($d.Trim()))" }
       return 1
     }
@@ -6660,29 +6918,26 @@ function Write-PhienAutoState([hashtable]$S) {
   } catch { }
 }
 
-# che do tu dong (luat v2): chi doc `instabox ls --json`, ssh moi ngan khong tinh la hoat dong lam box khong tu nghi duoc.
-#  - box khong chay: khong ssh
-#  - box vua tu khong chay thanh dang chay: dong bo mot lan ngay
-#  - con lai: chi dong bo khi lan mo ssh gan nhat da cach >= 40 phut (lon hon 30 phut box tu nghi khi ranh, nen box khong dung
-#    den thi luon duoc nghi). Lan loi cung chi cho den moc 40 phut sau, khong thu lai nhanh.
+# che do tu dong (luat v2): truoc het kiem tra box vao duoc khong (`ssh <host> true`, rat re).
+#  - khong vao duoc: khong lam gi, khong doi trang thai, ghi mot dong nhat ky
+#  - lan dau (chua co trang thai): dong bo mot lan ngay
+#  - con lai: chi dong bo khi lan mo ssh gan nhat da cach >= 40 phut. Lan loi cung chi cho den moc 40 phut sau, khong thu lai nhanh.
 $PhienAutoGapSec = 2400
+function Get-PhienAutoDeadline { [Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime().AddSeconds((Get-PhienLimitSec $true)) }
 function Invoke-PhienAutoRun {
   $as = Read-PhienAutoState
   $last = if ($as) { [double]$as.lastSshAt } else { 0 }
-  $bs = Test-BoxRunning
-  # instabox ls loi / tra ve thu khong doc duoc: khong biet box ra sao -> khong ssh va KHONG doi trang thai (khong tu tao ra "box vua chay")
-  if ($bs -eq 'unknown') { Add-PhienLog @('không đọc được trạng thái box (instabox ls lỗi): bỏ qua lần này, giữ nguyên trạng thái'); return 0 }
-  if ($bs -ne 'running') {
-    if ($as -and $as.boxRunning) { Add-PhienLog @('box không chạy nữa, tạm nghỉ') }
-    Write-PhienAutoState @{ boxRunning = $false; lastSshAt = $last }
-    return 0
-  }
+  # the reachability check runs under the same one deadline as the sync (ConnectTimeout covers only connect + handshake, not auth, a proxy hop or the remote true); a timeout counts as unreachable
+  $saveDl = $script:PhienDeadline; $script:PhienDeadline = Get-PhienAutoDeadline
+  try { $bs = Test-BoxRunning } finally { $script:PhienDeadline = $saveDl }
+  # khong vao duoc box (mang, box tat, alias sai): khong mo ssh dong bo va KHONG doi trang thai
+  if ($bs -ne 'running') { Add-PhienLog @("không vào được box (ssh $box lỗi): bỏ qua lần này, giữ nguyên trạng thái"); return 0 }
   $age = (ConvertTo-Epoch (Get-Date)) - $last
   $mins = [int][Math]::Floor($age / 60)
-  if (-not $as -or -not $as.boxRunning) { $why = 'box vừa chạy (lần đầu trong đợt chạy này)' }
-  elseif ($age -ge $PhienAutoGapSec) { $why = "lần mở ssh trước đã cách $mins phút (từ 40 phút trở lên, box ranh thì đã tự nghỉ)" }
+  if (-not $as) { $why = 'lần đầu (chưa có trạng thái)' }
+  elseif ($age -ge $PhienAutoGapSec) { $why = "lần mở ssh trước đã cách $mins phút (từ 40 phút trở lên)" }
   else {
-    Add-PhienLog @("box đang chạy, lần mở ssh trước mới cách $mins phút (dưới 40): bỏ qua để box tự nghỉ được")
+    Add-PhienLog @("box vào được, lần mở ssh trước mới cách $mins phút (dưới 40): bỏ qua lần này")
     Write-PhienAutoState @{ boxRunning = $true; lastSshAt = $last }
     return 0
   }
@@ -6728,7 +6983,7 @@ function Invoke-PhienAuto([string]$Mode) {
   switch ($Mode) {
     'bat' {
       try { Install-PhienTask $FcodeScript } catch { Write-IpaError 'không bật được chế độ tự động (Task Scheduler báo lỗi).' $_.Exception.Message; return 1 }
-      Write-Host 'Đã bật tự động: cứ 10 phút, nếu box đang chạy, fcode tự đồng bộ phiên chat omp hai chiều (chạy ngầm, không hiện cửa sổ). Mở kết nối thưa (box vừa bật, hoặc cách lần trước từ 40 phút), để box vẫn tự nghỉ được.'
+      Write-Host 'Đã bật tự động: cứ 10 phút, nếu vào được box, fcode tự đồng bộ phiên chat omp hai chiều (chạy ngầm, không hiện cửa sổ). Mở kết nối thưa (lần đầu, hoặc cách lần trước từ 40 phút).'
       Write-Host "Nhật ký: $PhienLog    Tắt: fcode phien tu-dong tat"
       return 0
     }
@@ -6799,7 +7054,7 @@ function Get-PhienJob {
 }
 # the supervisor of a quick run: no job -> no sync at all (fail closed). The worker is the same program with FCODE_PHIEN_WORKER=1 and the screen of this
 # one. When it overruns cap + 10 s this process returns 1 and ends; however this process ends (also killed, or its window closed), the job ends the worker
-# and all its children (git, tar, instabox, ssh). So there is no kill call here.
+# and all its children (git, tar, ssh). So there is no kill call here.
 function Invoke-PhienBounded([string]$Proj, [bool]$Nen) {
   if ($Nen) { Start-Sleep -Seconds (Get-PhienNenDelaySec) }
   $job = Get-PhienJob
@@ -6840,7 +7095,7 @@ function Invoke-Phien {
   if ($quick -and $env:FCODE_PHIEN_WORKER -ne '1') { return (Invoke-PhienBounded $sub $nen) }
   $key = if ($sub) { Get-PhienKeyOf $sub (Get-PhienProjects) }   # ten that tren box -> thu muc tren laptop (cung ten, hoac cung repo GitHub; ten thu muc co the khac)
   $rc = Invoke-PhienSync $(if ($key) { $key } else { $sub }) $false $dry $false $quick
-  # --nhanh (the hook): the screen gets at most one line, the asleep / busy / cap message, or one short line when the sync failed; success prints nothing
+  # --nhanh (the hook): the screen gets at most one line, the busy / cap message, or one short line when the sync failed; success prints nothing
   if ($quick) { if ($script:PhienScreen) { Write-Host $script:PhienScreen } elseif ($rc -ne 0) { Write-Host $PhienFailMsg } }
   $rc
 }
@@ -7004,7 +7259,7 @@ function Invoke-Moc {
     }
   }
   if ($sub -eq 'bat') {
-    Write-Host 'Xong. Mở cửa sổ PowerShell mới. Từ giờ, gõ omp / claude / codex trong thư mục một project (có trong syncRepos), fcode đồng bộ nhanh phiên trước và sau (tối đa khoảng 20 giây; box đang ngủ thì bỏ qua).'
+    Write-Host 'Xong. Mở cửa sổ PowerShell mới. Từ giờ, gõ omp / claude / codex trong thư mục một project (có trong syncRepos), fcode đồng bộ nhanh phiên trước và sau (tối đa khoảng 20 giây; không vào được box thì báo một dòng lỗi).'
     Write-Host "Tắt hook trong cửa sổ này: `$env:FCODE_MOC = '0'  (bật lại: Remove-Item Env:FCODE_MOC, hoặc đóng cửa sổ)    Tắt hẳn: fcode moc tat    Xem trạng thái: fcode moc trang-thai"
     Write-Host 'Hook là hàm bọc nên không chuyển đúng hoàn toàn các tham số kiểu -- và -x:giá-trị, cũng không để lại lỗi trong $?; khi cần đúng tuyệt đối, chạy thẳng claude.exe / codex.exe / omp.exe.'
     Write-MocPolicy
@@ -7043,22 +7298,43 @@ if ($arg -and $arg -ne '--list' -and $arg -ne '--new' -and $arg -notmatch '\A[A-
   exit 1
 }
 if (-not $arg) { $pw = Get-PhienWarning; if ($pw) { Write-Host $pw -ForegroundColor Yellow } }
-$ib = Get-InstaboxExe
-while ($true) {
-  # tham so $1 di cung script (set -- '..'), khong nam tren dong lenh ssh
-  $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((Get-BareScript $arg)))
-  $remote = "bash <(echo $b64 | base64 -d)"
-  # box tu tam dung (ranh 30 phut / chay 8 tieng) thi danh thuc truoc; loi wake de ssh tu bao
-  & $ib wake $box *> $null
-  if ($arg -eq '--list') { & $ib ssh $box -- $remote } else { & $ib ssh $box -- -q -tt $remote }
-  $rc = $LASTEXITCODE
-  if ($rc -eq 78 -and $bareWord -and -not $asked) {   # box bao khong co phien nao ten nay (ma 78; ssh dut, 255, thi khong): co the la ten goi moi dat trong app. Hoi box mot lan; doi duoc ra ten that thi chay lai
-    $asked = $true
-    $new = Resolve-ProjectArg $arg @(Get-PrefsNames) $true
-    if ($new -cne $arg -and $new -match '\A[A-Za-z0-9._-]+\z') { $arg = $new; continue }
-  }
-  break
+$ssh = Get-SshExe
+# vao phien (khong phai --list): may chu clipboard cho Alt+V dan anh, dong khi ssh tra ve (ke ca khi loi); keo chuot de chep va Alt+V can Windows Terminal
+$clip = $null
+if ($arg -ne '--list') {
+  if (-not $env:WT_SESSION) { Write-Host 'Lưu ý: không chạy trong Windows Terminal: kéo chuột để chép và Alt+V dán ảnh cần Windows Terminal.' -ForegroundColor Yellow }
+  $clip = Start-FcodeClipServer
 }
+try {
+  while ($true) {
+    # tham so $1 di cung script (set -- '..'), khong nam tren dong lenh ssh. Script nen gzip roi base64: dong lenh ngan (cmd.exe/wrapper .cmd gioi han 8191 ky tu)
+    $gzIn = [Text.Encoding]::UTF8.GetBytes((Get-BareScript $arg))
+    $gzMs = New-Object IO.MemoryStream
+    $gz = New-Object IO.Compression.GZipStream($gzMs, [IO.Compression.CompressionMode]::Compress)
+    $gz.Write($gzIn, 0, $gzIn.Length); $gz.Close()
+    $b64 = [Convert]::ToBase64String($gzMs.ToArray())
+    $remote = "bash <(echo $b64 | base64 -d | gunzip)"
+    if ($arg -eq '--list') { & $ssh $box $remote }
+    elseif ($clip) {
+      # -R: o unix tren box -> may chu clipboard o day (ssh loi khi chuyen tiep thi van vao phien: khong dat ExitOnForwardFailure).
+      # Ten o MOI cho moi lan goi ssh (chay lai khi ma 78 cung vay): sshd khong go o -R khi phien ket thuc nen ten cu se bi tu choi.
+      # Token khong bao gio len dong lenh (ssh.exe hay box): di bang bien moi truong LC_FCODE_CLIP_TOKEN + -o SendEnv (sshd cua box nhan LC_*); dong lenh tren box chi mang duong o (khong phai bi mat).
+      # Script tren box doc bien roi unset truoc khi exec tmux; day xoa bien khoi moi truong cua fcode ngay khi ssh tra ve (hop dong A3 muc 13).
+      $sock = New-FcodeClipSock
+      $env:LC_FCODE_CLIP_TOKEN = $clip.Token
+      try { & $ssh -q -tt -R "${sock}:127.0.0.1:$($clip.Port)" -o StreamLocalBindUnlink=yes -o SendEnv=LC_FCODE_CLIP_TOKEN $box "FCODE_CLIP_SOCK=$sock $remote" }
+      finally { $env:LC_FCODE_CLIP_TOKEN = $null }
+    }
+    else { & $ssh -q -tt $box $remote }
+    $rc = $LASTEXITCODE
+    if ($rc -eq 78 -and $bareWord -and -not $asked) {   # box bao khong co phien nao ten nay (ma 78; ssh dut, 255, thi khong): co the la ten goi moi dat trong app. Hoi box mot lan; doi duoc ra ten that thi chay lai
+      $asked = $true
+      $new = Resolve-ProjectArg $arg @(Get-PrefsNames) $true
+      if ($new -cne $arg -and $new -match '\A[A-Za-z0-9._-]+\z') { $arg = $new; continue }
+    }
+    break
+  }
+} finally { Stop-FcodeClipServer $clip }
 if ($rc -eq 78) { $rc = 1 }   # 78 chi la tin hieu giua script tren box va laptop; nguoi dung van thay ma 1
 if ($rc -eq 77 -and -not $arg) { exit (Invoke-PhienMenu) }
 # tham so khong khop phien nao (hoac loi) thi nhac lenh help

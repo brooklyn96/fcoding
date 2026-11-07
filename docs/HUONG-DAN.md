@@ -20,22 +20,25 @@
    - [Deploy từ box (`fcode-deploy`)](#deploy-từ-box-fcode-deploy)
 8. [Dùng từ laptop](#8-dùng-từ-laptop)
    - [Lệnh `fcode` (tùy chọn)](#lệnh-fcode-tùy-chọn)
+   - [Chép chữ và dán ảnh từ laptop](#chép-chữ-và-dán-ảnh-từ-laptop)
    - [Đồng bộ phiên chat omp giữa laptop và box (`fcode phien`)](#đồng-bộ-phiên-chat-omp-giữa-laptop-và-box-fcode-phien)
    - [Tự đồng bộ khi mở agent (`fcode moc`)](#tự-đồng-bộ-khi-mở-agent-fcode-moc)
    - [Cài lệnh fcode trên máy Windows khác](#cài-lệnh-fcode-trên-máy-windows-khác)
+   - [Kết nối box (ssh)](#kết-nối-box-ssh)
 9. [Bảo mật](#9-bảo-mật)
 10. [Phát triển](#10-phát-triển)
 
 ## 1. FCode là gì
 
-FCode là một ứng dụng iPhone kèm một máy chủ nhỏ. Máy chủ chạy trên box (máy Linux đám mây của instabox). Ứng dụng cho bạn trò chuyện với các chương trình đang làm việc trên box mà không cần ngồi trước máy tính. Mỗi chương trình chạy trong một phiên tmux, nên phiên vẫn sống khi bạn khóa điện thoại, và bạn có thể vào lại cùng phiên đó từ laptop.
+FCode là một ứng dụng iPhone kèm một máy chủ nhỏ. Máy chủ chạy trên box (một máy Linux Oracle chạy liên tục, không bao giờ ngủ). Ứng dụng cho bạn trò chuyện với các chương trình đang làm việc trên box mà không cần ngồi trước máy tính. Mỗi chương trình chạy trong một phiên tmux, nên phiên vẫn sống khi bạn khóa điện thoại, và bạn có thể vào lại cùng phiên đó từ laptop.
 
 Tính năng chính:
 
 - Trò chuyện với **omp**, **Claude Code** hoặc **Codex** chạy trong tmux trên box. (Máy chủ vẫn chạy được **shell** (bash), nhưng app không còn liệt kê shell.)
 - **Hộp thư tổng quan**: mọi phiên được chia thành **Cần bạn**, **Đang chạy** và **Đang nghỉ**. Việc cần bạn trả lời luôn nằm trên cùng.
 - **Trả lời y/n ngay trên danh sách**, không cần mở phiên.
-- **Hàng phím nhanh**: Esc, Ctrl+C, mũi tên, Tab, Shift+Tab, Enter, y, n, **Agents** (phiên omp, Claude Code và Codex) và **^O** (chỉ trong phiên omp), cùng nút `/` cho các lệnh hay dùng.
+- **Chọn trong menu bằng một chạm**: khi phiên hỏi bạn chọn (một menu có một dòng đang được chọn), chạm ngay dòng đó trên màn hình hoặc nút của nó trên thanh chọn.
+- **Hàng phím nhanh**: Esc, ↑, ↓, Enter, **Agents** (phiên omp, Claude Code và Codex), Ctrl+C, ←, →, Tab, Shift+Tab, y, n và **^O** (chỉ trong phiên omp), cùng nút `/` cho các lệnh hay dùng.
 - **Gõ tiếng Việt** bình thường bằng bàn phím iPhone; chữ được gửi nguyên vẹn lên box.
 - **Phiên mới bằng nút +**: chọn chương trình và dự án, luôn tạo phiên mới.
 - Ghép máy bằng **mã 6 số**, không có mật khẩu; iPhone mới ghép thêm được bằng **mã QR** (`fcode-pair --qr`, hoặc `fcode pair` trên laptop).
@@ -43,6 +46,7 @@ Tính năng chính:
 - Box **tự cập nhật** omp, Claude Code và Codex mỗi 6 giờ, không làm hỏng phiên đang mở.
 - **Gửi ảnh trong chat** (v1.3.3): chụp ảnh hoặc chọn ảnh từ thư viện rồi gửi cho trợ lý ([xem mục 7](#gửi-ảnh-trong-chat)).
 - **Laptop tự đồng bộ khi mở agent** (v1.3.3): bật một lần bằng `fcode moc bat` ([xem mục 8](#tự-đồng-bộ-khi-mở-agent-fcode-moc)).
+- **Chép chữ và dán ảnh từ laptop**: kéo chuột là chép vào clipboard laptop, **Alt+V** dán ảnh từ clipboard laptop vào phiên, **Ctrl+V** vẫn dán chữ; cần Windows Terminal ([xem mục 8](#chép-chữ-và-dán-ảnh-từ-laptop)).
 - Chưa có: hội thoại **Claude Code** và **Codex** chưa được mang qua lại giữa laptop và box (hiện chỉ phiên omp và ghi chú dự án đi theo).
 
 ## 2. Cách hoạt động
@@ -51,7 +55,7 @@ Tính năng chính:
 iPhone (app FCode)
    │  HTTPS
    ▼
-Link công khai của instabox  (https://7681-<id>.instabox.tech)
+Caddy trên box  (https://fcode-quoc.duckdns.org, cổng 443)
    │
    ▼
 server.mjs trên box  (cổng 7681)
@@ -62,7 +66,7 @@ Các phiên tmux: omp / claude / codex (shell: chỉ từ máy chủ)
 
 - `server.mjs` là một file Node.js duy nhất, chỉ dùng thư viện có sẵn của Node 22. Không có gói ngoài, không có cơ sở dữ liệu.
 - Máy chủ gọi lệnh `tmux` (và `git` ở chế độ chỉ đọc để hiện nhánh và số dòng thay đổi). Cho màn hình chính nó còn gọi `omp usage` (hạn mức) và `gh` (pull request, lần chạy CI); chính hai lệnh này kết nối ra internet, máy chủ thì không. Nó không bao giờ đọc file đăng nhập của omp, Claude hay Codex.
-- Dữ liệu chỉ đi giữa box và điện thoại của bạn, qua đường HTTPS của instabox. FCode không có máy chủ riêng, không gửi thống kê đi đâu.
+- Dữ liệu chỉ đi giữa box và điện thoại của bạn, qua đường HTTPS của Caddy trên box. FCode không có máy chủ riêng, không gửi thống kê đi đâu.
 - Lưu ý: bản thân omp, Claude Code, Codex vẫn nói chuyện với dịch vụ AI của chúng như khi bạn chạy chúng ở bất kỳ nơi nào khác. FCode không can thiệp vào việc đó.
 
 ## 3. Cài máy chủ trên box
@@ -79,20 +83,21 @@ bash install.sh
 
 Script `install.sh` làm các việc sau, và chạy lại nhiều lần vẫn an toàn:
 
-1. Chép `server.mjs` vào `/data/home/fcoding`.
+1. Chép `server.mjs` và `start.sh` vào `/data/home/fcoding`. `start.sh` là đoạn khởi động chung: dịch vụ `fcoding`, mọi phiên mới (omp, Claude, Codex, shell) và timer đồng bộ `fcode-git-sync` đều chạy qua nó, để có `GH_TOKEN` (xem mục "Màn hình chính" bên dưới).
 2. Tạo thư mục cấu hình `/data/home/.fcoding` (quyền 700).
 3. Lần cài đầu: tạo `config.json` với một khóa bí mật ngẫu nhiên và danh sách dự án **trống** (không có dự án mẫu). Thêm dự án của bạn theo mục "Danh sách dự án" bên dưới.
 4. Cài lệnh `~/.local/bin/fcode-pair` (dùng để lấy mã ghép máy, xem [mục 6](#6-ghép-iphone-với-box)) và `~/.local/bin/fcode-new` (tạo phiên mới như nút "+" trong app: `fcode-new --projects`, `fcode-new --harnesses`, `fcode-new <dự án> <harness>`; chỉ in tên phiên, trùng tên thì thêm `-2`, `-3`…).
 5. Cài bộ tự cập nhật omp, Claude Code, Codex (timer chạy mỗi 6 giờ; cần `sudo` không mật khẩu, thiếu thì chỉ cảnh báo và việc cài vẫn tiếp tục). Chi tiết trong [`box/README.md`](../box/README.md).
 6. Tạo dịch vụ systemd của người dùng tên **`fcoding`**, bật chạy cùng hệ thống, tự chạy lại khi lỗi, rồi khởi động ngay. Cổng mặc định là **7681**.
 
-**Cập nhật:** vào thư mục `fcoding`, chạy `git pull` rồi `bash install.sh` lại (script khởi động lại dịch vụ). Từ v1.3.4, khi cập nhật `fcode` ở laptop, hãy cập nhật server trên box như vậy (tốt nhất là cập nhật box trước). Dù box chạy server bản nào, trước khi gỡ dòng ghi chú của mình trong `.git/info/exclude` của một dự án, fcode trên box luôn bảo đảm trong thư mục `.fcode` của dự án đó và của mọi dự án khác trong `config.json` của box dùng chung file `.git/info/exclude` đó (worktree của cùng một kho, hoặc dự án là thư mục con của kho) có file `.gitignore` chỉ gồm dòng `*` (tạo thư mục `.fcode` nếu chưa có, đúng thư mục server mới dùng để chứa ảnh; file đó nếu có nội dung khác thì được thay bằng đúng dòng `*`, giống như server mới làm; không đi qua liên kết, và nếu `.fcode` hoặc file đó ở một dự án nào trong số đó là liên kết, hoặc git trên box không trả lời, thì fcode chưa gỡ, lần sau thử lại); lý do: nếu box vẫn chạy server bản 1.3.3 thì nhờ file này ảnh gửi từ app vẫn được giấu khỏi git, kể cả khi dòng `/.fcode/` mà server cũ thêm bị mất trong lúc gỡ. Vì thế thư mục `.fcode` có thể xuất hiện trong một dự án chưa từng nhận ảnh, kể cả dự án khác dùng chung file `.git/info/exclude`; git không hiện nó. Cập nhật server trên box vẫn là cách nên làm: server mới không ghi vào `.git/info/exclude` nữa.
+**Cập nhật:** vào thư mục `fcoding`, chạy `git pull` rồi `bash install.sh` lại (script khởi động lại dịch vụ). Từ v1.3.4, khi cập nhật `fcode` ở laptop, hãy cập nhật server trên box như vậy (tốt nhất là cập nhật box trước). Dù box chạy server bản nào, trước khi gỡ dòng ghi chú của mình trong `.git/info/exclude` của một dự án, fcode trên box luôn bảo đảm trong thư mục `.fcode` của dự án đó và của mọi dự án khác trong `config.json` của box dùng chung file `.git/info/exclude` đó (worktree của cùng một kho, hoặc dự án là thư mục con của kho) có file `.gitignore` chỉ gồm dòng `*` (tạo thư mục `.fcode` nếu chưa có, đúng thư mục server mới dùng để chứa ảnh; file đó nếu có nội dung khác thì được thay bằng đúng dòng `*`, giống như server mới làm; không đi qua liên kết, và nếu `.fcode` hoặc file đó ở một dự án nào trong số đó là liên kết, hoặc git trên box không trả lời, thì fcode chưa gỡ, lần sau thử lại); lý do: nếu box vẫn chạy server bản 1.3.3 thì nhờ file này ảnh gửi từ app vẫn được giấu khỏi git, kể cả khi dòng `/.fcode/` mà server cũ thêm bị mất trong lúc gỡ. Vì thế thư mục `.fcode` có thể xuất hiện trong một dự án chưa từng nhận ảnh, kể cả dự án khác dùng chung file `.git/info/exclude`; git không hiện nó. Cập nhật server trên box vẫn là cách nên làm: server mới không ghi vào `.git/info/exclude` nữa. Sau khi cập nhật, hãy đóng rồi mở lại các phiên đang mở, vì phiên mở từ trước bản này chưa có `GH_TOKEN`. Khi token đổi: phiên mới mở dùng token mới ngay, phiên đã mở vẫn giữ token cũ cho tới khi bạn đóng (vuốt trái -> Đóng) rồi mở lại.
 
 Các tệp quan trọng:
 
 | Đường dẫn | Nội dung |
 |---|---|
 | `/data/home/fcoding/server.mjs` | Máy chủ |
+| `/data/home/fcoding/start.sh` | Đoạn khởi động chung: dịch vụ `fcoding`, mọi phiên mới (omp, Claude, Codex, shell) và timer đồng bộ `fcode-git-sync` chạy qua nó để lấy `GH_TOKEN` |
 | `/data/home/.fcoding/config.json` | Cấu hình: khóa bí mật, danh sách dự án, cổng |
 | `/data/home/.fcoding/devices.json` | Các iPhone đã ghép (chỉ lưu dạng băm) |
 
@@ -133,38 +138,47 @@ Màn hình chính của app lấy mọi thứ từ một địa chỉ của máy
 | Pull request, CI | `gh` theo kho GitHub của từng dự án trong `config.json` | mỗi 2 phút |
 | Phiên bản công cụ | `~/.local/state/fcode-update/status.json` (omp, claude, codex) | mỗi lần mở |
 | Dự án chậm so với GitHub, cây chưa commit | `~/.local/state/fcode/git-sync.json` (timer `fcode-git-sync` trên box ghi) | mỗi lần mở |
-| Máy staging của dự án (đang chạy / đang nghỉ) | `instabox ls --json` (cần khóa instabox, xem dưới) | mỗi 30 giây |
 | Định dạng phiên omp, phiên bản omp | `omp --version` và dòng đầu các file phiên mới nhất trong `~/.omp/agent/sessions` | mỗi 10 phút |
-| Giờ box ngủ | ước tính: lần box thức dậy gần nhất + 8 giờ (vẫn giữ đúng khi máy chủ khởi động lại, nhờ file `~/.fcoding/box-timer.json`; box khởi động lại thì tính lại từ đầu) | luôn |
 
 - Mở phiên mới (nút "+" hoặc `fcode-new`) thì box chạy `fcode-git-sync <dự án>` trước và chờ tối đa 8 giây, để thẻ dự án có số commit "chậm / chưa đẩy" mới nhất. Lệnh này chỉ `fetch` và đếm lại, không bao giờ đổi thư mục làm việc (chỉ timer 5 phút của box mới tự kéo nhánh chính về khi nhánh đó rảnh và sạch; nó không đụng nhánh khác, không stash, không reset, không push). Cập nhật code ở các trường hợp còn lại là việc của agent (luật "Sync first"). Thẻ dự án có thêm `autoUpdated` / `autoSkip` để biết timer đã tự kéo hay vì sao không. Thiếu lệnh, lệnh lỗi hay quá 8 giây thì phiên vẫn được tạo (máy chủ chỉ ghi một dòng nhật ký). Máy chủ không bao giờ tắt tiến trình đồng bộ; nó tự chạy xong, và mở phiên khác cùng dự án lúc đó dùng chung lần đồng bộ đang chạy.
 - Phiên omp gần đây của một dự án (app: "Phiên omp gần đây", nút "Tiếp tục"): `GET /api/projects/<dự án>/omp-sessions` liệt kê tối đa 10 phiên omp mới nhất có nội dung, lấy từ `~/.omp/agent/sessions/<tên thư mục mã hóa>/`. Máy chủ chỉ đọc hai dòng đầu mỗi file (tiêu đề và phần đầu), không bao giờ đọc nội dung tin nhắn. Phiên do laptop đồng bộ sang có file đánh dấu `<tên>.fcode-origin` nên hiện thẻ "laptop". Nút "Tiếp tục" (`POST .../omp-sessions/<id>/resume`) mở phiên tmux `<dự án>-omp-r-<8 ký tự cuối của id>` chạy `omp -r <id>`; bấm lại thì vào lại đúng phiên đó.
-- Máy staging: nút "Bật" trong app chạy `instabox start <tên dự án> --no-wait` trên box (chỉ khi có máy tên trùng tên dự án trong `instabox ls`; không bao giờ dừng, xóa hay tạo máy). Cần khóa instabox: tạo file `~/.config/fcode/instabox.env` (chmod 600) chỉ có một dòng `export INSTABOX_API_KEY=...`, rồi `systemctl --user restart fcoding`. Dịch vụ chỉ đọc đúng dòng đó như chữ (không chạy file), không ghi khóa ra nhật ký, và không để khóa lọt vào các phiên tmux. Không có file thì app không hiện trạng thái staging.
 - Bảo vệ định dạng: máy chủ chỉ hiểu phiên omp có `version` 3 (`KNOWN_VERSIONS` trong `server.mjs`, laptop dùng cùng danh sách). Khi omp cập nhật và đổi định dạng (phiên mới có version khác, header hỏng, hoặc omp đổi cách đặt tên thư mục), `GET /api/home` trả `omp.formatOk: false` kèm `reason`, danh sách phiên bỏ qua các phiên lạ, và app sẽ nhắc cập nhật FCode.
 - Một phần bị lỗi (ví dụ `gh` chưa đăng nhập) thì phần đó trống, các phần khác vẫn hiện. Hạn mức cũ được đánh dấu "cũ" nếu không làm mới được.
 - Màn hình chính luôn trả lời nhanh: phần nào đã có thì hiện ngay và được làm mới ở nền. Lần mở đầu tiên sau khi máy chủ khởi động, phần nào chưa đọc xong trong 8 giây thì tạm trống và hiện ở lần tải sau.
 - Chi phí là giá API niêm yết (bảng giá kèm trong `server.mjs`), không phải số tiền bạn trả theo gói. Chi phí của omp và của Codex được tính vào đúng tài khoản; chi phí từ Claude Code chạy riêng chỉ cộng vào tổng. Mẫu máy (model) không có trong bảng giá thì chỉ đếm token, không đoán tiền.
 - "Ước tính cả tuần" của một tài khoản chỉ tính phần chi phí đã biết là của tài khoản đó. Claude Code chạy riêng (và vài lệnh nhỏ của omp như đặt tên phiên) cũng dùng hạn mức tuần nhưng không biết thuộc tài khoản nào, nên khi có chúng con số ước tính sẽ thấp hơn thực tế.
 - Ngày (Hôm nay, Hôm qua, 30 ngày) tính theo giờ Việt Nam, bất kể box dùng múi giờ nào. Muốn đổi, thêm `"timeZone": "<múi giờ>"` (ví dụ `"Asia/Tokyo"`) vào `~/.fcoding/config.json`; máy chủ tự đọc lại, không cần khởi động lại.
-- `gh` cần `GH_TOKEN` để đọc kho. Trên box instabox, dịch vụ tự lấy `GH_TOKEN` từ kho bí mật của instabox (giống như cửa sổ dòng lệnh), không ghi ra ổ đĩa. Nếu bạn vừa thêm token vào kho bí mật, khởi động lại dịch vụ: `systemctl --user restart fcoding`. Không có token thì phần dự án hiện "chưa đọc được GitHub". Nếu token không có quyền Checks thì kết quả checks của PR lấy từ các lần chạy GitHub Actions của commit đầu PR. "Deploy" trên thẻ dự án là lần chạy mới nhất của workflow có tên hoặc tên file chứa "deploy"; chưa có thì app hiện "deploy: chưa có". Với dự án dùng cổng deploy chung (kho có file `.fcode/deploy.json`), dòng "deploy" lấy từ trạng thái `fcode/deploy` của commit mới nhất trên nhánh chính, không lấy từ GitHub Actions: "đang deploy", "đã deploy", "deploy bỏ qua", "deploy thay bằng bản mới", "deploy lỗi" hoặc "deploy cần người xử lý". Chưa có trạng thái nào thì hiện "đang deploy". Khi máy chủ thấy trạng thái này lần đầu, nó ghi kho đó vào `~/.fcoding/gate-repos.json` và từ đó luôn coi là dự án dùng cổng, kể cả khi file `.fcode/deploy.json` bị xóa sau này (máy chủ không tự xóa; muốn bỏ thì sửa file đó rồi khởi động lại dịch vụ). Dự án khác giữ nguyên cách cũ.
+- `gh` cần `GH_TOKEN` để đọc kho. Token lấy từ file bí mật của box, `/run/instabox/secrets/env` (trên máy Oracle đây là liên kết tới `~/.config/fcode/secrets.env`, file nằm trên ổ đĩa):
+  - Đoạn khởi động chung `/data/home/fcoding/start.sh` đọc file này lúc bắt đầu dịch vụ `fcoding`, mỗi phiên mới (nút "+", mở dự án, mở lại phiên omp, `fcode-new`) và mỗi lượt của timer `fcode-git-sync`. Nhờ vậy `gh` và lệnh push https trong omp dùng được ngay.
+  - `start.sh` chỉ lấy đúng một biến `GH_TOKEN`. Nó đọc file như chữ, không chạy file, không đưa biến nào khác vào phiên, không ghi token ra file hay nhật ký. (Riêng phiên shell `bash -l` và cửa sổ dòng lệnh tự đọc cả file như trước.)
+  - Không có token thì app hiện "chưa đọc được GitHub".
+- Luật cho file bí mật. Chỉ cần một dòng sai là dịch vụ, mọi phiên omp/Claude/Codex mới và timer đồng bộ đều không có token (phiên shell và cửa sổ dòng lệnh vẫn tự đọc file nên có thể vẫn có token):
+  - Mỗi dòng có dạng `TÊN=giá trị`, có thể có `export` ở đầu. Dòng trống và dòng bắt đầu bằng `#` được bỏ qua.
+  - Giá trị viết trần chỉ được gồm chữ, số và các dấu `_ . / : @ % + , = ~ ^ -`. Có dấu cách hoặc ký tự khác (ví dụ `!`, `?`, `&`, `$`) thì đặt cả giá trị trong nháy đơn `'...'`.
+  - Trong nháy đơn không được có thêm dấu `'`. Trong nháy kép `"..."` không được có `$`, dấu huyền (`` ` ``) hay `\`.
+  - Không dùng các tên OPTIND, HISTCMD, MAILCHECK, RANDOM, SRANDOM, SECONDS.
+  - Giá trị của `GH_TOKEN` phải dài 1 đến 255 ký tự, chỉ gồm chữ cái không dấu (a-z, A-Z), số và `_`.
+  - File phải là một file bình thường (không phải thư mục), tối đa 64 KB, chỉ là văn bản thuần, không có ký tự điều khiển (dòng `#` cũng vậy). Giá trị viết trần hay trong nháy kép mà có `$` (ví dụ `X=$HOME/a`), hoặc một giá trị viết trên nhiều dòng, đều bị từ chối; trong nháy đơn (`X='$HOME/a'`) thì `$` được phép.
+  - Xuống dòng kiểu Windows (CRLF) vẫn được, nhưng phiên shell và cửa sổ dòng lệnh giữ nguyên ký tự CR nên với file CRLF chúng có thể thấy `GH_TOKEN` khác với `start.sh`.
+- Xem vì sao không có token:
+  - Chạy `sh /data/home/fcoding/start.sh -v true`: in ra một dòng trạng thái cho file hiện tại.
+  - Hoặc xem dòng của lần khởi động dịch vụ gần nhất: `journalctl --user -u fcoding | grep start.sh | tail -n 1`. Dòng này chỉ được ghi một lần mỗi khi dịch vụ khởi động, nên đừng dùng `-n 20` (dòng sẽ bị đẩy ra ngoài).
+  - `ok` là tốt. `line-3` là dòng 3 sai luật. `no-GH_TOKEN` là thiếu dòng `GH_TOKEN`. `bad-GH_TOKEN` là token trống, dài quá 255 hoặc có ký tự ngoài chữ cái không dấu, số, `_`.
+  - `too-big` là file quá 64 KB. `missing` là không có file. `not-a-file` là đường dẫn không phải file bình thường. `unreadable` là không đọc được file. `error` là máy thiếu hoặc lỗi lệnh `head`/`awk`.
+  - Sửa file rồi khởi động lại dịch vụ để danh sách dự án đọc được GitHub: `systemctl --user restart fcoding`. Phiên đang mở vẫn giữ token cũ: đóng rồi mở lại (xem phần "Cập nhật" ở trên).
+- Nếu token không có quyền Checks thì kết quả checks của PR lấy từ các lần chạy GitHub Actions của commit đầu PR. "Deploy" trên thẻ dự án là lần chạy mới nhất của workflow có tên hoặc tên file chứa "deploy"; chưa có thì app hiện "deploy: chưa có". Với dự án dùng cổng deploy chung (kho có file `.fcode/deploy.json`), dòng "deploy" lấy từ trạng thái `fcode/deploy` của commit mới nhất trên nhánh chính, không lấy từ GitHub Actions: "đang deploy", "đã deploy", "deploy bỏ qua", "deploy thay bằng bản mới", "deploy lỗi" hoặc "deploy cần người xử lý". Chưa có trạng thái nào thì hiện "đang deploy". Khi máy chủ thấy trạng thái này lần đầu, nó ghi kho đó vào `~/.fcoding/gate-repos.json` và từ đó luôn coi là dự án dùng cổng, kể cả khi file `.fcode/deploy.json` bị xóa sau này (máy chủ không tự xóa; muốn bỏ thì sửa file đó rồi khởi động lại dịch vụ). Dự án khác giữ nguyên cách cũ.
 - Nút Reset của Codex trong app chạy `omp usage reset <tài khoản>` trên box, mỗi tài khoản một lần một. Nếu reset chạy lâu hơn 15 giây, app báo "đang chạy" và bạn xem lại Hạn mức sau ít phút. Reset của Claude chỉ mở trang claude.ai.
 - Đổi tên phiên (vuốt trên một phiên, "Đổi tên") dùng `tmux rename-session`; tên mới theo cùng luật như tên phiên. Tên dạng `<dự án>-<chương trình>` (ví dụ `deal-sync-claude`) dành cho phiên mở từ dự án đó, nên phiên khác không đổi sang tên này được.
 
 ## 4. Mở link công khai
 
-Máy chủ nghe ở cổng 7681 trên box. Để iPhone vào được, hãy công khai cổng này bằng công cụ `instabox` (chạy trên laptop):
-
-```sh
-instabox port publish <tên-box> 7681
-```
-
-Lệnh in ra một địa chỉ dạng:
+Máy chủ nghe ở cổng 7681 trên box, nhưng cổng này đóng với bên ngoài. Từ ngoài vào bằng HTTPS ở cổng 443: Caddy trên box lấy chứng chỉ và chuyển yêu cầu vào cổng 7681. Địa chỉ công khai của box là:
 
 ```
-https://7681-<id>.instabox.tech
+https://fcode-quoc.duckdns.org
 ```
 
-Hãy chép địa chỉ này, bạn sẽ nhập nó vào app ở bước ghép máy. Để kiểm tra, mở địa chỉ trong trình duyệt: nếu thấy dòng chữ `fcoding ok` là máy chủ đang chạy.
+(Trên máy Oracle hiện tại, Caddy, tên miền DuckDNS và tường lửa đã được dựng sẵn khi tạo máy, không cần làm thêm gì khi cài FCode. Với một máy mới, cần dựng một Caddy chuyển HTTPS cổng 443 vào cổng 7681 trước.) Hãy chép địa chỉ này, bạn sẽ nhập nó vào app ở bước ghép máy. Để kiểm tra, mở địa chỉ trong trình duyệt: nếu thấy dòng chữ `fcoding ok` là máy chủ đang chạy.
 
 Địa chỉ công khai thì ai biết cũng mở được trang đó, nhưng mọi chức năng khác đều cần iPhone đã ghép (xem [mục 9](#9-bảo-mật)).
 
@@ -209,7 +223,7 @@ FCode không dùng mật khẩu. Chỉ người đang có quyền vào dòng l�
    Tên trong ngoặc là tên hiển thị của máy trong danh sách thiết bị (bỏ trống cũng được). Lệnh in ra một **mã 6 số**, ví dụ `482913`.
 
 2. Trên iPhone, mở FCode ở màn hình **Ghép máy**:
-   - **Địa chỉ máy chủ**: địa chỉ công khai ở [mục 4](#4-mở-link-công-khai) (bắt đầu bằng `https://`).
+   - **Địa chỉ máy chủ**: địa chỉ công khai ở [mục 4](#4-mở-link-công-khai) (bắt đầu bằng `https://`). Sau này nếu box đổi địa chỉ thì không cần ghép lại: vào **Cài đặt → Địa chỉ máy chủ** (xem [mục 7](#7-dùng-hằng-ngày)).
    - **Mã ghép**: gõ 6 số vừa thấy.
 3. Bấm **Ghép iPhone này**.
 
@@ -219,7 +233,7 @@ Lưu ý về mã:
 - Nhập sai 5 lần thì mã bị hủy; chạy lại `fcode-pair` để lấy mã mới. Mỗi nơi tạo mã (lệnh `fcode-pair` hoặc từng iPhone đã ghép) chỉ có 1 mã đang chờ, tạo mã mới thì thay mã cũ của nơi đó; tổng cộng tối đa 3 mã cùng lúc.
 - Máy chủ phải đang chạy thì lệnh mới in được mã.
 
-Sau khi ghép, iPhone nhớ box trong Keychain. Mở app là vào thẳng danh sách; box khởi động lại cũng không phải ghép lại.
+Sau khi ghép, iPhone nhớ box trong Keychain. Mở app là vào thẳng danh sách; box khởi động lại cũng không phải ghép lại. Box chuyển sang địa chỉ mới (cùng thiết bị đã ghép) thì đổi trong **Cài đặt → Địa chỉ máy chủ**: gõ địa chỉ mới (chỉ `https`; gõ tên miền là đủ) rồi bấm **Lưu**. iPhone thử kết nối bằng đăng nhập hiện tại, được thì đổi luôn, không được thì giữ địa chỉ cũ và báo lý do (báo "chưa ghép" thì gỡ iPhone này rồi ghép lại).
 
 ### Ghép thêm iPhone bằng mã QR
 
@@ -268,7 +282,7 @@ Hướng dẫn đầy đủ cho app nằm ở [ios/README.md, mục 4](../ios/RE
 
 **Màn hình chính** (thanh trên cùng chỉ có nút **?** Hướng dẫn và **⚙** Cài đặt). Phiên tự cập nhật mỗi 5 giây, hạn mức và dự án mỗi phút; kéo xuống để cập nhật ngay.
 
-- **Vòng giờ box** (bên trái thẻ trên cùng): **Sleeps in** là thời gian box còn chạy trước khi tự nghỉ (tối đa 8 giờ, hoặc sớm hơn nếu rảnh 30 phút; đây là ước tính của máy chủ). Vòng chuyển vàng khi còn dưới 10 phút. **Wakes in** hiện khi box vừa nghỉ vì đã chạy đủ 8 giờ: lúc đó box chưa đánh thức lại được trong khoảng 10 phút. Chạm vào vòng để xem giờ chính xác. Về giờ nghỉ của box: box tự nghỉ khi 30 phút không ai dùng, và một box đang nghỉ tự dậy khi có thứ gì dùng tới nó (một lệnh, file, SSH, hoặc mở link công khai của nó, tức là app); đo thực tế, lần gửi đầu tiên tới link khi box đang nghỉ được trả lời sau khoảng 4 giây, không báo lỗi. Một lần chạy liền tối đa 8 giờ, hết thì box nghỉ. Box nghỉ bằng tay (`instabox suspend`) thì nằm yên cho tới khi bạn bật lại bằng tay. Box nghỉ chỉ tính tiền chỗ lưu trữ.
+- **Lời chào và giờ** (bên trái thẻ trên cùng): lời chào theo giờ (Chào buổi sáng, trưa, chiều hoặc tối), giờ hiện tại cỡ lớn (24 giờ, ví dụ 22:05) và thứ, ngày (ví dụ Thứ Ba, 3/11). Luôn là **giờ Việt Nam**, dù điện thoại đặt múi giờ nào. Tự đổi mỗi phút theo đồng hồ điện thoại, đã chỉnh theo đồng hồ của box (độ lệch lấy từ `generatedAt` của `GET /api/home`, như trước). Máy chủ không gửi số liệu riêng nào cho phần này. Chạm vào phần này không có gì xảy ra.
 - **Ô hạn mức** (bên phải): mỗi lần một tài khoản, tự chuyển sang tài khoản kế mỗi 4 giây (giữ ngón tay trên ô để dừng). Chạm để mở màn hình **Hạn mức**.
 - Dòng **đang chạy · chờ bạn**: chạm để nhảy tới phiên tương ứng.
 - **Dự án** (trượt ngang): mỗi thẻ cho biết số PR đang mở, kết quả checks và lần deploy gần nhất ("đang đọc…" khi máy chủ vừa khởi động, "chưa đọc được GitHub" khi `gh` lỗi). Chạm thẻ để chỉ xem phiên của dự án đó; bấm **…** để mở phiên mới trong dự án đó. Giữ lâu trên thẻ để mở menu: **Mở phiên mới**, **Đổi tên hiển thị…** và **Sắp xếp**.
@@ -280,7 +294,7 @@ Hướng dẫn đầy đủ cho app nằm ở [ios/README.md, mục 4](../ios/RE
 
 **Tạo phiên mới**: bấm nút tròn **+** ở góc dưới bên phải. Chọn dự án, rồi chọn chương trình (omp, claude hoặc codex). Nút này luôn tạo phiên **mới** (tên như `web-claude`, `web-claude-2`, …) và không bao giờ mở lại phiên cũ; muốn vào phiên cũ thì mở từ danh sách. App không còn liệt kê shell, dù máy chủ vẫn chạy được shell. Dự án chưa có trong danh sách thì thêm bằng **Thêm dự án** ([xem bên dưới](#thêm-dự-án-từ-app)).
 
-**Phiên omp gần đây và máy staging** (v1.3.2): trong một dự án, mục **Phiên omp gần đây** liệt kê các phiên omp mới nhất của dự án (cả phiên đồng bộ từ laptop, có thẻ "laptop"); bấm **Tiếp tục** để mở lại đúng phiên đó. Thẻ dự án có máy staging (máy instabox cùng tên dự án) thì có nút **Bật** để đánh thức máy đó. Chi tiết và cách cài khóa instabox nằm ở mục 3, "Màn hình chính".
+**Phiên omp gần đây** (v1.3.2): trong một dự án, mục **Phiên omp gần đây** liệt kê các phiên omp mới nhất của dự án (cả phiên đồng bộ từ laptop, có thẻ "laptop"); bấm **Tiếp tục** để mở lại đúng phiên đó. Chi tiết nằm ở mục 3, "Màn hình chính".
 
 **Hạn mức** (chạm ô hạn mức): tổng chi phí 30 ngày, rồi từng tài khoản: thanh dùng của từng khung giờ, xu hướng 30 ngày, chi phí "Hôm nay / Hôm qua / 30 ngày / Ước tính tuần". **Reset**: Codex dùng lượt reset ngay trong app (có hỏi xác nhận); Claude chỉ mở trang claude.ai. Xem thêm "Màn hình chính: hạn mức, chi phí, dự án" ở mục 3.
 
@@ -294,7 +308,16 @@ Hướng dẫn đầy đủ cho app nằm ở [ios/README.md, mục 4](../ios/RE
 - Nút **ghim** trên ô nhập: khi ghim, ô nhập hiện sẵn mỗi lần mở phiên và vẫn ở lại sau khi gửi. Bấm lần nữa để bỏ ghim. App nhớ lựa chọn này.
 - **Màu và biểu tượng**: màn hình hiện đúng màu của chương trình (chữ, nền, đậm, nghiêng, gạch chân), nên dễ phân biệt lỗi, phần thêm/xóa của diff hay mục đang chọn. Các biểu tượng đặc biệt (nhánh git, thư mục…) hiện đúng nhờ font Nerd Font đi kèm app. Tên phiên ở thanh trên nằm trong nhãn màu theo chương trình (claude cam, omp tím, codex xanh).
 - Link trong màn hình được gạch chân; chạm để mở trong trình duyệt. Link dài bị omp cắt xuống dòng thường vẫn mở đúng cả link. Nhấn giữ để chép chữ trên màn hình.
-- Hàng phím nhanh: Esc, **Agents**, Ctrl+C, mũi tên, Tab, ⇧Tab, Enter, y, n, **^O**. Nút `/` chèn các lệnh hay dùng như `/model`, `/clear`. Phím được gửi đúng thứ tự bạn bấm.
+- Hàng phím nhanh: Esc, ↑, ↓, Enter, **Agents**, Ctrl+C, ←, →, Tab, ⇧Tab, y, n, **^O**. Nút `/` chèn các lệnh hay dùng như `/model`, `/clear`. Phím được gửi đúng thứ tự bạn bấm.
+- **Chọn trong menu**: khi phiên hỏi bạn chọn, tức là hiện một menu có **một dòng đang được chọn** (dấu ❯ hay ›; ví dụ câu hỏi tin thư mục của Claude **No, exit** / **Yes, I trust this folder**, câu hỏi xin quyền chạy lệnh, câu hỏi của Claude có nhiều lựa chọn, câu hỏi xin quyền của Codex, hộp **Ask** của omp), app cho bạn chọn bằng một chạm theo hai cách:
+  - Chạm **ngay dòng lựa chọn trên màn hình**: các dòng lựa chọn có nền màu nhạt (dòng đang được chọn đậm hơn).
+  - Hoặc chạm **nút của nó trên thanh chọn** hiện ngay trên ô nhập (cả khi xoay ngang, cả khi ô nhập đang ẩn). Chữ trên màn hình nhỏ thì dùng thanh này cho dễ.
+  - App tự bấm ↑ / ↓ tới đúng dòng rồi Enter. Ở câu hỏi chọn nhiều (ô `[ ]`), chạm một dòng chỉ đánh dấu hoặc bỏ đánh dấu dòng đó (phím Space), chưa gửi; chọn xong thì chạm **Submit**. Dòng **Type something** của Claude: app chỉ đưa con trỏ tới đó, bạn gõ thẳng câu trả lời vào dòng đó rồi Enter để gửi (không cần Enter trước khi gõ); Esc huỷ cả câu hỏi. Dòng **Other (type your own)** của omp: app đưa con trỏ tới đó và bấm Enter, omp mở ô **Custom answer**; bạn gõ câu trả lời rồi bấm Enter (hoặc Ctrl+Q) để gửi, bấm Esc để quay lại danh sách lựa chọn. Câu hỏi có nhiều trang thì thanh có thêm nút **←** / **→** để sang câu trước / câu sau. Nút **Esc** đóng menu.
+  - Dòng mình gõ đã gửi, chữ đang soạn hay danh sách có số trong câu trả lời không làm hiện thanh: chỉ menu đang chờ bạn chọn mới hiện.
+  - Nhiều lựa chọn quá thì phần nút lựa chọn kéo ngang được (nút đang được chọn tự hiện ra); **←** / **→** và **Esc** luôn nằm cố định bên phải.
+  - Sau mỗi lần chạm (hay mỗi phím, dòng chữ bạn gửi), thanh và các dòng mờ đi tới khi màn hình bạn đang thấy giống hệt màn hình app vừa hỏi lại box (thường khoảng nửa giây). Nhờ vậy chạm hai lần không gửi hai lần, và app không bấm theo màn hình đã cũ. Lúc mờ, cả nút **Esc**, **←**, **→** trên thanh cũng mờ theo; nếu thanh vẫn mờ, dùng ↑ ↓ Enter (và Esc) ở hàng phím nhanh.
+  - Hiếm khi: nếu chương trình vẽ lại chậm hơn khoảng nửa giây, hay tự đổi màn hình đúng lúc bạn chạm, lần chạm vẫn có thể rơi vào màn hình vừa bị thay. Nhìn lại màn hình trước khi chạm vào câu hỏi quan trọng.
+  - Chạm để dừng màn hình đang trượt, hay giữ ngón tay để bôi đen chữ trên một dòng lựa chọn, không chọn dòng đó.
 - **Agents**: mở danh sách agent con. Phím **Agents** không hiện ở phiên shell hay phiên không rõ chương trình.
   - Phiên omp: gửi Alt+A, mở Agent Hub. Dùng ↑↓ chọn, Enter mở, Esc đóng.
   - Phiên Claude Code: gõ lệnh `/tasks` rồi Enter. Lệnh chạy ngay cả khi Claude đang làm. Bấm Enter để mở một subagent; các phím khác xem trên màn hình. Bấm Esc đóng danh sách trước khi gửi chữ: trong danh sách, phím `x` dừng subagent đang chọn (`f` đưa nó lên trước).
@@ -347,11 +370,11 @@ Từ v1.3.2, bạn thêm dự án GitHub vào box ngay trên iPhone, không cầ
 | thoát 25 | Box không ghi được cấu hình đăng nhập GitHub cho repo này. |
 | thoát 26 | Cấu hình git trên box đang chuyển hướng địa chỉ GitHub (`insteadOf`, `pushInsteadOf`, `pushurl`): gỡ trên box rồi chạy lại. |
 | `ADDED_WARN` (30) | Đã thêm nhưng có mục cần xem lại, ví dụ không xóa được nhánh thử `box/fcode-add-check-…` (xóa nhánh đó trên GitHub). Dự án vẫn dùng được. |
-| `TIMEOUT` (124 / 137) | Quá 10 phút nên bị dừng; chạy lại là an toàn. |
+| `TIMEOUT` (137) | Quá 10 phút nên bị dừng; chạy lại là an toàn. |
 
 Thêm lại một dự án đã có (cùng tên, cùng repo) không làm gì và báo thành công (`ADDED`, thoát 0).
 
-**Làm tay trên box**: `timeout --kill-after=30 600 bash /data/home/fcoding/fcode-add.sh <chủ/repo> <tên>` (script do `install.sh` cài; tự nó không có giới hạn thời gian, nên lệnh làm tay cần `timeout` như trên). Giới hạn 10 phút tự động chỉ áp dụng khi thêm từ app và bằng `fcode add`; thêm lỗi chỉ xóa thư mục do chính lần đó tạo ra, thư mục có sẵn từ trước không bao giờ bị xóa; thêm lại cùng một repo là an toàn. Cách làm tương đương trên laptop: `fcode add <chủ/repo> [tên]`.
+**Làm tay trên box**: `fcode-add <chủ/repo> <tên>` (lệnh do `install.sh` cài, cùng giới hạn 10 phút như app; quá giờ thì bị dừng và thoát mã 137). Bấm **Ctrl+C** cũng dừng lệnh: box cần tối đa 30 giây để dọn xong rồi lệnh mới trả về (mã 137). Lỡ tắt cửa sổ thì box vẫn tự dọn trong 30 giây đó. Nếu gõ `fcode-add` mà box báo "command not found" thì box còn bản cũ; nếu lệnh in `R NO_SCRIPT` và thoát mã 3 thì box thiếu một phần của bản mới. Cả hai cách xử lý giống nhau, chạy trên box: `cd ~/fcode-src && git pull && bash install.sh`. Giới hạn 10 phút tự động áp dụng khi thêm từ app, bằng `fcode add` trên laptop và bằng lệnh `fcode-add` làm tay; thêm lỗi chỉ xóa thư mục do chính lần đó tạo ra, thư mục có sẵn từ trước không bao giờ bị xóa; thêm lại cùng một repo là an toàn. Cách làm tương đương trên laptop: `fcode add <chủ/repo> [tên]`.
 
 ### Gửi ảnh trong chat
 
@@ -425,11 +448,11 @@ fcode-deploy <tên> trust off
 Mọi phiên là phiên tmux thật trên box, nên bạn vào cùng phiên với điện thoại từ laptop và thấy đúng những gì điện thoại thấy:
 
 ```sh
-instabox ssh <tên-box> -- tmux ls
-instabox ssh <tên-box> -- -tt tmux -u attach -t <tên-phiên>
+ssh oracle tmux ls
+ssh -tt oracle tmux -u attach -t <tên-phiên>
 ```
 
-`-tt` (đặt trước `tmux`) bắt ssh mở một màn hình thật; thiếu nó, tmux báo `open terminal failed: not a terminal`. `-u` để chữ tiếng Việt hiện đúng.
+`-tt` (đặt trước tên máy `oracle`) bắt ssh mở một màn hình thật; thiếu nó, tmux báo `open terminal failed: not a terminal`. `-u` để chữ tiếng Việt hiện đúng.
 
 Để thoát mà **không tắt** phiên: bấm **Ctrl+B**, thả ra rồi bấm **D**.
 
@@ -439,16 +462,16 @@ Khi điện thoại mở một phiên, app đặt kích thước cửa sổ tmux
 - Hoặc từ laptop:
 
   ```sh
-  instabox ssh <tên-box> -- tmux set-option -wu -t <tên-phiên> window-size
+  ssh oracle tmux set-option -wu -t <tên-phiên> window-size
   ```
 
 Đừng gõ lệnh này vào ô chat của omp, Claude Code hay Codex: nó sẽ được gửi cho trợ lý như một tin nhắn. Lần sau điện thoại mở lại phiên, kích thước lại theo điện thoại.
 
 ### Lệnh `fcode` (tùy chọn)
 
-Lệnh `fcode` nằm trong thư mục `laptop/` của kho mã này, chạy trên PowerShell hoặc cmd của Windows và không bắt buộc. Để vào phiên, `fcode` gọi `instabox ssh` cho bạn; ngoài ra còn có `fcode new` (mở phiên mới), `fcode sync` (dùng git ngay trên laptop), `fcode ipa` (tải app về máy), `fcode add` (thêm dự án) và `fcode pair` (ghép iPhone mới). Cách cài nằm ngay bên dưới, ở mục [Cài lệnh fcode trên máy Windows khác](#cài-lệnh-fcode-trên-máy-windows-khác).
+Lệnh `fcode` nằm trong thư mục `laptop/` của kho mã này, chạy trên PowerShell hoặc cmd của Windows và không bắt buộc. Để vào phiên, `fcode` gọi `ssh` thẳng tới box cho bạn (tên ssh `oracle` trong `~/.ssh/config`); ngoài ra còn có `fcode new` (mở phiên mới), `fcode sync` (dùng git ngay trên laptop), `fcode ipa` (tải app về máy), `fcode add` (thêm dự án) và `fcode pair` (ghép iPhone mới). Cách cài nằm ngay bên dưới, ở mục [Cài lệnh fcode trên máy Windows khác](#cài-lệnh-fcode-trên-máy-windows-khác).
 
-Tên box và các thư mục mà `fcode sync` cập nhật nằm trong file `%USERPROFILE%\.fcode\config.json` (mục `box`, mặc định `coder`, và mục `syncRepos`). Biến môi trường `FCODE_BOX` chỉ dùng để đổi tên box tạm thời cho một lần chạy; `FCODE_SYNC_REPOS` cũng vậy cho danh sách thư mục.
+Tên ssh của box và các thư mục mà `fcode sync` cập nhật nằm trong file `%USERPROFILE%\.fcode\config.json` (mục `host`, mặc định `oracle`, và mục `syncRepos`). Biến môi trường `FCODE_HOST` chỉ dùng để đổi tên ssh tạm thời cho một lần chạy; `FCODE_SYNC_REPOS` cũng vậy cho danh sách thư mục.
 
 ```sh
 fcode           # liệt kê các phiên, gõ số để vào
@@ -464,11 +487,80 @@ fcode new       # mở phiên mới: chọn dự án và harness (hoặc gõ 0 t
   - Hỏi bạn xác nhận hoặc chọn một thư mục tìm thấy, hoặc dán đường dẫn khác (mặc định `Desktop\<tên>`). Thư mục phải là git và có cùng origin GitHub với project; thư mục trống hoặc chưa có thì được clone về.
   - Thư mục được thêm vào `syncRepos` trong `%USERPROFILE%\.fcode\config.json` và đồng bộ ngay một lần.
   - Nếu đã đặt biến `FCODE_SYNC_REPOS` thì bước này được bỏ qua.
-- `fcode add <chủ/repo> [tên]`: thêm một dự án GitHub vào box để omp làm việc và hiện trong danh sách của app. Lệnh chạy script đã cài sẵn trên box: nếu token GitHub của box ghi được thì xong luôn, không cần khóa. Nếu không, lệnh hiện khóa công khai kèm các bước dán vào trang GitHub của repo, chờ bạn bấm Enter rồi thử lại. Nếu box chưa có script, lệnh báo `cd ~/fcode-src && git pull && bash install.sh` (chạy trên box). Xong lệnh gợi ý chạy `fcode sync` để có project này cả trên laptop.
+- `fcode add <chủ/repo> [tên]`: thêm một dự án GitHub vào box để omp làm việc và hiện trong danh sách của app. Lệnh chạy lệnh `fcode-add` đã cài sẵn trên box (giới hạn 10 phút): nếu token GitHub của box ghi được thì xong luôn, không cần khóa. Nếu không, lệnh hiện khóa công khai kèm các bước dán vào trang GitHub của repo, chờ bạn bấm Enter rồi thử lại. Nếu box chưa có lệnh `fcode-add` (box cũ, chưa cập nhật), lệnh báo `cd ~/fcode-src && git pull && bash install.sh` (chạy trên box). Xong lệnh gợi ý chạy `fcode sync` để có project này cả trên laptop.
 - `fcode pair [tên thiết bị]`: tạo mã ghép kèm mã QR cho iPhone mới (cần `publicUrl`, xem [mục 6](#ghép-thêm-iphone-bằng-mã-qr)).
 - `fcode ipa`: tải bản app mới nhất về `Downloads\fcode.ipa`. Khi có bản mới, kéo file này vào Sideloadly và bấm Start; việc tự ký lại 7 ngày của Sideloadly chỉ gia hạn bản đang cài, không tự cập nhật. Không có `fcode` thì tải `fcode.ipa` từ **Releases** trên GitHub.
 
-Thoát bằng **Ctrl+B** rồi **D**, phiên vẫn chạy tiếp.
+Thoát bằng **Ctrl+B** rồi **D**, phiên vẫn chạy tiếp. Khi vào từ laptop, phiên tự chỉnh cho vừa cửa sổ laptop (kể cả khi vừa mở trên điện thoại); lần sau mở lại trên điện thoại, app tự chỉnh lại theo màn hình điện thoại. Lăn chuột để cuộn lên xem lại; bấm **q** (hoặc lăn xuống tới cuối) để về chỗ đang chạy. Kéo chuột để bôi đen chữ là chép luôn, không cần giữ **Shift** nữa (xem mục ngay dưới).
+
+### Chép chữ và dán ảnh từ laptop
+
+Khi bạn vào phiên bằng lệnh `fcode` trên laptop Windows, có ba thao tác dưới đây. **Alt+V** chỉ dán được ảnh khi phiên được mở bằng `fcode` (vào bằng `ssh` gõ tay như đầu mục này thì Alt+V báo `Chưa nối clipboard laptop…` hoặc không có gì). Kéo chuột để chép thì đã cài vào tmux trên box ở lần vào bằng `fcode`, nên sau đó cửa sổ `ssh` gõ tay cũng chép được, cho tới khi tmux trên box khởi động lại.
+
+| Bạn muốn | Làm gì | Kết quả |
+|---|---|---|
+| **Chép chữ** trên màn hình | **Kéo chuột** qua chữ rồi thả ra | Chữ được bôi đen và chép luôn vào clipboard của **laptop**. Không cần giữ Shift, không cần bấm Ctrl+C. Muốn dán thì bấm **Ctrl+V** ở bất kỳ đâu trên laptop. |
+| **Dán chữ** vào phiên | **Ctrl+V** | Giống mọi chương trình Windows: Windows Terminal dán chữ trong clipboard laptop vào phiên. |
+| **Dán ảnh** vào phiên | **Alt+V** (giữ phím Alt rồi bấm V) | Ảnh đang nằm trong clipboard laptop (ví dụ vừa chụp màn hình bằng **Win+Shift+S**) được chuyển lên box, đường dẫn của ảnh được gõ sẵn vào ô nhập của trợ lý. |
+
+**Vì sao ảnh dùng Alt+V mà không phải Ctrl+V?** Windows Terminal giữ Ctrl+V cho việc dán chữ của chính nó, phím này không bao giờ tới được phiên. Claude Code và omp trên Windows cũng dùng Alt+V cho ảnh vì lý do đó. Bạn không cần đổi cài đặt nào của Windows Terminal.
+
+**Dán ảnh, từng bước:**
+
+1. Chụp màn hình bằng **Win+Shift+S** (khoanh vùng cần chụp), hoặc chép một ảnh bất kỳ (chuột phải vào ảnh, **Copy**).
+2. Mở phiên bằng `fcode` như thường lệ.
+3. Bấm **Alt+V** trong phiên. Sau chừng một hai giây, một dòng báo hiện ở đáy màn hình: `Đã dán ảnh vào phiên (đường dẫn đã gõ, chưa gửi)`.
+4. Đường dẫn ảnh đã nằm trong ô nhập của trợ lý nhưng **chưa gửi** (FCode không tự bấm Enter). Gõ lời nhắn của bạn, ví dụ "sửa lỗi trong ảnh này", rồi bấm Enter như thường.
+
+Ảnh được lưu trên box ở thư mục `.fcode/uploads` trong dự án của phiên, cùng chỗ và cùng luật với ảnh gửi từ iPhone (xem [Gửi ảnh trong chat](#gửi-ảnh-trong-chat): tối đa 10 MB, ảnh cũ hơn 7 ngày bị xoá, thư mục được giấu khỏi git). Chỉ nhận ảnh PNG hoặc JPEG; ảnh chụp màn hình Windows là PNG nên dùng được ngay. Bấm Alt+V khi clipboard đang chứa **chữ** (không có ảnh) thì chỉ hiện một thông báo (bảng bên dưới), không gõ gì vào phiên.
+
+**Điều kiện:**
+
+- **Phải dùng Windows Terminal.** Đó là cửa sổ có thể mở nhiều thẻ; trên Windows 11 thường là chương trình tên **Terminal** (bấm Start, gõ `Terminal`); Windows 10 thì cài **Windows Terminal** từ Microsoft Store. Cửa sổ PowerShell cũ màu xanh (console cũ, `conhost`) **không chép được** bằng cách kéo chuột. Nếu mở `fcode` ngoài Windows Terminal, `fcode` in một dòng nhắc trước khi vào phiên.
+- **Cập nhật cả hai đầu, box trước.** Trên laptop chạy lại đúng một dòng lệnh ở mục [Cài lệnh fcode trên máy Windows khác](#cài-lệnh-fcode-trên-máy-windows-khác); trên box làm như mục 3, phần "Cập nhật" (`git pull` rồi `bash install.sh`). Laptop mới mà box chưa cập nhật: bấm Alt+V hiện dòng `Box chưa cập nhật: cd ~/fcode-src && git pull && bash install.sh`; làm đúng như dòng đó trên box rồi vào lại phiên bằng `fcode`. Laptop chưa cập nhật thì không dán được ảnh, và cách báo phụ thuộc vào box: chưa có lần nào một `fcode` bản mới (của máy khác) vào phiên trên box thì phím Alt+V chưa được gắn, bấm không hiện gì (phím đó có thể đến thẳng trợ lý, ví dụ Claude Code tự dán ảnh từ clipboard của box); sau khi bất kỳ `fcode` bản mới nào đã vào phiên, phím Alt+V được gắn cho cả box, nên bấm từ laptop cũ hiện `Chưa nối clipboard laptop…`. Cả hai trường hợp cách sửa như nhau: cập nhật `fcode` trên laptop đó rồi vào lại phiên.
+- **Mở phiên bằng `fcode` sau khi cập nhật.** Cửa sổ `fcode` đã mở từ trước chưa có tính năng này: thoát (**Ctrl+B** rồi **D**) và vào lại.
+- Clipboard laptop chỉ đi sang box **khi bạn bấm Alt+V**, và chỉ là ảnh. Chữ bạn chép trên laptop không bao giờ bị gửi lên box khi bạn không dán. Đường nối này chỉ sống khi cửa sổ `fcode` còn mở, đóng cửa sổ là hết.
+
+**Thông báo và cách xử lý** (hiện ở đáy màn hình vài giây, chỉ trong cửa sổ của bạn, không làm hỏng phiên):
+
+| Thông báo | Ý nghĩa và cách xử lý |
+|---|---|
+| `Đã dán ảnh vào phiên (đường dẫn đã gõ, chưa gửi)` | Thành công. Gõ lời nhắn rồi Enter. |
+| `Clipboard laptop không có ảnh` | Clipboard đang chứa chữ hoặc trống. Chụp màn hình (**Win+Shift+S**) hoặc chép ảnh lại rồi bấm Alt+V. |
+| `Chưa nối clipboard laptop: mở phiên bằng fcode trên laptop (bản mới)` | Phiên này không được mở bằng `fcode` bản mới (vào bằng `ssh` tay, hoặc `fcode` ở laptop chưa cập nhật). Cập nhật rồi vào lại bằng `fcode`. |
+| `Không nối được clipboard laptop (phiên mở bằng fcode đã thoát?)` | Cửa sổ `fcode` đã đóng, máy ngủ hoặc mất mạng nên đường nối sang laptop đã đứt. Vào lại phiên bằng `fcode` rồi bấm Alt+V. |
+| `Không lấy được ảnh từ laptop (mã N)` | Laptop không đưa ảnh ra được. Mã 413 là ảnh lớn hơn 10 MB: chụp vùng nhỏ hơn. Mã khác: vào lại phiên bằng `fcode` rồi thử lại. |
+| `Clipboard laptop đang bận, thử lại` | Một chương trình khác trên laptop đang giữ clipboard. Đợi một chút rồi bấm Alt+V lại. |
+| `Ảnh lớn quá (tối đa 10 MB)` | Ảnh vượt giới hạn của box; chụp vùng nhỏ hơn. |
+| `Ảnh từ laptop không phải PNG hoặc JPEG` / `Ảnh lấy từ laptop không đọc được` | Chép lại ảnh rồi thử lần nữa; vẫn lỗi thì vào lại phiên bằng `fcode`. |
+| `Thư mục tạm của FCode trên box không an toàn (<thư mục>): xoá nó rồi thử lại` | Thư mục tạm của FCode trên box (`clip` hoặc `clip-in`, tên đầy đủ nằm trong dòng báo) đã bị đổi thành một liên kết, hoặc không phải của bạn, hoặc quyền không phải 700, nên FCode không dùng nó (để không đọc hay xoá nhầm chỗ khác). Chép ảnh lại không sửa được. Trên box gõ `rm -rf '<thư mục>'` với đúng đường dẫn trong dòng báo (thư mục chỉ chứa ảnh và ghi nhớ tạm, FCode tự tạo lại; nếu là liên kết thì chỉ liên kết bị bỏ), rồi vào lại phiên bằng `fcode` và bấm Alt+V. |
+| `Phiên này không còn nữa, chưa dán được ảnh` | Phiên đã đóng; mở phiên khác. |
+| `Phiên chưa gắn dự án nào, chưa dán được ảnh` | Chỉ dán ảnh được vào phiên của một dự án; mở phiên từ một dự án (nút **+** hoặc `fcode new`). |
+| `Không lưu được ảnh trên box` | Box không ghi được ảnh (ổ đĩa đầy hoặc thư mục dự án bị khoá quyền); kiểm tra trên box. |
+| `Đã lưu ảnh nhưng chưa gắn được vào phiên: <đường dẫn>` | Ảnh đã nằm trên box nhưng đường dẫn chưa gõ vào được ô nhập (thường vì đường dẫn dự án có dấu cách). Nhờ trợ lý đọc đúng đường dẫn trong thông báo. |
+| `Server FCode chưa chạy trên box` | Dịch vụ `fcoding` đang tắt: `systemctl --user status fcoding` trên box (xem mục 3). |
+| `Server FCode trên box là bản cũ: chạy lại bash install.sh` | Box chưa cập nhật: `git pull` rồi `bash install.sh` trên box. |
+| `Server FCode không trả lời kịp, thử lại` | Box đang bận; đợi vài giây rồi bấm Alt+V lại. |
+| `Không nói chuyện được với server FCode` | Box có server nhưng không nói chuyện được với nhau; chạy lại `bash install.sh` trên box (xem mục 3), rồi thử lại. |
+| `Box chưa cập nhật: cd ~/fcode-src && git pull && bash install.sh` | Box chưa có bản mới của FCode. Làm đúng như dòng hiện ra trên box, rồi vào lại phiên bằng `fcode`. |
+| `Không dán được ảnh, thử lại` | Lỗi khác; thử lại, vẫn lỗi thì vào lại phiên bằng `fcode`. |
+
+**Bấm Alt+V mà không thấy gì?**
+
+- Bạn đang ở ngoài Windows Terminal, hoặc một phần mềm khác (ví dụ chương trình gõ tiếng Việt) đang giữ tổ hợp Alt+V. Thử trong Windows Terminal, hoặc tắt tổ hợp đó.
+- Phiên đang ở chế độ cuộn (bạn vừa lăn chuột lên xem lại): bấm **q** để về chỗ đang chạy rồi bấm Alt+V.
+- Laptop chưa cập nhật lệnh `fcode`, hoặc chưa vào lại phiên bằng `fcode` sau khi cập nhật: Alt+V không dán được ảnh. Nếu box chưa có phiên nào được mở bằng `fcode` bản mới thì phím chưa được gắn nên không hiện gì; nếu đã có thì hiện `Chưa nối clipboard laptop…`. Cập nhật rồi vào lại (xem "Điều kiện").
+- Nếu chỉ box chưa cập nhật thì Alt+V không im lặng mà hiện dòng `Box chưa cập nhật: ...` ở đáy màn hình (xem bảng trên).
+- Máy công ty có phần mềm bảo mật (EDR, Windows Defender) chặn tiến trình `powershell.exe` chạy ẩn mà `fcode` bật để đọc clipboard: `fcode` vẫn vào phiên bình thường nhưng không có Alt+V (bấm thì hiện `Chưa nối clipboard laptop…`); kéo chuột chép chữ vẫn dùng được. Nhờ bộ phận IT cho phép, hoặc dùng laptop khác.
+- Sshd trên box không nhận biến `LC_*` (dòng `AcceptEnv` trong `/etc/ssh/sshd_config` không có `LC_*`; Ubuntu mặc định có): `fcode` không gửi được khóa phiên lên box nên Alt+V hiện `Chưa nối clipboard laptop…` dù laptop và box đều đã cập nhật. Nhờ người quản trị box thêm `AcceptEnv LANG LC_*` rồi nạp lại sshd.
+
+**Alt+V dán chậm hơn bình thường?**
+- Ảnh chép cùng lúc với chữ (chép ô trong Excel, Word, qua Remote Desktop, hoặc "Copy image" trong trình duyệt) không được `fcode` mã hóa sẵn như ảnh chụp màn hình (**Win+Shift+S**), nên bấm Alt+V lần đó chậm hơn một chút; dán vẫn đúng. Ảnh chụp màn hình thì mã hóa sẵn nên dán nhanh.
+- Máy chặn `csc.exe` (AppLocker hoặc phần mềm bảo mật): `fcode` không theo dõi được clipboard để mã hóa trước, nên mọi lần Alt+V đều chậm hơn nhưng vẫn dán được ảnh, không cần làm gì thêm.
+
+**Kéo chuột không chép được chữ?** Thường do console cũ (xem "Điều kiện"). Thử mở `fcode` trong Windows Terminal. Cách cũ vẫn dùng được: giữ **Shift** khi kéo để Windows Terminal tự bôi đen, rồi bấm **Ctrl+C** để chép (cách này chép thẳng bằng Windows Terminal, không qua box).
+
+**Một điều nhỏ cần biết:** trong omp, Claude Code hay Codex, kéo chuột để chép có thể làm chương trình thấy một cú bấm chuột mà không thấy thả ra (nó đang bôi đen theo cách riêng); bấm chuột một lần nữa là hết.
 
 ### Đồng bộ phiên chat omp giữa laptop và box (`fcode phien`)
 
@@ -523,7 +615,7 @@ Ghi chú ở thư mục gốc project: cùng lượt đồng bộ này chép hai
 - `[<dự án>] ghi chú <file>: dự án khác cùng kho trên <box|laptop> còn dùng dòng giấu /<file>, fcode chưa gỡ`: đây là thông báo, không phải lỗi (mã lỗi giữ nguyên): file đó đã vào git ở một dự án nhưng một dự án khác cùng kho vẫn còn bản chưa theo dõi được giấu nhờ dòng đó, nên fcode giữ dòng và hỏi lại ở mỗi lần chạy. Cách xử lý: xem điểm về hai dự án dùng chung `.git/info/exclude` ở trên (giữ bản cũ). Thông báo này chỉ hiện khi chắc chắn có dự án khác còn dùng dòng; nếu git lỗi hoặc không trả lời thì fcode báo lỗi (xem hai dòng lỗi ở trên). Chạy tay thì dòng hiện trên màn hình; lần nhanh và lần tự động chỉ ghi vào phien.log.
 - `[<thư mục>] không đọc được .git/info/exclude (<lý do>), bỏ qua ghi chú của dự án này lần này`: `<thư mục>` là đường dẫn thư mục dự án trên laptop, `<lý do>` là lời báo lỗi của PowerShell. Laptop không đọc được file đó (ví dụ phần mềm diệt virus đang giữ file). Ghi chú của dự án đó được bỏ qua trong lần này, phiên và các dự án khác vẫn đồng bộ, lần sau thử lại. Chạy tay thì dòng hiện trên màn hình; lần nhanh và lần tự động chỉ ghi vào phien.log. Box gặp chuyện tương tự thì cũng bỏ qua ghi chú của dự án đó lần này và không in dòng nào.
 
-Tự động và box nghỉ: box gói miễn phí tự nghỉ sau 30 phút không dùng, và mỗi lần mở kết nối tới box đều tính là có người dùng. Vì vậy tự động chạy kiểu thưa: mỗi 10 phút nó chỉ hỏi `instabox ls` xem box có đang chạy không (không bao giờ đánh thức box). Box không chạy thì thôi. `instabox ls` lỗi hoặc trả về thứ không đọc được thì lần đó bỏ qua, không kết nối box và không đổi trạng thái đã lưu. Box vừa chuyển từ nghỉ sang chạy thì đồng bộ ngay một lần. Còn lại, chỉ đồng bộ khi lần mở kết nối gần nhất (của lần tự động hoặc lần chạy tay; lần đồng bộ nhanh khi mở agent không tính) đã cách từ **40 phút** trở lên, tức là lâu hơn 30 phút box tự nghỉ, nên box không ai dùng vẫn luôn được nghỉ. Lần bị lỗi cũng chỉ chờ đến mốc 40 phút sau, không thử lại dồn dập. Cả hai chiều đều chia theo file thành từng đợt tối đa 50 MB (mỗi đợt một kết nối, gửi xong đợt này mới làm đợt sau), nên đường truyền chậm hoặc bị ngắt giữa chừng thì các đợt đã xong vẫn nằm ở máy nhận và lần sau chỉ làm tiếp phần còn lại, kể cả một phiên rất lớn. Thứ tự: các đợt thường (tối đa 50 MB) làm trước theo cả hai chiều, rồi từng file lớn hơn 50 MB đi riêng một đợt, file nhỏ trước. Một đợt lỗi thì được ghi chú và lần chạy vẫn tiếp tục; chỉ hết giờ hoặc mất kết nối box mới dừng cả lần chạy. File lớn chưa chép xong thì báo `phiên lớn: <file> chưa chép xong — chạy fcode phien khi mạng tốt`, không bao giờ báo thành công; chạy tay (15 phút mỗi kết nối) sẽ làm nốt. Lần chạy tự động có tổng thời gian tối đa 7 phút: hết giờ thì dừng kết nối đang treo và không bắt đầu đợt mới (chạy tay: tối đa 15 phút mỗi kết nối). Thay đổi ở laptop hoặc ở box nhờ vậy sang bên kia chậm nhất sau khoảng 40 phút; muốn ngay thì gõ `fcode phien`. File lớn hơn 50 MB không đi theo lần đồng bộ nhanh khi mở agent (lần đó chỉ ghi vào phien.log `phiên lớn: <file> — lần nhanh không chép, để lần tự động hoặc fcode phien`); lần tự động hoặc `fcode phien` chép file đó. Chạy tay và chạy tự động dùng chung một khóa nên không giẫm lên nhau (chạy tay chờ lượt tự động xong). Chạy thử `--thu` không chép gì nhưng vẫn ghi lại giờ kết nối box, vì kết nối đó cũng tính là dùng box. Lý do và kết quả ghi ở `%USERPROFILE%\.fcode\phien.log` (mỗi dòng ghi ngay kèm giờ; file quá 200 KB thì được đổi tên thành `phien.log.1`, là phần nhật ký cũ hơn, rồi `phien.log` mới bắt đầu).
+Tự động: để không đồng bộ liên tục, tự động chạy kiểu thưa: mỗi 10 phút nó chỉ hỏi box một câu rất nhẹ (`ssh -o BatchMode=yes -o ConnectTimeout=8 oracle true`) xem vào được không. Không vào được (mất mạng, box tắt, tên ssh sai) thì lần đó bỏ qua, không đồng bộ, không đổi trạng thái đã lưu và ghi một dòng vào phien.log. Vào được mà chưa có trạng thái nào (lần đầu) thì đồng bộ ngay một lần. Còn lại, chỉ đồng bộ khi lần mở kết nối gần nhất (của lần tự động hoặc lần chạy tay; lần đồng bộ nhanh khi mở agent không tính) đã cách từ **40 phút** trở lên. Lần bị lỗi cũng chỉ chờ đến mốc 40 phút sau, không thử lại dồn dập. Cả hai chiều đều chia theo file thành từng đợt tối đa 50 MB (mỗi đợt một kết nối, gửi xong đợt này mới làm đợt sau), nên đường truyền chậm hoặc bị ngắt giữa chừng thì các đợt đã xong vẫn nằm ở máy nhận và lần sau chỉ làm tiếp phần còn lại, kể cả một phiên rất lớn. Thứ tự: các đợt thường (tối đa 50 MB) làm trước theo cả hai chiều, rồi từng file lớn hơn 50 MB đi riêng một đợt, file nhỏ trước. Một đợt lỗi thì được ghi chú và lần chạy vẫn tiếp tục; chỉ hết giờ hoặc mất kết nối box mới dừng cả lần chạy. File lớn chưa chép xong thì báo `phiên lớn: <file> chưa chép xong — chạy fcode phien khi mạng tốt`, không bao giờ báo thành công; chạy tay (15 phút mỗi kết nối) sẽ làm nốt. Lần chạy tự động có tổng thời gian tối đa 7 phút: hết giờ thì dừng kết nối đang treo và không bắt đầu đợt mới (chạy tay: tối đa 15 phút mỗi kết nối). Thay đổi ở laptop hoặc ở box nhờ vậy sang bên kia chậm nhất sau khoảng 40 phút; muốn ngay thì gõ `fcode phien`. File lớn hơn 50 MB không đi theo lần đồng bộ nhanh khi mở agent (lần đó chỉ ghi vào phien.log `phiên lớn: <file> — lần nhanh không chép, để lần tự động hoặc fcode phien`); lần tự động hoặc `fcode phien` chép file đó. Chạy tay và chạy tự động dùng chung một khóa nên không giẫm lên nhau (chạy tay chờ lượt tự động xong). Chạy thử `--thu` không chép gì nhưng vẫn ghi lại giờ kết nối box. Lý do và kết quả ghi ở `%USERPROFILE%\.fcode\phien.log` (mỗi dòng ghi ngay kèm giờ; file quá 200 KB thì được đổi tên thành `phien.log.1`, là phần nhật ký cũ hơn, rồi `phien.log` mới bắt đầu).
 
 Dọn rác: mỗi lần chạy thật, fcode xóa các file tạm do chính nó để lại. Nó chỉ xóa file có tên **đúng hoàn toàn** theo các mẫu dưới đây, và chỉ ở chỗ nó đã tạo ra file đó. Tên chỉ giống một phần (ví dụ `fcode-phien-backup`, `x.jsonl.fcode-part-backup`, `exclude.part-backup`) thì không bao giờ bị đụng vào.
 
@@ -552,8 +644,8 @@ Sau khi bật, mỗi lần bạn gõ `omp`, `claude` hoặc `codex` trong thư m
 Cần biết:
 
 - **Màn hình êm**: đồng bộ xong bình thường thì không hiện gì (chi tiết ghi ở `%USERPROFILE%\.fcode\phien.log`). Nếu có chuyện, màn hình hiện tối đa **một dòng** ở cuối, và agent luôn được mở.
-- **Không đánh thức box.** Box đang ngủ thì hiện `phien: box đang ngủ, bỏ qua` và agent mở ngay. Lần tự động mỗi 10 phút ở trên vẫn là phương án dự phòng.
-- **Không đọc được trạng thái box thì là lỗi, không phải "ngủ".** Nếu `instabox ls` lỗi (ví dụ bạn chưa chạy `instabox login`), màn hình hiện `phien: không đồng bộ được, xem phien.log` và trong phien.log ghi `lỗi: không đọc được trạng thái box (instabox ls lỗi — đã chạy "instabox login" chưa?)`; agent vẫn mở.
+- **Box luôn bật.** Trước khi đồng bộ, FCode chỉ hỏi box một câu rất nhẹ (`ssh -o BatchMode=yes -o ConnectTimeout=8 oracle true`). Lần tự động mỗi 10 phút ở trên vẫn là phương án dự phòng.
+- **Không vào được box thì là lỗi.** Nếu `ssh oracle` không vào được (mất mạng, box tắt, tên ssh sai), màn hình hiện `phien: không đồng bộ được, xem phien.log` và trong phien.log ghi `lỗi: không vào được box (ssh oracle lỗi — kiểm tra mạng và alias ssh)`; agent vẫn mở.
 - **Dừng ở khoảng 20 giây** mỗi lần (có thể dư vài giây khi một bước đang hoàn tất); FCode chỉ dừng giữa hai việc, không bao giờ bỏ dở một file, và các lệnh con (ssh, tar, kiểm tra box) cũng bị dừng đúng hạn. Hết giờ thì hiện `phien: hết 20 giây, phần còn lại chạy lần sau`; phần còn lại làm tiếp ở lần mở agent sau, hoặc ở lần tự động kế tiếp theo lịch thường (lần đồng bộ nhanh không đẩy lùi lịch đó). File lớn hơn 50 MB không bao giờ đi theo lần nhanh, mà để lần tự động hoặc `fcode phien` chép (lần nhanh chỉ ghi `phiên lớn: <file> — lần nhanh không chép, để lần tự động hoặc fcode phien` vào phien.log).
 - **Ngắt hẳn ở 30 giây.** Nếu một lần đồng bộ nhanh vẫn chưa xong sau 30 giây (ví dụ một lệnh bị treo), FCode ngắt hẳn nó cùng mọi lệnh con của nó, màn hình hiện `phien: không đồng bộ được, xem phien.log` và phien.log ghi `lỗi: lần chạy nhanh vượt quá 30 giây nên bị ngắt hẳn …`; việc đang làm dở để lần sau, agent vẫn mở. Nếu Windows không cho FCode tạo lớp bảo vệ này, lần nhanh không đồng bộ gì, màn hình hiện cùng dòng `phien: không đồng bộ được, xem phien.log` và phien.log ghi lý do (`lỗi: không tạo được job bảo vệ cho lần chạy nhanh (…) — không đồng bộ`). Lần chạy tay `fcode phien` thì không bị ngắt như vậy.
 - Đang có một lần đồng bộ khác chạy thì hiện `phien: đang có lần đồng bộ khác, bỏ qua` và mở agent luôn.
@@ -583,33 +675,49 @@ Lệnh cài sẽ lần lượt làm các việc sau, mỗi việc một dòng tr
 2. Cho phép PowerShell chạy lệnh `fcode` (chế độ RemoteSigned, chỉ áp dụng cho tài khoản của bạn). Nếu máy công ty khóa việc này bằng chính sách của quản trị viên, lệnh cài báo `✗` ở dòng "Lệnh fcode" và bạn cần nhờ quản trị viên cho phép chế độ RemoteSigned (khi đó `fcode.cmd` cũng không chạy được). Nếu không bật được vì lý do khác, gõ `fcode.cmd` thay cho `fcode`.
 3. Tạo file cấu hình `%USERPROFILE%\.fcode\config.json` nếu chưa có (có rồi thì giữ nguyên).
 4. Kiểm tra **GitHub CLI** (`gh`). Máy chưa có thì tự cài. Nếu Windows hỏi quyền, bấm **Yes**; bấm No cũng được, lệnh cài sẽ tự thử cách khác không cần quyền admin.
-5. Kiểm tra **instabox**. Máy chưa có thì tải thẳng bản Windows từ trang chính thức của instabox và kiểm tra mã SHA256 của file. Không cần cài Node.js.
-6. Hướng dẫn bạn đăng nhập, **chỉ với phần chưa đăng nhập**. Bạn không phải gõ mật khẩu vào cửa sổ này.
+5. Hướng dẫn bạn đăng nhập GitHub, **chỉ khi chưa đăng nhập**. Bạn không phải gõ mật khẩu vào cửa sổ này.
+6. Thử vào box bằng `ssh -o BatchMode=yes -o ConnectTimeout=8 oracle true`. Vào được thì dòng "Kết nối tới box" là `✓`. Chưa vào được thì dòng đó là `✗` kèm việc còn thiếu (xem [Kết nối box (ssh)](#kết-nối-box-ssh)).
 
-Bạn đăng nhập tối đa hai lần, theo thứ tự:
+Lệnh cài không tạo khóa và không đọc khóa của bạn: khóa ssh và tên `oracle` trong `%USERPROFILE%\.ssh\config` bạn tự có sẵn (xem [Kết nối box (ssh)](#kết-nối-box-ssh)); lệnh cài chỉ thử vào box rồi báo kết quả.
 
-- **Bước 1/2, instabox**: trình duyệt mở ra, bạn đăng nhập rồi quay lại cửa sổ PowerShell. Nếu trình duyệt không mở, gõ `instabox login --device` và làm theo mã hiện ra.
-- **Bước 2/2, GitHub**: GitHub hiện một mã 8 ký tự (dạng `ABCD-1234`). Chép mã đó, bấm Enter, dán mã vào trang GitHub vừa mở rồi bấm **Authorize**.
+Đăng nhập GitHub: GitHub hiện một mã 8 ký tự (dạng `ABCD-1234`). Chép mã đó, bấm Enter, dán mã vào trang GitHub vừa mở rồi bấm **Authorize**.
 
 Cuối cùng có bảng kết quả, mỗi dòng là `✓` (xong) hoặc `✗` kèm việc cần làm. Gặp `✗` thì làm theo dòng đó rồi chạy lại đúng lệnh trên; chạy lại bao nhiêu lần cũng an toàn và chỉ làm phần còn thiếu. Xong thì **mở cửa sổ PowerShell mới** (Start, gõ `PowerShell`, Enter) rồi gõ `fcode help` để xem danh sách lệnh.
 
 Nếu bạn đã tải kho mã này về máy, chạy `powershell -ExecutionPolicy Bypass -File .\laptop\install.ps1` trong thư mục kho mã cũng được.
 
+### Kết nối box (ssh)
+
+`fcode` vào box bằng `ssh` thường, không qua dịch vụ nào khác. Máy Windows cần ba thứ:
+
+1. **OpenSSH Client** của Windows (Windows 10/11 thường có sẵn; thiếu thì bật ở Settings > System > Optional features).
+2. **Khóa riêng** của bạn (file không có đuôi `.pub`) cất trong `%USERPROFILE%\.ssh`, khóa công khai tương ứng đã nằm trên box. Lệnh cài không tạo, không chép và không đọc khóa.
+3. **Một khối `Host`** trong file `%USERPROFILE%\.ssh\config` (chưa có file thì tạo mới):
+
+```
+Host oracle
+  HostName fcode-quoc.duckdns.org
+  User quoc
+  IdentityFile ~/.ssh/<tên-file-khóa-riêng-của-bạn>
+```
+
+Rồi gõ `ssh oracle` **một lần** trong PowerShell: ssh hỏi có tin khóa của máy chủ không, gõ `yes`, vào được thì gõ `exit`. Từ đó `fcode` chạy không hỏi gì nữa (nó dùng `BatchMode`, nên thiếu bước này `fcode` sẽ báo không vào được box).
+
+Muốn dùng tên khác `oracle`, đặt tên đó vào khóa `host` của `%USERPROFILE%\.fcode\config.json` (hoặc biến `FCODE_HOST` cho một lần chạy). Tên chỉ gồm chữ, số và dấu `.` `_` `-`, và phải bắt đầu bằng chữ hoặc số; tên sai thì `fcode` dừng ngay và không chạy ssh. Kiểm tra: `ssh -o BatchMode=yes -o ConnectTimeout=8 oracle true` chạy xong, không hiện gì và không báo lỗi là được. Lệnh cài chạy đúng lệnh này ở bước 6 rồi báo kết quả.
+
 **Sửa file cấu hình.** Mở `%USERPROFILE%\.fcode\config.json` bằng Notepad:
 
 ```json
 {
-  "instabox": "",
-  "box": "coder",
+  "host": "oracle",
   "syncRepos": ["C:/Users/ten-ban/code/du-an-1", "C:/Users/ten-ban/code/du-an-2"],
   "ipaRepo": "brooklyn96/fcoding",
   "ipaTag": "latest"
 }
 ```
 
-- `box`: tên box mà `fcode` sẽ vào (mặc định `coder`).
+- `host`: tên ssh (trong `~/.ssh/config`) của box mà `fcode` sẽ vào (mặc định `oracle`).
 - `syncRepos`: các thư mục trên máy mà `fcode sync` cập nhật. Viết dấu gạch chéo `/` giữa các thư mục (hoặc gấp đôi dấu `\`), mỗi thư mục trong dấu ngoặc kép, cách nhau bằng dấu phẩy. Để trống `[]` nếu chưa dùng.
-- `instabox`: đường dẫn đầy đủ tới `instabox.exe`. Để trống `""` là máy tự tìm.
 - `ipaRepo`, `ipaTag`: nơi `fcode ipa` lấy file cài app iPhone. Thường không cần đổi.
 
 File này chỉ do bạn sửa; lệnh cài không bao giờ ghi đè nó. Danh sách đầy đủ các lệnh: gõ `fcode help`.
@@ -644,7 +752,8 @@ node -e 'console.log(require("crypto").randomBytes(32).toString("base64"))'
 ## 10. Phát triển
 
 - Máy chủ dùng **Node 22**, chỉ thư viện có sẵn (không `npm install`). Toàn bộ nằm trong `server.mjs`.
-- Hợp đồng giữa máy chủ và app nằm trong [`CONTRACT.md`](../CONTRACT.md) (các mục A1 trở đi là các thay đổi theo thời gian; ví dụ A4 thay mật khẩu bằng ghép máy, A5 thêm hộp thư tổng quan, A6 thêm màu cho màn hình, A7 ghép thêm máy bằng mã QR, A9 phiên omp của dự án và máy staging, A10 đồng bộ phiên omp giữa laptop và box, A11 thêm dự án từ app).
+- Hợp đồng giữa máy chủ và app nằm trong [`CONTRACT.md`](../CONTRACT.md) (các mục A1 trở đi là các thay đổi theo thời gian; ví dụ A4 thay mật khẩu bằng ghép máy, A5 thêm hộp thư tổng quan, A6 thêm màu cho màn hình, A7 ghép thêm máy bằng mã QR, A9 phiên omp của dự án, A10 đồng bộ phiên omp giữa laptop và box, A11 thêm dự án từ app, A16 bỏ vòng giờ box; sau đó thẻ trên cùng hiện lời chào và giờ Việt Nam).
+- Chép chữ và dán ảnh từ laptop là mục A17 của [`CONTRACT.md`](../CONTRACT.md): cầu clipboard giữa `fcode` trên laptop (`laptop/fcode.ps1`) và box (lệnh `server.mjs --clip`, lệnh quản trị `image`); file nối nằm ở `<thư mục cấu hình>/clip/` và `clip-in/`.
 - Chạy thử trên máy bất kỳ, kể cả Windows (dùng tmux giả, không cần tmux):
 
   ```sh

@@ -884,6 +884,28 @@ const terminated = (pid) => {
     return st.slice(st.lastIndexOf(')') + 2, st.lastIndexOf(')') + 3) === 'Z';
   } catch { return true; }
 };
+// every live process of one escalation run, found by the SC_MARK path (unique per world) in its environment: the CLI, the watchdog (own setsid group) and the job with its python
+const runPids = (e) => {
+  const needle = `SC_MARK=${path.join(e.root, 'mark-hang')}`;
+  const out = [];
+  for (const d of fs.readdirSync('/proc')) {
+    if (!/^\d+$/.test(d) || Number(d) === process.pid) continue;
+    try { if (fs.readFileSync(`/proc/${d}/environ`, 'utf8').split('\0').includes(needle)) out.push(Number(d)); } catch {}
+  }
+  return out;
+};
+const pgidOf = (pid) => { try { const st = fs.readFileSync(`/proc/${pid}/stat`, 'utf8'); return Number(st.slice(st.lastIndexOf(')') + 2).split(' ')[2]); } catch { return 0; } };
+// KILL the whole process group of each of them (and each pid), never this test runner's own group; repeated, so a group that is forking has no gap
+const killRunGroups = (e) => {
+  const mine = pgidOf(process.pid);
+  for (let i = 0; i < 3; i++) {
+    for (const pid of runPids(e)) {
+      const g = pgidOf(pid);
+      if (g > 1 && g !== mine) { try { process.kill(-g, 'SIGKILL'); } catch {} }
+      try { process.kill(pid, 'SIGKILL'); } catch {}
+    }
+  }
+};
 
 test('reservation: a failed clone leaves nothing (key route, and token route after its fallback)', { skip }, () => {
   for (const push of ['false', 'true']) {
@@ -965,25 +987,34 @@ test('reservation: a TERM that lands between mkdir and "owned" is held, then hon
   } finally { done(e); }
 });
 
-test('escalation (script): under timeout --kill-after a TERM ignored during the registration step ends in KILL for the whole group; the project stays registered', { skip }, async () => {
+test('escalation (script): through the box CLI fcode-add (server watchdog under setsid) a TERM ignored during the registration step ends in KILL for the whole group; the project stays registered', { skip }, async () => {
   const e = world('true');
   try {
     bare(e, 'o/r');
-    const env = { ...scriptEnv(e), ...faulty(e, 'hang'), SC_HANG: '10' };
-    const p = spawn('timeout', ['--kill-after=2', '60', 'bash', SCRIPT, 'o/r', 'r'], { env, stdio: 'ignore', detached: true });
+    const cli = path.join(here, '..', 'box', 'fcode-add-run.sh');
+    // FCODE_ADD_TIMEOUT_S is large on purpose: the TERM below is the test's own, not the deadline's (a slow start must not trip the deadline first)
+    const env = { ...scriptEnv(e), ...faulty(e, 'hang'), SC_HANG: '10', FCODE_APP: path.join(here, '..'), FCODE_ADD_SCRIPT: SCRIPT, FCODE_ADD_TIMEOUT_S: '60', FCODE_ADD_KILL_AFTER_S: '2' };
+    // detached: the CLI itself leads its process group, like a script run by hand or by ssh's shell; its watchdog (setsid) still gets its own group
+    const p = spawn('sh', [cli, 'o/r', 'r'], { env, stdio: 'ignore', detached: true });
     const exited = new Promise((resolve) => p.on('close', (code, sig) => resolve([code, sig])));
     await until(() => fs.existsSync(env.SC_MARK) && fs.readFileSync(env.SC_MARK, 'utf8').length > 0);
     const pyPid = Number(fs.readFileSync(env.SC_MARK, 'utf8'));
     const t0 = Date.now();
-    process.kill(-p.pid, 'SIGTERM'); // bash and python both ignore it (registration step); timeout arms its KILL
+    process.kill(p.pid, 'SIGTERM'); // to the CLI alone: it forwards it to the watchdog, which TERMs the job's group (bash and python ignore it here) and arms its KILL
     const [code, sig] = await exited;
     const took = Date.now() - t0;
-    assert.ok(code === 137 || sig === 'SIGKILL', `ended by KILL (code ${code}, signal ${sig})`);
+    assert.equal(code, 137, `the CLI reports the group KILL as 137, not 0 (code ${code}, signal ${sig})`);
     assert.ok(took < 4500, `within kill-after + slack (${took} ms)`);
     await until(() => terminated(pyPid), 3000);
     assert.equal(projects(e).r, path.join(e.ws, 'r'));
     assert.ok(fs.existsSync(path.join(e.ws, 'r', '.git')));
-  } finally { done(e); }
+  } finally {
+    // whatever happened, no process of this run may outlive the test and re-create the temp dirs after done(): KILL every process group that holds this world's marker
+    // (the CLI's group, and the watchdog's own setsid group with the job in it, found through the SC_MARK in their environment, even if the marker file never appeared)
+    killRunGroups(e);
+    await until(() => !runPids(e).some((q) => !terminated(q)), 3000).catch(() => {});
+    done(e);
+  }
 });
 
 // ======================= round 5: the reservation mkdir cannot be killed by a group signal =======================

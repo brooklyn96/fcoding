@@ -6,7 +6,6 @@ import Foundation
 /// an empty or stale state, never a decoding failure of the whole screen.
 struct HomeData: Decodable {
     var generatedAt: Date?
-    var box: HomeBox?
     var accounts: [QuotaAccount] = []
     var totals: HomeTotals?
     var projects: [HomeProject] = []
@@ -15,11 +14,10 @@ struct HomeData: Decodable {
 
     init() {}
 
-    private enum K: String, CodingKey { case generatedAt, box, accounts, totals, projects, omp }
+    private enum K: String, CodingKey { case generatedAt, accounts, totals, projects, omp }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: K.self)
         generatedAt = c.date(.generatedAt)
-        box = c.value(.box)
         let all: [QuotaAccount] = c.list(.accounts)
         accounts = all.filter { !$0.harness.isEmpty }
         totals = c.value(.totals)
@@ -35,33 +33,6 @@ struct HomeOmp: Decodable {
     private enum K: String, CodingKey { case formatOk }
     init(from decoder: Decoder) throws {
         formatOk = try decoder.container(keyedBy: K.self).value(.formatOk)
-    }
-}
-
-struct HomeBox: Decodable {
-    var state: String?
-    var sleepsAt: Date?
-    var maxRunMinutes: Double?
-    var idlePauseMinutes: Double?
-    var cooldownMinutes: Double?
-
-    init(state: String? = "running", sleepsAt: Date?, maxRunMinutes: Double? = 480,
-         idlePauseMinutes: Double? = 30, cooldownMinutes: Double? = 10) {
-        self.state = state
-        self.sleepsAt = sleepsAt
-        self.maxRunMinutes = maxRunMinutes
-        self.idlePauseMinutes = idlePauseMinutes
-        self.cooldownMinutes = cooldownMinutes
-    }
-
-    private enum K: String, CodingKey { case state, sleepsAt, maxRunMinutes, idlePauseMinutes, cooldownMinutes }
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: K.self)
-        state = c.value(.state)
-        sleepsAt = c.date(.sleepsAt)
-        maxRunMinutes = c.value(.maxRunMinutes)
-        idlePauseMinutes = c.value(.idlePauseMinutes)
-        cooldownMinutes = c.value(.cooldownMinutes)
     }
 }
 
@@ -279,10 +250,8 @@ struct HomeProject: Decodable {
     var git: HomeGit?
     /// Placeholder before the server's first gh read (not a failure).
     var loading = false
-    /// The project's instabox staging box; nil = no such box (or an older server): no chip.
-    var staging: HomeStaging?
 
-    private enum K: String, CodingKey { case name, branch, prs, lastRun, git, loading, staging }
+    private enum K: String, CodingKey { case name, branch, prs, lastRun, git, loading }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: K.self)
         name = c.value(.name) ?? ""
@@ -292,20 +261,6 @@ struct HomeProject: Decodable {
         lastRun = c.value(.lastRun)
         git = c.value(.git)
         loading = c.value(.loading) ?? false
-        staging = c.value(.staging)
-    }
-}
-
-/// `projects[].staging`: state running | suspended | stopped | starting | unknown.
-struct HomeStaging: Decodable {
-    var state: String
-    var updatedAt: Date?
-
-    private enum K: String, CodingKey { case state, updatedAt }
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: K.self)
-        state = ((c.value(.state) as String?) ?? "unknown").lowercased()
-        updatedAt = c.date(.updatedAt)
     }
 }
 
@@ -499,23 +454,6 @@ enum HomeLogic {
         return "\(day) lúc \(pad2(c.hour ?? 0)):\(pad2(c.minute ?? 0))"
     }
 
-    /// "HH:MM" for the ring (hours may pass 99 only in theory; then they are just longer).
-    static func hhmm(_ seconds: Int) -> String {
-        let s = max(0, seconds)
-        return "\(pad2(s / 3600)):\(pad2(s % 3600 / 60))"
-    }
-
-    static func hms(_ seconds: Int) -> String {
-        let s = max(0, seconds)
-        return "\(pad2(s / 3600)):\(pad2(s % 3600 / 60)):\(pad2(s % 60))"
-    }
-
-    /// Wall clock "9:41".
-    static func clock(_ date: Date, calendar: Calendar = .current) -> String {
-        let c = calendar.dateComponents([.hour, .minute], from: date)
-        return "\(c.hour ?? 0):\(pad2(c.minute ?? 0))"
-    }
-
     /// "vừa xong" / "N phút trước" / "N giờ trước" / "N ngày trước".
     static func ago(_ seconds: TimeInterval) -> String {
         let m = Int(max(0, seconds) / 60)
@@ -616,36 +554,6 @@ enum HomeLogic {
         guard let at = e.firstIndex(of: "@") else { return e }
         let user = e[..<at]
         return (user.count > 7 ? String(user.prefix(6)) + "…" : String(user)) + String(e[at...])
-    }
-
-    // MARK: Box ring
-
-    enum RingMode: Hashable { case run, warn, paused, unknown }
-
-    struct Ring: Equatable {
-        var mode: RingMode
-        /// Seconds to the next change (sleep, or wake while paused).
-        var seconds: Int
-        /// Arc length, 0...1.
-        var fraction: Double
-        var changeAt: Date?
-    }
-
-    /// Derived from `sleepsAt` alone (the server only sends state "running"). Before it: counts
-    /// down to sleep (warn under 10 min). After it (the box is asleep and cannot answer): counts
-    /// down to the estimated wake, sleepsAt + cooldown. `now` is the server clock.
-    static func ring(_ box: HomeBox?, now: Date) -> Ring {
-        guard let box = box, let sleeps = box.sleepsAt else { return Ring(mode: .unknown, seconds: 0, fraction: 0) }
-        let maxRun = max(60, (box.maxRunMinutes ?? 480) * 60), cooldown = max(60, (box.cooldownMinutes ?? 10) * 60)
-        let left = sleeps.timeIntervalSince(now)
-        if left > 0 {
-            let s = Int(left.rounded(.up))
-            return Ring(mode: s < 600 ? .warn : .run, seconds: s, fraction: max(0, min(1, left / maxRun)), changeAt: sleeps)
-        }
-        let wake = sleeps.addingTimeInterval(cooldown)
-        let rest = wake.timeIntervalSince(now)
-        guard rest > 0 else { return Ring(mode: .unknown, seconds: 0, fraction: 0) }
-        return Ring(mode: .paused, seconds: Int(rest.rounded(.up)), fraction: max(0, min(1, rest / cooldown)), changeAt: wake)
     }
 
     // MARK: Projects
@@ -852,51 +760,98 @@ enum HomeLogic {
         s.range(of: "^[a-z0-9][a-z0-9-]{0,31}$", options: .regularExpression) != nil
     }
 
-    // MARK: Staging box
+    /// GET /api/home (and the prefs) period while the project list is on screen.
+    static let homePoll: TimeInterval = 60
 
-    struct StagingChip: Equatable {
-        var text: String
-        /// StatusDot state: "running" green, "waiting" orange (starting), "idle" grey.
-        var dot: String
-        /// "Bật" is offered.
-        var canStart: Bool
+    // MARK: Greeting (top card)
+
+    /// Every time on the greeting card is Vietnam time, whatever the phone's zone (owner rule).
+    static let vietnam: Calendar = {
+        var c = Calendar(identifier: .gregorian)
+        c.timeZone = TimeZone(identifier: "Asia/Ho_Chi_Minh") ?? TimeZone(secondsFromGMT: 7 * 3600)!
+        return c
+    }()
+
+    /// The last server-minute boundary at or before `phone`, on the phone clock (`offset` =
+    /// server minus phone): the greeting card's timeline starts here and ticks every 60 s.
+    static func minuteStart(phone: Date, offset: TimeInterval) -> Date {
+        Date(timeIntervalSince1970: ((phone.timeIntervalSince1970 + offset) / 60).rounded(.down) * 60 - offset)
     }
 
-    /// A tapped "Bật" shows "đang bật…" until the server reports running, for at most this long
-    /// (then the server's state, and the button, come back).
-    static let stagingStartWindow: TimeInterval = 180
+    /// The server instant the card reads, rounded to the whole second. A tick lands on the
+    /// boundary only within Double error (often 1e-7 s before it), and that must not show the
+    /// previous minute.
+    static func shownInstant(_ server: Date) -> Date {
+        Date(timeIntervalSince1970: server.timeIntervalSince1970.rounded())
+    }
 
-    /// nil = no staging box: the chip is hidden. `startedAt` = when "Bật" was tapped on this phone.
-    static func stagingChip(_ s: HomeStaging?, startedAt: Date?, now: Date) -> StagingChip? {
-        guard let s = s else { return nil }
-        var state = s.state
-        if state != "running", let t = startedAt, now.timeIntervalSince(t) < stagingStartWindow { state = "starting" }
-        switch state {
-        case "running": return StagingChip(text: "Staging: đang chạy", dot: "running", canStart: false)
-        case "starting": return StagingChip(text: "Staging: đang bật…", dot: "waiting", canStart: false)
-        case "suspended": return StagingChip(text: "Staging: đang nghỉ", dot: "idle", canStart: true)
-        case "stopped": return StagingChip(text: "Staging: đã tắt", dot: "idle", canStart: true)
-        default: return StagingChip(text: "Staging: chưa rõ", dot: "idle", canStart: false)
+    /// By the hour in Vietnam: sáng 04–10, trưa 11–12, chiều 13–17, tối 18–03.
+    static func greeting(_ date: Date) -> String {
+        switch vietnam.component(.hour, from: date) {
+        case 4...10: return "Chào buổi sáng"
+        case 11...12: return "Chào buổi trưa"
+        case 13...17: return "Chào buổi chiều"
+        default: return "Chào buổi tối"
         }
     }
 
-    /// Seconds after a successful POST staging/start at which GET /api/home is fetched again
-    /// (each a request started after the reply). "running" (already up): at once, then twice more
-    /// in case the server's 30 s cache still says otherwise; "starting": while the box boots.
-    /// The "đang bật…" override is kept until one of these shows running.
-    static func stagingReloads(replyState: String?) -> [Double] {
-        replyState == "running" ? [0, 20, 45] : [20, 45, 90, 150]
+    /// "22:05", 24 h.
+    static func clockTime(_ date: Date) -> String {
+        let c = vietnam.dateComponents([.hour, .minute], from: date)
+        return "\(pad2(c.hour ?? 0)):\(pad2(c.minute ?? 0))"
     }
 
-    /// Known failures of POST staging/start (an error status, or a 200 with ok:false); nil = an
-    /// ordinary error, worded by the caller.
-    static func stagingFailure(status: Int, code: String?) -> String? {
-        if code == "no_instabox_key" { return "Box chưa có API key instabox" }
-        if code == "no_staging_box" { return "Dự án này chưa có máy staging" }
-        if code == "staging_unavailable" { return "Chưa đọc được trạng thái máy staging, thử lại sau" }
-        if code == "unknown_project" { return "Dự án này không có trên box." }
-        if [404, 405, 501].contains(status) { return "Máy chủ chưa hỗ trợ, cập nhật máy chủ trước." }
-        return nil
+    private static let weekdays = ["Chủ Nhật", "Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy"]
+
+    /// "Chủ Nhật" … "Thứ Bảy".
+    static func weekdayName(_ date: Date) -> String {
+        weekdays[(vietnam.component(.weekday, from: date) + 6) % 7]
+    }
+
+    /// "Thứ Ba, 3/11": day/month with no leading zero.
+    static func dayLine(_ date: Date) -> String {
+        let c = vietnam.dateComponents([.day, .month], from: date)
+        return "\(weekdayName(date)), \(c.day ?? 0)/\(c.month ?? 0)"
+    }
+
+    /// VoiceOver: "Chào buổi tối, 22 giờ 05, Thứ Ba ngày 3 tháng 11".
+    static func greetingSpoken(_ date: Date) -> String {
+        let c = vietnam.dateComponents([.hour, .minute, .day, .month], from: date)
+        return "\(greeting(date)), \(c.hour ?? 0) giờ \(pad2(c.minute ?? 0)), \(weekdayName(date)) ngày \(c.day ?? 0) tháng \(c.month ?? 0)"
+    }
+
+    // MARK: Server address (Cài đặt)
+
+    /// The new address as typed: the canonical https origin, or nil. A bare host gets https://;
+    /// spaces, a trailing slash and any path go; http:// and invalid hosts are refused
+    /// (PairLink.origin, the pairing screen's rule).
+    static func serverAddress(_ input: String) -> String? { PairLink.origin(input)?.absoluteString }
+
+    static let serverAddressInvalid = "Địa chỉ phải là tên miền hoặc IP dùng https, ví dụ fcode.example.com."
+
+    /// GET / of an FCode server, no login needed (server.mjs route "/"): exactly "fcoding ok".
+    /// Checked before this phone's token is sent to the new address.
+    static func isFcodeRoot(_ body: Data) -> Bool { String(data: body, encoding: .utf8) == "fcoding ok" }
+
+    /// GET api/me with a valid login: the JSON `{"ok":true}`.
+    static func isMeOk(_ body: Data) -> Bool {
+        ((try? JSONSerialization.jsonObject(with: body)) as? [String: Any])?["ok"] as? Bool == true
+    }
+
+    /// Why the new address was not taken; `status` 0 = no HTTP reply, `notFcode` = it answered
+    /// but not as an FCode server. The old address stays in every case.
+    static func serverMoveFailure(status: Int, label: String, notFcode: Bool = false) -> String {
+        if notFcode {
+            return "\(label) không phải máy chủ FCode, nên vẫn giữ địa chỉ cũ. Kiểm tra lại địa chỉ."
+        }
+        switch status {
+        case 401, 403:
+            return "iPhone này chưa ghép với máy chủ \(label), nên vẫn giữ địa chỉ cũ. Muốn dùng máy chủ đó: bấm Gỡ iPhone này, rồi ghép lại bằng mã từ máy chủ đó."
+        case 0:
+            return "Không kết nối được máy chủ \(label), nên vẫn giữ địa chỉ cũ. Kiểm tra lại địa chỉ và mạng."
+        default:
+            return "Máy chủ \(label) trả lời lỗi (mã \(status)), nên vẫn giữ địa chỉ cũ."
+        }
     }
 
     // MARK: Recent omp sessions
@@ -1324,28 +1279,92 @@ enum HomeLogic {
         eq("short mail cut 8", shortMail("data.int@example.vn"), "data.i…@example.vn")
         eq("short mail keep", shortMail("box@x.vn"), "box@x.vn")
 
-        // Ring
-        let r1 = ring(HomeBox(sleepsAt: now.addingTimeInterval(2 * hr + 14 * 60 + 5)), now: now)
-        eq("ring run", r1.mode, .run)
-        eq("ring hhmm", hhmm(r1.seconds), "02:14")
-        eq("ring warn", ring(HomeBox(sleepsAt: now.addingTimeInterval(7 * 60)), now: now).mode, .warn)
-        let r3 = ring(HomeBox(sleepsAt: now.addingTimeInterval(-50)), now: now)
-        eq("ring paused", r3.mode, .paused)
-        eq("ring paused secs", r3.seconds, 550)
-        let paused = HomeBox(state: "paused", sleepsAt: now.addingTimeInterval(-100))
-        eq("ring paused counts", ring(paused, now: now).seconds - ring(paused, now: now.addingTimeInterval(30)).seconds, 30)
-        eq("ring ignores state", ring(HomeBox(state: "paused", sleepsAt: now.addingTimeInterval(hr)), now: now).mode, .run)
-        // Phone 4 min fast: the server clock (phone + offset) still sees 2 h before sleep.
+        // Server clock
+        // Phone 4 min fast: phone + offset gives the server clock.
         let phone = now.addingTimeInterval(240)
         let off = clockOffset(generatedAt: now, received: phone)
         eq("clock offset", off, -240)
         // A slow reply (the server waited on a refresh) does not shift the offset.
         eq("clock slow reply", clockOffset(generatedAt: now.addingTimeInterval(30), received: now.addingTimeInterval(30)), 0)
-        eq("ring skew", ring(HomeBox(sleepsAt: now.addingTimeInterval(2 * hr)), now: phone.addingTimeInterval(off)).seconds, 7200)
         eq("clock no date", clockOffset(generatedAt: nil, received: now), 0)
-        eq("ring woke", ring(HomeBox(sleepsAt: now.addingTimeInterval(-700)), now: now).mode, .unknown)
-        eq("ring no data", ring(nil, now: now).mode, .unknown)
-        eq("hms", hms(9 * 60 + 12), "00:09:12")
+
+        // Greeting: Vietnam time from an absolute instant, whatever the phone's zone.
+        // 1_800_000_000 = 2027-01-15 08:00 UTC = Friday 15:00 in Vietnam.
+        eq("vn zone time", clockTime(now), "15:00")
+        eq("vn zone day", dayLine(now), "Thứ Sáu, 15/1")
+        eq("vn zone greeting", greeting(now), "Chào buổi chiều")
+        // 2026-11-03 is a Tuesday.
+        func vn(_ d: Int, _ h: Int, _ m: Int, month: Int = 11) -> Date {
+            vietnam.date(from: DateComponents(year: 2026, month: month, day: d, hour: h, minute: m)) ?? now
+        }
+        eq("greet 03:59", greeting(vn(3, 3, 59)), "Chào buổi tối")
+        eq("greet 04:00", greeting(vn(3, 4, 0)), "Chào buổi sáng")
+        eq("greet 10:59", greeting(vn(3, 10, 59)), "Chào buổi sáng")
+        eq("greet 11:00", greeting(vn(3, 11, 0)), "Chào buổi trưa")
+        eq("greet 12:59", greeting(vn(3, 12, 59)), "Chào buổi trưa")
+        eq("greet 13:00", greeting(vn(3, 13, 0)), "Chào buổi chiều")
+        eq("greet 17:59", greeting(vn(3, 17, 59)), "Chào buổi chiều")
+        eq("greet 18:00", greeting(vn(3, 18, 0)), "Chào buổi tối")
+        eq("greet 00:00", greeting(vn(3, 0, 0)), "Chào buổi tối")
+        eq("weekdays", (1...7).map { weekdayName(vn($0, 12, 0)) },
+           ["Chủ Nhật", "Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy"])
+        eq("time padded", clockTime(vn(3, 9, 5)), "09:05")
+        eq("time 24h", clockTime(vn(3, 22, 5)), "22:05")
+        eq("time midnight", clockTime(vn(3, 0, 0)), "00:00")
+        eq("day no zero", dayLine(vn(3, 22, 5)), "Thứ Ba, 3/11")
+        eq("day two digits", dayLine(vn(25, 9, 0, month: 12)), "Thứ Sáu, 25/12")
+        eq("day turns at midnight", dayLine(vn(3, 23, 59).addingTimeInterval(60)), "Thứ Tư, 4/11")
+        eq("greet spoken", greetingSpoken(vn(3, 22, 5)), "Chào buổi tối, 22 giờ 05, Thứ Ba ngày 3 tháng 11")
+        // Phone 4 min fast: phone + offset is the server clock, so the shown time is unchanged.
+        eq("time skew", clockTime(phone.addingTimeInterval(off)), "15:00")
+        // A tick a hair before the boundary reads the new minute; mid-minute is unchanged.
+        eq("shown hair before", clockTime(shownInstant(vn(3, 22, 5).addingTimeInterval(-1e-6))), "22:05")
+        eq("shown day hair before", dayLine(shownInstant(vn(4, 0, 0).addingTimeInterval(-1e-6))), "Thứ Tư, 4/11")
+        eq("shown mid minute", clockTime(shownInstant(vn(3, 22, 5).addingTimeInterval(30.4))), "22:05")
+        // Ticks with fractional offsets (phone = reference-date seconds): start + k * 60 + offset,
+        // as shown, reads the minute that just began (1 s later is safely inside it). Case 0 is
+        // the review's float example, which landed 1.19e-7 s before the boundary.
+        let ticks: [(Double, Double)] = [(815_660_938.622738, -8.95476588930691), (815_660_938, 0.1), (815_660_999.999, -0.3),
+                                         (815_661_000.0000001, 12.345678), (815_660_960.5, -240.000001), (815_660_940.25, 3599.9999)]
+        for (i, t) in ticks.enumerated() {
+            let start = minuteStart(phone: Date(timeIntervalSinceReferenceDate: t.0), offset: t.1)
+            for k in 0..<3 {
+                let server = start.addingTimeInterval(Double(k) * 60 + t.1)
+                eq("tick \(i).\(k)", clockTime(shownInstant(server)), clockTime(server.addingTimeInterval(1)))
+                eq("tick \(i).\(k) on boundary", Int(shownInstant(server).timeIntervalSince1970) % 60, 0)
+            }
+        }
+
+        // Server address (Cài đặt)
+        eq("addr bare host", serverAddress("fcode-quoc.duckdns.org"), "https://fcode-quoc.duckdns.org")
+        eq("addr spaces slash", serverAddress("  fcode-quoc.duckdns.org/ \n"), "https://fcode-quoc.duckdns.org")
+        eq("addr https slash", serverAddress("https://fcode-quoc.duckdns.org/"), "https://fcode-quoc.duckdns.org")
+        eq("addr upper", serverAddress("HTTPS://FCode.Example.com"), "https://fcode.example.com")
+        eq("addr port", serverAddress("fcode.example.com:8443"), "https://fcode.example.com:8443")
+        eq("addr 443 dropped", serverAddress("https://fcode.example.com:443"), "https://fcode.example.com")
+        eq("addr path cut", serverAddress("https://fcode.example.com/api/home"), "https://fcode.example.com")
+        eq("addr http refused", serverAddress("http://fcode.example.com"), nil)
+        eq("addr empty", serverAddress("   "), nil)
+        eq("addr one label", serverAddress("localhost"), nil)
+        eq("addr space inside", serverAddress("fcode example.com"), nil)
+        eq("move 401", serverMoveFailure(status: 401, label: "a.example.com"),
+           "iPhone này chưa ghép với máy chủ a.example.com, nên vẫn giữ địa chỉ cũ. Muốn dùng máy chủ đó: bấm Gỡ iPhone này, rồi ghép lại bằng mã từ máy chủ đó.")
+        eq("move 403 same as 401", serverMoveFailure(status: 403, label: "a"), serverMoveFailure(status: 401, label: "a"))
+        eq("move no reply", serverMoveFailure(status: 0, label: "a.example.com"),
+           "Không kết nối được máy chủ a.example.com, nên vẫn giữ địa chỉ cũ. Kiểm tra lại địa chỉ và mạng.")
+        eq("move 502", serverMoveFailure(status: 502, label: "a.example.com"),
+           "Máy chủ a.example.com trả lời lỗi (mã 502), nên vẫn giữ địa chỉ cũ.")
+        eq("move not fcode", serverMoveFailure(status: 200, label: "a.example.com", notFcode: true),
+           "a.example.com không phải máy chủ FCode, nên vẫn giữ địa chỉ cũ. Kiểm tra lại địa chỉ.")
+        eq("root ok", isFcodeRoot(Data("fcoding ok".utf8)), true)
+        eq("root other page", isFcodeRoot(Data("<html>parked</html>".utf8)), false)
+        eq("root newline", isFcodeRoot(Data("fcoding ok\n".utf8)), false)
+        eq("root empty", isFcodeRoot(Data()), false)
+        eq("me ok", isMeOk(Data("{\"ok\":true}".utf8)), true)
+        eq("me false", isMeOk(Data("{\"ok\":false}".utf8)), false)
+        eq("me string", isMeOk(Data("{\"ok\":\"true\"}".utf8)), false)
+        eq("me html", isMeOk(Data("<html></html>".utf8)), false)
+        eq("me array", isMeOk(Data("[true]".utf8)), false)
 
         // Projects
         eq("deploy ok", deployLine(HomeRun(status: "success", at: now.addingTimeInterval(-3 * hr)), now: now).text, "✓ deploy 3 giờ trước")
@@ -1385,8 +1404,7 @@ enum HomeLogic {
 
         // Lenient decoding
         let json = """
-        {"box":{"state":"running","sleepsAt":"2027-01-15T10:00:00.000Z","maxRunMinutes":480},
-         "accounts":[{"id":"x","harness":"Codex","email":"e@x","windows":[{"key":"5h","label":"5 giờ","usedPercent":18,"resetsAt":"2027-01-15T09:00:00Z","periodSeconds":18000},{"key":"7d","label":"7 ngày","usedPercent":null}],"resets":{"available":1,"target":"openai-codex/4"},"spend":{"today":{"usd":3.1,"tokens":8200000},"daily30":[{"date":"2027-01-02","usd":1,"tokens":2},{"date":"2027-01-01","usd":1,"tokens":1}]}},
+        {"accounts":[{"id":"x","harness":"Codex","email":"e@x","windows":[{"key":"5h","label":"5 giờ","usedPercent":18,"resetsAt":"2027-01-15T09:00:00Z","periodSeconds":18000},{"key":"7d","label":"7 ngày","usedPercent":null}],"resets":{"available":1,"target":"openai-codex/4"},"spend":{"today":{"usd":3.1,"tokens":8200000},"daily30":[{"date":"2027-01-02","usd":1,"tokens":2},{"date":"2027-01-01","usd":1,"tokens":1}]}},
                      {"harness":5}],
          "projects":[{"name":"deal-sync","prs":null,"lastRun":null},{"name":"c","repo":null,"branch":null,"prs":null,"lastRun":null,"loading":true},{"name":"b","prs":[{"number":6,"checks":"failure"}],"lastRun":{"workflow":"fcode/deploy","status":"failure","kind":"needs_human","at":"2027-01-15T08:00:00.000Z","url":null}}],
          "totals":"broken"}
@@ -1406,7 +1424,6 @@ enum HomeLogic {
             eq("pr line loading", prLine(h.projects.dropFirst().first), "đang đọc…")
             eq("decode gate kind", h.projects.last?.lastRun?.kind, "needs_human")
             eq("decode checks", checksLine(h.projects.last?.prs, branch: nil).text, "✗ checks PR lỗi")
-            eq("decode sleeps", h.box?.sleepsAt, now.addingTimeInterval(2 * hr))
         } else {
             failures.append("decode: lenient JSON failed")
         }
@@ -1511,42 +1528,6 @@ enum HomeLogic {
         eq("name upper", validSessionName("Deal"), false)
         eq("name dash first", validSessionName("-a"), false)
 
-        // Staging chip
-        let stg = projects("""
-        {"name":"a","staging":{"state":"suspended","updatedAt":"2027-01-15T07:59:00Z"}},{"name":"b","staging":null},\
-        {"name":"c"},{"name":"d","staging":{"state":"Running"}},{"name":"e","staging":{"state":"stopped"}},\
-        {"name":"f","staging":{"state":"weird"}},{"name":"g","staging":"broken"}
-        """)
-        eq("staging count", stg.count, 7)
-        eq("staging decoded", stg.first?.staging?.state, "suspended")
-        eq("staging updatedAt", stg.first?.staging?.updatedAt, now.addingTimeInterval(-60))
-        eq("staging null hides", stagingChip(stg[1].staging, startedAt: nil, now: now) == nil, true)
-        eq("staging missing hides", stagingChip(stg[2].staging, startedAt: nil, now: now) == nil, true)
-        eq("staging broken hides", stagingChip(stg[6].staging, startedAt: nil, now: now) == nil, true)
-        eq("staging suspended", stagingChip(stg[0].staging, startedAt: nil, now: now),
-           StagingChip(text: "Staging: đang nghỉ", dot: "idle", canStart: true))
-        eq("staging running", stagingChip(stg[3].staging, startedAt: nil, now: now),
-           StagingChip(text: "Staging: đang chạy", dot: "running", canStart: false))
-        eq("staging stopped", stagingChip(stg[4].staging, startedAt: nil, now: now),
-           StagingChip(text: "Staging: đã tắt", dot: "idle", canStart: true))
-        eq("staging unknown", stagingChip(stg[5].staging, startedAt: nil, now: now),
-           StagingChip(text: "Staging: chưa rõ", dot: "idle", canStart: false))
-        eq("staging tapped", stagingChip(stg[0].staging, startedAt: now.addingTimeInterval(-30), now: now),
-           StagingChip(text: "Staging: đang bật…", dot: "waiting", canStart: false))
-        eq("staging tapped then running", stagingChip(stg[3].staging, startedAt: now.addingTimeInterval(-30), now: now)?.text,
-           "Staging: đang chạy")
-        eq("staging tap expires", stagingChip(stg[0].staging, startedAt: now.addingTimeInterval(-200), now: now)?.canStart, true)
-        eq("staging no key", stagingFailure(status: 200, code: "no_instabox_key"), "Box chưa có API key instabox")
-        eq("staging no key 4xx", stagingFailure(status: 400, code: "no_instabox_key"), "Box chưa có API key instabox")
-        eq("staging old server", stagingFailure(status: 404, code: "not_found"), "Máy chủ chưa hỗ trợ, cập nhật máy chủ trước.")
-        eq("staging other", stagingFailure(status: 500, code: "error") == nil, true)
-        eq("staging reloads running", stagingReloads(replyState: "running"), [0, 20, 45])
-        eq("staging reloads starting", stagingReloads(replyState: "starting"), [20, 45, 90, 150])
-        eq("staging reloads no state", stagingReloads(replyState: nil), [20, 45, 90, 150])
-        // Reply "running" but a stale home (cached "suspended") lands: the override still holds.
-        eq("staging stale after running reply", stagingChip(stg[0].staging, startedAt: now.addingTimeInterval(-1), now: now)?.canStart, false)
-        eq("staging no box",stagingFailure(status: 404, code: "no_staging_box"), "Dự án này chưa có máy staging")
-
         // omp format banner
         func banner(_ json: String) -> String? {
             ompFormatBanner(try? JSONDecoder().decode(HomeData.self, from: Data(json.utf8)))
@@ -1593,8 +1574,6 @@ enum HomeLogic {
         eq("omp resume unknown format", ompResumeFailure(status: 409, code: "unknown_format"),
            "Phiên này dùng định dạng omp mới — nhắn Claude để cập nhật FCode")
         eq("omp resume 409 exists generic", ompResumeFailure(status: 409, code: "exists") == nil, true)
-        eq("staging unavailable", stagingFailure(status: 503, code: "staging_unavailable"),
-           "Chưa đọc được trạng thái máy staging, thử lại sau")
         eq("omp resume other",ompResumeFailure(status: 503, code: "busy") == nil, true)
         // Add project: validation (Invoke-Add rules)
         eq("repo clean .git", cleanRepo("  Me/My.Repo.GIT \n"), "Me/My.Repo")

@@ -1,0 +1,39 @@
+name: Server tests (fcoding)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "server.mjs"
+      - "box/**"
+      - "test/**"
+      - "install.sh"
+      - "package*.json"
+      - ".github/workflows/server-tests.yml"
+  pull_request:
+    paths:
+      - "server.mjs"
+      - "box/**"
+      - "test/**"
+      - "install.sh"
+      - "package*.json"
+      - ".github/workflows/server-tests.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: server-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # The server tests use a fake tmux (test/fake-tmux.mjs) and need no extra package; the real-tmux case skips itself when tmux is absent.
+      - run: node --test test/server.test.mjs

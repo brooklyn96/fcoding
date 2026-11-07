@@ -8,10 +8,13 @@ import { spawnSync, execFile, spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
-import { createApp, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, strictOrigin, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock,
-  boxOf, parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, releaseRunOf, parseUpdates, updateStatusOf, gateStatusOf, gateRunOf, resetReply, RESET_MSG, BOX, memo, codexChildMeta, parseGitSync, ompDirName, ompHead, parseStaging, KNOWN_VERSIONS, repoOfLink } from '../server.mjs';
+import { createApp, HARNESSES, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, strictOrigin, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock,
+  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, releaseRunOf, parseUpdates, updateStatusOf, gateStatusOf, gateRunOf, resetReply, RESET_MSG, memo, codexChildMeta, parseGitSync, ompDirName, ompHead, KNOWN_VERSIONS, repoOfLink } from '../server.mjs';
+import { ADD_WATCHDOG, addOutcome } from '../server.mjs';
 
 process.env.TZ = 'America/Los_Angeles'; // spend days follow config.json timeZone, never the process zone: a third zone proves it
+// no test may make the loader read the real secrets file: a path that does not exist, unless the caller already chose one
+process.env.FCODE_SECRETS_ENV ||= path.join(os.tmpdir(), `fcode-no-secrets-${process.pid}`, 'env');
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const FAKE = path.join(here, 'fake-tmux.mjs');
@@ -19,7 +22,12 @@ const SERVER = path.join(here, '..', 'server.mjs');
 const VN = 'Xin chào, tiếng Việt có dấu: ắ ẫ ợ ữ';
 const ABS = path.resolve(os.tmpdir());
 const HOME = os.homedir();
-const LAUNCH = `env LANG=C.UTF-8 LC_ALL=C.UTF-8 'PATH=${HOME}/.local/bin:${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin' `;
+const LOADER = path.join(here, '..', 'box', 'start.sh'); // a checkout has no start.sh next to server.mjs: box/start.sh is the loader
+const shq = (s) => `'${s.replace(/'/g, "'\\''")}'`;
+const ENV_PART = `env LANG=C.UTF-8 LC_ALL=C.UTF-8 'PATH=${HOME}/.local/bin:${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin' `; // the launch before the loader
+// the server makes the secrets path absolute once (path.resolve against its cwd)
+const launchOf = (loader, secrets = process.env.FCODE_SECRETS_ENV) => `${ENV_PART}${shq(`FCODE_SECRETS_ENV=${path.resolve(secrets)}`)} /bin/sh ${shq(loader)} `;
+const LAUNCH = launchOf(LOADER);
 
 async function boot(opts = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-test-'));
@@ -34,9 +42,9 @@ async function boot(opts = {}) {
   process.env.FAKE_TMUX_DIR = fakeDir;
   const logs = [];
   // home v2 sources default to nothing real: no scan of this machine's logs, no omp/gh on PATH
-  const app = createApp({ configDir, tmux: [process.execPath, FAKE], log: (l) => logs.push(l), pollMs: 40, pasteEnterDelayMs: 0,
+  const app = (opts.make ?? createApp)({ configDir, tmux: [process.execPath, FAKE], log: (l) => logs.push(l), pollMs: 40, pasteEnterDelayMs: 0,
     spendRoots: {}, updatesFile: path.join(root, 'no-status.json'), gitSync: null, gitSyncFile: path.join(root, 'no-git-sync.json'), omp: [process.execPath, '-e', 'process.exit(1)'], gh: [process.execPath, '-e', 'process.exit(1)'],
-    ompSessionsRoot: path.join(root, 'omp-sessions'), instabox: [process.execPath, '-e', 'process.exit(1)'], instaboxKey: null, warmTickMs: 0, ...opts }); // warmTickMs 0: no warm-up from boot, so the tests that count tool calls stay as they are
+    ompSessionsRoot: path.join(root, 'omp-sessions'), warmTickMs: 0, ...opts }); // warmTickMs 0: no warm-up from boot, so the tests that count tool calls stay as they are
   const port = await app.listen(0, '127.0.0.1');
   const ctx = { app, port, logs, root, configDir };
   ctx.req = (method, p, o = {}) => request(port, method, p, o);
@@ -48,9 +56,11 @@ async function boot(opts = {}) {
     return { cookie: r.headers['set-cookie'][0].split(';')[0], json: r.json, token: r.json.token };
   };
   ctx.deviceId = async (name) => (await adminRequest(configDir, { cmd: 'devices' })).devices.find((d) => d.name === name).id;
-  ctx.calls = () => {
+  ctx.allCalls = () => {
     try { return fs.readFileSync(path.join(fakeDir, 'log.jsonl'), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; }
   };
+  // without the per-create `set-environment -g -u` token cleanup (A3), which the tests that count tmux calls do not expect
+  ctx.calls = () => ctx.allCalls().filter((x) => x.argv[0] !== 'set-environment');
   ctx.close = async () => {
     await app.close();
     for (let i = 0; i < 150 && app.stats().running + app.stats().waiting > 0; i++) await new Promise((r) => setTimeout(r, 20));
@@ -292,13 +302,19 @@ test('send: multi-line and long text use load-buffer (stdin) + paste-buffer -p',
   assert.equal(c.calls().at(-1).argv[0], 'paste-buffer');
   // concurrent sends do not interleave use of the shared buffer
   await Promise.all([1, 2, 3].map((n) => c.req('POST', '/api/send/work', { cookie, body: { text: `a${n}\nb${n}`, enter: false } })));
-  assert.deepEqual(c.calls().slice(-6).map((x) => x.argv[0]), ['load-buffer', 'paste-buffer', 'load-buffer', 'paste-buffer', 'load-buffer', 'paste-buffer']);
+  assert.deepEqual(c.calls().slice(-9).map((x) => x.argv[0]), ['copy-mode', 'load-buffer', 'paste-buffer', 'copy-mode', 'load-buffer', 'paste-buffer', 'copy-mode', 'load-buffer', 'paste-buffer']);
 }));
 
 test('send to a missing session is 404 and the buffer is dropped', () => withApp(async (c) => {
   const { cookie } = await c.login();
   const r = await c.req('POST', '/api/send/ghost', { cookie, body: { text: 'a\nb' } });
   assert.equal(r.status, 404);
+  assert.ok(!c.calls().some((x) => x.argv[0] === 'load-buffer'), 'copy-mode -q failed first: nothing was loaded'); // the first call already finds no session
+  // a session that dies between the load and the paste: the loaded buffer is deleted
+  await mkSession(c, cookie);
+  await withEnv({ FAKE_TMUX_FAIL_ON: 'paste-buffer' }, async () => {
+    assert.equal((await c.req('POST', '/api/send/work', { cookie, body: { text: 'a\nb' } })).status, 404);
+  });
   assert.ok(c.calls().some((x) => x.argv[0] === 'delete-buffer'));
 }));
 
@@ -543,6 +559,28 @@ test('send-keys path: trailing ";" is escaped for tmux, nothing else is touched'
   assert.equal(Buffer.from(lb.stdin, 'base64').toString('utf8'), 'a\nb;');
 }));
 
+// a laptop that scrolled with the mouse wheel leaves the pane in copy mode, where send-keys goes to the copy-mode key table, not to the program
+test('send and key leave any pane mode (copy-mode -q) before they type, so the phone input reaches the program', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  await mkSession(c, cookie);
+  const quit = ['copy-mode', '-q', '-t', '=work:'];
+  const since = async (n, req) => { assert.equal((await req).status, 200); return c.calls().slice(n).map((x) => x.argv); };
+  let n = c.calls().length;
+  assert.deepEqual(await since(n, c.req('POST', '/api/send/work', { cookie, body: { text: 'hi', enter: true } })),
+    [quit, ['send-keys', '-t', '=work:', '-l', '--', 'hi'], ['send-keys', '-t', '=work:', 'Enter']]);
+  n = c.calls().length;
+  assert.deepEqual(await since(n, c.req('POST', '/api/send/work', { cookie, body: { text: '', enter: true } })), [quit, ['send-keys', '-t', '=work:', 'Enter']]);
+  n = c.calls().length;
+  assert.deepEqual((await since(n, c.req('POST', '/api/send/work', { cookie, body: { text: 'a\nb', enter: false } }))).map((a) => a[0]), ['copy-mode', 'load-buffer', 'paste-buffer']);
+  n = c.calls().length;
+  assert.deepEqual(await since(n, c.req('POST', '/api/key/work', { cookie, body: { key: 'Down', repeat: 2 } })), [quit, ['send-keys', '-t', '=work:', 'Down', 'Down']]);
+  // a session that is gone: the failure is the same as before (no typing happens)
+  n = c.calls().length;
+  const gone = await c.req('POST', '/api/key/nope', { cookie, body: { key: 'Up' } });
+  assert.equal(gone.status, 404);
+  assert.ok(!c.calls().slice(n).some((x) => x.argv[0] === 'send-keys'));
+}));
+
 test('SSE admission: at most 50 streams, reserved before any await, all capacity released', () => withApp(async (c) => {
   const { cookie } = await c.login();
   await mkSession(c, cookie);
@@ -628,7 +666,7 @@ test('mutation queue: at most 20 waiting (503 busy); reads capped at 7 children 
     assert.ok(busy.length >= 8 && ok >= 15, `ok=${ok} busy=${busy.length}`);
     assert.deepEqual(busy[0].json, { error: 'busy' });
     assert.equal(c.app.stats().waiting, 0);
-    assert.equal(c.calls().length - before, ok); // only admitted sends reached tmux
+    assert.equal(c.calls().length - before, ok * 2); // only admitted sends reached tmux: copy-mode -q, then send-keys
   });
   // concurrent tmux children never exceed 8
   await withEnv({ FAKE_TMUX_DELAY_MS: '120' }, async () => {
@@ -684,7 +722,8 @@ const rawPost = (port, p, body, cookie) => {
   });
   return { req, done, data };
 };
-const victimRan = (c) => c.calls().some((x) => x.argv.some((a) => String(a).includes('VICTIM')) || (x.argv[0] === 'send-keys' && x.argv.at(-1) === 'Enter'));
+// the victim's send starts with copy-mode -q (no text in its argv); the blockers of these tests never run one (resize-window)
+const victimRan = (c) => c.calls().some((x) => x.argv[0] === 'copy-mode' || x.argv.some((a) => String(a).includes('VICTIM')) || (x.argv[0] === 'send-keys' && x.argv.at(-1) === 'Enter'));
 const rotate = (c) => {
   const f = path.join(c.configDir, 'config.json');
   const cfg = JSON.parse(fs.readFileSync(f, 'utf8'));
@@ -700,7 +739,7 @@ for (const fill of [false, true]) {
         const owner = await c.login({}, 'owner');
         await mkSession(c, owner.cookie);
         await withEnv({ FAKE_TMUX_DELAY_MS: '500' }, async () => {
-          const blocker = c.req('POST', '/api/send/work', { cookie: owner.cookie, body: { text: 'BLOCKER', enter: false } });
+          const blocker = c.req('POST', '/api/resize/work', { cookie: owner.cookie, body: { cols: 80, rows: 24 } }); // one tmux call: a job with two (send) would get its second one refused after a rotate
           assert.ok(await until(() => c.app.stats().running === 1 && c.app.stats().active, 3000));
           let reads = [];
           if (fill) {
@@ -776,10 +815,14 @@ test('text + Enter job cancelled between stages: no Enter is sent', () => withAp
   assert.ok(await until(() => c.calls().some((x) => x.argv[0] === 'paste-buffer')));
   a.req.destroy();
   await sleep(700);
-  // typed text: cancelled while send-keys -l runs
-  await withEnv({ FAKE_TMUX_DELAY_MS: '300' }, async () => {
+  // typed text: cancelled while send-keys -l runs (copy-mode -q ran first, at once; send-keys is the slow one)
+  await withEnv({ FAKE_TMUX_DELAYS: JSON.stringify({ 'send-keys': 600 }) }, async () => {
+    const modes = () => c.calls().filter((x) => x.argv[0] === 'copy-mode').length;
+    const m0 = modes();
     const b = rawPost(c.port, '/api/send/work', { text: 'VICTIM2', enter: true }, cookie);
     b.req.end(b.data);
+    assert.ok(await until(() => modes() > m0, 3000), 'copy-mode -q never ran');
+    await sleep(150); // send-keys -l is now running
     assert.ok(await until(() => c.app.stats().running === 1 && c.app.stats().active, 3000));
     b.req.destroy();
     assert.ok(await until(() => !c.app.stats().active && c.app.stats().running === 0));
@@ -797,12 +840,20 @@ test('mixed traffic: mutations run in FIFO order, <= 20 wait, <= 8 children, rea
     let peakWait = 0, peakRun = 0;
     const iv = setInterval(() => { const s = c.app.stats(); peakWait = Math.max(peakWait, s.waiting); peakRun = Math.max(peakRun, s.running); }, 2);
     const muts = []; const reads = [];
+    // "arrival order" is the order the SERVER gets the requests: each client request opens its own socket, and under load two of them can
+    // connect out of order. So the next mutation is sent only once the server has seen the previous one.
+    let arrived = 0;
+    const onReq = (req) => { if (req.method === 'POST' && req.url === '/api/send/work') arrived++; };
+    c.app.server.on('request', onReq);
     for (let i = 0; i < 30; i++) {
       muts.push(c.req('POST', '/api/send/work', { cookie, body: { text: `q${i}`, enter: false } }));
+      for (const end = Date.now() + 10000; arrived < i + 1 && Date.now() < end;) await sleep(1);
+      assert.equal(arrived, i + 1, `request q${i} never reached the server`);
       reads.push(c.req('GET', i % 3 ? '/api/screen/work' : '/api/sessions', { cookie }));
       await sleep(8);
     }
     const mr = await Promise.all(muts); const rr = await Promise.all(reads);
+    c.app.server.off('request', onReq);
     clearInterval(iv);
     assert.ok(peakWait <= 20, `peakWait=${peakWait}`);
     assert.ok(peakRun <= 8, `peakRun=${peakRun}`);
@@ -852,9 +903,13 @@ test('SSE: a ping that hits backpressure during a capture, then drain -> the lat
 
 test('screen trim is linear: 2000 lines x 300 spaces < 50 ms and correct', () => {
   const blank = `${' '.repeat(300)}\n`.repeat(2000);
-  const t0 = performance.now();
-  const out = trimScreen(`top  \n${blank}`);
-  const dt = performance.now() - t0;
+  // best of 5: one cold or descheduled run (a loaded box, a JIT warm-up) says nothing about linear versus quadratic; the best run must still be < 50 ms, which a quadratic trim never reaches
+  let out, dt = Infinity;
+  for (let i = 0; i < 5; i++) {
+    const t0 = performance.now();
+    out = trimScreen(`top  \n${blank}`);
+    dt = Math.min(dt, performance.now() - t0);
+  }
   assert.equal(out, 'top  ');
   assert.ok(dt < 50, `${dt} ms`);
   assert.equal(trimScreen(blank), '');
@@ -882,21 +937,396 @@ test('empty projects: meta, overview and the + flow work with no projects; a fre
   assert.deepEqual((await c.req('GET', '/api/meta', { cookie })).json.projects, ['beta']);
 }));
 
-test('install.sh start.sh: the service takes GH_TOKEN alone from the instabox secrets file, nothing else', { skip: process.platform === 'win32' && 'POSIX sh' }, () => {
+// ---- GH_TOKEN for harness sessions (CONTRACT A3 "Harness launch"): one loader, read as data; tmux never sees the service's token ----
+const POSIX = process.platform === 'win32' && 'POSIX sh';
+const PROBE = `'${process.execPath}' -e 'console.log(JSON.stringify([process.env.GH_TOKEN ?? null, process.env.OTHER ?? null, process.env.GITHUB_TOKEN ?? null]))'`;
+// a fresh module instance of server.mjs in `dir` (with box/start.sh beside it, or alone): what SERVER_DIR finds is what the copy has
+async function serverCopy(dir, withLoader = true) {
+  fs.mkdirSync(path.join(dir, 'box'), { recursive: true });
+  fs.copyFileSync(SERVER, path.join(dir, 'server.mjs'));
+  if (withLoader) fs.copyFileSync(LOADER, path.join(dir, 'box', 'start.sh'));
+  return import(pathToFileURL(path.join(dir, 'server.mjs')).href);
+}
+
+test('install.sh start.sh: the loader reads GH_TOKEN alone, as data, under a strict whole-file grammar; a hostile file never runs, blocks or prints', { skip: POSIX }, (t) => {
   const install = fs.readFileSync(path.join(here, '..', 'install.sh'), 'utf8');
-  const m = /cat > "\$APP\/start\.sh" <<'START'\r?\n([\s\S]*?)\r?\nSTART\r?\n/.exec(install);
-  assert.ok(m, 'start.sh not found in install.sh');
-  assert.match(install, /ExecStart=\/bin\/sh \$APP\/start\.sh \$\(command -v node\) \$APP\/server\.mjs/);
+  assert.match(install, /\ninstall -m 755 "\$SRC\/box\/start\.sh" "\$APP\/start\.sh"\n/); // the one loader, shared with the harness sessions
+  assert.match(install, /ExecStart=\/bin\/sh \$APP\/start\.sh -v \$\(command -v node\) \$APP\/server\.mjs/); // the service passes -v: the journal says why there is no token
+  assert.ok(install.indexOf('install -m 755 "$SRC/box/start.sh"') < install.indexOf('install-autoupdate.sh'), 'the loader is installed before the auto-update step');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-start-'));
+  const f = path.join(dir, 'env'), pwn = path.join(dir, 'PWNED');
+  const onPath = (name) => (process.env.PATH || '').split(path.delimiter).map((d) => path.join(d, name)).find((p) => fs.existsSync(p));
+  // every awk present (mawk, gawk, the PATH one: unique by realpath), each as the `awk` first on PATH: a locale or dialect that breaks one is caught
+  const awks = [...new Set(['/usr/bin/mawk', '/usr/bin/gawk', onPath('awk')].filter((p) => p && fs.existsSync(p)).map((p) => fs.realpathSync(p)))];
+  assert.ok(awks.length > 0, 'an awk is needed');
+  t.diagnostic(`awks used: ${awks.join(', ')}`);
+  const bins = awks.map((a, i) => { const d = path.join(dir, `awk${i}`); fs.mkdirSync(d); fs.symlinkSync(a, path.join(d, 'awk')); return d; });
+  const L = (s) => Buffer.from(s, 'latin1'); // a body with raw bytes (\xff, \0)
+  // env A: the inherited tokens are stale; env B adds a UTF-8 locale (gawk then rejects an awk regex that is not byte-wise)
+  const envFor = (bin, file, extra = {}) => ({ PATH: `${bin}${path.delimiter}${process.env.PATH}`, FCODE_SECRETS_ENV: file, GH_TOKEN: 'stale_inherited_1', GITHUB_TOKEN: 'stale_inherited_2', ...extra });
+  const ENV_B = { LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8' };
+  const go = (env, { v = false, shell = '/bin/sh' } = {}) => spawnSync('/bin/sh', ['-c', `exec ${shell} ${shq(LOADER)} ${v ? '-v ' : ''}${PROBE}`], { encoding: 'utf8', cwd: dir, timeout: 5000, env });
+  const expect = (tok) => `${JSON.stringify([tok, null, null])}\n`; // [GH_TOKEN, OTHER, GITHUB_TOKEN]
+  // out(file): the probe's output, the same on every awk and in both envs; status 0, nothing on stderr
+  const out = (file = f) => {
+    const seen = new Set();
+    for (const bin of bins) for (const extra of [{}, ENV_B]) {
+      const r = go(envFor(bin, file, extra));
+      assert.equal(r.status, 0, r.stderr); assert.equal(r.stderr, '');
+      seen.add(r.stdout);
+    }
+    assert.equal(seen.size, 1, `awks or locales disagree: ${[...seen].join(' ')}`);
+    return [...seen][0];
+  };
+  // status(label, file, word, tok): `-v`: exactly one stderr line, never a value; stdout as without -v
+  const status = (label, file, word, tok = null) => {
+    for (const bin of bins) {
+      const r = go(envFor(bin, file), { v: true });
+      assert.equal(r.status, 0, `${label}: ${r.stderr}`);
+      assert.equal(r.stderr, `fcoding start.sh: secrets file ${file}: ${word}\n`, label);
+      assert.equal(r.stdout, expect(tok), label);
+    }
+  };
+  const withBody = (body, fn) => { fs.writeFileSync(f, body); return fn(); };
   try {
-    fs.writeFileSync(path.join(dir, 'start.sh'), `${m[1]}\n`);
-    fs.writeFileSync(path.join(dir, 'env'), 'export GH_TOKEN=tok-test\nexport OTHER_SECRET=zz\necho noise\n');
-    const probe = [process.execPath, '-e', 'console.log(JSON.stringify([process.env.GH_TOKEN ?? null, process.env.OTHER_SECRET ?? null]))'];
-    const env = { PATH: process.env.PATH, FCODE_SECRETS_ENV: path.join(dir, 'env') };
-    const out = (e) => spawnSync('/bin/sh', [path.join(dir, 'start.sh'), ...probe], { encoding: 'utf8', env: e }).stdout.trim();
-    assert.equal(out(env), '["tok-test",null]');
-    assert.equal(out({ ...env, FCODE_SECRETS_ENV: path.join(dir, 'missing') }), '[null,null]'); // no file: starts without it
-    assert.equal(out({ ...env, GH_TOKEN: 'mine' }), '["mine",null]'); // one already set wins
+    const tokLine = 'GH_TOKEN=tokS1\n'; // 15 bytes
+    const pad = (n) => `${'#'.repeat(n - 1)}\n`; // a comment line of n bytes
+    // any line outside the grammar means NO token for the whole file (fail closed), whatever else the file holds
+    const cases = [
+      ['plain', 'export GH_TOKEN=tok_test\nexport OTHER_SECRET=zz\n', 'tok_test'],
+      ['a mixed valid file: comments, blanks, quotes, empty values, spaces, CRLF; the last GH_TOKEN wins',
+        "# vault\r\n\r\n   \t\nexport A='x y'\nB=\"q r\"\nC=\nexport   D=plain_1   \n  # GH_TOKEN=commented\nexport GH_TOKEN=\"tokG7\"\r\n  export   GH_TOKEN='tokH8'  \r\nE=after\n", 'tokH8'],
+      ['set -x', 'set -x\nexport GH_TOKEN=tokA1\n', null],
+      ['trap on EXIT', `trap 'echo pwned; touch ${shq(pwn)}' EXIT\nGH_TOKEN=tokB2\n`, null],
+      ['exit 3', 'exit 3\nexport GH_TOKEN=tokC3\n', null],
+      ['syntax error', 'if then fi ((\nexport GH_TOKEN=tokD4\n', null],
+      ['read x', 'read x\nexport GH_TOKEN=tokE5\n', null],
+      ['echo', 'echo noise\nexport GH_TOKEN=tokE6\n', null],
+      ['a multiline value whose inner line looks like GH_TOKEN=', 'export X="line one\nGH_TOKEN=tokM1\n"\n', null],
+      ['a heredoc', 'cat <<EOF\nGH_TOKEN=tokM2\nEOF\n', null],
+      ['an unbalanced quote', "A='open\nGH_TOKEN=tokM3\n", null],
+      ['a trailing comment after a value', 'GH_TOKEN=tokM4 # mine\n', null],
+      ['export without a value', 'export GH_TOKEN\n', null],
+      ['a bad name', '1A=x\nGH_TOKEN=tokM5\n', null],
+      ['an expansion in double quotes', 'A="$HOME"\nGH_TOKEN=tokM6\n', null],
+      ['a backslash in double quotes', 'A="a\\"b"\nGH_TOKEN=tokM7\n', null],
+      ['command substitution', `export GH_TOKEN=$(touch ${shq(pwn)})\n`, null],
+      ['backticks', `export GH_TOKEN=\`touch ${shq(pwn)}\`\n`, null],
+      ['a NUL byte', 'A=x\0y\nGH_TOKEN=tokN1\n', null],
+      ['empty token', 'export GH_TOKEN=\n', null],
+      ['a space in the quoted value', 'export GH_TOKEN="a b"\n', null],
+      ['256 characters', `GH_TOKEN=${'a'.repeat(256)}\n`, null],
+      ['255 characters', `GH_TOKEN=${'a'.repeat(255)}\n`, 'a'.repeat(255)],
+      ['exactly 65536 bytes', pad(65536 - tokLine.length) + tokLine, 'tokS1'],
+      ['65537 bytes', pad(65537 - tokLine.length) + tokLine, null],
+      ['a value crossing the 64 KiB boundary (a cut read would give "tok")', pad(65536 - 'GH_TOKEN=tok'.length) + tokLine, null],
+      ['other variables never reach the command', 'export OTHER=x\nGH_TOKEN_X=nope\nOLD_GH_TOKEN=bad\n#GH_TOKEN=bad\nexport GH_TOKEN=tokJ0\n', 'tokJ0'],
+      ['no GH_TOKEN line: the inherited one is dropped', 'export OTHER=x\n', null],
+      // no token (the label is the file's bytes)
+      ...[
+        L('B="x\xff\nGH_TOKEN=inner_leak\n\xff"\n'),
+        'A=x;cat<<X=1\nGH_TOKEN=heredoc_leak\nX=1\n',
+        'A=x;id\nGH_TOKEN=t1\n',
+        'A=x|id\nGH_TOKEN=t1\n',
+        'A=x&\nGH_TOKEN=t1\n',
+        '\vGH_TOKEN=t1\n',
+        '\fGH_TOKEN=t1\n',
+        'GH_TOKEN=ab\rcd\n',
+        "A='x\ry'\nGH_TOKEN=t1\n",
+        L('GH_TOKEN=ab\0cd\n'),
+        L("A='x\0y'\nGH_TOKEN=t1\n"),
+        L('GH_TOKEN=t\xff\n'),
+        'GH_TOKEN="t1"x\n',
+        "A=''''\nGH_TOKEN=t1\n",
+        'GH_TOKEN=a\nGH_TOKEN=\n',
+        "GH_TOKEN=DUMMY\nOPTIND='GH_TOKEN=123'\n",
+        `GH_TOKEN=DUMMY\nOPTIND='a[$(touch ${pwn})0]'\n`,
+        "export HISTCMD='GH_TOKEN=5'\nGH_TOKEN=t\n",
+        'RANDOM=1\nGH_TOKEN=t\n',
+        "SRANDOM='x[$(id)]'\nGH_TOKEN=t\n",
+        'OPTIND=1\nGH_TOKEN=t\n',
+        'SECONDS=5\nGH_TOKEN=t\n',
+        "GH_TOKEN=DUMMY\nMAILCHECK='GH_TOKEN=123'\n",
+        `GH_TOKEN=DUMMY\nMAILCHECK='a[$(touch ${pwn})0]'\n`,
+        `export MAILCHECK='x[$(touch ${pwn})]'\nGH_TOKEN=tokMC\n`,
+        'MAILCHECK=1\nGH_TOKEN=t\n',
+        'GH_TOKEN=tok1\nOPTIND=2\n',
+        L('#x\0y\nGH_TOKEN=DUMMY\n'),
+        '#x\ry\nGH_TOKEN=DUMMY\n',
+        '#x\vy\nGH_TOKEN=DUMMY\n',
+        L('A=x\x7fy\nGH_TOKEN=t\n'),
+        L('#x\x7fy\nGH_TOKEN=t\n'),
+        'GH_TOKEN=tok\r\r\n',
+        L('\xef\xbb\xbfGH_TOKEN=tokBOM\n'), // a BOM
+        'GH_TOKEN=tokH\nH0', // the loader's own sentinel is not a file line
+        'H0\n',
+        'export export GH_TOKEN=x\n',
+        'GH_TOKEN+=x\n',
+        "A=$'x'\nGH_TOKEN=t\n",
+        'GH_TOKEN=~abc\n',
+        "GH_TOKEN='\n",
+        "GH_TOKEN=''\n",
+        "A='\nGH_TOKEN=t1\n", // a lone quote (drop `length(val) < 2`)
+        'A="x\\"\nGH_TOKEN=t1\n', // a backslash before the closing quote (the dq class)
+        `A="\`touch ${pwn}\`"\nGH_TOKEN=t1\n`, // a backtick in double quotes (the dq class)
+        'A=x(\nGH_TOKEN=t1\n', // a bare `(` (the bare class)
+        'A=x\\\nGH_TOKEN=t1\n', // a bare backslash: a shell joins the next line
+        `A=x>${pwn}\nGH_TOKEN=t1\n`, // a bare `>`: a shell would write the file
+        `A=x<${pwn}\nGH_TOKEN=t1\n`, // a bare `<` (a shell would read the file or fail)
+      ].map((b) => [`no token: ${JSON.stringify(Buffer.from(b).toString('latin1'))}`, b, null]),
+      // a token
+      ...[
+        ['GH_TOKEN=tokCR\r\n', 'tokCR'],
+        ['GH_TOKEN=tokA\nGH_TOKEN=tokB \r\n', 'tokB'],
+        ["A='Hồng'\nGH_TOKEN=tokU\n", 'tokU'],
+        [Buffer.concat([Buffer.from('# Hồng '), Buffer.from([0xff]), Buffer.from('\nGH_TOKEN=tokCU\n')]), 'tokCU'],
+        [L('A=x\xff\nGH_TOKEN=tokB\n'), 'tokB'],
+        ['A="a\'b"\nGH_TOKEN=tokQ\n', 'tokQ'],
+        ["A='a\\b $x `y` #z'\nGH_TOKEN=tokS\n", 'tokS'],
+        ['A=~/x:b=c,d@e%f+g^h\nGH_TOKEN=tokA\n', 'tokA'],
+        ['export\tGH_TOKEN=tokT\n', 'tokT'],
+        ['GH_TOKEN=tokN', 'tokN'], // no final newline
+        ['# a comment\r\nGH_TOKEN=tokCm\r\n', 'tokCm'],
+        ['GH_TOKEN=tokH\n#H0\n', 'tokH'],
+        ['LINENO=3\nBASH_SUBSHELL=1\nEPOCHSECONDS=1\nGH_TOKEN=tokL2\n', 'tokL2'],
+        ['TMOUT=0\nHISTSIZE=1000\nLINES=24\nGH_TOKEN=tokT2\n', 'tokT2'],
+        ["GH_TOKEN=DUMMY\nPROMPT_COMMAND='GH_TOKEN=123'\n", 'DUMMY'], // the boundary row: prompt-time names are the shell's business (CONTRACT A3)
+        ['gh_token=x\nGH_TOKEN=tokL\n', 'tokL'],
+        ['\r\nGH_TOKEN=tokCr2\n', 'tokCr2'],
+        ['GH_TOKEN=tokA1\nGH_TOKEN=tokB2\n', 'tokB2'],
+        [pad(65536 - 'GH_TOKEN=tokS2'.length) + 'GH_TOKEN=tokS2', 'tokS2'], // 65536 bytes, the last line has no newline
+      ].map(([b, t]) => [`token ${t}: ${JSON.stringify(Buffer.from(b).toString('latin1').slice(0, 60))}`, b, t]),
+    ];
+    for (const [label, body, tok] of cases) {
+      fs.writeFileSync(f, body);
+      assert.equal(out(), expect(tok), label);
+    }
+    assert.ok(!fs.existsSync(pwn), 'nothing in the file ran');
+    assert.equal(out(path.join(dir, 'missing')), expect(null)); // no file: starts without it
+    fs.rmSync(f); spawnSync('mkfifo', [f]);
+    assert.ok(fs.statSync(f).isFIFO());
+    assert.equal(out(), expect(null)); // a FIFO is refused, never opened (it would block)
+    fs.rmSync(f); fs.writeFileSync(f, 'GH_TOKEN=tokK1\n'); fs.chmodSync(f, 0);
+    if (process.getuid?.() !== 0) assert.equal(out(), expect(null)); // unreadable: the same
+    fs.chmodSync(f, 0o600);
+
+    // -v: one stderr line `fcoding start.sh: secrets file <path>: <status>`, never a value; the command runs as without -v
+    status('good file', f, 'ok', 'tokK1');
+    withBody('A="$HOME"\nGH_TOKEN=x\n', () => status('expansion', f, 'line-1'));
+    withBody('A=ok\nB="$x"\n', () => status('second line', f, 'line-2'));
+    withBody("GH_TOKEN=DUMMY\nOPTIND='GH_TOKEN=123'\n", () => status('OPTIND', f, 'line-2'));
+    withBody("GH_TOKEN=DUMMY\nMAILCHECK='GH_TOKEN=123'\n", () => status('MAILCHECK', f, 'line-2'));
+    withBody(L('#x\0y\nGH_TOKEN=x\n'), () => status('NUL in a comment', f, 'line-1'));
+    withBody(L('GH_TOKEN=ab\0cd\n'), () => status('NUL in a value (an awk that splits records at NUL would say line-2)', f, 'line-1'));
+    withBody(pad(65537 - tokLine.length) + tokLine, () => status('65537 bytes', f, 'too-big'));
+    withBody('export GH_TOKEN=\n', () => status('empty token', f, 'bad-GH_TOKEN'));
+    withBody('export OTHER=x\n', () => status('no GH_TOKEN line', f, 'no-GH_TOKEN'));
+    withBody('', () => status('empty file', f, 'no-GH_TOKEN'));
+    fs.rmSync(f);
+    status('missing', f, 'missing');
+    fs.symlinkSync(path.join(dir, 'nowhere'), f);
+    status('dangling symlink', f, 'missing');
+    fs.rmSync(f); spawnSync('mkfifo', [f]);
+    status('FIFO', f, 'not-a-file');
+    fs.rmSync(f); fs.mkdirSync(f);
+    status('directory', f, 'not-a-file');
+    fs.rmdirSync(f); fs.writeFileSync(f, 'GH_TOKEN=tokK1\n'); fs.chmodSync(f, 0);
+    if (process.getuid?.() !== 0) status('mode 0', f, 'unreadable');
+    fs.chmodSync(f, 0o600);
+
+    // fault injection: head or awk missing, failing or killed is no token (never a partial read), the command still runs
+    fs.writeFileSync(f, 'GH_TOKEN=tokF1\n');
+    const faults = path.join(dir, 'faults');
+    fs.mkdirSync(faults);
+    const wrap = (name, tail) => { fs.writeFileSync(path.join(faults, name), `#!/bin/sh\n${onPath(name)} "$@"\n${tail}\n`, { mode: 0o755 }); };
+    const faultEnv = (bin) => envFor(bin, f);
+    for (const [label, name, tail] of [['head exits 1', 'head', 'exit 1'], ['head is killed', 'head', 'kill -9 $$'], ['awk exits 9', 'awk', 'exit 9'], ['awk is killed', 'awk', 'kill -9 $$']]) {
+      wrap(name, tail);
+      const env = faultEnv(faults);
+      const a = go(env), b = go(env, { v: true });
+      assert.deepEqual([a.status, a.stdout, a.stderr], [0, expect(null), ''], label);
+      assert.deepEqual([b.status, b.stdout, b.stderr], [0, expect(null), `fcoding start.sh: secrets file ${f}: error\n`], label);
+      fs.rmSync(path.join(faults, name));
+    }
+    for (const [label, only, name] of [['head is missing', awks[0], 'awk'], ['awk is missing', fs.realpathSync(onPath('head')), 'head']]) {
+      const bare = path.join(dir, `only-${name}`);
+      fs.mkdirSync(bare); fs.symlinkSync(only, path.join(bare, name));
+      const env = { ...envFor(bare, f), PATH: bare };
+      const a = go(env), b = go(env, { v: true });
+      assert.deepEqual([a.status, a.stdout, a.stderr], [0, expect(null), ''], label);
+      assert.deepEqual([b.status, b.stdout, b.stderr], [0, expect(null), `fcoding start.sh: secrets file ${f}: error\n`], label);
+    }
+
+    // xtrace: an inherited SHELLOPTS=xtrace must never trace the token (set +x is the first command)
+    if (fs.existsSync('/bin/bash')) {
+      fs.writeFileSync(f, 'export GH_TOKEN=tokXT9\n');
+      const env = envFor(bins[0], f, { SHELLOPTS: 'xtrace' });
+      const a = go(env, { shell: '/bin/bash' }), b = go(env, { v: true, shell: '/bin/bash' });
+      assert.deepEqual([a.status, a.stdout], [0, expect('tokXT9')]);
+      assert.ok(!a.stderr.includes('tokXT9'), a.stderr);
+      assert.equal(b.status, 0); assert.equal(b.stdout, expect('tokXT9'));
+      assert.ok(!b.stderr.includes('tokXT9'), b.stderr);
+      assert.ok(b.stderr.endsWith(`fcoding start.sh: secrets file ${f}: ok\n`), b.stderr);
+    }
+
+    // name rule self-check: the names bash evaluates as arithmetic on assignment (probed in `-c` AND `-i -c`) must be a subset of the
+    // six the loader refuses; a seventh name in a newer bash fails here: add it to the regex in start.sh, a row, and the docs
+    if (fs.existsSync('/bin/bash')) {
+      const bash = (args, opts = {}) => spawnSync('/bin/bash', ['--norc', '--noprofile', ...args], { encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'ignore'], detached: true, ...opts }); // detached (setsid): `-i` opens /dev/tty, which would stop a run in a background job group
+      const SIX = ['OPTIND', 'HISTCMD', 'MAILCHECK', 'RANDOM', 'SRANDOM', 'SECONDS'];
+      const names = new Set([...bash(['-c', 'compgen -v']).stdout.split('\n'), ...bash(['-i', '-c', 'compgen -v']).stdout.split('\n'),
+        ...SIX, 'LINENO', 'BASHPID', 'EPOCHSECONDS', 'EPOCHREALTIME', 'BASH_SUBSHELL', 'DIRSTACK', 'GROUPS', 'FUNCNAME', 'BASH_ARGV0', 'BASH_COMMAND', 'TMOUT', 'HISTSIZE', 'PROMPT_COMMAND', 'PS1']);
+      const mdir = path.join(dir, 'marks'), probeDir = path.join(dir, 'probe');
+      fs.mkdirSync(mdir); fs.mkdirSync(probeDir);
+      const marked = (mode) => {
+        const hit = [];
+        for (const n of [...names].filter((x) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(x))) {
+          const r = spawnSync('/bin/bash', ['--norc', '--noprofile', ...mode, `: "\${${n}-}"; ${n}='x[$(touch ${mdir}/${n})0]'`], { cwd: probeDir, timeout: 5000, stdio: 'ignore', detached: true, env: { PATH: process.env.PATH, HOME: probeDir } });
+          assert.ok(r.status !== null && !r.error, `the probe of ${n} (bash ${mode.join(' ')}) did not finish: ${r.error?.message ?? `signal ${r.signal}`}`);
+          if (fs.existsSync(path.join(mdir, n))) { hit.push(n); fs.rmSync(path.join(mdir, n)); }
+        }
+        return hit.sort();
+      };
+      const six = [...SIX].sort();
+      const plain = marked(['-c']), interactive = marked(['-i', '-c']);
+      assert.ok(plain.every((n) => SIX.includes(n)), `bash -c evaluates ${plain} on assignment`);
+      assert.ok(interactive.every((n) => SIX.includes(n)), `bash -i -c evaluates ${interactive} on assignment`);
+      const ver = bash(['-c', 'echo "${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"']).stdout.trim().split('.').map(Number);
+      if (ver[0] > 5 || (ver[0] === 5 && ver[1] >= 2)) assert.deepEqual(interactive, six, 'bash >= 5.2, interactive: exactly the six names'); // MAILCHECK only here
+      assert.deepEqual(fs.readdirSync(probeDir), [], 'the probe left nothing behind');
+      for (const n of SIX) {
+        withBody(`${n}=1\nGH_TOKEN=x\n`, () => { assert.equal(out(), expect(null), n); status(n, f, 'line-1'); });
+      }
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('harness sessions: every harness and every creation path starts through the loader; tmux never gets the token', async () => {
+  const TOKEN = 'ghp_sessionTokenProbe123';
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-ghtok-'));
+  const secrets = path.join(dir, 'env');
+  fs.writeFileSync(secrets, `export GH_TOKEN=${TOKEN}\nexport OTHER=x\n`);
+  try {
+    // as on the box: the service holds the token. Set BEFORE this copy of server.mjs is imported: a read at module load is caught too
+    await withEnv({ GH_TOKEN: TOKEN, GITHUB_TOKEN: TOKEN, FCODE_SECRETS_ENV: secrets }, async () => {
+      const mod = await serverCopy(path.join(dir, 'app'));
+      const launch = launchOf(path.join(dir, 'app', 'box', 'start.sh'), secrets);
+      await withApp(async (c) => {
+        const { cookie } = await c.login();
+        for (const h of Object.keys(HARNESSES)) {
+          assert.equal((await c.req('POST', '/api/sessions', { cookie, body: { name: `s-${h}`, project: 'alpha', harness: h } })).status, 201, h);
+          assert.equal((await c.req('POST', '/api/open', { cookie, body: { project: 'my.proj', harness: h } })).json?.created, true, h);
+          assert.equal((await c.req('POST', '/api/open', { cookie, body: { project: 'my.proj', harness: h, fresh: true } })).json?.created, true, h);
+        }
+        assert.equal((await adminRequest(c.configDir, { cmd: 'new', project: 'alpha', harness: 'codex' })).ok, true); // fcode-new
+        const ns = c.calls().filter((x) => x.argv[0] === 'new-session');
+        assert.equal(ns.length, Object.keys(HARNESSES).length * 3 + 1);
+        // in creation order: per harness POST /api/sessions, /api/open, /api/open fresh (openFresh); then fcode-new (openFresh)
+        const want = [...Object.values(HARNESSES).flatMap((h) => [h, h, h]), 'codex'].map((h) => `${launch}${h}`);
+        assert.deepEqual(ns.map((x) => x.argv.at(-1)), want);
+        const all = c.allCalls();
+        assert.ok(all.length > ns.length);
+        for (const x of all) assert.equal(x.hasGhToken, false, x.argv.join(' ')); // no tmux child got GH_TOKEN / GITHUB_TOKEN in its env
+        for (const x of all) assert.ok(!JSON.stringify(x).includes(TOKEN), x.argv.join(' ')); // nor in argv or stdin
+        assert.ok(!c.logs.some((l) => JSON.stringify(l).includes(TOKEN)));
+      }, { make: mod.createApp });
+    });
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('harness sessions: tmux global GH_TOKEN / GITHUB_TOKEN are unset right before EVERY new-session, also after a later global set', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  // a tmux server started (or touched) later by a login shell: its global env gets a token between two creates
+  const setGlobal = () => {
+    for (const v of ['GH_TOKEN', 'GITHUB_TOKEN']) spawnSync(process.execPath, [FAKE, 'set-environment', '-g', v, 'dummy_global'], { env: { PATH: process.env.PATH, FAKE_TMUX_DIR: process.env.FAKE_TMUX_DIR } });
+  };
+  setGlobal();
+  assert.equal((await mkSession(c, cookie, 'one')).status, 201);
+  setGlobal();
+  assert.equal((await mkSession(c, cookie, 'two')).status, 201);
+  setGlobal();
+  assert.equal((await c.req('POST', '/api/open', { cookie, body: { project: 'alpha', harness: 'omp' } })).json?.created, true);
+  setGlobal();
+  assert.equal((await c.req('POST', '/api/open', { cookie, body: { project: 'alpha', harness: 'omp', fresh: true } })).json?.created, true);
+  const st = JSON.parse(fs.readFileSync(fakeState(c), 'utf8'));
+  for (const n of ['one', 'two', 'alpha-omp', 'alpha-omp-2']) assert.equal(st.sessions[n]?.globalToken, false, n); // no session inherits it
+  const server = c.allCalls().filter((x) => !(x.argv[0] === 'set-environment' && !x.argv.includes('-u'))); // without the test's own sets
+  const at = server.flatMap((x, i) => (x.argv[0] === 'new-session' ? [i] : []));
+  assert.equal(at.length, 4);
+  for (const i of at) { // directly preceded by both unsets, every time
+    assert.deepEqual(server.slice(i - 2, i).map((x) => x.argv), [['set-environment', '-g', '-u', 'GH_TOKEN'], ['set-environment', '-g', '-u', 'GITHUB_TOKEN']], server[i].argv[3]);
+  }
+}));
+
+test('harness sessions: a failing tmux set-environment never blocks the create', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  await withEnv({ FAKE_TMUX_FAIL_ON: 'set-environment' }, async () => {
+    assert.equal((await mkSession(c, cookie, 'one')).status, 201);
+  });
+  const calls = c.allCalls();
+  const at = calls.findIndex((x) => x.argv[0] === 'new-session');
+  assert.ok(at >= 2, 'new-session was reached');
+  assert.deepEqual(calls.slice(at - 2, at).map((x) => x.argv), [['set-environment', '-g', '-u', 'GH_TOKEN'], ['set-environment', '-g', '-u', 'GITHUB_TOKEN']]); // both tried, both failed
+  assert.ok(JSON.parse(fs.readFileSync(fakeState(c), 'utf8')).sessions.one, 'the session exists');
+}));
+
+test('harness sessions: no start.sh beside server.mjs: one warning, harnesses start as before the loader', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-noloader-'));
+  try {
+    const mod = await serverCopy(dir, false);
+    await withApp(async (c) => {
+      assert.deepEqual(c.logs.filter((l) => /start\.sh/.test(l)), ['warning: start.sh not found next to server.mjs; harness sessions start without GH_TOKEN (run bash install.sh)']);
+      const { cookie } = await c.login();
+      assert.equal((await mkSession(c, cookie, 'plain')).status, 201);
+      assert.equal(c.calls().find((x) => x.argv[0] === 'new-session').argv.at(-1), `${ENV_PART}bash -l`);
+    }, { make: mod.createApp });
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('harness sessions: the logged launch, run as tmux runs it from a path with a space and a quote, sees the file\'s GH_TOKEN only', { skip: POSIX }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-ghtok-'));
+  const app = path.join(dir, "sp ace'q"), secrets = path.join(dir, "sec rets'env");
+  try {
+    await withEnv({ FCODE_SECRETS_ENV: secrets, GH_TOKEN: undefined }, async () => {
+      const mod = await serverCopy(app);
+      await withApp(async (c) => {
+        const { cookie } = await c.login();
+        await mkSession(c, cookie, 'probe'); // shell harness: bash -l
+        const cmd = c.calls().find((x) => x.argv[0] === 'new-session').argv.at(-1);
+        assert.equal(cmd, `${launchOf(path.join(app, 'box', 'start.sh'), secrets)}bash -l`);
+        const launch = cmd.slice(0, -'bash -l'.length) + PROBE; // the same prefix (env, PATH, secrets path, loader), a probe for the harness
+        const run = () => { // tmux runs the pane command with `sh -c`, in its global env: here a stale token, as an old tmux server may hold
+          const r = spawnSync('/bin/sh', ['-c', launch], { encoding: 'utf8', timeout: 5000, env: { HOME, PATH: '/usr/bin:/bin', GH_TOKEN: 'stale_global_1' } });
+          assert.equal(r.status, 0, r.stderr); assert.equal(r.stderr, '');
+          return r.stdout.trim();
+        };
+        fs.writeFileSync(secrets, '# vault\nexport GH_TOKEN=tok_session\nexport OTHER=x\n');
+        assert.equal(run(), '["tok_session",null,null]');
+        fs.writeFileSync(secrets, 'export GH_TOKEN=tok_rotated\n');
+        assert.equal(run(), '["tok_rotated",null,null]'); // read at each session start: a rotated token reaches the next session
+        fs.rmSync(secrets);
+        assert.equal(run(), '[null,null,null]'); // no file: it still starts, without GH_TOKEN
+      }, { make: mod.createApp });
+    });
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('harness sessions: a relative FCODE_SECRETS_ENV is made absolute once at start; a session in another cwd reads the same file', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-ghtok-'));
+  const secrets = path.join(dir, 'env'), elsewhere = path.join(dir, 'project');
+  fs.mkdirSync(elsewhere);
+  try {
+    await withEnv({ FCODE_SECRETS_ENV: path.relative(process.cwd(), secrets) }, () => withApp(async (c) => {
+      assert.ok(!path.isAbsolute(process.env.FCODE_SECRETS_ENV));
+      const { cookie } = await c.login();
+      await mkSession(c, cookie, 'rel');
+      const cmd = c.calls().find((x) => x.argv[0] === 'new-session').argv.at(-1);
+      assert.equal(cmd, `${launchOf(LOADER, secrets)}bash -l`); // the absolute path, not the relative one
+      if (process.platform === 'win32') return; // running the launch needs POSIX sh
+      fs.writeFileSync(secrets, 'export GH_TOKEN=tok_abs1\n');
+      const r = spawnSync('/bin/sh', ['-c', cmd.slice(0, -'bash -l'.length) + PROBE], { encoding: 'utf8', cwd: elsewhere, timeout: 5000, env: { HOME, PATH: '/usr/bin:/bin' } });
+      assert.deepEqual([r.status, r.stderr, r.stdout.trim()], [0, '', '["tok_abs1",null,null]']); // tmux starts the pane in the project dir
+    }));
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -2181,7 +2611,9 @@ const freePort = () => new Promise((resolve) => { const s = net.createServer().l
 // the real server as a child: resolves {listening, child} once it serves, or {code, err} when it exits first
 async function startServer(configDir) {
   const port = await freePort();
-  const child = spawn(process.execPath, [SERVER], { env: { ...process.env, PC_CONFIG_DIR: configDir, PC_PORT: String(port) }, stdio: ['ignore', 'pipe', 'pipe'] });
+  // the fake tmux: no tmux call of a spawned server (e.g. the per-create `set-environment -g -u`) may reach the real tmux of whoever runs the tests
+  const env = { ...process.env, PC_CONFIG_DIR: configDir, PC_PORT: String(port), PC_TMUX: JSON.stringify([process.execPath, FAKE]), FAKE_TMUX_DIR: path.join(path.dirname(configDir), 'fake') };
+  const child = spawn(process.execPath, [SERVER], { env, stdio: ['ignore', 'pipe', 'pipe'] });
   let out = '', err = '';
   return new Promise((resolve) => {
     child.stdout.on('data', (d) => { out += d; if (out.includes('fcoding listening')) resolve({ listening: true, child, port }); });
@@ -2240,12 +2672,17 @@ test('instance lock: after SIGKILL a new start succeeds at once and replaces the
   try {
     const a = await startServer(c.configDir); running.push(a);
     assert.ok(a.listening, a.err);
-    const ino = fs.lstatSync(sock).ino;
     await new Promise((r) => { a.child.once('exit', r); a.child.kill('SIGKILL'); });
     assert.ok(fs.lstatSync(sock).isSocket()); // left behind by the crash
+    await assert.rejects(adminRequest(c.configDir, { cmd: 'devices' }), { code: 'ENOSERVER' }); // stale: nobody listens on it
+    // a hard link keeps the stale inode alive, so its number cannot be handed to the new socket (ext4 reuses a freed one at once)
+    const old = `${sock}.old`; fs.linkSync(sock, old);
+    const ino = fs.lstatSync(old).ino;
     const b = await startServer(c.configDir); running.push(b);
     assert.ok(b.listening, b.err);
-    assert.notEqual(fs.lstatSync(sock).ino, ino);
+    assert.equal(fs.lstatSync(old).nlink, 1); // the server unlinked the stale path...
+    assert.notEqual(fs.lstatSync(sock).ino, ino); // ...and bound a new socket there
+    assert.ok(fs.lstatSync(sock).isSocket());
     assert.equal(fs.statSync(sock).mode & 0o777, 0o600);
     assert.equal((await adminRequest(c.configDir, { cmd: 'pair' })).ok, true);
   } finally { await Promise.all(running.map(stop)); fs.rmSync(c.root, { recursive: true, force: true }); }
@@ -2806,11 +3243,11 @@ test('tmux targets: panes are =name:, session-only commands are =name; a bare =n
     seen.add(argv[0]);
     assert.match(argv[i + 1], ['kill-session', 'has-session'].includes(argv[0]) ? /^=work$/ : /^=work:$/, argv.join(' '));
   }
-  for (const cmd of ['set-option', 'has-session', 'capture-pane', 'display-message', 'send-keys', 'paste-buffer', 'resize-window', 'kill-session']) assert.ok(seen.has(cmd), `${cmd} was not exercised`);
+  for (const cmd of ['set-option', 'has-session', 'capture-pane', 'display-message', 'send-keys', 'paste-buffer', 'resize-window', 'copy-mode', 'kill-session']) assert.ok(seen.has(cmd), `${cmd} was not exercised`);
   // the fake follows real tmux: a bare session target does not resolve a pane
   const fake = (...args) => spawnSync(process.execPath, [FAKE, ...args], { env: { ...process.env, FAKE_TMUX_DIR: path.join(c.root, 'fake') }, encoding: 'utf8' });
   await mkSession(c, cookie);
-  for (const cmd of [['capture-pane', '-p'], ['send-keys'], ['resize-window', '-x', '80'], ['display-message', '-p'], ['paste-buffer'], ['set-option', '@x', '1']]) {
+  for (const cmd of [['capture-pane', '-p'], ['send-keys'], ['resize-window', '-x', '80'], ['display-message', '-p'], ['paste-buffer'], ['copy-mode', '-q'], ['set-option', '@x', '1']]) {
     const bare = fake(cmd[0], '-t', '=work', ...cmd.slice(1)), colon = fake(cmd[0], '-t', '=work:', ...cmd.slice(1));
     assert.equal(bare.status, 1, `${cmd[0]} =work`);
     assert.match(bare.stderr, /can't find pane/);
@@ -2892,13 +3329,13 @@ async function homeApp(fn, extra = {}) {
   c.reset = (body, o = {}) => c.req('POST', '/api/codex-reset', { cookie: c.cookie, body, ...o });
   c.homeUntil = (ok) => waitFor(async () => { const h = await c.home(); return ok(h) && h; }); // a background refresh landed
   // warm: the first listing has landed and the quota is built from it. A cold spawn can be slower than homeWait / 2, and the
-  // quota built without it is cached 60 s on the frozen clock, so each miss lets the listing land and moves past QUOTA_TTL (with a
-  // regular box tick, so the box run goes on). `ok` can also wait for the other parts; the reply that passed it is returned.
+  // quota built without it is cached 60 s on the frozen clock, so each miss lets the listing land and moves past QUOTA_TTL.
+  // `ok` can also wait for the other parts; the reply that passed it is returned.
   c.warm = async (ok = (h) => h.accounts[3]?.resets.target) => {
     let h;
     await waitFor(async () => {
       if (ok(h = await c.home())) return true;
-      await c.app.homeIdle(); c.clock.t += 61e3; c.app.tickBox(); await c.home(); await c.app.homeIdle(); // the next read is built from the listing
+      await c.app.homeIdle(); c.clock.t += 61e3; await c.home(); await c.app.homeIdle(); // the next read is built from the listing
       return false;
     });
     await c.app.homeIdle();
@@ -3209,11 +3646,10 @@ test('codex reset: every omp answer maps to a result and a Vietnamese message', 
   for (const [text, result, message = RESET_MSG[result]] of cases) assert.deepEqual(resetReply(text), { result, message }, text);
 });
 
-test('GET /api/home: the whole shape from omp, logs, gh and status.json; box timer estimate', () => homeApp(async (c) => {
+test('GET /api/home: the whole shape from omp, logs, gh and status.json; no box ring, no staging', () => homeApp(async (c) => {
   const h = await c.warm((x) => x.accounts[3]?.resets.target && x.totals.spend && !x.projects[0].loading); // every part has landed
-  assert.deepEqual(Object.keys(h), ['generatedAt', 'box', 'accounts', 'totals', 'projects', 'updates', 'omp']);
+  assert.deepEqual(Object.keys(h), ['generatedAt', 'accounts', 'totals', 'projects', 'updates', 'omp']); // no 'working'
   assert.equal(h.generatedAt, new Date(c.clock.t).toISOString());
-  assert.deepEqual(h.box, { state: 'running', sleepsAt: new Date(T0 + 480 * 60e3).toISOString(), ...BOX, source: 'estimate' });
   assert.deepEqual(h.accounts.map((a) => a.id), ['anthropic/1', 'anthropic/2', 'anthropic/3', 'openai-codex/4']);
   const cx = h.accounts[3];
   assert.deepEqual(Object.keys(cx), ['id', 'harness', 'email', 'org', 'plan', 'fetchedAt', 'stale', 'rateLimited', 'windows', 'resets', 'spend']);
@@ -3223,16 +3659,10 @@ test('GET /api/home: the whole shape from omp, logs, gh and status.json; box tim
   assert.deepEqual(h.totals.byHarness.map((x) => x.harness), ['claude', 'codex']);
   // the newest run is a failed PR gate: the deploy line is the newest run of the workflow whose FILE is deploy.yml ("Ship it")
   const ship = { workflow: 'Ship it', status: 'success', at: '2026-10-25T19:10:00Z', url: 'https://github.com/owner/repo/actions/runs/7' };
-  assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: 'owner/repo', branch: 'main', prs: prsOf(GH.prs), lastRun: ship, git: GIT_NULL, staging: null })));
+  assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: 'owner/repo', branch: 'main', prs: prsOf(GH.prs), lastRun: ship, git: GIT_NULL })));
   assert.deepEqual(Object.keys(h.updates), ['omp', 'claude', 'codex']);
   assert.ok(!JSON.stringify(h).includes('github-work')); // the remote URL never leaves the server
-  // box: a tick more than 90 s late is a resume; regular ticks are not
-  c.clock.t += 30e3; c.app.tickBox();
-  assert.equal((await c.home()).box.sleepsAt, new Date(T0 + 480 * 60e3).toISOString());
-  c.clock.t += 120e3; c.app.tickBox();
-  assert.equal((await c.home()).box.sleepsAt, new Date(c.clock.t + 480 * 60e3).toISOString());
-  for (let i = 0; i < 962; i++) { c.clock.t += 30e3; c.app.tickBox(); } // ran 481 minutes without a gap: past the estimate
-  assert.equal((await c.home()).box.sleepsAt, null);
+  assert.ok(!('box' in h) && h.projects.every((p) => !('staging' in p)));
 }));
 
 test('GET /api/home caches: quota 60 s, projects 2 min, spend 5 min; one refresh shared by concurrent requests', () => homeApp(async (c) => {
@@ -3265,9 +3695,9 @@ test('GET /api/home partial failure: omp, gh or the logs down -> that part empty
   fs.rmSync(c.roots.dirs.claude, { recursive: true }); // one log source gone
   let h = await c.homeUntil((x) => x.totals.spend && !x.projects[0].loading); // the spend scan and gh have answered
   assert.deepEqual(h.accounts, []);
-  assert.deepEqual(h.projects[0], { name: 'alpha', repo: 'owner/repo', branch: 'main', prs: null, lastRun: null, git: GIT_NULL, staging: null });
+  assert.deepEqual(h.projects[0], { name: 'alpha', repo: 'owner/repo', branch: 'main', prs: null, lastRun: null, git: GIT_NULL });
   assert.equal(h.totals.spend.last30.usd, 0.2897); // omp + Codex logs; Claude Code logs gone
-  assert.ok(h.box.sleepsAt && h.updates.omp);
+  assert.ok(h.updates.omp);
   // omp back: fresh; omp down again after the TTL: the last accounts, marked stale
   c.setRules(rules);
   c.clock.t += 61e3;
@@ -3662,9 +4092,9 @@ test('GET /api/home never waits long: a slow part is empty the first time, then 
   let t0 = Date.now();
   let h = await c.home();
   assert.ok(Date.now() - t0 < 1200, `took ${Date.now() - t0} ms`); // homeWaitMs 300 per part, in parallel
-  assert.deepEqual(h.accounts, []); // not ready yet: empty, the rest answers (box, updates; spend if its scan was quick)
-  assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: null, branch: null, prs: null, lastRun: null, loading: true, git: GIT_NULL, staging: null })));
-  assert.ok('spend' in h.totals && Array.isArray(h.totals.byHarness) && h.box && h.updates.omp);
+  assert.deepEqual(h.accounts, []); // not ready yet: empty, the rest answers (updates; spend if its scan was quick)
+  assert.deepEqual(h.projects, ['alpha', 'my.proj'].map((name) => ({ name, repo: null, branch: null, prs: null, lastRun: null, loading: true, git: GIT_NULL })));
+  assert.ok('spend' in h.totals && Array.isArray(h.totals.byHarness) && h.updates.omp);
   h = await c.homeUntil((x) => x.accounts.length === 4 && x.projects[0].repo && x.totals.spend);
   c.clock.t += 121e3; // both TTLs over, both tools still slow: the cached parts at once
   t0 = Date.now();
@@ -3860,56 +4290,6 @@ test('cold start: the first listing fails: ~ ids until the listing is asked agai
   await c.home(); await c.app.homeIdle();
   assert.equal((await c.home()).accounts[3].resets.target, 'openai-codex/4'); // built from the listing as it landed
 }, { homeWaitMs: 600 }));
-
-test('box timer: kept across a server restart within 90 s of the last tick on the same boot (box-timer.json); a longer gap or a reboot is a new run', async () => {
-  const clock = { t: T0 };
-  const bootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-boot-'));
-  const bootIdFile = path.join(bootDir, 'boot_id');
-  fs.writeFileSync(bootIdFile, 'boot-aaaa\n');
-  const start = (o = {}) => boot({ bootIdFile, ...o });
-  const a = await start({ now: () => clock.t });
-  const sleeps = async (c) => { const { cookie } = await c.login(); return (await c.req('GET', '/api/home', { cookie })).json.box.sleepsAt; };
-  try {
-    clock.t += 30e3; a.app.tickBox();
-    clock.t += 30e3; a.app.tickBox(); // an hour into the run, ticking regularly
-    const before = await sleeps(a);
-    assert.equal(before, new Date(T0 + 480 * 60e3).toISOString());
-    const stored = JSON.parse(fs.readFileSync(path.join(a.configDir, 'box-timer.json'), 'utf8'));
-    assert.deepEqual(stored, { resume: T0, tick: T0 + 60e3, boot: 'boot-aaaa' });
-    if (process.platform !== 'win32') assert.equal(fs.statSync(path.join(a.configDir, 'box-timer.json')).mode & 0o777, 0o600);
-    await a.app.close(); // the config dir (and box-timer.json) stays
-    clock.t += 45e3; // restarted 45 s after the last tick (reinstall, crash, systemctl restart)
-    const b = await start({ now: () => clock.t, configDir: a.configDir });
-    try { assert.equal(await sleeps(b), before); } finally { await b.close(); }
-    clock.t += 91e3; // stopped longer than 90 s (b ticked once at its start): the box slept, a new run
-    const c = await start({ now: () => clock.t, configDir: a.configDir });
-    try { assert.equal(await sleeps(c), new Date(clock.t + 480 * 60e3).toISOString()); } finally { await c.close(); }
-    fs.writeFileSync(path.join(a.configDir, 'box-timer.json'), 'not json');
-    clock.t += 1e3;
-    const d = await start({ now: () => clock.t, configDir: a.configDir });
-    try { assert.equal(await sleeps(d), new Date(clock.t + 480 * 60e3).toISOString()); } finally { await d.close(); }
-    // d left a fresh run in the file; a restart 10 s later on another boot (the box rebooted): a new run, not d's resume
-    const dRun = JSON.parse(fs.readFileSync(path.join(a.configDir, 'box-timer.json'), 'utf8')).resume;
-    clock.t += 10e3;
-    fs.writeFileSync(bootIdFile, 'boot-bbbb\n');
-    const e = await start({ now: () => clock.t, configDir: a.configDir });
-    try {
-      assert.equal(await sleeps(e), new Date(clock.t + 480 * 60e3).toISOString());
-      assert.notEqual(clock.t, dRun);
-    } finally { await e.close(); }
-    // no boot_id at all (not Linux): null on both sides still matches
-    clock.t += 10e3;
-    const noBoot = path.join(bootDir, 'missing');
-    const f = await start({ now: () => clock.t, configDir: a.configDir, bootIdFile: noBoot });
-    const fRun = clock.t;
-    await f.app.close();
-    assert.equal(JSON.parse(fs.readFileSync(path.join(a.configDir, 'box-timer.json'), 'utf8')).boot, null);
-    clock.t += 20e3;
-    const g = await start({ now: () => clock.t, configDir: a.configDir, bootIdFile: noBoot });
-    try { assert.equal(await sleeps(g), new Date(fRun + 480 * 60e3).toISOString()); } finally { await g.close(); }
-    await f.close();
-  } finally { await a.close(); fs.rmSync(bootDir, { recursive: true, force: true }); }
-});
 
 test('POST /api/codex-reset: a slow reset is answered 202 pending; it finishes in the background and clears the quota cache', () => homeApp(async (c) => {
   const body = { accountId: 'openai-codex/4', requestId: '0f8f7a6e-1111-4222-8333-000000000088' };
@@ -4387,7 +4767,7 @@ test('open fresh: an open while a sync still runs (even past an earlier open\'s 
   } finally { s.cleanup(); }
 });
 
-// ======================= v1.3.2: omp sessions of a project, format guard, staging box =======================
+// ======================= v1.3.2: omp sessions of a project, format guard =======================
 const OMPFIX = path.join(here, 'fixtures', 'omp-sessions');
 const ID = { a: 'aaaaaaaa-1111-7000-8000-000000000001', b: 'bbbbbbbb-2222-7000-8000-000000000002', c: 'cccccccc-3333-7000-8000-000000000003', d: 'dddddddd-4444-7000-8000-000000000004', e: 'eeeeeeee-5555-7000-8000-000000000005' };
 const ompDirOf = (c, dir = ABS) => path.join(c.root, 'omp-sessions', ompDirName(dir));
@@ -4510,7 +4890,7 @@ test('POST resume: a long project name is shortened, the id part never; the name
   }, { config: { projects: { [long]: ABS } } });
 });
 
-test('a project named "jobs": its omp-sessions list, resume and staging routes are not taken by GET /api/projects/jobs/<id>; the job route still answers', () => withApp(async (c) => {
+test('a project named "jobs": its omp-sessions list and resume routes are not taken by GET /api/projects/jobs/<id>; the job route still answers', () => withApp(async (c) => {
   const { cookie } = await c.login();
   ompTree(c);
   const r = await ompGet(c, cookie, 'jobs');
@@ -4519,10 +4899,18 @@ test('a project named "jobs": its omp-sessions list, resume and staging routes a
   assert.equal((await c.req('POST', '/api/projects/jobs/omp-sessions', { cookie, body: {} })).status, 405);
   const rs = await resumeReq(c, cookie, ID.a, 'jobs');
   assert.equal(rs.status, 200, rs.text);
-  assert.equal((await c.req('POST', '/api/projects/jobs/staging/start', { cookie })).json.error, 'no_instabox_key');
-  const j = await c.req('GET', `/api/projects/jobs/${'0'.repeat(32)}`, { cookie });
+  const j =await c.req('GET', `/api/projects/jobs/${'0'.repeat(32)}`, { cookie });
   assert.deepEqual([j.status, j.json], [404, { error: 'no_job' }]);
 }, { config: { projects: { jobs: ABS } } }));
+
+test('the staging start route is gone: an old app that still calls it gets the normal 404', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  for (const p of ['alpha', 'nope']) {
+    const r = await c.req('POST', `/api/projects/${p}/staging/start`, { cookie });
+    assert.deepEqual([r.status, r.json], [404, { error: 'not_found' }], p);
+  }
+  assert.equal(c.calls().length, 0); // nothing reached tmux
+}));
 
 test('POST resume: unknown or malformed ids and traversal attempts -> 404 unknown_session, nothing is started', () => withApp(async (c) => {
   const { cookie } = await c.login();
@@ -4559,16 +4947,8 @@ const stubDir = () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-stub-'));
   fs.writeFileSync(path.join(dir, 'omp.mjs'), `import fs from 'node:fs'; fs.appendFileSync(${JSON.stringify(path.join(dir, 'omp.log'))}, process.argv.slice(2).join(' ') + '\\n');
 if (process.argv[2] === '--version') console.log('omp/18.12.6'); else process.exit(1);\n`);
-  fs.writeFileSync(path.join(dir, 'instabox.mjs'), `import fs from 'node:fs';
-const d = ${JSON.stringify(dir)}, a = process.argv.slice(2);
-fs.appendFileSync(d + '/instabox.log', JSON.stringify({ argv: a, key: process.env.INSTABOX_API_KEY ?? null }) + '\\n');
-if (a[0] === 'ls') setTimeout(() => { if (fs.existsSync(d + '/ls-fail')) process.exit(2); process.stdout.write(fs.readFileSync(d + '/ls.json', 'utf8')); }, fs.existsSync(d + '/ls-slow') ? 1500 : 0)
-else if (a[0] === 'start') setTimeout(() => process.exit(fs.existsSync(d + '/start-fail') ? 3 : 0), 400); // a start takes a moment\n`);
-  fs.writeFileSync(path.join(dir, 'ls.json'), '[]');
   return {
-    dir, omp: [process.execPath, path.join(dir, 'omp.mjs')], instabox: [process.execPath, path.join(dir, 'instabox.mjs')],
-    ls: (boxes) => fs.writeFileSync(path.join(dir, 'ls.json'), JSON.stringify(boxes)),
-    calls: () => { try { return fs.readFileSync(path.join(dir, 'instabox.log'), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } },
+    dir, omp: [process.execPath, path.join(dir, 'omp.mjs')],
     ompCalls: () => { try { return fs.readFileSync(path.join(dir, 'omp.log'), 'utf8').trim().split('\n').filter(Boolean); } catch { return []; } },
     cleanup: () => fs.rmSync(dir, { recursive: true, force: true }),
   };
@@ -4640,125 +5020,6 @@ test('omp format guard: checked at most every 10 min (one omp --version per wind
       clock.t += 2 * 60e3; await homeOmp(c, cookie); await c.app.homeIdle(); await homeOmp(c, cookie);
       assert.equal(s.ompCalls().filter((x) => x === '--version').length, 2);
     }, { omp: s.omp, now: () => clock.t });
-  } finally { s.cleanup(); }
-});
-
-// staging box: projects[].staging and POST /api/projects/<name>/staging/start
-const BOXES = [
-  { name: 'alpha', desiredState: 'suspended', state: 'suspended', updatedAt: '2026-10-26T07:40:41.143075Z', extra: { token: 'x' } },
-  { name: 'my.proj', desiredState: 'running', state: 'suspended', updatedAt: '2026-10-26T07:41:00Z' },
-  { name: 'other', desiredState: 'running', state: 'running', updatedAt: '2026-10-26T03:18:19.3925Z' },
-];
-const stagingOf = async (c, cookie) => { await c.app.homeIdle(); return (await c.req('GET', '/api/home', { cookie })).json.projects.map((p) => p.staging); };
-
-test('parseStaging: states from instabox ls --json; unknown values, a box asked to run but not running, bad rows', () => {
-  const m = parseStaging([
-    { name: 'a', state: 'running', desiredState: 'running', updatedAt: '2026-10-26T03:18:19.3925Z' }, { name: 'b', state: 'suspended', desiredState: 'suspended' },
-    { name: 'c', state: 'stopped', desiredState: 'stopped' }, { name: 'd', state: 'suspended', desiredState: 'running' }, { name: 'e', state: 'weird', desiredState: 'weird' },
-    { name: 'f', state: 'starting' }, { state: 'running' }, null, 'x', { name: 'g' },
-  ]);
-  assert.deepEqual([...m], [
-    ['a', { state: 'running', updatedAt: '2026-10-26T03:18:19.392Z' }], ['b', { state: 'suspended', updatedAt: null }], ['c', { state: 'stopped', updatedAt: null }],
-    ['d', { state: 'starting', updatedAt: null }], ['e', { state: 'unknown', updatedAt: null }], ['f', { state: 'starting', updatedAt: null }], ['g', { state: 'unknown', updatedAt: null }],
-  ]);
-  assert.equal(parseStaging('nope').size, 0);
-});
-
-test('GET /api/home projects[].staging: {state, updatedAt} from instabox ls --json (30 s cache); a missing box is null; nothing else of the box leaks', async () => {
-  const s = stubDir();
-  const clock = { t: 1_700_000_000_000 };
-  try {
-    s.ls(BOXES);
-    await withApp(async (c) => {
-      const { cookie } = await c.login();
-      const st = await stagingOf(c, cookie);
-      assert.deepEqual(st, [{ state: 'suspended', updatedAt: '2026-10-26T07:40:41.143Z' }, { state: 'starting', updatedAt: '2026-10-26T07:41:00.000Z' }]);
-      assert.ok(!JSON.stringify((await c.req('GET', '/api/home', { cookie })).json).includes('"extra"'));
-      assert.deepEqual(s.calls().map((x) => [x.argv.join(' '), x.key]), [['ls --json', 'ibk_test']]);
-      await stagingOf(c, cookie);
-      assert.equal(s.calls().length, 1); // cached
-      s.ls([{ name: 'alpha', desiredState: 'running', state: 'running', updatedAt: '2026-10-26T08:00:00Z' }]);
-      clock.t += 31e3; await c.req('GET', '/api/home', { cookie }); // a stale value is served at once and refreshed behind
-      await c.app.homeIdle();
-      assert.equal(s.calls().length, 2);
-      assert.deepEqual(await stagingOf(c, cookie), [{ state: 'running', updatedAt: '2026-10-26T08:00:00.000Z' }, null]);
-      fs.writeFileSync(path.join(s.dir, 'ls-fail'), '');
-      clock.t += 31e3; await c.req('GET', '/api/home', { cookie }); await c.app.homeIdle();
-      assert.equal(s.calls().length, 3);
-      assert.deepEqual((await stagingOf(c, cookie))[0].state, 'running'); // ls failing: the last good answer stays
-    }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t });
-    fs.rmSync(path.join(s.dir, 'ls-fail'), { force: true });
-    await withApp(async (c) => { // ls fails from the start: every staging is null, no error
-      const { cookie } = await c.login();
-      fs.writeFileSync(path.join(s.dir, 'ls-fail'), '');
-      assert.deepEqual(await stagingOf(c, cookie), [null, null]);
-    }, { instabox: s.instabox, instaboxKey: 'ibk_test' });
-  } finally { s.cleanup(); }
-});
-
-test('staging without a key: every staging is null and instabox is never run; start answers 409 no_instabox_key', async () => {
-  const s = stubDir();
-  try {
-    s.ls(BOXES);
-    await withApp(async (c) => {
-      const { cookie } = await c.login();
-      assert.deepEqual(await stagingOf(c, cookie), [null, null]);
-      const r = await c.req('POST', '/api/projects/alpha/staging/start', { cookie });
-      assert.deepEqual([r.status, r.json], [409, { ok: false, error: 'no_instabox_key' }]);
-      assert.equal((await c.req('POST', '/api/projects/nope/staging/start', { cookie })).json.error, 'unknown_project');
-      assert.equal(s.calls().length, 0);
-    }, { instabox: s.instabox, instaboxKey: null });
-  } finally { s.cleanup(); }
-});
-
-test('POST staging/start: instabox start <box> --no-wait, detached, answered at once; a running or missing box is not started; never stop/rm/create/snapshot/fork', async () => {
-  const s = stubDir();
-  try {
-    s.ls(BOXES);
-    await withApp(async (c) => {
-      const { cookie } = await c.login();
-      assert.equal((await c.req('POST', '/api/projects/alpha/staging/start', { pc: false, cookie })).status, 403);
-      assert.equal((await c.req('GET', '/api/projects/alpha/staging/start', { cookie })).status, 405);
-      const r = await c.req('POST', '/api/projects/alpha/staging/start', { cookie });
-      assert.deepEqual([r.status, r.json], [200, { ok: true, state: 'starting' }]);
-      assert.ok(await until(() => s.calls().some((x) => x.argv[0] === 'start')));
-      const start = s.calls().find((x) => x.argv[0] === 'start');
-      assert.deepEqual(start, { argv: ['start', 'alpha', '--no-wait'], key: 'ibk_test' });
-      // already starting (desired state running): left alone
-      const before = s.calls().filter((x) => x.argv[0] === 'start').length;
-      assert.deepEqual((await c.req('POST', '/api/projects/my.proj/staging/start', { cookie })).json, { ok: true, state: 'starting' });
-      s.ls([{ name: 'alpha', desiredState: 'running', state: 'running', updatedAt: '2026-10-26T08:00:00Z' }]);
-      assert.deepEqual((await c.req('POST', '/api/projects/alpha/staging/start', { cookie })).json, { ok: true, state: 'running' });
-      assert.equal(s.calls().filter((x) => x.argv[0] === 'start').length, before);
-      const none = await c.req('POST', '/api/projects/my.proj/staging/start', { cookie }); // not in the listing any more
-      assert.deepEqual([none.status, none.json], [404, { ok: false, error: 'no_staging_box' }]);
-      assert.ok(s.calls().every((x) => ['ls', 'start'].includes(x.argv[0])));
-      assert.ok(!c.logs.join('\n').includes('ibk_test'));
-    }, { instabox: s.instabox, instaboxKey: 'ibk_test' });
-  } finally { s.cleanup(); }
-});
-
-test('POST staging/start: a failing start logs one line (no key); ls down with nothing known -> 503 staging_unavailable; two taps at once start once', async () => {
-  const s = stubDir();
-  try {
-    s.ls(BOXES);
-    await withApp(async (c) => {
-      const { cookie } = await c.login();
-      fs.writeFileSync(path.join(s.dir, 'start-fail'), '');
-      const two = await Promise.all([1, 2].map(() => c.req('POST', '/api/projects/alpha/staging/start', { cookie })));
-      assert.deepEqual(two.map((r) => [r.status, r.json.state]), [[200, 'starting'], [200, 'starting']]);
-      assert.ok(await until(() => c.logs.includes('staging-start alpha: exit 3')));
-      assert.equal(s.calls().filter((x) => x.argv[0] === 'start').length, 1);
-      assert.deepEqual(c.logs.filter((l) => l.startsWith('staging-start')), ['staging-start alpha: exit 3']);
-      assert.ok(!c.logs.join('\n').includes('ibk_test'));
-    }, { instabox: s.instabox, instaboxKey: 'ibk_test' });
-    fs.writeFileSync(path.join(s.dir, 'ls-fail'), '');
-    await withApp(async (c) => {
-      const { cookie } = await c.login();
-      const r = await c.req('POST', '/api/projects/alpha/staging/start', { cookie });
-      assert.deepEqual([r.status, r.json], [503, { ok: false, error: 'staging_unavailable' }]);
-      assert.equal(s.calls().filter((x) => x.argv[0] === 'start').length, 1); // only the first app's
-    }, { instabox: s.instabox, instaboxKey: 'ibk_test' });
   } finally { s.cleanup(); }
 });
 
@@ -4977,194 +5238,6 @@ test('updateStatusOf: a failed tool keeps its `from`; a version that is not a pl
   assert.deepEqual(u, { versions: { omp: '1.1.0', claude: '2.0.0', codex: null }, last_run: '2026-10-31T03:00:00.000Z', last_ok: false });
 });
 
-// box ring: GET /api/home box from the box's own instabox record (hostname instabox-<name>), the estimate otherwise
-const HOUR = 3600e3;
-const boxRec = (clock, o = {}) => ({ name: 'coder', desiredState: 'running', state: 'running', maxRunMinutes: 240, runStartedAt: new Date(clock.t - HOUR).toISOString(), cooldownUntil: '2026-10-26T19:53:20.620244Z', ...o });
-const homeBox = async (c, cookie) => (await c.req('GET', '/api/home', { cookie })).json.box;
-
-test('boxOf: the box by name or id; no run, an unlimited max run or an unknown box -> null; cooldownMinutes defaults to 10', () => {
-  const r = { id: 'm_1', name: 'coder', state: 'running', maxRunMinutes: 480, runStartedAt: '2026-10-29T14:40:04.056599Z', cooldownUntil: '2026-10-26T19:53:20.620244Z' };
-  const want = { state: 'running', runStartedAt: Date.parse('2026-10-29T14:40:04.056Z'), maxRunMinutes: 480, cooldownUntil: Date.parse('2026-10-26T19:53:20.620Z'), cooldownMinutes: 10, idlePauseMinutes: 30 };
-  assert.deepEqual(boxOf([{ name: 'other' }, r], ['coder']), want);
-  assert.deepEqual(boxOf([r], ['nope', 'm_1']), want);
-  assert.deepEqual(boxOf([{ ...r, cooldownMinutes: 15, cooldownUntil: 'x' }], ['coder']), { ...want, cooldownUntil: null, cooldownMinutes: 15 });
-  assert.equal(boxOf([{ ...r, autoSuspendAfterSeconds: 1800 }], ['coder']).idlePauseMinutes, 30); // the idle pause from the record, in minutes
-  assert.equal(boxOf([{ ...r, autoSuspendAfterSeconds: 900 }], ['coder']).idlePauseMinutes, 15);
-  assert.equal(boxOf([{ ...r, autoSuspendAfterSeconds: 0 }], ['coder']).idlePauseMinutes, 30); // 0 = off, or bad: the default
-  assert.equal(boxOf([r], ['zzz']), null);
-  for (const bad of [[{ ...r, maxRunMinutes: -1 }], [{ ...r, runStartedAt: null }], [{ ...r, maxRunMinutes: '480' }], 'nope', null, [null, 'x']]) assert.equal(boxOf(bad, ['coder']), null);
-});
-
-test('GET /api/home box: from the box\'s own instabox record (runStartedAt + maxRunMinutes), not the tick estimate; a paused record uses cooldownUntil; the key stays secret', async () => {
-  const s = stubDir();
-  const clock = { t: 1_700_000_000_000 };
-  try {
-    s.ls([{ name: 'alpha', state: 'running' }, boxRec(clock, { cooldownMinutes: 15, autoSuspendAfterSeconds: 900 })]);
-    for (const boxName of ['coder', 'instabox-coder']) { // the plain name or the hostname
-      await withApp(async (c) => {
-        const { cookie } = await c.login();
-        await stagingOf(c, cookie); // the first listing has landed
-        assert.deepEqual(await homeBox(c, cookie), { state: 'running', sleepsAt: new Date(clock.t + 3 * HOUR).toISOString(), maxRunMinutes: 240, idlePauseMinutes: 15, cooldownMinutes: 15, source: 'instabox' });
-        assert.ok(!JSON.stringify(c.logs).includes('ibk_test'));
-      }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t, boxName });
-    }
-    // paused (not running, cooldown ahead): the wake is cooldownUntil, which the app reads as sleepsAt + cooldown
-    s.ls([boxRec(clock, { state: 'suspended', cooldownUntil: new Date(clock.t + 5 * 60e3).toISOString() })]);
-    await withApp(async (c) => {
-      const { cookie } = await c.login();
-      await stagingOf(c, cookie);
-      const b = await homeBox(c, cookie);
-      assert.deepEqual([b.source, b.sleepsAt], ['instabox', new Date(clock.t - 5 * 60e3).toISOString()]);
-    }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t, boxName: 'coder' });
-  } finally { s.cleanup(); }
-});
-
-test('GET /api/home box: a failing CLI, an unlisted box, an unlimited max run or no key -> the estimate, unchanged', async () => {
-  const s = stubDir();
-  const clock = { t: 1_700_000_000_000 };
-  const est = () => ({ state: 'running', sleepsAt: new Date(clock.t + 480 * 60e3).toISOString(), ...BOX, source: 'estimate' });
-  try {
-    for (const [ls, key, fail] of [[[boxRec(clock)], 'ibk_test', true], [[boxRec(clock, { name: 'elsewhere' })], 'ibk_test'], [[boxRec(clock, { maxRunMinutes: -1 })], 'ibk_test'], [[boxRec(clock)], null], [[], 'ibk_test']]) {
-      s.ls(ls);
-      if (fail) fs.writeFileSync(path.join(s.dir, 'ls-fail'), ''); else fs.rmSync(path.join(s.dir, 'ls-fail'), { force: true });
-      await withApp(async (c) => {
-        const { cookie } = await c.login();
-        await stagingOf(c, cookie);
-        assert.deepEqual(await homeBox(c, cookie), est());
-      }, { instabox: s.instabox, instaboxKey: key, now: () => clock.t, boxName: 'coder' });
-    }
-  } finally { s.cleanup(); }
-});
-
-test('GET /api/home box: a record read before the last resume is not used; the fresh one is, once it lands', async () => {
-  const s = stubDir();
-  const clock = { t: 1_700_000_000_000 };
-  try {
-    s.ls([boxRec(clock)]);
-    await withApp(async (c) => {
-      const { cookie } = await c.login();
-      await stagingOf(c, cookie);
-      assert.equal((await homeBox(c, cookie)).source, 'instabox');
-      clock.t += 120e3; c.app.tickBox(); // a tick gap: the box slept and woke, a new run
-      s.ls([boxRec(clock, { runStartedAt: new Date(clock.t).toISOString() })]);
-      const b = await homeBox(c, cookie); // the old record is served stale by the staging part, but dated before the resume
-      assert.deepEqual([b.source, b.sleepsAt], ['estimate', new Date(clock.t + 4 * HOUR).toISOString()]); // the estimate runs on the last record's max run (240 min)
-      await c.app.homeIdle();
-      assert.deepEqual(await homeBox(c, cookie), { state: 'running', sleepsAt: new Date(clock.t + 4 * HOUR).toISOString(), maxRunMinutes: 240, idlePauseMinutes: 30, cooldownMinutes: 10, source: 'instabox' });
-    }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t, boxName: 'coder' });
-  } finally { s.cleanup(); }
-});
-
-test('GET /api/home box: a slow instabox CLI never holds /api/home back: the estimate answers within homeWait, the record is used once it lands', async () => {
-  const s = stubDir();
-  const clock = { t: 1_700_000_000_000 };
-  try {
-    s.ls([boxRec(clock)]);
-    fs.writeFileSync(path.join(s.dir, 'ls-slow'), ''); // ls takes 1.5 s
-    await withApp(async (c) => {
-      const { cookie } = await c.login();
-      const t0 = Date.now();
-      const r = await c.req('GET', '/api/home', { cookie });
-      assert.ok(Date.now() - t0 < 1200, `answered in ${Date.now() - t0} ms`);
-      assert.equal(r.status, 200);
-      assert.equal(r.json.box.source, 'estimate');
-      await c.app.homeIdle(); // the slow listing lands behind the reply
-      assert.equal((await homeBox(c, cookie)).source, 'instabox');
-    }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t, boxName: 'coder', homeWaitMs: 150 });
-  } finally { s.cleanup(); }
-});
-
-test('GET /api/home box estimate: more than a cooldown past its sleep time while we answer = a missed pause: the run restarts now (never --:-- for good)', () => homeApp(async (c) => {
-  const maxMs = BOX.maxRunMinutes * 60e3;
-  for (let i = 0; i < 962; i++) { c.clock.t += 30e3; c.app.tickBox(); } // 481 min with no tick gap: inside the cooldown, still null
-  assert.equal((await c.home()).box.sleepsAt, null);
-  for (let i = 0; i < 19; i++) { c.clock.t += 30e3; c.app.tickBox(); } // 490.5 min: past sleep time + cooldown
-  assert.equal((await c.home()).box.sleepsAt, new Date(c.clock.t + maxMs).toISOString());
-  c.clock.t += 30e3; c.app.tickBox(); // the restarted run goes on from now, and is stored
-  assert.equal((await c.home()).box.sleepsAt, new Date(c.clock.t - 30e3 + maxMs).toISOString());
-  assert.equal(JSON.parse(fs.readFileSync(path.join(c.configDir, 'box-timer.json'), 'utf8')).resume, c.clock.t - 30e3);
-}));
-
-test('GET /api/home box: a record not paused, more than a cooldown past runStartedAt + max run, is not used (the estimate answers, in the future, on the record\'s own max run 240); inside the cooldown it still is', async () => {
-  const s = stubDir();
-  const clock = { t: 1_700_000_000_000 };
-  try {
-    for (const [ago, state, source, sleeps] of [[5 * HOUR, 'running', 'estimate', clock.t + 4 * HOUR], [4 * HOUR + 5 * 60e3, 'running', 'instabox', null], [5 * HOUR, 'starting', 'estimate', clock.t + 4 * HOUR]]) {
-      // max run 240 min, not the default 480; cooldownUntil in the past (the default one is ahead of this test's clock)
-      s.ls([boxRec(clock, { state, runStartedAt: new Date(clock.t - ago).toISOString(), cooldownUntil: new Date(clock.t - HOUR).toISOString() })]);
-      await withApp(async (c) => {
-        const { cookie } = await c.login();
-        await stagingOf(c, cookie);
-        const b = await homeBox(c, cookie);
-        assert.deepEqual([b.source, b.sleepsAt, b.maxRunMinutes], [source, sleeps && new Date(sleeps).toISOString(), 240]);
-      }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t, boxName: 'coder' });
-    }
-  } finally { s.cleanup(); }
-});
-
-test('GET /api/home box: the restart rule never fights a known run: the estimate follows the record, so when ls then fails past 10 min it keeps runStartedAt + max run (no restart, no jump)', async () => {
-  const s = stubDir();
-  const clock = { t: 1_700_000_000_000 };
-  const t0 = clock.t;
-  try {
-    s.ls([boxRec(clock)]); // the run started 1 h ago, max run 240 min (not the default 480)
-    await withApp(async (c) => {
-      const { cookie } = await c.login();
-      await stagingOf(c, cookie);
-      const b = await homeBox(c, cookie); // the stored estimate is 491 min old (past sleep + cooldown), the record is right
-      assert.deepEqual([b.source, b.sleepsAt], ['instabox', new Date(t0 + 3 * HOUR).toISOString()]);
-      fs.writeFileSync(path.join(s.dir, 'ls-fail'), '');
-      for (let i = 0; i < 22; i++) { clock.t += 30e3; c.app.tickBox(); } // 11 min with regular ticks: the record is past BOX_REC_MS
-      const e = await homeBox(c, cookie);
-      assert.deepEqual([e.source, e.sleepsAt, e.maxRunMinutes], ['estimate', new Date(t0 + 3 * HOUR).toISOString(), 240]); // the same moment and max run, not 480 / now + 8 h
-      assert.equal(JSON.parse(fs.readFileSync(path.join(c.configDir, 'box-timer.json'), 'utf8')).resume, t0 - HOUR); // and stored as the true run start
-    }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t, boxName: 'coder', bootIdFile: path.join(s.dir, 'no-boot-id'),
-      seedConfig: (d) => fs.writeFileSync(path.join(d, 'box-timer.json'), JSON.stringify({ resume: t0 - 491 * 60e3, tick: t0 - 10e3, boot: null })) });
-  } finally { s.cleanup(); }
-});
-
-test('the instabox key is taken out of the server\'s environment (tmux and the harnesses never inherit it) and still works for instabox', async () => {
-  const s = stubDir();
-  try {
-    s.ls(BOXES);
-    await withEnv({ INSTABOX_API_KEY: 'ibk_env' }, async () => {
-      await withApp(async (c) => {
-        assert.equal(process.env.INSTABOX_API_KEY, undefined);
-        const { cookie } = await c.login();
-        assert.deepEqual((await stagingOf(c, cookie))[0].state, 'suspended');
-        assert.equal(s.calls()[0].key, 'ibk_env');
-        await c.req('POST', '/api/projects/alpha/staging/start', { cookie });
-        assert.ok(await until(() => s.calls().some((x) => x.argv[0] === 'start')));
-        assert.equal(s.calls().find((x) => x.argv[0] === 'start').key, 'ibk_env');
-      }, { instabox: s.instabox, instaboxKey: undefined });
-    });
-  } finally { s.cleanup(); }
-});
-
-test('install.sh start.sh: INSTABOX_API_KEY alone is read, as text, from instabox.env; nothing is sourced', { skip: process.platform === 'win32' && 'POSIX sh' }, () => {
-  const install = fs.readFileSync(path.join(here, '..', 'install.sh'), 'utf8');
-  const m = /cat > "\$APP\/start\.sh" <<'START'\r?\n([\s\S]*?)\r?\nSTART\r?\n/.exec(install);
-  assert.ok(m, 'start.sh not found in install.sh');
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-start-'));
-  try {
-    fs.writeFileSync(path.join(dir, 'start.sh'), `${m[1]}\n`);
-    const probe = [process.execPath, '-e', 'console.log(JSON.stringify([process.env.INSTABOX_API_KEY ?? null, process.env.OTHER_SECRET ?? null, process.env.GH_TOKEN ?? null]))'];
-    const env = { PATH: process.env.PATH, FCODE_SECRETS_ENV: path.join(dir, 'none'), FCODE_INSTABOX_ENV: path.join(dir, 'instabox.env') };
-    const run = (file, e = env) => { if (file !== null) fs.writeFileSync(path.join(dir, 'instabox.env'), file); return spawnSync('/bin/sh', [path.join(dir, 'start.sh'), ...probe], { encoding: 'utf8', env: e }).stdout.trim(); };
-    assert.equal(run('export INSTABOX_API_KEY=ibk_abc-123.x_y\n'), '["ibk_abc-123.x_y",null,null]');
-    assert.equal(run('export OTHER_SECRET=zz\nexport INSTABOX_API_KEY=ibk_abc\necho noise\n'), '["ibk_abc",null,null]'); // only that variable
-    assert.equal(run('export INSTABOX_API_KEY="ibk_q"\r\n'), '["ibk_q",null,null]');
-    assert.equal(run("export INSTABOX_API_KEY='ibk_s'\n"), '["ibk_s",null,null]');
-    assert.equal(run('# no key here\nexport OTHER_SECRET=zz\n'), '[null,null,null]');
-    assert.equal(run(`export INSTABOX_API_KEY=$(touch ${path.join(dir, 'pwned')})\n`), '[null,null,null]'); // not a key: dropped, and never run
-    assert.equal(run('export INSTABOX_API_KEY=ibk_a;touch pwned2\n'), '[null,null,null]');
-    assert.equal(run('export INSTABOX_API_KEY=`touch x`\n'), '[null,null,null]');
-    assert.equal(run('export INSTABOX_API_KEY=\n'), '[null,null,null]');
-    assert.ok(!fs.existsSync(path.join(dir, 'pwned')) && !fs.existsSync(path.join(dir, 'pwned2')) && !fs.existsSync(path.join(dir, 'x')));
-    assert.equal(run(null, { ...env, FCODE_INSTABOX_ENV: path.join(dir, 'missing') }), '[null,null,null]'); // no file: starts without it
-    assert.equal(run('export INSTABOX_API_KEY=ibk_file\n', { ...env, INSTABOX_API_KEY: 'mine' }), '["mine",null,null]'); // one already set wins
-  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
-});
 // ---- review round 1 ----
 test('POST resume: ids that share their first 8 digits (UUIDv7 timestamp) get different tmux names; the name ends in the last 8', () => withApp(async (c) => {
   const { cookie } = await c.login();
@@ -5190,24 +5263,6 @@ test('POST resume: a session of an unknown format (header version 4, no header) 
   assert.equal((await resumeReq(c, cookie, ID.a)).status, 200); // v3
   assert.equal((await resumeReq(c, cookie, ID.c)).status, 200); // empty but a known header: it exists, omp decides
 }));
-
-test('POST staging/start decides on a FRESH ls: ls failing after a good cached answer -> 503 staging_unavailable, no start', async () => {
-  const s = stubDir();
-  try {
-    s.ls(BOXES);
-    await withApp(async (c) => {
-      const { cookie } = await c.login();
-      assert.equal((await stagingOf(c, cookie))[0].state, 'suspended'); // cached
-      fs.writeFileSync(path.join(s.dir, 'ls-fail'), '');
-      const r = await c.req('POST', '/api/projects/alpha/staging/start', { cookie });
-      assert.deepEqual([r.status, r.json], [503, { ok: false, error: 'staging_unavailable' }]);
-      assert.equal(s.calls().filter((x) => x.argv[0] === 'start').length, 0);
-      assert.equal((await stagingOf(c, cookie))[0].state, 'suspended'); // the card keeps its last good value
-      fs.rmSync(path.join(s.dir, 'ls-fail'));
-      assert.equal((await c.req('POST', '/api/projects/alpha/staging/start', { cookie })).status, 200);
-    }, { instabox: s.instabox, instaboxKey: 'ibk_test' });
-  } finally { s.cleanup(); }
-});
 
 test('omp format guard: an empty or title-only file, and a header-less file younger than 30 s, are being created (no alarm); a complete old one with a bad header is', async () => {
   const s = stubDir();
@@ -5237,6 +5292,7 @@ test('omp format guard: an empty or title-only file, and a header-less file youn
 // (the way the real script does), starts a grandchild, sleeps, exits with a code
 const ADD_FAKE_SRC = `import fs from 'node:fs'; import path from 'node:path'; import { spawn } from 'node:child_process';
 const [dir, ...argv] = process.argv.slice(2);
+fs.writeFileSync(path.join(dir, 'watchdog.pid'), String(process.ppid)); // under ADD_WATCHDOG the parent is the watchdog
 fs.appendFileSync(path.join(dir, 'calls.jsonl'), JSON.stringify({ argv, cfg: process.env.FCODE_CFG }) + '\\n');
 const plan = JSON.parse(fs.readFileSync(path.join(dir, 'plan.json'), 'utf8'));
 for (const l of plan.lines ?? []) fs.writeSync(1, l + '\\n');
@@ -5245,8 +5301,12 @@ if (plan.addProject) {
   c.projects[argv[1]] = plan.addProject; fs.writeFileSync(f + '.tmp', JSON.stringify(c), { mode: 0o600 }); fs.renameSync(f + '.tmp', f);
 }
 if (plan.child) { const k = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }); fs.writeFileSync(path.join(dir, 'child.pid'), String(k.pid)); }
-if (plan.ignoreTerm) {
-  process.on('SIGTERM', () => {});
+if (plan.holdStdout) { // a daemon in its own group keeps the job's stdout open, so the job's 'close' comes long after the watchdog is reaped
+  const d = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: ['ignore', 'inherit', 'ignore'] });
+  fs.writeFileSync(path.join(dir, 'daemon.pid'), String(d.pid));
+}
+if (plan.ignoreTerm) { // 'grand': only the grandchild ignores TERM
+  if (plan.ignoreTerm !== 'grand') process.on('SIGTERM', () => {});
   const gsrc = "process.on('SIGTERM',()=>{});require('fs').writeFileSync(" + JSON.stringify(path.join(dir, 'ready-grand')) + ",String(process.pid));setInterval(()=>{},1000)";
   spawn(process.execPath, ['-e', gsrc], { stdio: 'ignore' });
   fs.writeFileSync(path.join(dir, 'ready-fake'), String(process.pid)); // after the handler above
@@ -5268,9 +5328,10 @@ async function addApp(fn, extra = {}) {
       c.job = (id) => c.req('GET', `/api/projects/jobs/${id}`, { cookie: c.cookie });
       c.jobEnd = async (id) => (await waitFor(async () => { const r = await c.job(id); return r.json?.state !== 'running' && r; })).json;
       await fn(c, dir);
-    }, { addScript: [process.execPath, path.join(dir, 'fake-add.mjs'), dir], ...extra });
+    }, { addScript: [process.execPath, path.join(dir, 'fake-add.mjs'), dir], addKillAfterS: 1, ...extra }); // off Windows a watchdog outlives its job until its kill-after
   } finally {
-    try { process.kill(Number(fs.readFileSync(path.join(dir, 'child.pid'), 'utf8')), 'SIGKILL'); } catch {}
+    try { const p = Number(fs.readFileSync(path.join(dir, 'child.pid'), 'utf8')); if (p > 0) process.kill(p, 'SIGKILL'); } catch {}
+    try { const d = Number(fs.readFileSync(path.join(dir, 'daemon.pid'), 'utf8')); if (d > 0) process.kill(d, 'SIGKILL'); } catch {} // a missing file throws; never kill pid 0 (the runner's own group)
     fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 }
@@ -5377,7 +5438,6 @@ test('add project: every exit code of the script ends the job in its state and c
     [11, R('R DIR_UNSAFE unsafe'), 'failed', 'DIR_CONFLICT', 'unsafe'],
     [24, R('R HOOK_FAIL install'), 'failed', 'FAILED', 'install'], [24, R('R HOOK_FAIL verify'), 'failed', 'FAILED', 'verify'],
     [25, R('R CRED_FAIL config'), 'failed', 'FAILED', 'config'], [26, R('R URL_REWRITE rewrite'), 'failed', 'FAILED', 'rewrite'],
-    [124, R('R KEY_NEW'), 'failed', 'TIMEOUT', null], // timeout(1) ends the job at its deadline
     [0, R('R CFG_EXISTS'), 'done', 'ADDED', null], // a rerun of a registered project: nothing but CFG_EXISTS
     [21, R('R CFG_CONFLICT /data/workspace/else'), 'failed', 'CFG_CONFLICT', '/data/workspace/else'],
     [21, R('R ALIAS_FAIL'), 'failed', 'FAILED', null], // 21 is also "cannot write the ssh config": not a name clash
@@ -5386,7 +5446,7 @@ test('add project: every exit code of the script ends the job in its state and c
     [2, R('R BAD_ARGS'), 'failed', 'BAD_ARGS', null],
     [12, R('R CLONE_FAIL fatal: repository not found'), 'failed', 'CLONE_FAIL', 'fatal: repository not found'],
     [20, R('R KEY_FAIL'), 'failed', 'FAILED', null],
-    [1, [], 'failed', 'FAILED', null], [3, [], 'failed', 'FAILED', null], [10, [], 'failed', 'FAILED', null], [31, [], 'failed', 'FAILED', null], [45, [], 'failed', 'FAILED', null], [137, [], 'failed', 'FAILED', null], // 137 never comes back as a code (timeout(1) --kill-after kills the group, node sees a signal)
+    [1, [], 'failed', 'FAILED', null], [3, [], 'failed', 'FAILED', null], [10, [], 'failed', 'FAILED', null], [31, [], 'failed', 'FAILED', null], [45, [], 'failed', 'FAILED', null], [137, [], 'failed', 'FAILED', null], // 137 never comes back as a code (the watchdog's kill-after KILL hits the group and itself, node sees a signal)
     [127, [], 'failed', 'FAILED', null], [255, [], 'failed', 'FAILED', null],
   ];
   for (const [exit, lines, state, code, detail, key] of cases) {
@@ -5488,13 +5548,13 @@ test('add project: after the timeout the job is TIMEOUT and the whole process gr
   const again = (await c.add({ repo: 'o/r' })).json.job;
   assert.notEqual(again, id);
   assert.equal((await c.jobEnd(again)).code, 'ADDED');
-}, { addTimeoutMs: 400 }));
+}, { addTimeoutMs: 3000 })); // far above a loaded box's node start-up: the second job (ADDED) must never meet the deadline
 
 test('add project: closing the app ends a running script and its group', { skip: process.platform === 'win32' && 'process groups' }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-add-'));
   fs.writeFileSync(path.join(dir, 'fake-add.mjs'), ADD_FAKE_SRC);
   fs.writeFileSync(path.join(dir, 'plan.json'), JSON.stringify({ sleep: 60e3, child: true }));
-  const c = await boot({ addScript: [process.execPath, path.join(dir, 'fake-add.mjs'), dir] });
+  const c = await boot({ addScript: [process.execPath, path.join(dir, 'fake-add.mjs'), dir], addKillAfterS: 1 });
   try {
     const cookie = (await c.login()).cookie;
     assert.equal((await c.req('POST', '/api/projects', { cookie, body: { repo: 'o/r' } })).status, 202);
@@ -5502,7 +5562,7 @@ test('add project: closing the app ends a running script and its group', { skip:
     assert.ok(alive(child));
     await c.close();
     await waitFor(() => !alive(child), 5000);
-  } finally { try { process.kill(Number(fs.readFileSync(path.join(dir, 'child.pid'), 'utf8')), 'SIGKILL'); } catch {} fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+  } finally { try { const p = Number(fs.readFileSync(path.join(dir, 'child.pid'), 'utf8')); if (p > 0) process.kill(p, 'SIGKILL'); } catch {} fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
 });
 
 test('add project: the new project is in /api/home, /api/meta and /api/overview at once, with no restart; ended jobs are kept 30 minutes', () => addApp(async (c) => {
@@ -5758,15 +5818,15 @@ test('add project: ended jobs are pruned on every submit, and at most 50 are kep
   await c.jobEnd((await c.add({ repo: 'o/after' })).json.job);
   assert.ok(c.app.stats().addJobs <= 2, `kept ${c.app.stats().addJobs}`); // only the new one (and, maybe, a job still ending)
 }));
-// the job's deadline and the server's stop, on a real server process (POSIX: process groups and timeout(1))
-async function addServerProc(fn, { timeoutMs = 2500, plan = { sleep: 120e3, child: true }, killAfter } = {}) {
+// the job's deadline and the server's stop, on a real server process (POSIX: process groups and ADD_WATCHDOG)
+async function addServerProc(fn, { timeoutMs = 2500, plan = { sleep: 120e3, child: true }, killAfter = 2 } = {}) { // killAfter: a watchdog outlives its job until then
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-addp-'));
   fs.writeFileSync(path.join(dir, 'fake-add.mjs'), ADD_FAKE_SRC);
   fs.writeFileSync(path.join(dir, 'plan.json'), JSON.stringify(plan));
   const c0 = await freshDir();
   const port = await freePort();
   const child = spawn(process.execPath, [SERVER], { stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, PC_CONFIG_DIR: c0.configDir, PC_PORT: String(port), PC_ADD_TIMEOUT_MS: String(timeoutMs), ...(killAfter && { PC_ADD_KILL_AFTER_S: String(killAfter) }), PC_ADD_SCRIPT: JSON.stringify([process.execPath, path.join(dir, 'fake-add.mjs'), dir]) } });
+    env: { ...process.env, PC_CONFIG_DIR: c0.configDir, PC_PORT: String(port), PC_TMUX: JSON.stringify([process.execPath, FAKE]), FAKE_TMUX_DIR: path.join(c0.root, 'fake'), PC_ADD_TIMEOUT_MS: String(timeoutMs), ...(killAfter && { PC_ADD_KILL_AFTER_S: String(killAfter) }), PC_ADD_SCRIPT: JSON.stringify([process.execPath, path.join(dir, 'fake-add.mjs'), dir]) } });
   const listening = new Promise((resolve) => child.stdout.on('data', (d) => { if (String(d).includes('fcoding listening')) resolve(); }));
   const exited = new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })));
   const pids = () => { try { return Number(fs.readFileSync(path.join(dir, 'child.pid'), 'utf8')); } catch { return 0; } };
@@ -5783,9 +5843,9 @@ async function addServerProc(fn, { timeoutMs = 2500, plan = { sleep: 120e3, chil
       fake = await waitFor(() => pidOf('ready-fake')); grand = await waitFor(() => pidOf('ready-grand'));
     } else grand = await waitFor(() => pids());
     assert.ok(alive(grand));
-    await fn({ child, exited, grand, fake, pid: child.pid, cookie, port });
+    await fn({ child, exited, grand, fake, pid: child.pid, cookie, port, pidOf, dir });
   } finally {
-    for (const pid of [pids(), pidOf('ready-fake'), pidOf('ready-grand')]) if (pid) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+    for (const pid of [pids(), pidOf('ready-fake'), pidOf('ready-grand'), pidOf('watchdog.pid')]) if (pid > 0) { try { process.kill(pid, 'SIGKILL'); } catch {} } // SIGKILL ends a stopped process too
     try { child.kill('SIGKILL'); } catch {}
     await exited;
     fs.rmSync(c0.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
@@ -5797,7 +5857,7 @@ test('add project: the job ends by its own deadline after the server is killed (
   child.kill('SIGKILL'); // a crash: nothing runs close(), the job's process group is left alone
   await exited;
   assert.ok(alive(grand), 'the job survives the crash for now');
-  await waitFor(() => !alive(grand), 15000); // timeout(1) at 2.5 s: TERM to the group (kill-after 10 s)
+  await waitFor(() => !alive(grand), 15000); // the watchdog at 2.5 s: TERM to the group
 }));
 
 test('add project: a stop of the service (SIGTERM, SIGINT) ends the running job and its group, then the process exits', { skip: process.platform === 'win32' && 'POSIX' }, async () => {
@@ -5812,7 +5872,7 @@ test('add project: a stop of the service (SIGTERM, SIGINT) ends the running job 
   }
 });
 
-// timeout(1) --kill-after is load-bearing: a job that ignores TERM (and a grandchild that does too) must still die within the bound.
+// the watchdog's kill-after is load-bearing: a job that ignores TERM (and a grandchild that does too) must still die within the bound.
 // "dead" = gone or a zombie (a killed process may stay a zombie when the box has no reaping init)
 const terminatedPid = (pid) => {
   try {
@@ -5820,17 +5880,106 @@ const terminatedPid = (pid) => {
     return st.slice(st.lastIndexOf(')') + 2, st.lastIndexOf(')') + 3) === 'Z';
   } catch { return true; }
 };
-const addPosix = { skip: process.platform !== 'linux' && 'needs Linux (timeout(1), /proc)' };
+// state letter in /proc/<pid>/stat ('T' = stopped), '' when the process is gone
+const procState = (pid) => { try { const st = fs.readFileSync(`/proc/${pid}/stat`, 'utf8'); return st.slice(st.lastIndexOf(')') + 2, st.lastIndexOf(')') + 3); } catch { return ''; } };
+// a SIGTERM waiting in the process's pending mask (a stopped process keeps it there; SIGTERM = 15 = bit index 14)
+const termQueued = (pid) => {
+  try {
+    const t = fs.readFileSync(`/proc/${pid}/status`, 'utf8');
+    const mask = (k) => BigInt('0x' + (t.match(new RegExp(`^${k}:\\s*([0-9a-f]+)`, 'm'))?.[1] ?? '0'));
+    return (((mask('SigPnd') | mask('ShdPnd')) >> 14n) & 1n) === 1n;
+  } catch { return false; }
+};
+const addPosix = { skip: process.platform !== 'linux' && 'needs Linux (process groups, /proc)' };
 
-test('escalation (server): a job and a grandchild that ignore TERM are killed by timeout --kill-after after a server crash', addPosix, () => addServerProc(async ({ child, exited, fake, grand }) => {
+test('escalation (server): a job and a grandchild that ignore TERM are killed by the watchdog\'s kill-after after a server crash', addPosix, () => addServerProc(async ({ child, exited, fake, grand }) => {
   const t0 = Date.now();
-  child.kill('SIGKILL'); // a crash: only timeout(1) is left to enforce the deadline
+  child.kill('SIGKILL'); // a crash: only the watchdog is left to enforce the deadline
   await exited;
   await waitFor(() => terminatedPid(fake) && terminatedPid(grand), 2500 + 2000 + 2000 + 1500); // deadline 2.5 s + kill-after 2 s + 2 s
   assert.ok(Date.now() - t0 >= 2000, 'not before the deadline'); // they ignored TERM: it took the deadline's TERM and then the KILL
 }, { timeoutMs: 2500, killAfter: 2, plan: { sleep: 120e3, ignoreTerm: true } }));
 
-test('escalation (server): a stop of the service forwards TERM through timeout(1) and its kill-after kills a job that ignores it, the server exits 0', addPosix, () => addServerProc(async ({ child, exited, fake, grand }) => {
+// the case uutils' timeout and an early-exiting watchdog both miss: the job itself ends on TERM, only its grandchild ignores it
+test('escalation (server): after a server crash a grandchild that ignores TERM still dies by the KILL, though its job ended on the TERM', addPosix, () => addServerProc(async ({ child, exited, fake, grand }) => {
+  const t0 = Date.now();
+  child.kill('SIGKILL');
+  await exited;
+  await waitFor(() => terminatedPid(fake), 2500 + 2000); // the deadline's TERM ends the job
+  assert.ok(!terminatedPid(grand), 'the grandchild outlives the TERM');
+  await waitFor(() => terminatedPid(grand), 2000 + 2000 + 1500); // the KILL at the deadline + kill-after
+  assert.ok(Date.now() - t0 >= 2000, 'not before the deadline');
+}, { timeoutMs: 2500, killAfter: 2, plan: { sleep: 120e3, ignoreTerm: 'grand' } }));
+
+// ADD_WATCHDOG on its own. Not armed: the exit like timeout(1) (the job's code or signal; 127 when it cannot start). Armed (deadline or forwarded
+// TERM): never an exit before the KILL, and the KILL ends it as a signal
+const runWatchdog = (ms, job, { ready, capMs = 15000 } = {}) => new Promise((resolve) => {
+  const w = spawn(process.execPath, ['-e', ADD_WATCHDOG, String(ms), '1000', ...job], { stdio: ['ignore', 'ignore', 'pipe'], detached: true });
+  let err = '';
+  w.stderr.on('data', (d) => { err += d; });
+  if (ready) waitFor(() => fs.existsSync(ready)).then(() => process.kill(w.pid, 'SIGTERM')); // the server's close(): TERM to the watchdog alone
+  // a watchdog that never ends must not hang the run: the group dies and the row fails on `capped`
+  let capped = false;
+  const cap = setTimeout(() => { capped = true; try { process.kill(-w.pid, 'SIGKILL'); } catch {} }, capMs);
+  cap.unref();
+  w.on('close', (code, signal) => { clearTimeout(cap); resolve({ code, signal, err, ...(capped && { capped }) }); });
+});
+const sh = (src) => ['bash', '-c', src]; // bash sets its trap at once, before any TERM can come (the sleeps inherit an ignored TERM)
+
+test('add watchdog: exit codes (normal, signal, cannot start) and, after a TERM, the group KILL and nothing before it', addPosix, async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-wd-'));
+  const run = async (...a) => { const { err, ...r } = await runWatchdog(...a); assert.doesNotMatch(err, /Debugger|inspector/i); return r; }; // no inspector opened
+  try {
+    assert.deepEqual(await run(60e3, sh('exit 7')), { code: 7, signal: null });
+    assert.deepEqual(await run(60e3, sh('kill -HUP $$')), { code: null, signal: 'SIGHUP' }); // the job's signal, raised again
+    // signals this node handles itself are not raised again (SIGPIPE: ignored; SIGUSR1: would open the inspector, "Debugger listening";
+    // SIGTERM: the watchdog's own handler): 128 + n, which the server reads the same as the signal
+    assert.deepEqual(await run(60e3, sh('kill -PIPE $$')), { code: 141, signal: null });
+    assert.deepEqual(await run(60e3, sh('kill -USR1 $$')), { code: 138, signal: null });
+    assert.deepEqual(await run(60e3, sh('kill -TERM $$')), { code: 143, signal: null });
+    for (const n of [141, 138, 143]) assert.deepEqual(addOutcome(n, 'R KEY_NEW\n'), addOutcome(null, 'R KEY_NEW\n'));
+    const t0 = Date.now(); // a job that ends on the deadline's TERM: the old watchdog left at once with 124; now it waits for the KILL
+    assert.deepEqual(await run(300, sh('while :; do sleep 0.1; done')), { code: null, signal: 'SIGKILL' });
+    assert.ok(Date.now() - t0 >= 300 + 1000, `${Date.now() - t0} ms: not before deadline + kill-after`);
+    assert.deepEqual(await run(300, sh('trap "" TERM; while :; do sleep 0.1; done')), { code: null, signal: 'SIGKILL' }); // the group KILL, itself too
+    const ready = path.join(tmp, 'ready'); // written after the trap is set: no TERM before it
+    assert.deepEqual(await run(60e3, sh(`trap "exit 143" TERM; : > '${ready}'; while :; do sleep 0.1; done`), { ready }), { code: null, signal: 'SIGKILL' }); // the script's own TERM code is not used
+    assert.ok(Date.now() - fs.statSync(ready).mtimeMs >= 1000, 'not before kill-after after the TERM');
+    // the TERM must reach a member of the group that is not the watchdog's direct child: bash forks a real grandchild for the first command of
+    // `cmd; :` (no exec), and the job itself dies on the group TERM, so only the watchdog's group TERM can run the grandchild's trap
+    const marker = path.join(tmp, 'marker'), ready6 = path.join(tmp, 'ready6'), g = path.join(tmp, 'g.sh');
+    fs.writeFileSync(g, `trap ': > "${marker}"; exit 0' TERM; : > "${ready6}"; while :; do sleep 0.1; done\n`);
+    assert.deepEqual(await run(60e3, sh(`bash '${g}'; :`), { ready: ready6 }), { code: null, signal: 'SIGKILL' });
+    assert.ok(Date.now() - fs.statSync(ready6).mtimeMs >= 1000, 'row 6: not before kill-after after the TERM');
+    assert.ok(fs.existsSync(marker), 'row 6: the grandchild got the group TERM');
+    assert.deepEqual(await run(60e3, ['/nonexistent/fcode-add']), { code: 127, signal: null });
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
+
+// the race no scan of the group can close: a process forks after any look at it, and the process that was seen exits. The job's TERM trap forks a
+// descendant that ignores TERM and exits 0 at once; only the group KILL that the watchdog always sends can end that descendant.
+test('add watchdog: a descendant forked while the TERM is handled still gets the group KILL (the watchdog never leaves early)', addPosix, async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-wdfork-'));
+  const ready = path.join(tmp, 'ready'), pidFile = path.join(tmp, 'desc.pid'), desc = path.join(tmp, 'desc.sh');
+  const descPid = () => { try { return Number(fs.readFileSync(pidFile, 'utf8')) || 0; } catch { return 0; } };
+  fs.writeFileSync(desc, `trap '' TERM\necho $$ > '${pidFile}.tmp' && mv '${pidFile}.tmp' '${pidFile}'\nexec sleep 1000\n`);
+  try {
+    // the trap ignores TERM first, so the descendant is born ignoring it (the TERM reaches the group once, from the watchdog)
+    const job = sh(`trap "trap '' TERM; bash '${desc}' </dev/null >/dev/null 2>&1 & exit 0" TERM; : > '${ready}'; while :; do sleep 0.1; done`);
+    const { err, ...r } = await runWatchdog(60e3, job, { ready });
+    assert.deepEqual(r, { code: null, signal: 'SIGKILL' }); // a capped run fails here
+    assert.ok(Date.now() - fs.statSync(ready).mtimeMs >= 1000, 'not before kill-after after the TERM');
+    const pid = descPid();
+    assert.ok(pid > 0, 'the descendant started');
+    await waitFor(() => terminatedPid(pid), 2000);
+  } finally {
+    const pid = descPid();
+    if (pid) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('escalation (server): a stop of the service forwards TERM through the watchdog and its kill-after kills a job that ignores it, the server exits 0', addPosix, () => addServerProc(async ({ child, exited, fake, grand }) => {
   child.kill('SIGTERM');
   const r = await Promise.race([exited, new Promise((x) => setTimeout(x, 8000, 'hung'))]);
   assert.notEqual(r, 'hung', 'the server did not exit');
@@ -5838,17 +5987,80 @@ test('escalation (server): a stop of the service forwards TERM through timeout(1
   await waitFor(() => terminatedPid(fake) && terminatedPid(grand), 2000 + 2000 + 1000); // kill-after 2 s + 2 s
 }, { timeoutMs: 600e3, killAfter: 2, plan: { sleep: 120e3, ignoreTerm: true } }));
 
-test('add project: after a normal TIMEOUT close no late SIGKILL is sent (the kill-grace timer is cleared when the job is gone)', () => addApp(async (c) => {
+// the server's stop TERMs the watchdog alone. The watchdog and the job are stopped first, so a TERM from the server to the job's group would
+// stay queued in the stopped job (read from /proc, no timing); a SIGSTOP that is still pending is taken before a TERM (lower number first)
+test('escalation (server): the server\'s stop TERMs the watchdog alone; a stopped watchdog holds it, and after CONT it forwards the TERM and KILLs at kill-after', addPosix, () => addServerProc(async ({ child, exited, fake, grand, pidOf }) => {
+  const wd = pidOf('watchdog.pid'); assert.ok(wd > 0);
+  process.kill(wd, 'SIGSTOP'); process.kill(fake, 'SIGSTOP');
+  await waitFor(() => procState(wd) === 'T' && procState(fake) === 'T'); // a TERM that lands while the SIGSTOP is still pending is taken first (lower signal number), runs the handler and leaves no trace
+  child.kill('SIGTERM'); // the server stops: close() → TERM
+  const r = await Promise.race([exited, new Promise((x) => setTimeout(x, 8000, 'hung'))]);
+  assert.notEqual(r, 'hung', 'the server did not exit');
+  assert.equal(r.code, 0);
+  assert.ok(!termQueued(fake), 'a TERM reached the job while its watchdog was stopped: the server signalled the group'); // exact: kill(2) on the group queues the TERM before the server can exit, and a stopped process keeps it queued
+  assert.ok(alive(fake) && alive(grand));
+  process.kill(wd, 'SIGCONT');
+  await waitFor(() => termQueued(fake), 3000); // the watchdog forwards the TERM once armed
+  await waitFor(() => terminatedPid(fake) && terminatedPid(grand), 2000 + 2000); // the KILL at kill-after; SIGKILL ends a stopped process
+}, { timeoutMs: 600e3, killAfter: 2, plan: { sleep: 120e3, ignoreTerm: true } }));
+
+test('add project: after a normal TIMEOUT close no late SIGKILL is sent (the kill-grace timer is cleared when the watchdog is reaped)', () => addApp(async (c) => {
   const kills = []; const orig = process.kill;
   process.kill = (pid, sig) => { if (sig === 'SIGKILL') kills.push(pid); return orig.call(process, pid, sig); };
   try {
     c.plan({ sleep: 60e3 });
     const j = await c.jobEnd((await c.add({ repo: 'o/r' })).json.job);
     assert.equal(j.code, 'TIMEOUT');
-    await new Promise((r) => setTimeout(r, 2000)); // far past the 600 ms grace
+    await new Promise((r) => setTimeout(r, 2000)); // past the 1000 ms grace (the watchdog's own KILL at 600 ms ends the job and clears it)
     assert.deepEqual(kills, [], 'a SIGKILL went to a group that was already gone');
   } finally { process.kill = orig; }
-}, { addTimeoutMs: 300, addKillGraceMs: 600 }));
+}, { addTimeoutMs: 300, addKillAfterS: 0.3, addKillGraceMs: 1000 })); // kill-after < kill-grace, as in production
+
+// the server's close() and its deadline timer TERM the watchdog alone; only the watchdog's term() TERMs the group, once armed. A stopped watchdog
+// (and a stopped job, so that a TERM stays queued in it and a pending one can be read from /proc) shows who sent what: the server must not
+// reach the job's group before the watchdog is armed, or the job's exit could be seen first and no KILL would follow.
+test('add project: at the deadline the server TERMs the watchdog alone; a stopped watchdog holds it, and after CONT it forwards the TERM and KILLs at kill-after', addPosix, () => addApp(async (c, dir) => {
+  const pidIn = (f) => { try { return Number(fs.readFileSync(path.join(dir, f), 'utf8')) || 0; } catch { return 0; } };
+  c.plan({ sleep: 120e3, ignoreTerm: true });
+  const id = (await c.add({ repo: 'o/r' })).json.job;
+  const fake = await waitFor(() => pidIn('ready-fake')), grand = await waitFor(() => pidIn('ready-grand')), wd = pidIn('watchdog.pid');
+  try {
+    assert.ok(wd > 0);
+    process.kill(wd, 'SIGSTOP'); process.kill(fake, 'SIGSTOP');
+    await waitFor(() => procState(wd) === 'T' && procState(fake) === 'T');
+    // the watchdog's own deadline starts after the server's timer: 'running' here means neither fired while the watchdog was running
+    assert.equal((await c.job(id)).json.state, 'running', 'the deadline came before the watchdog was stopped: box too slow to judge');
+    assert.equal((await c.jobEnd(id)).code, 'TIMEOUT'); // the server's timer ran; its TERM goes out in the same callback
+    assert.ok(!termQueued(fake), 'a TERM reached the job at the deadline while its watchdog was stopped: the server signalled the group');
+    assert.ok(alive(grand));
+    process.kill(wd, 'SIGCONT');
+    await waitFor(() => termQueued(fake), 3000); // the watchdog forwards it once armed
+    await waitFor(() => terminatedPid(fake) && terminatedPid(grand), 1000 + 2000); // the KILL at kill-after (addApp: 1 s)
+  } finally { for (const p of [fake, grand, wd]) if (p > 0) { try { process.kill(p, 'SIGKILL'); } catch {} } }
+}, { addTimeoutMs: 3000 }));
+
+// a process in another group (a daemon) holds the job's stdout, so 'close' comes long after the watchdog was reaped ('exit'): from the reap on
+// the group id may be anyone's, and the server must send nothing to it
+test('add project: after the watchdog is reaped the server sends nothing to the job\'s group id, even while a process in another group still holds stdout', addPosix, () => addApp(async (c, dir) => {
+  const pidIn = (f) => { try { return Number(fs.readFileSync(path.join(dir, f), 'utf8')) || 0; } catch { return 0; } };
+  const kills = []; const orig = process.kill;
+  process.kill = (pid, sig) => { kills.push([pid, sig]); return orig.call(process, pid, sig); };
+  try {
+    c.plan({ holdStdout: true });
+    const id = (await c.add({ repo: 'o/r' })).json.job;
+    const wd = await waitFor(() => pidIn('watchdog.pid'));
+    await waitFor(() => !fs.existsSync('/proc/' + wd)); // the watchdog exited 0 and was reaped; 'close' is pending: the daemon holds stdout
+    assert.equal((await c.job(id)).json.state, 'running', 'the deadline fired before the reap was observed: box too slow to judge'); // from here every deadline/grace signal is after the reap
+    const j = await c.jobEnd(id);
+    assert.equal(j.code, 'TIMEOUT');
+    await sleep(1000); // past the 300 ms grace
+    assert.deepEqual(kills.filter(([pid]) => pid < 0 || pid === wd), [], 'a signal went to the job\'s group id after the watchdog was reaped');
+  } finally {
+    process.kill = orig;
+    const d = pidIn('daemon.pid');
+    if (d > 0) { try { process.kill(d, 'SIGKILL'); } catch {} }
+  }
+}, { addTimeoutMs: 3000, addKillGraceMs: 300 }));
 
 // ======================= v1.3.3: POST /api/projects/<name>/upload (CONTRACT A12) =======================
 const JPG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46, 0x49, 0x46, 1, 2, 3]);
@@ -6233,13 +6445,32 @@ test('upload: attach puts the path alone in the input, no Enter: claude, omp, sh
     const keys = calls.flatMap((x) => x.argv);
     assert.ok(!keys.includes('Enter'), `${h}: Enter was sent`);
     assert.ok(!calls.some((x) => x.argv[0] === 'send-keys' && x.argv.some((a) => /^(C-m|KPEnter)$/.test(a))), h);
+    const quit = ['copy-mode', '-q', '-t', `=s-${h}:`]; // a laptop may have left the pane in copy mode: leave it first
     if (h === 'codex') {
-      assert.deepEqual(calls.map((x) => x.argv), [['send-keys', '-t', '=s-codex:', '-l', '--', r.json.path]]);
+      assert.deepEqual(calls.map((x) => x.argv), [quit, ['send-keys', '-t', '=s-codex:', '-l', '--', r.json.path]]);
     } else {
-      assert.deepEqual(calls.map((x) => x.argv), [['load-buffer', '-b', 'pc', '-'], ['paste-buffer', '-p', '-d', '-b', 'pc', '-t', `=s-${h}:`]]);
-      assert.equal(calls[0].text, r.json.path); // the path and nothing else: no newline, no quotes
+      assert.deepEqual(calls.map((x) => x.argv), [quit, ['load-buffer', '-b', 'pc', '-'], ['paste-buffer', '-p', '-d', '-b', 'pc', '-t', `=s-${h}:`]]);
+      assert.equal(calls[1].text, r.json.path); // the path and nothing else: no newline, no quotes
     }
   }
+}));
+
+test('upload: attach leaves any pane mode (copy-mode -q) before it types the path, and types nothing when that fails', () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 'm-codex', 'codex');
+  await mkAgent(c, cookie, 'm-claude', 'claude');
+  for (const h of ['codex', 'claude']) {
+    const before = c.calls().length;
+    assert.equal((await upPost(c, cookie, 'alpha', JPG, { session: `m-${h}` })).json.attached, true, h);
+    const typed = c.calls().slice(before).map((x) => x.argv[0]).filter((a) => a !== 'list-sessions');
+    assert.deepEqual(typed, h === 'codex' ? ['copy-mode', 'send-keys'] : ['copy-mode', 'load-buffer', 'paste-buffer'], h);
+  }
+  const before = c.calls().length;
+  await withEnv({ FAKE_TMUX_FAIL_ON: 'copy-mode' }, async () => {
+    const r = await upPost(c, cookie, 'alpha', JPG, { session: 'm-codex' });
+    assert.equal(r.status, 200, r.text);
+    assert.equal(r.json.attached, false); // the file is saved, the input is not touched
+  });
+  assert.ok(!c.calls().slice(before).some((x) => ['send-keys', 'load-buffer', 'paste-buffer'].includes(x.argv[0])));
 }));
 
 test('upload: without a session nothing goes to tmux and attached is false', () => withUpload(async (c, dirs, cookie) => {
@@ -6813,32 +7044,13 @@ test('warm-up: a part past its TTL is refreshed by the timer with no request, on
   assert.equal(c.toolCalls('pr list').length, 4);
 }, { warmTickMs: 30, homeWaitMs: 3000 }));
 
-test('warm-up: the staging box list is kept warm too (only with a key), and close() stops the timer', async () => {
-  const s = stubDir();
-  const clock = { t: 1_700_000_000_000 };
-  try {
-    s.ls(BOXES);
-    await withApp(async (c) => {
-      assert.ok(await until(() => s.calls().length === 1)); // no request yet
-      await sleep(150);
-      assert.equal(s.calls().length, 1);
-      clock.t += 31e3; // past the 30 s TTL
-      assert.ok(await until(() => s.calls().length === 2));
-      await c.app.close();
-      clock.t += 61e3;
-      await sleep(200); // a timer left running would have read again
-      assert.equal(s.calls().length, 2);
-    }, { instabox: s.instabox, instaboxKey: 'ibk_test', now: () => clock.t, warmTickMs: 30 });
-  } finally { s.cleanup(); }
-});
-
 test('warm-up: a server that closed leaves nothing running (the process exits on its own)', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-warm-'));
   try {
     fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({ cookieSecret: Buffer.alloc(32, 7).toString('base64'), projects: { alpha: ABS }, port: 7681 }));
     const code = `import { createApp } from ${JSON.stringify(pathToFileURL(SERVER).href)};
 const bad = [process.execPath, '-e', 'process.exit(1)'];
-const app = createApp({ configDir: ${JSON.stringify(dir)}, tmux: bad, omp: bad, gh: bad, git: bad, instabox: bad, instaboxKey: 'k', spendRoots: {}, ompSessionsRoot: ${JSON.stringify(path.join(dir, 'o'))}, warmTickMs: 20, log: () => {} });
+const app = createApp({ configDir: ${JSON.stringify(dir)}, tmux: bad, omp: bad, gh: bad, git: bad, spendRoots: {}, ompSessionsRoot: ${JSON.stringify(path.join(dir, 'o'))}, warmTickMs: 20, log: () => {} });
 await app.listen(0, '127.0.0.1');
 await new Promise((r) => setTimeout(r, 150));
 await app.close();`;
@@ -7088,3 +7300,1063 @@ test('GET /api/home?fresh=1: the quota and the reset listing are read side by si
   assert.ok(took >= 1400 && took < 2700, `took ${took} ms`); // in series it would be 3 s and more
   assert.deepEqual([resetsOf(h), pct(h), h.accounts.every((a) => !a.stale)], [3, 42, true]);
 }));
+
+// ======================= box/fcode-add-run.sh: the box CLI `fcode-add` (laptop `fcode add` and the owner's manual entry) =======================
+// It runs the installed fcode-add.sh under the server's own ADD_WATCHDOG (read from server.mjs, never a copy), under setsid. Its deadline exit is 137.
+const ADD_RUN = path.join(here, '..', 'box', 'fcode-add-run.sh');
+const REPO_ROOT = path.join(here, '..');
+const addRunEnv = (vars) => envWith({ HOME: os.tmpdir(), PATH: `${path.dirname(process.execPath)}${path.delimiter}${process.env.PATH}`, FCODE_APP: REPO_ROOT,
+  FCODE_ADD_SCRIPT: undefined, FCODE_ADD_TIMEOUT_S: undefined, FCODE_ADD_KILL_AFTER_S: undefined, ...vars });
+// Every run spawns its child detached (own session and group, as sshd or a tty gives it). 'direct': the CLI itself is that group's leader (`ssh box fcode-add …`, or an
+// interactive job; the laptop's payload is the 'parent' shape: bash -c leads, bash -l execs the CLI); 'parent': a bash leader runs the CLI in the foreground, so the CLI is a plain member of that group (no leader), and reports the CLI's
+// status (`rc=`) and a bystander of that group (`bystander up|gone`); 'bg': like 'parent', but the CLI runs in the background and its pid is printed (`cli=`).
+// sendSig: { sig, when }: once when() holds (via 'bg' also once `cli=` is out) the signal goes to the CLI's own pid ('bg'), or to the CLI's whole
+// group ('direct', which is what a tty does on Ctrl-C or a hangup). The watchdog and the job live in their own session (setsid), out of the caller's
+// group, so the cap must end both: it kills the caller's group and the job's group (the job writes its pgid to $FCODE_TEST_PGID, see addRunScript),
+// and resolves even when the pipes do not close.
+function runAddCli(env, { args = ['o/r', 'name'], via = 'parent', capMs = 20000, sendSig } = {}) {
+  return new Promise((resolve) => {
+    const t0 = Date.now();
+    const pgidFile = env.FCODE_TEST_PGID ?? (env.FCODE_ADD_SCRIPT ? path.join(path.dirname(env.FCODE_ADD_SCRIPT), 'job.pgid') : undefined);
+    if (pgidFile) fs.rmSync(pgidFile, { force: true });
+    const argv = via === 'direct' ? ['/bin/sh', [ADD_RUN, ...args]]
+      : via === 'bg' ? ['/bin/bash', ['-c', 'sleep 1000 & b=$!; /bin/sh "$0" "$@" & c=$!; echo "cli=$c"; wait $c; rc=$?; if kill -0 $b 2>/dev/null; then echo "bystander up"; else echo "bystander gone"; fi; kill $b 2>/dev/null; echo "rc=$rc"', ADD_RUN, ...args]]
+      : ['/bin/bash', ['-c', 'sleep 1000 & b=$!; /bin/sh "$0" "$@"; rc=$?; if kill -0 $b 2>/dev/null; then echo "bystander up"; else echo "bystander gone"; fi; kill $b 2>/dev/null; echo "rc=$rc"', ADD_RUN, ...args]];
+    const p = spawn(argv[0], argv[1], { env: addRunEnv({ ...env, ...(pgidFile && { FCODE_TEST_PGID: pgidFile }) }), stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    let out = '', err = '', capped = false, done = false, sigAt = 0;
+    const finish = (code, signal) => {
+      if (done) return; done = true; clearTimeout(cap);
+      resolve({ code, signal, out, err, ms: Date.now() - t0, sigAt, capped, rc: /^rc=(\d+)$/m.exec(out)?.[1] ?? null, bystander: /^bystander (\w+)$/m.exec(out)?.[1] ?? null });
+    };
+    p.stdout.on('data', (d) => { out += d; }); p.stderr.on('data', (d) => { err += d; });
+    if (sendSig) waitFor(() => sendSig.when() && (via !== 'bg' || /^cli=\d+$/m.test(out)), capMs).then(() => {
+      sigAt = Date.now();
+      process.kill(via === 'bg' ? Number(/^cli=(\d+)$/m.exec(out)[1]) : -p.pid, sendSig.sig);
+    }).catch(() => {});
+    const cap = setTimeout(() => {
+      capped = true;
+      killJobGroup(pgidFile);
+      try { process.kill(-p.pid, 'SIGKILL'); } catch {}
+      setTimeout(() => finish(null, 'SIGKILL'), 3000);
+    }, capMs);
+    p.on('close', finish);
+  });
+}
+// SIGKILLs the process group whose id the job wrote to pgidFile (the watchdog's group: the watchdog, the job and every descendant)
+function killJobGroup(pgidFile) {
+  let g = 0; try { g = Number(fs.readFileSync(pgidFile, 'utf8')) || 0; } catch {}
+  if (g > 1) { try { process.kill(-g, 'SIGKILL'); } catch {} }
+}
+const addRunDir = (prefix) => fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+// every job starts by writing its process-group id to $FCODE_TEST_PGID (set by runAddCli), so a test can end the whole group
+const addRunScript = (dir, body) => {
+  const f = path.join(dir, 'job.sh');
+  fs.writeFileSync(f, `[ -z "$FCODE_TEST_PGID" ] || { cut -d' ' -f5 /proc/$$/stat > "$FCODE_TEST_PGID.tmp" && mv "$FCODE_TEST_PGID.tmp" "$FCODE_TEST_PGID"; }\n${body}`);
+  return f;
+};
+
+test('fcode-add CLI: install.sh installs it as ~/.local/bin/fcode-add beside fcode-deploy and lists it in the usage text', () => {
+  const install = fs.readFileSync(path.join(here, '..', 'install.sh'), 'utf8');
+  assert.match(install, /\n\[ ! -f "\$SRC\/box\/fcode-add-run\.sh" \] \|\| install -D -m 755 "\$SRC\/box\/fcode-add-run\.sh" "\$HOME\/\.local\/bin\/fcode-add"\n/);
+  assert.match(install, /fcode-add <owner\/repo> <name>/); // the usage text at the end
+});
+
+test('fcode-add CLI: the job\'s exit code, stdout, stderr and arguments pass through; a clean run is quick and signals nobody', addPosix, async () => {
+  const dir = addRunDir('pc-addrun-');
+  try {
+    const s = addRunScript(dir, 'echo "R KEY_NEW ssh-ed25519 AAAA"; echo "args=$1|$2"; echo "oops" >&2; exit 7\n');
+    for (const via of ['parent', 'direct']) {
+      const r = await runAddCli({ FCODE_ADD_SCRIPT: s }, { via });
+      assert.ok(!r.capped, via);
+      assert.match(r.out, /^R KEY_NEW ssh-ed25519 AAAA\nargs=o\/r\|name\n/, via);
+      assert.match(r.err, /^oops\n/, via);
+      if (via === 'parent') assert.deepEqual([r.rc, r.bystander], ['7', 'up'], r.out);
+      else assert.deepEqual([r.code, r.signal], [7, null], via);
+    }
+    const ok = await runAddCli({ FCODE_ADD_SCRIPT: addRunScript(dir, 'echo "R OK"\n') });
+    assert.deepEqual([ok.rc, ok.bystander], ['0', 'up']);
+    assert.ok(ok.ms < 8000, `${ok.ms} ms: a job that ends on its own must not wait for the deadline`);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('fcode-add CLI: the caller is a process-group leader (`ssh box fcode-add …`, an interactive job): the job\'s code is not lost (a bare `exec setsid` would fork and answer 0 at once)', addPosix, async () => {
+  const dir = addRunDir('pc-addrun-');
+  try {
+    const r = await runAddCli({ FCODE_ADD_SCRIPT: addRunScript(dir, 'sleep 0.4; echo "R DONE"; exit 7\n') }, { via: 'direct' });
+    assert.deepEqual([r.code, r.signal, r.out], [7, null, 'R DONE\n']);
+    // and the deadline, as the same leader sees it: the watchdog's group KILL, 137 (or the signal itself), never 0, never 124
+    const pidFile = path.join(dir, 'leader.pid');
+    const d = await runAddCli({ FCODE_ADD_SCRIPT: addRunScript(dir, `echo $$ > '${pidFile}'; trap '' TERM; while :; do sleep 0.1; done\n`), FCODE_ADD_TIMEOUT_S: '1', FCODE_ADD_KILL_AFTER_S: '1' }, { via: 'direct' });
+    assert.ok(!d.capped);
+    assert.deepEqual([d.code, d.signal], [137, null], d.out); // only the watchdog's group KILL: a KILLed CLI (no setsid) would show signal SIGKILL
+    assert.ok(d.ms >= 2000, `${d.ms} ms: not before the deadline + kill-after`);
+    await waitFor(() => terminatedPid(Number(fs.readFileSync(pidFile, 'utf8'))), 3000);
+  } finally { killJobGroup(path.join(dir, 'job.pgid')); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// the job forks a grandchild that ignores TERM (set before the exec, so the sleep is born ignoring it), waits until it exists, then idles; the job itself dies on a TERM
+const GRAND_JOB = `bash -c 'trap "" TERM; echo $$ > "$FCODE_TEST_PID.tmp" && mv "$FCODE_TEST_PID.tmp" "$FCODE_TEST_PID"; exec sleep 1000' </dev/null >/dev/null 2>&1 &
+while [ ! -s "$FCODE_TEST_PID" ]; do sleep 0.02; done
+echo "R WAITING"
+exec sleep 1000
+`;
+test('fcode-add CLI: the deadline TERMs the group and, kill-after later, KILLs it: a TERM-ignoring grandchild dies, exit 137 (not 124, not before 2 s), the caller\'s group is not signalled', addPosix, async () => {
+  const dir = addRunDir('pc-addrun-');
+  const pidFile = path.join(dir, 'grand.pid');
+  const readPid = () => { try { return Number(fs.readFileSync(pidFile, 'utf8')) || 0; } catch { return 0; } };
+  try {
+    const s = addRunScript(dir, GRAND_JOB);
+    const r = await runAddCli({ FCODE_ADD_SCRIPT: s, FCODE_ADD_TIMEOUT_S: '1', FCODE_ADD_KILL_AFTER_S: '1', FCODE_TEST_PID: pidFile });
+    assert.ok(!r.capped, 'the run hung');
+    assert.equal(r.rc, '137', r.out);
+    assert.match(r.out, /^R WAITING\n/);
+    assert.ok(r.ms >= 2000, `${r.ms} ms: not before deadline + kill-after`);
+    assert.ok(r.ms < 12000, `${r.ms} ms`);
+    assert.equal(r.bystander, 'up', 'a process of the caller\'s group was killed: the watchdog\'s kill(0) reached the caller\'s group');
+    const grand = readPid();
+    assert.ok(grand > 0, 'the grandchild started');
+    await waitFor(() => terminatedPid(grand), 3000);
+  } finally {
+    killJobGroup(path.join(dir, 'job.pgid'));
+    const g = readPid(); if (g) { try { process.kill(g, 'SIGKILL'); } catch {} }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('fcode-add CLI: no script, no server.mjs or a server without ADD_WATCHDOG -> R NO_SCRIPT and exit 3, nothing is run', addPosix, async () => {
+  const dir = addRunDir('pc-addrun-');
+  try {
+    const marker = path.join(dir, 'ran');
+    const s = addRunScript(dir, `: > '${marker}'\n`);
+    const app = path.join(dir, 'app'); fs.mkdirSync(app);
+    const bad = path.join(dir, 'bad'); fs.mkdirSync(bad); fs.writeFileSync(path.join(bad, 'server.mjs'), 'export const NOTHING = 1;\n');
+    const throwing = path.join(dir, 'throwing'); fs.mkdirSync(throwing); fs.writeFileSync(path.join(throwing, 'server.mjs'), 'throw new Error("boom");\n');
+    const empty = path.join(dir, 'empty'); fs.mkdirSync(empty); fs.writeFileSync(path.join(empty, 'server.mjs'), 'export const ADD_WATCHDOG = "";\n');
+    const cases = {
+      'missing script': { FCODE_APP: REPO_ROOT, FCODE_ADD_SCRIPT: path.join(dir, 'nope.sh') },
+      'missing server.mjs': { FCODE_APP: app, FCODE_ADD_SCRIPT: s },
+      'server without ADD_WATCHDOG': { FCODE_APP: bad, FCODE_ADD_SCRIPT: s },
+      'server that throws on import': { FCODE_APP: throwing, FCODE_ADD_SCRIPT: s },
+      'empty ADD_WATCHDOG': { FCODE_APP: empty, FCODE_ADD_SCRIPT: s },
+    };
+    for (const [what, env] of Object.entries(cases)) for (const via of ['parent', 'direct']) {
+      const r = await runAddCli(env, { via });
+      assert.ok(!r.capped, what);
+      assert.match(r.out, /^R NO_SCRIPT\n/, `${what} (${via})`);
+      if (via === 'parent') assert.equal(r.rc, '3', what); else assert.deepEqual([r.code, r.signal], [3, null], what);
+    }
+    assert.ok(!fs.existsSync(marker), 'the script ran');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('fcode-add CLI: limits are 1 to 5 digits without a leading zero; anything else falls back to 600 s / 30 s (seen on the watchdog\'s argv)', addPosix, async () => {
+  const dir = addRunDir('pc-addrun-');
+  try {
+    // a server whose ADD_WATCHDOG only prints its own argv: [timeout ms, kill-after ms, bash, script, args...]
+    const app = path.join(dir, 'app'); fs.mkdirSync(app);
+    fs.writeFileSync(path.join(app, 'server.mjs'), 'export const ADD_WATCHDOG = "process.stdout.write(JSON.stringify(process.argv.slice(1)))";\n');
+    const s = addRunScript(dir, 'exit 0\n');
+    const seen = async (t, k) => {
+      const r = await runAddCli({ FCODE_APP: app, FCODE_ADD_SCRIPT: s, FCODE_ADD_TIMEOUT_S: t, FCODE_ADD_KILL_AFTER_S: k }, { via: 'direct' });
+      assert.deepEqual([r.code, r.err], [0, '']);
+      return JSON.parse(r.out);
+    };
+    assert.deepEqual(await seen(undefined, undefined), ['600000', '30000', 'bash', s, 'o/r', 'name']);
+    assert.deepEqual((await seen('5', '7')).slice(0, 2), ['5000', '7000']);
+    assert.deepEqual((await seen('99999', '12')).slice(0, 2), ['99999000', '12000']);
+    for (const bad of ['0', 'x', '', '-1', '01', '1.5', '100000', ' 5', '5 ', '1e3', '5;ls']) {
+      assert.deepEqual((await seen(bad, bad)).slice(0, 2), ['600000', '30000'], JSON.stringify(bad));
+      assert.deepEqual((await seen(bad, '9')).slice(0, 2), ['600000', '9000'], `timeout ${JSON.stringify(bad)}`); // each limit on its own
+      assert.deepEqual((await seen('9', bad)).slice(0, 2), ['9000', '30000'], `kill-after ${JSON.stringify(bad)}`);
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// the laptop's $FcodeAddRun (laptop/fcode.ps1) is the box-side snippet the laptop sends over ssh: run it here with bash against a fake ~/.local/bin/fcode-add
+test('laptop $FcodeAddRun: execs ~/.local/bin/fcode-add, no timeout(1); the FCODE_ADD_* vars and the arguments reach it; a missing CLI gives R NO_SCRIPT and exit 3', { skip: process.platform === 'win32' && 'bash' }, () => {
+  const ps1 = fs.readFileSync(path.join(here, '..', 'laptop', 'fcode.ps1'), 'utf8');
+  const m = /\$FcodeAddRun = \(@'\r?\n([\s\S]*?)\r?\n'@\)/.exec(ps1);
+  assert.ok(m, '$FcodeAddRun here-string not found in laptop/fcode.ps1');
+  const snippet = m[1].replace(/\r\n/g, '\n') + '\n';
+  assert.match(snippet, /\$HOME\/\.local\/bin\/fcode-add/);
+  assert.match(snippet, /exec "\$f" "\$@"/);
+  assert.doesNotMatch(snippet, /\btimeout\b/);
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-lapadd-'));
+  try {
+    const run = (prefix, ...args) => spawnSync('bash', ['-c', prefix + snippet, 'fcode-add-test', ...args], { encoding: 'utf8', timeout: 10000, env: { PATH: process.env.PATH, HOME: home } });
+    // no CLI yet: the box is not installed or updated
+    let r = run('', 'o/r', 'name');
+    assert.deepEqual([r.status, r.stdout, r.stderr], [3, 'R NO_SCRIPT\n', '']);
+    const bin = path.join(home, '.local', 'bin'); fs.mkdirSync(bin, { recursive: true });
+    const cli = path.join(bin, 'fcode-add');
+    fs.writeFileSync(cli, '#!/bin/sh\nprintf \'%s\\n\' "S=${FCODE_ADD_SCRIPT-unset}" "T=${FCODE_ADD_TIMEOUT_S-unset}" "K=${FCODE_ADD_KILL_AFTER_S-unset}"\nfor a in "$@"; do printf \'A=%s\\n\' "$a"; done\nexit 5\n');
+    fs.chmodSync(cli, 0o644);
+    r = run('', 'o/r', 'name'); // not executable: the same answer
+    assert.deepEqual([r.status, r.stdout], [3, 'R NO_SCRIPT\n']);
+    fs.chmodSync(cli, 0o755);
+    r = run('', 'o/r', 'name'); // the vars are unset here and stay unset (exporting an unset var must not invent one)
+    assert.deepEqual([r.status, r.stdout], [5, 'S=unset\nT=unset\nK=unset\nA=o/r\nA=name\n']);
+    // the laptop's prefix lines (fcode.ps1 Invoke-Add) set them as plain assignments before the snippet
+    r = run("FCODE_ADD_SCRIPT='/tmp/x y.sh'\nFCODE_ADD_TIMEOUT_S=5\nFCODE_ADD_KILL_AFTER_S=2\n", 'a/b', 'c d');
+    assert.deepEqual([r.status, r.stdout], [5, 'S=/tmp/x y.sh\nT=5\nK=2\nA=a/b\nA=c d\n']);
+    r = run('FCODE_ADD_TIMEOUT_S=9\n', 'o/r', 'name'); // only the ones that are set
+    assert.deepEqual([r.status, r.stdout], [5, 'S=unset\nT=9\nK=unset\nA=o/r\nA=name\n']);
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+// A signal to the CLI (Ctrl-C, a hung-up terminal, a kill; a dropped ssh without a tty sends none) is forwarded to the watchdog alone: it TERMs the job's group and KILLs it kill-after later, so the CLI ends
+// with 137 only after kill-after, the TERM-ignoring grandchild is dead, and the caller's group is not hit. The deadline is far away (600 s): only the forward ends the run.
+// INT and HUP go via 'direct' (the CLI is the leader of a detached group and the signal goes to that whole group, as a tty does): a background job of a
+// non-interactive bash starts with INT ignored and could not trap it. TERM goes to the CLI's own pid, from a bash parent, with the caller's group watched.
+for (const [sig, via] of [['SIGTERM', 'bg'], ['SIGINT', 'direct'], ['SIGHUP', 'direct']]) {
+  test(`fcode-add CLI: a ${sig} to the CLI (${via}) is forwarded to the watchdog: the TERM-ignoring grandchild is dead after kill-after, the CLI exits 137, the caller's group is not signalled`, addPosix, async () => {
+    const dir = addRunDir('pc-addrun-');
+    const pidFile = path.join(dir, 'grand.pid');
+    const readPid = () => { try { return Number(fs.readFileSync(pidFile, 'utf8')) || 0; } catch { return 0; } };
+    try {
+      const t0 = Date.now();
+      const r = await runAddCli({ FCODE_ADD_SCRIPT: addRunScript(dir, GRAND_JOB), FCODE_ADD_KILL_AFTER_S: '1', FCODE_TEST_PID: pidFile },
+        { via, sendSig: { sig, when: () => readPid() > 0 } });
+      assert.ok(!r.capped, `the run hung: the ${sig} did not end the watchdog`);
+      assert.ok(r.sigAt > 0, 'the signal was sent');
+      if (via === 'bg') assert.deepEqual([r.rc, r.bystander], ['137', 'up'], r.out); // the caller's group (the bystander) is not signalled
+      else assert.deepEqual([r.code, r.signal], [137, null], r.out);
+      const after = Date.now() - r.sigAt;
+      assert.ok(r.ms - (r.sigAt - t0) >= 900, `${r.ms - (r.sigAt - t0)} ms after the signal: the KILL comes only at kill-after`);
+      assert.ok(after < 15000, `${after} ms`);
+      await waitFor(() => terminatedPid(readPid()), 3000);
+    } finally {
+      killJobGroup(path.join(dir, 'job.pgid'));
+      const g = readPid(); if (g) { try { process.kill(g, 'SIGKILL'); } catch {} }
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+// a non-interactive ssh login has PATH=/usr/bin:/bin (no node): the CLI appends the server's tool dirs (~/.local/bin, ~/.bun/bin) and /usr/local/bin and still runs the job.
+// node here is a logging wrapper in the tool dir under a temp HOME, so the lookup itself is seen (a node in /usr/local/bin would hide a missing append)
+const nodeInSystemPath = spawnSync('/bin/sh', ['-c', 'command -v node'], { env: { PATH: '/usr/bin:/bin' }, encoding: 'utf8' }).status === 0;
+for (const toolDir of ['.local/bin', '.bun/bin']) {
+  test(`fcode-add CLI: PATH=/usr/bin:/bin without node: node is found in ~/${toolDir}, the job runs and its code passes through`, { skip: (process.platform !== 'linux' && 'needs Linux') || (nodeInSystemPath && 'node is in /usr/bin or /bin here: the lookup cannot be seen') }, async () => {
+    const dir = addRunDir('pc-addrun-'), home = addRunDir('pc-addhome-');
+    try {
+      const bin = path.join(home, toolDir); fs.mkdirSync(bin, { recursive: true });
+      const log = path.join(dir, 'node.log');
+      fs.writeFileSync(path.join(bin, 'node'), `#!/bin/sh\necho "$0" >> '${log}'\nexec '${process.execPath}' "$@"\n`, { mode: 0o755 });
+      const r = await runAddCli({ HOME: home, PATH: '/usr/bin:/bin', FCODE_ADD_SCRIPT: addRunScript(dir, 'echo "R OK"; exit 7\n') }, { via: 'direct' });
+      assert.ok(!r.capped);
+      assert.deepEqual([r.code, r.signal, r.out, r.err], [7, null, 'R OK\n', '']);
+      assert.ok(fs.readFileSync(log, 'utf8').includes(path.join(bin, 'node')), 'the wrapper in the tool dir was the node that ran');
+    } finally {
+      killJobGroup(path.join(dir, 'job.pgid'));
+      fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+}
+
+// ======================= laptop clipboard: admin `image`, the `--clip` CLI (Alt+V), and the attach bindings (drag-to-copy, Alt+V) =======================
+// admin `image` {session, file}: a PNG/JPEG the CLI left in <configDir>/clip-in/ goes through the SAME store code as the HTTP upload, then the path is typed into the session
+const NO_SOCK = process.platform === 'win32' && 'unix sockets';
+const NO_BASH = process.platform === 'win32' && 'bash';
+const clipInDir = (c) => path.join(c.configDir, 'clip-in');
+const clipInLeft = (c) => { try { return fs.readdirSync(clipInDir(c)); } catch { return []; } };
+const clipFile = (c, name, body) => { fs.mkdirSync(clipInDir(c), { recursive: true, mode: 0o700 }); const f = path.join(clipInDir(c), name); fs.writeFileSync(f, body, { mode: 0o600 }); return f; };
+const imageReq = (c, session, file) => adminRequest(c.configDir, { cmd: 'image', session, file }, 15000);
+const upDirOf = (dirs, p = 'alpha') => path.join(dirs[p], '.fcode', 'uploads');
+const inputCalls = (c) => c.calls().filter((x) => ['send-keys', 'load-buffer', 'paste-buffer'].includes(x.argv[0]));
+const addFakeSession = (name, project) => { // a session made outside the app: only @pc_project (or nothing) says which project it is
+  const state = path.join(process.env.FAKE_TMUX_DIR, 'state.json');
+  const st = JSON.parse(fs.readFileSync(state, 'utf8'));
+  st.sessions[name] = { created: 1700000000, dir: ABS, cmd: 'x', opts: project === undefined ? {} : { '@pc_project': project } };
+  fs.writeFileSync(state, JSON.stringify(st));
+};
+const OLD = (f) => { fs.writeFileSync(f, 'x'); const t = (Date.now() - 30 * 86400e3) / 1000; fs.utimesSync(f, t, t); return f; };
+
+test('admin image: the same store path as the HTTP upload (name, modes, O_EXCL, .gitignore, sweep); the path alone goes into the input, no Enter; the clip-in file is deleted', { skip: NO_SOCK }, () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 'work', 'claude');
+  const up = upDirOf(dirs); fs.mkdirSync(up, { recursive: true, mode: 0o700 }); // the store creates the folders with 0700; mine must not say otherwise
+  const old = OLD(path.join(up, '20260101-010101-abcdef.png')); // older than 7 days: the sweep of any store removes it
+  const opened = []; const orig = fs.promises.open;
+  fs.promises.open = (f, flags, mode) => { if (String(f).includes('.fcode') && !String(f).includes('.gitignore')) opened.push([String(f), flags, mode]); return orig.call(fs.promises, f, flags, mode); };
+  const before = c.calls().length;
+  let a, b, h;
+  try {
+    a = await imageReq(c, 'work', clipFile(c, 'a.png', PNG));
+    b = await imageReq(c, 'work', clipFile(c, 'b.jpg', JPG));
+    h = await upPost(c, cookie, 'alpha', PNG, { type: 'image/png' });
+  } finally { fs.promises.open = orig; }
+  assert.equal(h.status, 200, h.text);
+  for (const [r, ext, body] of [[a, 'png', PNG], [b, 'jpg', JPG]]) {
+    assert.deepEqual(Object.keys(r).sort(), ['attached', 'ok', 'path'], JSON.stringify(r));
+    assert.deepEqual([r.ok, r.attached], [true, true]);
+    assert.ok(path.isAbsolute(r.path));
+    assert.equal(path.dirname(r.path), up);
+    assert.match(path.basename(r.path), NAME_UP);
+    assert.equal(path.extname(r.path), `.${ext}`);
+    assert.deepEqual(fs.readFileSync(r.path), body);
+    assert.equal(fs.statSync(r.path).mode & 0o777, 0o600);
+  }
+  assert.equal(new Set([a.path, b.path, h.json.path]).size, 3);
+  const K = fs.constants, want = K.O_WRONLY | K.O_CREAT | K.O_EXCL | (K.O_NOFOLLOW ?? 0); // the very flags of the HTTP upload: never overwrite, never follow a link
+  assert.deepEqual(opened.map(([, flags, mode]) => [flags, mode]), [[want, 0o600], [want, 0o600], [want, 0o600]]);
+  assert.equal(fs.statSync(up).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(path.join(dirs.alpha, '.fcode')).mode & 0o777, 0o700);
+  assert.equal(fs.readFileSync(path.join(dirs.alpha, '.fcode', '.gitignore'), 'utf8'), '*\n'); // hideFromGit ran
+  assert.equal(fs.existsSync(old), false); // the sweep ran
+  assert.deepEqual(fs.readdirSync(dirs.alpha), ['.fcode']);
+  assert.deepEqual(clipInLeft(c), []); // the clip-in files are gone
+  // the path alone is typed, as for the phone: leave a pane mode, bracketed paste, no Enter
+  const calls = c.calls().slice(before).filter((x) => x.argv[0] !== 'list-sessions');
+  const quit = ['copy-mode', '-q', '-t', '=work:'], paste = ['paste-buffer', '-p', '-d', '-b', 'pc', '-t', '=work:'], load = ['load-buffer', '-b', 'pc', '-'];
+  assert.deepEqual(calls.map((x) => x.argv), [quit, load, paste, quit, load, paste]);
+  assert.deepEqual([calls[1], calls[4]].map((x) => Buffer.from(x.stdin, 'base64').toString()), [a.path, b.path]);
+  assert.ok(!calls.flatMap((x) => x.argv).includes('Enter'));
+}));
+
+test('admin image: two at once store two different files; a codex session gets the path by send-keys -l', { skip: NO_SOCK }, () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 'cx', 'codex');
+  const [a, b] = await Promise.all([imageReq(c, 'cx', clipFile(c, 'a.png', PNG)), imageReq(c, 'cx', clipFile(c, 'b.png', PNG))]);
+  assert.deepEqual([a.ok, b.ok, a.attached, b.attached], [true, true, true, true], JSON.stringify([a, b]));
+  assert.notEqual(a.path, b.path);
+  assert.deepEqual(fs.readdirSync(upDirOf(dirs)).sort(), [a.path, b.path].map((p) => path.basename(p)).sort());
+  const typed = c.calls().filter((x) => x.argv[0] === 'send-keys').map((x) => x.argv);
+  assert.deepEqual(typed.map((x) => x.slice(0, 5)), [['send-keys', '-t', '=cx:', '-l', '--'], ['send-keys', '-t', '=cx:', '-l', '--']]);
+  assert.deepEqual(typed.map((x) => x[5]).sort(), [a.path, b.path].sort());
+  assert.deepEqual(clipInLeft(c), []);
+}));
+
+test('admin image: a path with a space is saved but not attached (ok true, attached false, no input call); the clip-in file is deleted', { skip: NO_SOCK }, () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 'sp', 'claude', 'spaced');
+  const r = await imageReq(c, 'sp', clipFile(c, 'a.png', PNG));
+  assert.deepEqual([r.ok, r.attached], [true, false], JSON.stringify(r));
+  assert.equal(path.dirname(r.path), upDirOf(dirs, 'spaced'));
+  assert.deepEqual(fs.readFileSync(r.path), PNG); // the file is kept
+  assert.deepEqual(inputCalls(c), []);
+  assert.deepEqual(clipInLeft(c), []);
+}));
+
+test('admin image: when tmux refuses the input the file is still saved and attached is false', { skip: NO_SOCK }, () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 'dies', 'claude');
+  const state = path.join(process.env.FAKE_TMUX_DIR, 'state.json'); // the session is listed, then gone when the paste runs
+  const orig = fs.promises.open;
+  fs.promises.open = async (...a) => { const fh = await orig.apply(fs.promises, a); if (String(a[0]).includes('.fcode')) fs.writeFileSync(state, JSON.stringify({ sessions: {} })); return fh; };
+  let r;
+  try { r = await imageReq(c, 'dies', clipFile(c, 'a.png', PNG)); } finally { fs.promises.open = orig; }
+  assert.deepEqual([r.ok, r.attached], [true, false], JSON.stringify(r));
+  assert.ok(fs.existsSync(r.path));
+  assert.deepEqual(clipInLeft(c), []);
+}));
+
+test('admin image: no_session (not live, empty, not a name) and no_project (unknown project, folder gone, no @pc_project): nothing is stored or typed, the clip-in file is deleted; a session that is no string is refused', { skip: NO_SOCK }, () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 'work', 'claude');
+  addFakeSession('s-unknown', 'nope'); addFakeSession('s-gone', 'gone'); addFakeSession('s-none');
+  for (const session of ['ghost', '', 'Bad Name', '../x', 'a'.repeat(40)]) {
+    const r = await imageReq(c, session, clipFile(c, 'a.png', PNG));
+    assert.deepEqual(r, { ok: false, error: 'no_session' }, String(session));
+    assert.deepEqual(clipInLeft(c), [], String(session));
+  }
+  for (const session of [7, null, undefined]) { // the CLI always sends a string: a malformed request is refused
+    const r = await imageReq(c, session, clipFile(c, 'a.png', PNG));
+    assert.equal(r.ok, false, String(session));
+    assert.ok(['bad_file', 'no_session'].includes(r.error), JSON.stringify(r));
+  }
+  fs.rmSync(clipInDir(c), { recursive: true });
+  for (const session of ['s-unknown', 's-gone', 's-none']) {
+    const r = await imageReq(c, session, clipFile(c, 'a.png', PNG));
+    assert.deepEqual(r, { ok: false, error: 'no_project' }, session);
+    assert.deepEqual(clipInLeft(c), [], session);
+  }
+  assert.equal(fs.existsSync(path.join(dirs.alpha, '.fcode')), false);
+  assert.deepEqual(inputCalls(c), []);
+}));
+
+test('admin image: bad_file for anything that is not a regular file directly inside clip-in (other folder, .., link, folder, subfolder, relative, not a string); a file outside is never deleted', { skip: process.platform === 'win32' && 'unix sockets, symlinks' }, () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 'work', 'claude');
+  fs.mkdirSync(clipInDir(c), { recursive: true, mode: 0o700 });
+  const outside = path.join(c.configDir, 'outside.png'); fs.writeFileSync(outside, PNG);
+  const link = path.join(clipInDir(c), 'link.png'); fs.symlinkSync(outside, link);
+  const folder = path.join(clipInDir(c), 'folder.png'); fs.mkdirSync(folder);
+  const nested = path.join(clipInDir(c), 'sub', 'n.png'); fs.mkdirSync(path.dirname(nested)); fs.writeFileSync(nested, PNG);
+  const cases = [path.join(clipInDir(c), 'nope.png'), outside, `${clipInDir(c)}/../outside.png`, link, folder, nested, 'clip-in/a.png', '', undefined, 42, { x: 1 }];
+  for (const file of cases) {
+    const r = await imageReq(c, 'work', file);
+    assert.deepEqual(r, { ok: false, error: 'bad_file' }, JSON.stringify(file));
+  }
+  assert.deepEqual(fs.readFileSync(outside), PNG); // the target of the link and a file outside clip-in are untouched
+  assert.equal(fs.existsSync(path.join(dirs.alpha, '.fcode')), false);
+  assert.deepEqual(inputCalls(c), []);
+}));
+
+test('admin image: bad_type (no PNG/JPEG magic: text, GIF, WebP, truncated magic, empty) and too_big (10 MiB + 1; exactly 10 MiB is stored); the clip-in file is deleted each time', { skip: NO_SOCK }, () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 'work', 'claude');
+  const bad = [['text', Buffer.from('hello, not an image')], ['gif', Buffer.from('GIF89a\x01\x00\x01\x00')], ['webp', Buffer.from('RIFF\x00\x00\x00\x00WEBPVP8 ')],
+    ['short png', PNG.subarray(0, 7)], ['short jpeg', JPG.subarray(0, 2)]];
+  for (const [name, body] of bad) {
+    const r = await imageReq(c, 'work', clipFile(c, 'a.png', body)); // the name says png: the bytes decide
+    assert.deepEqual(r, { ok: false, error: 'bad_type' }, name);
+    assert.deepEqual(clipInLeft(c), [], name);
+  }
+  const empty = await imageReq(c, 'work', clipFile(c, 'a.png', Buffer.alloc(0)));
+  assert.equal(empty.ok, false);
+  assert.ok(['bad_type', 'bad_file'].includes(empty.error), JSON.stringify(empty));
+  assert.deepEqual(clipInLeft(c), []);
+  const big = clipFile(c, 'big.png', PNG); fs.truncateSync(big, UPLOAD_MAX + 1);
+  assert.deepEqual(await imageReq(c, 'work', big), { ok: false, error: 'too_big' });
+  assert.deepEqual(clipInLeft(c), []);
+  assert.equal(fs.existsSync(path.join(dirs.alpha, '.fcode', 'uploads')), false); // nothing of the refused ones was stored
+  const exact = await imageReq(c, 'work', clipFile(c, 'max.png', sized(PNG, UPLOAD_MAX)));
+  assert.equal(exact.ok, true, JSON.stringify(exact));
+  assert.equal(fs.statSync(exact.path).size, UPLOAD_MAX);
+  assert.deepEqual(clipInLeft(c), []);
+  assert.equal(inputCalls(c).filter((x) => x.argv[0] === 'load-buffer').length, 1); // only the stored one was typed
+}));
+
+test('admin image: a symlinked .fcode or uploads folder is not followed (storage, nothing written through it, nothing typed); the clip-in file is deleted', { skip: process.platform === 'win32' && 'unix sockets, symlinks' }, () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 'work', 'claude');
+  const elsewhere = path.join(dirs.beta, 'target'); fs.mkdirSync(elsewhere);
+  fs.symlinkSync(elsewhere, path.join(dirs.alpha, '.fcode'));
+  assert.deepEqual(await imageReq(c, 'work', clipFile(c, 'a.png', PNG)), { ok: false, error: 'storage' });
+  assert.deepEqual(fs.readdirSync(elsewhere), []);
+  assert.deepEqual(clipInLeft(c), []);
+  fs.unlinkSync(path.join(dirs.alpha, '.fcode')); fs.mkdirSync(path.join(dirs.alpha, '.fcode'));
+  fs.symlinkSync(elsewhere, path.join(dirs.alpha, '.fcode', 'uploads'));
+  assert.deepEqual(await imageReq(c, 'work', clipFile(c, 'a.png', PNG)), { ok: false, error: 'storage' });
+  assert.deepEqual(fs.readdirSync(elsewhere), []);
+  assert.deepEqual(clipInLeft(c), []);
+  assert.deepEqual(inputCalls(c), []);
+  fs.rmSync(path.join(dirs.alpha, '.fcode'), { recursive: true }); // a repaired project works at once
+  assert.equal((await imageReq(c, 'work', clipFile(c, 'a.png', PNG))).ok, true);
+}));
+
+// ---- `server.mjs --clip <client_tty> <session>`: what Alt+V runs on the box (tmux run-shell -b) ----
+const M_NONE = 'Chưa nối clipboard laptop: mở phiên bằng fcode trên laptop (bản mới)';
+const M_NOIMG = 'Clipboard laptop không có ảnh';
+const M_GONE = 'Không nối được clipboard laptop (phiên mở bằng fcode đã thoát?)';
+const M_OK = 'Đã dán ảnh vào phiên (đường dẫn đã gõ, chưa gửi)';
+const TTY = '/dev/pts/3';
+const ttyKey = (tty) => tty.replace(/\//g, '_');
+const mapTty = (cfg, tty, sock, token) => { // the mapping the box attach script writes
+  const d = path.join(cfg, 'clip'); fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(d, `${ttyKey(tty)}.json`), JSON.stringify({ sock, token }), { mode: 0o600 });
+};
+// the laptop's clipboard server, as a unix-socket HTTP server: handler(req, res); seen = what it was asked
+async function clipServer(dir, handler) {
+  const sock = path.join(dir, `s${crypto.randomBytes(3).toString('hex')}.sock`);
+  const seen = []; const conns = new Set();
+  const srv = http.createServer((req, res) => { seen.push({ method: req.method, url: req.url, token: req.headers['x-fcode-token'] }); handler(req, res); });
+  srv.on('connection', (s) => { conns.add(s); s.on('close', () => conns.delete(s)); });
+  await new Promise((resolve, reject) => { srv.once('error', reject); srv.listen(sock, resolve); });
+  return { sock, seen, close: () => { for (const s of conns) s.destroy(); return new Promise((r) => srv.close(r)); } };
+}
+const sendBody = (status, body, type = 'image/png') => (req, res) => { res.writeHead(status, { 'Content-Type': type, 'Content-Length': body.length }); res.end(body); };
+const TOKEN = 'a'.repeat(32);
+
+// withClip: a project session 'work' (alpha) and 'sp' (a folder with a space); run(args) = the CLI child with a recording tmux (PC_TMUX), shown() = what it asked tmux
+async function withClip(fn) {
+  await withUpload(async (c, dirs, cookie, base) => {
+    await mkAgent(c, cookie, 'work', 'claude'); await mkAgent(c, cookie, 'sp', 'claude', 'spaced');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-clip-'));
+    const rec = path.join(tmp, 'rec.mjs'), recLog = path.join(tmp, 'rec.jsonl');
+    fs.writeFileSync(rec, "import fs from 'node:fs';\nfs.appendFileSync(process.env.REC_LOG, JSON.stringify(process.argv.slice(2)) + '\\n');\n");
+    const servers = [];
+    const k = {
+      c, dirs, cookie, tmp,
+      serve: async (handler) => { const s = await clipServer(tmp, handler); servers.push(s); return s; },
+      run: (args = [TTY, 'work'], { env = {}, cfg = c.configDir, timeout = 30000 } = {}) => new Promise((resolve) => {
+        const t0 = Date.now();
+        execFile(process.execPath, [SERVER, '--clip', ...args], { env: { ...process.env, PC_CONFIG_DIR: cfg, PC_TMUX: JSON.stringify([process.execPath, rec]), REC_LOG: recLog, ...env }, encoding: 'utf8', timeout, windowsHide: true },
+          (err, stdout, stderr) => resolve({ status: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stdout, stderr, ms: Date.now() - t0 }));
+      }),
+      shown: () => { try { return fs.readFileSync(recLog, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } },
+      // exit 0 and nothing on stdout (run-shell would print it into the pane); tmux is asked exactly once: display-message -c <tty> <text>
+      expect: (r, tty, text) => {
+        assert.equal(r.status, 0, r.stderr); assert.equal(r.stdout, '');
+        assert.deepEqual(k.shown(), [['display-message', '-d', '5000', '-c', tty, text]]);
+      },
+      uploads: (p = 'alpha') => { try { return fs.readdirSync(upDirOf(dirs, p)); } catch { return []; } },
+    };
+    try { await fn(k); } finally { for (const s of servers) await s.close(); fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+}
+
+test('--clip 200: GET /image with the token over the unix socket; the PNG is stored, typed into the session, the clip-in file is gone; only that client is told (display-message -c)', { skip: NO_SOCK }, () => withClip(async (k) => {
+  const s = await k.serve(sendBody(200, PNG));
+  mapTty(k.c.configDir, TTY, s.sock, TOKEN);
+  const before = k.c.calls().length;
+  const r = await k.run();
+  k.expect(r, TTY, M_OK);
+  assert.deepEqual(s.seen, [{ method: 'GET', url: '/image', token: TOKEN }]); // one request, and only that one
+  const files = k.uploads(); assert.equal(files.length, 1);
+  const stored = path.join(upDirOf(k.dirs), files[0]);
+  assert.match(files[0], NAME_UP);
+  assert.deepEqual(fs.readFileSync(stored), PNG);
+  assert.deepEqual(clipInLeft(k.c), []);
+  assert.equal(fs.statSync(clipInDir(k.c)).mode & 0o777, 0o700);
+  const typed = k.c.calls().slice(before).filter((x) => x.argv[0] === 'load-buffer');
+  assert.deepEqual(typed.map((x) => Buffer.from(x.stdin, 'base64').toString()), [stored]); // the path alone, no Enter
+  assert.ok(!k.c.calls().slice(before).some((x) => x.argv.includes('Enter')));
+}));
+
+test('--clip 200 into a project whose path has a space: the image is saved, not typed, and the message says where', { skip: NO_SOCK }, () => withClip(async (k) => {
+  const s = await k.serve(sendBody(200, JPG, 'image/jpeg'));
+  mapTty(k.c.configDir, TTY, s.sock, TOKEN);
+  const r = await k.run([TTY, 'sp']);
+  const files = k.uploads('spaced'); assert.equal(files.length, 1);
+  k.expect(r, TTY, `Đã lưu ảnh nhưng chưa gắn được vào phiên: ${path.join(upDirOf(k.dirs, 'spaced'), files[0])}`);
+  assert.deepEqual(inputCalls(k.c), []);
+  assert.deepEqual(clipInLeft(k.c), []);
+}));
+
+test('--clip: the mapping is looked up by the client tty (slashes become _): another tty has none, and then nothing connects', { skip: NO_SOCK }, () => withClip(async (k) => {
+  const s = await k.serve(sendBody(200, PNG));
+  mapTty(k.c.configDir, '/dev/pts/9', s.sock, TOKEN);
+  assert.ok(fs.existsSync(path.join(k.c.configDir, 'clip', '_dev_pts_9.json')));
+  k.expect(await k.run([TTY, 'work']), TTY, M_NONE);
+  assert.deepEqual(s.seen, []);
+  assert.deepEqual(k.uploads(), []);
+}));
+
+test('--clip with no mapping at all: the "open the session with the new fcode" message, exit 0, nothing stored', { skip: NO_SOCK }, () => withClip(async (k) => {
+  k.expect(await k.run(), TTY, M_NONE);
+  assert.deepEqual(k.uploads(), []);
+}));
+
+test('--clip 204: the laptop clipboard has no image; nothing stored or typed', { skip: NO_SOCK }, () => withClip(async (k) => {
+  const s = await k.serve((req, res) => { res.writeHead(204); res.end(); });
+  mapTty(k.c.configDir, TTY, s.sock, TOKEN);
+  k.expect(await k.run(), TTY, M_NOIMG);
+  assert.equal(s.seen.length, 1);
+  assert.deepEqual(k.uploads(), []);
+  assert.deepEqual(inputCalls(k.c), []);
+}));
+
+test('--clip 403 (wrong token) and 413: "không lấy được ảnh (mã N)"; 500 (laptop clipboard busy): "đang bận, thử lại"; nothing stored', { skip: NO_SOCK }, () => withClip(async (k) => {
+  let status = 0;
+  const s = await k.serve((req, res) => { if (req.headers['x-fcode-token'] !== TOKEN) { res.writeHead(403); res.end(); } else { res.writeHead(status); res.end('x'); } });
+  mapTty(k.c.configDir, TTY, s.sock, 'b'.repeat(32)); // the box has another token than the laptop: 403 from the server
+  k.expect(await k.run(), TTY, 'Không lấy được ảnh từ laptop (mã 403)');
+  assert.deepEqual(s.seen, [{ method: 'GET', url: '/image', token: 'b'.repeat(32) }]);
+  for (const [code, text] of [[413, 'Không lấy được ảnh từ laptop (mã 413)'], [500, 'Clipboard laptop đang bận, thử lại']]) {
+    fs.rmSync(path.join(k.tmp, 'rec.jsonl'), { force: true });
+    mapTty(k.c.configDir, TTY, s.sock, TOKEN);
+    status = code;
+    k.expect(await k.run([TTY, 'work']), TTY, text);
+  }
+  assert.deepEqual(k.uploads(), []);
+  assert.deepEqual(clipInLeft(k.c), []);
+  assert.deepEqual(inputCalls(k.c), []);
+}));
+
+test('--clip: a socket that is gone, a path that is no socket (refused) and a folder that is gone all say the laptop is not connected; exit 0', { skip: NO_SOCK }, () => withClip(async (k) => {
+  mapTty(k.c.configDir, TTY, path.join(k.tmp, 'gone.sock'), TOKEN);
+  k.expect(await k.run(), TTY, M_GONE);
+  const dead = path.join(k.tmp, 'dead.sock'); fs.writeFileSync(dead, ''); // a leftover that nobody listens on
+  mapTty(k.c.configDir, TTY, dead, TOKEN);
+  fs.rmSync(path.join(k.tmp, 'rec.jsonl'));
+  k.expect(await k.run(), TTY, M_GONE);
+  mapTty(k.c.configDir, TTY, path.join(k.tmp, 'no', 'such', 'dir.sock'), TOKEN);
+  fs.rmSync(path.join(k.tmp, 'rec.jsonl'));
+  k.expect(await k.run(), TTY, M_GONE);
+  assert.deepEqual(k.uploads(), []);
+}));
+
+test('--clip: a laptop that never answers is given up after 10 s (same "not connected" message)', { skip: NO_SOCK }, () => withClip(async (k) => {
+  const s = await k.serve(() => {}); // accepts, never answers
+  mapTty(k.c.configDir, TTY, s.sock, TOKEN);
+  const r = await k.run();
+  k.expect(r, TTY, M_GONE);
+  assert.ok(r.ms >= 9000 && r.ms < 20000, `${r.ms} ms`);
+  assert.equal(s.seen.length, 1);
+}));
+
+test('--clip: a body over 10 MiB is cut off by the CLI itself (its own "mã 413" text, no staging file, the server is never asked), exit 0', { skip: NO_SOCK }, () => withClip(async (k) => {
+  const s = await k.serve((req, res) => { // PNG head, then 10 MiB + 1 in all, in chunks
+    res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': UPLOAD_MAX + 1 });
+    res.write(PNG);
+    let left = UPLOAD_MAX + 1 - PNG.length; const chunk = Buffer.alloc(1 << 16);
+    const pump = () => { while (left > 0) { const n = Math.min(left, chunk.length); left -= n; if (!res.write(n === chunk.length ? chunk : chunk.subarray(0, n))) return res.once('drain', pump); } res.end(); };
+    pump();
+  });
+  mapTty(k.c.configDir, TTY, s.sock, TOKEN);
+  const stage = clipInDir(k.c);
+  // the text is the CLI's: without its cap the whole body would reach the server, whose answer is "Ảnh lớn quá" (too_big), a different text
+  k.expect(await k.run(), TTY, 'Không lấy được ảnh từ laptop (mã 413)');
+  assert.equal(fs.existsSync(stage), false); // nothing was staged, so the admin socket was never used for an image
+  assert.deepEqual(inputCalls(k.c), []);
+  assert.deepEqual(k.uploads(), []);
+}));
+
+test('--clip: an answer that is no image, a session that is gone, and a broken mapping: exit 0, a failure text, nothing stored, no clip-in file left', { skip: NO_SOCK }, () => withClip(async (k) => {
+  const s = await k.serve(sendBody(200, Buffer.from('this is not an image')));
+  mapTty(k.c.configDir, TTY, s.sock, TOKEN);
+  const failed = async (args, what) => {
+    fs.rmSync(path.join(k.tmp, 'rec.jsonl'), { force: true });
+    const r = await k.run(args);
+    assert.equal(r.status, 0, `${what}: ${r.stderr}`); assert.equal(r.stdout, '', what);
+    const shown = k.shown(); assert.equal(shown.length, 1, what);
+    assert.deepEqual(shown[0].slice(0, 5), ['display-message', '-d', '5000', '-c', args[0]], what);
+    assert.ok(shown[0][5] && shown[0][5] !== M_OK, what);
+  };
+  await failed([TTY, 'work'], 'bad type');
+  s.seen.length = 0;
+  const good = await k.serve(sendBody(200, PNG));
+  mapTty(k.c.configDir, TTY, good.sock, TOKEN);
+  await failed([TTY, 'ghost'], 'no session');
+  fs.writeFileSync(path.join(k.c.configDir, 'clip', `${ttyKey(TTY)}.json`), '{not json');
+  await failed([TTY, 'work'], 'broken mapping');
+  fs.writeFileSync(path.join(k.c.configDir, 'clip', `${ttyKey(TTY)}.json`), JSON.stringify({ sock: good.sock }));
+  await failed([TTY, 'work'], 'mapping without a token');
+  assert.deepEqual(k.uploads(), []);
+  assert.deepEqual(clipInLeft(k.c), []);
+}));
+
+test('--clip with no FCode server running: exit 0 and a failure text (the laptop answered with an image)', { skip: NO_SOCK }, () => withClip(async (k) => {
+  const cfg = path.join(k.tmp, 'cfg-noserver'); fs.mkdirSync(cfg, { mode: 0o700 });
+  const s = await k.serve(sendBody(200, PNG));
+  mapTty(cfg, TTY, s.sock, TOKEN);
+  const r = await k.run([TTY, 'work'], { cfg });
+  assert.equal(r.status, 0, r.stderr); assert.equal(r.stdout, '');
+  k.expect(r, TTY, 'Server FCode chưa chạy trên box');
+  assert.deepEqual(fs.readdirSync(path.join(cfg, 'clip-in')), []); // the staging file the CLI wrote is deleted by the CLI itself
+  assert.equal(s.seen.length, 1); // the laptop did answer: the image was staged
+}));
+
+// ---- round 2 (Amendment 1): the staging folders are never followed; the CLI deletes its staging file after every admin answer ----
+const NO_LINK = process.platform === 'win32' && 'unix sockets, symlinks';
+const NO_IMG = 'Ảnh lấy từ laptop không đọc được';
+const UNSAFE = (p) => `Thư mục tạm của FCode trên box không an toàn (${p}): xoá nó rồi thử lại`; // Amendment 2 item 12: the CLI names the folder to remove
+
+test('--clip: a symlinked or loose (not 700) clip folder (the mappings) is refused with the "không an toàn" text naming it (laptop never asked); a symlinked mapping file is "Chưa nối"', { skip: NO_LINK }, () => withClip(async (k) => {
+  const s = await k.serve(sendBody(200, PNG));
+  const real = path.join(k.tmp, 'real-clip'); fs.mkdirSync(real, { mode: 0o700 });
+  const key = `${ttyKey(TTY)}.json`, mapping = path.join(real, key);
+  fs.writeFileSync(mapping, JSON.stringify({ sock: s.sock, token: TOKEN }), { mode: 0o600 });
+  const clipDir = path.join(k.c.configDir, 'clip');
+  const refused = async (what, want = UNSAFE(clipDir)) => { fs.rmSync(path.join(k.tmp, 'rec.jsonl'), { force: true }); k.expect(await k.run(), TTY, want); assert.deepEqual(s.seen, [], what); };
+  fs.symlinkSync(real, clipDir); // the whole folder is a link to a folder that holds a good mapping
+  await refused('symlinked folder');
+  fs.unlinkSync(clipDir);
+  for (const mode of [0o755, 0o750, 0o770, 0o777]) { // ours, but others could add or swap files in it
+    fs.mkdirSync(clipDir, { mode: 0o700 }); fs.copyFileSync(mapping, path.join(clipDir, key)); fs.chmodSync(clipDir, mode);
+    await refused(`mode ${mode.toString(8)}`);
+    fs.rmSync(clipDir, { recursive: true });
+  }
+  fs.mkdirSync(clipDir, { mode: 0o700 }); fs.symlinkSync(mapping, path.join(clipDir, key)); // a proper folder, but the mapping file is a link
+  await refused('symlinked mapping file', M_NONE);
+  fs.rmSync(clipDir, { recursive: true });
+  fs.mkdirSync(clipDir, { mode: 0o700 }); fs.copyFileSync(mapping, path.join(clipDir, key)); // control: the same mapping in a proper folder is used
+  fs.rmSync(path.join(k.tmp, 'rec.jsonl'), { force: true });
+  k.expect(await k.run(), TTY, M_OK);
+  assert.equal(s.seen.length, 1);
+  assert.equal(k.uploads().length, 1);
+}));
+
+test('--clip: a symlinked or loose (not 700) clip-in folder is refused by the CLI itself with the "không an toàn" text naming it (the admin socket is never asked, nothing is written through the link or deleted in the folder)', { skip: NO_LINK }, () => withClip(async (k) => {
+  const cfg = path.join(k.tmp, 'cfg-ci'); fs.mkdirSync(cfg, { mode: 0o700 }); // a fake admin server records every request: the CLI must not even stage the file
+  const s = await k.serve(sendBody(200, PNG)); mapTty(cfg, TTY, s.sock, TOKEN);
+  const asked = [];
+  const adm = await fakeAdmin(cfg, (req, c) => { seenByAdmin(asked)(req); c.end(`${JSON.stringify({ ok: true, path: '/x/y.png', attached: true })}\n`); });
+  const inDir = path.join(cfg, 'clip-in');
+  try {
+    const target = path.join(k.tmp, 'target'); fs.mkdirSync(target, { mode: 0o700 });
+    fs.writeFileSync(path.join(target, 'keep.png'), PNG);
+    const refused = async (what) => {
+      fs.rmSync(path.join(k.tmp, 'rec.jsonl'), { force: true });
+      k.expect(await k.run([TTY, 'work'], { cfg }), TTY, UNSAFE(inDir));
+      assert.deepEqual(asked, [], what);
+    };
+    fs.symlinkSync(target, inDir);
+    await refused('symlinked folder');
+    assert.deepEqual(fs.readdirSync(target), ['keep.png']); // nothing was written through the link, the file in it is intact
+    assert.deepEqual(fs.readFileSync(path.join(target, 'keep.png')), PNG);
+    fs.unlinkSync(inDir);
+    fs.mkdirSync(inDir, { mode: 0o700 }); fs.writeFileSync(path.join(inDir, 'old.png'), PNG);
+    for (const mode of [0o755, 0o750, 0o770, 0o777]) {
+      fs.chmodSync(inDir, mode);
+      await refused(`mode ${mode.toString(8)}`);
+      assert.deepEqual(fs.readdirSync(inDir), ['old.png'], `mode ${mode.toString(8)}`); // neither a new image nor the old file was touched
+    }
+    fs.chmodSync(inDir, 0o700); // control: a proper folder is used, the image is staged and handed over (only the CLI's own file is deleted)
+    fs.rmSync(path.join(k.tmp, 'rec.jsonl'), { force: true });
+    k.expect(await k.run([TTY, 'work'], { cfg }), TTY, M_OK);
+    assert.equal(asked.length, 1); assert.equal(asked[0].there, true);
+    assert.deepEqual(fs.readdirSync(inDir), ['old.png']);
+  } finally { fs.chmodSync(inDir, 0o700); await adm.close(); }
+}));
+
+test('--clip: a clip-in that is a dangling symlink or a regular file is refused with the "không an toàn" text naming it (item 15): nothing is created through the link or in its place, the admin socket is never asked; an absent one is created 700', { skip: NO_LINK }, () => withClip(async (k) => {
+  const cfg = path.join(k.tmp, 'cfg-dl'); fs.mkdirSync(cfg, { mode: 0o700 });
+  const s = await k.serve(sendBody(200, PNG)); mapTty(cfg, TTY, s.sock, TOKEN);
+  const asked = [];
+  const adm = await fakeAdmin(cfg, (req, c) => { seenByAdmin(asked)(req); c.end(`${JSON.stringify({ ok: true, path: '/x/y.png', attached: true })}\n`); });
+  const inDir = path.join(cfg, 'clip-in');
+  const refused = async (what) => {
+    fs.rmSync(path.join(k.tmp, 'rec.jsonl'), { force: true });
+    k.expect(await k.run([TTY, 'work'], { cfg }), TTY, UNSAFE(inDir));
+    assert.deepEqual(asked, [], what);
+  };
+  try {
+    const nowhere = path.join(k.tmp, 'nowhere'), target = path.join(nowhere, 'deeper');
+    fs.symlinkSync(target, inDir); // dangling: neither the target nor its parent exists
+    await refused('dangling symlink');
+    assert.equal(fs.existsSync(nowhere), false); // nothing was created through the link
+    assert.equal(fs.lstatSync(inDir).isSymbolicLink(), true); // and the link itself was left alone
+    assert.equal(fs.readlinkSync(inDir), target);
+    fs.unlinkSync(inDir);
+    fs.writeFileSync(inDir, 'not a folder', { mode: 0o600 });
+    await refused('regular file');
+    assert.equal(fs.lstatSync(inDir).isFile(), true); // not replaced by a folder, not deleted
+    assert.equal(fs.readFileSync(inDir, 'utf8'), 'not a folder');
+    fs.unlinkSync(inDir);
+    fs.rmSync(path.join(k.tmp, 'rec.jsonl'), { force: true }); // control: absent -> the CLI creates it 700 and hands the image over
+    k.expect(await k.run([TTY, 'work'], { cfg }), TTY, M_OK);
+    assert.equal(asked.length, 1); assert.equal(asked[0].there, true);
+    assert.equal(fs.lstatSync(inDir).isDirectory(), true);
+    assert.equal(fs.statSync(inDir).mode & 0o777, 0o700);
+  } finally { await adm.close(); }
+}));
+
+// a stand-in for the FCode server's admin socket: onReq(request, connection) per request line
+async function fakeAdmin(cfg, onReq) {
+  const conns = new Set();
+  const srv = net.createServer((c) => {
+    conns.add(c); c.on('close', () => conns.delete(c)); c.on('error', () => {});
+    let b = '', seen = false;
+    c.on('data', (d) => { b += d; if (!seen && b.includes('\n')) { seen = true; onReq(JSON.parse(b.split('\n')[0]), c); } });
+  });
+  await new Promise((resolve, reject) => { srv.once('error', reject); srv.listen(adminPath(cfg), resolve); });
+  return { close: () => { for (const c of conns) c.destroy(); return new Promise((r) => srv.close(r)); } };
+}
+const seenByAdmin = (asked) => (req) => { // what the admin server saw: the staging file must exist, in clip-in, with the image in it
+  const there = fs.existsSync(String(req.file));
+  asked.push({ cmd: req.cmd, session: req.session, dir: path.dirname(String(req.file)), there, body: there ? fs.readFileSync(req.file) : null });
+};
+
+test('--clip: the CLI deletes its staging file after any admin answer: an old server\'s `unknown command`, a reply that never touches the file, garbage, a refusal', { skip: NO_SOCK }, () => withClip(async (k) => {
+  const cfg = path.join(k.tmp, 'cfg-fake'); fs.mkdirSync(cfg, { mode: 0o700 });
+  const s = await k.serve(sendBody(200, PNG)); mapTty(cfg, TTY, s.sock, TOKEN);
+  const asked = []; let reply = null;
+  const adm = await fakeAdmin(cfg, (req, c) => { seenByAdmin(asked)(req); c.end(`${reply}\n`); });
+  try {
+    const cases = [
+      ['old server', JSON.stringify({ ok: false, error: 'unknown command' }), /bản cũ/],
+      ['ok, file left alone by the server', JSON.stringify({ ok: true, path: '/x/y.png', attached: true }), M_OK],
+      ['garbage', 'not json', 'Không nói chuyện được với server FCode'],
+      ['refusal', JSON.stringify({ ok: false, error: 'bad_file' }), NO_IMG],
+    ];
+    for (const [what, text, want] of cases) {
+      reply = text;
+      fs.rmSync(path.join(k.tmp, 'rec.jsonl'), { force: true });
+      const r = await k.run([TTY, 'work'], { cfg });
+      assert.equal(r.status, 0, `${what}: ${r.stderr}`); assert.equal(r.stdout, '', what);
+      const shown = k.shown(); assert.equal(shown.length, 1, what);
+      assert.deepEqual(shown[0].slice(0, 5), ['display-message', '-d', '5000', '-c', TTY], what);
+      if (typeof want === 'string') assert.equal(shown[0][5], want, what); else assert.match(shown[0][5], want, what);
+      assert.deepEqual(fs.readdirSync(path.join(cfg, 'clip-in')), [], what); // the staging file is gone whatever the server did
+    }
+    assert.equal(asked.length, cases.length);
+    for (const a of asked) assert.deepEqual([a.cmd, a.session, a.dir, a.there, a.body?.equals(PNG)], ['image', 'work', path.join(cfg, 'clip-in'), true, true]); // it was staged, in clip-in, with the image
+  } finally { await adm.close(); }
+}));
+
+test('--clip: an admin server that never answers is given up after 15 s ("không trả lời kịp") and the staging file is deleted anyway', { skip: NO_SOCK }, () => withClip(async (k) => {
+  const cfg = path.join(k.tmp, 'cfg-hang'); fs.mkdirSync(cfg, { mode: 0o700 });
+  const s = await k.serve(sendBody(200, PNG)); mapTty(cfg, TTY, s.sock, TOKEN);
+  const asked = [];
+  const adm = await fakeAdmin(cfg, seenByAdmin(asked));
+  try {
+    const r = await k.run([TTY, 'work'], { cfg });
+    k.expect(r, TTY, 'Server FCode không trả lời kịp, thử lại');
+    assert.ok(r.ms >= 14000 && r.ms < 25000, `${r.ms} ms`);
+    assert.equal(asked.length, 1); assert.equal(asked[0].there, true);
+    assert.deepEqual(fs.readdirSync(path.join(cfg, 'clip-in')), []);
+  } finally { await adm.close(); }
+}));
+
+test('admin image: a symlinked or loose (not 700) clip-in folder is refused (bad_file): nothing in it is read, stored or deleted', { skip: NO_LINK }, () => withUpload(async (c, dirs, cookie) => {
+  await mkAgent(c, cookie, 'work', 'claude');
+  const real = path.join(c.configDir, 'real-in'); fs.mkdirSync(real, { mode: 0o700 });
+  const f = path.join(real, 'a.png'); fs.writeFileSync(f, PNG);
+  fs.symlinkSync(real, clipInDir(c)); // the folder the CLI would name is a link to a folder that holds a good PNG
+  assert.deepEqual(await imageReq(c, 'work', path.join(clipInDir(c), 'a.png')), { ok: false, error: 'bad_file' });
+  assert.deepEqual(fs.readFileSync(f), PNG); // not read-and-unlinked through the link
+  fs.unlinkSync(clipInDir(c));
+  for (const mode of [0o755, 0o750, 0o770, 0o777]) {
+    fs.mkdirSync(clipInDir(c), { mode: 0o700 });
+    const g = path.join(clipInDir(c), 'a.png'); fs.writeFileSync(g, PNG);
+    fs.chmodSync(clipInDir(c), mode);
+    assert.deepEqual(await imageReq(c, 'work', g), { ok: false, error: 'bad_file' }, mode.toString(8));
+    assert.deepEqual(fs.readFileSync(g), PNG, mode.toString(8)); // refused, not deleted
+    if (mode === 0o777) { fs.chmodSync(clipInDir(c), 0o700); const ok = await imageReq(c, 'work', g); assert.equal(ok.ok, true, JSON.stringify(ok)); } // control: 700 is accepted
+    fs.chmodSync(clipInDir(c), 0o700); fs.rmSync(clipInDir(c), { recursive: true });
+  }
+  assert.equal(fs.existsSync(path.join(dirs.alpha, '.fcode', 'uploads')), true); // only the control stored anything
+  assert.equal(fs.readdirSync(upDirOf(dirs)).length, 1);
+  assert.equal(inputCalls(c).filter((x) => x.argv[0] === 'load-buffer').length, 1);
+}));
+
+// ---- the box attach script ($FcodeSh in laptop/fcode.ps1): two global tmux bindings before the attach, and the clip mapping when the laptop forwards its clipboard ----
+const fcodeShScript = () => {
+  const ps1 = fs.readFileSync(path.join(here, '..', 'laptop', 'fcode.ps1'), 'utf8');
+  const m = /\$FcodeSh = \(@'\r?\n([\s\S]*?)\r?\n'@\)/.exec(ps1);
+  assert.ok(m, '$FcodeSh here-string not found in laptop/fcode.ps1');
+  return m[1].replace(/\r\n/g, '\n') + '\n';
+};
+// runs `bash <script> work` with a fake tmux (records every call but list-sessions, and the content of $PC_CONFIG_DIR/clip at that moment), tty, sleep and a node.
+// The script is patched in two ways so the test never touches the real box: /tmp (the stale-socket sweep and the previous-socket removal) becomes <root>/tmp,
+// and the installed server.mjs the Alt+V guard greps (/data/home/fcoding/server.mjs) becomes `server`: this repo's server.mjs (default), 'old' (no --clip; running
+// it leaves a marker file) or 'none' (no file).
+function attachRun(t, { env = {}, node = true, tty = '/dev/pts/7', cfgName = 'cfg', binName = 'bin', server = SERVER } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-att-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const bin = path.join(root, binName), home = path.join(root, 'home'), cfg = path.join(root, cfgName), tmp = path.join(root, 'tmp'), log = path.join(root, 'tmux.log');
+  const marker = path.join(root, 'old-server-ran');
+  for (const d of [bin, home, tmp]) fs.mkdirSync(d);
+  fs.mkdirSync(cfg, { mode: 0o700 });
+  let srv = server;
+  if (server === 'old') { srv = path.join(root, 'old-server.mjs'); fs.writeFileSync(srv, `import fs from 'node:fs';\nfs.writeFileSync(${JSON.stringify(marker)}, 'ran');\n// an older server: --new, --pair, --devices, --revoke\n`); }
+  if (server === 'none') srv = path.join(root, 'no-such-server.mjs');
+  const stub = (name, body) => fs.writeFileSync(path.join(bin, name), `#!/bin/bash\n${body}\n`, { mode: 0o755 });
+  stub('tmux', `if [ "$1" = list-sessions ]; then echo 'work|0|alpha|claude'; exit 0; fi
+{ for a in "$@"; do printf '%s\\n' "$a"; done; printf '@@clip=%s\\n' "$(ls "$PC_CONFIG_DIR/clip" 2>/dev/null | tr '\\n' ,)"; printf '@@tok=%s\\n' "$(env | grep -c 'CLIP_TOKEN=')"; echo '-----'; } >> "$TMUX_LOG"`);
+  stub('sleep', 'exit 0');
+  stub('tty', 'echo "$FAKE_TTY"');
+  if (node) fs.symlinkSync(process.execPath, path.join(bin, 'node'));
+  const text = fcodeShScript();
+  assert.ok(text.includes('srv=/data/home/fcoding/server.mjs') && text.includes('find /tmp -maxdepth 1'), 'the attach script no longer has the two places this test patches');
+  const script = path.join(root, 'fcode.sh'); fs.writeFileSync(script, text.replaceAll('/tmp', tmp).replace('srv=/data/home/fcoding/server.mjs', `srv='${srv}'`));
+  const run = (more = {}) => {
+    const r = spawnSync('bash', ['-c', 'umask 0; exec bash "$0" "$@"', script, 'work'], { encoding: 'utf8', timeout: 20000,
+      env: { PATH: `${bin}:/usr/bin:/bin`, HOME: home, LANG: 'C.UTF-8', PC_CONFIG_DIR: cfg, TMUX_LOG: log, FAKE_TTY: tty, ...env, ...more } });
+    let out = ''; try { out = fs.readFileSync(log, 'utf8'); } catch {}
+    const calls = out.split('-----\n').filter(Boolean).map((blk) => { const l = blk.split('\n').slice(0, -1); const tok = l.pop(); const last = l.pop(); return { args: l, clip: last.slice('@@clip='.length), tok: Number(tok.slice('@@tok='.length)) }; }); // tok = how many CLIP_TOKEN= variables (any name) tmux was started with
+    try { fs.rmSync(log); } catch {}
+    return { ...r, calls, flat: calls.flatMap((x) => [...x.args, '\0']) };
+  };
+  return { run, root, cfg, bin, home, tmp, marker, srv };
+}
+const seqAt = (flat, seq) => { for (let i = 0; i + seq.length <= flat.length; i++) if (seq.every((s, j) => flat[i + j] === s)) return i; return -1; };
+const DRAG = ['bind-key', '-n', 'MouseDrag1Pane', 'if-shell', '-F', '#{pane_in_mode}', 'send-keys -M', 'copy-mode -M'];
+// #{q:...} (tmux escapes the value for the shell at run time), never a raw '#{...}' inside quotes
+const ALT_V = /^PC_CONFIG_DIR='([^']*)' '([^']*)' '([^']*)' --clip #\{q:client_tty\} #\{q:session_name\}$/;
+const OLD_BOX = 'Box chưa cập nhật: cd ~/fcode-src && git pull && bash install.sh';
+
+test('laptop $FcodeSh attach: the drag binding and the hint are set before tmux attaches, also with no clipboard forwarded; no mapping without the two env vars (the token is LC_FCODE_CLIP_TOKEN, the old FCODE_CLIP_TOKEN is not read)', { skip: NO_BASH }, (t) => {
+  const a = attachRun(t);
+  for (const env of [{}, { FCODE_CLIP_SOCK: '/tmp/x.sock' }, { LC_FCODE_CLIP_TOKEN: TOKEN }, { FCODE_CLIP_SOCK: '', LC_FCODE_CLIP_TOKEN: '' }, { FCODE_CLIP_SOCK: '/tmp/fcode-clip-0123456789abcdef.sock', FCODE_CLIP_TOKEN: TOKEN }]) {
+    const r = a.run(env);
+    assert.equal(r.status, 0, r.stderr);
+    const drag = seqAt(r.flat, DRAG), att = r.flat.indexOf('attach');
+    assert.ok(drag >= 0, `no drag binding in ${JSON.stringify(r.flat)}`);
+    assert.ok(att > drag, 'the binding is set before the attach');
+    assert.deepEqual(r.flat.slice(att - 1, att + 3), ['-u', 'attach', '-t', '=work']);
+    assert.equal(fs.existsSync(path.join(a.cfg, 'clip')), false, JSON.stringify(env)); // no mapping, not even the folder
+  }
+  const r = a.run();
+  assert.match(r.stdout, /kéo chuột/); assert.match(r.stdout, /clipboard laptop/); assert.match(r.stdout, /Alt\+V/); assert.match(r.stdout, /Ctrl\+V/);
+  assert.doesNotMatch(r.stdout, /giữ Shift/);
+  assert.match(fcodeShScript(), /\/data\/home\/\.fcoding/); // the default config dir when PC_CONFIG_DIR is not set, as server.mjs defaultConfigDir
+});
+
+test('laptop $FcodeSh attach: with the clipboard env it writes clip/<tty with / as _>.json (folder 700, file 600, {sock, token}, no temp file left) before the Alt+V binding, which runs server.mjs --clip', { skip: NO_BASH }, (t) => {
+  const a = attachRun(t);
+  const sock = '/tmp/fcode-clip-0123456789abcdef.sock';
+  const r = a.run({ FCODE_CLIP_SOCK: sock, LC_FCODE_CLIP_TOKEN: TOKEN });
+  assert.equal(r.status, 0, r.stderr);
+  const dir = path.join(a.cfg, 'clip'), file = path.join(dir, '_dev_pts_7.json');
+  assert.deepEqual(fs.readdirSync(dir), ['_dev_pts_7.json']);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { sock, token: TOKEN });
+  assert.equal(fs.statSync(dir).mode & 0o777, 0o700); // explicit modes: the test runs under umask 0
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  const i = r.flat.indexOf('M-v');
+  assert.ok(i >= 2, JSON.stringify(r.flat));
+  assert.deepEqual(r.flat.slice(i - 2, i + 2), ['bind-key', '-n', 'M-v', 'run-shell']);
+  assert.equal(r.flat[i + 2], '-b');
+  const m = ALT_V.exec(r.flat[i + 3]);
+  assert.ok(m, r.flat[i + 3]);
+  assert.deepEqual([m[1], m[2], m[3]], [a.cfg, path.join(a.bin, 'node'), SERVER]); // PC_CONFIG_DIR, the login shell's node and the installed server.mjs
+  assert.doesNotMatch(r.flat[i + 3], /'#\{/); // no raw '#{client_tty}': a quote in a renamed session must not break out of the shell string
+  assert.ok(!r.flat.includes('display-message')); // the "box not updated" message is only for a server.mjs without --clip
+  const bindCall = r.calls.find((x) => x.args.includes('M-v'));
+  assert.equal(bindCall.clip, '_dev_pts_7.json,', 'the mapping exists when the binding is set');
+  const att = r.flat.indexOf('attach');
+  assert.ok(i < att && seqAt(r.flat, DRAG) < att, 'both bindings come before the attach');
+  // Amendment 3: the token came in as LC_FCODE_CLIP_TOKEN, it is in the mapping file only; tmux (the attach and its server) is started without it, and it is in no argv
+  assert.equal(r.calls.find((x) => x.args.includes('attach')).tok, 0, 'the attach tmux still has the token in its environment');
+  assert.ok(!r.calls.some((x) => x.tok > 0), 'some tmux call was started with the token in its environment');
+  assert.ok(!r.flat.some((x) => x.includes(TOKEN)), 'the token is in a tmux argv');
+  assert.ok(!r.stdout.includes(TOKEN) && !r.stderr.includes(TOKEN));
+  // a new attach from the same tty replaces the mapping (atomically: one file, no temp left); another tty gets its own
+  const sock2 = '/tmp/fcode-clip-fedcba9876543210.sock', token2 = 'c'.repeat(32);
+  const r2 = a.run({ FCODE_CLIP_SOCK: sock2, LC_FCODE_CLIP_TOKEN: token2 });
+  assert.equal(r2.status, 0, r2.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { sock: sock2, token: token2 });
+  assert.deepEqual(fs.readdirSync(dir), ['_dev_pts_7.json']);
+  assert.ok(seqAt(r2.flat, DRAG) >= 0 && r2.flat.includes('M-v')); // the bindings are set again on every attach
+  const other = attachRun(t, { tty: '/dev/pts/12' });
+  other.run({ FCODE_CLIP_SOCK: sock, LC_FCODE_CLIP_TOKEN: TOKEN });
+  assert.deepEqual(fs.readdirSync(path.join(other.cfg, 'clip')), ['_dev_pts_12.json']);
+});
+
+test('laptop $FcodeSh attach: without node on the PATH the Alt+V binding is skipped, the drag binding and the attach still happen', { skip: NO_BASH || (spawnSync('/bin/sh', ['-c', 'command -v node'], { env: { PATH: '/usr/bin:/bin' } }).status === 0 && 'node is in /usr/bin or /bin here') }, (t) => {
+  const a = attachRun(t, { node: false });
+  const r = a.run({ FCODE_CLIP_SOCK: '/tmp/fcode-clip-0123456789abcdef.sock', LC_FCODE_CLIP_TOKEN: TOKEN });
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!r.flat.includes('M-v'));
+  const att = r.flat.indexOf('attach');
+  assert.ok(seqAt(r.flat, DRAG) >= 0 && seqAt(r.flat, DRAG) < att);
+  assert.ok(att > 0);
+});
+
+// ---- round 2 (Amendment 1): the attach script's guards ----
+const bindsAt = (r) => { const att = r.flat.indexOf('attach'); return att > 0 && seqAt(r.flat, DRAG) >= 0 && seqAt(r.flat, DRAG) < att; }; // the drag binding came first and the attach still happens
+const mkSock = async (t, p) => { // a real unix socket file that stays until the test ends (find -type s)
+  const s = net.createServer();
+  await new Promise((resolve, reject) => { s.once('error', reject); s.listen(p, resolve); });
+  t.after(() => new Promise((r) => s.close(() => r())));
+  return p;
+};
+const age = (p, days) => { const when = (Date.now() - days * 86400e3) / 1000; fs.utimesSync(p, when, when); return p; };
+
+test('laptop $FcodeSh attach: a server.mjs without --clip (an old box, or none) gets an "update the box" message on Alt+V; server.mjs is never run and run-shell is never bound', { skip: NO_BASH }, (t) => {
+  for (const server of ['old', 'none']) {
+    const a = attachRun(t, { server });
+    const r = a.run({ FCODE_CLIP_SOCK: '/tmp/fcode-clip-0123456789abcdef.sock', LC_FCODE_CLIP_TOKEN: TOKEN });
+    assert.equal(r.status, 0, `${server}: ${r.stderr}`);
+    const i = r.flat.indexOf('M-v');
+    assert.ok(i >= 2, `${server}: ${JSON.stringify(r.flat)}`);
+    assert.deepEqual(r.flat.slice(i - 2, i + 5), ['bind-key', '-n', 'M-v', 'display-message', '-d', '5000', OLD_BOX], server);
+    assert.ok(!r.flat.includes('run-shell'), server);
+    assert.ok(!r.flat.some((x) => x.includes('--clip')), server);
+    assert.equal(fs.existsSync(a.marker), false, `${server}: the old server.mjs was run by the attach`);
+    assert.ok(bindsAt(r), server);
+  }
+  // the guard is the quoted flag in the installed server.mjs, and this repo's server.mjs has it (the other tests bind M-v to run-shell against the real file)
+  assert.match(fcodeShScript(), /grep -q -- "'--clip'" "\$srv"/);
+  assert.match(fs.readFileSync(SERVER, 'utf8'), /'--clip'/);
+});
+
+test('laptop $FcodeSh attach: an attach with no (or half) clipboard env removes that tty\'s old mapping and no other', { skip: NO_BASH }, (t) => {
+  const a = attachRun(t);
+  const env = { FCODE_CLIP_SOCK: `${a.tmp}/fcode-clip-aaaaaaaaaaaaaaaa.sock`, LC_FCODE_CLIP_TOKEN: TOKEN };
+  const clip = path.join(a.cfg, 'clip');
+  for (const tty of ['/dev/pts/7', '/dev/pts/12']) assert.equal(a.run({ ...env, FAKE_TTY: tty }).status, 0);
+  assert.deepEqual(fs.readdirSync(clip).sort(), ['_dev_pts_12.json', '_dev_pts_7.json']);
+  const r = a.run(); // tty 7 again, now without the clipboard
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(fs.readdirSync(clip), ['_dev_pts_12.json']); // the stale mapping is gone (Alt+V says "Chưa nối"), the other tty's stays
+  assert.ok(bindsAt(r));
+  for (const half of [{ FCODE_CLIP_SOCK: env.FCODE_CLIP_SOCK }, { LC_FCODE_CLIP_TOKEN: TOKEN }, { FCODE_CLIP_SOCK: '', LC_FCODE_CLIP_TOKEN: TOKEN }]) {
+    assert.equal(a.run({ ...env, FAKE_TTY: '/dev/pts/7' }).status, 0);
+    assert.deepEqual(fs.readdirSync(clip).sort(), ['_dev_pts_12.json', '_dev_pts_7.json']);
+    assert.equal(a.run({ FCODE_CLIP_SOCK: '', LC_FCODE_CLIP_TOKEN: '', ...half }).status, 0);
+    assert.deepEqual(fs.readdirSync(clip), ['_dev_pts_12.json'], JSON.stringify(half));
+  }
+  assert.deepEqual(fs.readdirSync(clip), ['_dev_pts_12.json']);
+});
+
+test('laptop $FcodeSh attach: a socket path or token with a char outside [A-Za-z0-9/._-] is never written into the mapping (the attach goes on); plain ones are', { skip: NO_BASH }, (t) => {
+  const good = '/tmp/fcode-clip-0123456789abcdef.sock';
+  const a = attachRun(t);
+  const bad = [['space', '/tmp/a b.sock', TOKEN], ['single quote', "/tmp/a'b.sock", TOKEN], ['double quote', '/tmp/a"b.sock', TOKEN], ['dollar', '/tmp/$(id).sock', TOKEN],
+    ['semicolon', '/tmp/a;b.sock', TOKEN], ['backtick', '/tmp/a`b.sock', TOKEN], ['newline', '/tmp/a\nb.sock', TOKEN], ['backslash', '/tmp/a\\b.sock', TOKEN],
+    ['non-ASCII', '/tmp/é.sock', TOKEN], ['token with a quote', good, 'a"b'], ['token with a space', good, 'a b'], ['token with a newline', good, 'a\nb'], ['token with a brace', good, '{x}']];
+  for (const [what, sock, token] of bad) {
+    const r = a.run({ FCODE_CLIP_SOCK: sock, LC_FCODE_CLIP_TOKEN: token });
+    assert.equal(r.status, 0, `${what}: ${r.stderr}`);
+    assert.ok(bindsAt(r), what);
+    assert.equal(fs.existsSync(path.join(a.cfg, 'clip')), false, `${what}: a mapping (or its folder) was written`);
+  }
+  const r = a.run({ FCODE_CLIP_SOCK: '/tmp/Fcode_clip-1.2.sock', LC_FCODE_CLIP_TOKEN: 'Ab-c_d.9' }); // control: every allowed class
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(a.cfg, 'clip', '_dev_pts_7.json'), 'utf8')), { sock: '/tmp/Fcode_clip-1.2.sock', token: 'Ab-c_d.9' });
+});
+
+test('laptop $FcodeSh attach: the previous mapping\'s socket of this tty is removed and old (> 1 day) fcode-clip sockets nobody names are swept; recent ones, ones a mapping names, non-sockets and other names stay', { skip: NO_BASH }, async (t) => {
+  const a = attachRun(t);
+  const name = (c) => path.join(a.tmp, `fcode-clip-${c.repeat(16)}.sock`);
+  const prev = await mkSock(t, name('1')), named = await mkSock(t, name('2'));
+  assert.equal(a.run({ FCODE_CLIP_SOCK: named, LC_FCODE_CLIP_TOKEN: TOKEN, FAKE_TTY: '/dev/pts/12' }).status, 0); // another live session's mapping
+  assert.equal(a.run({ FCODE_CLIP_SOCK: prev, LC_FCODE_CLIP_TOKEN: TOKEN }).status, 0); // this tty's previous attach (/dev/pts/7)
+  age(named, 3); // a long-lived session: old, but a mapping names it
+  const stale = age(await mkSock(t, name('3')), 3), fresh = age(await mkSock(t, name('4')), 0.5), other = age(await mkSock(t, path.join(a.tmp, 'other-5555555555555555.sock')), 3); // fresh: 12 hours, under the 1-day limit
+  const plain = name('6'); fs.writeFileSync(plain, ''); age(plain, 3); // old, right name, but not a socket
+  const r = a.run({ FCODE_CLIP_SOCK: name('7'), LC_FCODE_CLIP_TOKEN: TOKEN }); // the new attach of tty 7
+  assert.equal(r.status, 0, r.stderr);
+  const alive = (p) => fs.existsSync(p);
+  assert.deepEqual([alive(prev), alive(stale)], [false, false]); // the previous socket of tty 7 and the old orphan are gone
+  assert.deepEqual([alive(named), alive(fresh), alive(other), alive(plain)], [true, true, true, true]);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(a.cfg, 'clip', '_dev_pts_7.json'), 'utf8')), { sock: name('7'), token: TOKEN });
+  // an attach without the clipboard also removes the previous socket of its tty, and still leaves the others alone
+  const again = await mkSock(t, name('8'));
+  assert.equal(a.run({ FCODE_CLIP_SOCK: again, LC_FCODE_CLIP_TOKEN: TOKEN }).status, 0);
+  assert.equal(alive(again), true);
+  assert.equal(a.run().status, 0);
+  assert.deepEqual([alive(again), alive(named), alive(fresh)], [false, true, true]);
+  assert.deepEqual(fs.readdirSync(path.join(a.cfg, 'clip')), ['_dev_pts_12.json']);
+});
+
+test('laptop $FcodeSh attach: the previous mapping\'s socket is only removed when it is /tmp/fcode-clip-<plain name>.sock itself: a path that leaves the folder, or lies elsewhere, survives', { skip: NO_BASH }, (t) => {
+  const a = attachRun(t);
+  fs.mkdirSync(path.join(a.tmp, 'fcode-clip-dir')); // so that fcode-clip-dir/../victim.sock resolves
+  const victim = path.join(a.tmp, 'victim.sock'); fs.writeFileSync(victim, 'x');
+  const outside = path.join(a.root, 'outside'); fs.mkdirSync(outside);
+  const far = path.join(outside, 'fcode-clip-9999999999999999.sock'); fs.writeFileSync(far, 'x');
+  for (const sock of [`${a.tmp}/fcode-clip-dir/../victim.sock`, far]) {
+    assert.equal(a.run({ FCODE_CLIP_SOCK: sock, LC_FCODE_CLIP_TOKEN: TOKEN }).status, 0); // the filter lets these chars through: the mapping names them
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(a.cfg, 'clip', '_dev_pts_7.json'), 'utf8')).sock, sock);
+    assert.equal(a.run({ FCODE_CLIP_SOCK: `${a.tmp}/fcode-clip-bbbbbbbbbbbbbbbb.sock`, LC_FCODE_CLIP_TOKEN: TOKEN }).status, 0); // the next attach tries to remove it
+    assert.equal(fs.existsSync(victim), true, sock);
+    assert.equal(fs.existsSync(far), true, sock);
+  }
+});
+
+test('laptop $FcodeSh attach: a quote or # in the config dir or in the node path leaves Alt+V unbound (it would break the tmux command string); a space is fine', { skip: NO_BASH }, (t) => {
+  const env = { FCODE_CLIP_SOCK: '/tmp/fcode-clip-0123456789abcdef.sock', LC_FCODE_CLIP_TOKEN: TOKEN };
+  for (const [what, opts] of [['quote in the config dir', { cfgName: "it's" }], ['# in the config dir', { cfgName: 'a#b' }], ['quote in the node dir', { binName: "b'in" }], ['# in the node dir', { binName: 'b#in' }]]) {
+    const a = attachRun(t, opts);
+    const r = a.run(env);
+    assert.equal(r.status, 0, `${what}: ${r.stderr}`);
+    assert.ok(!r.flat.includes('M-v'), what);
+    assert.ok(bindsAt(r), what); // the drag binding and the attach are not affected
+  }
+  const a = attachRun(t, { cfgName: 'my cfg' });
+  const r = a.run(env);
+  const i = r.flat.indexOf('M-v');
+  assert.ok(i >= 0, JSON.stringify(r.flat));
+  const m = ALT_V.exec(r.flat[i + 3]);
+  assert.ok(m, r.flat[i + 3]);
+  assert.equal(m[1], a.cfg);
+});
+
+test('laptop $FcodeSh attach: a symlinked clip folder is not written through (the attach goes on); a loose one is tightened to 700 and used', { skip: NO_BASH }, (t) => {
+  const env = { FCODE_CLIP_SOCK: '/tmp/fcode-clip-0123456789abcdef.sock', LC_FCODE_CLIP_TOKEN: TOKEN };
+  const a = attachRun(t);
+  const outside = path.join(a.root, 'outside'); fs.mkdirSync(outside, { mode: 0o700 });
+  fs.symlinkSync(outside, path.join(a.cfg, 'clip'));
+  const r = a.run(env);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(fs.readdirSync(outside), []); // no mapping, no .tmp file behind the link
+  assert.ok(bindsAt(r));
+  const b = attachRun(t);
+  fs.mkdirSync(path.join(b.cfg, 'clip'), { mode: 0o755 }); fs.chmodSync(path.join(b.cfg, 'clip'), 0o755);
+  assert.equal(b.run(env).status, 0);
+  assert.equal(fs.statSync(path.join(b.cfg, 'clip')).mode & 0o777, 0o700);
+  assert.deepEqual(fs.readdirSync(path.join(b.cfg, 'clip')), ['_dev_pts_7.json']);
+});
+
+test('laptop $FcodeSh attach: a symlinked clip folder and an attach WITHOUT the env: the link target\'s mapping file and the socket it names survive (nothing is read or removed through the link)', { skip: NO_BASH }, async (t) => {
+  const a = attachRun(t);
+  const outside = path.join(a.root, 'outside'); fs.mkdirSync(outside, { mode: 0o700 });
+  const sock = await mkSock(t, path.join(a.tmp, 'fcode-clip-cccccccccccccccc.sock'));
+  const mapping = path.join(outside, '_dev_pts_7.json'); // this tty's key
+  const body = JSON.stringify({ sock, token: TOKEN }) + '\n';
+  fs.writeFileSync(mapping, body, { mode: 0o600 });
+  fs.symlinkSync(outside, path.join(a.cfg, 'clip'));
+  const r = a.run(); // no FCODE_CLIP_SOCK / LC_FCODE_CLIP_TOKEN: the real-dir guard is the only thing between the rm and the link target
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(bindsAt(r)); // the attach goes on
+  assert.equal(fs.readFileSync(mapping, 'utf8'), body); // the mapping behind the link is not deleted
+  assert.equal(fs.existsSync(sock), true); // nor the socket it names
+  assert.deepEqual(fs.readdirSync(outside), ['_dev_pts_7.json']);
+});

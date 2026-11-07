@@ -11,6 +11,8 @@ final class AppState: ObservableObject {
     @Published var pairLink: PairLink?
     /// One-off message shown as an alert over whatever screen is up (link and re-pair results).
     @Published var popup: String?
+    /// The popup's alert title; nil = "Ghép máy" (link and re-pair results). Cleared with it.
+    @Published var popupTitle: String?
     /// Paired by an older build to an address this build rejects (shown escaped). While set,
     /// the app shows only the "pair again" card and sends that server nothing (`api` is nil).
     @Published private(set) var unsupportedServer: String?
@@ -171,6 +173,53 @@ final class AppState: ObservableObject {
         } catch {
             popup = "Chưa gỡ được iPhone này khỏi máy chủ cũ \(PairLink.label(previous.base.absoluteString)); vào máy chủ cũ để gỡ."
         }
+    }
+
+    /// Cài đặt → "Địa chỉ máy chủ": the same box at a new address (its devices and secrets moved
+    /// with it), so the token is kept. First GET / with NO token must answer "fcoding ok" (only an
+    /// FCode server ever sees the token); then GET api/me with this phone's token must answer
+    /// {"ok":true}. Anything else keeps the old address. Nothing is sent to the old address and a
+    /// 401 at the new one does not sign out here.
+    /// Returns the error text (the old address stays), nil when switched or unchanged.
+    func moveServer(to input: String) async -> String? {
+        guard let address = HomeLogic.serverAddress(input), let base = URL(string: address) else {
+            return HomeLogic.serverAddressInvalid
+        }
+        guard address != serverURL else { return nil }
+        guard unsupportedServer == nil, let token = token, !token.isEmpty else { return unpairedNotice }
+        let label = PairLink.label(address)
+        let root: Data
+        do {
+            root = try await API(base: base, token: "").call("GET", "", timeout: 15)
+        } catch let e as APIError where e.status != 0 {
+            return HomeLogic.serverMoveFailure(status: e.status, label: label, notFcode: true)
+        } catch {
+            return HomeLogic.serverMoveFailure(status: 0, label: label)
+        }
+        guard HomeLogic.isFcodeRoot(root) else {
+            return HomeLogic.serverMoveFailure(status: 200, label: label, notFcode: true)
+        }
+        let me: Data
+        do {
+            me = try await API(base: base, token: token).call("GET", "api/me", timeout: 15)
+        } catch {
+            return HomeLogic.serverMoveFailure(status: (error as? APIError)?.status ?? 0, label: label)
+        }
+        guard HomeLogic.isMeOk(me) else {
+            return HomeLogic.serverMoveFailure(status: 200, label: label, notFcode: true)
+        }
+        // A pairing or sign-out while the check was out wins.
+        guard self.token == token, unsupportedServer == nil else { return nil }
+        // Saved replies and prefs belong to the old address (ResponseCache and LaunchFetch are
+        // keyed by server + token, so nothing old would be read anyway). Drafts and read marks
+        // stay: it is the same box. The new address starts a fresh home screen (RootView's id).
+        AppState.removeSavedCopies()
+        serverURL = address
+        UserDefaults.standard.set(address, forKey: AppState.serverKey)
+        prefetch()
+        popupTitle = "FCode"
+        popup = "Đã chuyển sang máy chủ \(label)."
+        return nil
     }
 
     /// "Gỡ iPhone này": POST /api/logout. The token is deleted here even if the request fails

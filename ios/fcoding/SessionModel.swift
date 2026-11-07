@@ -5,6 +5,8 @@ import UIKit
 /// polling GET /api/screen every 1.5 s while the stream is down.
 /// Reading, decoding, patching and styling run off the main actor (`readStream`, `ScreenRender`);
 /// the main actor only receives the finished styled screen, and holds it while the user scrolls.
+/// After every input the choice menu stays locked until the published screen is the same screen
+/// as a probe (a GET of the box's screen taken after the input reached it); see `menuLocked`.
 @MainActor
 final class SessionModel: ObservableObject {
     enum Link { case connecting, live, polling, offline }
@@ -65,10 +67,19 @@ final class SessionModel: ObservableObject {
         pending = nil
         screens += 1
         styled = value
+        // Found once per published screen (scanned from the end), in the view's own line numbering.
+        shownLines = String(value.characters).components(separatedBy: "\n")
+        let found = MenuLogic.menu(shownLines)
+        if found != menu { menu = found }
+        checkUnlock()
     }
 
     /// Bumped with every published screen: a cheap change signal for the view (no text compare).
     private(set) var screens = 0
+    /// The live choice menu on the published screen, nil when there is none.
+    @Published private(set) var menu: MenuLogic.Menu?
+    /// The plain lines of the published screen (what `menu` was found on).
+    private var shownLines: [String] = []
 
     private func setLink(_ value: Link) {
         if link != value { link = value }
@@ -78,11 +89,14 @@ final class SessionModel: ObservableObject {
         self.app = app
         guard loop == nil, !gone else { return }
         loop = Task { [weak self] in await self?.run() }
+        if menuLocked { scheduleProbe() }
     }
 
+    /// Also drops the probe: after `start` only a probe taken from then on can unlock the menu.
     func stop() {
         loop?.cancel()
         loop = nil
+        cancelProbe()
     }
 
     func restart() {
@@ -218,15 +232,105 @@ final class SessionModel: ObservableObject {
     /// One FIFO chain for keys and sends: each request starts only after the previous one
     /// finished, so "↓ then Enter" reaches tmux in tap order. Enqueued synchronously by the caller.
     private var inputTail: Task<Bool, Never>?
+    /// Queued or running inputs.
+    private var inputPending = 0
+    /// The menu (bar and tappable lines) is off from an input's start until the published screen is
+    /// the same screen as a probe (`MenuLogic.sameScreen`): a screen the app asks for after the
+    /// chain drained, so its capture starts after the last key reached the box. Only that unlocks
+    /// it. Keys are computed only from a screen that equalled a probe taken after the input (the box
+    /// can still move on after that, or an older frame can arrive late over a slow stream); a
+    /// double tap never fires twice.
+    @Published private(set) var menuLocked = false
+    /// The newest probe of this input chain (plain lines and their menu); nil until one comes back.
+    private var probe: (lines: [String], menu: MenuLogic.Menu?)?
+    /// The one probe request waiting or on the wire, if any.
+    private var probeTask: Task<Void, Never>?
+    /// Probes asked in this chain: the first 4 wait 250 ms, later ones 1.5 s.
+    private var attempts = 0
 
     private func enqueue(_ op: @escaping @MainActor () async -> Bool) -> Task<Bool, Never> {
         let previous = inputTail
-        let job = Task { @MainActor () async -> Bool in
+        inputPending += 1
+        cancelProbe()
+        if !menuLocked { menuLocked = true }
+        let job = Task { @MainActor [weak self] () async -> Bool in
             _ = await previous?.value
-            return await op()
+            let ok = await op()
+            self?.inputDone()
+            return ok
         }
         inputTail = job
         return job
+    }
+
+    private func inputDone() {
+        inputPending -= 1
+        guard inputPending == 0 else { return }
+        scheduleProbe()
+    }
+
+    /// GETs the box's screen after 250 ms (the server's last poke step; 1.5 s from the 5th try on)
+    /// and keeps its plain text, as in `ScreenRender.build`. Runs only while the screen loop runs and
+    /// nothing is queued, so every kept probe was captured after the last input reached the box. A
+    /// failed request asks again (the previous probe stays); 404/401 end it.
+    private func scheduleProbe() {
+        guard loop != nil, !gone, inputPending == 0, let api = app?.api else { return }
+        probeTask?.cancel()
+        let delay: Double = attempts < 4 ? 0.25 : 1.5
+        attempts += 1
+        let path = "api/screen/\(name)"
+        probeTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1e9))
+            guard !Task.isCancelled else { return }
+            let result: Result<(lines: [String], menu: MenuLogic.Menu?), Error>
+            do {
+                let data = try await api.call("GET", path, query: SessionModel.ansi, timeout: 3)
+                // Decoded and scanned off the main actor, like the stream's screens.
+                result = .success(try await Task.detached(priority: .userInitiated) { () throws -> (lines: [String], menu: MenuLogic.Menu?) in
+                    let screen = try JSONDecoder().decode(Screen.self, from: data)
+                    let lines = ANSI.runs(screen.text).map(\.text).joined().components(separatedBy: "\n")
+                    return (lines: lines, menu: MenuLogic.menu(lines))
+                }.value)
+            } catch {
+                result = .failure(error)
+            }
+            // Cancelled by an input, stop() or unlock() while on the wire: nothing is kept.
+            guard !Task.isCancelled, let self = self else { return }
+            self.probeTask = nil
+            switch result {
+            case .success(let found):
+                self.probe = found
+                self.checkUnlock()
+            case .failure(let error):
+                if self.isTerminal(error) { return }
+                self.scheduleProbe()
+            }
+        }
+    }
+
+    /// Unlocks once nothing is queued, no newer screen is held, and the published screen is the
+    /// probe's screen. A mismatch asks again (the box may redraw later than the probe); a probe
+    /// already on the wire compares when it returns.
+    private func checkUnlock() {
+        guard menuLocked, inputPending == 0, pending == nil, let p = probe else { return }
+        if MenuLogic.sameScreen(shownLines, menu, p.lines, p.menu) {
+            unlock()
+        } else if probeTask == nil {
+            scheduleProbe()
+        }
+    }
+
+    /// Drops the chain's probe: the request, its result and its count.
+    private func cancelProbe() {
+        probeTask?.cancel()
+        probeTask = nil
+        probe = nil
+        attempts = 0
+    }
+
+    private func unlock() {
+        cancelProbe()
+        if menuLocked { menuLocked = false }
     }
 
     /// Queues the text; the returned task's value is true when the server accepted it.
@@ -249,6 +353,24 @@ final class SessionModel: ObservableObject {
             guard let self = self, let api = self.app?.api else { return false }
             do {
                 try await api.call("POST", "api/key/\(self.name)", body: ["key": key])
+                self.errorText = nil
+                return true
+            } catch {
+                self.fail(error)
+                return false
+            }
+        }
+    }
+
+    /// Queues the keys as one input, each request after the previous one, with its repeat
+    /// (1...20); stops at the first failure so a later Enter never confirms the wrong option.
+    func keys(_ keys: [(key: String, `repeat`: Int)]) -> Task<Bool, Never> {
+        enqueue { [weak self] in
+            guard let self = self, let api = self.app?.api else { return false }
+            do {
+                for k in keys {
+                    try await api.call("POST", "api/key/\(self.name)", body: ["key": k.key, "repeat": k.repeat])
+                }
                 self.errorText = nil
                 return true
             } catch {

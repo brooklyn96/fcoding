@@ -47,7 +47,7 @@ Các bước chi tiết có trong app: bấm nút **?** (Hướng dẫn) ở gó
 ## 4. Cách dùng
 
 - **Màn hình chính** (thanh trên cùng cuộn theo danh sách; chỉ có nút **?** Hướng dẫn và **⚙** Cài đặt). Phiên tự cập nhật mỗi 5 giây, hạn mức và dự án mỗi phút; kéo xuống để cập nhật ngay.
-  - **Vòng giờ box** (bên trái thẻ trên cùng): **Sleeps in** = box còn chạy bao lâu rồi tự nghỉ (tối đa 8 giờ, hoặc sớm hơn nếu rảnh 30 phút). Vòng chuyển vàng khi còn dưới 10 phút. **Wakes in** = box vừa nghỉ vì đã chạy đủ 8 giờ, chưa đánh thức lại được trong khoảng 10 phút. Chạm vào vòng để xem giờ chính xác.
+  - **Lời chào và giờ** (bên trái thẻ trên cùng): lời chào theo buổi (sáng, trưa, chiều, tối), giờ hiện tại (24 giờ) và thứ, ngày, ví dụ **Thứ Ba, 3/11**. Luôn là giờ Việt Nam, kể cả khi iPhone đặt múi giờ khác; đổi theo từng phút.
   - **Ô hạn mức** (bên phải): mỗi lần một tài khoản, tự chuyển sang tài khoản kế mỗi 4 giây (giữ ngón tay trên ô để dừng). Chạm để mở màn hình **Hạn mức**.
   - Dòng **đang chạy · chờ bạn**: chạm để nhảy tới phiên tương ứng.
   - **Dự án** (trượt ngang): mỗi thẻ cho biết số PR đang mở, kết quả checks và lần deploy gần nhất. Chạm thẻ để chỉ xem phiên của dự án đó; giữ lâu hoặc bấm **…** để mở phiên mới trong dự án đó.
@@ -75,7 +75,8 @@ Các bước chi tiết có trong app: bấm nút **?** (Hướng dẫn) ở gó
   - Ô nhập cao 1 dòng, tự giãn tới 4 dòng khi bạn gõ dài.
   - Nút tròn **↑** bên phải ô nhập = **Gửi** (gửi rồi nhấn Enter). Bấm khi ô trống = chỉ nhấn Enter. **Giữ lâu** nút này để chọn **Gửi không Enter**.
   - Nội dung đang soạn được giữ lại cho từng phiên (kể cả khi ẩn khung gõ, hay khi iPhone bị gỡ khỏi box và phải ghép lại). Nó bị xoá khi gửi thành công, khi bạn xoá phiên đó, hoặc khi bạn tự gỡ máy (**Gỡ iPhone này** / **Gỡ mọi thiết bị**).
-  - Hàng phím nhanh: Esc, Ctrl+C, mũi tên, Tab, ⇧Tab, Enter, y, n. Nút **/** chèn các lệnh hay dùng (/model, /clear, …). Các phím được gửi đúng thứ tự bạn bấm.
+  - Hàng phím nhanh: Esc, ↑, ↓, Enter, Agents, Ctrl+C, ←, →, Tab, ⇧Tab, y, n, ^O (omp). Nút **/** chèn các lệnh hay dùng (/model, /clear, …). Các phím được gửi đúng thứ tự bạn bấm.
+  - **Chọn trong menu**: khi phiên hiện một menu có một dòng đang được chọn (câu hỏi tin thư mục, xin quyền chạy lệnh, câu hỏi nhiều lựa chọn của Claude, xin quyền của Codex, hộp Ask của omp), chạm ngay dòng lựa chọn trên màn hình (có nền màu nhạt) hoặc nút của nó trên thanh chọn ngay trên ô nhập (cả khi xoay ngang, cả khi ô nhập đang ẩn). App tự bấm ↑ / ↓ rồi Enter; ô `[ ]` của câu hỏi chọn nhiều chỉ được đánh dấu (Space), chọn xong thì chạm **Submit**. Dòng **Type something** của Claude: app chỉ đưa con trỏ tới đó, bạn gõ thẳng câu trả lời vào dòng đó rồi Enter để gửi (không cần Enter trước khi gõ); Esc huỷ cả câu hỏi. Dòng **Other (type your own)** của omp: app đưa con trỏ tới đó và bấm Enter, omp mở ô **Custom answer**; bạn gõ câu trả lời rồi bấm Enter (hoặc Ctrl+Q) để gửi, bấm Esc để quay lại danh sách lựa chọn. Câu hỏi nhiều trang có thêm nút **←** / **→**; nút **Esc** đóng menu. Nhiều lựa chọn thì phần nút kéo ngang được; ←, → và Esc luôn ở cố định bên phải. Sau mỗi lần chạm (hay mỗi phím, chữ gửi đi), thanh và các dòng mờ đi tới khi màn hình đang thấy giống hệt màn hình app vừa hỏi lại box (thường khoảng nửa giây), nên chạm hai lần không gửi hai lần và app không bấm theo màn hình đã cũ; Esc, ←, → trên thanh cũng mờ theo, nếu thanh vẫn mờ thì dùng ↑ ↓ Enter ở hàng phím nhanh. Hiếm khi, nếu chương trình vẽ lại chậm hay tự đổi màn hình đúng lúc bạn chạm, lần chạm vẫn có thể rơi vào màn hình vừa bị thay. Chạm để dừng màn hình đang trượt, hay giữ để bôi đen chữ, không chọn dòng.
   - Phím **Agents** có trong phiên omp, Claude Code và Codex: omp nhận phím Alt+A, Claude Code nhận `/tasks` + Enter, Codex nhận `/subagents` + Enter (gửi qua đường gửi chữ thường).
     - omp: mở Agent Hub; chọn bằng ↑ / ↓, bấm **Enter** để mở, **Esc** để đóng.
     - Claude Code: `/tasks` chạy ngay cả khi Claude đang làm; bấm **Enter** để mở một subagent; các phím khác xem trên màn hình. Bấm **Esc** đóng danh sách trước khi gửi chữ: trong danh sách, `x` dừng subagent đang chọn (`f` đưa nó lên trước).
@@ -85,6 +86,7 @@ Các bước chi tiết có trong app: bấm nút **?** (Hướng dẫn) ở gó
   - Khi xoay ngang: ô nhập thấp lại để màn hình còn chỗ; nút ghim và **⌄** nằm cạnh ô nhập; bấm nút **phím nhanh** bên trái ô nhập để hiện / ẩn hàng phím nhanh.
   - Khi bạn chuyển sang ứng dụng khác, kết nối tạm dừng; mở lại ứng dụng là tự kết nối lại.
 - **Cài đặt** (bánh răng):
+  - **Địa chỉ máy chủ**: khi box chuyển sang địa chỉ mới, chạm vào dòng này, gõ địa chỉ mới (chỉ https; gõ tên miền là đủ) rồi bấm **Lưu**. iPhone thử kết nối bằng đăng nhập hiện tại; được thì đổi luôn, không cần ghép lại; không được thì giữ địa chỉ cũ và báo lý do (báo "chưa ghép" thì gỡ iPhone này rồi ghép lại với máy chủ mới).
   - **Gỡ iPhone này**: gỡ điện thoại này khỏi box.
   - **Gỡ mọi thiết bị**: gỡ tất cả thiết bị đã ghép với box (có hỏi xác nhận).
   - **Gỡ iPhone này** xoá ghép trên iPhone này ngay, kể cả khi box không trả lời.

@@ -565,7 +565,7 @@ function Invoke-MoveTool([string]$Tool, [string[]]$ToolArgs, [string]$Stdin = $n
   if ($Tool -match '(^|[\\/])gh(\.exe)?$') {
     $t = $a -join ' '
     [void]$W.GhLog.Add(@{ Text = $t; Stdin = $Stdin })
-    Log "gh $t"
+    Log "gh $t"; if ($W.GhHook -and $t -match $GhForm.RepoList) { & $W.GhHook }   # GhHook: a case's side effect at the push scan (the one gh call of a rebuild, after its reads)
     foreach ($r in $W.Gh) { if ($r.N -ne 0 -and $t -match $r.Rx) { if ($r.N -gt 0) { $r.N-- }; return @{ Code = $r.Code; Out = @($r.Out) } } }
     if ($t -match $GhForm.SecretListAny) { return @{ Code = 0; Out = @("DEPLOY_KNOWN_HOSTS`t2026-10-01T00:00:00Z", "DEPLOY_SSH_KEY`t2026-10-01T00:00:00Z") } }
     if ($t -match $GhForm.Json -or $t -match $GhForm.Api) { return @{ Code = 0; Out = @('[]') } }
@@ -1007,6 +1007,49 @@ T 'L.plan-tunnel-remedies: a connector ingress naming old''s own address (INV re
   [void](Do-Plan -Want 65); HasText 'đổi service của tên đó trong cấu hình tunnel sang 127.0.0.1 hoặc tên container'; NothingWritten
   Reset-World; $W.PlanOut = @('INV refuse own-ip path=/opt/app/conf.yml'); $W.PlanCode = 65; Ans 'không'
   [void](Do-Plan -Want 65); NoText 'đổi service của tên đó trong cấu hình tunnel'
+}
+# g37 triage §B.4 (B.12.4): an `own-ip path=ingress:<hostname>` hit has no file to rewrite (`rewrite own-ip` takes an absolute path only, B.14.2): it is not listed by Q-ownip and gets no map line; its remedy is printed and the plan
+# ends 65. The Q-ownip list holds the absolute paths only. The plan keeps refusing the ingress hit after the file's rewrite, so the plan always ends 65 here.
+$OwnipFile = '/opt/app/conf.yml'; $OwnipIngress = 'ingress:app.example.com'; $IngressRemedy = 'đổi service của tên đó trong cấu hình tunnel sang 127.0.0.1 hoặc tên container'
+function Set-OwnipIngress([string[]]$Old, [string[]]$New) {   # the refusal: the ingress hit always, the file hit until its `rewrite own-ip <file>` line (bare only for one address per family, else map-invalid ref=rewrites)
+  $W.Mf.dial = [ordered]@{ old = @($Old); new = @($New) }
+  $fam = { param($a, $six) @($a | Where-Object { ($_ -like '*:*') -eq $six }).Count }
+  $script:OwnipSeveral = (& $fam $Old $false) -gt 1 -or (& $fam $Old $true) -gt 1 -or (& $fam $New $false) -gt 1 -or (& $fam $New $true) -gt 1
+  $W.PlanHook = { param($n, $map)
+    $rw = @($map | Where-Object { $_ -cmatch '\Arewrite own-ip ' })
+    if ($script:OwnipSeveral -and @($rw | Where-Object { $_ -cmatch '\Arewrite own-ip \S+\z' }).Count) { return @{ Out = @('INV refuse map-invalid ref=rewrites'); Code = 65 } }
+    $o = @("INV refuse own-ip path=$OwnipIngress")
+    if (-not @($rw | Where-Object { $_ -cmatch "\Arewrite own-ip $([regex]::Escape($OwnipFile))(?: \S+=\S+)?\z" }).Count) { $o += "INV refuse own-ip path=$OwnipFile" }
+    @{ Out = $o; Code = 65 }
+  }
+}
+function Assert-OwnipIngressPlan([string]$Tag, [string]$Rewrite) {
+  $q = @(Lines | Where-Object { $_ -cmatch '\ACác file sau chứa địa chỉ của máy cũ: ' }); Eq $q.Count 1 "[$Tag] Q-ownip asked once: $(Lines)"
+  Ok ($q.Count -ge 1 -and $q[0].Contains($OwnipFile) -and -not $q[0].Contains('ingress:') -and -not $q[0].Contains('app.example.com')) "[$Tag] the Q-ownip list names the file and not the ingress hit: $($q -join ' | ')"
+  Eq $W.PlanN 2 "[$Tag] the refusal + one re-plan"; $in = @($W.PlanStdin[-1]); Eq (@($in | Where-Object { $_ -cmatch '\Arewrite own-ip ' }) -join ' | ') $Rewrite "[$Tag] the re-plan map has the file's rewrite line only"
+  Eq (@(OwnipLines | Where-Object { $_ -cmatch 'ingress:' }).Count) 0 "[$Tag] no rewrite line for the ingress hit"; HasText $IngressRemedy; NoText 'map-invalid'; Eq (@(@($W.PlanStdin) | ForEach-Object { $_ } | Where-Object { $_ -cmatch 'ingress:' }).Count) 0 "[$Tag] no ingress token in any plan stdin"
+}
+T 'L.plan-ownip-ingress-mixed: old refuses own-ip for a connector ingress AND for a file; Q-ownip (có) lists only the file, the re-plan map has `rewrite own-ip <file>` and no ingress line, and the plan ends 65 with the ingress remedy, never map-invalid (g37 §B.4, B.12.4)' {
+  Set-OwnipIngress @('203.0.113.10') @('198.51.100.20'); Ans 'có'; [void](Do-Plan -Want 65)
+  Assert-OwnipIngressPlan 'one address' "rewrite own-ip $OwnipFile"
+}
+T 'L.plan-ownip-ingress-pairs: the same with two old addresses (the pairs branch): `có`, `<from>=<to>` then the empty line: the map has `rewrite own-ip <file> <from>=<to>` only, no ingress line, plan ends 65 with the ingress remedy' {
+  Set-OwnipIngress @('203.0.113.10', '203.0.113.11') @('198.51.100.20'); Ans 'có', '203.0.113.10=198.51.100.20', '203.0.113.11=198.51.100.20', ''; [void](Do-Plan -Want 65)
+  Eq $W.Answers.Count 0 'every typed pair and the closing blank line were read'
+  Assert-OwnipIngressPlan 'pairs' ("rewrite own-ip $OwnipFile 203.0.113.10=198.51.100.20 | rewrite own-ip $OwnipFile 203.0.113.11=198.51.100.20")
+  Ok (@(OwnipLines | Where-Object { $_ -cmatch '\Arewrite own-ip \S+\z' }).Count -eq 0) "no bare rewrite line: $(OwnipLines)"
+}
+T 'L.plan-ownip-ingress-only: only the ingress hit refused: Q-ownip is NOT asked (no prompt, no answer read), no map line, the plan ends 65 with the ingress remedy after one plan run' {
+  $W.PlanOut = @("INV refuse own-ip path=$OwnipIngress"); $W.PlanCode = 65; Ans 'có'
+  [void](Do-Plan -Want 65); Eq $W.Prompts.Count 0 "no question asked: $($W.Prompts -join ' | ')"; Eq $W.Answers.Count 1 'the queued answer was not read'; Eq $W.PlanN 1 'one plan run'; Eq (@(OwnipLines).Count) 0 'no rewrite own-ip line'; HasText $IngressRemedy; NothingWritten
+}
+T 'L.plan-ownip-other-kinds: an `INV refuse own-ip-nat path=<file>` or `own-ip-family path=<file>` refusal is another refusal with its own label: it never feeds Q-ownip (no question, no `rewrite own-ip` line, one plan run, ends 65)' {
+  foreach ($k in 'own-ip-nat', 'own-ip-family') {
+    Reset-World; $W.PlanOut = @("INV refuse $k path=$OwnipFile"); $W.PlanCode = 65; Ans 'có'
+    [void](Do-Plan -Want 65); Eq $W.Prompts.Count 0 "[$k] no question asked: $($W.Prompts -join ' | ')"; Eq $W.PlanN 1 "[$k] one plan run"; Eq (@(OwnipLines).Count) 0 "[$k] no rewrite own-ip line"
+  }
+  Reset-World; $W.PlanOut = @("INV refuse own-ip-nat path=$OwnipFile", "INV refuse own-ip path=/etc/hostview-turn.conf"); $W.PlanCode = 65; Ans 'không'
+  [void](Do-Plan -Want 65); $q = @(Lines | Where-Object { $_ -cmatch '\ACác file sau chứa địa chỉ của máy cũ: ' }); Eq $q.Count 1 'a real own-ip hit beside the other kind still asks'; Ok ($q[0].Contains('/etc/hostview-turn.conf') -and -not $q[0].Contains($OwnipFile)) "the list holds the own-ip hit only: $($q -join ' | ')"
 }
 T 'L.plan-tunnel-remedies: a connector whose /config cannot be read (INV refuse unmapped what=connector path=<hold id>) ends plan 65 with the remedy "kiểm tra cổng metrics của connector rồi chạy lại"; another unmapped form gets no such remedy (B.12.4, W1-T3-GAP-18, CONTRACT §8.3.2)' {
   $W.PlanOut = @('INV refuse unmapped what=connector path=cloudflared.service'); $W.PlanCode = 65
@@ -1705,7 +1748,7 @@ T 'L.rb-dst-unreachable-not-started: new unreachable in a rollback before x.star
   [void](Do-Cutover -1); Eq $script:Last.Code 10 'exit'; HasText 'máy mới không trả lời; máy cũ chạy lại'
   Ok ((Sent 'old' '-r\.start-src$') -eq 1) 'old started'; Eq $W.old.Active $Holds 'old serves'
 }
-function Rebuild-Now { $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild ($($rr.Text))"; Get-St }
+function Rebuild-Now { $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild ($($rr.Text) | log: $(@(LogNow | Select-Object -Last 6) -join ' ; '))"; Get-St }
 function Assert-OldServes([string]$Tag, [switch]$NewDown) {   # -NewDown: new does not answer, only old is judged
   $s = Get-St; Eq $s.phase 'rolled-back' "[$Tag] phase"; Eq $s.serving 'old' "[$Tag] serving"; Ok ($null -eq $s.mark) "[$Tag] mark"; Eq $s.enabled $true "[$Tag] enabled"
   Eq $W.old.Frozen $false "[$Tag] old unfrozen"; Eq $W.old.Enabled $true "[$Tag] old enabled"; Eq $W.old.Active $Holds "[$Tag] old serves"; Eq $W.old.Conn $true "[$Tag] old's connectors run (r.start-src, not x.enable.N)"
@@ -2788,6 +2831,33 @@ T 'L.rebuild-return-partial: old holds r.start-src FAILED (rc 1) or INTERRUPTED 
     $r = Run-Move @('cutover'); Eq $r.Code 10 "[$tag] rb-continue ($($r.Text))"; Assert-NewUntouched $tag; Eq (SentAny '-x\.final$') 0 "[$tag] no x.final (never carry-resume)"; Eq (Sent 'old' "^$p-r\.start-src`$") 1 "[$tag] r.start-src re-executed"; Ok ((SentAny "^$p-r\.unfreeze-src`$") -ge 1) "[$tag] r.unfreeze-src"; Ok ((SentAny "^$p-r\.health-src`$") -ge 1) "[$tag] r.health-src"
     Assert-OldServes $tag
   } }
+}
+# review-lap-final P3-2: a log part file left by a run killed between Write-PhienText's write and its move is dropped by the next call's log write, before the number is counted
+T 'L.movelog-stale-part: a `log\<n>-<alias>-<call>.log.part-<pid>` left in the move log dir is deleted by the next recorded call, the new log is numbered WITHOUT it (existing files + 1), no .part-* remains, the new log is UTF-8 without BOM, and an existing .log and an unrelated file in the dir are untouched' {
+  Fx-Planned; $ld = Join-Path (MoveDir) 'log'; [void](New-Item -ItemType Directory -Force -Path $ld)
+  foreach ($f in @(Get-ChildItem -LiteralPath $ld -File)) { Remove-Item -LiteralPath $f.FullName -Force }
+  $keep1 = Join-Path $ld '00001-oldbox-fwd-1-x.freeze.log'; $keep2 = Join-Path $ld 'notes.txt'; $part = Join-Path $ld '00007-oldbox-fwd-1-x.freeze.log.part-99999'
+  [IO.File]::WriteAllText($keep1, "one`n", (New-Object Text.UTF8Encoding($false))); [IO.File]::WriteAllText($keep2, "mine`n", (New-Object Text.UTF8Encoding($false))); [IO.File]::WriteAllText($part, "half a log", (New-Object Text.UTF8Encoding($false)))
+  [void](Do-Copy)
+  Ok (-not (Test-Path -LiteralPath $part)) 'the stale part file is gone'; Eq (@(Get-ChildItem -LiteralPath $ld -Force | Where-Object { $_.Name -like '*.part-*' }).Count) 0 'no .part-* remains'
+  Eq ([IO.File]::ReadAllText($keep1)) "one`n" 'the existing log is untouched'; Eq ([IO.File]::ReadAllText($keep2)) "mine`n" 'the unrelated file is untouched'
+  $new = @(Get-ChildItem -LiteralPath $ld -File | Where-Object { $_.Name -like '*.log' -and $_.Name -cne '00001-oldbox-fwd-1-x.freeze.log' } | Sort-Object Name); Ok ($new.Count -ge 1) 'the call logs were written'
+  Ok ($new[0].Name -match '\A00003-') "the first new log is numbered 3 (2 files + 1), not 4 (the part counted): $($new[0].Name)"
+  $b = [IO.File]::ReadAllBytes($new[0].FullName); Ok (-not ($b.Count -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)) 'UTF-8 without BOM'; Ok ($b.Count -gt 0 -and $b[$b.Count - 1] -eq 10) 'ends with LF'
+}
+# review-lap-final P3-1: the rebuild pins old's and new's host keys in the move known_hosts through a whole-file rewrite (Write-PhienText, ASCII); the file's content is checked, not only that it exists
+T 'L.rebuild-known-hosts: the rebuild writes the pins `<addr> <key>` of old and new into the move known_hosts as plain ASCII (no BOM, LF, one line per pin, old first), keeps an unrelated line and adds the missing newline before the first new pin, never duplicates a pin already there, and a second rebuild leaves the file byte-identical; no .part file is left' {
+  $kh = Join-Path (MoveDir) 'known_hosts'; $lo = "$OldAddr ssh-ed25519 $KeyOld"; $ln = "$NewAddr ssh-ed25519 $KeyNew"
+  $lines = { @([IO.File]::ReadAllLines($kh)) }; $bytes = { [IO.File]::ReadAllBytes($kh) }
+  # ssh's accept-new pins the key during the rebuild's reads (the fake does too); the rebuild's own write is the net for a pin that is still missing at the end: the push scan (gh repo list: after the reads, before the write) clears the pins here
+  Fx-Copied; $W.GhHook = { [IO.File]::WriteAllText($kh, '') }; Lose-State; [void](Rebuild-Now)
+  $b = & $bytes; Ok (-not ($b.Count -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)) 'no BOM'; Ok (@($b | Where-Object { $_ -eq 13 -or $_ -gt 127 }).Count -eq 0) 'plain ASCII, no CR'; Ok ($b[$b.Count - 1] -eq 10) 'ends with LF'
+  Eq ((& $lines) -join ' | ') "$lo | $ln" 'a missing file is rebuilt with old first, then new, one line each'
+  Eq (@(Get-ChildItem -LiteralPath (MoveDir) -Force | Where-Object { $_.Name -like 'known_hosts.part-*' }).Count) 0 'no .part file left'
+  $before = & $bytes; $W.GhHook = $null; Lose-State; [void](Rebuild-Now); Eq ([Convert]::ToBase64String((& $bytes))) ([Convert]::ToBase64String($before)) 'a second rebuild leaves the file byte-identical (pins are never added twice)'
+  Reset-World; Fx-Copied; $W.GhHook = { [IO.File]::WriteAllText($kh, "other.example ssh-ed25519 AAAAother`n$lo", (New-Object Text.UTF8Encoding($false))) }   # an unrelated line, old already pinned, no final newline, new not pinned
+  Lose-State; [void](Rebuild-Now); Eq ((& $lines) -join ' | ') "other.example ssh-ed25519 AAAAother | $lo | $ln" 'the unrelated line and the old pin are kept, the new pin is added on its own line'
+  Ok ((& $bytes)[-1] -eq 10) 'ends with LF'
 }
 T 'L.rebuild-return-complete: all three return calls done on old (Q-newlost YES, with no x.switch): the rebuild is rolled-back, serving old, mark null, new_discarded true; the next verb fences new first and enables nothing on it; a FAILED r.health-src (it is report-only: E-R18) still rebuilds rolled-back, a MISSING one rolling-back (it is re-run)' {
   foreach ($leg in 'all-done', 'health-failed', 'health-missing') {
