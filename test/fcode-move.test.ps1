@@ -115,8 +115,8 @@ $LegacyRepo = 'brooklyn96/BD-Team-Project'
 
 function New-Machine([string]$Name, [string]$Addr, [string]$Key, [string]$Hn, [bool]$Serving) {
   @{ Name = $Name; Addr = $Addr; Key = $Key; Hostname = $Hn; Up = $true; HasGate = $Serving; NoMove = $false; Gate = $GateA
-     MoveId = $null; Frozen = $false; Holds = $Holds; Active = $(if ($Serving) { $Holds } else { 0 }); Enabled = $Serving
-     Rec = @{}; Order = (New-Object Collections.ArrayList); Last = $null; Running = $null; Skew = 0; Digest = @{}; Lst = @{}; Content = (New-Object Collections.Hashtable ([StringComparer]::Ordinal)); NoAcl = $false; LstOld = $false; Drop = (New-Object Collections.Hashtable ([StringComparer]::Ordinal)); Extra = @(); Os = 'debian-13'; Sha = ''; Legacy = @() }   # Content/Drop: paths are case-sensitive, like Linux
+     MoveId = $null; Frozen = $false; Holds = $Holds; Active = $(if ($Serving) { $Holds } else { 0 }); Enabled = $Serving; Conn = $Serving
+     Rec = @{}; Order = (New-Object Collections.ArrayList); Last = $null; Running = $null; Skew = 0; Digest = @{}; Lst = @{}; Content = (New-Object Collections.Hashtable ([StringComparer]::Ordinal)); NoAcl = $false; LstOld = $false; Drop = (New-Object Collections.Hashtable ([StringComparer]::Ordinal)); Extra = @(); Os = 'debian-13'; Sha = ''; Legacy = @(); GoneRoots = @(); PinManifest = $null }   # Content/Drop: paths are case-sensitive, like Linux; GoneRoots = item roots deleted on this machine, PinManifest = the manifest it pinned (init / repin)
 }
 function New-Manifest {
   [ordered]@{
@@ -154,7 +154,7 @@ function Reset-World {
     Log = (New-Object Collections.ArrayList); Calls = (New-Object Collections.ArrayList); From = 0
     Faults = (New-Object Collections.ArrayList); Answers = (New-Object Collections.Queue); Prompts = (New-Object Collections.ArrayList)
     Gh = (New-Object Collections.ArrayList); GhLog = (New-Object Collections.ArrayList); KeygenLog = (New-Object Collections.ArrayList); ToolLog = (New-Object Collections.ArrayList)
-    BoxLog = (New-Object Collections.ArrayList); Mf = (New-Manifest); Mfs = @{}; CheckNoPin = $false; StoredLf = $false; CheckProjects = @(); PlanStdin = (New-Object Collections.ArrayList); PlanN = 0
+    BoxLog = (New-Object Collections.ArrayList); Mf = (New-Manifest); Mfs = @{}; HealthFail = @{}; Tunnel = $null; CheckNoPin = $false; StoredLf = $false; CheckProjects = @(); PlanStdin = (New-Object Collections.ArrayList); PlanN = 0
     Pf = @('INV target user=quoc uid=1000 home-nonskel=1', 'INV target addr=198.51.100.20', 'INV target platform=0', 'INV target stop_budget_s=120'); PfCode = 0
     CheckOut = @('INV ok'); CheckCode = 0; CheckOnlyOut = @('INV ok'); CheckOnlyCode = 0; PlanHook = $null; PlanOut = @('INV ok'); PlanCode = 0
     NewGate = (New-Object Collections.Queue); TcpFail = @{}; LoginRc = 0; LoginErr = ''; CoderUp = $true; Dur = @{}; Sleeps = 0
@@ -402,9 +402,14 @@ function Fake-Gate($m, [string]$Cmd, [string]$Stdin, $e) {
   $hk = $W.Hooks[$step]; if ($hk) { & $hk $m $e }
   $flt = Get-Fault $m.Name $call
   $rc = 0; $out = Get-DefaultOut $m $step $call; $eff = $true
+  if ($step -cin 'x.health', 'x.switch') { $hv = Get-HealthVerdict $step $Stdin; $out = @($hv.Out); $rc = $hv.Rc }   # the real check against the baseline the laptop sent on stdin (B.14.7); a Fault overrides it below
+  # a missing source root: rsync fails (move-xfer.sh). The server's back PRE pass skips an item whose root is gone on the sender (`MOVE item <id> kind=<k> state=done why=item-gone`, rc 0, nothing copied); a fwd pass and every `final` pass against a pinned manifest that still lists it fail
+  if ($step -like 'c.transfer.*' -or $step -ceq 'x.final') { if (@($m.GoneRoots).Count -and $m.PinManifest) { $goneIt = @(@($m.PinManifest.items) | Where-Object { $_ -and @($m.GoneRoots) -ccontains [string]$_.root })
+      if ($goneIt.Count -and $step -like 'c.transfer.*' -and $call -like 'back-*') { $out = @($goneIt | ForEach-Object { "MOVE item $($_.id) kind=$($_.kind) state=done why=item-gone" }) }
+      elseif ($goneIt.Count) { $out = @("MOVE error rsync-failed why=missing-root path=$($goneIt[0].root)"); $rc = 1 } } }
   if ($flt) { $rc = $flt.Rc; if ($null -ne $flt.Out) { $out = @($flt.Out) }; $eff = ($rc -eq 0 -or $flt.Effect -or ($step -ceq 'x.freeze' -and $rc -eq 75)); if ($flt.Do) { & $flt.Do $m $e } }
   $dur = 5; foreach ($k in $W.Dur.Keys) { if ($step -match $k) { $dur = $W.Dur[$k] } }
-  $rec = @{ Rc = $rc; Out = @($out); Dur = $dur; Argv = $normS; Start = (Format-Iso $script:Clock); End = (Format-Iso $script:Clock.AddSeconds($dur)) }
+  $rec = @{ Rc = $rc; Out = @($out); Dur = $dur; Argv = $normS; Start = (Format-Iso $script:Clock.AddSeconds([int]$W.StartSkew)); End = (Format-Iso $script:Clock.AddSeconds($dur)) }   # StartSkew: the server stamps a record's start this many seconds after the laptop's clock reading (network and queue time)
   $m.Rec[$call] = $rec; [void]$m.Order.Add($call); $m.Last = $call
   $script:Clock = $script:Clock.AddSeconds($dur)   # the fake clock moves by each recorded call's dur: every record has its own Start, "now" is later than all of them
   if ($flt -and $flt.Mode -ceq 'running') { $rec.Rc = $null; $m.Running = @{ Call = $call; Left = $flt.Left; Rc = $rc; Step = $step; Verb = $verb; F = $f; Sw = $sw; Id = $id; Stdin = $Stdin }; return (New-Res 124 @()) }
@@ -414,6 +419,34 @@ function Fake-Gate($m, [string]$Cmd, [string]$Stdin, $e) {
   if ($flt -and $flt.Mode -ceq 'down') { $m.Up = $false; return (New-Res 255 @()) }
   if ($flt -and $flt.Mode -ceq 'kill') { throw 'laptop gone: the call ran to the end on the machine, its answer never arrived' }
   New-Res $rc (@($out) + "MOVE call id=$call rc=$rc dur_s=$dur" + "GATE_EXIT $rc")
+}
+# ---- health (B.14.7): x.baseline prints one `MOVE item <check> kind=health state=ok|failed [class=<d>]` line per check; the laptop sends them on the stdin of x.health and x.switch, which gate only on a check that did not
+# fail in the baseline (a check with no baseline line gates); a tunnel name is judged by its status class against the baseline class. Knobs: W.HealthFail[<hold id>] = $true (failing now), W.Tunnel = @{ Name; Code } (the live code).
+function Get-HealthChecks { @(@($script:W.Mf.holds) | Where-Object { $_ -and $_.kind -ceq 'unit' } | ForEach-Object { [string]$_.id }) }
+function Get-HealthBaseline {
+  $o = @(); foreach ($id in Get-HealthChecks) { $o += "MOVE item $id kind=health state=$(if ($script:W.HealthFail[$id]) { 'failed' } else { 'ok' })" }
+  $t = $script:W.Tunnel; if ($t) { $c = "$($t.BaseCode)"; $o += "MOVE item name:$($t.Name) kind=health state=$(if ($c -match '^[1-4]') { 'ok' } else { 'failed' }) class=$($c.Substring(0, 1))" }
+  $o
+}
+function Get-HealthVerdict([string]$Step, [string]$Stdin) {
+  $base = @{}; $cls = @{}
+  foreach ($l in @($Stdin -split '\r?\n')) { if ($l -cmatch '\AMOVE item (\S+) kind=health state=(\S+)(?: class=(\S+))?\z') { $base[$Matches[1]] = $Matches[2]; if ($Matches[3]) { $cls[$Matches[1]] = $Matches[3] } } }
+  $o = @(); $fail = 0
+  if ($Step -ceq 'x.health') {
+    foreach ($id in Get-HealthChecks) {
+      if ($script:W.HealthFail[$id]) { $o += "MOVE item $id kind=health state=failed"; if ($base[$id] -ceq 'failed') { $o += "INV warn health-baseline check=$id" } else { $fail++ } } else { $o += "MOVE item $id kind=health state=ok" }
+    }
+    if ($fail) { $o += "MOVE error health failed=$fail"; return @{ Rc = 69; Out = $o } }
+    return @{ Rc = 0; Out = $o }
+  }
+  $t = $script:W.Tunnel
+  if ($t) {
+    $n = "name:$($t.Name)"; $c = "$($t.Code)"; $want = $cls[$n]
+    $bad = if ($c -match '^(52[0-9]|530|000)$') { $true } elseif ($want -and $c.Substring(0, 1) -cne $want) { $true } elseif (-not $want -and $c -notmatch '^[1-4]') { $true } else { $false }
+    $o += "MOVE item $n kind=health state=$(if ($bad) { 'failed' } else { 'ok' })"
+    if ($bad) { $o += 'MOVE error switch-failed why=name'; return @{ Rc = 1; Out = $o } }
+  }
+  @{ Rc = 0; Out = $o }
 }
 function Get-DefaultOut($m, [string]$Step, [string]$Call) {
   if ($Step -match '^(c\.verify\.[0-9]+|x\.verify)$') {
@@ -435,8 +468,10 @@ function Get-DefaultOut($m, [string]$Step, [string]$Call) {
   }
   if ($Step -ceq 'x.check') {   # the re-pin (B.14.6): the manifest of the frozen machine differs from the pinned one (hold states, sizes after the freeze), so every x.check that returns 0 changes the sha
     $h = @($script:W.Mf.holds); if ($h.Count) { $h[0].n_restarts = [int]$h[0].n_restarts + 1 } else { $script:W.Mf.identity.swap_mb = [int]$script:W.Mf.identity.swap_mb + 1 }
-    return @(@(Get-ManifestLine $null) + @($script:W.CheckProjects | ForEach-Object { "INV warn back-new-only kind=project name=$_" }))   # CheckProjects: the project registry names new lists at x.check (a back)
+    $gw = @(); if (@($m.GoneRoots).Count) { foreach ($r in @($m.GoneRoots)) { if (@(@($script:W.Mf.items) | Where-Object { [string]$_.root -ceq $r }).Count) { $gw += "INV warn item-gone path=$r" } }; $script:W.Mf.items = @(@($script:W.Mf.items) | Where-Object { @($m.GoneRoots) -cnotcontains [string]$_.root }) }   # E-R31: an item whose root is gone on the checked machine is dropped from the re-pinned manifest
+    return @(@(Get-ManifestLine $null) + $gw + @($script:W.CheckProjects | ForEach-Object { "INV warn back-new-only kind=project name=$_" }))   # CheckProjects: the project registry names new lists at x.check (a back)
   }
+  if ($Step -ceq 'x.baseline') { return @(Get-HealthBaseline) }
   @("LOG $Step done")
 }
 function Apply-Effects($m, [string]$Step, [string]$Verb, $f, $sw, [string]$Id, [string]$Stdin) {
@@ -444,24 +479,25 @@ function Apply-Effects($m, [string]$Step, [string]$Verb, $f, $sw, [string]$Id, [
     '^(c\.init-(old|new)|b\.init-(new|old))$' {
       $j = $null; try { $j = $Stdin | ConvertFrom-Json } catch { [void]$script:W.Violations.Add("init stdin is not JSON") }
       $m.MoveId = @{ id = $Id; role = $f['role']; dir = $f['dir']; attempt = [int]$f['attempt']; state = 'open'; mark = $(if ($f['mark'] -and $f['mark'] -cne 'null') { $f['mark'] } else { $null }); phase = $f['phase']; serving = $f['serving']; dst_started = $f['dst-started']; old_addr = $(if ($j) { $j.old_addr }); new_addr = $(if ($j) { $j.new_addr }) }
-      $m.InitStdin = $j; $m.Sha = $f['sha']
+      $m.InitStdin = $j; $m.Sha = $f['sha']; if ($j) { $m.PinManifest = $j.manifest }
       if ($Step -ceq 'c.init-new' -and $j -and $j.PSObject.Properties['target'] -and -not $m.Target) { $m.Target = ConvertTo-Json -InputObject $j.target -Depth 10 -Compress }   # MV_DIR/target.json, written only when absent (D.0.9)
       if ($f['role'] -ceq 'new' -and $f['dir'] -ceq 'fwd') { $m.Frozen = $true; $m.Active = 0; $m.Enabled = $false }
     }
     '^(c\.repin\.[0-9]+|x\.repin)$' {   # _mvr_put_manifest stores the --sha FLAG as manifest.json.sha256 (the gate has refused a flag that is not the sha256 of the stdin manifest, S4)
       $m.Sha = $f['sha']
-      try { $m.RepinStdin = $Stdin | ConvertFrom-Json } catch { [void]$script:W.Violations.Add('repin stdin is not JSON') }
+      try { $m.RepinStdin = $Stdin | ConvertFrom-Json; $m.PinManifest = $m.RepinStdin.manifest } catch { [void]$script:W.Violations.Add('repin stdin is not JSON') }
     }
-    '^x\.check$' { if (-not $script:W.CheckNoPin) { $m.Sha = $script:W.LastSha } }   # x.check rc 0 writes the re-pinned manifest and its sha on the machine that ran it; CheckNoPin = a gate that wrote no pin (the defensive case of a garbled answer)
+    '^x\.check$' { if (-not $script:W.CheckNoPin) { $m.Sha = $script:W.LastSha; $m.PinManifest = ($script:W.LastManifest | ConvertFrom-Json) } }   # x.check rc 0 writes the re-pinned manifest and its sha on the machine that ran it; CheckNoPin = a gate that wrote no pin (the defensive case of a garbled answer)
     '^(c\.prepare\.[0-9]+|x\.prepare-id)$' { $m.Hostname = $script:W.Mf.identity.hostname }
     '^x\.freeze$' { $m.Frozen = $true }
     '^(x\.unfreeze\.[0-9]+|r\.unfreeze-src)$' { $m.Frozen = $false }
-    '^(x\.stop-src|x\.stop-dst|r\.stop-dst)$' { $m.Active = 0; $m.Enabled = $false }
+    '^(x\.stop-src|x\.stop-dst|r\.stop-dst)$' { $m.Active = 0; $m.Enabled = $false; $m.Conn = $false }
     '^x\.start$' { $m.Active = $m.Holds }
-    '^(x\.enable\.[0-9]+|r\.start-src)$' { $m.Active = $m.Holds; $m.Enabled = $true }
+    '^x\.enable\.[0-9]+$' { $m.Active = $m.Holds; $m.Enabled = $true; if ($m.MoveId) { $pf = "$($m.MoveId.dir)-$($m.MoveId.attempt)-"; if ($m.Rec.ContainsKey("${pf}r.start-src") -or $m.Rec.ContainsKey("${pf}x.stop-src")) { $m.Conn = $true } } }   # move-run.sh:481-483: x.enable.N runs `mvh_start rollback` (unit connectors too) when the machine holds the (dir, attempt)'s r.start-src or x.stop-src record, plain enable otherwise
+    '^r\.start-src$' { $m.Active = $m.Holds; $m.Enabled = $true; $m.Conn = $true }   # mvh_start rollback: starts the unit connectors too
     '^f\.(old|new)$' { if ($m.MoveId) { $m.MoveId.state = 'finished' }; $m.Frozen = $false }
     '^a\.(old|new)$' { if ($m.MoveId) { $m.MoveId.state = 'aborted' }; $m.Frozen = $false }
-    '^x\.switch$' { $m.Switched = $true }
+    '^x\.switch$' { $m.Switched = $true; $m.Conn = $true }
   }
 }
 
@@ -484,11 +520,12 @@ function Fake-Script($m, [string]$Text, $e) {
       if (-not $m.MoveId) { return (New-Res 1 @()) }
       $mi = $m.MoveId; $o = @('MOVE moveid ' + (@(foreach ($k in 'id', 'role', 'dir', 'attempt', 'state', 'mark', 'dst_started', 'phase', 'serving', 'old_addr', 'new_addr') { "$k=$(if ($null -ne $mi[$k]) { $mi[$k] })" }) -join ' '))
       $o += "MOVE hostkey ssh-ed25519 $($m.Key)"
-      foreach ($c in $m.Order) { $r = $m.Rec[$c]; $o += "MOVE record id=$c start=$(if ($r.Start) { $r.Start } else { '-' }) end=$(if ($r.End) { $r.End } else { '-' }) rc=$(if ($null -ne $r.Rc) { $r.Rc } else { '-' })" }
+      foreach ($c in $m.Order) { $r = $m.Rec[$c]; $sn = if ("$($r.Argv)" -cmatch '--since (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)') { $Matches[1] } else { '-' }; $sh = if ("$($r.Argv)" -cmatch '--sha ([0-9a-f]{64})') { $Matches[1] } else { '-' }; $o += "MOVE record id=$c start=$(if ($r.Start) { $r.Start } else { '-' }) end=$(if ($r.End) { $r.End } else { '-' }) rc=$(if ($null -ne $r.Rc) { $r.Rc } else { '-' }) since=$sn sha=$sh" }   # since= / sha= = the --since / --sha word of the record's argv, like the server's rebuild read
       # the machine's own pin (manifest.json + manifest.json.sha256, D.0.10): the manifest whose sha it pinned; the plan's last one when it pinned none
       # the stored manifest.json holds exactly the hashed bytes (R16 r4 server); StoredLf = an older machine: the text plus a final LF (jsontool's output) under the sha256 of the text without it
       if ($m.Sha -and $W.Mfs.ContainsKey($m.Sha)) { $mb = $utf8.GetBytes([string]$W.Mfs[$m.Sha] + $(if ($W.StoredLf) { "`n" } else { '' })); $o += "MOVE manifest sha=$($m.Sha) gz64=$(Get-Gz64 $mb)" } else { $o += (Get-ManifestLine $null) }
       if ($m.Target) { $o += "MOVE target $($m.Target)" }   # new only: c.init-new kept it (D.0.10)
+      if (-not $W.RebuildNoProbe) { $pl = if (@($W.Pf | Where-Object { $_ -ceq 'INV target platform=1' }).Count) { 1 } else { 0 }; $o += "INV target platform=$pl" }   # preflight's probe lines (shared, B.5.2): the platform answer of this machine; RebuildNoProbe = an older rebuild script without the line
       return (New-Res 0 $o)
     }
     default { return (New-Res 0 @()) }
@@ -615,7 +652,7 @@ function Fx-Copied { [void](Do-Plan); [void](Do-Copy) }
 function Fx-Cut { Fx-Copied; [void](Do-Cutover) }
 function Fx-BackDone { Fx-Cut; Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "back exit ($($r.Text))"; Eq (Get-St).phase 'back-done' 'fixture back-done' }
 # the recorded out of a fixture record: the real x.check prints the re-pinned `MOVE manifest sha= gz64=` line (D.4 step 3), which a replay returns
-function Get-RecOut([string]$Call) { if ($Call -match '-x\.check$') { return @(Get-ManifestLine $null) }; @("LOG $Call") }
+function Get-RecOut([string]$Call) { if ($Call -match '-x\.check$') { return @(Get-ManifestLine $null) }; if ($Call -match '-x\.baseline$') { return @(Get-HealthBaseline) }; @("LOG $Call") }
 # a recorded call whose unit still runs (its record has no rc yet); the fake attaches when the same id comes again
 function Set-Running([string]$M, [string]$Call, [int]$Left = 1000, [int]$Rc = 0, [switch]$Tie, [switch]$RcRecorded) {   # Left = the status polls the unit survives (each status answer of the machine counts one); Rc = its rc when it ends; -Tie = a same-second tie: the call before it stays `Last`; -RcRecorded = the completion window: the unit has written its rc but still runs, status shows call_state=running AND the rc
   $mc = $script:W[$M]; $st = $Call -replace '^(fwd|back)-[0-9]+-', ''
@@ -1011,7 +1048,7 @@ T 'L.pre-uid-collision: groups and subid ranges (B.6.2; W1-T11-DG-T11-4) — a m
     [void](Do-Plan -Want $c[2])
     if ($c[2] -eq 65) { HasText 'Trùng user hoặc uid trên máy mới'; NothingWritten "[$($c[0]) $($c[1])] nothing written"; Eq (@(RecCalls -All).Count) 0 'no recorded call' }
   }
-  foreach ($c in @(@('zed', 120000, 65), @('app', 120000, 0), @('zed', 165536, 0))) {
+  foreach ($c in @(@('zed', 120000, 65), @('app', 120000, 0), @('zed', 165536, 0), @('svc$', 120000, 65), @('svc$', 165536, 0), @('alice.smith', 120000, 65), @('Debian-exim', 120000, 65))) {   # names a target account may hold (the shared name-token rule: `svc$`, `alice.smith`, `Debian-exim`) must collide like any other
     Reset-World; $W.Mf.subids = @([ordered]@{ kind = 'uid'; name = 'app'; start = 100000; count = 65536 }); $W.Pf = $pf0 + "INV target subid user=$($c[0]) kind=uid start=$($c[1]) count=65536"
     [void](Do-Plan -Want $c[2])
     if ($c[2] -eq 65) { HasText 'Trùng user hoặc uid trên máy mới'; HasText 'what=subuid'; NothingWritten "[$($c[0]) $($c[1])] nothing written" }
@@ -1308,11 +1345,21 @@ T 'L.pre-empty-rules: /usr/local/man as the base-files link with the text share/
 } -NeedsBash
 T 'L.pre-uid-collision: the preflight script prints new''s groups with gid ≥ 1000, every /etc/subuid and /etc/subgid line and every global address (B.0.2; W1-T11-DG-T11-4)' {
   $fr = Pf-Root
-  Fx-File $fr 'fx-group' "root:x:0:`nsudo:x:27:alice`ndevs:x:1800:alice`n"; Fx-File $fr 'etc/subuid' "alice:100000:65536`n"; Fx-File $fr 'etc/subgid' "alice:165536:65536`n"
+  Fx-File $fr 'fx-group' "root:x:0:`nsudo:x:27:alice`ndevs:x:1800:alice`n"; Fx-File $fr 'etc/subuid' "alice:100000:65536`nsvc`$:300000:65536`nalice.smith:400000:65536`n"; Fx-File $fr 'etc/subgid' "alice:165536:65536`nsvc`$:365536:65536`n"
   $r = Pf-Run $fr (Pf-Stubs); Eq $r.Code 0 "exit ($($r.Text))"
   PfHas $r 'INV target group=devs gid=1800'; PfLacks $r '^INV target group=(root|sudo) '
   PfHas $r 'INV target subid user=alice kind=uid start=100000 count=65536'; PfHas $r 'INV target subid user=alice kind=gid start=165536 count=65536'
+  PfHas $r 'INV target subid user=svc$ kind=uid start=300000 count=65536'; PfHas $r 'INV target subid user=svc$ kind=gid start=365536 count=65536'; PfHas $r 'INV target subid user=alice.smith kind=uid start=400000 count=65536'
   PfHas $r 'INV target addr=198.51.100.20'; PfHas $r 'INV target addr=2001:db8::20'
+} -NeedsBash
+T 'L.preflight-subid-names: the preflight script keeps every subid name that is a name token (B.6.2.1: `svc$`, `alice.smith`, `Debian-exim`, 256 characters) and drops one with a blank, a tab or a control byte, an empty one or one longer than 256 characters; the range of a kept name is printed for subuid and subgid' {
+  $fr = Pf-Root; $long = 'n' * 257; $ok256 = 'm' * 256
+  Fx-File $fr 'etc/subuid' ("svc`$:300000:65536`nDebian-exim:310000:65536`nalice.smith:320000:65536`n${ok256}:330000:65536`nsp ace:340000:65536`ntab`tname:350000:65536`nctl$([char]1)name:360000:65536`n:370000:65536`n${long}:380000:65536`n"); Fx-File $fr 'etc/subgid' "svc`$:300000:65536`n"
+  $r = Pf-Run $fr (Pf-Stubs); Eq $r.Code 0 "exit ($($r.Text))"
+  foreach ($n in 'svc$', 'Debian-exim', 'alice.smith', $ok256) { PfHas $r "INV target subid user=$n kind=uid start=$(@{ 'svc$' = 300000; 'Debian-exim' = 310000; 'alice.smith' = 320000; $ok256 = 330000 }[$n]) count=65536" }
+  PfHas $r 'INV target subid user=svc$ kind=gid start=300000 count=65536'
+  foreach ($n in 'sp ace', "tab`tname", "ctl$([char]1)name", $long) { PfLacks $r ('^INV target subid user=' + [regex]::Escape($n) + ' ') }
+  Eq @($r.Out | Where-Object { "$_" -match '^INV target subid user=' }).Count 5 'exactly the four kept uid names and the one gid range'
 } -NeedsBash
 T 'L.push-scan: the facts script prints one MOVE legacy line per legacy project directory on the machine (/opt/deal-sync deal-sync, /opt/internal-scraper vps-scraper) from a read-only git remote get-url origin, next to MOVE facts; no other directory, nothing written (ruling T10c-LP 04/11)' {
   $git = @(Get-Command git -CommandType Application -ErrorAction SilentlyContinue)[0]; Ok ($null -ne $git) 'git on the test machine'
@@ -1656,21 +1703,30 @@ T 'L.rb-dst-unreachable-not-started: new unreachable in a rollback before x.star
   [void](Do-Cutover -1); Eq $script:Last.Code 10 'exit'; HasText 'máy mới không trả lời; máy cũ chạy lại'
   Ok ((Sent 'old' '-r\.start-src$') -eq 1) 'old started'; Eq $W.old.Active $Holds 'old serves'
 }
-T 'L.rb-fail-src-start: old r.start-src failing in a rollback: unfreeze still tried, exit 70, enabled=false' {
-  Fx-Copied; Add-Fault -M new -Key '-x\.final$' -Rc 1; Add-Fault -M old -Key '-r\.start-src$' -Rc 1
-  [void](Do-Cutover 70); Ok ((Sent 'old' '-r\.unfreeze-src$') -eq 1) 'unfreeze tried'; Eq (Get-St).enabled $false 'enabled'
+function Rebuild-Now { $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild ($($rr.Text))"; Get-St }
+function Assert-OldServes([string]$Tag, [switch]$NewDown) {   # -NewDown: new does not answer, only old is judged
+  $s = Get-St; Eq $s.phase 'rolled-back' "[$Tag] phase"; Eq $s.serving 'old' "[$Tag] serving"; Ok ($null -eq $s.mark) "[$Tag] mark"; Eq $s.enabled $true "[$Tag] enabled"
+  Eq $W.old.Frozen $false "[$Tag] old unfrozen"; Eq $W.old.Enabled $true "[$Tag] old enabled"; Eq $W.old.Active $Holds "[$Tag] old serves"; Eq $W.old.Conn $true "[$Tag] old's connectors run (r.start-src, not x.enable.N)"
+  if (-not $NewDown) { Eq $W.new.Active 0 "[$Tag] new stopped"; Ok (-not ($W.new.Active -gt 0 -and $W.old.Active -gt 0)) "[$Tag] never both" }
 }
-T 'L.rb-unfreeze-fail: r.unfreeze-src failing: exit 70, old serves frozen, enabled=false' {
-  Fx-Copied; Add-Fault -M new -Key '-x\.final$' -Rc 1; Add-Fault -M old -Key '-r\.unfreeze-src$' -Rc 1
-  [void](Do-Cutover 70); $s = Get-St; Eq $s.enabled $false 'enabled'; Eq $s.phase 'rolled-back' 'phase'; Eq $s.serving 'old' 'serving'; Eq $W.old.Frozen $true 'old still frozen'
+function Assert-NewUntouched([string]$Tag) {   # the first call to new is the fence; nothing that starts, enables, switches or health-checks it
+  $nc = @(RecCalls | Where-Object { $_.M -ceq 'new' } | ForEach-Object { $_.Call }); Ok ($nc.Count -ge 1) "[$Tag] a call reached new"
+  if ($nc.Count -ge 1) { Ok ($nc[0] -match '-r\.stop-dst$') "[$Tag] r.stop-dst is the FIRST call to new: $($nc -join ', ')" }
+  Eq (Sent 'new' '-x\.(enable|unfreeze)\.[0-9]+$') 0 "[$Tag] no x.enable.N / x.unfreeze.N to new"; Eq (Sent 'new' '-x\.(switch|health|start|final)$') 0 "[$Tag] no x.switch / x.health / x.start / x.final to new"
 }
-T 'L.prerule-after-rb-unfreeze-fail: the next verb repairs old first with chore 0 (x.enable.N, x.unfreeze.N) under the current attempt' {
-  Fx-Copied; Add-Fault -M new -Key '-x\.final$' -Rc 1; Add-Fault -M old -Key '-r\.unfreeze-src$' -Rc 1
-  [void](Do-Cutover 70)
-  [void](Do-Copy 0)
-  Ordered @('^old fwd-1-x\.enable\.[0-9]+$', '^old fwd-1-x\.unfreeze\.[0-9]+$', '^old fwd-2-c\.init-old$')
-  Eq $W.old.Frozen $false 'old unfrozen by the repair'
+# ADDENDUM (E-R3): a definite r.start-src / r.unfreeze-src failure leaves the write-ahead state rolling-back (serving old, enabled false) and exits 70; copy / abort / back are refused, `cutover` re-sends the three calls (the failed id is re-executed, the done ones replay) and a now-successful start ends rolled-back; chore 0 never repairs a return
+function Rb-Fail-Case([string]$Which) {
+  Fx-Copied; Add-Fault -M new -Key '-x\.final$' -Rc 1; Add-Fault -M old -Key "-r\.$Which-src`$" -Rc 1
+  [void](Do-Cutover 70); Ok ((Sent 'old' '-r\.unfreeze-src$') -eq 1) "[$Which] unfreeze tried (also after a failed start)"
+  $s = Get-St; Eq $s.mark 'rolling-back' "[$Which] state stays rolling-back"; Eq $s.serving 'old' "[$Which] serving"; Eq $s.enabled $false "[$Which] enabled"; Eq $s.carry $false "[$Which] carry"; Ok ($s.phase -cne 'rolled-back') "[$Which] not rolled-back"
+  if ($Which -ceq 'unfreeze') { Eq $W.old.Frozen $true "[$Which] old still frozen" }
+  foreach ($v in 'copy', 'abort', 'back') { $r = Run-Move @($v); Ok ($r.Code -ne 0) "[$Which] $v is refused ($($r.Text))"; Eq (SentAny '.') 0 "[$Which] $v sent nothing" }
+  $r = Run-Move @('cutover'); Eq $r.Code 10 "[$Which] cutover continues the return ($($r.Text))"
+  foreach ($c in 'start', 'unfreeze', 'health') { Ok ((SentAny "^fwd-1-r\.$c-src`$") -ge 1) "[$Which] r.$c-src re-sent (a done one replays)" }; Eq (Sent 'old' "^fwd-1-r\.$Which-src`$") 1 "[$Which] the failed r.$Which-src is re-executed"
+  Eq (SentAny '-x\.(enable|unfreeze)\.[0-9]+$') 0 "[$Which] no chore 0"; Assert-OldServes $Which
 }
+T 'L.rb-fail-src-start: old r.start-src failing in a rollback: unfreeze still tried, exit 70, the state stays rolling-back with enabled=false; copy / abort / back refused; `cutover` re-sends the three calls and a now-successful start ends rolled-back, enabled (E-R3)' { Rb-Fail-Case 'start' }
+T 'L.rb-unfreeze-fail: r.unfreeze-src failing: exit 70, old serves frozen, the state stays rolling-back with enabled=false; `cutover` repairs it with the return''s own calls, never with chore 0' { Rb-Fail-Case 'unfreeze' }
 T 'L.rb-health-fail-unfreezes: a failing r.health-src is reported after the unfreeze with the failed checks; old serves, exit 10 (report only: D.5.1, E-R18; W1-T11-DG-T11-2)' {
   Fx-Copied; Add-Fault -M new -Key '-x\.final$' -Rc 1; Add-Fault -M old -Key '-r\.health-src$' -Rc 69 -Out @('MOVE item health-nginx kind=check state=failed')
   [void](Do-Cutover 10); HasText 'health-nginx'
@@ -2333,7 +2389,9 @@ T 'L.new-lost-return-fences: after Q-newlost YES (new_lost), when new answers st
   $W.new.Up = $true; $r = Run-Move @('copy'); Eq $r.Code 0 "copy after new came back ($($r.Text))"
   Eq (Sent 'new' '^fwd-1-r\.stop-dst$') 1 'exactly one r.stop-dst on new'; $first = @(RecCalls | Where-Object { $_.M -ceq 'new' } | Select-Object -First 1); Eq $first[0].Call 'fwd-1-r.stop-dst' "the fence is the first call to new: $(@(RecCalls | Where-Object { $_.M -ceq 'new' } | ForEach-Object { $_.Call }) -join ', ')"
   Reset-World; Start-Carry; Add-Fault -M old -Key '^back-2-x\.stop-dst$' -Rc 1; Ans 'có', 'YES'; $r = Run-Move @('cutover'); Eq $r.Code 10 "Q-discard YES ($($r.Text))"; Eq (Get-St).new_discarded $true 'new_discarded'
-  $r = Run-Move @('copy'); Eq $r.Code 0 "copy after the discard ($($r.Text))"; Eq (Sent 'new' '^back-2-r\.stop-dst$') 1 'exactly one r.stop-dst on new (the discard)'; $first = @(RecCalls | Where-Object { $_.M -ceq 'new' } | Select-Object -First 1); Eq $first[0].Call 'back-2-r.stop-dst' 'the fence is the first call to new'
+  # ADDENDUM: the YES return IS a rollback, so it stops new first when it answers: the fence is the first call to new of the YES run itself (one r.stop-dst) and is not re-executed by the next verb
+  Eq (Sent 'new' '^back-2-r\.stop-dst$') 1 'exactly one r.stop-dst on new (the discard)'; $last = @(RecCalls | Where-Object { $_.M -ceq 'new' } | Select-Object -Last 1); Eq $last[0].Call 'back-2-r.stop-dst' 'the fence is the last call to new of the run (the return''s own first call, after the carry-back''s earlier calls)'
+  $r = Run-Move @('copy'); Eq $r.Code 0 "copy after the discard ($($r.Text))"; Eq (Sent 'new' '^back-2-r\.stop-dst$') 0 'the fence is not executed again'
 }
 T 'L.new-lost-fence-text: Q-newlost asks to power off or reinstall new first and names <giờ> (D.5.3)' {
   Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.health$' -Mode down; [void](Do-Cutover 70)
@@ -2495,12 +2553,14 @@ T 'L.x-check-lost-rollback: x.check to old is lost but old pinned B: the rollbac
   Eq (Get-St).manifest_sha $B 'manifest_sha = B'; Eq (Get-Sha256Hex ([IO.File]::ReadAllBytes((Join-Path (MoveDir) 'manifest.json')))) $B 'manifest.json = B'; Eq (SentAny '-x\.repin$') 0 'no x.repin'
   foreach ($st in 'r.unfreeze-src', 'r.health-src') { Eq (@(CallShas 'old' "^fwd-1-$([regex]::Escape($st))$") -join ' ') $B "$st carries B" }
 }
-T 'L.x-check-lost-rollback-rerun: the same loss, but the re-sent r.start-src of the recovery is lost too (old drops again): the run does not finish; after old answers again the next verb (copy) repairs old from the saved B (its pre-rule chore 0 is not refused what=sha) and goes on' {
+T 'L.x-check-lost-rollback-rerun: the same loss, but the re-sent r.start-src of the recovery is lost too (old drops again): the run does not finish; after old answers again the next verb is `cutover` (the state stays rolling-back, `copy` is refused): rb-continue re-sends the return''s calls from the saved B (no what=sha refusal), never chore 0' {
   Fx-Copied
   Add-Fault -M old -Key '^fwd-1-x\.check$' -Rc 0 -Mode noexit -Do { Add-Fault -M old -Key '^status$' -Mode down -N 1 }
   Add-Fault -M old -Key '^fwd-1-r\.start-src$' -Mode down -N 1
-  Ans 'có'; $r1 = Run-Move @('cutover'); $B = $W.LastSha; Ok ($r1.Code -ne 0 -and $r1.Code -ne 10) "the first run does not finish ($($r1.Code): $($r1.Text))"; Eq (Get-St).manifest_sha $B 'the recovery saved B'
-  $W.old.Up = $true; $r = Run-Move @('copy'); Eq $r.Code 0 "the next verb (copy) repairs old with its pre-rule (chore 0 carries B) and goes on ($($r.Text))"; Eq (Get-St).phase 'copied' 'phase'; Eq $W.old.Frozen $false 'old unfrozen'; Eq $W.old.Active $Holds 'old serves again'; Eq (Sent 'old' '-x\.enable\.') 1 'chore 0 ran on old'
+  Ans 'có'; $r1 = Run-Move @('cutover'); $B = $W.LastSha; Ok ($r1.Code -ne 0 -and $r1.Code -ne 10) "the first run does not finish ($($r1.Code): $($r1.Text))"; Eq (Get-St).manifest_sha $B 'the recovery saved B'; Eq (Get-St).mark 'rolling-back' 'the write-ahead state stays'
+  $W.old.Up = $true; $rc = Run-Move @('copy'); Ok ($rc.Code -ne 0) "copy is refused while the return is unfinished ($($rc.Text))"
+  $r = Run-Move @('cutover'); Eq $r.Code 10 "cutover continues the return from the saved B ($($r.Text))"; Eq (Get-St).phase 'rolled-back' 'phase'; Eq $W.old.Frozen $false 'old unfrozen'; Eq $W.old.Active $Holds 'old serves again'; Eq (Sent 'old' '-x\.enable\.') 0 'no chore 0'
+  foreach ($st in 'r.start-src', 'r.unfreeze-src', 'r.health-src') { Eq (@(CallShas 'old' "^fwd-1-$([regex]::Escape($st))$") -join ' ') $B "$st carries B" }
   Eq @(LogNow | Where-Object { $_ -match ' sha$' }).Count 0 "no what=sha refusal in the next verb: $(@(LogNow | Where-Object { $_ -match ' sha$' }))"
 }
 T 'L.x-check-lost-unpinned-rollback: the lost x.check did NOT pin (old still pins A): the rollback''s calls to old carry A and pass - no what=sha, no x.check replay, ends 10 as before' {
@@ -2516,6 +2576,336 @@ T 'L.x-check-lost-back-rollback: a manual back whose x.check to new (src) is los
   Eq $r.Code 1 "E-R19 end ($($r.Text))"; $s = Get-St; Eq $s.phase 'cut' 'phase'; Eq $s.serving 'new' 'serving'; Ok ($null -eq $s.mark) 'mark'; Eq $W.new.Frozen $false 'new unfrozen'; Eq $W.new.Active $Holds 'new serves again'
   Eq (@(CallShas 'new' '^back-2-r\.start-src$') -join ' ') "$B0 $C" 'r.start-src: the old sha (refused what=sha), then the same id with C'; Eq $s.manifest_sha $C 'manifest_sha = C'; Eq (@(CallShas 'new' '^back-2-r\.unfreeze-src$') -join ' ') $C 'r.unfreeze-src carries C'
 }
+# ============================== T14 final rework (Astra :2, :3, :6) ==============================
+# :2 x.baseline prints its health lines; x.health AND x.switch read them on stdin (B.14.7, _mvr_base_load): a check that failed in the baseline is a warn, never a gate; a tunnel name is judged by its class against the baseline class
+function HealthStdin([string]$Call) { $c = @(RecCalls -All | Where-Object { $_.Call -ceq $Call -and -not $_.Replay } | Select-Object -First 1); if ($c.Count) { [string]$c[0].Stdin } else { $null } }
+function BaselineLines { @(@($W.old.Rec['fwd-1-x.baseline'].Out) | Where-Object { $_ -match '^MOVE item .* kind=health ' }) }
+T 'L.baseline-stdin-health-switch: x.baseline''s health lines (one check failed already, a tunnel at class 2) are sent as the stdin of x.health and x.switch; a check failing now that the baseline marked failed is a warn, not a gate (cutover ends cut), and the tunnel at 200 passes' {
+  $W.HealthFail['worker.service'] = $true; $W.Tunnel = @{ Name = 't.example.com'; BaseCode = 200; Code = 200 }
+  Fx-Copied; [void](Do-Cutover 0); Eq (Get-St).phase 'cut' 'phase'
+  $bl = @(BaselineLines); Ok ($bl.Count -eq 4) "x.baseline printed 4 health lines: $($bl -join ' | ')"; Ok ($bl -contains 'MOVE item worker.service kind=health state=failed') 'the failed check is in the baseline'
+  foreach ($c in 'fwd-1-x.health', 'fwd-1-x.switch') { $in = HealthStdin $c; Ok ($null -ne $in) "$c was sent"; Eq (@($in -split '\r?\n' | Where-Object { $_ }) -join "`n") ($bl -join "`n") "$c stdin = the baseline lines" }
+  Ok (@($W.new.Rec['fwd-1-x.health'].Out) -contains 'INV warn health-baseline check=worker.service') 'x.health warned about the baseline-failed check, no gate'
+}
+T 'L.baseline-regression: a check that was ok in the baseline and fails at x.health gates (69): the cutover turns into the carry-back (10); the same for a tunnel whose class changes 2 -> 4 at x.switch, which the server passes only if no baseline class was sent' {
+  Fx-Copied; $W.Hooks['x.health'] = { param($m, $e) $W.HealthFail['app.service'] = ($e.Call -like 'fwd-*') }; Ans 'có'; $r = Run-Move @('cutover'); Eq $r.Code 10 "x.health regression: carry-back ($($r.Text))"; Eq (Get-St).phase 'back-done' 'phase'
+  Reset-World; $W.Tunnel = @{ Name = 't.example.com'; BaseCode = 200; Code = 200 }; $W.Hooks['x.switch'] = { param($m, $e) $W.Tunnel.Code = $(if ($e.Call -like 'fwd-*') { 404 } else { 200 }) }; Fx-Copied; Ans 'có'; $r = Run-Move @('cutover'); Eq $r.Code 10 "x.switch class regression 200 -> 404: carry-back ($($r.Text))"; Eq (Get-St).phase 'back-done' 'phase'
+}
+T 'L.baseline-resume: the laptop died after x.start: the resume (step 8) sends the baseline lines it kept as the stdin of x.health and x.switch, and does not send x.baseline again' {
+  $W.HealthFail['worker.service'] = $true; Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.start$' -Rc 0 -Mode kill; Ans 'có'; $r1 = Run-Move @('cutover'); Ok ($r1.Code -ne 0) "the laptop died ($($r1.Text))"
+  $bl = @(BaselineLines); Ok ($bl.Count -ge 3) 'fixture: a baseline was taken'; $r = Run-Move @('cutover'); Eq $r.Code 0 "resume ($($r.Text))"; Eq (Get-St).phase 'cut' 'phase'
+  Eq (SentAny '-x\.baseline$') 0 'x.baseline not sent again in the resume'
+  foreach ($c in 'fwd-1-x.health', 'fwd-1-x.switch') { $in = HealthStdin $c; Eq (@($in -split '\r?\n' | Where-Object { $_ }) -join "`n") ($bl -join "`n") "$c stdin = the baseline lines (resumed)" }
+}
+T 'L.baseline-recover: the lines are not in the laptop state (wiped, or a rebuilt state): the resume replays this attempt''s x.baseline once (a done record answers its stored out, nothing runs) and sends those lines; when the replay fails, x.health is not sent and the run turns to the recovery path' {
+  $W.HealthFail['worker.service'] = $true; Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.start$' -Rc 0 -Mode kill; Ans 'có'; $r1 = Run-Move @('cutover'); Ok ($r1.Code -ne 0) "the laptop died ($($r1.Text))"
+  $s = Get-St; $a = $s.answers; [void]$a.PSObject.Properties.Remove('health-baseline'); [void](Patch-St @{ answers = $a }); Ok ($null -eq (Get-St).answers.PSObject.Properties['health-baseline']) 'fixture: the stored baseline is gone'
+  $bl = @(BaselineLines); $r = Run-Move @('cutover'); Eq $r.Code 0 "resume ($($r.Text))"; Eq (Get-St).phase 'cut' 'phase'
+  Eq (SentAny '-x\.baseline$') 1 'x.baseline sent once (a replay)'; Eq (Sent 'old' '-x\.baseline$') 0 'it executed nothing (done record)'; Eq (@((HealthStdin 'fwd-1-x.health') -split '\r?\n' | Where-Object { $_ }) -join "`n") ($bl -join "`n") 'x.health stdin = the replayed lines'
+  Reset-World; Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.start$' -Rc 0 -Mode kill; Ans 'có'; [void](Run-Move @('cutover'))
+  $s = Get-St; $a = $s.answers; [void]$a.PSObject.Properties.Remove('health-baseline'); [void](Patch-St @{ answers = $a }); $W.old.Rec['fwd-1-x.baseline'].Rc = 1; Add-Fault -M old -Key '^fwd-1-x\.baseline$' -Rc 1
+  $r = Run-Move @('cutover'); Ok ($r.Code -ne 0) "the replay failed ($($r.Code): $($r.Text))"; Eq (SentAny '^fwd-1-x\.health$') 0 'x.health not sent without a baseline'
+}
+T 'L.baseline-carry-empty: the carry-back runs no x.baseline, so its x.health goes out with an empty stdin (no baseline line gates)' {
+  Start-Carry; Ans 'có'; $r = Run-Move @('cutover'); Eq $r.Code 10 "carry-back ($($r.Text))"
+  $h = @(RecCalls -All | Where-Object { $_.Call -ceq 'back-2-x.health' }); Ok ($h.Count -ge 1) 'the carry-back sent x.health'; Eq ([string]$h[0].Stdin) '' 'x.health stdin is empty'
+  $h = @(RecCalls -All | Where-Object { $_.Call -ceq 'back-2-x.switch' }); foreach ($x in $h) { Eq ([string]$x.Stdin) '' 'x.switch stdin is empty' }
+}
+T 'L.baseline-other-attempt: a later attempt takes its OWN baseline: the lines kept for attempt 1 are never sent in attempt 3 (a resume that finds only the attempt-1 lines replays attempt 3''s x.baseline)' {
+  Fx-BackDone; [void](Do-Copy 0); $W.HealthFail['cron.service'] = $true; [void](Do-Cutover 0); Eq (Get-St).attempt 3 'attempt'
+  $in = HealthStdin 'fwd-3-x.health'; Ok ($null -ne $in) 'attempt 3 sent x.health'; Ok ($in -match 'MOVE item cron\.service kind=health state=failed') "attempt 3's own baseline (cron failed): $in"
+  # the stale leftover: the laptop died after x.start of attempt 3 and only attempt 1's lines are in the state
+  Reset-World; Fx-BackDone; [void](Do-Copy 0); $W.HealthFail['cron.service'] = $true; Add-Fault -M new -Key '^fwd-3-x\.start$' -Rc 0 -Mode kill; Ans 'có'; $r1 = Run-Move @('cutover'); Ok ($r1.Code -ne 0) "the laptop died ($($r1.Text))"
+  $s = Get-St; $a = $s.answers; Set-Prop $a 'health-baseline' ([pscustomobject]@{ id = 'fwd-1'; lines = @('MOVE item app.service kind=health state=ok', 'MOVE item worker.service kind=health state=ok', 'MOVE item cron.service kind=health state=ok') }); [void](Patch-St @{ answers = $a })
+  $r = Run-Move @('cutover'); Eq $r.Code 0 "resume ($($r.Text))"; Eq (SentAny '^fwd-3-x\.baseline$') 1 'attempt 3''s x.baseline replayed: the attempt-1 lines were not taken'
+  Ok ((HealthStdin 'fwd-3-x.health') -match 'MOVE item cron\.service kind=health state=failed') 'attempt 3''s own baseline reached x.health'
+}
+# :3 a manual back: a failed x.final / x.verify / x.prepare-id / x.adopt (steps 6-7) ends 70 and is resume-only - old holds an incomplete copy, new stays frozen and stopped: the resume retries them, it is never E-R19 (which restarts new)
+T 'L.back-final-failed-resume: a manual back whose x.final fails ends 70 (resume only, new frozen and stopped, no r.start-src); `back` again retries x.final under the same id and goes on to back-done' {
+  Fx-Cut; Add-Fault -M new -Key '^back-2-x\.final$' -Rc 1; Ans 'YES'; $r1 = Run-Move @('back'); Eq $r1.Code 70 "x.final failed ($($r1.Text))"; $s = Get-St; Eq $s.mark 'cutting' 'mark kept'; Eq $s.dir 'back' 'dir'; Eq $W.new.Frozen $true 'new frozen'; Eq $W.new.Active 0 'new stopped'
+  Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "resume ($($r.Text))"; Eq (Get-St).phase 'back-done' 'phase'
+  Eq (SentAny '-r\.start-src$') 0 'never E-R19: new was not restarted'; Eq (Sent 'new' '^back-2-x\.final$') 1 'x.final re-sent (the failed record runs again)'; Ok ((Sent 'old' '^back-2-x\.start$') -ge 1) 'old started after the final copy'
+}
+T 'L.back-adopt-failed-resume: a manual back whose x.adopt on old fails ends 70; the resume does not restart new: it replays the done steps, runs x.adopt again and goes on to back-done' {
+  Fx-Cut; Add-Fault -M old -Key '^back-2-x\.adopt$' -Rc 1; Ans 'YES'; $r1 = Run-Move @('back'); Eq $r1.Code 70 "x.adopt failed ($($r1.Text))"; Eq $W.new.Frozen $true 'new frozen'
+  Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "resume ($($r.Text))"; Eq (Get-St).phase 'back-done' 'phase'; Eq (SentAny '-r\.start-src$') 0 'never E-R19'; Eq (Sent 'old' '^back-2-x\.adopt$') 1 'x.adopt run again'
+}
+T 'L.back-stop-failed-still-e-r19: a failure BEFORE the final copy (x.stop-dst on old) still ends the manual back as E-R19: new restarted and unfrozen, phase cut, serving new, exit 1; the fwd cutover is unchanged (plain rollback)' {
+  Fx-Cut; Add-Fault -M old -Key '^back-2-x\.stop-dst$' -Rc 1; Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code 1 "E-R19 ($($r.Text))"; $s = Get-St; Eq $s.phase 'cut' 'phase'; Eq $s.serving 'new' 'serving'; Eq (Sent 'new' '^back-2-r\.start-src$') 1 'new restarted'; Eq $W.new.Frozen $false 'new unfrozen'
+  # the same failure found on a RESUME (the laptop died after the failed x.stop-dst record): the failed record is before the final copy, so the resume ends it as E-R19 too
+  Reset-World; Fx-Cut; Add-Fault -M old -Key '^back-2-x\.stop-dst$' -Rc 1 -Effect -Mode kill; Ans 'YES'; $r1 = Run-Move @('back'); Ok ($r1.Code -ne 0) "the laptop died ($($r1.Text))"
+  Eq (SentAny '-r\.start-src$') 0 'fixture: no restart yet'; Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code 1 "the resume ends E-R19 ($($r.Text))"; Eq (Get-St).phase 'cut' 'phase'; Eq (Sent 'new' '^back-2-r\.start-src$') 1 'new restarted by the resume'
+}
+# :6 rebuild after f.old but before f.new: phase finished only when BOTH machines are finished
+T 'L.rebuild-finish-half: f.old ran, f.new never did, the laptop state is lost: `status --rebuild` does NOT write phase finished; the next `finish` skips old (no call into its door) and runs f.new, ends 0 and finished, new''s move-id finished' {
+  Fx-Cut; Add-Fault -M new -Key '-f\.new$' -Mode down; Ans 'YES'; $r = Run-Move @('finish'); Ok ($r.Code -ne 0) 'finish stops at f.new'; Eq $W.old.MoveId.state 'finished' 'old finished'; Eq $W.new.MoveId.state 'open' 'new still open'
+  $W.new.Up = $true; [IO.File]::Delete((StatePath)); foreach ($n in 'old', 'new') { $W[$n].MoveId.old_addr = $OldAddr; $W[$n].MoveId.new_addr = $NewAddr }
+  $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild ($($rr.Text))"; $s = Get-St; Ok ($s.phase -cne 'finished') "phase is not finished: $($s.phase)"; Eq $s.phase 'cut' 'phase'; Eq $s.serving 'new' 'serving'
+  Ans 'YES'; $r = Run-Move @('finish'); Eq $r.Code 0 "finish ($($r.Text))"; Eq (Get-St).phase 'finished' 'phase'; Eq $W.new.MoveId.state 'finished' 'new closed'; Eq (Sent 'new' '-f\.new$') 1 'f.new sent'; Eq (SentAny '-f\.old$') 0 'no f.old (not even into the door)'
+}
+T 'L.rebuild-finish-both: both machines finished: `status --rebuild` writes phase finished (idempotent: finish and every verb end as D.11 says)' {
+  Fx-Finished; [IO.File]::Delete((StatePath)); foreach ($n in 'old', 'new') { $W[$n].MoveId.old_addr = $OldAddr; $W[$n].MoveId.new_addr = $NewAddr }
+  $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild ($($rr.Text))"; Eq (Get-St).phase 'finished' 'phase'
+}
+# ============================== T14 final2 (Astra final2 :7-10) ==============================
+function Lose-State { [IO.File]::Delete((StatePath)); foreach ($n in 'old', 'new') { if ($W[$n].MoveId) { $W[$n].MoveId.old_addr = $OldAddr; $W[$n].MoveId.new_addr = $NewAddr } } }
+function SinceOf([string]$Call) { $s = @(); foreach ($n in 'old', 'new') { $r = $W[$n].Rec[$Call]; if ($r -and "$($r.Argv)" -match '--since (\S+)') { $s += $Matches[1] } }; $s }
+# :7 the server keeps its call records across a rebuild; the rebuilt laptop must number its next `.N` calls past every record it can read (done, failed or interrupted, either machine), else it re-sends a done id (a replay: nothing is prepared or copied) or a changed argv (call-argv)
+T 'L.rebuild-pass-counters: state lost after a finished copy: `status --rebuild` rebuilds pass{} from the records of both machines; the next `copy` sends c.prepare / c.transfer / c.verify / c.adopt as .2 (never a replay of .1, never call-argv) and ends copied' {
+  Fx-Copied; Lose-State; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild ($($rr.Text))"; $p = (Get-St).pass
+  foreach ($b in 'c.prepare', 'c.transfer', 'c.verify', 'c.adopt') { Eq ([int]$p.PSObject.Properties["fwd-1-$b"].Value) 1 "pass[fwd-1-$b] = the highest N on the machines" }
+  $r = Run-Move @('copy'); Eq $r.Code 0 "copy ($($r.Text))"; Eq (Get-St).phase 'copied' 'phase'
+  Eq (Sent 'new' '^fwd-1-c\.prepare\.2$') 1 'c.prepare.2 ran'; Eq (SentAny '^fwd-1-c\.prepare\.1$') 0 'no c.prepare.1 again'; Eq (Sent 'new' '^fwd-1-c\.transfer\.2$') 1 'c.transfer.2 ran'; Eq (SentAny '^fwd-1-c\.transfer\.1$') 0 'no c.transfer.1 again'
+  Eq (Sent 'old' '^fwd-1-c\.verify\.2$') 1 'c.verify.2 on old'; Eq (Sent 'new' '^fwd-1-c\.verify\.2$') 1 'c.verify.2 on new'; Eq (Sent 'new' '^fwd-1-c\.adopt\.2$') 1 'c.adopt.2'
+  Eq @(LogNow -All | Where-Object { $_ -match 'call-argv' }).Count 0 "no call-argv refusal: $(@(LogNow | Where-Object { $_ -match 'call-argv' }))"
+}
+T 'L.rebuild-pass-counters-failed: a failed c.transfer.2 and an interrupted c.prepare.3 on new count too: the rebuilt pass{} holds 2 and 3, the next copy sends c.transfer.3 and c.prepare.4 (a failed or interrupted id is never re-used by a new pass)' {
+  Fx-Copied; Add-Rec 'new' 'fwd-1-c.transfer.2' 1; $W.new.Rec['fwd-1-c.prepare.3'] = @{ Rc = $null; Out = @('LOG fwd-1-c.prepare.3'); Dur = 5; Argv = '?'; Start = (Format-Iso $script:Clock); End = '' }; [void]$W.new.Order.Add('fwd-1-c.prepare.3')
+  Lose-State; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild ($($rr.Text))"; $p = (Get-St).pass
+  Eq ([int]$p.PSObject.Properties['fwd-1-c.transfer'].Value) 2 'pass[c.transfer] counts the failed record'; Eq ([int]$p.PSObject.Properties['fwd-1-c.prepare'].Value) 3 'pass[c.prepare] counts the interrupted record'
+  $r = Run-Move @('copy'); Eq $r.Code 0 "copy ($($r.Text))"; Eq (Sent 'new' '^fwd-1-c\.transfer\.3$') 1 'c.transfer.3'; Eq (Sent 'new' '^fwd-1-c\.prepare\.4$') 1 'c.prepare.4'; Eq (SentAny '^fwd-1-c\.(prepare\.[123]|transfer\.[12])$') 0 'no old id re-sent'
+}
+# :8 the server compares --since of x.verify even for a done record (K1 argv compare): a resumed back must send the value it sent the first time, on both machines, not "now"
+T 'L.rebuild-since: a manual back dies after x.verify, the state is lost and rebuilt: the resume sends x.verify with the SAME --since on both machines (no call-argv), and the back ends back-done' {
+  Fx-Cut; Add-Fault -M old -Key '^back-2-x\.verify$' -Rc 0 -Mode kill; Ans 'YES'; $r1 = Run-Move @('back'); Ok ($r1.Code -ne 0) "the laptop died ($($r1.Text))"
+  $s1 = @(SinceOf 'back-2-x.verify'); Ok ($s1.Count -eq 2) "x.verify ran on both machines: $($s1 -join ',')"; Eq $s1[0] $s1[1] 'the same --since on both machines'
+  Lose-State; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild ($($rr.Text))"
+  Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "resume ($($r.Text))"; Eq (Get-St).phase 'back-done' 'phase'
+  Eq @(LogNow -All | Where-Object { $_ -match 'call-argv' }).Count 0 "no call-argv refusal: $(@(LogNow | Where-Object { $_ -match 'call-argv' }))"
+  $vs = @(RecCalls -All | Where-Object { $_.Call -ceq 'back-2-x.verify' } | ForEach-Object { [string]$_.Flags['since'] } | Select-Object -Unique); Eq $vs.Count 1 "every x.verify of the back carries one --since: $($vs -join ',')"; Eq $vs[0] $s1[0] 'the recorded value'
+}
+# a FAILED x.verify record carries the recorded --since too (any rc): the resume re-sends it with that value and the failed call runs again
+T 'L.rebuild-since-failed: x.verify fails on old (rc 1) or on new (the only record), the back ends 70, the state is lost and rebuilt: the resume re-sends x.verify with the RECORDED --since, the failed call executes again, no call-argv, back-done' {
+  Fx-Cut; Add-Fault -M old -Key '^back-2-x\.verify$' -Rc 1; Ans 'YES'; $r1 = Run-Move @('back'); Ok ($r1.Code -ne 0 -and $r1.Code -ne $BackDoneExit) "x.verify failed on old ($($r1.Code): $($r1.Text))"
+  $s2 = @(SinceOf 'back-2-x.verify'); Eq $s2.Count 2 'x.verify ran on both machines'; Eq $s2[0] $s2[1] 'the same --since'; Eq ([int]$W.old.Rec['back-2-x.verify'].Rc) 1 'the dst record is failed'
+  Lose-State; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild ($($rr.Text))"; Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "resume ($($r.Text))"
+  Eq @(LogNow -All | Where-Object { $_ -match 'call-argv' }).Count 0 'no call-argv refusal'; $vs = @(RecCalls -All | Where-Object { $_.Call -ceq 'back-2-x.verify' } | ForEach-Object { [string]$_.Flags['since'] } | Select-Object -Unique); Eq $vs.Count 1 'one --since'; Eq $vs[0] $s2[0] 'the recorded value'; Eq (Sent 'old' '^back-2-x\.verify$') 1 'the failed x.verify ran again'
+  Reset-World; $W.StartSkew = 2; Fx-Cut; foreach ($n in 'old', 'new') { [void]$W[$n].Rec.Remove('fwd-1-c.verify.1'); [void]$W[$n].Order.Remove('fwd-1-c.verify.1') }; Add-Fault -M new -Key '^back-2-x\.verify$' -Rc 1; Ans 'YES'; $r1 = Run-Move @('back'); Ok ($r1.Code -ne 0 -and $r1.Code -ne $BackDoneExit) "x.verify failed on new ($($r1.Code))"
+  $s3 = @(SinceOf 'back-2-x.verify'); Eq $s3.Count 1 'only the failed record exists'; Lose-State; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 'rebuild'; Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "resume ($($r.Text))"
+  Eq @(LogNow -All | Where-Object { $_ -match 'call-argv' }).Count 0 'no call-argv refusal'; $vs = @(RecCalls -All | Where-Object { $_.Call -ceq 'back-2-x.verify' } | ForEach-Object { [string]$_.Flags['since'] } | Select-Object -Unique); Eq $vs.Count 1 'one --since'; Eq $vs[0] $s3[0] 'taken from the failed record'
+}
+# no x.verify record of the attempt yet: last_copy_at falls back to new's newest forward pass (the field is written only in Invoke-MovePasses, just before that transfer; the same pass's c.verify.N carries it)
+T 'L.rebuild-since-fallback: (a) a manual back rebuilt between the pre-copy and x.verify sends its first x.verify with the --since of new''s newest fwd c.verify.N (not now, not the back''s pre-copy start); (b) with that c.verify record gone: the start of the fwd c.transfer.N; (c) a fwd rebuilt at copied within 60 min: cutover does not re-copy (0b)' {
+  $W.StartSkew = 2; Fx-Cut; $V1 = @(SinceOf 'fwd-1-c.verify.1'); Ok ($V1.Count -ge 1) 'fixture: the fwd pass recorded a --since'; Ok ($V1[0] -cne [string]$W.new.Rec['fwd-1-c.transfer.1'].Start) 'fixture: the verify since differs from the transfer start'
+  Add-Fault -M new -Key '^back-2-x\.final$' -Rc 0 -Mode kill; Ans 'YES'; $r1 = Run-Move @('back'); Ok ($r1.Code -ne 0) "the back died after the pre-copy ($($r1.Text))"; Eq @(SinceOf 'back-2-x.verify').Count 0 'fixture: no x.verify record yet'
+  Lose-State; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild ($($rr.Text))"; Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "resume ($($r.Text))"
+  $vs = @(RecCalls -All | Where-Object { $_.Call -ceq 'back-2-x.verify' } | ForEach-Object { [string]$_.Flags['since'] } | Select-Object -Unique); Eq $vs.Count 1 'one --since'; Eq $vs[0] $V1[0] 'the since of the fwd c.verify.N'; Ok ($vs[0] -cne [string]$W.new.Rec['back-2-c.transfer.1'].Start) 'not the back''s pre-copy start'
+  Reset-World; $W.StartSkew = 2; Fx-Cut; $T1 = [string]$W.new.Rec['fwd-1-c.transfer.1'].Start; foreach ($n in 'old', 'new') { [void]$W[$n].Rec.Remove('fwd-1-c.verify.1'); [void]$W[$n].Order.Remove('fwd-1-c.verify.1') }
+  Add-Fault -M new -Key '^back-2-x\.final$' -Rc 0 -Mode kill; Ans 'YES'; [void](Run-Move @('back')); Lose-State; [void](Run-Move @('status', '--rebuild', $OldAlias, $NewAlias)); Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "resume without c.verify.N ($($r.Text))"
+  $vs = @(RecCalls -All | Where-Object { $_.Call -ceq 'back-2-x.verify' } | ForEach-Object { [string]$_.Flags['since'] } | Select-Object -Unique); Eq $vs.Count 1 'one --since'; Eq $vs[0] $T1 'the start of the fwd c.transfer.N'
+  Reset-World; Fx-Copied; Lose-State; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 'rebuild'; Ok ($null -ne (Get-St).last_copy_at) 'last_copy_at restored'; Ans 'có'; $r = Run-Move @('cutover'); Eq $r.Code 0 "cutover ($($r.Text))"; NoText 'cutover (0b)'; Eq (SentAny '-c\.transfer\.') 0 'no re-copy before the cutover'
+}
+# E-R19 on a rebuild (D.0.10): only a done r.start-src / r.unfreeze-src of NEW means the back ended as E-R19; the fence's r.stop-dst (sent under dir=back too) never does
+T 'L.rebuild-after-discard-fence: a carry-back Q-discard YES, the next verb fences new (back-2-r.stop-dst done on new), the state is lost and rebuilt: phase rolled-back, serving old, new_discarded true; the next verb sends no x.enable.N / x.unfreeze.N to new' {
+  Start-Carry; Add-Fault -M old -Key '^back-2-x\.stop-dst$' -Rc 1; Ans 'có', 'YES'; $r = Run-Move @('cutover'); Eq $r.Code 10 "Q-discard YES ($($r.Text))"; Eq (Get-St).new_discarded $true 'new_discarded'
+  $r2 = Run-Move @('cutover'); Ok ($W.new.Rec.ContainsKey('back-2-r.stop-dst') -and [int]$W.new.Rec['back-2-r.stop-dst'].Rc -eq 0) "the fence ran on new: $(@($W.new.Order) -join ',')"
+  Lose-State; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild ($($rr.Text))"; $s = Get-St; Eq $s.phase 'rolled-back' 'phase'; Eq $s.serving 'old' 'serving'; Eq $s.new_discarded $true 'new_discarded'
+  $r3 = Run-Move @('copy'); Eq (Sent 'new' '-x\.(enable|unfreeze)\.') 0 'nothing enables new'
+}
+T 'L.rebuild-cut-no-fence: a rebuilt `cut` and a rebuilt `back-done` send no r.stop-dst to new on their next verb (new_discarded stays false; the E-R19 end still rebuilds as cut)' {
+  Fx-Cut; Lose-State; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 'rebuild'; $s = Get-St; Eq $s.phase 'cut' 'phase'; Eq $s.new_discarded $false 'new_discarded'; [void](Run-Move @('cutover')); Eq (SentAny '-r\.stop-dst$') 0 'no fence at cut'
+  Reset-World; Fx-BackDone; Lose-State; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 'rebuild'; $s = Get-St; Eq $s.phase 'back-done' 'phase'; Eq $s.new_discarded $false 'new_discarded'; [void](Run-Move @('abort')); Eq (SentAny '-r\.stop-dst$') 0 'no fence at back-done'
+  Reset-World; Fx-Cut; Add-Fault -M old -Key '^back-2-x\.stop-dst$' -Rc 1; Ans 'YES'; [void](Run-Move @('back')); Eq (Get-St).phase 'cut' 'fixture: E-R19 end'; Lose-State; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 'rebuild'; $s = Get-St; Eq $s.phase 'cut' 'the E-R19 end rebuilds as cut'; Eq $s.serving 'new' 'serving new'
+}
+T 'L.rebuild-fence: Q-newlost YES (new down), the state is lost, new answers again and is rebuilt: new_discarded is true, the next `copy` sends r.stop-dst to new at the start of the verb, before c.init-new; `abort` after that rebuild still sends a.new' {
+  Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.health$' -Mode down; [void](Do-Cutover 70); Ans 'YES'; $r = Run-Move @('cutover'); Eq $r.Code 10 "Q-newlost ($($r.Text))"
+  $W.new.Up = $true; Lose-State; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild ($($rr.Text))"; $s = Get-St; Eq $s.phase 'rolled-back' 'phase'; Eq $s.new_discarded $true 'new_discarded'
+  $r = Run-Move @('copy'); Eq (Sent 'new' '^fwd-1-r\.stop-dst$') 1 'the fence r.stop-dst on new'; $l = @(LogNow | Where-Object { $_ -match '^new fwd-1-r\.stop-dst$|^new fwd-[0-9]+-c\.init-new$' }); Ok ($l.Count -ge 1 -and $l[0] -match 'r\.stop-dst') "the fence comes first: $($l -join ' ; ')"
+  Reset-World; Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.health$' -Mode down; [void](Do-Cutover 70); Ans 'YES'; [void](Run-Move @('cutover')); $W.new.Up = $true; Lose-State; [void](Run-Move @('status', '--rebuild', $OldAlias, $NewAlias))
+  Ans 'có'; $r = Run-Move @('abort'); Eq $r.Code 0 "abort ($($r.Text))"; Eq (Sent 'new' '-a\.new$') 1 'a.new is still sent'
+}
+T 'L.rebuild-fence-plain: after a plain rollback (new''s r.stop-dst done) the rebuilt `copy` re-sends the fence under the same id: it is a replay of the done record, nothing executes' {
+  Fx-RolledBack; Lose-State; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild ($($rr.Text))"; $s = Get-St; Eq $s.phase 'rolled-back' 'phase'; Eq $s.new_discarded $true 'new_discarded'
+  [void](Run-Move @('copy')); Eq (Sent 'new' '^fwd-1-r\.stop-dst$') 0 'nothing executes'; $rp = @(Calls | Where-Object { $_.Call -ceq 'fwd-1-r.stop-dst' }); Eq $rp.Count 1 'the fence was sent once'; Ok ($rp[0].Replay -eq $true) 'as a replay'; Ok (@(LogNow | Where-Object { $_ -match 'fwd-1-r\.stop-dst \(replay\)' }).Count -ge 1) 'the log says replay'
+}
+# Astra final4 P1: x.switch ran to the end on new but its answer was lost (new then went down); Q-newlost YES restarted old; new is back and the state is lost. The completed x.switch must not override the LATER return-to-old records:
+# the rebuild is rolled-back with new_discarded (the fence), never `cut`, whose chore 0 would start new while old serves
+T 'L.rebuild-switch-lost-newlost: x.switch done on new (answer lost, new down), Q-newlost YES starts old, new comes back, the state is lost and rebuilt: rolled-back, serving old, new_discarded true, never cut; the next verb fences new first, never enables it, and old and new are never both serving after it' {
+  Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.switch$' -Rc 0 -Mode down; [void](Do-Cutover 70); Ok ([int]$W.new.Rec['fwd-1-x.switch'].Rc -eq 0) 'fixture: x.switch ran to the end on new'
+  Ans 'YES'; $r = Run-Move @('cutover'); Eq $r.Code 10 "Q-newlost YES starts old ($($r.Text))"; Eq (Get-St).new_lost $true 'new_lost'; Ok ([int]$W.old.Rec['fwd-1-r.start-src'].Rc -eq 0) 'fixture: old was restarted (a done r.start-src later than the switch)'
+  $W.new.Up = $true; Lose-State; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild ($($rr.Text))"; $s = Get-St
+  Ok ($s.phase -cne 'cut') 'never cut'; Eq $s.phase 'rolled-back' 'phase'; Eq $s.serving 'old' 'serving'; Eq $s.new_discarded $true 'new_discarded'; Eq $s.mark $null 'mark'
+  $r = Run-Move @('copy'); Eq (Sent 'new' '^fwd-1-r\.stop-dst$') 1 'the fence r.stop-dst reached new'; Eq (Sent 'new' '-x\.(enable|unfreeze)\.') 0 'nothing enables or unfreezes new'
+  Ok (-not ($W.new.Active -gt 0 -and $W.old.Active -gt 0)) "never both: old Active=$($W.old.Active) new Active=$($W.new.Active)"; Eq $W.new.Active 0 'new stopped by the fence'; Eq $W.old.Active $Holds 'old serves'
+  # a successful x.switch with NO later return record stays cut (the precedence only applies to records after it)
+  Reset-World; Fx-Cut; Lose-State; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 'rebuild'; Eq (Get-St).phase 'cut' 'a done x.switch alone is cut'; Eq (Get-St).new_discarded $false 'not fenced'
+}
+# Astra final5 P1 (+ ADDENDUM): the return-to-old record that follows the lost x.switch is NOT always done: the laptop is killed during old's r.start-src (the record is interrupted, the apps are already started) or it fails;
+# ANY return record of old (any state) is a return that began: the rebuild is rolling-back (serving old, new_discarded; the x.switch is not applied), never cut and never rolled-back; `cutover` is rb-continue (new fenced first, none enabled)
+T 'L.rebuild-switch-lost-interrupted-start: x.switch done on new (answer lost), Q-newlost YES, the laptop is killed during old''s r.start-src (interrupted record, apps started) or old''s r.start-src, r.unfreeze-src and r.health-src fail (rc 1): the rebuild is rolling-back (never cut, never rolled-back), serving old, new_discarded true, phase copied; `cutover` is rb-continue: r.stop-dst first to new, nothing enabled or unfrozen on new, old ends rolled-back, serving, unfrozen, enabled; old and new are never both serving' {
+  foreach ($leg in 'interrupted', 'failed') {
+    Reset-World; Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.switch$' -Rc 0 -Mode down; [void](Do-Cutover 70); Ok ([int]$W.new.Rec['fwd-1-x.switch'].Rc -eq 0) "[$leg] fixture: x.switch ran to the end on new"
+    if ($leg -ceq 'interrupted') { Add-Fault -M old -Key '^fwd-1-r\.start-src$' -Rc 0 -Mode kill } else { Add-Fault -M old -Key '^fwd-1-r\.(start|unfreeze|health)-src$' -Rc 1 -N 3 }
+    Ans 'YES'; $r = Run-Move @('cutover')
+    if ($leg -ceq 'interrupted') { Ok ($r.Code -ne 0) "[$leg] the laptop died ($($r.Text))"; $W.old.Rec['fwd-1-r.start-src'].Rc = $null; Ok ($W.old.Active -gt 0) "[$leg] fixture: the apps are already started on old" }
+    else { Eq $r.Code 70 "[$leg] old did not start ($($r.Text))"; Eq ([int]$W.old.Rec['fwd-1-r.start-src'].Rc) 1 "[$leg] fixture: a failed r.start-src on old" }
+    $W.new.Up = $true; Lose-State; $s = Rebuild-Now
+    Ok ($s.phase -cne 'cut') "[$leg] never cut"; Ok ($s.phase -cne 'rolled-back') "[$leg] not rolled-back (r.start-src / r.unfreeze-src did not both return 0)"; Eq $s.phase 'copied' "[$leg] phase"; Eq $s.mark 'rolling-back' "[$leg] mark"; Eq $s.serving 'old' "[$leg] serving"; Eq $s.carry $false "[$leg] carry"; Eq $s.new_discarded $true "[$leg] new_discarded"
+    $r = Run-Move @('cutover'); Eq $r.Code 10 "[$leg] rb-continue ($($r.Text))"; Assert-NewUntouched $leg; Assert-OldServes $leg
+  }
+}
+# ======= ADDENDUM (challenger, "return to old is a rollback"): every return (plain rollback, Q-newlost YES, Q-discard YES) writes ahead mark=rolling-back, serving=old, carry=false (+ the fence flag) BEFORE r.start-src;
+# `rolled-back` is written only when r.start-src and r.unfreeze-src returned 0; the rebuild reads ANY return record of old (any state) as rolling-back; chore 0 is never the repair of a return
+T 'L.newlost-kill-during-return: x.switch done on new (answer lost) or new down after x.health; Q-newlost YES; the laptop is killed while old''s r.start-src unit runs (the write-ahead rolling-back survives); new answers again: `cutover` is rb-continue (r.stop-dst the first call to new, no enable / unfreeze / switch / health to new, old''s three calls), rolled-back, old serving with its connectors, exit 10; a second `cutover` is refused copy-first' {
+  foreach ($leg in 'switch-lost', 'health-down', 'serving-new-state') {   # serving-new-state: the state said serving=new when the return began (a state of an older fcode): the return's own write-ahead must say old
+    Reset-World; Fx-Copied; if ($leg -ceq 'switch-lost') { Add-Fault -M new -Key '^fwd-1-x\.switch$' -Rc 0 -Mode down } else { Add-Fault -M new -Key '^fwd-1-x\.health$' -Mode down }
+    [void](Do-Cutover 70); if ($leg -ceq 'serving-new-state') { [void](Patch-St @{ serving = 'new' }) }; Add-Fault -M old -Key '^fwd-1-r\.start-src$' -Rc 0 -Mode kill; Ans 'YES'; $r = Run-Move @('cutover'); Ok ($r.Code -ne 0) "[$leg] the laptop died ($($r.Text))"
+    $W.old.Rec['fwd-1-r.start-src'].Rc = $null; Ok ($W.old.Conn -eq $true) "[$leg] fixture: the unit started the connectors"
+    $s = Get-St; Eq $s.mark 'rolling-back' "[$leg] write-ahead mark"; Eq $s.serving 'old' "[$leg] write-ahead serving"; Eq $s.carry $false "[$leg] write-ahead carry"; Eq $s.new_lost $true "[$leg] the fence flag"
+    $W.new.Up = $true; $r = Run-Move @('cutover'); Eq $r.Code 10 "[$leg] rb-continue ($($r.Text))"
+    Assert-NewUntouched $leg; Ok ((SentAny '^fwd-1-r\.start-src$') -ge 1) "[$leg] r.start-src attached or replayed"; Eq (Sent 'old' '^fwd-1-r\.unfreeze-src$') 1 "[$leg] r.unfreeze-src"; Eq (Sent 'old' '^fwd-1-r\.health-src$') 1 "[$leg] r.health-src"
+    Assert-OldServes $leg; $r2 = Run-Move @('cutover'); Ok ($r2.Code -ne 0) "[$leg] a second cutover is refused"; HasText 'chạy copy trước'; Eq (SentAny '-x\.(enable|unfreeze)\.[0-9]+$') 0 "[$leg] and sends nothing"
+  }
+}
+T 'L.carry-discard-kill-during-return: a carry-back Q-discard YES, the laptop is killed during old''s r.start-src: `cutover` is rb-continue IN dir=back (back-2 r.* ids, no carry-resume, no x.final, no x.enable.N), rolled-back, serving old, exit 10' {
+  Start-Carry; Add-Fault -M old -Key '^back-2-x\.stop-dst$' -Rc 1; Add-Fault -M old -Key '^back-2-r\.start-src$' -Rc 0 -Mode kill; Ans 'có', 'YES'; $r = Run-Move @('cutover'); Ok ($r.Code -ne 0) "the laptop died ($($r.Text))"
+  $W.old.Rec['back-2-r.start-src'].Rc = $null; $s = Get-St; Eq $s.mark 'rolling-back' 'write-ahead mark'; Eq $s.dir 'back' 'dir'; Eq $s.serving 'old' 'serving'; Eq $s.carry $false 'carry'; Eq $s.new_discarded $true 'the fence flag'
+  $r = Run-Move @('cutover'); Eq $r.Code 10 "rb-continue ($($r.Text))"; Eq (SentAny '-x\.final$') 0 'no x.final (no carry-resume)'; Eq (SentAny '-(x\.enable|x\.unfreeze|b\.init-new)') 0 'no enable / unfreeze / b.init-new'
+  Ok ((SentAny '^back-2-r\.start-src$') -ge 1) 'r.start-src attached or replayed'; Eq (Sent 'old' '^back-2-r\.unfreeze-src$') 1 'r.unfreeze-src'; Eq (Sent 'old' '^back-2-r\.health-src$') 1 'r.health-src'
+  $s = Get-St; Eq $s.phase 'rolled-back' 'phase'; Eq $s.serving 'old' 'serving'; Ok ($null -eq $s.mark) 'mark'; Eq $W.old.Active $Holds 'old serves'; Eq $W.old.Conn $true 'connectors run'; Eq $W.new.Active 0 'new stopped'
+  # counter-addendum §5: a YES return stops new first when it answers; a DEFINITE r.stop-dst refusal ends 70 with the power-off remedy and old is NOT started (the plain rollback keeps its own text)
+  Reset-World; Start-Carry; Add-Fault -M new -Key '^back-2-x\.stop-src$' -Rc 1; Add-Fault -M new -Key '^back-2-r\.stop-dst$' -Rc 1; Ans 'có', 'YES'
+  $r = Run-Move @('cutover'); Eq $r.Code 70 "stop refused ($($r.Text))"; HasText 'tắt hoặc cài lại máy mới trong trang quản lý nhà cung cấp, rồi chạy lại  fcode move cutover'; Eq (SentAny '-r\.start-src$') 0 'old is not started'
+  $s = Get-St; Eq $s.mark 'rolling-back' 'the return stays rolling-back'; Eq $s.serving 'old' 'serving'
+  Reset-World; Fx-Copied; Add-Fault -M new -Key '-x\.final$' -Rc 1; Add-Fault -M new -Key '^fwd-1-r\.stop-dst$' -Rc 1; [void](Do-Cutover 70); HasText 'chạy lại  fcode move cutover  khi máy mới trả lời'; NoText 'tắt hoặc cài lại máy mới'; Eq (SentAny '-r\.start-src$') 0 'plain rollback: old is not started either'
+}
+T 'L.newlost-no-requestion: after a kill during the return (state rolling-back) with new still down, `cutover` continues the return (old started, rolled-back, exit 10) and never asks Q-newlost again' {
+  Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.health$' -Mode down; [void](Do-Cutover 70); Add-Fault -M old -Key '^fwd-1-r\.start-src$' -Rc 0 -Mode kill; Ans 'YES'; $r = Run-Move @('cutover'); Ok ($r.Code -ne 0) "the laptop died ($($r.Text))"
+  $W.old.Rec['fwd-1-r.start-src'].Rc = $null; Eq (Get-St).mark 'rolling-back' 'fixture: rolling-back'; Ok ($W.new.Up -eq $false) 'fixture: new is still down'
+  $n0 = $W.Prompts.Count; $r = Run-Move @('cutover'); Eq $r.Code 10 "continued ($($r.Text))"; Eq $W.Prompts.Count $n0 "no question asked: $($W.Prompts -join ' | ')"; NoText 'Gõ YES'
+  Ok ((SentAny '^fwd-1-r\.start-src$') -ge 1) 'old started'; Assert-OldServes 'new down' -NewDown
+}
+T 'L.rebuild-return-partial: old holds r.start-src FAILED (rc 1) or INTERRUPTED (no rc) and no r.unfreeze-src, in a fwd (new down after x.start) and in a carry-back; the state is lost, new answers: the rebuild is mark rolling-back, serving old, carry false, new_discarded true, phase copied (fwd) / planned (carry); `cutover` is rb-continue (r.stop-dst first to new, r.start-src re-executed with the connectors, r.unfreeze-src, r.health-src) and ends rolled-back' {
+  foreach ($dir in 'fwd', 'carry') { foreach ($st in 'failed', 'interrupted') {
+    $tag = "$dir/$st"; Reset-World; $p = $(if ($dir -ceq 'fwd') { 'fwd-1' } else { 'back-2' })
+    if ($dir -ceq 'fwd') { Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.health$' -Mode down; [void](Do-Cutover 70); Ans 'YES' } else { Start-Carry; Add-Fault -M old -Key '^back-2-x\.stop-dst$' -Rc 1; Ans 'có', 'YES' }
+    Add-Fault -M old -Key "^$p-r\.start-src`$" -Rc 1; [void](Run-Move @('cutover')); foreach ($c in 'r.unfreeze-src', 'r.health-src') { [void]$W.old.Rec.Remove("$p-$c"); [void]$W.old.Order.Remove("$p-$c") }
+    if ($st -ceq 'interrupted') { $W.old.Rec["$p-r.start-src"].Rc = $null };
+    $W.new.Up = $true; Lose-State; $s = Rebuild-Now
+    Eq $s.mark 'rolling-back' "[$tag] mark"; Eq $s.serving 'old' "[$tag] serving"; Eq $s.carry $false "[$tag] carry"; Eq $s.new_discarded $true "[$tag] new_discarded"; Eq $s.phase $(if ($dir -ceq 'fwd') { 'copied' } else { 'planned' }) "[$tag] phase"
+    $r = Run-Move @('cutover'); Eq $r.Code 10 "[$tag] rb-continue ($($r.Text))"; Assert-NewUntouched $tag; Eq (SentAny '-x\.final$') 0 "[$tag] no x.final (never carry-resume)"; Eq (Sent 'old' "^$p-r\.start-src`$") 1 "[$tag] r.start-src re-executed"; Ok ((SentAny "^$p-r\.unfreeze-src`$") -ge 1) "[$tag] r.unfreeze-src"; Ok ((SentAny "^$p-r\.health-src`$") -ge 1) "[$tag] r.health-src"
+    Assert-OldServes $tag
+  } }
+}
+T 'L.rebuild-return-complete: all three return calls done on old (Q-newlost YES, with no x.switch): the rebuild is rolled-back, serving old, mark null, new_discarded true; the next verb fences new first and enables nothing on it; a FAILED r.health-src (it is report-only: E-R18) still rebuilds rolled-back, a MISSING one rolling-back (it is re-run)' {
+  foreach ($leg in 'all-done', 'health-failed', 'health-missing') {
+    Reset-World; Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.health$' -Mode down; [void](Do-Cutover 70); if ($leg -ceq 'health-failed') { Add-Fault -M old -Key '^fwd-1-r\.health-src$' -Rc 69 -Out @('MOVE item health-nginx kind=check state=failed') }
+    Ans 'YES'; $r = Run-Move @('cutover'); Eq $r.Code 10 "[$leg] Q-newlost ($($r.Text))"; if ($leg -ceq 'health-missing') { [void]$W.old.Rec.Remove('fwd-1-r.health-src'); [void]$W.old.Order.Remove('fwd-1-r.health-src') }
+    $W.new.Up = $true; Lose-State; $s = Rebuild-Now; Eq $s.serving 'old' "[$leg] serving"; Eq $s.new_discarded $true "[$leg] new_discarded"; Ok ($s.phase -cne 'cut') "[$leg] never cut"
+    if ($leg -ceq 'health-missing') { Eq $s.mark 'rolling-back' "[$leg] mark"; Eq $s.phase 'copied' "[$leg] phase"; $r = Run-Move @('cutover'); Eq $r.Code 10 "[$leg] the return is completed ($($r.Text))"; Eq (Sent 'old' '^fwd-1-r\.health-src$') 1 "[$leg] r.health-src re-run"; Assert-NewUntouched $leg; Assert-OldServes $leg }
+    else { Eq $s.phase 'rolled-back' "[$leg] phase"; Ok ($null -eq $s.mark) "[$leg] mark"; $r = Run-Move @('copy'); Assert-NewUntouched $leg }
+  }
+}
+T 'L.rebuild-rollback-stop-only: a plain rollback is killed after new''s r.stop-dst and before old''s r.start-src (no return record on old); the state is lost: the rebuild is NOT rolled-back (the fence''s r.stop-dst on new is no return), mark rolling-back from the move-ids; `cutover` completes the rollback (old started, rolled-back, exit 10)' {
+  Fx-Copied; Add-Fault -M new -Key '-x\.final$' -Rc 1; Add-Fault -M old -Key '^fwd-1-r\.start-src$' -Rc 0 -Do { throw 'laptop gone before r.start-src' }; Ans 'có'; $r = Run-Move @('cutover'); Ok ($r.Code -ne 0) "the laptop died ($($r.Text))"
+  Ok ($W.new.Rec.ContainsKey('fwd-1-r.stop-dst') -and [int]$W.new.Rec['fwd-1-r.stop-dst'].Rc -eq 0) 'fixture: new''s r.stop-dst is done'; Ok (-not $W.old.Rec.ContainsKey('fwd-1-r.start-src')) 'fixture: no return record on old'
+  Lose-State; $s = Rebuild-Now; Ok ($s.phase -cne 'rolled-back') "not rolled-back: $($s.phase)"; Eq $s.mark 'rolling-back' 'mark'
+  $r = Run-Move @('cutover'); Eq $r.Code 10 "the rollback completes ($($r.Text))"; Eq (Sent 'old' '^fwd-1-r\.start-src$') 1 'old started'; Assert-OldServes 'stop-only'
+  # the same in a carry-back (dir back): a Q-discard YES return killed after new's back-2-r.stop-dst, before old's r.start-src: the fence's r.stop-dst on new is NOT an E-R19 end (cut, serving new)
+  Reset-World; Start-Carry; Add-Fault -M old -Key '^back-2-x\.stop-dst$' -Rc 1; Add-Fault -M old -Key '^back-2-r\.start-src$' -Rc 0 -Do { throw 'laptop gone before r.start-src' }; Ans 'có', 'YES'; $r = Run-Move @('cutover'); Ok ($r.Code -ne 0) "[carry] the laptop died ($($r.Text))"
+  Ok ($W.new.Rec.ContainsKey('back-2-r.stop-dst') -and [int]$W.new.Rec['back-2-r.stop-dst'].Rc -eq 0) '[carry] fixture: new''s back-2-r.stop-dst is done'; Ok (-not $W.old.Rec.ContainsKey('back-2-r.start-src')) '[carry] fixture: no return record on old'
+  Lose-State; $s = Rebuild-Now; Ok ($s.phase -cne 'cut') "[carry] never cut (not an E-R19 end): $($s.phase)"; Ok ($s.phase -cne 'rolled-back') "[carry] not rolled-back: $($s.phase)"; Eq $s.serving 'old' '[carry] serving'; Eq $s.carry $false '[carry] carry'
+  $r = Run-Move @('cutover'); Eq $r.Code 10 "[carry] the rollback completes ($($r.Text))"; Eq (Sent 'old' '^back-2-r\.start-src$') 1 '[carry] old started'; Eq (SentAny '-x\.final$') 0 '[carry] no x.final'; Assert-OldServes 'stop-only carry'
+}
+# G35 (E-R5, E-R23): x.final was SENT in a carry-back when new holds its record; a rebuilt state keeps that fact, so a new that is down later does not turn the carry-back into a Q-discard
+T 'L.rebuild-final-sent: a carry-back dies after x.final was sent, the state is lost and rebuilt with both machines up, then new goes down: `cutover` ends 70 with the "chỉ tiếp tục được khi máy mới nối lại" line, no Q-discard / Q-newlost, no r.start-src to old' {
+  Start-Carry; Add-Fault -M new -Key '^back-2-x\.final$' -Rc 0 -Mode kill; Ans 'có'; $r1 = Run-Move @('cutover'); Ok ($r1.Code -ne 0) "the laptop died ($($r1.Text))"; Ok ($W.new.Rec.ContainsKey('back-2-x.final')) 'fixture: new recorded x.final'
+  Lose-State; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild ($($rr.Text))"; Eq ([string](Get-St).answers.'final-sent') 'back-2-x.final' 'final-sent restored'
+  $W.new.Up = $false; $n0 = $W.Prompts.Count; $r = Run-Move @('cutover'); Eq $r.Code 70 "exit ($($r.Text))"; HasText 'chỉ tiếp tục được khi máy mới nối lại'; Eq $W.Prompts.Count $n0 'no Q-discard / Q-newlost asked'; Eq (SentAny '-r\.start-src$') 0 'old is not restarted'
+}
+T 'L.rebuild-final-sent-none: no x.final record on new: the same rebuild and a down new keep today''s Q-discard question' {
+  Start-Carry; Add-Fault -M new -Key '^back-2-x\.stop-src$' -Rc 0 -Mode kill; Ans 'có'; $r1 = Run-Move @('cutover'); Ok ($r1.Code -ne 0) "the laptop died ($($r1.Text))"; Ok (-not $W.new.Rec.ContainsKey('back-2-x.final')) 'fixture: no x.final'
+  Lose-State; [void](Run-Move @('status', '--rebuild', $OldAlias, $NewAlias)); Ok (-not [string](Get-St).answers.'final-sent') 'no final-sent'
+  $W.new.Up = $false; $n0 = $W.Prompts.Count; Ans 'không'; [void](Run-Move @('cutover')); Ok ($W.Prompts.Count -gt $n0) "a question was asked: $($W.Prompts -join ' | ')"; NoText 'chỉ tiếp tục được khi máy mới nối lại'
+}
+# O2: a refresh (D.3 re-run) that died after the re-pin: the cutover must still refuse (answers{refresh-pending}); the rebuild restores it from the records: pending iff no DONE c.adopt.N on new carries the manifest_sha
+T 'L.rebuild-refresh-pending: (a) a refresh dies after c.repin.N on both and c.prepare.N failed: rebuilt copied with refresh-pending true, cutover refuses, no 0b transfer, `copy` completes and cutover goes on; (b) old-only re-pin (new still pins A): the same; (c) a completed refresh: not pending; (d) a first copy: not pending' {
+  $late = [ordered]@{ name = 'late'; uid = 1003 }
+  Fx-Copied; $W.Mf.users = @($W.Mf.users) + $late; Add-Fault -M new -Key '-c\.prepare\.2$' -Rc 1; [void](Do-Copy 1); Lose-State; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild a ($($rr.Text))"
+  Eq (Get-St).phase 'copied' 'phase'; Eq (Get-St).answers.'refresh-pending' $true '(a) pending'; Ans 'có'; $r = Run-Move @('cutover'); Eq $r.Code 1 "(a) cutover refused ($($r.Text))"; HasText 'chạy fcode move copy lại'; Eq (SentAny '-c\.transfer\.|-x\.freeze$') 0 '(a) no 0b transfer, nothing frozen'
+  [void](Do-Copy 0); Eq (Get-St).answers.'refresh-pending' $false '(a) the refresh ended'; Ans 'có'; $r = Run-Move @('cutover'); Eq $r.Code 0 "(a) cutover after a good refresh ($($r.Text))"
+  Reset-World; Fx-Copied; $W.Mf.users = @($W.Mf.users) + $late; Add-Fault -M new -Key '-c\.repin\.1$' -Rc 1; [void](Do-Copy -1); $B = $W.LastSha; Eq $W.old.Sha $B 'fixture: old pins B'; Ok ($W.new.Sha -cne $B) 'fixture: new still pins A'
+  Lose-State; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild b ($($rr.Text))"; Eq (Get-St).manifest_sha $B '(b) manifest_sha = old''s pin'; Eq (Get-St).answers.'refresh-pending' $true '(b) pending'
+  Ans 'có'; $r = Run-Move @('cutover'); Eq $r.Code 1 "(b) cutover refused ($($r.Text))"; HasText 'chạy fcode move copy lại'
+  Reset-World; Fx-Copied; $W.Mf.users = @($W.Mf.users) + $late; [void](Do-Copy 0); Lose-State; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild c ($($rr.Text))"; Eq (Get-St).answers.'refresh-pending' $false '(c) a completed refresh is not pending'; Ans 'có'; $r = Run-Move @('cutover'); Eq $r.Code 0 "(c) cutover goes on ($($r.Text))"
+  Reset-World; Fx-Copied; Lose-State; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild d ($($rr.Text))"; Eq (Get-St).answers.'refresh-pending' $false '(d) a first copy is not pending'; Ans 'có'; $r = Run-Move @('cutover'); Eq $r.Code 0 "(d) cutover goes on ($($r.Text))"
+}
+# O4: target_platform survives a rebuild (the probe line of the rebuild script; B31, DG-R1)
+T 'L.rebuild-target-platform: a mixed pair (new carries the platform) is rebuilt: target_platform 1, so a copy refresh whose re-plan adds a tree item under a platform path refuses target-not-empty; with no probe line target_platform is 0 and the same copy goes on' {
+  $node = [ordered]@{ id = 'file-usr-local-bin-node'; root = '/usr/local/bin/node'; kind = 'file'; bytes_apparent = 1000; inodes = 1 }
+  $W.Pf = @('INV target user=quoc uid=1000 home-nonskel=1', 'INV target platform=1', 'INV target stop_budget_s=120'); Fx-Copied; Eq (St-Raw 'target_platform') '1' 'stored from preflight'
+  Lose-State; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild ($($rr.Text))"; Eq (St-Raw 'target_platform') '1' 'restored from the probe'
+  $W.Mf.items = @($W.Mf.items) + $node; [void](Do-Copy 65); HasText 'Máy mới không trống'; HasText '/usr/local/bin/node'; Eq (SentAny '-c\.repin\.') 0 'refused before c.repin.N'
+  Reset-World; $W.Pf = @('INV target user=quoc uid=1000 home-nonskel=1', 'INV target platform=1', 'INV target stop_budget_s=120'); Fx-Copied; $W.RebuildNoProbe = $true; Lose-State; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 'rebuild'; Eq (St-Raw 'target_platform') '0' 'no probe line: 0'
+  $W.Mf.items = @($W.Mf.items) + $node; [void](Do-Copy 0); Ok ((Sent 'old' '-c\.repin\.[0-9]+$') -ge 1) 'the copy went on to c.repin.N'
+}
+# Astra final4 P2: a target-only account whose name is a valid name token (`svc$`) holds a subuid range; the laptop must keep it (plan, target.json, rebuild) so a moved user overlapping it is refused before any write
+T 'L.rebuild-target-subid-token: preflight''s `INV target subid user=svc$ ...` is kept in target_subids (plan) and restored by the rebuild from target.json; a copy refresh whose re-plan moves a user whose range overlaps it refuses uid-collision (what=subuid) before c.repin / prepare / transfer' {
+  $W.Pf = @('INV target user=quoc uid=1000 home-nonskel=1', 'INV target user=app uid=1001 home-nonskel=0', 'INV target platform=0', 'INV target stop_budget_s=120', 'INV target subid user=svc$ kind=uid start=300000 count=65536', 'INV target subid user=alice.smith kind=gid start=500000 count=65536')
+  Fx-Copied; $sb = @((Get-St).target_subids | ForEach-Object { "$($_.user):$($_.kind):$($_.start):$($_.count)" }); Ok ($sb -ccontains 'svc$:uid:300000:65536' -and $sb -ccontains 'alice.smith:gid:500000:65536') "plan kept the ranges of the token-named accounts: $($sb -join ',')"
+  $t = $W.new.Target | ConvertFrom-Json; Ok (@($t.subids | Where-Object { $_.user -ceq 'svc$' }).Count -eq 1) 'c.init-new sent the range in target.json'
+  Lose-State; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild ($($rr.Text))"
+  $sb = @((Get-St).target_subids | ForEach-Object { "$($_.user):$($_.kind):$($_.start):$($_.count)" }); Ok ($sb -ccontains 'svc$:uid:300000:65536' -and $sb -ccontains 'alice.smith:gid:500000:65536') "the rebuild restored them: $($sb -join ',')"
+  $W.Mf.subids = @([ordered]@{ kind = 'uid'; name = 'app'; start = 320000; count = 65536 }); [void](Do-Copy 65); HasText 'Trùng user hoặc uid trên máy mới'; HasText 'what=subuid'; Eq (SentAny '-c\.(repin|prepare|transfer)\.') 0 'refused before any write'
+}
+# O5 (DECISION-r3, static): every laptop-state field and every answers{} key the code writes is named in $MoveRebuildInventory (restored `from:<src>` or `empty:<why>`), the keys come from New-MoveState, the literal Set-MoveProp /
+# Set-MoveAnswer $S '<k>', Set-MoveAsk (a literal key or the part before the first `$` of a computed one) and Set-MoveWriteAhead $S @{...}; `answers` has ONE writer (Set-MoveAnswer); every `from:` key is written by the rebuild code
+function Get-InventoryProblems([string]$Text) {
+  $A = [Management.Automation.Language.Parser]; $tk = $null; $er = $null; $ast = $A::ParseInput($Text, [ref]$tk, [ref]$er); $pr = New-Object Collections.Generic.List[string]
+  if ($er.Count) { return @("does not parse: $($er[0].Message)") }
+  $isS = { param($e) $e -is [Management.Automation.Language.VariableExpressionAst] -and $e.VariablePath.UserPath -ceq 'S' }
+  $str = { param($e, [bool]$Prefix) if ($e -is [Management.Automation.Language.StringConstantExpressionAst]) { [string]$e.Value } elseif ($Prefix -and $e -is [Management.Automation.Language.ExpandableStringExpressionAst]) { $v = [string]$e.Value; $i = $v.IndexOf('$'); if ($i -ge 0) { $v.Substring(0, $i) } else { $v } } else { $null } }
+  $asg = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -ceq '$MoveRebuildInventory' }, $true))
+  if ($asg.Count -ne 1) { return @('$MoveRebuildInventory is not assigned exactly once') }
+  $inv = @{}; $iht = @($asg[0].FindAll({ param($n) $n -is [Management.Automation.Language.HashtableAst] }, $true))[0]; foreach ($kv in $iht.KeyValuePairs) { $inv[[string]$kv.Item1.Value] = ([string]$kv.Item2.Extent.Text).Trim("'") }
+  foreach ($k in @($inv.Keys)) { if ($inv[$k] -cnotmatch '\A(from|empty):.+') { $pr.Add("inventory value of [$k] is neither from:<src> nor empty:<why>: $($inv[$k])") } }
+  $nf = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'New-MoveState' }, $true))[0]; $props = @(); if ($nf) { $props = @(@($nf.FindAll({ param($n) $n -is [Management.Automation.Language.HashtableAst] }, $true))[0].KeyValuePairs | ForEach-Object { [string]$_.Item1.Value }) }
+  if (-not $props.Count) { $pr.Add('New-MoveState: no property list found') }
+  foreach ($p in $props) { if (-not $inv.ContainsKey($p)) { $pr.Add("New-MoveState property [$p] is not in the inventory") } }
+  foreach ($f in 'map.txt', 'manifest.json', 'known_hosts') { if (-not $inv.ContainsKey($f)) { $pr.Add("file [$f] is not in the inventory") } }
+  $inFn = { param($n, [string]$Name) $p = $n.Parent; while ($p) { if ($p -is [Management.Automation.Language.FunctionDefinitionAst] -and $p.Name -ceq $Name) { return $true }; $p = $p.Parent }; $false }
+  foreach ($c in @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] }, $true))) {
+    $nm = $c.GetCommandName(); $e = @($c.CommandElements)
+    if ($nm -cin 'Set-MoveProp', 'Set-MoveAnswer') { if ($e.Count -ge 3 -and (& $isS $e[1])) { $k = & $str $e[2] $false; if ($null -ne $k -and -not $inv.ContainsKey($k)) { $pr.Add("$nm `$S '$k': [$k] is not in the inventory") } } }
+    elseif ($nm -ceq 'Set-MoveAsk') { if ($e.Count -ge 4 -and (& $isS $e[1])) { $k = & $str $e[3] $true; if ($null -ne $k -and -not $inv.ContainsKey($k)) { $pr.Add("Set-MoveAsk key/prefix [$k] is not in the inventory") } } }
+    elseif ($nm -ceq 'Set-MoveWriteAhead') { if ($e.Count -ge 3 -and (& $isS $e[1]) -and $e[2] -is [Management.Automation.Language.HashtableAst]) { foreach ($kv in $e[2].KeyValuePairs) { $k = & $str $kv.Item1 $false; if ($null -ne $k -and $props -cnotcontains $k) { $pr.Add("Set-MoveWriteAhead key [$k] is not declared in New-MoveState") } } } }
+    elseif ($nm -ceq 'Set-MoveMapVal' -and $e.Count -ge 2 -and $e[1].Extent.Text -ceq '$S.answers' -and -not (& $inFn $c 'Set-MoveAnswer')) { $pr.Add("answers has a second writer: $($c.Extent.Text)") }
+  }
+  $rb = (@($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -cmatch 'Rebuil[dt]' }, $true) | ForEach-Object { $_.Extent.Text }) -join "`n")
+  $alias = @{ 'known_hosts' = 'Get-MoveKnownFile'; 'manifest.json' = 'Save-MoveManifest'; 'answers' = 'Set-MoveAnswer' }
+  foreach ($k in @($inv.Keys)) { if ($inv[$k] -cmatch '\Afrom:') { $w = if ($alias.ContainsKey($k)) { $alias[$k] } else { $k }; if ($rb -cnotmatch ('(?<![A-Za-z0-9_-])' + [regex]::Escape($w) + '(?![A-Za-z0-9_-])')) { $pr.Add("inventory says [$k] is restored (from:) but the rebuild code never writes it") } } }
+  if ($Text -cnotmatch 'every top-level field.*declared here') { $pr.Add('New-MoveState lacks its "every top-level field is declared here" comment') }
+  $pr
+}
+T 'L.rebuild-inventory: the rebuild inventory names every laptop-state field and every answers{} key the code writes (New-MoveState, literal Set-MoveProp / Set-MoveAnswer, the Set-MoveAsk keys and prefixes, Set-MoveWriteAhead), answers has one writer, every from: key is written by the rebuild; planted writers are caught' {
+  $pr = @(Get-InventoryProblems $script:FcodeText); Eq $pr.Count 0 "inventory problems: $($pr -join ' | ')"
+  $cases = @(
+    @('a planted literal answers key', "`nSet-MoveAnswer `$S 'planted' 1`n", 'planted'),
+    @('a planted literal state key', "`nSet-MoveProp `$S 'plantedprop' 1`n", 'plantedprop'),
+    @('a planted Set-MoveAsk key', "`nSet-MoveAsk `$S `$asked 'Q-planted' 'có'`n", 'Q-planted'),
+    @('a planted Set-MoveAsk computed key', "`nSet-MoveAsk `$S `$asked `"Q-plantedprefix:`$nm`" 'có'`n", 'Q-plantedprefix:'),
+    @('a planted write-ahead key', "`nSet-MoveWriteAhead `$S @{ plantedwa = 1 } -NoCheck`n", 'plantedwa'),
+    @('a second answers writer', "`nSet-MoveMapVal `$S.answers 'x' 1`n", 'second writer'))
+  foreach ($c in $cases) { $p2 = @(Get-InventoryProblems ($script:FcodeText + $c[1])); Ok (@($p2 | Where-Object { $_ -like "*$($c[2])*" }).Count -ge 1) "$($c[0]) must be reported: $($p2 -join ' | ')" }
+  $p3 = @(Get-InventoryProblems ($script:FcodeText -replace "'Q-ownip' = ", "'Q-ownipX' = ")); Ok (@($p3 | Where-Object { $_ -like '*Q-ownip*' }).Count -ge 1) "an inventory without a written key is reported: $($p3 -join ' | ')"
+}
+# :9 (DECISION-r3) a forward item root deleted on new: the SERVER's back pre pass skips it itself (`MOVE item <id> kind=<k> state=done why=item-gone`, rc 0, nothing copied); the laptop always sends the plain pre-copy and x.check drops the item (E-R31)
+T 'L.back-precopy-item-gone: an item root deleted on new before a manual back: the pre-copy IS sent (one c.transfer.N) and ends 0 with the server''s item-gone line, old''s copy is untouched, x.check drops the item from the re-pin, x.final carries the re-pin and the back ends back-done; a final pass against a still-pinned gone root would fail' {
+  Fx-Cut; $W.new.GoneRoots = @('/srv/data'); $c0 = $W.old.Content.Count
+  Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "back ($($r.Text))"; Eq (Get-St).phase 'back-done' 'phase'
+  Eq (SentAny '^back-2-c\.transfer\.') 1 'one pre-copy transfer is sent'; $t = @(RecCalls -All | Where-Object { $_.Call -match '^back-2-c\.transfer\.[0-9]+$' })[0]; Eq ([int]$W.new.Rec[$t.Call].Rc) 0 'it ended 0'; Ok (@($W.new.Rec[$t.Call].Out) -contains 'MOVE item srv-data kind=tree state=done why=item-gone') "the server's item-gone line: $(@($W.new.Rec[$t.Call].Out) -join ' | ')"
+  Eq $W.old.Content.Count $c0 'old''s copies untouched'; Ok (@($W.new.Rec['back-2-x.check'].Out) -contains 'INV warn item-gone path=/srv/data') 'x.check dropped the item (E-R31)'; Eq (@($W.Mf.items | Where-Object { $_.root -ceq '/srv/data' }).Count) 0 'the re-pinned manifest has no /srv/data'
+  Eq ([int]$W.new.Rec['back-2-x.final'].Rc) 0 'x.final (against the re-pin) ended 0'
+}
+T 'L.back-precopy-item-present: with every item root present the pre-copy runs (one c.transfer.N) and carries the whole manifest' {
+  Fx-Cut; Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "back ($($r.Text))"; Eq (SentAny '^back-2-c\.transfer\.') 1 'one pre-copy transfer'; Eq (@($W.Mf.items).Count) 2 'both items kept'; Ok (-not @(@($W.new.Rec['back-2-x.check'].Out) | Where-Object { $_ -match 'item-gone' }).Count) 'no item-gone'
+}
+# :10 the bootstrap gate pulls through old's door by plain ssh from new: like the server's mv_ssh_opts it must ignore the client config and the global known_hosts the adopt may have copied from old
+T 'L.bootstrap-ssh-isolated: the bootstrap gate script''s ssh (the -e of its rsync) carries -F /dev/null and -o GlobalKnownHostsFile=/dev/null besides its own key, known_hosts and host-key checking' {
+  $fr = New-FcmRoot; $r = Run-Bash (Get-MoveBootstrapGateScript) @('--old-addr', "${OldAddr}:2222") $fr (New-Stubs @{ rsync = 'printf "%s\n" "$*" >> "$FCM_ROOT/rsync.log"; exit 0' })
+  Eq $r.Code 0 "bootstrap gate ($($r.Text))"; $lg = Join-Path $fr 'rsync.log'; Ok (Test-Path -LiteralPath $lg) 'rsync was called'; $t = [IO.File]::ReadAllText($lg)
+  foreach ($o in '-F /dev/null', '-o GlobalKnownHostsFile=/dev/null', '-o UserKnownHostsFile=', '-o StrictHostKeyChecking=yes', '-o BatchMode=yes', '-o IdentitiesOnly=yes', '-p 2222') { Ok ($t.Contains($o)) "ssh option [$o] in: $t" }
+} -NeedsBash
 # the agreement check (D.11, W1-T10-G9): a machine with no move-id is skipped only in phase planned; in every other phase it is re-init-ed like a disagreement
 T 'L.agreement-missing-move-id: new lost its move-id after the copy (wiped box): `cutover` re-inits new (c.init-new under the same attempt) before any call that needs it, and the cutover goes through' {
   Fx-Copied; $n = $W.new; $n.MoveId = $null; $n.Rec = @{}; $n.Order.Clear(); $n.Last = $null; $n.Sha = ''
@@ -2791,12 +3181,27 @@ T 'L.back-new-projects-resume: the laptop died after the back''s x.check rc 0 (t
   Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "resume ($($r.Text))"; Eq (Sent 'new' '^back-2-x\.check$') 0 'x.check replayed, not run'; Eq (SentAny '^back-2-x\.check$') 1 'x.check sent again'
   Ok (-not ($r.Text -match 'Máy mới có dự án đăng ký sau khi hỏi Q-back')) 'no drift line'; Eq (ShaRefusals).Count 0 "no what=sha refusal: $(ShaRefusals)"
 }
-T 'L.back-new-projects-rebuilt: a rebuilt state has no stored list (rebuild cannot know what Q-back showed): the resumed back compares nothing and goes through even though x.check lists a name' {
+T 'L.back-new-projects-rebuilt: a rebuilt manual back carries an EMPTY Q-back list (DECISION-r3 O3): the resumed back''s x.check lists a name, which then stops the back as E-R19 (no x.repin), and `back` again shows the name' {
   Back-Projects @('app9') @('app9', 'app10')
   Add-Fault -M new -Key '^back-2-x\.check$' -Rc 0 -Mode kill; Ans 'YES'; $r1 = Run-Move @('back'); Ok ($r1.Code -ne 0) "the laptop died ($($r1.Text))"
   [IO.File]::Delete((StatePath)); foreach ($n in 'old', 'new') { $W[$n].MoveId.old_addr = $OldAddr; $W[$n].MoveId.new_addr = $NewAddr }
-  $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild ($($rr.Text))"; Ok ($null -eq (Get-St).answers.'back-new-projects') 'no stored list after the rebuild'
-  Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "resume ($($r.Text))"; Ok (-not ($r.Text -match 'Máy mới có dự án đăng ký sau khi hỏi Q-back')) 'no drift line'; Eq (Sent 'old' '^back-2-x\.repin$') 1 'x.repin on old'
+  $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias); Eq $rr.Code 0 "rebuild ($($rr.Text))"; Eq @((Get-St).answers.'back-new-projects').Count 0 'an empty stored list after the rebuild'; Ok ($null -ne (Get-St).answers.PSObject.Properties['back-new-projects']) 'the key exists'
+  Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code 1 "the resume stops as E-R19 ($($r.Text))"; HasText 'Máy mới có dự án đăng ký sau khi hỏi Q-back'; HasText 'app10'; Eq (SentAny '-x\.repin$') 0 'no x.repin'
+  # a manual-back state WITHOUT the key (written by an older fcode) keeps the old behaviour: no compare, no stop as E-R19 (the key guard of Invoke-MoveBack's drift test)
+  Reset-World; Back-Projects @('app9') @('app9', 'app10'); Add-Fault -M new -Key '^back-2-x\.check$' -Rc 0 -Mode kill; Ans 'YES'; $r1 = Run-Move @('back'); Ok ($r1.Code -ne 0) "[no key] the laptop died ($($r1.Text))"
+  $j = Get-St; [void]$j.answers.PSObject.Properties.Remove('back-new-projects'); [IO.File]::WriteAllText((StatePath), (ConvertTo-Json -InputObject $j -Depth 20), $utf8)
+  Ans 'YES'; $r = Run-Move @('back'); NoText 'Máy mới có dự án đăng ký sau khi hỏi Q-back'; Ok ((SentAny '-x\.repin$') -ge 1) "[no key] no stop: the back goes on to x.repin ($($r.Code): $($r.Text))"
+}
+# O3: a rebuilt manual back carries an empty Q-back list, so a back-new-only project that x.check lists stops the back as E-R19 (the same names as at the original Q-back are indistinguishable from new ones)
+T 'L.rebuild-back-new-projects: a manual back rebuilt at mark cutting before x.check, one kind=project name: the re-run x.check ends E-R19 (new restarted and unfrozen, cut, exit 1), no x.repin, no x.adopt; `back` again shows the name at Q-back and reaches back-done; the same when rebuilt after x.check (replayed); rebuilt after x.final: no compare' {
+  Back-Projects @('app9') @('app9'); Add-Fault -M new -Key '^back-2-x\.freeze$' -Rc 0 -Mode kill; Ans 'YES'; [void](Run-Move @('back')); Lose-State; [void](Run-Move @('status', '--rebuild', $OldAlias, $NewAlias)); Eq @((Get-St).answers.'back-new-projects').Count 0 'empty list'
+  Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code 1 "stops as E-R19 ($($r.Text))"; HasText 'app9'; Eq (SentAny '-x\.(repin|adopt)$') 0 'no x.repin, no x.adopt'; $s = Get-St; Eq $s.phase 'cut' 'phase'; Eq $s.serving 'new' 'serving'; Eq $W.new.Frozen $false 'new unfrozen'
+  $r = Run-Move @('cutover'); Eq $r.Code 0 "the chores of the rebuilt cut run ($($r.Text))"
+  $W.CheckOnlyOut = @('INV ok', 'INV warn back-new-only kind=project name=app9'); Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "back again ($($r.Text))"; Eq (Get-St).phase 'back-done' 'phase'; Eq ([string](Get-St).answers.'back-new-projects') 'app9' 'the list Q-back showed'
+  Reset-World; Back-Projects @('app9') @('app9'); Add-Fault -M new -Key '^back-2-x\.check$' -Rc 0 -Mode kill; Ans 'YES'; [void](Run-Move @('back')); Lose-State; [void](Run-Move @('status', '--rebuild', $OldAlias, $NewAlias))
+  Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code 1 "after x.check: stops the same way ($($r.Text))"; Eq (SentAny '-x\.(repin|adopt)$') 0 'no x.repin, no x.adopt'; Eq (Sent 'new' '^back-2-x\.check$') 0 'x.check was replayed'
+  Reset-World; Back-Projects @('app9') @('app9'); Add-Fault -M new -Key '^back-2-x\.final$' -Rc 0 -Mode kill; Ans 'YES'; [void](Run-Move @('back')); Lose-State; [void](Run-Move @('status', '--rebuild', $OldAlias, $NewAlias))
+  Ans 'YES'; $r = Run-Move @('back'); Eq $r.Code $BackDoneExit "after x.final: no compare ($($r.Text))"; Ok (-not ($r.Text -match 'Máy mới có dự án đăng ký sau khi hỏi Q-back')) 'no drift line'
 }
 T 'L.status-no-init: status and check never run the agreement check: no init or other recorded call even when the machines disagree' {
   Fx-RolledBack; [void](Patch-St @{ attempt = 2 })   # the write-ahead of a new attempt, then a crash: both machines still hold attempt 1
@@ -2974,11 +3379,10 @@ T 'L.resume-table: fwd dừng unfreeze-fail case — exit 70 with old frozen; th
   Ordered @('^old fwd-2-c\.init-old$', '^old fwd-2-x\.enable\.1$', '^old fwd-2-x\.unfreeze\.1$', '^old fwd-2-x\.freeze$')
   Eq (@(LogNow | Where-Object { $_ -match ' mismatch$' }).Count) 0 'no chore 0 before the agreement re-init'
 }
-T 'L.resume-table: two chore-0 repairs in one attempt — the second repair uses x.enable.2 / x.unfreeze.2 and really runs' {
+T 'L.resume-table: two chore-0 repairs in one attempt — the first repair''s x.unfreeze.1 fails (x.enable.1 done), the second repair uses x.enable.2 / x.unfreeze.2 and really runs (a chore 0 repairs the abandon''s unfreeze only; a failed return is never repaired by it: ADDENDUM)' {
   Fx-Copied; Add-Fault -M old -Key '-x\.freeze$' -Rc 75 -Out @('MOVE wait drain lock=/var/lock/fcode-deploy/task.lock waited=900'); Add-Fault -M old -Key '-r\.unfreeze-src$' -Rc 1
   Ans 'có', 'dừng'; [void](Run-Move @('cutover'))
-  Add-Fault -M new -Key '^fwd-2-x\.final$' -Rc 1; Add-Fault -M old -Key '^fwd-2-r\.unfreeze-src$' -Rc 1
-  [void](Do-Cutover 70); Eq (Sent 'old' '^fwd-2-x\.unfreeze\.1$' -All) 1 'first repair'; Eq $W.old.Frozen $true 'frozen again after the failed rollback unfreeze'
+  Add-Fault -M old -Key '^fwd-2-x\.unfreeze\.1$' -Rc 1; Ans 'có'; $r1 = Run-Move @('abort'); Ok ($r1.Code -ne 0) "the first repair fails ($($r1.Text))"; Eq (Sent 'old' '^fwd-2-x\.enable\.1$') 1 'first repair: x.enable.1'; Eq (Sent 'old' '^fwd-2-x\.unfreeze\.1$') 1 'first repair: x.unfreeze.1'; Eq $W.old.Frozen $true 'still frozen'
   Ans 'có'; $r = Run-Move @('abort'); Eq $r.Code 0 "abort ($($r.Text))"
   Eq (Sent 'old' '^fwd-2-x\.enable\.2$') 1 'second repair x.enable.2 runs'; Eq (Sent 'old' '^fwd-2-x\.unfreeze\.2$') 1 'second repair x.unfreeze.2 runs'
   Before '^old fwd-2-x\.unfreeze\.2$' '^old fwd-2-a\.old$'
