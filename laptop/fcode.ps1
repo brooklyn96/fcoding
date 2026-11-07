@@ -2019,6 +2019,18 @@ fi
 if [ -r "$MV/target.json" ]; then
   echo "MOVE target $(tr -d '\r\n' < "$MV/target.json")"
 fi
+# the durable snapshot of c.init-new's `target` key: the call's recorded stdin (run/<id>/in; the init publishes the move-id BEFORE it writes target.json, so a kill between the two
+# leaves a move-id without target.json); the newest c.init-new record's last key `,"target":{…}}`, printed as one line
+bs=; bd=
+for d in "$MV"/run/*-c.init-new/; do
+  [ -f "$d/in" ] || continue
+  s=$(cat "$d/start" 2>/dev/null)
+  if [ -z "$bd" ] || [[ $s > $bs ]]; then bs=$s; bd=$d; fi
+done
+if [ -n "$bd" ]; then
+  ti=$(tr -d '\r\n' < "$bd/in" | sed -n 's/.*,"target":\(.*\)}$/\1/p')
+  [ -n "$ti" ] && echo "MOVE target-in $ti"
+fi
 exit 0
 '@.Replace('@@PUNITS@@', (@(Get-MovePlatformUnits) -join ' '))
 }
@@ -3706,17 +3718,30 @@ function Show-MoveStatus {
 # one machine's `rebuild read` (D.0.10; 2400 s, W1-T10-G3): @{ Mid; Recs; Hk; Mf; Target } or $null when there is no readable move-id
 function Read-MoveRebuildFacts($Mach) {
   $r = Invoke-MoveScript $Mach (Get-MoveRebuildScript) @() (Get-MoveConst 'script_s') -Pin:(Test-MoveFirstContact $Mach.Addr) -Quiet
-  $mid = @{}; $recs = @(); $hk = ''; $tg = $null; $tp = $null
+  $mid = @{}; $recs = @(); $hk = ''; $tg = $null; $tgi = $null; $tp = $null
   foreach ($l in $r.Lines) {
     if ("$l" -cmatch '\AMOVE moveid ') { $mid = ConvertFrom-MoveKv $l }
     elseif ("$l" -cmatch '\AMOVE hostkey (ssh-ed25519) ([A-Za-z0-9+/=]+)(?: .*)?\z') { $hk = "$($Matches[1]) $($Matches[2])" }
     elseif ("$l" -cmatch '\AMOVE record ') { $recs += , (ConvertFrom-MoveKv $l) }
     elseif ("$l" -cmatch '\AMOVE target (.+)\z') { try { $tg = ConvertFrom-Json $Matches[1] } catch { $tg = $null } }
+    elseif ("$l" -cmatch '\AMOVE target-in (.+)\z') { try { $tgi = ConvertFrom-Json $Matches[1] } catch { $tgi = $null } }
     elseif ("$l" -cmatch '\AINV target platform=([01])\z') { $tp = [int]$Matches[1] }
   }
   if ($r.Code -in 124, 255, -1) { return @{ Down = $r.Code } }   # the transport lost: the caller says "không trả lời", never "không có move-id"
   if ($r.Code -ne 0 -or -not $mid['id']) { return $null }
-  @{ Mid = $mid; Recs = $recs; Hk = $hk; Mf = (ConvertFrom-MoveManifestLine $r.Lines); Target = $tg; Platform = $tp }
+  @{ Mid = $mid; Recs = $recs; Hk = $hk; Mf = (ConvertFrom-MoveManifestLine $r.Lines); Target = $tg; TargetIn = $tgi; Platform = $tp }
+}
+# D.0.10: a target object (new's target.json, or the `target` key of the c.init-new record's stdin) is usable when it has users[] {name, uid}, groups[] {name, gid}, subids[]
+# {user, kind uid|gid, start, count}, addrs[] of strings and stop_budget_s >= 0 (the server's own validator refuses anything else), every name one name token (B.6.2.1)
+function Test-MoveTargetObj($T) {
+  if ($null -eq $T -or $T -isnot [pscustomobject]) { return $false }
+  foreach ($k in 'users', 'groups', 'subids', 'addrs', 'stop_budget_s') { if (-not $T.PSObject.Properties[$k]) { return $false } }
+  $tok = '\A[^\s\x00-\x1f\x7f]{1,256}\z'
+  foreach ($u in @($T.users)) { if ($null -eq $u -or "$($u.name)" -cnotmatch $tok -or "$($u.uid)" -cnotmatch '\A[0-9]+\z') { return $false } }
+  foreach ($g in @($T.groups)) { if ($null -eq $g -or "$($g.name)" -cnotmatch $tok -or "$($g.gid)" -cnotmatch '\A[0-9]+\z') { return $false } }
+  foreach ($s in @($T.subids)) { if ($null -eq $s -or "$($s.user)" -cnotmatch $tok -or "$($s.kind)" -cnotin 'uid', 'gid' -or "$($s.start)" -cnotmatch '\A[0-9]+\z' -or "$($s.count)" -cnotmatch '\A[0-9]+\z') { return $false } }
+  foreach ($a in @($T.addrs)) { if ($a -isnot [string] -or $a -cnotmatch '\A[A-Za-z0-9.:-]{1,253}\z') { return $false } }
+  "$($T.stop_budget_s)" -cmatch '\A[0-9]+\z'
 }
 # D.0.10: what a rebuilt state restores (`from:<source>`) and what it leaves empty (`empty:<why>`); every New-MoveState property, every literal `Set-MoveProp $S '<k>'` /
 # `Set-MoveAnswer $S '<k>'` key, every Set-MoveAsk key (literal, or `<prefix>:`) and the files the rebuild writes. L.rebuild-inventory checks it against the code; the rebuild's
@@ -3811,10 +3836,12 @@ function Invoke-MoveRebuild([string]$OldAlias, [string]$NewAlias) {
   # new_discarded: a return to old fences new (Q-newlost / Q-discard, and a plain rollback's r.stop-dst is then a replay); new_lost stays false (abort still sends a.new)
   foreach ($kv in @{ dir = $dir; attempt = $att; phase = $phase; serving = $serv; mark = $(if ($mark) { $mark } else { $null }); dst_started = ([string]$o.Mid['dst_started'] -ceq '1' -or [string]$n.Mid['dst_started'] -ceq '1'); enabled = $finishPending; chores_done = $finishPending; new_discarded = ($phase -ceq 'rolled-back' -or $mark -ceq 'rolling-back'); rebuilt = $true; manifest_sha = $mf.Sha; manifest_sha_prev = $shaPrev; carry = [bool]($dir -ceq 'back' -and $phase -ceq 'planned' -and $mark -and $mark -cne 'rolling-back') }.GetEnumerator()) { Set-MoveProp $S $kv.Key $kv.Value }
   # D.0.10 (W1-T10-F4, W1-T11-DG-R11-2): target_users[], target_groups[], target_subids[], target_addrs[] and target_stop_budget_s come from new's MV_DIR/target.json (`MOVE target`),
-  # never from new's current users. DESIGN-GAP (T10c-RT): DESIGN is silent when there is nothing to read: (a) phase planned before any c.init-new (no target.json yet), or (b) a later
-  # phase with target.json missing or unparseable (no `MOVE target` line, or bad JSON at Read-MoveRebuildFacts). Reading, in this one spot: empty target_* and target_stop_budget_s 0
-  # (so a later c.init-new sends and new keeps those empty values).
+  # never from new's current users. When target.json is missing or unusable, the durable snapshot of the same key, the newest c.init-new record's stdin on new (`MOVE target-in`:
+  # the init publishes the move-id before it writes target.json, so a kill between the two leaves none), is validated and used; when neither is usable the rebuild is REFUSED
+  # (new holds a move-id, so c.init-new began): persisting empty target_* would drop same_users protection from the next plan
   $T = $n.Target
+  if (-not (Test-MoveTargetObj $T)) { $T = $n.TargetIn }
+  if (-not (Test-MoveTargetObj $T)) { Write-Host "lỗi: máy mới '$NewAlias' không còn danh sách tài khoản đích (target.json) và không đọc được bản ghi c.init-new; không dựng lại, chưa ghi gì. Chạy lại fcode move copy từ máy còn state, hoặc đặt lại máy mới rồi chuyển lại."; return 1 }
   Set-MoveProp $S 'target_users' @(@(Get-MoveProp $T 'users' @()) | Where-Object { $_ } | ForEach-Object { [pscustomobject][ordered]@{ name = [string]$_.name; uid = [int]$_.uid } })
   Set-MoveProp $S 'target_groups' @(@(Get-MoveProp $T 'groups' @()) | Where-Object { $_ } | ForEach-Object { [pscustomobject][ordered]@{ name = [string]$_.name; gid = [int]$_.gid } })
   Set-MoveProp $S 'target_subids' @(@(Get-MoveProp $T 'subids' @()) | Where-Object { $_ } | ForEach-Object { [pscustomobject][ordered]@{ user = [string]$_.user; kind = [string]$_.kind; start = [long]$_.start; count = [long]$_.count } })
@@ -3871,8 +3898,9 @@ function Invoke-MoveRebuild([string]$OldAlias, [string]$NewAlias) {
       Set-MoveProp $obj $k ([int][Math]::Max(0, ($b - $a).TotalSeconds))
     }
   }
-  Set-MoveProp $S.aliases 'laptop_backup' $(if ($serv -ceq 'new') { [string]$S.old.addr } else { $null })   # rebuilt from the move-ids, never from the ssh config
-  Set-MoveProp $S.aliases 'coder_backup' $(if ($serv -ceq 'new') { [string]$S.old.addr } else { $null })
+  # back chores may remain after x.switch (back-done: aliases back to old), so both backups are restored from old_addr there too, not only while new serves
+  Set-MoveProp $S.aliases 'laptop_backup' $(if ($serv -ceq 'new' -or $phase -ceq 'back-done') { [string]$S.old.addr } else { $null })   # rebuilt from the move-ids, never from the ssh config
+  Set-MoveProp $S.aliases 'coder_backup' $(if ($serv -ceq 'new' -or $phase -ceq 'back-done') { [string]$S.old.addr } else { $null })
   foreach ($lp in @(Get-MoveProp $S 'legacy_push' @())) { Set-MoveMapVal $S.legacy_known_hosts ([string]$lp.repo) "$($S.old.addr) $($o.Hk)" }
   foreach ($k in 'old', 'new') { $m = if ($k -ceq 'old') { $S.old } else { $S.new }; if ($m.hostkey_line -and -not (Get-MovePinnedKey $m.addr)) { Add-Content -LiteralPath (Get-MoveKnownFile) -Value "$($m.addr) $($m.hostkey_line)" -Encoding ascii } }
   Save-MoveManifest $mf.Text
