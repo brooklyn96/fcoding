@@ -467,7 +467,7 @@ Box chặn ở hai chỗ:
 1. Agent đưa nhánh `box/...` lên `origin/main` **trước** (`git fetch origin`, rồi rebase hoặc merge như trên), sửa và commit, rồi hỏi bạn: `fcode-notify <dự án> needs-yes "<một dòng: sửa gì, commit nào>"`. Agent không tự đẩy, không tự merge.
 2. Bạn xem thay đổi và trả lời rõ "Yes" cho đúng commit đó.
 3. Chỉ sau câu Yes của bạn, phiên chính (Architect) tạo file cho phép gắn với đúng commit: `~/.config/fcode/guard-allow/<chủ>__<repo>__<mã commit 40 ký tự>` (file thường, chữ thường; ví dụ `brooklyn96__bd-team-project__<mã>`). Agent con không bao giờ tự tạo file này.
-4. Hook cho đẩy đúng commit đó. Đẩy xong, Architect xoá file. Commit khác (sửa thêm sau khi duyệt, hay merge lại `origin/main`) phải hỏi lại.
+4. Hook cho đẩy đúng commit đó. Đẩy xong, Architect xoá file. Commit sau đó chỉ cần hỏi lại khi `.github/` của nó khác bản đã có trên GitHub (hook sẽ chặn); commit chỉ sửa code, hay merge lại `origin/main` mà `.github/` trên main không đổi, thì đẩy bình thường.
 5. Agent mở PR rồi báo `fcode-notify <dự án> merge-ready "<một dòng>" <link PR>`. **Bạn** merge PR trên GitHub; box không merge PR sửa `.github/` ở repo ngoài danh sách (file cho phép không dùng cho merge).
 
 Hai lớp này nằm trên box, chỉ chặn lỗi và lối tắt của agent, không phải hàng rào an ninh. Những đường sau box **không** chặn, đã biết và chấp nhận:
