@@ -1559,6 +1559,7 @@ function Invoke-MoveTimedExe([string]$Exe, [string[]]$ExeArgs, [string]$StdinTex
 }
 
 # ---- state.json (D.0.9; atomic through Write-PhienText) ----
+# every top-level field is declared here (L.rebuild-inventory reads this list); a key written only through `Set-MoveWriteAhead $S @{…}` must be declared here too
 function New-MoveState([string]$Id, $OldM, $NewM) {
   [pscustomobject][ordered]@{
     move_id = $Id; dir = 'fwd'; attempt = 1; phase = 'planned'; serving = 'old'; mark = $null; dst_started = $false; dst_started_at = $null; carry = $false; enabled = $true
@@ -1837,7 +1838,8 @@ getent group | awk -F: '$3 >= 1000 { print "INV target group=" $1 " gid=" $3 }'
 for k in uid gid; do
   [ -r "$R/etc/sub$k" ] || continue
   while IFS=: read -r u s c; do
-    case $u in ''|*[!A-Za-z0-9._-]*) continue;; esac
+    case $u in ''|*[[:space:][:cntrl:]]*) continue;; esac   # the move's one name token (B.6.2.1): 1 to 256 characters, no blank, no control byte (`svc$`, `alice.smith`, `Debian-exim` are names)
+    [ "${#u}" -le 256 ] || continue
     case $s in ''|*[!0-9]*) continue;; esac
     case $c in ''|*[!0-9]*) continue;; esac
     echo "INV target subid user=$u kind=$k start=$s count=$c"
@@ -1949,7 +1951,7 @@ R=${FCM_ROOT:-}
 MV=$R/var/lib/fcode-move
 [ "${1:-}" = --old-addr ] && [ $# -ge 2 ] || { echo "MOVE error bad-request why=old-addr"; exit 65; }
 oaddr=$2; host=${oaddr%%:*}; port=22; case $oaddr in *:*) port=${oaddr##*:};; esac
-ssh="ssh -i $MV/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$MV/known_hosts -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -p $port"
+ssh="ssh -F /dev/null -i $MV/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$MV/known_hosts -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -p $port"   # as mv_ssh_opts: a moved old-side client config (Host * ProxyJump, Port, HostKeyAlias) never steers the pull
 F="-aHAX --numeric-ids --delete --force --one-file-system --partial-dir=.fcode-move-partial --info=stats2,progress2"
 for p in @@PATHS@@; do
   mkdir -p "$(dirname "$R${p%/}")"
@@ -2001,10 +2003,15 @@ MV=$R/var/lib/fcode-move
 [ -r "$MV/move-id" ] || exit 1
 echo "MOVE moveid $(grep -E '^[a-z_]+=[A-Za-z0-9._:-]*$' "$MV/move-id" | tr '\n' ' ' | sed 's/ $//')"
 k=$(head -n1 "$R/etc/ssh/ssh_host_ed25519_key.pub" 2>/dev/null); [ -n "$k" ] && echo "MOVE hostkey $k"
+punits="@@PUNITS@@"
+platform=1; for u in $punits; do [ -f "$R/etc/systemd/system/$u" ] || platform=0; done
+echo "INV target platform=$platform"
 for d in "$MV"/run/*/; do
   [ -d "$d" ] || continue
   id=$(basename "$d"); rc=$(cat "$d/rc" 2>/dev/null); st=$(cat "$d/start" 2>/dev/null); en=$(cat "$d/end" 2>/dev/null)
-  echo "MOVE record id=$id start=${st:--} end=${en:--} rc=${rc:--}"
+  sn=$(awk '$0=="--since"{getline; print; exit}' "$d/argv" 2>/dev/null); [[ $sn =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || sn=
+  sh=$(awk '$0=="--sha"{getline; print; exit}' "$d/argv" 2>/dev/null); [[ $sh =~ ^[0-9a-f]{64}$ ]] || sh=
+  echo "MOVE record id=$id start=${st:--} end=${en:--} rc=${rc:--} since=${sn:--} sha=${sh:--}"
 done
 if [ -r "$MV/manifest.json" ] && [ -r "$MV/manifest.json.sha256" ]; then
   echo "MOVE manifest sha=$(cut -c1-64 "$MV/manifest.json.sha256") gz64=$(gzip -c -n "$MV/manifest.json" | base64 -w0)"
@@ -2013,7 +2020,7 @@ if [ -r "$MV/target.json" ]; then
   echo "MOVE target $(tr -d '\r\n' < "$MV/target.json")"
 fi
 exit 0
-'@
+'@.Replace('@@PUNITS@@', (@(Get-MovePlatformUnits) -join ' '))
 }
 # step 11 on the coder box: the alias block `Host <alias>` gets HostName <addr>; HostKeyAlias <key alias> (or none); a known_hosts line added
 # args: <alias> <hostname> <hostkeyalias|-> <known line|->. Prints `MOVE alias coder state=done|none`.
@@ -2414,9 +2421,11 @@ function Resolve-MoveRow([string]$Verb, $S) {
     if ($Verb -ceq 'back') { return (& $say (Get-MoveText 'carrying')) }
     return $ref
   }
+  # a return to old is a rollback: `rolling-back` with old serving (carry=false) is resumed by `cutover` in either dir (a plain rollback, Q-newlost, Q-discard), everything else is
+  # refused. A manual back's rolling-back with NEW serving (dir=back) is the E-R19 end: it keeps the cut-resume row below
+  if ($mark -ceq 'rolling-back' -and ($dir -ceq 'fwd' -or [string]$S.serving -ceq 'old')) { if ($Verb -ceq 'cutover') { return @{ Do = 'rb-continue' } }; return $ref }
   if ($mark) {
     if ($dir -ceq 'fwd') {
-      if ($mark -ceq 'rolling-back') { if ($Verb -ceq 'cutover') { return @{ Do = 'rb-continue' } }; return $ref }
       if ($Verb -ceq 'cutover') { return @{ Do = 'cut-resume' } }
       if ($Verb -ceq 'back' -and ($mark -ceq 'switching' -or $S.dst_started -eq $true)) { return (& $say (Get-MoveText 'cut-carries')) }
       return $ref
@@ -2511,8 +2520,8 @@ function Invoke-MovePlanOld($S, [string[]]$Map) {
   $mf = ConvertFrom-MoveManifestLine $r.Lines
   @{ Code = $r.Code; Known = $r.Known; Lines = $r.Lines; Mf = $mf; Transport = $r.Transport }
 }
-# DESIGN-GAP (DG-R1, CONTRACT §4.1 OPEN): a rebuilt state has no source for target_platform (target.json and D.0.10 name none); this one
-# spot reads the stored value; a rebuilt state keeps New-MoveState's 0, and a state without the field counts as 0.
+# DESIGN-GAP (DG-R1, CONTRACT §4.1): target_platform is read by D.0.10 from the `INV target platform=` line of new's `rebuild read` (preflight's probe of the platform units);
+# a state without the field counts as 0.
 function Get-MoveTargetPlatform($S) { [int](Get-MoveProp $S 'target_platform' 0) }
 # D.2 step 3b and the D.3 re-plan's 3b: the B.5.2 mixed-pair check against the stored target_platform (GAP-RULINGS-3 §16.5, §16.7 T-4).
 # With platform=1 on new, refuses target-not-empty path=<p> (ruling 05/11 (25), B31) for: (1) every item root (tree, file) or `files` name
@@ -3162,7 +3171,8 @@ function Invoke-MoveCutSteps($S, [int]$From, [switch]$Carry) {
     if ($r.Code -ne 0) { return (& $beforeStart 'x.check') }
     if (-not (Set-MoveCheckManifest $S $r.Lines)) { Write-Host 'lỗi: x.check không trả manifest đọc được (thiếu dòng MOVE manifest, hoặc sha không khớp).'; return (& $beforeStart 'x.check') }   # never re-pin the stale plan over x.check's
     # B41: a project name x.check lists that Q-back did not show is never moved aside on old; stop as E-R19 (new restarted and unfrozen), after the re-pin
-    # above is saved so that r.start-src / r.unfreeze-src carry new's pin. A name Q-back showed that is gone needs no stop; no stored list (rebuilt state) = no compare
+    # above is saved so that r.start-src / r.unfreeze-src carry new's pin. A name Q-back showed that is gone needs no stop; a rebuilt manual back stores an empty list (D.0.10), so any project
+    # x.check lists then stops; a carry-back has no key (CONTRACT §4.1) and runs no x.check
     if ([string]$S.dir -ceq 'back' -and $S.answers.PSObject.Properties['back-new-projects']) {
       $shown = @(Get-MoveMapVal $S.answers 'back-new-projects' @())
       $drift = @($r.Lines | ForEach-Object { if ("$_" -cmatch '\AINV warn back-new-only kind=project name=(\S+)\z') { $Matches[1] } } | Where-Object { $shown -cnotcontains $_ } | Sort-Object -Unique -CaseSensitive)
@@ -3178,6 +3188,7 @@ function Invoke-MoveCutSteps($S, [int]$From, [switch]$Carry) {
     }
     $r = Invoke-MoveCall $S $src 'x.baseline'
     if ($r.Code -ne 0) { return (& $beforeStart 'x.baseline') }
+    Set-MoveBaseline $S $r.Lines
   }
   # a manual back runs x.guards (D.8 row 4, W1-T10-G32); a carry-back does not (D.5.2 lists steps 2, 5, 6-10)
   if ($From -le 4 -and -not $Carry) {
@@ -3224,11 +3235,13 @@ function Invoke-MoveCutSteps($S, [int]$From, [switch]$Carry) {
     if ($S.dst_started -ne $true) { Set-MoveProp $S 'dst_started_at' (Format-MoveTs (Get-MoveNow)) }
     Set-MoveProp $S 'dst_started' $true; Save-MoveState $S
     $r = Invoke-MoveCall $S $dst 'x.start'; if ($r.Code -ne 0) { return (& $afterStart 'x.start') }
-    $r = Invoke-MoveCall $S $dst 'x.health'; if ($r.Code -ne 0) { return (& $afterStart 'x.health') }
+    $bl = Get-MoveBaselineStdin $S $src -Carry:$Carry; if ($null -eq $bl) { return (& $afterStart 'x.baseline') }
+    $r = Invoke-MoveCall $S $dst 'x.health' @() $bl; if ($r.Code -ne 0) { return (& $afterStart 'x.health') }
   }
   if ($From -le 9) {
     if (-not $Carry) { Set-MoveProp $S 'mark' 'switching'; Save-MoveState $S }
-    $r = Invoke-MoveCall $S $dst 'x.switch'
+    $bl = Get-MoveBaselineStdin $S $src -Carry:$Carry; if ($null -eq $bl) { return (& $afterStart 'x.baseline') }
+    $r = Invoke-MoveCall $S $dst 'x.switch' @() $bl
     if ($r.Code -eq -1) { Write-Host (Get-MoveText 'cutover-now'); return (New-MoveFail 'human' 'x.switch' 70) }   # D.5.4
     if ($r.Code -ne 0) { return (& $afterStart 'x.switch') }
     $win = if ($script:MoveWindowT0) { [int][Math]::Ceiling(((Get-MoveNow) - $script:MoveWindowT0).TotalSeconds) } else { $S.window_s }
@@ -3245,7 +3258,9 @@ function Invoke-MoveCutSteps($S, [int]$From, [switch]$Carry) {
 # D.5.1 plain rollback (fwd); exit 10, or 70 when r.start-src or r.unfreeze-src failed
 function Invoke-MoveRollback($S, $Fail) {
   Write-Host "Quay lại máy cũ (lỗi ở $($Fail.Why))..."
-  Set-MoveProp $S 'mark' 'rolling-back'; Save-MoveState $S
+  # the write-ahead of the return: from here on the laptop state says "rolling back, old serving" (a Q-newlost / Q-discard return added its fence flag before calling this), so a
+  # laptop killed in any call below resumes this very rollback (`cutover` = rb-continue), never a cut or carry resume, and a rebuild reads the same from old's r.* records
+  [void](Set-MoveWriteAhead $S @{ mark = 'rolling-back'; serving = 'old'; carry = $false } -NoCheck)
   # E-R2: an unreachable dst is skipped after its bounded retries (it has no started or enabled hold, I12); a new already found down by
   # the agreement check gets no call at all (F2).
   # DESIGN-GAP (T10-G45, F8k): D.5.1 is silent on a DEFINITE r.stop-dst failure; reading: stop at 70, old left stopped and frozen (safe for I8).
@@ -3255,6 +3270,7 @@ function Invoke-MoveRollback($S, $Fail) {
   }
   if ($d.Code -ne 0) {
     if (-not $d.Known) { Write-Host (Get-MoveText 'new-down') }
+    elseif ($S.new_lost -eq $true -or $S.new_discarded -eq $true) { Write-Host 'lỗi: không dừng được máy mới; tắt hoặc cài lại máy mới trong trang quản lý nhà cung cấp, rồi chạy lại  fcode move cutover.'; return 70 }   # a YES return (Q-newlost / Q-discard): old is not started; new answers, so D.5.3's power-off is the remedy
     else { Write-Host 'lỗi: không dừng được máy mới; giữ nguyên, chạy lại  fcode move cutover  khi máy mới trả lời.'; return 70 }
   }
   $a = Invoke-MoveCall $S 'old' 'r.start-src'
@@ -3262,9 +3278,11 @@ function Invoke-MoveRollback($S, $Fail) {
   $u = Invoke-MoveCall $S 'old' 'r.unfreeze-src'
   if ($u.Code -ne 0) { Set-MoveProp $S 'enabled' $false; Save-MoveState $S }
   [void](Invoke-MoveCall $S 'old' 'r.health-src')   # report only (E-R18)
-  [void](Set-MoveWriteAhead $S @{ mark = $null; phase = 'rolled-back'; serving = 'old' } -NoCheck)
   if ($Fail.Verify) { Write-MoveVerifyReport $S $Fail.Verify }
-  if ($a.Code -ne 0 -or $u.Code -ne 0) { Write-Host 'Máy cũ chưa chạy lại đủ: cần người xem (70). Lệnh fcode move tiếp theo sẽ thử sửa trước.'; return 70 }
+  # the end state is written only when r.start-src and r.unfreeze-src both returned 0; otherwise the state stays `rolling-back` and `cutover` re-sends the three calls
+  # (rollback mode: the unit connectors too); a chore 0 is never the repair of a return
+  if ($a.Code -ne 0 -or $u.Code -ne 0) { Write-Host 'Máy cũ chưa chạy lại đủ: cần người xem (70). Sau khi sửa, chạy lại  fcode move cutover  để hoàn tất quay lại.'; return 70 }
+  [void](Set-MoveWriteAhead $S @{ mark = $null; phase = 'rolled-back'; serving = 'old'; enabled = $true } -NoCheck)
   Write-MoveReturnOld $S
   10
 }
@@ -3381,13 +3399,9 @@ function Invoke-MoveCarryFail($S, $F) {
 }
 # Q-discard / Q-newlost YES: old r.start-src, r.unfreeze-src, r.health-src; rolled-back, serving old, carry false; exit 10
 function Invoke-MoveOldBack($S, [string]$Flag) {
-  $a = Invoke-MoveCall $S 'old' 'r.start-src'
-  $u = Invoke-MoveCall $S 'old' 'r.unfreeze-src'
-  [void](Invoke-MoveCall $S 'old' 'r.health-src')
-  [void](Set-MoveWriteAhead $S @{ phase = 'rolled-back'; serving = 'old'; mark = $null; carry = $false; enabled = ($a.Code -eq 0 -and $u.Code -eq 0); $Flag = $true } -NoCheck)
-  if ($a.Code -ne 0 -or $u.Code -ne 0) { return 70 }
-  Write-MoveReturnOld $S
-  10
+  # one code path with the plain rollback: the write-ahead (state rolling-back, serving old, carry false, the fence flag) comes BEFORE r.start-src
+  [void](Set-MoveWriteAhead $S @{ mark = 'rolling-back'; serving = 'old'; carry = $false; enabled = $false; $Flag = $true } -NoCheck)
+  Invoke-MoveRollback $S (New-MoveFail 'rb' $(if ($Flag -ceq 'new_lost') { 'máy mới bị mất' } else { 'bỏ máy mới' }))
 }
 # D.8 E-R19 (manual back, a failure before x.start on old): new r.start-src + r.unfreeze-src; dir back, phase cut, serving new, mark null
 function Invoke-MoveER19($S) {
@@ -3518,6 +3532,9 @@ function Invoke-MoveCutResume($S) {
       $x = $script:MoveSeen[$m]
       if ($guardBusy -and $m -ceq $src) { continue }
       if ($x -and ([string]$x.Kv['call']).StartsWith($pre) -and [string]$x.Kv['call_state'] -ceq 'failed') {
+        # D.8 steps 6-7 of a manual back (x.final, x.verify, x.prepare-id, x.adopt): once x.final was sent old holds an incomplete copy, the failure ended 70 "resume"
+        # and it stays a resume: never the E-R19 restart of new (D.8 step 5 only); the steps below re-send from step 5 (done calls replay)
+        if ([string]$S.dir -ceq 'back' -and ([string]$x.Kv['call'] -replace '\A(fwd|back)-[0-9]+-', '') -cin 'x.final', 'x.verify', 'x.prepare-id', 'x.adopt') { continue }
         return (Complete-MoveCutFail $S $(if ([string]$S.dir -ceq 'fwd') { New-MoveFail 'rb' $x.Kv['call'] } else { New-MoveFail 'e-r19' $x.Kv['call'] }))
       }
     }
@@ -3589,6 +3606,27 @@ function Invoke-MoveBackRun($S) {
   # 0 (the owner asked for it; nothing failed). A carry-back ends 10 (D.5.2).
   if ($f.Code -eq 0) { $c = Invoke-MoveChores $S; if ($c -ne 0) { return $c }; return 0 }
   Complete-MoveCutFail $S $f
+}
+# D.4 step 8 / 9 (B.14.7): `x.health` and `x.switch` read x.baseline's `MOVE item <id> kind=health` lines on stdin (a check that failed in the baseline does not
+# gate, a tunnel name keeps its baseline status class). The laptop keeps them in answers{'health-baseline'} = {id = "<dir>-<attempt>"; lines[]} when x.baseline
+# returns 0 and sends them again on a resume; a state without them for this attempt (laptop died before the save, rebuilt state) gets them by replaying
+# this attempt's x.baseline (a done record answers with its stored out, nothing runs; step 8 is reached only after it returned 0). A carry-back has no
+# x.baseline: empty stdin (every check gates). $null = the baseline could not be recovered
+function Set-MoveBaseline($S, $Lines) {
+  Set-MoveAnswer $S 'health-baseline' ([pscustomobject][ordered]@{ id = "$($S.dir)-$($S.attempt)"; lines = @(@($Lines | Where-Object { "$_" -cmatch '\AMOVE item \S+ kind=health ' } | ForEach-Object { "$_" })) })
+  Save-MoveState $S
+}
+function Get-MoveBaselineStdin($S, [string]$Src, [switch]$Carry) {
+  if ($Carry) { return '' }
+  $b = Get-MoveMapVal $S.answers 'health-baseline' $null
+  if (-not ($b -and [string]$b.id -ceq "$($S.dir)-$($S.attempt)")) {
+    $r = Invoke-MoveCall $S $Src 'x.baseline' -Quiet
+    if ($r.Code -ne 0) { return $null }
+    Set-MoveBaseline $S $r.Lines
+    $b = Get-MoveMapVal $S.answers 'health-baseline' $null
+  }
+  $ls = @(@($b.lines) | Where-Object { "$_" })
+  if ($ls.Count) { ($ls -join "`n") + "`n" } else { '' }
 }
 # a fresh unrecorded status of $Machine: its move-id is this move's and `finished`
 function Test-MoveSideFinished($S, [string]$Machine) {
@@ -3668,28 +3706,40 @@ function Show-MoveStatus {
 # one machine's `rebuild read` (D.0.10; 2400 s, W1-T10-G3): @{ Mid; Recs; Hk; Mf; Target } or $null when there is no readable move-id
 function Read-MoveRebuildFacts($Mach) {
   $r = Invoke-MoveScript $Mach (Get-MoveRebuildScript) @() (Get-MoveConst 'script_s') -Pin:(Test-MoveFirstContact $Mach.Addr) -Quiet
-  $mid = @{}; $recs = @(); $hk = ''; $tg = $null
+  $mid = @{}; $recs = @(); $hk = ''; $tg = $null; $tp = $null
   foreach ($l in $r.Lines) {
     if ("$l" -cmatch '\AMOVE moveid ') { $mid = ConvertFrom-MoveKv $l }
     elseif ("$l" -cmatch '\AMOVE hostkey (ssh-ed25519) ([A-Za-z0-9+/=]+)(?: .*)?\z') { $hk = "$($Matches[1]) $($Matches[2])" }
     elseif ("$l" -cmatch '\AMOVE record ') { $recs += , (ConvertFrom-MoveKv $l) }
     elseif ("$l" -cmatch '\AMOVE target (.+)\z') { try { $tg = ConvertFrom-Json $Matches[1] } catch { $tg = $null } }
+    elseif ("$l" -cmatch '\AINV target platform=([01])\z') { $tp = [int]$Matches[1] }
   }
   if ($r.Code -in 124, 255, -1) { return @{ Down = $r.Code } }   # the transport lost: the caller says "không trả lời", never "không có move-id"
   if ($r.Code -ne 0 -or -not $mid['id']) { return $null }
-  @{ Mid = $mid; Recs = $recs; Hk = $hk; Mf = (ConvertFrom-MoveManifestLine $r.Lines); Target = $tg }
+  @{ Mid = $mid; Recs = $recs; Hk = $hk; Mf = (ConvertFrom-MoveManifestLine $r.Lines); Target = $tg; Platform = $tp }
 }
-# D.0.10 (W1-T10-F4, W1-T11-DG-R11-2): target_users[], target_groups[], target_subids[], target_addrs[] and target_stop_budget_s come from
-# new's MV_DIR/target.json (`MOVE target`), never from new's current users.
-# DESIGN-GAP (T10c-RT): DESIGN is silent when there is nothing to read: (a) phase planned before any c.init-new (no target.json yet), or
-# (b) a later phase with target.json missing or unparseable (no `MOVE target` line, or bad JSON at Read-MoveRebuildFacts). Reading, in
-# this one spot: empty target_* and target_stop_budget_s 0 (so a later c.init-new sends and new keeps those empty values).
-function Set-MoveRebuiltTarget($S, $T) {
-  Set-MoveProp $S 'target_users' @(@(Get-MoveProp $T 'users' @()) | Where-Object { $_ } | ForEach-Object { [pscustomobject][ordered]@{ name = [string]$_.name; uid = [int]$_.uid } })
-  Set-MoveProp $S 'target_groups' @(@(Get-MoveProp $T 'groups' @()) | Where-Object { $_ } | ForEach-Object { [pscustomobject][ordered]@{ name = [string]$_.name; gid = [int]$_.gid } })
-  Set-MoveProp $S 'target_subids' @(@(Get-MoveProp $T 'subids' @()) | Where-Object { $_ } | ForEach-Object { [pscustomobject][ordered]@{ user = [string]$_.user; kind = [string]$_.kind; start = [long]$_.start; count = [long]$_.count } })
-  Set-MoveProp $S 'target_addrs' @(@(Get-MoveProp $T 'addrs' @()) | Where-Object { $_ } | ForEach-Object { [string]$_ })
-  Set-MoveProp $S 'target_stop_budget_s' ([int](Get-MoveProp $T 'stop_budget_s' 0))
+# D.0.10: what a rebuilt state restores (`from:<source>`) and what it leaves empty (`empty:<why>`); every New-MoveState property, every literal `Set-MoveProp $S '<k>'` /
+# `Set-MoveAnswer $S '<k>'` key, every Set-MoveAsk key (literal, or `<prefix>:`) and the files the rebuild writes. L.rebuild-inventory checks it against the code; the rebuild's
+# Set-MoveProp / Set-MoveAnswer calls are the only ones for the `from:` keys
+$MoveRebuildInventory = [ordered]@{
+  'move_id' = 'from:move-ids'; 'dir' = 'from:move-ids'; 'attempt' = 'from:move-ids'; 'phase' = 'from:records'; 'serving' = 'from:move-ids'; 'mark' = 'from:move-ids'
+  'dst_started' = 'from:move-ids'; 'dst_started_at' = 'from:records'; 'carry' = 'from:move-ids'; 'enabled' = 'from:move-ids'
+  'new_lost' = 'empty:a lost new leaves no record; the owner answers Q-newlost again'; 'new_discarded' = 'from:records'; 'chores_done' = 'from:move-ids'; 'rebuilt' = 'from:move-ids'
+  'pass' = 'from:records'; 'dur' = 'from:records'; 'answers' = 'empty:the container of the answers{} keys listed below'
+  'manifest_sha' = 'from:pins'; 'manifest_sha_prev' = 'from:pins'; 'gate_id' = 'empty:read again by the next 0c (E-G4)'
+  'est' = 'empty:measured again by the next copy and cutover'; 'last_copy_at' = 'from:records'; 'old' = 'from:move-ids'; 'new' = 'from:move-ids'
+  'legacy_known_hosts' = 'from:scan'; 'aliases' = 'from:move-ids'; 'sshpush_disabled' = 'empty:plan-time answer; a re-plan asks again'; 'window_s' = 'empty:measured by the next x.switch'
+  'target_users' = 'from:target.json'; 'target_groups' = 'from:target.json'; 'target_subids' = 'from:target.json'; 'target_addrs' = 'from:target.json'; 'target_stop_budget_s' = 'from:target.json'
+  'target_platform' = 'from:probe'; 'idmap' = 'from:manifest'; 'legacy_push' = 'from:scan'
+  'Q-abort' = 'empty:asked again by every abort'; 'Q-back' = 'empty:asked again by every back'; 'Q-cut' = 'from:records'; 'Q-finish' = 'empty:asked again by every finish'
+  'Q-guard' = 'empty:the question of a resume is asked again from the guards'' own output'; 'back-new-projects' = 'from:answers'; 'final-sent' = 'from:records'
+  'health-baseline' = 'empty:recovered by replaying this attempt''s x.baseline (Get-MoveBaselineStdin)'; 'init-new-warn' = 'empty:printed again by c.init-new'
+  'refresh-pending' = 'from:records'; 'transient-excluded' = 'empty:listed again by the next plan or x.check'; 'ufw-lockout' = 'empty:printed again by x.adopt'
+  'Q-pm2save' = 'empty:plan-time answer, the in-run $asked table is the reader; a re-plan asks again'; 'Q-cert:' = 'empty:plan-time answer, the in-run $asked table is the reader; a re-plan asks again'
+  'Q-direct:' = 'empty:plan-time answer, the in-run $asked table is the reader; a re-plan asks again'; 'Q-ownip' = 'empty:plan-time answer, the in-run $asked table is the reader; a re-plan asks again'
+  'Q-port' = 'empty:plan-time answer, the in-run $asked table is the reader; a re-plan asks again'; 'Q-inbound' = 'empty:plan-time answer, the in-run $asked table is the reader; a re-plan asks again'
+  'Q-sshd' = 'empty:plan-time answer, the in-run $asked table is the reader; a re-plan asks again'; 'Q-sshpush:' = 'empty:plan-time answer, the in-run $asked table is the reader; a re-plan asks again'
+  'map.txt' = 'empty:kept when present (never rewritten by the rebuild); a lost map.txt falls back to the default map and x.check refuses or rolls back (D.0.10.1)'; 'manifest.json' = 'from:pins'; 'known_hosts' = 'from:move-ids'
 }
 function Invoke-MoveRebuild([string]$OldAlias, [string]$NewAlias) {
   if (-not (Test-MoveAlias $OldAlias) -or -not (Test-MoveAlias $NewAlias)) { Write-Host 'Cách dùng: fcode move status --rebuild <máy cũ> <máy mới>'; return 65 }
@@ -3733,20 +3783,80 @@ function Invoke-MoveRebuild([string]$OldAlias, [string]$NewAlias) {
   foreach ($k in 'old', 'new') { foreach ($rr in $got[$k].Recs) { if ([string]$rr['rc'] -ceq '0') { $done[[string]$rr['id']] = $true } } }
   $p = "$dir-$att-"; $phase = 'planned'
   if (@($done.Keys | Where-Object { $_ -like "${p}c.adopt.*" }).Count) { $phase = 'copied' }
-  if (@($done.Keys | Where-Object { $_ -like "${p}r.*" }).Count) { $phase = 'rolled-back' }
-  if ($done["${p}x.switch"]) { $phase = $(if ($dir -ceq 'back') { 'back-done' } else { 'cut' }) }
-  if ([string]$o.Mid['state'] -ceq 'finished') { $phase = 'finished' } elseif ([string]$o.Mid['state'] -ceq 'aborted') { $phase = 'aborted' }
-  # DESIGN-GAP (T10-G4): a manual back's E-R19 end ran r.start-src / r.unfreeze-src on NEW (dir=back): that is phase cut with new serving, not rolled-back
-  if ($phase -ceq 'rolled-back' -and $dir -ceq 'back' -and @($got['new'].Recs | Where-Object { [string]$_['rc'] -ceq '0' -and ([string]$_['id']).StartsWith("${p}r.") }).Count) { $phase = 'cut' }
+  # a return to old is a rollback (D.0.10.1): ANY r.start-src / r.unfreeze-src / r.health-src record of the attempt ON OLD, whatever its rc or state (done, failed, running,
+  # interrupted: a killed r.start-src may already have started old's apps), with or without a done x.switch, means the return began (a plain rollback, Q-newlost and Q-discard all
+  # send these calls to old; the fence's r.stop-dst on new is no return record). The state is then `rolling-back`, serving old, carry false, new fenced (new_discarded) and resumable
+  # (`cutover` = rb-continue), and `rolled-back` only as the run's end test: r.start-src and r.unfreeze-src done AND r.health-src has an rc (report-only, E-R18: any rc). A return record and an x.switch of one attempt can only be "switch, then return" (a return ends the
+  # attempt), so no time compare is needed. Without a return record: a done x.switch decides cut (back-done), else a done c.adopt.N is copied, else planned
+  $retIds = @("${p}r.start-src", "${p}r.unfreeze-src", "${p}r.health-src")
+  $retRecs = @($o.Recs | Where-Object { [string]$_['id'] -cin $retIds })
+  $returning = [bool]$retRecs.Count
+  if ($returning) {
+    $serv = 'old'
+    $rcOf = { param($step, [bool]$AnyRc) @($retRecs | Where-Object { [string]$_['id'] -ceq "$p$step" -and $(if ($AnyRc) { [string]$_['rc'] -cmatch '\A[0-9]+\z' } else { [string]$_['rc'] -ceq '0' }) }).Count }
+    if ((& $rcOf 'r.start-src' $false) -and (& $rcOf 'r.unfreeze-src' $false) -and (& $rcOf 'r.health-src' $true)) { $phase = 'rolled-back'; $mark = '' } else { $mark = 'rolling-back' }
+  } elseif ($done["${p}x.switch"]) { $phase = $(if ($dir -ceq 'back') { 'back-done' } else { 'cut' }) }
+  # a finished move-id on BOTH machines closes the move; old finished alone (f.old ran, f.new failed or was lost) is a resumable finish: phase cut, new serving,
+  # chores done and old enabled (finish needs both, I27), so `finish` skips old (Test-MoveSideFinished) and completes new
+  $finishPending = $false
+  if ([string]$o.Mid['state'] -ceq 'finished') { if ([string]$n.Mid['state'] -ceq 'finished') { $phase = 'finished' } else { $phase = 'cut'; $finishPending = $true } } elseif ([string]$o.Mid['state'] -ceq 'aborted') { $phase = 'aborted' }
+  # DESIGN-GAP (T10-G4): a manual back's E-R19 end ran r.start-src / r.unfreeze-src on NEW (dir=back): that is phase cut with new serving, not a return to old
+  if (-not $returning -and $dir -ceq 'back' -and $phase -cin 'planned', 'copied' -and @($got['new'].Recs | Where-Object { [string]$_['rc'] -ceq '0' -and ([string]$_['id'] -cin @("${p}r.start-src", "${p}r.unfreeze-src")) }).Count) { $phase = 'cut' }
+  # E-R19 (D.8 step 5) sends exactly r.start-src and r.unfreeze-src to new (the abandon end too); a done r.stop-dst on new is the fence's and never counts
   # DESIGN-GAP (T10-G4): end states are laptop-only (never sent to the machines), so the move-ids may still carry the run's mark: an end phase fixes both
   if ($phase -ceq 'cut') { $serv = 'new'; $mark = '' } elseif ($phase -cin 'back-done', 'rolled-back', 'finished', 'aborted') { if ($phase -cne 'finished') { $serv = 'old' } else { $serv = 'new' }; $mark = '' }
   # D.0.10 (W1-T10-O2): for dir=back with a mark set and no end phase in the records, the phase is the latest move-id's `phase` (a manual
   # back sends --phase copied from x.freeze on; a carry-back keeps planned), and carry=true only when that phase is planned
   if ($dir -ceq 'back' -and $mark -and $phase -cin 'planned', 'copied' -and [string]$latest.Mid['phase'] -cin 'planned', 'copied') { $phase = [string]$latest.Mid['phase'] }
-  foreach ($kv in @{ dir = $dir; attempt = $att; phase = $phase; serving = $serv; mark = $(if ($mark) { $mark } else { $null }); dst_started = ([string]$o.Mid['dst_started'] -ceq '1' -or [string]$n.Mid['dst_started'] -ceq '1'); enabled = $false; rebuilt = $true; manifest_sha = $mf.Sha; manifest_sha_prev = $shaPrev; carry = [bool]($dir -ceq 'back' -and $phase -ceq 'planned' -and $mark) }.GetEnumerator()) { Set-MoveProp $S $kv.Key $kv.Value }
-  Set-MoveRebuiltTarget $S $n.Target
+  # new_discarded: a return to old fences new (Q-newlost / Q-discard, and a plain rollback's r.stop-dst is then a replay); new_lost stays false (abort still sends a.new)
+  foreach ($kv in @{ dir = $dir; attempt = $att; phase = $phase; serving = $serv; mark = $(if ($mark) { $mark } else { $null }); dst_started = ([string]$o.Mid['dst_started'] -ceq '1' -or [string]$n.Mid['dst_started'] -ceq '1'); enabled = $finishPending; chores_done = $finishPending; new_discarded = ($phase -ceq 'rolled-back' -or $mark -ceq 'rolling-back'); rebuilt = $true; manifest_sha = $mf.Sha; manifest_sha_prev = $shaPrev; carry = [bool]($dir -ceq 'back' -and $phase -ceq 'planned' -and $mark -and $mark -cne 'rolling-back') }.GetEnumerator()) { Set-MoveProp $S $kv.Key $kv.Value }
+  # D.0.10 (W1-T10-F4, W1-T11-DG-R11-2): target_users[], target_groups[], target_subids[], target_addrs[] and target_stop_budget_s come from new's MV_DIR/target.json (`MOVE target`),
+  # never from new's current users. DESIGN-GAP (T10c-RT): DESIGN is silent when there is nothing to read: (a) phase planned before any c.init-new (no target.json yet), or (b) a later
+  # phase with target.json missing or unparseable (no `MOVE target` line, or bad JSON at Read-MoveRebuildFacts). Reading, in this one spot: empty target_* and target_stop_budget_s 0
+  # (so a later c.init-new sends and new keeps those empty values).
+  $T = $n.Target
+  Set-MoveProp $S 'target_users' @(@(Get-MoveProp $T 'users' @()) | Where-Object { $_ } | ForEach-Object { [pscustomobject][ordered]@{ name = [string]$_.name; uid = [int]$_.uid } })
+  Set-MoveProp $S 'target_groups' @(@(Get-MoveProp $T 'groups' @()) | Where-Object { $_ } | ForEach-Object { [pscustomobject][ordered]@{ name = [string]$_.name; gid = [int]$_.gid } })
+  Set-MoveProp $S 'target_subids' @(@(Get-MoveProp $T 'subids' @()) | Where-Object { $_ } | ForEach-Object { [pscustomobject][ordered]@{ user = [string]$_.user; kind = [string]$_.kind; start = [long]$_.start; count = [long]$_.count } })
+  Set-MoveProp $S 'target_addrs' @(@(Get-MoveProp $T 'addrs' @()) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+  Set-MoveProp $S 'target_stop_budget_s' ([int](Get-MoveProp $T 'stop_budget_s' 0))
+  Set-MoveProp $S 'target_platform' ([int]$n.Platform)   # D.0.10: the probe line of new's rebuild read (0 when missing)
   Set-MoveProp $S 'idmap' @(@(Get-MoveProp $mf.Obj 'idmap' @()) | Where-Object { $_ })   # D.0.10: idmap[] from the manifest
-  # DESIGN-GAP (DG-R5-2, the Architect's): D.0.10 names neither pass{} nor last_copy_at; a rebuilt state keeps them empty.
+  # what a rebuilt state restores and what it leaves empty (and why) is listed in $MoveRebuildInventory (L.rebuild-inventory)
+  # D.0.10: every value the server compares in an argv (K1, D.0.5; `--budget --mark --dst-started --phase --serving` are ignored, `--sha` is the pin) is restored from the
+  # machines, never invented: dir, attempt (move-ids), --sha (pins), --call = <dir>-<attempt>-<step>[.N] with every counter N raised past the highest record of EITHER machine
+  # (failed and interrupted records included, so a done record is never replayed for current data), --role/--repin/--check/--final/--guards/--enable/--baseline (fixed per step),
+  # --seed = <move_id>-<attempt> (derived), --since = the recorded x.verify argv (below)
+  foreach ($k in 'old', 'new') {
+    foreach ($rr in $got[$k].Recs) {
+      if ("$($rr['id'])" -cmatch '\A((?:fwd|back)-[0-9]+-.+)\.([0-9]+)\z') {
+        $cur = [int](Get-MoveMapVal $S.pass $Matches[1] 0); if ([int]$Matches[2] -gt $cur) { Set-MoveMapVal $S.pass $Matches[1] ([int]$Matches[2]) }
+      }
+    }
+  }
+  # last_copy_at: the `--since` of this attempt's x.verify record (src's, else dst's), so a resumed x.verify re-sends exactly the recorded argument on both machines. Without one the
+  # laptop's own write is recovered: it writes the field only in Invoke-MovePasses, just before that pass's c.transfer.N, and the same pass's c.verify.N carries it verbatim: new's
+  # newest fwd-<n>-c.transfer.<N> record (by start) gives `start`, replaced by the `since=` of new's fwd-<n>-c.verify.<N> when it has one; none of them: empty
+  $tsRx = '\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\z'
+  $vs = @(foreach ($k in $(if ($dir -ceq 'back') { 'new', 'old' } else { 'old', 'new' })) { foreach ($rr in $got[$k].Recs) { if ("$($rr['id'])" -ceq "${p}x.verify" -and "$($rr['since'])" -cmatch $tsRx) { "$($rr['since'])" } } })
+  $lc = ''
+  if ($vs.Count) { $lc = $vs[0] }
+  else {
+    $tr = @($n.Recs | Where-Object { "$($_['id'])" -cmatch '\Afwd-[0-9]+-c\.transfer\.[0-9]+\z' -and (ConvertTo-MoveTime $_['start']) } | Sort-Object -Property { [string]$_['start'] } -Descending | Select-Object -First 1)
+    if ($tr.Count) {
+      $lc = [string]$tr[0]['start']
+      if ("$($tr[0]['id'])" -cmatch '\Afwd-([0-9]+)-c\.transfer\.([0-9]+)\z') { $vid = "fwd-$($Matches[1])-c.verify.$($Matches[2])"; foreach ($rr in $n.Recs) { if ("$($rr['id'])" -ceq $vid -and "$($rr['since'])" -cmatch $tsRx) { $lc = "$($rr['since'])" } } }
+    }
+  }
+  if ($lc) { Set-MoveProp $S 'last_copy_at' $lc }
+  # final-sent (G35, E-R5 / E-R23): new holds this attempt's x.final record, whatever its rc
+  if (@($n.Recs | Where-Object { "$($_['id'])" -ceq "${p}x.final" }).Count) { Set-MoveAnswer $S 'final-sent' "${p}x.final" }
+  # refresh-pending (F13): a forward copy whose manifest pin is newer than every done c.adopt.<N> on new (the record's --sha) has not prepared new for it
+  $rp = $false
+  if ($dir -ceq 'fwd' -and $phase -ceq 'copied') { $rp = -not @($n.Recs | Where-Object { "$($_['id'])" -cmatch ('\A' + [regex]::Escape($p) + 'c\.adopt\.[0-9]+\z') -and "$($_['rc'])" -ceq '0' -and "$($_['sha'])" -ceq [string]$mf.Sha }).Count }
+  Set-MoveAnswer $S 'refresh-pending' $rp
+  # Q-back's list (B41): a rebuilt manual back keeps an empty one, so a project x.check lists stops the back as E-R19 (D.8.2)
+  if ($dir -ceq 'back' -and $S.carry -ne $true) { Set-MoveAnswer $S 'back-new-projects' @() }
   $scan = Get-MovePushScan $S; if (-not $scan.Ok) { if (-not $script:MoveNoAnswerShown) { Write-Host 'lỗi: không quét lại được repo (D.0.10: legacy_push[] từ một lần quét mới); chưa ghi gì.' }; return 1 }
   Set-MoveProp $S 'legacy_push' @($scan.Legacy)
   $co = Get-MoveRebuiltCutOff $o.Recs; if ($co) { Set-MoveAnswer $S 'Q-cut' ([pscustomobject]@{ a = 'có'; ts = $co }) }   # R2-4 (T10-G36): step 11's since
@@ -3804,8 +3914,9 @@ function Invoke-MoveRun([string[]]$MoveArgs) {
     # D.11 order: (1) the K1 agreement check, (2) unknown outcomes by real state (inside each call), (3) the chore-0 pre-rule, (4) the row
     $c = Sync-MoveAgreement $S; if ($c -ne 0) { return $c }
     $down = [bool]$script:MoveNewDown
-    # D.5.3 / E-R4: new unreachable after dst_started in a fwd cutover in flight: no automatic action; Q-newlost
-    if ($down -and $verb -ceq 'cutover' -and [string]$S.dir -ceq 'fwd' -and $S.mark -and $S.dst_started -eq $true -and $S.carry -ne $true) { return [int]@(Invoke-MoveNewLost $S)[-1] }
+    # D.5.3 / E-R4: new unreachable after dst_started in a fwd cutover in flight: no automatic action; Q-newlost. Not while a return to old is under way (`rolling-back`): then
+    # `cutover` continues that return (rb-continue) instead of asking again
+    if ($down -and $verb -ceq 'cutover' -and [string]$S.dir -ceq 'fwd' -and $S.mark -and [string]$S.mark -cne 'rolling-back' -and $S.dst_started -eq $true -and $S.carry -ne $true) { return [int]@(Invoke-MoveNewLost $S)[-1] }
     if ($down -and [string]$S.serving -ceq 'new') { return (Write-MoveNoAnswer ([string]$S.new.alias) 'khi đang phục vụ' $script:MoveNewDownCode) }
     $c = Invoke-MovePreRule $S; if ($c -ne 0) { return $c }
     $row = Resolve-MoveRow $verb $S
