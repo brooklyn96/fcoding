@@ -44,10 +44,11 @@ hook_text() {
 # no_secret <owner/repo>: 0 = listed in ~/.config/fcode/no-secret-repos (one GitHub slug per line, any case, # comments); a list that is not a
 # regular readable file or holds a NUL byte (grep would split lines there) allows nothing; the same line is in box/gh-guard.sh
 no_secret() { nsf=$HOME/.config/fcode/no-secret-repos; [ -f "$nsf" ] && [ -r "$nsf" ] && [ "$(wc -c <"$nsf")" -eq "$(tr -d '\000' <"$nsf" | wc -c)" ] && sed 's/#.*//; s/[[:space:]]//g' "$nsf" | grep -qixF -- "$1"; }
-# default_ref: $db = origin's default branch (origin/HEAD, else origin/main, else origin/master); 1 = none
+# default_ref: $db = origin's default branch (origin/HEAD when it leads to a commit; else origin/main, else origin/master); 1 = none. An
+# origin/HEAD left dangling (the default branch renamed, then fetch --prune) is skipped, so the refusal names set-head when nothing else is left.
 default_ref() {
-  db=$(git symbolic-ref -q refs/remotes/origin/HEAD) || db=
-  for sr_c in refs/remotes/origin/main refs/remotes/origin/master; do [ -n "$db" ] || ! git rev-parse -q --verify "$sr_c" >/dev/null || db=$sr_c; done
+  db=$(git symbolic-ref -q refs/remotes/origin/HEAD) && git rev-parse -q --verify "$db^{commit}" >/dev/null || db=
+  for sr_c in refs/remotes/origin/main refs/remotes/origin/master; do [ -n "$db" ] || ! git rev-parse -q --verify "$sr_c^{commit}" >/dev/null || db=$sr_c; done
   [ -n "$db" ]
 }
 # guard_allow <owner/repo> <sha>: 0 = ~/.config/fcode/guard-allow/<owner>__<repo>__<sha> (lower case) is a regular file, not a link: made by the

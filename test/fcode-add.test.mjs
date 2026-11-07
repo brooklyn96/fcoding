@@ -1300,7 +1300,7 @@ test('hook 1c: syncing with origin/main: a pushed branch merges origin/main afte
   } finally { done(e); }
 });
 
-test('hook 1d: with no origin/HEAD and no origin/main|master (a clone --single-branch, an empty repo) a new ref is compared with nothing: refused, .github/ or not, a .github/ deletion too; only a whole-empty-tree commit pushes; the remote ref stays a base; an origin/HEAD to a missing ref compares as different', { skip }, () => {
+test('hook 1d: with no origin/HEAD and no origin/main|master (a clone --single-branch, an empty repo) a new ref is compared with nothing: refused, .github/ or not, a .github/ deletion too; only a whole-empty-tree commit pushes; the remote ref stays a base; a dangling origin/HEAD is no default branch (set-head hint, or origin/main when there)', { skip }, () => {
   const e = hookWorld(DEPLOY_WF);
   try {
     e.git('switch', '-q', '-c', 'box/p');
@@ -1350,8 +1350,16 @@ test('hook 1d: with no origin/HEAD and no origin/main|master (a clone --single-b
     const sha = x.commit(x.dir, '.github/workflows/ci.yml', 'on: push\n');
     refused(x.push('origin', 'box/u'), sha);
     refusedNB(x.push('origin', 'HEAD:refs/heads/box/new'), sha);
+    // review-r7: the default branch renamed, then fetch --prune: origin/HEAD dangles; it is skipped, nothing else is left -> the set-head hint
     x.git('symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/gone');
-    refused(x.push('origin', 'HEAD:refs/heads/box/new'), sha);
+    refusedNB(x.push('origin', 'HEAD:refs/heads/box/new'), sha);
+    // with origin/main there, a dangling origin/HEAD falls back to it: a new branch outside .github pushes, a .github change is refused
+    x.git('fetch', '-q', 'origin');
+    assert.equal(x.git('symbolic-ref', 'refs/remotes/origin/HEAD'), 'refs/remotes/origin/gone');
+    x.git('switch', '-q', '-c', 'box/w', 'origin/main');
+    x.commit(x.dir, 'src.txt', 'w\n');
+    pushed(x.push('origin', 'box/w'));
+    refused(x.push('origin', `${sha}:refs/heads/box/new`), sha);
   } finally { done(x); }
 });
 
