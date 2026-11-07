@@ -9,7 +9,7 @@
 1. Trên máy tính, vào trang GitHub của dự án này, bấm **Releases**, chọn bản **"FCode (bản mới nhất)"** (nhãn `latest`).
 2. Bấm vào **fcode.ipa** để tải về máy tính.
 
-Mỗi lần có thay đổi mới, GitHub tự dựng lại và thay file `fcode.ipa` ở cùng chỗ đó.
+Mỗi lần có thay đổi mới, GitHub tự dựng lại và thay file `fcode.ipa` ở cùng chỗ đó. Mỗi bản phát hành có số phiên bản (vX.Y.Z) cũng đính kèm sẵn `fcode.ipa`, nên bạn có thể tải đúng phiên bản mình cần.
 
 ## 2. Cài bằng Sideloadly
 
