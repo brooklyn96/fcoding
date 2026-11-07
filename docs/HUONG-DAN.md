@@ -18,6 +18,7 @@
    - [Thêm dự án từ app](#thêm-dự-án-từ-app)
    - [Gửi ảnh trong chat](#gửi-ảnh-trong-chat)
    - [Deploy từ box (`fcode-deploy`)](#deploy-từ-box-fcode-deploy)
+   - [Sửa workflow từ box](#sửa-workflow-từ-box)
 8. [Dùng từ laptop](#8-dùng-từ-laptop)
    - [Lệnh `fcode` (tùy chọn)](#lệnh-fcode-tùy-chọn)
    - [Chép chữ và dán ảnh từ laptop](#chép-chữ-và-dán-ảnh-từ-laptop)
@@ -445,6 +446,21 @@ fcode-deploy <tên> trust off
 - Mã thoát là mã của cổng (0 xong, 1 bị từ chối hoặc rollback, 65 yêu cầu sai hoặc chưa được duyệt, 69 dịch vụ chết, 70 cần người xử lý). Riêng 65 cũng là mã khi lệnh từ chối ngay trên box (tên, sha, bản nháp sai: chưa gửi gì); 1 là lỗi công cụ (thiếu cấu hình, `gh` lỗi); 255 là ssh không nối được (kể cả khoá máy chủ chưa có trong `known_hosts`).
 - `add` từ chối (65) khi repo còn lượt Actions đang chạy hoặc đang chờ, và khi khoá deploy của repo có quyền ghi (kiểm tra cả sau khi vừa thêm). Chưa có `--yes` thì không bao giờ gửi `register`.
 - Các project cũ `deal-sync` và `vps-scraper` dùng khoá riêng của chúng, không qua lệnh này.
+
+### Sửa workflow từ box
+
+Token `gh` của box có quyền sửa workflow (`.github/workflows`). Ở repo mà workflow đọc secret (ví dụ khoá deploy của `deal-sync`, `vps-scraper`), ai sửa được workflow là đọc được secret đó. GitHub Free không cho khoá secret theo nhánh ở repo riêng tư, nên box tự chặn hai chỗ:
+
+- **Khi đẩy code (hook `pre-push`):** ở repo có secret, mọi lần đẩy có commit mới sửa thư mục `.github/` đều bị từ chối, kèm dòng `pre-push: <chủ/repo> dùng secret trong workflow; sửa .github/ ở repo này cần chủ duyệt …`. Sửa file khác vẫn đẩy bình thường. Repo không có secret (như `fcoding`, `deploy-gate`) không bị chặn.
+- **Khi merge (lệnh `gh` của box):** `gh pr merge` một PR có sửa `.github/` ở repo có secret bị từ chối (mã 65): `gh-guard: PR #<số> sửa .github/ ở repo có secret; chỉ chủ được merge …`. Lệnh `gh api` ghi (PUT, PATCH, DELETE) vào `.github/`, secret hay environment của repo đó cũng bị chặn. Mọi lệnh `gh` khác chạy như cũ.
+
+"Repo có secret" là repo có workflow trên nhánh mặc định đọc `secrets.<TÊN>` (trừ `GITHUB_TOKEN`), hoặc repo bạn ghi tay vào `~/.config/fcode/sensitive-repos` trên box (mỗi dòng một `chủ/repo`). Không đọc được nhánh mặc định thì box coi như repo có secret.
+
+**Cần sửa workflow ở repo có secret thì làm thế này:** agent sửa và commit trên nhánh `box/...` của nó (box không cho đẩy), rồi báo bạn bằng `fcode-notify <dự án> merge-ready`. Agent không tự đẩy, không tự merge. Bạn xem thay đổi, rồi tự đẩy và merge (từ laptop hoặc trên GitHub). Nếu PR đã có sẵn trên GitHub thì cũng vậy: chỉ bạn merge.
+
+Hai lớp này nằm trên box, chỉ chặn lỗi và thói quen của agent: gọi thẳng `/usr/bin/gh` hoặc `git push --no-verify` vẫn đi qua được. Chốt thật là khoá deploy trên VPS: khoá lưu trong secret của GitHub chỉ được chạy cổng deploy, không làm được gì khác.
+
+Cài và cập nhật: `bash install.sh` cài `~/.local/bin/gh` (lớp chặn trước `/usr/bin/gh`) và `~/.local/bin/fcode-hooks`, rồi chạy `fcode-hooks` để đưa hook mới vào mọi dự án đã thêm (mỗi dự án một dòng `HOOK_OK`, `HOOK_EXISTS` hoặc `HOOK_FAIL <lý do>`). Chạy lại `fcode-hooks` lúc nào cũng được.
 
 ## 8. Dùng từ laptop
 

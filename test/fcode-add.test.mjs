@@ -1094,3 +1094,126 @@ test('push destination: when BOTH the https URL and the key alias are rewritten 
     tmpClean(e);
   } finally { done(e); }
 });
+
+// ---- the box pre-push hook itself (fcode-add.sh --hook-text), run by a real `git push` into a local bare o/r.git ----
+const SECRET_MSG = /pre-push: o\/r dùng secret trong workflow; sửa \.github\/ ở repo này cần chủ duyệt — báo fcoding, không tự đẩy\./;
+const DEPLOY_WF = 'jobs:\n  d:\n    env:\n      K: ${{ secrets.DEPLOY_SSH_KEY }}\n';
+// <root>/o/r.git with README (and .github/workflows/ci.yml = workflow, unless undefined) on main; <root>/c is a clone of it with the box hook
+function hookWorld(workflow) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-hk-'));
+  const e = { root, home: path.join(root, 'home'), remote: path.join(root, 'o', 'r.git'), dir: path.join(root, 'c'), seed: path.join(root, 'seed') };
+  fs.mkdirSync(e.home);
+  e.commit = (dir, file, text) => {
+    fs.mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
+    fs.writeFileSync(path.join(dir, file), text);
+    sh('git', ['-C', dir, 'add', '-A'], e);
+    sh('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-C', dir, 'commit', '-q', '-m', file], e);
+  };
+  sh('git', ['init', '-q', '--bare', '-b', 'main', e.remote], e);
+  sh('git', ['init', '-q', '-b', 'main', e.seed], e);
+  e.commit(e.seed, 'README.md', 'hello\n');
+  if (workflow !== undefined) e.commit(e.seed, '.github/workflows/ci.yml', workflow);
+  sh('git', ['-C', e.seed, 'push', '-q', e.remote, 'main'], e);
+  sh('git', ['clone', '-q', e.remote, e.dir], e);
+  const text = spawnSync('bash', [SCRIPT, '--hook-text'], { encoding: 'utf8' });
+  assert.equal(text.status, 0);
+  fs.mkdirSync(path.join(e.dir, '.git', 'hooks'), { recursive: true });
+  fs.writeFileSync(path.join(e.dir, '.git', 'hooks', 'pre-push'), text.stdout, { mode: 0o755 });
+  e.push = (...a) => spawnSync('git', ['-C', e.dir, 'push', '-q', ...a], { encoding: 'utf8', env: { PATH: process.env.PATH, HOME: e.home, GIT_CONFIG_NOSYSTEM: '1' } });
+  e.at = (ref) => gitOr(e, e.remote, 'rev-parse', '-q', '--verify', ref);
+  return e;
+}
+const pushed = (r) => assert.equal(r.status, 0, r.stderr);
+const refused = (r, re = SECRET_MSG) => { assert.notEqual(r.status, 0); assert.match(r.stderr, re); };
+
+test('hook: --hook-text prints the hook alone (exit 0, no R line), the same text fcode add installs', { skip }, () => {
+  const r = spawnSync('bash', [SCRIPT, '--hook-text'], { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^#!\/bin\/sh\n# Box guard: never push directly to main\/master/);
+  assert.ok(!/^R /m.test(r.stdout));
+  assert.equal(spawnSync('sh', ['-n'], { input: r.stdout }).status, 0);
+});
+
+test('hook: a repo whose default-branch workflow reads a secret refuses pushes whose new commits change .github/ (new branch, update, force-push); other changes, deletes and main merges push', { skip }, () => {
+  const e = hookWorld(DEPLOY_WF);
+  try {
+    sh('git', ['-C', e.dir, 'switch', '-q', '-c', 'box/a'], e);
+    e.commit(e.dir, 'src.txt', 'x\n');
+    pushed(e.push('origin', 'box/a')); // new branch (zero remote sha), no .github change
+    const before = e.at('refs/heads/box/a');
+    e.commit(e.dir, '.github/workflows/ci.yml', 'jobs: {}\n');
+    refused(e.push('origin', 'box/a')); // update of an existing branch
+    refused(e.push('origin', 'HEAD:refs/heads/box/b')); // the same commits on a new branch
+    assert.equal(e.at('refs/heads/box/a'), before);
+    assert.equal(e.at('refs/heads/box/b'), '');
+    // force-push: a rewritten branch without .github pushes; one with it is refused
+    sh('git', ['-C', e.dir, 'reset', '-q', '--hard', 'origin/main'], e);
+    e.commit(e.dir, 'other.txt', 'y\n');
+    pushed(e.push('--force', 'origin', 'box/a'));
+    sh('git', ['-C', e.dir, 'reset', '-q', '--hard', 'origin/main'], e);
+    e.commit(e.dir, '.github/dependabot.yml', 'version: 2\n');
+    refused(e.push('--force', 'origin', 'box/a'));
+    // deleting a branch is no change to .github
+    pushed(e.push('origin', ':box/a'));
+    assert.equal(e.at('refs/heads/box/a'), '');
+    // main stays blocked as before, whatever the commits hold
+    sh('git', ['-C', e.dir, 'reset', '-q', '--hard', 'origin/main'], e);
+    e.commit(e.dir, 'src.txt', 'z\n');
+    refused(e.push('origin', 'HEAD:main'), /pushing to main is blocked on this box/);
+    refused(e.push('origin', 'HEAD:refs/heads/master'), /pushing to master is blocked on this box/);
+    // the owner changes .github on main; a box branch that merges origin/main brings no new .github commit of its own
+    e.commit(e.seed, '.github/workflows/ci.yml', DEPLOY_WF + '# owner edit\n');
+    sh('git', ['-C', e.seed, 'push', '-q', e.remote, 'main'], e);
+    sh('git', ['-C', e.dir, 'fetch', '-q', 'origin'], e);
+    sh('git', ['-C', e.dir, 'switch', '-q', '-c', 'box/c', 'HEAD'], e);
+    sh('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-C', e.dir, 'merge', '-q', '--no-edit', 'origin/main'], e);
+    pushed(e.push('origin', 'box/c'));
+  } finally { done(e); }
+});
+
+test('hook: every way a workflow reads secrets makes the repo sensitive; GITHUB_TOKEN alone, comments and no workflows do not', { skip }, () => {
+  for (const wf of ["k: ${{ secrets['K'] }}\n", 'k: ${{ toJSON(secrets) }}\n', 'jobs:\n  c:\n    uses: ./.github/workflows/x.yml\n    secrets: inherit\n', 'k: ${{ secrets . K }}\n', 'k: ${{ SECRETS.k }}\n']) {
+    const e = hookWorld(wf);
+    try {
+      sh('git', ['-C', e.dir, 'switch', '-q', '-c', 'box/w'], e);
+      e.commit(e.dir, '.github/workflows/new.yml', 'on: push\n');
+      refused(e.push('origin', 'box/w'));
+    } finally { done(e); }
+  }
+  for (const wf of ['# No secrets here.\nenv:\n  T: ${{ secrets.GITHUB_TOKEN }}\n  U: ${{ Secrets.github_token }}\n', undefined]) {
+    const e = hookWorld(wf);
+    try {
+      sh('git', ['-C', e.dir, 'switch', '-q', '-c', 'box/w'], e);
+      e.commit(e.dir, '.github/workflows/new.yml', 'k: ${{ secrets.ADDED_ON_THE_BRANCH }}\n'); // only the default branch counts
+      pushed(e.push('origin', 'box/w'));
+    } finally { done(e); }
+  }
+});
+
+test('hook: a repo listed in ~/.config/fcode/sensitive-repos is sensitive (case-insensitive, comments ignored); other listed repos are not', { skip }, () => {
+  const e = hookWorld(undefined);
+  try {
+    const list = path.join(e.home, '.config', 'fcode', 'sensitive-repos');
+    fs.mkdirSync(path.dirname(list), { recursive: true });
+    fs.writeFileSync(list, '# forced by the owner\nother/repo\n');
+    sh('git', ['-C', e.dir, 'switch', '-q', '-c', 'box/l'], e);
+    e.commit(e.dir, '.github/workflows/ci.yml', 'on: push\n');
+    pushed(e.push('origin', 'box/l'));
+    e.commit(e.dir, '.github/workflows/ci.yml', 'on: pull_request\n');
+    fs.writeFileSync(list, '# forced by the owner\nother/repo\n  O/R  # this one\n');
+    refused(e.push('origin', 'box/l'));
+  } finally { done(e); }
+});
+
+test('hook: when the default branch cannot be resolved (no origin/HEAD, main or master) a .github change is refused; other changes push', { skip }, () => {
+  const e = hookWorld(undefined);
+  try {
+    sh('git', ['-C', e.dir, 'remote', 'set-head', 'origin', '-d'], e);
+    sh('git', ['-C', e.dir, 'update-ref', '-d', 'refs/remotes/origin/main'], e);
+    sh('git', ['-C', e.dir, 'switch', '-q', '-c', 'box/u'], e);
+    e.commit(e.dir, 'src.txt', 'x\n');
+    pushed(e.push('origin', 'box/u'));
+    e.commit(e.dir, '.github/workflows/ci.yml', 'on: push\n');
+    refused(e.push('origin', 'box/u'));
+  } finally { done(e); }
+});

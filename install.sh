@@ -22,6 +22,11 @@ mkdir -p "$APP"
 ( umask 077; d=$HOME/.local/state/fcode/notify; mkdir -p "$d" && chmod 700 "$d" && : >>"$d/outbox.tsv" )
 # the box CLI behind the laptop's `fcode add` and the owner's manual add: ~/.local/bin/fcode-add (runs fcode-add.sh under the server's ADD_WATCHDOG)
 [ ! -f "$SRC/box/fcode-add-run.sh" ] || install -D -m 755 "$SRC/box/fcode-add-run.sh" "$HOME/.local/bin/fcode-add"
+# puts the current pre-push hook (fcode-add.sh --hook-text) into every project already added: ~/.local/bin/fcode-hooks (run below, once the config exists)
+[ ! -f "$SRC/box/fcode-hooks.sh" ] || install -D -m 755 "$SRC/box/fcode-hooks.sh" "$HOME/.local/bin/fcode-hooks"
+# the box's gh: ~/.local/bin/gh, ahead of /usr/bin/gh on PATH; refuses a PR merge or gh api write that touches .github/, secrets or environments
+# of a repo with secrets, passes every other call to /usr/bin/gh unchanged (docs/HUONG-DAN.md, "Sửa workflow từ box")
+[ ! -f "$SRC/box/gh-guard.sh" ] || install -D -m 755 "$SRC/box/gh-guard.sh" "$HOME/.local/bin/gh"
 
 mkdir -p "$CFG"
 chmod 700 "$CFG"
@@ -51,6 +56,10 @@ strip_password_hash() { # strip_password_hash CONFIG_FILE  (tmp file, full write
 }
 strip_password_hash "$CFG/config.json"
 [ ! -f "$CFG/devices.json" ] || chmod 600 "$CFG/devices.json"
+# refresh every project's pre-push hook; best effort: a project it cannot fix gets a HOOK_FAIL line, and the install goes on
+if [ -x "$HOME/.local/bin/fcode-hooks" ]; then
+  FCODE_APP="$APP" FCODE_CFG="$CFG/config.json" "$HOME/.local/bin/fcode-hooks" || echo "warning: fcode-hooks did not update every project's pre-push hook (see the HOOK_FAIL lines)" >&2
+fi
 
 # fcode-pair [device name] [--qr]: prints a one-time 6-digit code for the app (needs the running server);
 # --qr adds the pairing links and a QR code (qrencode, when installed; apt package "qrencode")

@@ -22,6 +22,51 @@
 # 42 GitHub chan tao nhanh box/*, 43 mang loi, 44 repo da luu tru, 24 khong cai/kiem chung duoc hook, 25 khong dat duoc credential helper,
 # 26 cau hinh git (url.*.insteadOf / pushurl) doi huong URL, 2 tham so sai, 11 thu muc da co / khong an toan, 21/22 cau hinh xung dot / hong,
 # 23 ten khoa/alias da dung cho repo khac, 20 khong tao duoc khoa, 12 clone loi.
+# Hook pre-push chuan cua box (fcode-hooks cai lai noi dung nay vao moi project da co: "fcode-add.sh --hook-text" chi in no ra roi thoat 0).
+# 1) chan push thang len main/master. 2) repo "co secret" (workflow tren nhanh mac dinh cua origin doc secrets.<TEN> khac GITHUB_TOKEN, hay
+# owner/repo ghi trong ~/.config/fcode/sensitive-repos; khong doc duoc nhanh mac dinh = co secret): chan push co commit moi sua .github/.
+# Cung quy tac voi box/gh-guard.sh (sensitive_local); doi o day thi doi ca ben do.
+hook_text() {
+  cat <<'HOOK'
+#!/bin/sh
+# Box guard: never push directly to main/master. Work on box/<topic>, then merge through a PR.
+# Repo with secrets (a workflow on origin's default branch reads secrets other than GITHUB_TOKEN, or owner/repo is listed in
+# ~/.config/fcode/sensitive-repos; an unreadable default branch counts as one): a push whose new commits change .github/ is refused.
+s=
+sensitive() {
+  [ -z "$s" ] || return "$s"
+  s=0
+  f="$HOME/.config/fcode/sensitive-repos"
+  [ -f "$f" ] && sed 's/#.*//; s/[[:space:]]//g' "$f" | grep -qixF -- "$slug" && return 0
+  b=$(git symbolic-ref -q refs/remotes/origin/HEAD) || b=
+  for c in refs/remotes/origin/main refs/remotes/origin/master; do [ -n "$b" ] || ! git rev-parse -q --verify "$c" >/dev/null || b=$c; done
+  [ -n "$b" ] || return 0
+  m=$(git grep -ohiE 'secrets[[:space:]]*(\.[[:space:]]*[a-z0-9_-]+|\[)|tojson\([[:space:]]*secrets|secrets:[[:space:]]*inherit' "$b" -- .github/workflows 2>/dev/null)
+  case $? in
+    1) s=1;;
+    0) printf '%s\n' "$m" | tr -d ' \t' | grep -qvixF secrets.github_token || s=1;;
+  esac
+  return "$s"
+}
+u=${2:-$(git config --get remote.origin.url)}; u=${u%/}; u=${u%.git}; o=${u%/*}; slug=${o##*[/:]}/${u##*/}
+# shellcheck disable=SC2034,SC2162 # git's four fields; refs and object names hold no backslash
+while read local_ref local_sha remote_ref remote_sha; do
+  case "$remote_ref" in
+    refs/heads/main|refs/heads/master) echo "pre-push: pushing to ${remote_ref#refs/heads/} is blocked on this box; push a box/<topic> branch and merge via PR" >&2; exit 1;;
+  esac
+  case "$local_sha" in *[!0]*) ;; *) continue;; esac
+  x=; case "$remote_sha" in *[!0]*) ! git cat-file -e "$remote_sha^{commit}" 2>/dev/null || x=$remote_sha;; esac
+  if r=$(git rev-list "$local_sha" --not --remotes ${x:+"$x"} 2>/dev/null); then
+    p=$(printf '%s\n' "$r" | git diff-tree --stdin -r --root -c --name-only --no-commit-id 2>/dev/null) || p=.github/
+  else p=.github/; fi
+  if printf '%s\n' "$p" | grep -q '^"\{0,1\}\.github/' && sensitive; then
+    echo "pre-push: $slug dùng secret trong workflow; sửa .github/ ở repo này cần chủ duyệt — báo fcoding, không tự đẩy." >&2; exit 1
+  fi
+done
+exit 0
+HOOK
+}
+[ "${1:-}" = --hook-text ] && { hook_text; exit 0; }
 set -u
 arg1="${1:-}"; arg2="${2:-}"
 repo="${1:-}"; name="${2:-}"
@@ -79,20 +124,6 @@ if [ -e "$dir" ]; then
     if [ -z "$gdir" ] || [ "$(readlink -f "$gdir")" != "$rdir/.git" ]; then say DIR_UNSAFE unsafe; exit 11; fi
   fi
 fi
-
-# hook chan push thang len main/master (noi dung chuan cua box)
-hook_text() {
-  cat <<'HOOK'
-#!/bin/sh
-# Box guard: never push directly to main/master. Work on box/<topic>, then merge through a PR.
-while read local_ref local_sha remote_ref remote_sha; do
-  case "$remote_ref" in
-    refs/heads/main|refs/heads/master) echo "pre-push: pushing to ${remote_ref#refs/heads/} is blocked on this box; push a box/<topic> branch and merge via PR" >&2; exit 1;;
-  esac
-done
-exit 0
-HOOK
-}
 
 # alias cua rieng repo nay? 0 = co (co dong "# fcode add: <repo>" ngay tren), 1 = chua co, 2 = co nhung cua nguoi khac
 alias_owner() {
