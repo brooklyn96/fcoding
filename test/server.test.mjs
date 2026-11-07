@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import { createApp, HARNESSES, parseConfig, writePrivate, trimScreen, sgrOnly, trimAnsiScreen, adminRequest, adminPath, strictOrigin, KEYS, stateOf, previewOf, summarize, menuOf, WAIT_PATTERNS, parseShortstat, acquireInstanceLock,
-  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, releaseRunOf, parseUpdates, updateStatusOf, gateStatusOf, gateRunOf, resetReply, RESET_MSG, memo, codexChildMeta, parseGitSync, ompDirName, ompHead, KNOWN_VERSIONS, repoOfLink } from '../server.mjs';
+  parseQuota, windowsOf, ompLine, claudeLine, codexLine, spendScanner, spendOf, spendView, priceOf, priceFor, codexRoots, repoOf, checksOf, checksOfRuns, prsOf, runOf, deployRunOf, releaseRunOf, parseUpdates, updateStatusOf, gateStatusOf, gateRunOf, resetReply, RESET_MSG, memo, codexChildMeta, parseGitSync, ompDirName, ompHead, KNOWN_VERSIONS, repoOfLink } from '../server.mjs';
 import { ADD_WATCHDOG, addOutcome } from '../server.mjs';
 
 process.env.TZ = 'America/Los_Angeles'; // spend days follow config.json timeZone, never the process zone: a third zone proves it
@@ -3455,6 +3455,77 @@ test('codex replay gate (Pane CodexReplayGate): child markers; replayed parent h
     { timestamp: '2026-07-10T10:00:00Z', type: 'session_meta', payload: { id: 'parent', forked_from_id: 'x', creator_account_id: 'acct-other' } },
     tcl('2026-07-10T10:00:01Z', [1000, 100], [1000, 100])]);
   assert.deepEqual(first.map((e) => [e.who, e.tokens, e.key.startsWith('x:f:')]), [['codex:acct-cdx', 1100, true]]);
+});
+
+const near = (a, b) => assert.ok(Math.abs(a - b) < 1e-9, `${a} != ${b}`);
+// a Codex token_count line shaped like the real ones (cache_write_input_tokens in both usages; no model in info)
+const gptTc = (ts, last, total = last) => ({ timestamp: ts, type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: total, last_token_usage: last, model_context_window: 500000 } } });
+const usage = (input, cached, written, output) => ({ input_tokens: input, cached_input_tokens: cached, cache_write_input_tokens: written, output_tokens: output, reasoning_output_tokens: 0, total_tokens: input + output });
+
+test('Codex prices: gpt-6 family, cache write out of plain input, long-context tier per request above 272,000 input tokens', () => {
+  assert.deepEqual(['gpt-6-astra', 'gpt-6-sol', 'gpt-6.1-sol', 'gpt-6-luna', 'gpt-6.1-terra', 'openai/gpt-6-astra-20261101'].map(priceOf),
+    [[10, 50, 1, 12.5], [2, 10, 0.2, 2.5], [2, 10, 0.1, 2.5], [0.1, 0.5, 0.01, 0.125], [1, 5, 0.05, 1.25], [10, 50, 1, 12.5]]);
+  assert.equal(priceOf('gpt-6-nova'), null);
+  // both sides of 272,000: the long rates need MORE than 272,000 input tokens
+  assert.deepEqual([priceFor('gpt-6-astra', 272000), priceFor('gpt-6-astra', 272001), priceFor('gpt-6-sol', 272001), priceFor('gpt-6.1-sol', 900000), priceFor('nope', 900000)],
+    [[10, 50, 1, 12.5], [20, 75, 2, 25], [4, 15, 0.4, 5], [2, 10, 0.1, 2.5], null]);
+  const run = (model, last, total) => {
+    const st = { file: 'f' };
+    return [{ timestamp: '2026-10-25T09:00:00Z', type: 'turn_context', payload: { model } }, gptTc('2026-10-25T09:00:10Z', last, total)].map((v) => codexLine(v, st)).filter(Boolean)[0];
+  };
+  // plain 30,000 x 10 + cached 60,000 x 1 + cache write 10,000 x 12.5 + output 1,000 x 50 (cache write is part of input_tokens, not added)
+  let e = run('gpt-6-astra', usage(100000, 60000, 10000, 1000));
+  near(e.usd, 0.535); assert.equal(e.tokens, 101000);
+  // above 272,000: 50,000 x 20 + 200,000 x 2 + 50,000 x 25 + 2,000 x 75
+  near(run('gpt-6-astra', usage(300000, 200000, 50000, 2000)).usd, 2.8);
+  near(run('gpt-6-astra', usage(272000, 0, 0, 0)).usd, 2.72); // at the limit: base rate
+  near(run('gpt-6-astra', usage(272001, 0, 0, 0)).usd, 272001 * 20 / 1e6);
+  near(run('gpt-6.1-sol', usage(300000, 100000, 0, 1000)).usd, 0.42); // no long-context tier for gpt-6.1-sol
+  // no last_token_usage: a delta of totals may span several requests, so the size is unknown and the base rates apply
+  near(run('gpt-6-astra', undefined, usage(300000, 0, 0, 0)).usd, 3);
+  // a cache write rate missing from the table: the input rate; a write larger than the plain input is capped to it
+  near(run('gpt-5.5', usage(1000, 0, 400, 0)).usd, 1000 * 5 / 1e6);
+  near(run('gpt-6-astra', usage(1000, 900, 500, 0)).usd, (900 * 1 + 100 * 12.5) / 1e6);
+  // an unknown model still counts its tokens, no dollars
+  e = run('gpt-9-unknown', usage(1000, 0, 0, 10));
+  assert.deepEqual([e.usd, e.tokens], [null, 1010]);
+});
+
+test('Codex roots: default home plus ~/.codex-* and ~/.codex-accounts/*, symlinked homes read once, a duplicated file counted once', async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'pc-codex-roots-')));
+  try {
+    const mk = (...p) => { const d = path.join(root, ...p); fs.mkdirSync(d, { recursive: true }); return d; };
+    const write = (dir, name, lines) => { const f = path.join(dir, name); fs.writeFileSync(f, lines.map((v) => JSON.stringify(v)).join('\n') + '\n'); fs.utimesSync(f, T0 / 1000, T0 / 1000); };
+    const session = (id, acct, model, tcs) => [
+      { timestamp: '2026-10-25T09:00:00Z', type: 'session_meta', payload: { id, creator_account_id: acct, thread_source: 'user' } },
+      { timestamp: '2026-10-25T09:00:01Z', type: 'turn_context', payload: { model } },
+      ...tcs,
+    ];
+    const sessA = session('sess-a', 'acct-a', 'gpt-6-astra', [gptTc('2026-10-25T09:00:10Z', usage(100000, 60000, 10000, 1000)),
+      gptTc('2026-10-25T09:00:20Z', usage(300000, 200000, 50000, 2000), usage(400000, 260000, 60000, 3000))]);
+    const sessB = session('sess-b', 'acct-b', 'gpt-6.1-sol', [gptTc('2026-10-25T09:00:30Z', usage(300000, 100000, 0, 1000))]);
+    const c2 = mk('.codex-accounts', 'c2', 'sessions', '2026', '10', '25');
+    write(c2, 'rollout-a.jsonl', sessA);
+    fs.symlinkSync(path.join('.codex-accounts', 'c2'), path.join(root, '.codex')); // ~/.codex -> c2
+    mk('.codex-accounts', 'c1');
+    fs.symlinkSync(path.join('..', 'c2', 'sessions'), path.join(root, '.codex-accounts', 'c1', 'sessions')); // c1/sessions -> c2/sessions
+    write(mk('.codex-acc-x', 'sessions', '2026', '10', '25'), 'rollout-b.jsonl', sessB);
+    write(mk('.codex-acc-y', 'archived_sessions'), 'rollout-a.jsonl', sessA); // the same session, a second real copy
+    mk('.codex-other'); mk('.claude', 'sessions'); // no sessions here / not a Codex home
+    const roots = await codexRoots(root, {});
+    const want = [path.join(root, '.codex-accounts', 'c2', 'sessions'), path.join(root, '.codex-acc-x', 'sessions'), path.join(root, '.codex-acc-y', 'archived_sessions')];
+    assert.deepEqual([...roots].sort(), want.sort()); // .codex, c1 and c2 are one real directory; .codex-other and .claude are not Codex homes
+    assert.deepEqual([...await codexRoots(root, { CODEX_HOME: path.join(root, '.codex-acc-x') })].sort(), want); // CODEX_HOME already listed: no change
+    mk('elsewhere');
+    assert.equal((await codexRoots(root, { CODEX_HOME: path.join(root, 'elsewhere') })).length, 3); // no sessions there: nothing added
+    const events = await spendScanner({ codex: () => codexRoots(root, {}) }, () => T0)();
+    assert.equal(events.length, 5); // sess-a twice (c2 and the second copy; the symlinks add nothing) and sess-b once
+    const accounts = [{ id: 'openai-codex/1', harness: 'codex', resets: { target: 'openai-codex/1' }, windows: [] }, { id: 'openai-codex/2', harness: 'codex', resets: { target: 'openai-codex/2' }, windows: [] }];
+    const { perAccount, totals } = spendView(events, accounts, new Map([['codex:acct-a', 'openai-codex/1'], ['codex:acct-b', 'openai-codex/2']]), T0, 'UTC');
+    assert.deepEqual(perAccount.get('openai-codex/1').last30, { usd: 3.335, tokens: 403000 }); // 0.535 + 2.8, once
+    assert.deepEqual(perAccount.get('openai-codex/2').last30, { usd: 0.42, tokens: 301000 });
+    assert.deepEqual(totals.spend.last30, { usd: 3.755, tokens: 704000 });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test('spend summary: today / yesterday / last 30 days, 30 daily rows, weekly estimate, per account and per harness', async () => {
