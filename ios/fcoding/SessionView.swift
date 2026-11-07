@@ -1039,7 +1039,9 @@ struct ComposerView: View {
             TextField("Nhập tin nhắn…", text: $draft, axis: .vertical)
                 .font(.system(size: 17))
                 .lineLimit(compact ? 1...2 : 1...4)
-                .textInputAutocapitalization(.never)
+                // Agent sessions get sentence capitals (first letter, and after ". "); a shell
+                // session keeps them off so typed commands reach bash unchanged.
+                .textInputAutocapitalization(HarnessStyle.all.contains(harness ?? "") ? .sentences : .never)
                 .autocorrectionDisabled()
                 .focused(focused)
                 .id(fieldID)
