@@ -481,6 +481,7 @@ function Apply-Effects($m, [string]$Step, [string]$Verb, $f, $sw, [string]$Id, [
       $m.MoveId = @{ id = $Id; role = $f['role']; dir = $f['dir']; attempt = [int]$f['attempt']; state = 'open'; mark = $(if ($f['mark'] -and $f['mark'] -cne 'null') { $f['mark'] } else { $null }); phase = $f['phase']; serving = $f['serving']; dst_started = $f['dst-started']; old_addr = $(if ($j) { $j.old_addr }); new_addr = $(if ($j) { $j.new_addr }) }
       $m.InitStdin = $j; $m.Sha = $f['sha']; if ($j) { $m.PinManifest = $j.manifest }
       if ($Step -ceq 'c.init-new' -and $j -and $j.PSObject.Properties['target'] -and -not $m.Target) { $m.Target = ConvertTo-Json -InputObject $j.target -Depth 10 -Compress }   # MV_DIR/target.json, written only when absent (D.0.9)
+      if ($Step -ceq 'c.init-new' -and $j -and $j.PSObject.Properties['target']) { $m.TargetIn = ConvertTo-Json -InputObject $j.target -Depth 10 -Compress }   # the call's recorded stdin: the newest c.init-new record's `in`
       if ($f['role'] -ceq 'new' -and $f['dir'] -ceq 'fwd') { $m.Frozen = $true; $m.Active = 0; $m.Enabled = $false }
     }
     '^(c\.repin\.[0-9]+|x\.repin)$' {   # _mvr_put_manifest stores the --sha FLAG as manifest.json.sha256 (the gate has refused a flag that is not the sha256 of the stdin manifest, S4)
@@ -525,6 +526,7 @@ function Fake-Script($m, [string]$Text, $e) {
       # the stored manifest.json holds exactly the hashed bytes (R16 r4 server); StoredLf = an older machine: the text plus a final LF (jsontool's output) under the sha256 of the text without it
       if ($m.Sha -and $W.Mfs.ContainsKey($m.Sha)) { $mb = $utf8.GetBytes([string]$W.Mfs[$m.Sha] + $(if ($W.StoredLf) { "`n" } else { '' })); $o += "MOVE manifest sha=$($m.Sha) gz64=$(Get-Gz64 $mb)" } else { $o += (Get-ManifestLine $null) }
       if ($m.Target) { $o += "MOVE target $($m.Target)" }   # new only: c.init-new kept it (D.0.10)
+      if ($m.TargetIn) { $o += "MOVE target-in $($m.TargetIn)" }   # the `target` key of the newest run/*-c.init-new/in record (the call's recorded stdin; written when the call began, before MV_DIR/target.json): the snapshot a rebuild falls back on (final7 :2)
       if (-not $W.RebuildNoProbe) { $pl = if (@($W.Pf | Where-Object { $_ -ceq 'INV target platform=1' }).Count) { 1 } else { 0 }; $o += "INV target platform=$pl" }   # preflight's probe lines (shared, B.5.2): the platform answer of this machine; RebuildNoProbe = an older rebuild script without the line
       return (New-Res 0 $o)
     }
@@ -2807,6 +2809,49 @@ T 'L.rebuild-rollback-stop-only: a plain rollback is killed after new''s r.stop-
   Lose-State; $s = Rebuild-Now; Ok ($s.phase -cne 'cut') "[carry] never cut (not an E-R19 end): $($s.phase)"; Ok ($s.phase -cne 'rolled-back') "[carry] not rolled-back: $($s.phase)"; Eq $s.serving 'old' '[carry] serving'; Eq $s.carry $false '[carry] carry'
   $r = Run-Move @('cutover'); Eq $r.Code 10 "[carry] the rollback completes ($($r.Text))"; Eq (Sent 'old' '^back-2-r\.start-src$') 1 '[carry] old started'; Eq (SentAny '-x\.final$') 0 '[carry] no x.final'; Assert-OldServes 'stop-only carry'
 }
+# ======= final7 :2 (P2): c.init-new killed after new published its move-id (move-run.sh:555) but before target.json was written (:559), then the laptop state is lost: the rebuild takes target_* from the durable c.init-new `in` record
+# (`MOVE target-in <json>`, the newest run/*-c.init-new record's `target` key) when target.json is missing or invalid; with neither it refuses before any write; a valid target.json wins
+function Flat-Target($T) { [ordered]@{ users = (@($T.users | ForEach-Object { "$($_.name):$($_.uid)" }) -join ','); groups = (@($T.groups | ForEach-Object { "$($_.name):$($_.gid)" }) -join ','); subids = (@($T.subids | ForEach-Object { "$($_.user):$($_.kind):$($_.start):$($_.count)" }) -join ','); addrs = (@($T.addrs) -join ','); stop = "$($T.stop_budget_s)" } }
+function Flat-State($S) { Flat-Target ([pscustomobject]@{ users = $S.target_users; groups = $S.target_groups; subids = $S.target_subids; addrs = $S.target_addrs; stop_budget_s = $S.target_stop_budget_s }) }
+$TargetInPf = @('INV target user=quoc uid=1000 home-nonskel=1', 'INV target user=zed uid=1700 home-nonskel=0', 'INV target group=devs gid=1800', 'INV target subid user=zed kind=uid start=300000 count=65536', 'INV target subid user=zed kind=gid start=300000 count=65536', 'INV target addr=198.51.100.20', 'INV target addr=2001:db8::20', 'INV target platform=0', 'INV target stop_budget_s=240')
+function Kill-InitNew { Reset-World; $W.Pf = $TargetInPf; Fx-Planned; Add-Fault -M new -Key '^fwd-1-c\.init-new$' -Rc 0 -Mode kill; $r = Run-Move @('copy'); Ok ($r.Code -ne 0) "the laptop died in c.init-new ($($r.Text))"; Ok ($null -ne $W.new.TargetIn) 'fixture: new recorded the call''s in (the target snapshot)' }
+function Mut-TargetIn([scriptblock]$F) { $t = $W.new.TargetIn | ConvertFrom-Json; & $F $t; $W.new.TargetIn = ConvertTo-Json -InputObject $t -Depth 10 -Compress }
+T 'L.rebuild-target-in: target.json missing (c.init-new killed before it was written) and the state lost: the rebuild restores target_users / groups / subids / addrs / stop_budget_s from the c.init-new in-record snapshot, the next copy re-plans with the same_users protection and sends the same target; an invalid target.json falls back to the snapshot, a valid target.json wins over it' {
+  $want = [ordered]@{ users = 'quoc:1000,zed:1700'; groups = 'devs:1800'; subids = 'zed:uid:300000:65536,zed:gid:300000:65536'; addrs = '198.51.100.20,2001:db8::20'; stop = '240' }
+  Kill-InitNew; $snap = Flat-Target ($W.new.TargetIn | ConvertFrom-Json); foreach ($k in $want.Keys) { Eq $snap[$k] $want[$k] "fixture: snapshot $k" }; $W.new.Target = $null   # the kill came before :559
+  Lose-State; $s = Rebuild-Now; $got = Flat-State $s; foreach ($k in $want.Keys) { Eq $got[$k] $want[$k] "[missing target.json] state target_$k from the snapshot" }; Eq $s.phase 'planned' '[missing target.json] phase'
+  $r = Run-Move @('copy'); Eq $r.Code 0 "[retry] copy ($($r.Text))"; $in = @($W.PlanStdin[-1]); foreach ($l in 'target-user zed 1700', 'target-addr 198.51.100.20') { Ok ($in -ccontains $l) "[retry] the re-plan keeps the target protection: lacks [$l]" }
+  $sent = Flat-Target $W.new.InitStdin.target; foreach ($k in $want.Keys) { Eq $sent[$k] $want[$k] "[retry] c.init-new sends target.$k" }
+  Kill-InitNew; $W.new.Target = '{"users":[]}'; Lose-State; $s = Rebuild-Now; $got = Flat-State $s; foreach ($k in $want.Keys) { Eq $got[$k] $want[$k] "[invalid target.json] state target_$k from the snapshot" }
+  Kill-InitNew; Mut-TargetIn { param($t) $t.stop_budget_s = 999 }; Lose-State; $s = Rebuild-Now; Eq (Flat-State $s).stop '240' '[both valid] target.json wins over the snapshot'
+}
+T 'L.rebuild-target-in-refused: new holds a move-id but neither a valid target.json nor a valid c.init-new snapshot (none, or a snapshot with a missing key, a non-digit uid, a bad subid kind, a bad address, a name with a blank): the rebuild refuses (exit 1, "không còn danh sách tài khoản đích") BEFORE any write: no state.json, no manifest.json' {
+  $dirSnap = { @(Get-ChildItem -LiteralPath (MoveDir) -Recurse -File -ErrorAction SilentlyContinue | Sort-Object FullName | ForEach-Object { "$($_.FullName):$((Get-FileHash -LiteralPath $_.FullName).Hash)" }) }
+  $legs = [ordered]@{
+    'no snapshot'      = { $W.new.TargetIn = $null }
+    'no stop_budget_s' = { Mut-TargetIn { param($t) [void]$t.PSObject.Properties.Remove('stop_budget_s') } }
+    'stop_budget_s not digits' = { Mut-TargetIn { param($t) $t.stop_budget_s = 'abc' } }
+    'uid not digits'   = { Mut-TargetIn { param($t) $t.users[0].uid = 'x1' } }
+    'subid kind'       = { Mut-TargetIn { param($t) $t.subids[0].kind = 'sub' } }
+    'addr chars'       = { Mut-TargetIn { param($t) $t.addrs[0] = '1.2.3.4;rm' } }
+    'name with blank'  = { Mut-TargetIn { param($t) $t.users[0].name = 'a b' } }
+  }
+  foreach ($k in $legs.Keys) {
+    Kill-InitNew; $W.new.Target = $null; & $legs[$k]; Lose-State; $d0 = & $dirSnap; $rr = Run-Move @('status', '--rebuild', $OldAlias, $NewAlias)
+    Eq $rr.Code 1 "[$k] refused ($($rr.Text))"; HasText 'không còn danh sách tài khoản đích'; Ok (-not (Test-Path -LiteralPath (StatePath))) "[$k] no state.json"; Eq ((& $dirSnap) -join '|') ($d0 -join '|') "[$k] nothing else written under the move dir (manifest.json, known_hosts, ...)"
+  }
+}
+# ======= final7 :3 (P2): a manual back's x.switch completed, the laptop died before the alias chores, the state is lost: the rebuild (back-done, serving old) must keep both alias backups (old_addr) so that `back` restores the aliases
+T 'L.rebuild-back-aliases: x.switch done in a manual back, the laptop dies before the alias chores, the state is lost: the rebuild is back-done / serving old with chores pending and aliases.laptop_backup = aliases.coder_backup = old_addr; `back` runs the chores and the laptop ssh alias reaches old again' {
+  Fx-Cut; Add-Fault -M old -Key '^back-2-x\.switch$' -Rc 0 -Mode kill; Ans 'YES'; $r = Run-Move @('back'); Ok ($r.Code -ne 0) "the laptop died after x.switch ($($r.Text))"; Eq (Get-ConfigHosts (Get-LaptopConfig))[$OldAlias] $NewAddr 'fixture: the alias still reaches new'
+  Lose-State; $s = Rebuild-Now; Eq $s.phase 'back-done' 'phase'; Eq $s.serving 'old' 'serving'; Eq $s.chores_done $false 'chores pending'; Eq "$($s.aliases.laptop_backup)" $OldAddr 'laptop_backup'; Eq "$($s.aliases.coder_backup)" $OldAddr 'coder_backup'
+  Ans 'YES'; $r = Run-Move @('back'); Eq (Get-ConfigHosts (Get-LaptopConfig))[$OldAlias] $OldAddr "the back chores point the alias at old again ($($r.Code): $($r.Text))"; Eq (Get-St).chores_done $true 'chores done'
+}
+T 'L.rebuild-back-aliases-coder: the same rebuild: the coder alias script runs with old_addr (coder_backup) and the coder alias reaches old again' {
+  Fx-Cut; $h = Get-ConfigHosts ([IO.File]::ReadAllText((Join-Path (Join-Path $CoderHome '.ssh') 'config'))); Eq $h[$OldAlias] $NewAddr 'fixture: the coder alias reaches new'
+  Add-Fault -M old -Key '^back-2-x\.switch$' -Rc 0 -Mode kill; Ans 'YES'; [void](Run-Move @('back')); Lose-State; $s = Rebuild-Now; Eq "$($s.aliases.coder_backup)" $OldAddr 'coder_backup'
+  Ans 'YES'; $r = Run-Move @('back'); $h = Get-ConfigHosts ([IO.File]::ReadAllText((Join-Path (Join-Path $CoderHome '.ssh') 'config'))); Eq $h[$OldAlias] $OldAddr "the coder alias reaches old again ($($r.Code): $($r.Text))"
+} -NeedsBash
 # G35 (E-R5, E-R23): x.final was SENT in a carry-back when new holds its record; a rebuilt state keeps that fact, so a new that is down later does not turn the carry-back into a Q-discard
 T 'L.rebuild-final-sent: a carry-back dies after x.final was sent, the state is lost and rebuilt with both machines up, then new goes down: `cutover` ends 70 with the "chỉ tiếp tục được khi máy mới nối lại" line, no Q-discard / Q-newlost, no r.start-src to old' {
   Start-Carry; Add-Fault -M new -Key '^back-2-x\.final$' -Rc 0 -Mode kill; Ans 'có'; $r1 = Run-Move @('cutover'); Ok ($r1.Code -ne 0) "the laptop died ($($r1.Text))"; Ok ($W.new.Rec.ContainsKey('back-2-x.final')) 'fixture: new recorded x.final'
