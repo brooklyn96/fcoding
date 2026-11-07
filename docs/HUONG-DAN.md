@@ -197,7 +197,7 @@ File này do GitHub Actions tự dựng lại mỗi khi nhánh `main` thay đổ
 
 Mỗi bản phát hành có sẵn file fcode.ipa để tải: các bản `vX.Y.Z` trong **Releases** cũng có file này.
 
-Số phiên bản hiện trong app của một bản phát hành lấy từ tên bản đó (tag `vX.Y.Z`), không cần sửa tay file nào trước khi phát hành; bản `latest` dùng số trong `ios/project.yml`.
+Số phiên bản hiện trong app luôn do GitHub Actions tự điền, không cần sửa tay file nào: bản phát hành `vX.Y.Z` hiện đúng số của tag đó, còn bản `latest` hiện số của tag `vX.Y.Z` mới nhất có trong nhánh `main` (không có tag nào thì dùng số trong `ios/project.yml`).
 
 ### Cài bằng Sideloadly
 
