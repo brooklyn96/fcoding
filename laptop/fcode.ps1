@@ -1371,6 +1371,8 @@ function Get-MoveText([string]$Key, [hashtable]$F = @{}) {
     'rewrites-remedy' { 'ghi rõ `<from>=<to>`' }
     'ingress-remedy' { 'đổi service của tên đó trong cấu hình tunnel sang 127.0.0.1 hoặc tên container' }
     'connector-remedy' { 'kiểm tra cổng metrics của connector rồi chạy lại' }
+    'return-busy' { 'Máy cũ còn đang chạy lệnh trước; chạy lại  fcode move cutover , lệnh sẽ đợi lệnh đó xong.' }   # B60 (a): a return that met a call still running on old
+    'return-incomplete' { 'Máy cũ chưa chạy lại đủ: cần người xem (70). Sau khi sửa, chạy lại  fcode move cutover  để hoàn tất quay lại.' }
     'root-link' { 'Đường <đường dẫn> là symlink ngay dưới / nằm trong phần chuyển; hãy chuyển thư mục đích thay cho link, hoặc tạo lại link bằng tay trên máy mới' }   # B45 (ruling 06/11 (a)): `MOVE error bad-request why=root-link path=<p>`
     default { throw "Get-MoveText: $Key" }
   }
@@ -2899,10 +2901,10 @@ function Invoke-MovePlanCmd([string]$NewAlias, [string]$Addr, [string]$OldAddrAr
 # and refreshes $script:MoveSeen with every Ok poll. A poll that is not Ok is never read as "not running" and never stored: a transport failure is
 # retried `retries` times, then it ends the run as a no-answer (1, nothing written); an answer that is not GATE_EXIT 0 with a state line ends the run
 # as the agreement check does. -ExceptStep <step>: a running call of that step (this attempt) is not waited for (cut-resume: new's x.final is attached).
-function Wait-MoveRunning($S, [string]$ExceptStep = '') {
+function Wait-MoveRunning($S, [string]$ExceptStep = '', [string[]]$Machines = @('old', 'new')) {
   $pre = "$($S.dir)-$($S.attempt)-"
   $busy = { param($s) [string]$s.Kv['call_state'] -ceq 'running' -and ([string]$s.Kv['call']).StartsWith($pre) -and -not ($ExceptStep -and [string]$s.Kv['call'] -ceq "$pre$ExceptStep") }
-  foreach ($m in 'old', 'new') {
+  foreach ($m in $Machines) {
     if (-not $script:MoveSeen.ContainsKey($m)) { continue }
     $st = $script:MoveSeen[$m]
     $t0 = Get-MoveNow
@@ -3290,6 +3292,15 @@ function Invoke-MoveRollback($S, $Fail) {
     elseif ($S.new_lost -eq $true -or $S.new_discarded -eq $true) { Write-Host 'lỗi: không dừng được máy mới; tắt hoặc cài lại máy mới trong trang quản lý nhà cung cấp, rồi chạy lại  fcode move cutover.'; return 70 }   # a YES return (Q-newlost / Q-discard): old is not started; new answers, so D.5.3's power-off is the remedy
     else { Write-Host 'lỗi: không dừng được máy mới; giữ nguyên, chạy lại  fcode move cutover  khi máy mới trả lời.'; return 70 }
   }
+  # B59 (a) / B60: a call still running on old (a held x.stop-dst / x.stop-src of this attempt keeps old's call lock) would answer r.start-src busy: the return WAITS for it, bounded, with
+  # the resume rows' wait (Wait-MoveRunning on old, its budget and polls), after the fence on new above. The in-run MoveSeen is the agreement check's old snapshot, so old's status is READ FRESH
+  # here (up to `retries` reads; one that is not Ok is never read as "not running") and replaces it, then the wait re-reads it at every poll. The wait's 75 (still busy past the budget) and its
+  # 1 / status-failure results cannot be returned after the write-ahead (I17): they end 70 with the state kept rolling-back (old not started, enabled false), the busy one with the plain
+  # remedy text, the others with the usual one; `cutover` continues. Nothing else is written
+  $os = $null
+  for ($i = 1; $i -le (Get-MoveConst 'retries'); $i++) { $os = Get-MoveStatus $S 'old' -Quiet; if ($os.Ok -or $os.Known) { break }; if ($i -lt (Get-MoveConst 'retries')) { Wait-Move 5 } }
+  if ($os.Ok) { $script:MoveSeen['old'] = $os; $w = Wait-MoveRunning $S '' @('old') } else { $w = 1 }
+  if ($w -ne 0) { Set-MoveProp $S 'enabled' $false; Save-MoveState $S; Write-Host $(if ($w -eq 75) { Get-MoveText 'return-busy' } else { Get-MoveText 'return-incomplete' }); return 70 }
   $a = Invoke-MoveCall $S 'old' 'r.start-src'
   Set-MoveProp $S 'enabled' ($a.Code -eq 0); Save-MoveState $S
   $u = Invoke-MoveCall $S 'old' 'r.unfreeze-src'
@@ -3298,7 +3309,7 @@ function Invoke-MoveRollback($S, $Fail) {
   if ($Fail.Verify) { Write-MoveVerifyReport $S $Fail.Verify }
   # the end state is written only when r.start-src and r.unfreeze-src both returned 0; otherwise the state stays `rolling-back` and `cutover` re-sends the three calls
   # (rollback mode: the unit connectors too); a chore 0 is never the repair of a return
-  if ($a.Code -ne 0 -or $u.Code -ne 0) { Write-Host 'Máy cũ chưa chạy lại đủ: cần người xem (70). Sau khi sửa, chạy lại  fcode move cutover  để hoàn tất quay lại.'; return 70 }
+  if ($a.Code -ne 0 -or $u.Code -ne 0) { Write-Host $(if (@($a.Code, $u.Code | Where-Object { $_ -ne 0 -and $_ -ne 75 }).Count -eq 0) { Get-MoveText 'return-busy' } else { Get-MoveText 'return-incomplete' }); return 70 }   # busy (75) alone = nothing to fix: the plain remedy; a real failure keeps the old text
   [void](Set-MoveWriteAhead $S @{ mark = $null; phase = 'rolled-back'; serving = 'old'; enabled = $true } -NoCheck)
   Write-MoveReturnOld $S
   10
