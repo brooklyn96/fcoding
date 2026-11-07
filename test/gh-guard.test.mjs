@@ -13,7 +13,8 @@ const GUARD = path.join(here, '..', 'box', 'gh-guard.sh');
 const skip = (process.platform === 'win32' || spawnSync('bash', ['-c', 'command -v git >/dev/null']).status !== 0) && 'needs Linux with bash and git';
 
 // the stub: logs argv (one line per call); "pr view" prints STUB_PR, the workflow listing of a repo prints one file url (or 404 when STUB_WF is
-// unset), that url prints STUB_WF, "repo view" prints STUB_REPO, "stdin cat" echoes its stdin; anything else prints out:/err: lines and exits STUB_RC
+// unset), that url prints STUB_WF, "repo view" prints STUB_REPO, "alias list" prints STUB_ALIAS, "stdin cat" echoes its stdin; anything else
+// prints out:/err: lines (and in:<its stdin> when STUB_CAT is set) and exits STUB_RC
 const STUB = `#!/bin/bash
 printf '%s\\n' "$*" >>"$STUB_LOG"
 case "$1 $2" in
@@ -24,8 +25,10 @@ case "$1 $2" in
     echo "https://api.github.com/repos/$(echo "$2" | cut -d/ -f2-3)/contents/.github/workflows/ci.yml?ref=main"; exit 0;;
   "api https://api.github.com/"*) printf '%s\\n' "$STUB_WF"; exit 0;;
   "repo view") [ -n "\${STUB_REPO:-}" ] && echo "$STUB_REPO"; [ -n "\${STUB_REPO:-}" ]; exit;;
+  "alias list") printf '%s' "\${STUB_ALIAS:-}"; exit 0;;
   "stdin cat") cat; exit 0;;
 esac
+[ -z "\${STUB_CAT:-}" ] || { printf 'in:'; cat; }
 echo "out:$*"; echo "err:$*" >&2; exit "\${STUB_RC:-0}"
 `;
 const MSG = (n) => `gh-guard: PR #${n} sửa .github/ ở repo có secret; chỉ chủ được merge — gọi fcode-notify merge-ready.\n`;
@@ -59,7 +62,9 @@ test('gh-guard: every other call is passed through unchanged (argv, stdin, stdou
   const e = world();
   try {
     for (const [args, rc] of [[['repo', 'list', '--limit', '5'], 0], [['run', 'view', '42', '--log'], 3], [['workflow', 'run', 'deploy.yml', '--ref', 'box/x', '-f', 'action=deploy'], 0],
-      [['pr', 'create', '--base', 'main', '--fill'], 1], [['pr', 'list', '--state', 'merged'], 0], [['api', 'repos/o/r/contents/.github/workflows/ci.yml'], 0], [['api', '-X', 'PUT', 'repos/o/r/contents/README.md', '-f', 'content=eA=='], 0]]) {
+      [['pr', 'create', '--base', 'main', '--fill'], 1], [['pr', 'list', '--state', 'merged'], 0], [['api', 'repos/o/r/contents/.github/workflows/ci.yml'], 0], [['api', '-X', 'PUT', 'repos/o/r/contents/README.md', '-f', 'content=eA=='], 0],
+      [['api', 'graphql', '-f', 'query=query { viewer { login } }'], 0], [['api', 'repos/o/r/git/refs/heads/main'], 0], [['api', 'repos/o/r/pulls/5/merge'], 1],
+      [['api', 'repos/o/r/issues/1/comments', '-f', 'body=100% done, see repos/o/r//contents/.github and mergePullRequest'], 0], [['api', '-X', 'POST', 'repos/o/r/git/blobs', '-f', 'content=x'], 0]]) {
       e.reset();
       const r = e.run(args, { STUB_RC: String(rc), STUB_WF: SECRET_WF });
       const line = args.join(' ');
@@ -163,7 +168,7 @@ test('gh-guard: gh api PUT/PATCH/DELETE on contents/.github, actions/secrets or 
       e.reset();
       const r = e.run(args, env);
       assert.equal(r.code, 65, args.join(' '));
-      assert.match(r.stderr, /^gh-guard: o\/r dùng secret trong workflow; gh api (PUT|PATCH|DELETE) vào \.github\/, secrets hay environments bị chặn/i, args.join(' '));
+      assert.match(r.stderr, /^gh-guard: o\/r dùng secret trong workflow; gh api (PUT|PATCH|DELETE) vào \.github\/, secrets, environments, git refs\/trees\/commits hay merges bị chặn/i, args.join(' '));
       assert.ok(!e.calls().some((c) => c.startsWith(args.slice(0, 2).join(' '))), args.join(' '));
     }
     for (const args of [['api', '-X', 'PUT', 'repos/o/r/contents/%2Egithub/x'], ['api', '-X', 'PUT', 'repos/o/r/contents/./.github/x'], ['api', '-X', 'PUT', 'repos/o/r//contents/.github/x'],
@@ -182,6 +187,110 @@ test('gh-guard: gh api PUT/PATCH/DELETE on contents/.github, actions/secrets or 
     // {owner}/{repo} that gh cannot resolve: refused
     const r = e.run(['api', '-X', 'PUT', 'repos/{owner}/{repo}/environments/x'], { STUB_WF: SECRET_WF });
     assert.equal(r.code, 65);
+  } finally { done(e); }
+});
+
+test('gh-guard: gh api PUT repos/<o>/<r>/pulls/<n>/merge is checked like gh pr merge; --auto merges too', { skip }, () => {
+  const e = world();
+  try {
+    const env = { STUB_PR: PR(5, 'o/r', ['src/a.js', '.github/workflows/deploy.yml']), STUB_WF: SECRET_WF, STUB_REPO: 'o/r' };
+    for (const args of [['api', '-X', 'PUT', 'repos/o/r/pulls/5/merge'], ['api', '--method=put', '/repos/o/r/pulls/5/merge', '-f', 'merge_method=squash'],
+      ['api', '-XPUT', 'https://api.github.com/repos/o/r/pulls/5/merge'], ['api', '-X', 'PUT', 'repos/{owner}/{repo}/pulls/5/merge'], ['api', 'repos/o/r/pulls/5/merge', '-X', 'PUT', '--input', '-'],
+      ['pr', 'merge', '--auto', '--squash', '5', '-R', 'o/r']]) {
+      e.reset();
+      const r = e.run(args, env, { input: '{"merge_method":"merge"}' });
+      assert.deepEqual([r.code, r.stdout, r.stderr], [65, '', MSG(5)], args.join(' '));
+      assert.ok(e.calls().some((c) => c.startsWith('pr view 5 -R o/r --json ')), args.join(' '));
+      assert.ok(!e.calls().some((c) => c.includes('pulls/5/merge') || c.startsWith('pr merge')), args.join(' '));
+    }
+    // a PR without .github, or a repo without secrets: the call runs unchanged (stdin included)
+    for (const en of [{ ...env, STUB_PR: PR(5, 'o/r', ['src/a.js']) }, { STUB_PR: env.STUB_PR }]) {
+      e.reset();
+      const r = e.run(['api', '-X', 'PUT', 'repos/o/r/pulls/5/merge', '--input', '-'], { ...en, STUB_CAT: '1' }, { input: '{"merge_method":"squash"}' });
+      assert.deepEqual([r.code, r.stdout], [0, 'in:{"merge_method":"squash"}out:api -X PUT repos/o/r/pulls/5/merge --input -\n']);
+      assert.equal(e.calls().at(-1), 'api -X PUT repos/o/r/pulls/5/merge --input -');
+    }
+    e.reset();
+    const r = e.run(['api', '-X', 'PUT', 'repos/o/r/pulls/5/merge'], { STUB_WF: SECRET_WF }); // pr view fails
+    assert.equal(r.code, 65); assert.match(r.stderr, /^gh-guard: không đọc được PR 5;/);
+    assert.ok(!e.calls().some((c) => c.includes('pulls/5/merge')));
+  } finally { done(e); }
+});
+
+test('gh-guard: gh api graphql naming a merge or branch-write mutation is refused in every repo (query in -f, -F @file, --input file or stdin, URL endpoint); other graphql passes', { skip }, () => {
+  const e = world();
+  try {
+    const file = path.join(e.root, 'q.graphql');
+    const mut = (m) => `mutation { ${m}(input: {pullRequestId: "PR_kwDO"}) { clientMutationId } }`;
+    const MSGQ = (m) => `gh-guard: gh api graphql có ${m} (merge hoặc ghi nhánh) bị chặn: box không biết repo đích; dùng gh pr merge hoặc git push để box kiểm tra — repo có secret thì gọi fcode-notify merge-ready.\n`;
+    for (const m of ['mergePullRequest', 'enablePullRequestAutoMerge', 'enqueuePullRequest', 'createCommitOnBranch', 'updateRef', 'updateRefs', 'createRef', 'mergeBranch']) {
+      e.reset();
+      const r = e.run(['api', 'graphql', '-f', `query=${mut(m)}`]); // no secrets anywhere (STUB_WF unset): still refused
+      assert.deepEqual([r.code, r.stdout, r.stderr], [65, '', MSGQ(m)], m);
+      assert.deepEqual(e.calls(), [], m);
+    }
+    fs.writeFileSync(file, mut('mergePullRequest'));
+    const body = JSON.stringify({ query: 'mutation($id: ID!) { mergePullRequest(input: {pullRequestId: $id}) { clientMutationId } }', variables: { id: 'PR_kwDO' } });
+    for (const [args, input] of [[['api', 'graphql', '-F', `query=@${file}`], ''], [['api', 'graphql', '--input', file], ''], [['api', 'graphql', '--input', '-'], body],
+      [['api', 'graphql', '-F', 'query=@-', '-f', 'id=PR_kwDO'], mut('mergePullRequest')], [['api', '--raw-field=query=' + mut('mergePullRequest'), 'https://api.github.com/graphql'], ''],
+      [['api', 'GraphQL', '--field', `query=@${file}`], ''], [['api', '-X', 'POST', 'graphql', '-fquery=' + mut('mergepullrequest')], '']]) {
+      e.reset();
+      const r = e.run(args, {}, { input });
+      assert.equal(r.code, 65, args.join(' ')); assert.match(r.stderr, /^gh-guard: gh api graphql có mergePullRequest \(merge/i, args.join(' '));
+      assert.deepEqual(e.calls(), [], args.join(' '));
+    }
+    // a file the guard cannot read: refused (fail closed)
+    let r = e.run(['api', 'graphql', '--input', path.join(e.root, 'missing.json')]);
+    assert.equal(r.code, 65); assert.match(r.stderr, /^gh-guard: không đọc được .*missing\.json cho gh api graphql/);
+    // other graphql passes unchanged, its stdin handed on to the real gh
+    e.reset();
+    const q = JSON.stringify({ query: 'query { repository(owner: "o", name: "r") { pullRequests(first: 1) { nodes { number } } } }' });
+    r = e.run(['api', 'graphql', '--input', '-'], { STUB_CAT: '1', STUB_WF: SECRET_WF }, { input: q });
+    assert.deepEqual([r.code, r.stdout, r.stderr], [0, `in:${q}out:api graphql --input -\n`, 'err:api graphql --input -\n']);
+    assert.deepEqual(e.calls(), ['api graphql --input -']);
+    fs.writeFileSync(file, 'query { viewer { login } }');
+    e.reset();
+    r = e.run(['api', 'graphql', '-F', `query=@${file}`], { STUB_WF: SECRET_WF });
+    assert.deepEqual([r.code, e.calls()], [0, [`api graphql -F query=@${file}`]]);
+  } finally { done(e); }
+});
+
+test('gh-guard: gh api writes to git/refs, git/trees, git/commits or merges of a repo with secrets are refused (fields without -X mean POST); other repos pass', { skip }, () => {
+  const e = world();
+  try {
+    const calls = [['api', 'repos/o/r/git/refs', '-f', 'ref=refs/heads/x', '-f', 'sha=abc'], ['api', '-X', 'PATCH', 'repos/o/r/git/refs/heads/box/x', '-F', 'force=true'],
+      ['api', '-X', 'POST', 'repos/o/r/git/trees', '--input', '-'], ['api', 'repos/o/r/git/commits', '-f', 'message=m', '-f', 'tree=t'],
+      ['api', '-X', 'POST', 'repos/o/r/merges', '-f', 'base=main', '-f', 'head=box/x'], ['api', '-X', 'DELETE', 'repos/o/r/git/refs/heads/main']];
+    for (const args of calls) {
+      e.reset();
+      const r = e.run(args, { STUB_WF: SECRET_WF });
+      assert.equal(r.code, 65, args.join(' '));
+      assert.match(r.stderr, /^gh-guard: o\/r dùng secret trong workflow; gh api (POST|PATCH|DELETE) vào .*git refs\/trees\/commits hay merges bị chặn/, args.join(' '));
+      assert.ok(!e.calls().some((c) => c.startsWith(args.slice(0, 2).join(' '))), args.join(' '));
+    }
+    for (const args of calls) { // no workflows on o/r (404): unchanged
+      e.reset();
+      const r = e.run(args);
+      assert.deepEqual([r.code, r.stdout, e.calls().at(-1)], [0, `out:${args.join(' ')}\n`, args.join(' ')], args.join(' '));
+    }
+  } finally { done(e); }
+});
+
+test('gh-guard: an alias whose expansion runs merge or api is refused; other aliases and extensions pass unchanged', { skip }, () => {
+  const e = world();
+  try {
+    const env = { STUB_ALIAS: 'co: pr checkout\npm: pr merge --squash\nq: !gh api graphql -f query="$1"\nmine: pr list --author @me\n' };
+    for (const [args, exp] of [[['pm', '5'], 'pr merge --squash'], [['q', 'x'], '!gh api graphql -f query="$1"']]) {
+      e.reset();
+      const r = e.run(args, env);
+      assert.deepEqual([r.code, r.stderr], [65, `gh-guard: alias ${args[0]} chạy '${exp}'; box không kiểm tra alias — gõ lệnh gh đầy đủ.\n`]);
+      assert.deepEqual(e.calls(), ['alias list']);
+    }
+    for (const args of [['co', '5'], ['mine'], ['some-extension', 'merge']]) {
+      e.reset();
+      const r = e.run(args, env);
+      assert.deepEqual([r.code, r.stdout, e.calls()], [0, `out:${args.join(' ')}\n`, ['alias list', args.join(' ')]], args.join(' '));
+    }
   } finally { done(e); }
 });
 

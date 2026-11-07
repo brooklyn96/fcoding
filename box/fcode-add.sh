@@ -32,7 +32,7 @@ hook_text() {
 # Box guard: never push directly to main/master. Work on box/<topic>, then merge through a PR.
 # Repo with secrets (a workflow on origin's default branch reads secrets other than GITHUB_TOKEN, or owner/repo is listed in
 # ~/.config/fcode/sensitive-repos; an unreadable default branch counts as one): a push whose new commits change .github/ is refused.
-s=
+s=; w=' dùng secret trong workflow'
 sensitive() {
   [ -z "$s" ] || return "$s"
   s=0
@@ -40,11 +40,12 @@ sensitive() {
   [ -f "$f" ] && sed 's/#.*//; s/[[:space:]]//g' "$f" | grep -qixF -- "$slug" && return 0
   b=$(git symbolic-ref -q refs/remotes/origin/HEAD) || b=
   for c in refs/remotes/origin/main refs/remotes/origin/master; do [ -n "$b" ] || ! git rev-parse -q --verify "$c" >/dev/null || b=$c; done
-  [ -n "$b" ] || return 0
+  [ -n "$b" ] || { w=': không xác định được nhánh chính; coi là repo có secret'; return 0; }
   m=$(git grep -ohiE 'secrets[[:space:]]*(\.[[:space:]]*[a-z0-9_-]+|\[)|tojson\([[:space:]]*secrets|secrets:[[:space:]]*inherit' "$b" -- .github/workflows 2>/dev/null)
   case $? in
     1) s=1;;
     0) printf '%s\n' "$m" | tr -d ' \t' | grep -qvixF secrets.github_token || s=1;;
+    *) w=': không đọc được workflow trên nhánh chính; coi là repo có secret';;
   esac
   return "$s"
 }
@@ -60,7 +61,7 @@ while read local_ref local_sha remote_ref remote_sha; do
     p=$(printf '%s\n' "$r" | git diff-tree --stdin -r --root -c --name-only --no-commit-id 2>/dev/null) || p=.github/
   else p=.github/; fi
   if printf '%s\n' "$p" | grep -q '^"\{0,1\}\.github/' && sensitive; then
-    echo "pre-push: $slug dùng secret trong workflow; sửa .github/ ở repo này cần chủ duyệt — báo fcoding, không tự đẩy." >&2; exit 1
+    echo "pre-push: $slug$w; sửa .github/ ở repo này cần chủ duyệt — báo fcoding, không tự đẩy." >&2; exit 1
   fi
 done
 exit 0

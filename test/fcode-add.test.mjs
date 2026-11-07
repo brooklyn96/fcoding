@@ -1205,7 +1205,7 @@ test('hook: a repo listed in ~/.config/fcode/sensitive-repos is sensitive (case-
   } finally { done(e); }
 });
 
-test('hook: when the default branch cannot be resolved (no origin/HEAD, main or master) a .github change is refused; other changes push', { skip }, () => {
+test('hook: when the default branch cannot be resolved (no origin/HEAD, main or master) a .github change is refused with its own message; other changes push', { skip }, () => {
   const e = hookWorld(undefined);
   try {
     sh('git', ['-C', e.dir, 'remote', 'set-head', 'origin', '-d'], e);
@@ -1214,6 +1214,8 @@ test('hook: when the default branch cannot be resolved (no origin/HEAD, main or 
     e.commit(e.dir, 'src.txt', 'x\n');
     pushed(e.push('origin', 'box/u'));
     e.commit(e.dir, '.github/workflows/ci.yml', 'on: push\n');
-    refused(e.push('origin', 'box/u'));
+    const r = e.push('origin', 'box/u');
+    refused(r, /pre-push: o\/r: không xác định được nhánh chính; coi là repo có secret; sửa \.github\/ ở repo này cần chủ duyệt — báo fcoding, không tự đẩy\./);
+    assert.doesNotMatch(r.stderr, /dùng secret trong workflow/);
   } finally { done(e); }
 });
