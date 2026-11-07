@@ -15,7 +15,8 @@
 # Thu muc dich duoc DAT CHO bang 1 lenh mkdir nguyen tu ngay sau khi biet no chua co (owned=1, tin hieu bi hoan lai qua lenh do): thu muc nay
 # (ca khi clone hong hay bi tat giua chung) bi xoa neu co loi truoc khi project duoc ghi vao cau hinh (va chua co ten nay -> thu muc nay trong cau hinh).
 # Vong doi: moi tien trinh con hoac duoc cho den khi xong truoc khi script di tiep (trap chi chay sau khi lenh dang chay xong), hoac tu bi gioi han:
-# process substitution o url_rewrite_check la 1 lenh git config cuc bo doc den EOF; "timeout 20 gh ..." chay rieng voi gioi han rieng.
+# process substitution o url_rewrite_check la 1 lenh git config cuc bo doc den EOF; "timeout 20 gh ..." va "timeout 20 git ... set-head" chay rieng
+# voi gioi han rieng.
 # Han chot cua job la ADD_WATCHDOG (server.mjs): TERM roi KILL cho ca nhom tien trinh; TERM tu close() cua server duoc watchdog chuyen tiep va cung
 # khoi dong KILL do. KHONG them &, nohup, setsid, disown, coproc, hay process substitution khong doc den EOF.
 # Ma thoat: 0 xong, 30 xong nhung co canh bao, 40 can dan khoa vao GitHub, 41 khoa chua co quyen ghi,
@@ -25,7 +26,8 @@
 # Hook pre-push chuan cua box (fcode-hooks cai lai noi dung nay vao moi project da co: "fcode-add.sh --hook-text" chi in no ra roi thoat 0).
 # 1) chan push thang len main/master. 2) .github/: moi ref day len (nhanh va tag) ma CAY .github/ khong giong ref do tren remote va khong giong
 # nhanh chinh (origin/HEAD, origin/main, origin/master) deu bi chan; "khong co .github/" khong bao gio la chuan so sanh (xoa .github/ cung la sua;
-# khong co ca hai chuan, vd. clone --single-branch hay repo rong, thi moi commit deu bi coi la khac), chi commit co CA CAY rong (thu cua fcode add)
+# khong co ca hai chuan, vd. clone --single-branch, repo rong, hay nhanh chinh khac main/master ma chua co origin/HEAD, thi moi commit deu bi coi la
+# khac va loi nhac "git remote set-head origin --auto"; buoc 4 va fcode-hooks chay lenh do), chi commit co CA CAY rong (thu cua fcode add)
 # luon qua. Tru khi repo co trong ~/.config/fcode/no-secret-repos (chu xac nhan repo khong co secret nao) hoac chu da duyet dung commit do
 # (guard_allow). Dong no_secret giong het dong trong box/gh-guard.sh (test so sanh).
 hook_text() {
@@ -34,7 +36,8 @@ hook_text() {
 # Box guard: never push directly to main/master. Work on box/<topic>, then merge through a PR.
 # .github/ guard: every pushed ref, branch or tag, whose TREE under .github/ equals neither what the remote ref holds now nor origin's default
 # branch is refused. "No .github/ at all" is never a base: removing .github/ is a change too, and with neither base (a clone --single-branch
-# of a new ref, an empty repo) every commit counts as different; only a commit whose WHOLE tree is empty (fcode add's probes) always pushes.
+# of a new ref, an empty repo, a default branch other than main/master with no origin/HEAD: git fetch never makes it) every commit counts as
+# different, and the refusal names `git remote set-head origin --auto`; only a commit whose WHOLE tree is empty (fcode add's probes) always pushes.
 # Unless the repo is listed in ~/.config/fcode/no-secret-repos (the owner confirmed it has no Actions repository secret) or the owner approved
 # that exact commit (guard_allow). A tree that cannot be compared counts as different.
 # Deletes push. Not a security boundary (git push --no-verify skips it): it stops mistakes and shortcuts.
@@ -65,11 +68,12 @@ while read local_ref local_sha remote_ref remote_sha; do
     refs/heads/main|refs/heads/master) echo "pre-push: pushing to ${remote_ref#refs/heads/} is blocked on this box; push a box/<topic> branch and merge via PR" >&2; exit 1;;
   esac
   case "$local_sha" in *[!0]*) ;; *) continue;; esac
-  case "$remote_sha" in *[!0]*) same "$remote_sha" && continue;; esac
-  default_ref && same "$db" && continue
+  nb=1; case "$remote_sha" in *[!0]*) nb=; same "$remote_sha" && continue;; esac
+  if default_ref; then nb=; same "$db" && continue; fi
   git diff-tree --quiet "$et" "$local_sha" 2>/dev/null && continue
   no_secret "$slug" && continue
   guard_allow "$slug" "$local_sha" && continue
+  [ -z "$nb" ] || { echo "pre-push: $slug: không có nhánh nào để so .github/ của commit $local_sha (nhánh này chưa có trên remote, box chưa biết nhánh chính origin/HEAD). Chạy: git remote set-head origin --auto rồi đẩy lại; repo còn trống thì chủ tạo nhánh chính trên GitHub trước. Thật sự sửa .github/? repo không có trong ~/.config/fcode/no-secret-repos nên cần chủ duyệt — báo fcoding, không tự đẩy." >&2; exit 1; }
   echo "pre-push: $slug: .github/ của commit $local_sha khác với nhánh trên remote và với nhánh chính (hoặc không so sánh được). Nhánh cũ hơn origin/main? đưa nhánh lên origin/main (chưa đẩy: git rebase origin/main; đã đẩy: git merge origin/main) rồi đẩy lại. Thật sự sửa .github/? repo không có trong ~/.config/fcode/no-secret-repos nên cần chủ duyệt — báo fcoding, không tự đẩy." >&2; exit 1
 done
 exit 0
@@ -328,6 +332,9 @@ if [ "$via" = token ]; then
   git -C "$dir" config --local --unset-all credential.helper 2>/dev/null
   git -C "$dir" config --local --add credential.helper '' && git -C "$dir" config --local --add credential.helper "$GHELPER" || { say CRED_FAIL config; exit 25; }
 fi
+# origin/HEAD (nhanh chinh tren GitHub) cho hook: hoi lai GitHub (git fetch khong bao gio tao no), toi da 20 s, best effort: loi (vd. repo rong)
+# khong bao gio dung lan chay, chi la HEAD_FAIL o dong HOOK_OK / HOOK_EXISTS.
+hs=HEAD_FAIL; timeout 20 git -C "$dir" remote set-head origin --auto >/dev/null 2>&1 </dev/null && hs=HEAD_OK
 
 # 5. hook chan push len main/master. Git phai THAT SU dung hook nay: core.hooksPath (chi cua repo nay) tro vao thu muc hooks cua chinh no, nen
 # core.hooksPath ke thua tu global/system khong vo hieu hoa duoc (hook global cua box khong chay trong ban clone nay); roi kiem chung bang push
@@ -338,8 +345,8 @@ if [ -e "$hooks" ]; then case "$(readlink -f "$hooks")" in "$rdir"/*) ;; *) say 
 htmp="$(mktemp)"; hook_text >"$htmp"
 hk=1
 if mkdir -p "$hooks"; then
-  if cmp -s "$htmp" "$hooks/pre-push" 2>/dev/null; then hk=0; say HOOK_EXISTS
-  elif install -m 755 "$htmp" "$hooks/pre-push"; then hk=0; say HOOK_OK; fi
+  if cmp -s "$htmp" "$hooks/pre-push" 2>/dev/null; then hk=0; say HOOK_EXISTS "$hs"
+  elif install -m 755 "$htmp" "$hooks/pre-push"; then hk=0; say HOOK_OK "$hs"; fi
 fi
 rm -f "$htmp"
 if [ "$hk" -eq 0 ]; then chmod 755 "$hooks/pre-push" && git -C "$dir" config --local core.hooksPath "$hooks" || hk=1; fi

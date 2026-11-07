@@ -65,8 +65,8 @@ test('fcode-hooks: puts the current hook into every project (old box hook replac
     const before = { foreign: snap(foreign), elsewhere: snap(elsewhere), cur: snap(cur) };
     const r = e.run();
     assert.equal(r.code, 1, r.stdout + r.stderr);
-    assert.deepEqual(r.lines, ['HOOK_OK old', 'HOOK_OK none', 'HOOK_EXISTS cur', 'HOOK_FAIL foreign foreign', 'HOOK_FAIL elsewhere hookspath', 'HOOK_FAIL linked dir',
-      'HOOK_FAIL gitlink unsafe', 'HOOK_FAIL missing dir', 'HOOK_FAIL num dir']);
+    assert.deepEqual(r.lines, ['HOOK_OK old HEAD_FAIL', 'HOOK_OK none HEAD_FAIL', 'HOOK_EXISTS cur HEAD_FAIL', 'HOOK_FAIL foreign foreign', 'HOOK_FAIL elsewhere hookspath', 'HOOK_FAIL linked dir',
+      'HOOK_FAIL gitlink unsafe', 'HOOK_FAIL missing dir', 'HOOK_FAIL num dir']); // no origin remote: set-head fails, the project does not
     for (const d of [old, none, cur]) {
       const f = path.join(d, '.git', 'hooks', 'pre-push');
       assert.equal(fs.readFileSync(f, 'utf8'), HOOK, d);
@@ -83,7 +83,7 @@ test('fcode-hooks: puts the current hook into every project (old box hook replac
     // a second run: every installed project is HOOK_EXISTS and no file changes
     const after = { old: snap(old), none: snap(none), cur: snap(cur) };
     const again = e.run();
-    assert.deepEqual(again.lines.slice(0, 3), ['HOOK_EXISTS old', 'HOOK_EXISTS none', 'HOOK_EXISTS cur']);
+    assert.deepEqual(again.lines.slice(0, 3), ['HOOK_EXISTS old HEAD_FAIL', 'HOOK_EXISTS none HEAD_FAIL', 'HOOK_EXISTS cur HEAD_FAIL']);
     assert.deepEqual({ old: snap(old), none: snap(none), cur: snap(cur) }, after);
     // all fine -> exit 0
     fs.writeFileSync(e.cfg, JSON.stringify({ projects: { old, none, cur } }));
@@ -114,9 +114,40 @@ test('fcode-hooks [astra P2]: a relative core.hooksPath (.git/hooks) is read fro
     const away = e.repo('away'); e.git('-C', away, 'config', '--local', 'core.hooksPath', '../other-hooks'); // relative, but outside the clone's hooks
     fs.writeFileSync(e.cfg, JSON.stringify({ projects: { rel, away } }));
     const r = spawnSync('bash', [SCRIPT], { cwd: e.root, encoding: 'utf8', env: e.env }); // the cwd has no .git/hooks of its own
-    assert.deepEqual([r.status, r.stdout], [1, 'HOOK_OK rel\nHOOK_FAIL away hookspath\n'], r.stderr);
+    assert.deepEqual([r.status, r.stdout], [1, 'HOOK_OK rel HEAD_FAIL\nHOOK_FAIL away hookspath\n'], r.stderr);
     assert.equal(fs.readFileSync(path.join(rel, '.git', 'hooks', 'pre-push'), 'utf8'), HOOK);
     assert.equal(e.hooksPath(rel), '.git/hooks', 'left as the project had it');
+  } finally { done(e); }
+});
+
+test('fcode-hooks [review-r6]: a repo whose default branch is trunk and that has no origin/HEAD (git fetch never makes it): the hook refuses a new branch naming set-head; fcode-hooks runs it (HEAD_OK) and the push goes', { skip }, () => {
+  const e = world();
+  try {
+    const remote = path.join(e.root, 'o', 't.git'); const seed = path.join(e.root, 'seed');
+    const g = (...a) => { const r = e.git('-c', 'user.name=t', '-c', 'user.email=t@t', ...a); assert.equal(r.status, 0, r.stderr); return r.stdout.trim(); };
+    g('init', '-q', '--bare', '-b', 'trunk', remote); g('init', '-q', '-b', 'trunk', seed);
+    fs.mkdirSync(path.join(seed, '.github', 'workflows'), { recursive: true });
+    fs.writeFileSync(path.join(seed, '.github', 'workflows', 'ci.yml'), 'jobs:\n  d:\n    env:\n      K: ${{ secrets.DEPLOY_SSH_KEY }}\n');
+    g('-C', seed, 'add', '-A'); g('-C', seed, 'commit', '-q', '-m', 'seed'); g('-C', seed, 'push', '-q', remote, 'trunk');
+    const d = path.join(e.ws, 'trunk'); g('clone', '-q', remote, d);
+    g('-C', d, 'remote', 'set-head', 'origin', '-d'); // as after a clone of the empty repo and a later fetch
+    fs.writeFileSync(path.join(d, '.git', 'hooks', 'pre-push'), HOOK, { mode: 0o755 });
+    g('-C', d, 'switch', '-q', '-c', 'box/x');
+    fs.writeFileSync(path.join(d, 'src.txt'), 'x\n'); g('-C', d, 'add', '-A'); g('-C', d, 'commit', '-q', '-m', 'src');
+    const sha = g('-C', d, 'rev-parse', 'HEAD');
+    let p = e.git('-C', d, 'push', '-q', 'origin', 'box/x');
+    assert.notEqual(p.status, 0);
+    assert.ok(p.stderr.includes(`pre-push: o/t: không có nhánh nào để so .github/ của commit ${sha} (nhánh này chưa có trên remote, box chưa biết nhánh chính origin/HEAD). Chạy: git remote set-head origin --auto rồi đẩy lại;`), p.stderr);
+    fs.writeFileSync(e.cfg, JSON.stringify({ projects: { trunk: d } }));
+    const r = e.run();
+    assert.deepEqual([r.code, r.lines], [0, ['HOOK_EXISTS trunk HEAD_OK']], r.stderr);
+    assert.equal(g('-C', d, 'symbolic-ref', 'refs/remotes/origin/HEAD'), 'refs/remotes/origin/trunk');
+    p = e.git('-C', d, 'push', '-q', 'origin', 'box/x');
+    assert.equal(p.status, 0, p.stderr);
+    // a .github/ change is still refused, now against trunk
+    fs.writeFileSync(path.join(d, '.github', 'workflows', 'ci.yml'), 'on: push\n'); g('-C', d, 'commit', '-q', '-am', 'wf');
+    p = e.git('-C', d, 'push', '-q', 'origin', 'HEAD:refs/heads/box/y');
+    assert.notEqual(p.status, 0); assert.match(p.stderr, /khác với nhánh trên remote và với nhánh chính/);
   } finally { done(e); }
 });
 

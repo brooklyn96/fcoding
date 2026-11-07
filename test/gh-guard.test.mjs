@@ -140,6 +140,7 @@ test('gh-guard 3c: pr merge in a listed repo (any case, # comments) runs exactly
     const r = e.run(['pr', 'merge', '5', '-R', 'o/r'], { STUB_PR: PR(5, 'o/r', 1), STUB_FILES: FILES('.github/workflows/ci.yml') });
     assert.deepEqual([r.code, r.stderr], [65, MSG(5)]);
     // astra r4: a malformed list allows nothing (grep would split lines at a NUL); a list that is not a readable regular file neither
+    // The two NUL cases are the ones that guard the R6 fix; the directory and unreadable cases already failed closed before it (kept as cover).
     const listFile = path.join(e.home, '.config', 'fcode', 'no-secret-repos');
     const bad = [['NUL', () => e.list('other/repo\0o/r\n')], ['NUL beside a valid line', () => e.list('other/repo\0\nO/R\n')],
       ['directory', () => { e.list(undefined); fs.mkdirSync(listFile); }]];

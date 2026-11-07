@@ -6,8 +6,10 @@
 # Same safety rules as fcode add's step 5: the project's .git is a real directory inside the project (no link), its hooks dir and pre-push are
 # no links and live inside the project, and git uses that hooks dir (repo-local core.hooksPath; set when unset, never changed when it points elsewhere;
 # a relative core.hooksPath is read from the project's top folder, as git reads it).
-# A pre-push that is not a box hook (no "# Box guard:" line) is never replaced. Only hooks/pre-push and core.hooksPath are ever written.
-# One line per project: HOOK_OK <name> (written), HOOK_EXISTS <name> (already current), HOOK_FAIL <name> <reason>.
+# A pre-push that is not a box hook (no "# Box guard:" line) is never replaced. Only hooks/pre-push, core.hooksPath and refs/remotes/origin/HEAD
+# are ever written: after the hook, "git remote set-head origin --auto" (asks GitHub, 20 s at most, best effort: a failure never fails the
+# project) gives the hook origin's default branch, which git fetch never creates (a default branch other than main/master needs it).
+# One line per project: HOOK_OK <name> HEAD_OK|HEAD_FAIL (written), HOOK_EXISTS <name> HEAD_OK|HEAD_FAIL (already current), HOOK_FAIL <name> <reason>.
 # Exit: 0 all OK/EXISTS, 1 any HOOK_FAIL, 2 no hook text or unreadable config.
 set -u
 app="${FCODE_APP:-/data/home/fcoding}"
@@ -46,6 +48,7 @@ while IFS=$'\t' read -r name dir; do
   if [ -z "$hp" ] && ! git -C "$dir" config --local core.hooksPath "$hooks"; then fail hookspath; continue; fi
   # git really resolves pre-push to this file (a global or system core.hooksPath cannot win over the repo-local one)
   if [ "$(inrepo "$(git -C "$dir" rev-parse --git-path hooks 2>/dev/null)")" != "$(readlink -f "$hooks")" ]; then fail verify; continue; fi
-  echo "$st $name"
+  hs=HEAD_FAIL; GIT_TERMINAL_PROMPT=0 timeout 20 git -C "$dir" remote set-head origin --auto >/dev/null 2>&1 </dev/null && hs=HEAD_OK
+  echo "$st $name $hs"
 done <<<"$list"
 exit "$rc"

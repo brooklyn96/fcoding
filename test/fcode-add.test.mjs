@@ -1098,6 +1098,9 @@ test('push destination: when BOTH the https URL and the key alias are rewritten 
 // ---- the box pre-push hook itself (fcode-add.sh --hook-text), run by a real `git push` into a local bare o/r.git ----
 // Test groups 1a-1f and 2 are the matrix of /tmp/ai-work/fcoding/wf-guard/DECISION-r2.md, REWORK items 1 and 2.
 const GH_MSG = (sha) => `pre-push: o/r: .github/ của commit ${sha} khác với nhánh trên remote và với nhánh chính (hoặc không so sánh được). Nhánh cũ hơn origin/main? đưa nhánh lên origin/main (chưa đẩy: git rebase origin/main; đã đẩy: git merge origin/main) rồi đẩy lại. Thật sự sửa .github/? repo không có trong ~/.config/fcode/no-secret-repos nên cần chủ duyệt — báo fcoding, không tự đẩy.\n`;
+// the refusal when there is nothing to compare with (no remote ref, no default branch on the box): names set-head
+const NB_MSG = (sha) => `pre-push: o/r: không có nhánh nào để so .github/ của commit ${sha} (nhánh này chưa có trên remote, box chưa biết nhánh chính origin/HEAD). Chạy: git remote set-head origin --auto rồi đẩy lại; repo còn trống thì chủ tạo nhánh chính trên GitHub trước. Thật sự sửa .github/? repo không có trong ~/.config/fcode/no-secret-repos nên cần chủ duyệt — báo fcoding, không tự đẩy.\n`;
+const refusedNB = (r, sha) => { assert.notEqual(r.status, 0); assert.ok(r.stderr.includes(NB_MSG(sha)), r.stderr); };
 const DEPLOY_WF = 'jobs:\n  d:\n    env:\n      K: ${{ secrets.DEPLOY_SSH_KEY }}\n';
 // <root>/o/r.git with README (and .github/workflows/ci.yml = workflow, unless undefined) on main; <root>/c is a clone of it with the box hook
 function hookWorld(workflow) {
@@ -1248,6 +1251,7 @@ test('hook 1b: a repo listed in ~/.config/fcode/no-secret-repos (any case, # com
     e.list('o/r2\nx/o/r\nother/repo # o/r\n');
     refused(e.push('origin', 'box/l'), sha); // listed under other slugs only
     // astra r4: a malformed list allows nothing (grep would split lines at a NUL); a list that is not a readable regular file neither
+    // The two NUL cases are the ones that guard the R6 fix; the directory and unreadable cases already failed closed before it (kept as cover).
     const listFile = path.join(e.home, '.config', 'fcode', 'no-secret-repos');
     const bad = [['NUL', () => e.list('other/repo\0o/r\n')], ['NUL beside a valid line', () => e.list('other/repo\0\nO/R\n')],
       ['directory', () => { e.list(undefined); fs.mkdirSync(listFile); }]];
@@ -1311,13 +1315,13 @@ test('hook 1d: with no origin/HEAD and no origin/main|master (a clone --single-b
     sh('git', ['-C', s, 'rm', '-q', '-r', '.github'], e);
     sh('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-C', s, 'commit', '-q', '-m', 'drop .github'], e);
     const del = gitOr(e, s, 'rev-parse', 'HEAD');
-    refused(spush('origin', 'HEAD:refs/heads/box/q'), del); // new branch: no base, the deletion is a change
-    refused(spush('origin', 'HEAD:refs/tags/q1'), del);
+    refusedNB(spush('origin', 'HEAD:refs/heads/box/q'), del); // new branch: no base, the deletion is a change
+    refusedNB(spush('origin', 'HEAD:refs/tags/q1'), del);
     refused(spush('origin', 'HEAD:box/p'), del); // update: the remote ref has .github
     sh('git', ['-C', s, 'reset', '-q', '--hard', 'origin/box/p'], e);
     const src = e.commit(s, 'src2.txt', 'y\n');
     pushed(spush('origin', 'HEAD:box/p')); // update outside .github: the remote ref is the base
-    refused(spush('origin', 'HEAD:refs/heads/box/r'), src); // the same commit as a new ref: nothing to compare with
+    refusedNB(spush('origin', 'HEAD:refs/heads/box/r'), src); // the same commit as a new ref: nothing to compare with
     const probe = gitOr(e, s, 'commit-tree', gitOr(e, s, 'hash-object', '-t', 'tree', '-w', '/dev/null'), '-m', 'probe');
     pushed(spush('origin', `${probe}:refs/heads/box/fcode-add-check-x`)); // fcode add's probe
     assert.deepEqual([e.at('refs/heads/box/q'), e.at('refs/tags/q1'), e.at('refs/heads/box/r'), e.at('refs/heads/box/p')], ['', '', '', src]);
@@ -1326,7 +1330,7 @@ test('hook 1d: with no origin/HEAD and no origin/main|master (a clone --single-b
     e.git('update-ref', '-d', 'refs/remotes/origin/main');
     e.git('switch', '-q', '-c', 'box/u', 'box/p');
     const mainGithub = e.commit(e.dir, 'src3.txt', 'x\n');
-    refused(e.push('origin', 'box/u'), mainGithub); // main's .github, nothing to compare with
+    refusedNB(e.push('origin', 'box/u'), mainGithub); // main's .github, nothing to compare with
   } finally { done(e); }
   // a repo with no .github/ at all, no default branch on the box: a new ref is refused too, until listed; then its remote ref is the base
   const x = hookWorld(undefined);
@@ -1335,7 +1339,7 @@ test('hook 1d: with no origin/HEAD and no origin/main|master (a clone --single-b
     x.git('update-ref', '-d', 'refs/remotes/origin/main');
     x.git('switch', '-q', '-c', 'box/u');
     const first = x.commit(x.dir, 'src.txt', 'x\n');
-    refused(x.push('origin', 'box/u'), first); // no base at all: "no .github/" is no base
+    refusedNB(x.push('origin', 'box/u'), first); // no base at all: "no .github/" is no base
     const probe = x.git('commit-tree', x.git('hash-object', '-t', 'tree', '-w', '/dev/null'), '-m', 'probe');
     pushed(x.push('origin', `${probe}:refs/heads/box/fcode-add-check-x`));
     x.list('o/r\n');
@@ -1345,7 +1349,7 @@ test('hook 1d: with no origin/HEAD and no origin/main|master (a clone --single-b
     pushed(x.push('origin', 'box/u')); // the remote ref is the base
     const sha = x.commit(x.dir, '.github/workflows/ci.yml', 'on: push\n');
     refused(x.push('origin', 'box/u'), sha);
-    refused(x.push('origin', 'HEAD:refs/heads/box/new'), sha);
+    refusedNB(x.push('origin', 'HEAD:refs/heads/box/new'), sha);
     x.git('symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/gone');
     refused(x.push('origin', 'HEAD:refs/heads/box/new'), sha);
   } finally { done(x); }
@@ -1393,6 +1397,7 @@ test('add 2: a full add against an origin whose main has a workflow reading secr
       const r = run(e, 'o/r', 'r', extra);
       const head = extra.FCODE_NO_TOKEN ? ['KEY_NEW', 'ALIAS_ADDED', 'READ_OK'] : ['TOKEN_OK', 'READ_OK'];
       assert.deepEqual([r.code, r.codes], [0, [...head, 'CLONED', 'HOOK_OK', 'WRITE_OK', 'CFG_ADDED', ...TAIL]], r.stdout + r.stderr);
+      assert.equal(r.detail('HOOK_OK'), 'HEAD_OK'); // set-head asked the origin after the clone
       assert.equal(fs.existsSync(path.join(e.home, '.config', 'fcode', 'no-secret-repos')), false);
       assert.deepEqual(boxRefs(e, remote), []);
       const dir = path.join(e.ws, 'r');
@@ -1411,6 +1416,7 @@ test('add 2: a full add against an origin with no commits: exit 0, V_EMPTY_REPO,
     sh('git', ['init', '-q', '--bare', '-b', 'main', remote], e);
     const r = run(e, 'o/r', 'r');
     assert.deepEqual([r.code, r.codes], [0, ['TOKEN_OK', 'READ_OK', 'CLONED', 'HOOK_OK', 'WRITE_OK', 'CFG_ADDED', 'V_EMPTY_REPO', 'V_PR_OK', 'V_HOOK_OK', 'V_SERVER_OK', 'RULES_NO']], r.stdout + r.stderr);
+    assert.equal(r.detail('HOOK_OK'), 'HEAD_FAIL'); // an empty origin has no default branch to name: best effort, the add goes on
     assert.deepEqual(boxRefs(e, remote), []);
     tmpClean(e);
   } finally { done(e); }
