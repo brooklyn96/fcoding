@@ -193,6 +193,8 @@ FCode không có trên App Store. Bạn cài app bằng **Sideloadly** trên má
 
 File này do GitHub Actions tự dựng lại mỗi khi nhánh `main` thay đổi phần ứng dụng iOS, nên tải lại là có bản mới.
 
+Mỗi bản phát hành có sẵn file fcode.ipa để tải: các bản `vX.Y.Z` trong **Releases** cũng có file này.
+
 ### Cài bằng Sideloadly
 
 1. Cài **Sideloadly** (sideloadly.io). Trên Windows, cài thêm **iTunes** và **iCloud** bản tải từ trang của Apple (không dùng bản Microsoft Store; nếu đã có bản Microsoft Store thì gỡ bản đó trước).
@@ -766,4 +768,4 @@ node -e 'console.log(require("crypto").randomBytes(32).toString("base64"))'
   bash test/tmux-integration.sh
   ```
 
-- **App iOS** nằm trong thư mục `ios/` (SwiftUI, iOS 16 trở lên). Dự án Xcode được sinh bằng **XcodeGen** từ `ios/project.yml`. GitHub Actions (`.github/workflows/ios.yml`, máy macOS) dựng app **không ký** rồi đóng gói `fcode.ipa`. Khi chạy trên nhánh `main`, workflow đăng bản này lên bản phát hành trước (pre-release) tên **`latest`**. Việc ký được làm trên máy bạn, bằng Sideloadly. Hướng dẫn dùng app chi tiết hơn có trong [`ios/README.md`](../ios/README.md).
+- **App iOS** nằm trong thư mục `ios/` (SwiftUI, iOS 16 trở lên). Dự án Xcode được sinh bằng **XcodeGen** từ `ios/project.yml`. GitHub Actions (`.github/workflows/ios.yml`, máy macOS) dựng app **không ký** rồi đóng gói `fcode.ipa`. Khi chạy trên nhánh `main`, workflow đăng bản này lên bản phát hành trước (pre-release) tên **`latest`**. Khi một bản phát hành `vX.Y.Z` được đăng, workflow dựng đúng bản đó và đính `fcode.ipa` vào bản phát hành (chạy tay: điền ô `tag`). Việc ký được làm trên máy bạn, bằng Sideloadly. Hướng dẫn dùng app chi tiết hơn có trong [`ios/README.md`](../ios/README.md).
