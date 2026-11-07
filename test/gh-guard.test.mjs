@@ -183,7 +183,8 @@ test('gh-guard 3c: pr merge in an unlisted repo of a PR touching .github/ (renam
     }
     for (const [what, env] of [['previous_filename', { STUB_PR: PR(5, 'o/r', 1), STUB_FILES: FILES(['retired-deploy.yml', '.github/workflows/deploy.yml']) }],
       ['case', { STUB_PR: PR(5, 'o/r', 1), STUB_FILES: FILES(['.GitHub/x.yml', 'src/x.yml']) }], ['the folder itself', { STUB_PR: PR(5, 'o/r', 1), STUB_FILES: FILES('.github') }],
-      ['short list', { STUB_PR: PR(5, 'o/r', 3), STUB_FILES: FILES('a.js', 'b.js') }], ['files API failure', { STUB_PR: PR(5, 'o/r', 1), STUB_FILES_FAIL: '1' }]]) {
+      ['short list', { STUB_PR: PR(5, 'o/r', 3), STUB_FILES: FILES('a.js', 'b.js') }], ['files API failure', { STUB_PR: PR(5, 'o/r', 1), STUB_FILES_FAIL: '1' }],
+      ['files API failure, changedFiles 0', { STUB_PR: PR(5, 'o/r', 0), STUB_FILES_FAIL: '1' }]]) {
       e.reset();
       const r = e.run(['pr', 'merge', '5', '-R', 'o/r'], env);
       assert.deepEqual([r.code, r.stderr], [65, MSG(5)], what);

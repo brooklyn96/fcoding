@@ -1143,7 +1143,7 @@ test('hook 1f: --hook-text prints the hook alone (exit 0, no R line), valid sh; 
   assert.equal(sc.status, 0, sc.stdout + sc.stderr);
 });
 
-test('hook 1a: unlisted repo: a branch or tag whose .github/ matches neither the remote ref, nor main, nor nothing is refused (new branch, update, force-push, tags); src-only and deletes push; main and master stay blocked', { skip }, () => {
+test('hook 1a: unlisted repo: a branch or tag whose .github/ matches neither the remote ref nor main is refused (new branch, update, force-push, tags); src-only and deletes push; main and master stay blocked', { skip }, () => {
   const e = hookWorld(DEPLOY_WF);
   try {
     e.git('switch', '-q', '-c', 'box/a');
@@ -1197,6 +1197,45 @@ test('hook 1a [astra 2]: the TREE under .github/ is compared, not new commits: a
     refused(e.push('origin', 'refs/tags/v1'), gitOr(e, e.dir, 'rev-parse', 'refs/tags/v1'));
     assert.deepEqual([e.at('refs/heads/box/g'), e.at('refs/tags/v0'), e.at('refs/tags/v1')], ['', '', '']);
     pushed(e.push('origin', 'origin/main:refs/tags/same')); // the same .github as main
+  } finally { done(e); }
+});
+
+test('hook 1a [astra r3]: removing the .github/ a base has is a change: refused (update, new branch, tags, also with no local default branch when the remote ref has it); listed or approved: pushed; a whole-empty-tree commit (fcode add\'s probe) pushes', { skip }, () => {
+  const e = hookWorld(DEPLOY_WF);
+  try {
+    e.git('switch', '-q', '-c', 'box/c');
+    e.commit(e.dir, 'src.txt', 'x\n');
+    pushed(e.push('origin', 'box/c')); // the remote branch now holds main's .github
+    const before = e.at('refs/heads/box/c');
+    e.git('rm', '-q', '-r', '.github');
+    e.git('commit', '-q', '-m', 'drop .github');
+    const sha = gitOr(e, e.dir, 'rev-parse', 'HEAD');
+    refused(e.push('origin', 'box/c'), sha); // update of a branch that has .github
+    refused(e.push('origin', 'HEAD:refs/heads/box/d'), sha); // new branch: main has .github
+    refused(e.push('origin', 'HEAD:refs/tags/c1'), sha); // lightweight tag
+    e.git('tag', '-a', '-m', 'x', 'c2', 'HEAD');
+    refused(e.push('origin', 'refs/tags/c2'), gitOr(e, e.dir, 'rev-parse', 'refs/tags/c2')); // annotated tag
+    // no origin/HEAD and no origin/main on the box: the remote branch is still a base with .github
+    e.git('remote', 'set-head', 'origin', '-d');
+    e.git('update-ref', '-d', 'refs/remotes/origin/main');
+    refused(e.push('origin', 'box/c'), sha);
+    e.git('fetch', '-q', 'origin');
+    e.git('remote', 'set-head', 'origin', 'main');
+    assert.deepEqual([e.at('refs/heads/box/c'), e.at('refs/heads/box/d'), e.at('refs/tags/c1'), e.at('refs/tags/c2')], [before, '', '', '']);
+    // fcode add's probe: a commit whose whole tree is empty pushes, as a new branch and over a branch with .github
+    const probe = e.git('commit-tree', e.git('hash-object', '-t', 'tree', '-w', '/dev/null'), '-m', 'probe');
+    pushed(e.push('origin', `${probe}:refs/heads/box/fcode-add-check-x`));
+    pushed(e.push('--force', 'origin', `${probe}:refs/heads/box/c`));
+    pushed(e.push('--force', 'origin', `${before}:refs/heads/box/c`));
+    // the owner's way: approval file for that commit, or the repo listed
+    const dir = path.join(e.home, '.config', 'fcode', 'guard-allow'); fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `o__r__${sha}`), '');
+    pushed(e.push('origin', 'box/c'));
+    fs.rmSync(path.join(dir, `o__r__${sha}`));
+    refused(e.push('origin', 'HEAD:refs/heads/box/d'), sha);
+    e.list('o/r\n');
+    pushed(e.push('origin', 'HEAD:refs/heads/box/d'));
+    assert.deepEqual([e.at('refs/heads/box/c'), e.at('refs/heads/box/d')], [sha, sha]);
   } finally { done(e); }
 });
 
@@ -1259,7 +1298,7 @@ test('hook 1d: with no origin/HEAD and no origin/main|master a new branch carryi
     x.git('update-ref', '-d', 'refs/remotes/origin/main');
     x.git('switch', '-q', '-c', 'box/u');
     x.commit(x.dir, 'src.txt', 'x\n');
-    pushed(x.push('origin', 'box/u')); // the empty tree: no .github at all
+    pushed(x.push('origin', 'box/u')); // no base at all (empty repo): the empty tree counts, no .github at all
     x.commit(x.dir, 'src.txt', 'y\n');
     pushed(x.push('origin', 'box/u'));
     const sha = x.commit(x.dir, '.github/workflows/ci.yml', 'on: push\n');
@@ -1288,6 +1327,10 @@ test('hook 1e: an approval file for the exact commit lets it push and stays; ano
     pushed(e.push('origin', 'box/a'));
     assert.equal(e.at('refs/heads/box/a'), sha);
     assert.ok(fs.existsSync(f), 'the hook never removes the file');
+    // the owner flow after the push: the Architect deletes the file; later work outside .github on that branch pushes (its remote ref is the base)
+    fs.rmSync(f);
+    e.commit(e.dir, 'src.txt', 'after approval\n');
+    pushed(e.push('origin', 'box/a'));
     const later = e.commit(e.dir, '.github/workflows/ci.yml', DEPLOY_WF + '# a later edit, not approved\n');
     refused(e.push('origin', 'box/a'), later);
   } finally { done(e); }
