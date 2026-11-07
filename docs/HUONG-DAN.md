@@ -197,6 +197,8 @@ File này do GitHub Actions tự dựng lại mỗi khi nhánh `main` thay đổ
 
 Mỗi bản phát hành có sẵn file fcode.ipa để tải: các bản `vX.Y.Z` trong **Releases** cũng có file này.
 
+Số phiên bản hiện trong app luôn do GitHub Actions tự điền, không cần sửa tay file nào: bản phát hành `vX.Y.Z` hiện đúng số của tag đó, còn bản `latest` hiện số của tag `vX.Y.Z` mới nhất có trong nhánh `main` (không có tag nào thì dùng số trong `ios/project.yml`).
+
 ### Cài bằng Sideloadly
 
 1. Cài **Sideloadly** (sideloadly.io). Trên Windows, cài thêm **iTunes** và **iCloud** bản tải từ trang của Apple (không dùng bản Microsoft Store; nếu đã có bản Microsoft Store thì gỡ bản đó trước).
