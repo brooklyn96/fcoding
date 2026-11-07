@@ -1,164 +1,183 @@
 #!/bin/bash
-# gh-guard (runs ON the coder box, installed as ~/.local/bin/gh, ahead of /usr/bin/gh on PATH): every call goes to the real gh unchanged
-# (exec: same argv, stdin, stdout, stderr, exit code), except the ways to merge a PR or write .github / move a branch through gh:
-#  - `gh pr merge` (any flag order, --auto included, -R/--repo, GH_REPO or the current repo) and `gh api` PUT repos/<o>/<r>/pulls/<n>/merge
-#    of a PR that changes .github/ in a repo "with secrets" -> refused, exit 65;
-#  - `gh api` writes (any method but GET/HEAD; fields or --input without -X mean POST) on repos/<o>/<r>/contents/.github..., actions/secrets...,
-#    environments..., git/refs..., git/trees, git/commits or merges of a repo with secrets -> refused, exit 65;
-#  - `gh api graphql` whose query, fields or --input body name mergePullRequest, enablePullRequestAutoMerge, enqueuePullRequest,
-#    createCommitOnBranch, updateRef(s), createRef or mergeBranch -> refused, exit 65, in every repo: those mutations name their target by
-#    node ID only, so the box cannot tell its repo (gh pr merge and git push stay open where the rules allow them);
-#  - an alias (`gh alias set`) whose expansion runs merge or api -> refused, exit 65: type the full command so it is checked.
-# A repo has secrets when owner/repo is listed in ~/.config/fcode/sensitive-repos, or a workflow on its default branch reads secrets other than
-# GITHUB_TOKEN: read from origin's default branch when the current directory is a clone of that repo (same rule as the pre-push hook in
-# box/fcode-add.sh hook_text; change both together), else from the GitHub API through the real gh. Anything unreadable counts as secrets.
-# This is a box-side guard (defence in depth): /usr/bin/gh called directly, or the API reached without gh, bypasses it. The real gh is
-# FCODE_GH_REAL (default /usr/bin/gh), resolved once and never this script.
+# gh-guard (runs ON the coder box, installed as ~/.local/bin/gh, ahead of /usr/bin/gh on PATH).
+# Threat model: this guard and the box pre-push hook (box/fcode-add.sh hook_text) stop an honest agent's mistake and a rule-following agent's
+# shortcut. They are NOT a security boundary against a hostile process on the box (it can run /usr/bin/gh, git push --no-verify or curl with
+# the token): the real boundary is that every deploy key stored as a GitHub secret is a VPS forced-command key that can only run the deploy
+# gate. Still, the guard fails CLOSED: what it cannot classify with certainty is refused (exit 65), by refusing whole classes of calls.
+# Every call goes to the real gh unchanged (exec: same argv, stdin, stdout, stderr, exit code), except:
+#  - the first word is not a built-in gh command (an alias, an extension) -> refused;
+#  - `gh pr merge` and `gh api` are parsed the way gh parses flags (--f=v, --f v, -f=v, -fv, clustered -ds); a flag that command does not
+#    have, a missing value or an extra argument -> refused. --help changes nothing: the call is judged as if it runs;
+#  - `gh pr merge` of a PR whose base repo has secrets: --auto / --disable-auto (any value) -> refused. Else the PR's files are read from REST
+#    pulls/<n>/files (every page, the new AND the old name of a rename); a path under .github/ or a list shorter than the PR's file count ->
+#    refused, unless the owner approved that head commit (guard_allow; the file is removed after the merge succeeds). The merge then runs
+#    pinned to the inspected head: --match-head-commit <sha> is added (another value given -> refused). Repos without secrets: unchanged;
+#  - `gh api`: every graphql call -> refused (its target repo cannot be known). A call that is not GET (fields or --input without -X mean
+#    POST, as in gh) -> refused unless its endpoint names repos/<owner>/<repo>/... plainly ({owner}/{repo} filled from the current repo; no
+#    backslash, //, . or .. segment, %2e %2f %5c %25; github.com only) and that repo has no secrets. GET calls pass.
+# "Has secrets": the shared rule below (the same text as in the hook), read from origin's default branch when the current directory is a
+# clone of that repo, else through the API: listed in ~/.config/fcode/sensitive-repos, or a file under .github/ on the default branch
+# contains "secrets" in any case. Anything unreadable counts as secrets. The real gh is FCODE_GH_REAL (default /usr/bin/gh), never this script.
 real="${FCODE_GH_REAL:-/usr/bin/gh}"
 if [ ! -x "$real" ] || [ -d "$real" ] || [ "$(readlink -f "$real")" = "$(readlink -f "$0")" ]; then echo "gh-guard: real gh not found ($real)" >&2; exit 127; fi
-RE='secrets[[:space:]]*(\.[[:space:]]*[a-z0-9_-]+|\[)|tojson\([[:space:]]*secrets|secrets:[[:space:]]*inherit'
-GQL='mergePullRequest|enablePullRequestAutoMerge|enqueuePullRequest|createCommitOnBranch|updateRefs?|createRef|mergeBranch'
 
-# positional words of the call (flag values skipped), the -R/--repo, -X/--method and --input values and the api fields;
-# -h/--help means pass through
-words=(); repo=; method=; help=; input=; rawf=(); typf=()
-vflag() { case "$1" in -R|--repo|-t|--subject|-b|--body|-F|--body-file|-A|--author-email|--match-head-commit|-X|--method|--field|-f|--raw-field|-H|--header|--input|-q|--jq|--template|--hostname|--cache|-p|--preview) return 0;; esac; return 1; }
-setv() { case "$1" in -R|--repo) repo="$2";; -X|--method) method="$2";; -f|--raw-field) rawf+=("$2");; -F|--field) typf+=("$2");; --input) input="$2";; esac; }
-args=("$@"); i=0; n=${#args[@]}
+# >>> shared rule (the same text in box/fcode-add.sh hook_text; a test keeps them equal)
+# listed <owner/repo>: 0 = the owner listed it in ~/.config/fcode/sensitive-repos (one per line, any case, # comments)
+listed() { [ -f "$HOME/.config/fcode/sensitive-repos" ] && sed 's/#.*//; s/[[:space:]]//g' "$HOME/.config/fcode/sensitive-repos" | grep -qixF -- "$1"; }
+# default_ref: $db = origin's default branch (origin/HEAD, else origin/main, else origin/master); 1 = none
+default_ref() {
+  db=$(git symbolic-ref -q refs/remotes/origin/HEAD) || db=
+  for sr_c in refs/remotes/origin/main refs/remotes/origin/master; do [ -n "$db" ] || ! git rev-parse -q --verify "$sr_c" >/dev/null || db=$sr_c; done
+  [ -n "$db" ]
+}
+# sensitive_local <owner/repo> [tree]: 0 = the repo of this clone has secrets: it is listed; origin's default branch cannot be resolved; or a
+# file under .github/ (any depth, workflows and actions) on that branch, or on [tree], contains "secrets" in any case. Unreadable = secrets.
+# $why ends the refusal message.
+sensitive_local() {
+  why=' dùng secret trong workflow'
+  listed "$1" && return 0
+  default_ref || { why=': không xác định được nhánh chính; coi là repo có secret'; return 0; }
+  for sr_t in "$db" ${2:+"$2"}; do
+    git grep -qiF secrets "$sr_t" -- ':(top).github' 2>/dev/null
+    case $? in 0) return 0;; 1) ;; *) why=': không đọc được .github/; coi là repo có secret'; return 0;; esac
+  done
+  return 1
+}
+# guard_allow <owner/repo> <sha> <push|merge>: 0 = the owner approved exactly this commit: ~/.config/fcode/guard-allow/<owner>__<repo>__<sha>
+# (lower case, a plain file of mode 600, made by the Architect only after the owner's explicit Yes). Each use adds one line to
+# ~/.local/state/fcode/guard-allow.log (UTC time, repo, sha, push|merge); no log line, no allow. $ga = the file.
+guard_allow() {
+  case "$2" in *[!0-9a-f]*) return 1;; esac
+  [ "${#2}" -eq 40 ] || return 1
+  ga=$HOME/.config/fcode/guard-allow/$(printf '%s__%s__%s' "${1%%/*}" "${1#*/}" "$2" | tr '[:upper:]' '[:lower:]')
+  [ -f "$ga" ] && [ ! -L "$ga" ] && [ "$(stat -c %a "$ga" 2>/dev/null)" = 600 ] || return 1
+  mkdir -p "$HOME/.local/state/fcode" && printf '%s %s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$3" >>"$HOME/.local/state/fcode/guard-allow.log"
+}
+# <<< shared rule
+
+refuse() { echo "$1" >&2; exit 65; }
+lc() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+# owner/repo of a git remote URL or path (git@host:o/r.git, https://host/o/r, /x/o/r.git)
+slug_of() { local u="${1%/}"; u="${u%.git}"; local o="${u%/*}"; printf '%s/%s' "${o##*[/:]}" "${u##*/}"; }
+# 0 = owner/repo $1 has secrets (see the header): the shared rule in a clone of $1, else the API
+sensitive() {
+  local s="$1" o b out t list x
+  o="$(git config --get remote.origin.url 2>/dev/null)"
+  if [ -n "$o" ] && [ "$(lc "$(slug_of "$o")")" = "$(lc "$s")" ]; then sensitive_local "$s"; return; fi
+  why=' dùng secret trong workflow'
+  listed "$s" && return 0
+  why=': không đọc được .github/ qua API; coi là repo có secret'
+  b="$("$real" api "repos/$s" -q .default_branch </dev/null 2>/dev/null)" || return 0
+  [[ "$b" =~ ^[A-Za-z0-9._-]+$ ]] || return 0
+  out="$("$real" api "repos/$s/git/trees/$b?recursive=1" -q '.truncated, (.tree[] | select(.type != "tree" and (.path == ".github" or (.path | startswith(".github/")))) | .type + " " + .sha)' </dev/null 2>/dev/null)" || return 0
+  { read -r t; mapfile -t list; } <<<"$out"
+  [ "$t" = false ] || return 0
+  for x in "${list[@]}"; do
+    [ -n "$x" ] || continue
+    [[ "$x" =~ ^blob\ [0-9a-f]{40}$ ]] || return 0
+    out="$("$real" api "repos/$s/git/blobs/${x#blob }" -H 'Accept: application/vnd.github.raw' </dev/null 2>/dev/null)" || return 0
+    grep -qiF secrets <<<"$out" && { why=' dùng secret trong workflow'; return 0; }
+  done
+  return 1
+}
+# the repo gh means by {owner}/{repo} (GH_REPO or the current clone)
+cur=
+current() { [ -n "$cur" ] || cur="$("$real" repo view --json nameWithOwner -q .nameWithOwner </dev/null 2>/dev/null)"; [[ "$cur" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; }
+
+# ---- parse like gh (pflag). The flags of gh pr merge and gh api (gh 2.103): ..B = no value, ..V = takes a value; no flag is a value flag in
+# one and a no-value flag in the other, so one pass with both value lists finds the command words; then the command's own lists must hold
+# every flag seen.
+GHCMDS=' auth browse codespace discussion gist issue org pr project release repo skill cache run workflow agent-task alias api attestation completion config copilot extension gpg-key label licenses preview ruleset search secret ssh-key status variable help version accessibility actions environment exit-codes formatting mintty reference telemetry '
+PRB=' --admin --auto -d --delete-branch --disable-auto -m --merge -r --rebase -s --squash --help '
+PRV=' -A --author-email -b --body -F --body-file --match-head-commit -t --subject -R --repo '
+APB=' --allow-escape-sequences -i --include --paginate --silent --slurp --verbose --help '
+APV=' --cache -F --field -H --header --hostname --input -q --jq -X --method -p --preview -f --raw-field -t --template '
+words=(); fl=(); declare -A val=(); bad=; dd=-1
+setv() { case "$1" in -R) val[--repo]="$2";; -X) val[--method]="$2";; *) val[$1]="$2";; esac; }
+args=("$@"); i=0; n=$#
 while [ "$i" -lt "$n" ]; do
   a="${args[$i]}"; i=$((i + 1))
   case "$a" in
-    --) words+=("${args[@]:$i}"); break;;
-    -h|--help) help=1;;
-    --*=*) setv "${a%%=*}" "${a#*=}";;
-    --*) if vflag "$a"; then setv "$a" "${args[$i]:-}"; i=$((i + 1)); fi;;
-    -?*) # short flags, maybe clustered (-ds), the value attached (-Ro/r) or next
+    --) dd=$((i - 1)); words+=("${args[@]:$i}"); break;;
+    --*=*) fl+=("${a%%=*}"); setv "${a%%=*}" "${a#*=}";;
+    --?*) fl+=("$a"); if [[ "$PRV$APV" == *" $a "* ]]; then [ "$i" -lt "$n" ] || bad=1; setv "$a" "${args[$i]:-}"; i=$((i + 1)); fi;;
+    -?*) # short flags, maybe clustered (-ds); a value attached (-Ro/r, -R=o/r) or next; -d=false gives the rest to the no-value flag
       j=1
       while [ "$j" -lt "${#a}" ]; do
-        f="-${a:$j:1}"; j=$((j + 1))
-        if vflag "$f"; then
-          if [ "$j" -lt "${#a}" ]; then setv "$f" "${a:$j}"; else setv "$f" "${args[$i]:-}"; i=$((i + 1)); fi
+        f="-${a:$j:1}"; j=$((j + 1)); fl+=("$f")
+        if [[ "$PRV$APV" == *" $f "* ]]; then
+          if [ "$j" -lt "${#a}" ]; then v="${a:$j}"; [ "${v:0:1}" != = ] || v="${v:1}"; setv "$f" "$v"
+          else [ "$i" -lt "$n" ] || bad=1; setv "$f" "${args[$i]:-}"; i=$((i + 1)); fi
           break
         fi
+        [ "${a:$j:1}" != = ] || break
       done;;
     *) words+=("$a");;
   esac
 done
-[ -z "$help" ] || exec "$real" "$@"
+# 0 = every flag seen is in the list $1
+known() { local f; for f in "${fl[@]}"; do [[ "$1" == *" $f "* ]] || return 1; done; }
 
-# owner/repo of a git remote URL or path (git@host:o/r.git, https://host/o/r, /x/o/r.git)
-slug_of() { local u="${1%/}"; u="${u%.git}"; local o="${u%/*}"; printf '%s/%s' "${o##*[/:]}" "${u##*/}"; }
-# 0 = the matches of $RE (stdin) include a secret other than GITHUB_TOKEN
-reads_secret() { tr -d ' \t' | grep -qvixF secrets.github_token; }
-# 0 = sensitive. Local when the current directory is a clone of $1 (origin), else the API.
-sensitive() {
-  local s="$1" f="$HOME/.config/fcode/sensitive-repos" o b c m rc urls u e
-  [ -f "$f" ] && sed 's/#.*//; s/[[:space:]]//g' "$f" | grep -qixF -- "$s" && return 0
-  o="$(git config --get remote.origin.url 2>/dev/null)"
-  if [ -n "$o" ] && [ "$(slug_of "$o" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$s" | tr '[:upper:]' '[:lower:]')" ]; then
-    b=$(git symbolic-ref -q refs/remotes/origin/HEAD) || b=
-    for c in refs/remotes/origin/main refs/remotes/origin/master; do [ -n "$b" ] || ! git rev-parse -q --verify "$c" >/dev/null || b=$c; done
-    [ -n "$b" ] || return 0
-    m=$(git grep -ohiE "$RE" "$b" -- .github/workflows 2>/dev/null); rc=$?
-    [ "$rc" -eq 1 ] && return 1
-    [ "$rc" -eq 0 ] || return 0
-    printf '%s\n' "$m" | reads_secret
-    return
-  fi
-  e="$(mktemp)" || return 0
-  urls="$("$real" api "repos/$s/contents/.github/workflows" -q '.[] | select(.type == "file") | .url' </dev/null 2>"$e")"; rc=$?
-  if [ "$rc" -ne 0 ]; then grep -q 'HTTP 404' "$e"; rc=$?; rm -f "$e"; [ "$rc" -ne 0 ]; return; fi
-  rm -f "$e"
-  while IFS= read -r u; do
-    [ -n "$u" ] || continue
-    m="$("$real" api "$u" -H 'Accept: application/vnd.github.raw' </dev/null 2>/dev/null)" || return 0
-    printf '%s\n' "$m" | grep -oiE "$RE" | reads_secret && return 0
-  done <<<"$urls"
-  return 1
-}
-tmp= # stdin of the call, kept here when the guard had to read it (gh api graphql --input - or -F k=@-); handed to the real gh at exec
-refuse() { [ -z "$tmp" ] || rm -f "$tmp"; echo "$1" >&2; exit 65; }
-# the repo gh means by {owner}/{repo} (GH_REPO or the current clone)
-cur=
-current() { [ -n "$cur" ] || cur="$("$real" repo view --json nameWithOwner -q .nameWithOwner </dev/null 2>/dev/null)"; [ -n "$cur" ]; }
-# refuse merging PR $1 ("" = the current branch's PR) of repo $2 ("" = gh's default) when it changes .github/ in a repo with secrets
-merge_check() {
-  local v=(pr view) out num url cnt paths p base touches=
-  [ -z "$1" ] || v+=("$1"); [ -z "$2" ] || v+=(-R "$2")
-  out="$("$real" "${v[@]}" --json number,url,changedFiles,files -q '.number, .url, .changedFiles, .files[].path' </dev/null 2>/dev/null)" \
-    || refuse "gh-guard: không đọc được PR ${1:-của nhánh này}; không merge (chặn khi không chắc) — báo fcoding."
-  { read -r num; read -r url; read -r cnt; mapfile -t paths; } <<<"$out"
-  [[ "$url" =~ ^https://[^/]+/([^/]+/[^/]+)/pull/[0-9]+$ ]] || refuse "gh-guard: không đọc được repo của PR ${num:-?}; không merge (chặn khi không chắc) — báo fcoding."
-  base="${BASH_REMATCH[1]}"
-  [ "$cnt" = "${#paths[@]}" ] || touches=1 # gh lists at most 100 files: a list shorter than changedFiles may hide .github
-  for p in "${paths[@]}"; do case "$p" in .github/*) touches=1;; esac; done
-  if [ -n "$touches" ] && sensitive "$base"; then
-    refuse "gh-guard: PR #$num sửa .github/ ở repo có secret; chỉ chủ được merge — gọi fcode-notify merge-ready."
-  fi
-}
-# refuse a graphql call whose query, fields or body name a merge / branch-write mutation; files given with -F k=@<path> or --input are read
-gql() {
-  local b f src k
-  b="$(printf '%s\n' "${rawf[@]}" "${typf[@]}")"
-  for f in "${typf[@]}" ${input:+"=@$input"}; do
-    f="${f#*=}"; [ "${f:0:1}" = @ ] || continue
-    src="${f:1}"
-    if [ "$src" = - ]; then
-      [ -n "$tmp" ] || { tmp="$(mktemp)" && cat >"$tmp"; } || refuse "gh-guard: không đọc được stdin cho gh api graphql; bị chặn — báo fcoding."
-      src="$tmp"
-    fi
-    if [ ! -f "$src" ] || [ ! -r "$src" ]; then refuse "gh-guard: không đọc được $src cho gh api graphql; bị chặn (chặn khi không chắc) — báo fcoding."; fi
-    b+=$'\n'"$(cat -- "$src")"
+[ -n "${words[0]:-}" ] || exec "$real" "$@"
+[[ "$GHCMDS" == *" ${words[0]} "* ]] || refuse "gh-guard: '${words[0]}' không phải lệnh gh có sẵn (alias, extension) — box không chạy alias hay extension; gõ lệnh gh đầy đủ."
+
+if [ "${words[0]}" = pr ] && [ "${words[1]:-}" = merge ]; then
+  { known "$PRB$PRV" && [ -z "$bad" ] && [ "${#words[@]}" -le 3 ]; } || refuse "gh-guard: không đọc chắc lệnh gh pr merge này (cờ lạ, thiếu giá trị hay thừa đối số); bị chặn — gõ lại đúng cú pháp gh."
+  v=(pr view); [ -z "${words[2]:-}" ] || v+=("${words[2]}"); [ -z "${val[--repo]+x}" ] || v+=(-R "${val[--repo]}")
+  out="$("$real" "${v[@]}" --json number,url,headRefOid,changedFiles -q '.number, .url, .headRefOid, .changedFiles' </dev/null 2>/dev/null)" \
+    || refuse "gh-guard: không đọc được PR ${words[2]:-của nhánh này}; không merge (chặn khi không chắc) — báo fcoding."
+  { read -r num; read -r url; read -r head; read -r cnt; } <<<"$out"
+  { [[ "$url" =~ ^https://[^/]+/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([0-9]+)$ ]] && [ "${BASH_REMATCH[2]}" = "$num" ] && base="${BASH_REMATCH[1]}" \
+    && [[ "$head" =~ ^[0-9a-f]{40}$ ]] && [[ "$cnt" =~ ^[0-9]+$ ]]; } || refuse "gh-guard: không đọc rõ PR ${num:-?} (repo, head, số file); không merge — báo fcoding."
+  sensitive "$base" || exec "$real" "$@"
+  for f in "${fl[@]}"; do
+    case "$f" in --auto|--disable-auto) refuse "gh-guard: PR #$num: auto-merge ở repo có secret bị chặn (box chỉ kiểm tra được lần merge chạy ngay); merge không --auto.";; esac
   done
-  k="$(grep -oiE "$GQL" <<<"$b")" || return 0
-  refuse "gh-guard: gh api graphql có ${k%%$'\n'*} (merge hoặc ghi nhánh) bị chặn: box không biết repo đích; dùng gh pr merge hoặc git push để box kiểm tra — repo có secret thì gọi fcode-notify merge-ready."
-}
-
-case "${words[0]:-}" in
-  ''|auth|browse|codespace|discussion|gist|issue|org|pr|project|release|repo|skill|cache|run|workflow|agent-task|alias|api|attestation|completion|\
-  config|copilot|extension|gpg-key|label|licenses|preview|ruleset|search|secret|ssh-key|status|variable|help|version|accessibility|actions|\
-  environment|exit-codes|formatting|mintty|reference|telemetry) ;;
-  *) # an alias or an extension: an alias that runs merge or api would skip the checks below
-    while IFS= read -r l; do
-      [ "${l%%: *}" = "${words[0]}" ] || continue
-      [[ " ${l#*: } " =~ [^[:alnum:]_-](merge|api)[^[:alnum:]_-] ]] \
-        && refuse "gh-guard: alias ${words[0]} chạy '${l#*: }'; box không kiểm tra alias — gõ lệnh gh đầy đủ."
-    done < <("$real" alias list </dev/null 2>/dev/null);;
-esac
-if [ "${words[0]:-}" = pr ] && [ "${words[1]:-}" = merge ]; then
-  merge_check "${words[2]:-}" "$repo"
-elif [ "${words[0]:-}" = api ]; then
-  m="${method^^}"
-  if [ -z "$m" ]; then if [ "${#rawf[@]}" -gt 0 ] || [ "${#typf[@]}" -gt 0 ] || [ -n "$input" ]; then m=POST; else m=GET; fi; fi
-  g=; shopt -s nocasematch
-  for a in "${words[@]:1}"; do [[ "$a" =~ ^([^?#]*/)?graphql/*([?#].*)?$ ]] && g=1; done
+  if [ -n "${val[--match-head-commit]+x}" ] && [ "${val[--match-head-commit]}" != "$head" ]; then
+    refuse "gh-guard: PR #$num: --match-head-commit ${val[--match-head-commit]} khác head đã kiểm tra $head; bị chặn."
+  fi
+  touches=
+  out="$("$real" api --paginate "repos/$base/pulls/$num/files" -q '.[] | [.filename, (.previous_filename // "")] | @tsv' </dev/null 2>/dev/null)" || touches=1
+  files=(); [ -z "$out" ] || mapfile -t files <<<"$out"
+  [ "${#files[@]}" = "$cnt" ] || touches=1 # GitHub lists at most 3000 files: a shorter list may hide .github
+  shopt -s nocasematch
+  for x in "${files[@]}"; do
+    for p in "${x%%$'\t'*}" "${x#*$'\t'}"; do [[ "$p" == .github || "$p" == .github/* ]] && touches=1; done
+  done
   shopt -u nocasematch
-  [ -z "$g" ] || gql
-  case "$m" in
-    GET|HEAD) ;;
-    *)
-      for a in "${words[@]:1}"; do
-        t="$a"
-        if [[ "$t" == *'{owner}'* || "$t" == *'{repo}'* ]]; then
-          current || refuse "gh-guard: không biết repo hiện tại cho gh api $m; bị chặn — báo fcoding."
-          t="${t//\{owner\}\/\{repo\}/$cur}"
-        fi
-        [[ "$t" == *repos/* ]] || continue
-        [[ "$t" == *://* ]] && t="${t#*://}" && t="/${t#*/}"
-        if [[ "$t" == *%* || "$t" == *\\* || "$t" == *//* || "$t" == */./* || "$t" == */../* || "$t" == */. || "$t" == */.. || "$t" == *'{'* ]]; then
-          refuse "gh-guard: không đọc rõ đường dẫn của gh api $m ($a); bị chặn — báo fcoding."
-        fi
-        shopt -s nocasematch
-        if [[ "$t" =~ (^|/)repos/([^/]+/[^/?#]+)/pulls/([^/?#]+)/merge([/?#]|$) ]]; then
-          s="${BASH_REMATCH[2]}"; p="${BASH_REMATCH[3]}"; shopt -u nocasematch
-          merge_check "$p" "$s"
-        elif [[ "$t" =~ (^|/)repos/([^/]+/[^/?#]+)/(contents/\.github([/?#]|$)|actions/secrets([/?#]|$)|environments([/?#]|$)|git/(refs|trees|commits)([/?#]|$)|merges([/?#]|$)) ]]; then
-          s="${BASH_REMATCH[2]}"; shopt -u nocasematch
-          sensitive "$s" && refuse "gh-guard: $s dùng secret trong workflow; gh api $m vào .github/, secrets, environments, git refs/trees/commits hay merges bị chặn — báo fcoding, chủ làm."
-        fi
-        shopt -u nocasematch
-      done;;
-  esac
+  # the call as given, pinned to the inspected head (before a closing --, where flags still count)
+  fwd=("$@")
+  if [ -z "${val[--match-head-commit]+x}" ]; then
+    if [ "$dd" -lt 0 ]; then fwd+=(--match-head-commit "$head"); else fwd=("${@:1:$dd}" --match-head-commit "$head" "${@:$((dd + 1))}"); fi
+  fi
+  if [ -n "$touches" ]; then
+    guard_allow "$base" "$head" merge \
+      || refuse "gh-guard: PR #$num sửa .github/ ở repo có secret (head $head); chỉ chủ được duyệt — gọi fcode-notify <dự án> merge-ready \"<một dòng>\" $url"
+    "$real" "${fwd[@]}"; rc=$?
+    [ "$rc" -ne 0 ] || rm -f -- "$ga"
+    exit "$rc"
+  fi
+  exec "$real" "${fwd[@]}"
+elif [ "${words[0]}" = api ]; then
+  { known "$APB$APV" && [ -z "$bad" ] && [ "${#words[@]}" -eq 2 ]; } || refuse "gh-guard: không đọc chắc lệnh gh api này (cờ lạ, thiếu giá trị hay thừa đối số); bị chặn — gõ lại đúng cú pháp gh."
+  ep="${words[1]}"
+  shopt -s nocasematch
+  [[ "$ep" == *graphql* ]] && { shopt -u nocasematch; refuse "gh-guard: gh api graphql bị chặn trên box (box không biết repo đích); dùng lệnh gh thường (gh pr …, gh issue …) — báo fcoding nếu thật cần."; }
+  shopt -u nocasematch
+  if [ -n "${val[--method]+x}" ]; then m="${val[--method]}"
+  else m=GET; for f in "${fl[@]}"; do case "$f" in -f|--raw-field|-F|--field|--input) m=POST;; esac; done; fi
+  if [ "${m^^}" != GET ]; then
+    p="${ep#/}"; tgt=
+    shopt -s nocasematch
+    if [[ -z "${val[--hostname]+x}" && ( -z "${GH_HOST:-}" || "$GH_HOST" == github.com ) && "$p" != *\\* && "$p" != *//* ]] \
+      && ! [[ "$p" =~ (^|/)\.\.?([/?#]|$) || "$p" =~ %(2e|2f|5c|25) ]]; then
+      shopt -u nocasematch
+      if [[ "$p" == *'{owner}'* || "$p" == *'{repo}'* ]]; then current && p="${p//\{owner\}/${cur%%/*}}" && p="${p//\{repo\}/${cur#*/}}" || p=; fi
+      [[ "$p" =~ ^repos/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)([/?#]|$) ]] && tgt="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+    fi
+    shopt -u nocasematch
+    [ -n "$tgt" ] || refuse "gh-guard: gh api $m $ep: không xác định chắc repo đích; bị chặn (chặn khi không chắc) — báo fcoding."
+    sensitive "$tgt" && refuse "gh-guard: $tgt$why; gh api $m vào repo này bị chặn — báo fcoding, chủ làm."
+  fi
 fi
-[ -z "$tmp" ] || { exec 0<"$tmp"; rm -f "$tmp"; }
 exec "$real" "$@"

@@ -4,7 +4,8 @@
 # The hook text is not a copy: it is "fcode-add.sh --hook-text" of the installed script ($FCODE_APP/fcode-add.sh, FCODE_APP defaults to
 # /data/home/fcoding; FCODE_ADD_SCRIPT overrides the script and FCODE_CFG the config, for tests).
 # Same safety rules as fcode add's step 5: the project's .git is a real directory inside the project (no link), its hooks dir and pre-push are
-# no links and live inside the project, and git uses that hooks dir (repo-local core.hooksPath; set when unset, never changed when it points elsewhere).
+# no links and live inside the project, and git uses that hooks dir (repo-local core.hooksPath; set when unset, never changed when it points elsewhere;
+# a relative core.hooksPath is read from the project's top folder, as git reads it).
 # A pre-push that is not a box hook (no "# Box guard:" line) is never replaced. Only hooks/pre-push and core.hooksPath are ever written.
 # One line per project: HOOK_OK <name> (written), HOOK_EXISTS <name> (already current), HOOK_FAIL <name> <reason>.
 # Exit: 0 all OK/EXISTS, 1 any HOOK_FAIL, 2 no hook text or unreadable config.
@@ -27,6 +28,8 @@ PY
 )" || { echo "HOOK_FAIL - config ($cfg)"; exit 2; }
 rc=0
 fail() { echo "HOOK_FAIL $name $1"; rc=1; }
+# a path git gives for this project: a relative one is relative to the project's top folder
+inrepo() { case "$1" in /*) readlink -f "$1";; *) readlink -f "$dir/$1";; esac; }
 while IFS=$'\t' read -r name dir; do
   [ -n "$name" ] || continue
   if [ -z "$dir" ] || [ -L "$dir" ] || [ ! -d "$dir" ]; then fail dir; continue; fi
@@ -34,7 +37,7 @@ while IFS=$'\t' read -r name dir; do
   if [ -z "$gdir" ] || [ "$(readlink -f "$gdir")" != "$rdir/.git" ] || [ -L "$dir/.git" ] || [ -L "$hooks" ] || [ -L "$hooks/pre-push" ]; then fail unsafe; continue; fi
   if [ -e "$hooks" ]; then case "$(readlink -f "$hooks")" in "$rdir"/*) ;; *) fail unsafe; continue;; esac; fi
   hp="$(git -C "$dir" config --local --get core.hooksPath 2>/dev/null)"
-  if [ -n "$hp" ] && [ "$(readlink -f "$hp")" != "$(readlink -f "$hooks")" ]; then fail hookspath; continue; fi
+  if [ -n "$hp" ] && [ "$(inrepo "$hp")" != "$(readlink -f "$hooks")" ]; then fail hookspath; continue; fi
   if [ -e "$hooks/pre-push" ] && ! grep -q '^# Box guard:' "$hooks/pre-push" 2>/dev/null; then fail foreign; continue; fi
   if cmp -s "$htmp" "$hooks/pre-push" 2>/dev/null; then st=HOOK_EXISTS
   elif mkdir -p "$hooks" && install -m 755 "$htmp" "$hooks/pre-push"; then st=HOOK_OK
@@ -42,7 +45,7 @@ while IFS=$'\t' read -r name dir; do
   chmod 755 "$hooks/pre-push" 2>/dev/null || { fail install; continue; }
   if [ -z "$hp" ] && ! git -C "$dir" config --local core.hooksPath "$hooks"; then fail hookspath; continue; fi
   # git really resolves pre-push to this file (a global or system core.hooksPath cannot win over the repo-local one)
-  if [ "$(readlink -f "$(git -C "$dir" rev-parse --git-path hooks 2>/dev/null)")" != "$(readlink -f "$hooks")" ]; then fail verify; continue; fi
+  if [ "$(inrepo "$(git -C "$dir" rev-parse --git-path hooks 2>/dev/null)")" != "$(readlink -f "$hooks")" ]; then fail verify; continue; fi
   echo "$st $name"
 done <<<"$list"
 exit "$rc"

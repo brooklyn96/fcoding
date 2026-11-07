@@ -23,32 +23,50 @@
 # 26 cau hinh git (url.*.insteadOf / pushurl) doi huong URL, 2 tham so sai, 11 thu muc da co / khong an toan, 21/22 cau hinh xung dot / hong,
 # 23 ten khoa/alias da dung cho repo khac, 20 khong tao duoc khoa, 12 clone loi.
 # Hook pre-push chuan cua box (fcode-hooks cai lai noi dung nay vao moi project da co: "fcode-add.sh --hook-text" chi in no ra roi thoat 0).
-# 1) chan push thang len main/master. 2) repo "co secret" (workflow tren nhanh mac dinh cua origin doc secrets.<TEN> khac GITHUB_TOKEN, hay
-# owner/repo ghi trong ~/.config/fcode/sensitive-repos; khong doc duoc nhanh mac dinh = co secret): chan push co commit moi sua .github/.
-# Cung quy tac voi box/gh-guard.sh (sensitive_local); doi o day thi doi ca ben do.
+# 1) chan push thang len main/master. 2) repo "co secret" (sensitive_local trong hook): chan moi ref (nhanh va tag) ma CAY .github/ khac voi
+# gia tri hien tai cua ref do tren remote (ref moi: nhanh mac dinh), tru khi chu da duyet dung commit do (guard_allow).
+# Khoi "shared rule" giong het khoi trong box/gh-guard.sh (test/gh-guard.test.mjs so sanh); doi o day thi doi ca ben do.
 hook_text() {
   cat <<'HOOK'
 #!/bin/sh
 # Box guard: never push directly to main/master. Work on box/<topic>, then merge through a PR.
-# Repo with secrets (a workflow on origin's default branch reads secrets other than GITHUB_TOKEN, or owner/repo is listed in
-# ~/.config/fcode/sensitive-repos; an unreadable default branch counts as one): a push whose new commits change .github/ is refused.
-s=; w=' dùng secret trong workflow'
-sensitive() {
-  [ -z "$s" ] || return "$s"
-  s=0
-  f="$HOME/.config/fcode/sensitive-repos"
-  [ -f "$f" ] && sed 's/#.*//; s/[[:space:]]//g' "$f" | grep -qixF -- "$slug" && return 0
-  b=$(git symbolic-ref -q refs/remotes/origin/HEAD) || b=
-  for c in refs/remotes/origin/main refs/remotes/origin/master; do [ -n "$b" ] || ! git rev-parse -q --verify "$c" >/dev/null || b=$c; done
-  [ -n "$b" ] || { w=': không xác định được nhánh chính; coi là repo có secret'; return 0; }
-  m=$(git grep -ohiE 'secrets[[:space:]]*(\.[[:space:]]*[a-z0-9_-]+|\[)|tojson\([[:space:]]*secrets|secrets:[[:space:]]*inherit' "$b" -- .github/workflows 2>/dev/null)
-  case $? in
-    1) s=1;;
-    0) printf '%s\n' "$m" | tr -d ' \t' | grep -qvixF secrets.github_token || s=1;;
-    *) w=': không đọc được workflow trên nhánh chính; coi là repo có secret';;
-  esac
-  return "$s"
+# Repo with secrets (sensitive_local below; the pushed tree counts too, so a first secret added on a branch is seen): every pushed ref, branch
+# or tag, whose TREE under .github/ differs from what the remote ref holds now (a new ref: origin's default branch) is refused, unless the
+# owner approved that exact commit (guard_allow). A difference that cannot be computed counts as one. Deletes push.
+# Not a security boundary (git push --no-verify skips it): it stops mistakes and shortcuts; the deploy keys are VPS forced-command keys.
+# >>> shared rule (the same text in box/gh-guard.sh; a test keeps them equal)
+# listed <owner/repo>: 0 = the owner listed it in ~/.config/fcode/sensitive-repos (one per line, any case, # comments)
+listed() { [ -f "$HOME/.config/fcode/sensitive-repos" ] && sed 's/#.*//; s/[[:space:]]//g' "$HOME/.config/fcode/sensitive-repos" | grep -qixF -- "$1"; }
+# default_ref: $db = origin's default branch (origin/HEAD, else origin/main, else origin/master); 1 = none
+default_ref() {
+  db=$(git symbolic-ref -q refs/remotes/origin/HEAD) || db=
+  for sr_c in refs/remotes/origin/main refs/remotes/origin/master; do [ -n "$db" ] || ! git rev-parse -q --verify "$sr_c" >/dev/null || db=$sr_c; done
+  [ -n "$db" ]
 }
+# sensitive_local <owner/repo> [tree]: 0 = the repo of this clone has secrets: it is listed; origin's default branch cannot be resolved; or a
+# file under .github/ (any depth, workflows and actions) on that branch, or on [tree], contains "secrets" in any case. Unreadable = secrets.
+# $why ends the refusal message.
+sensitive_local() {
+  why=' dùng secret trong workflow'
+  listed "$1" && return 0
+  default_ref || { why=': không xác định được nhánh chính; coi là repo có secret'; return 0; }
+  for sr_t in "$db" ${2:+"$2"}; do
+    git grep -qiF secrets "$sr_t" -- ':(top).github' 2>/dev/null
+    case $? in 0) return 0;; 1) ;; *) why=': không đọc được .github/; coi là repo có secret'; return 0;; esac
+  done
+  return 1
+}
+# guard_allow <owner/repo> <sha> <push|merge>: 0 = the owner approved exactly this commit: ~/.config/fcode/guard-allow/<owner>__<repo>__<sha>
+# (lower case, a plain file of mode 600, made by the Architect only after the owner's explicit Yes). Each use adds one line to
+# ~/.local/state/fcode/guard-allow.log (UTC time, repo, sha, push|merge); no log line, no allow. $ga = the file.
+guard_allow() {
+  case "$2" in *[!0-9a-f]*) return 1;; esac
+  [ "${#2}" -eq 40 ] || return 1
+  ga=$HOME/.config/fcode/guard-allow/$(printf '%s__%s__%s' "${1%%/*}" "${1#*/}" "$2" | tr '[:upper:]' '[:lower:]')
+  [ -f "$ga" ] && [ ! -L "$ga" ] && [ "$(stat -c %a "$ga" 2>/dev/null)" = 600 ] || return 1
+  mkdir -p "$HOME/.local/state/fcode" && printf '%s %s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" "$3" >>"$HOME/.local/state/fcode/guard-allow.log"
+}
+# <<< shared rule
 u=${2:-$(git config --get remote.origin.url)}; u=${u%/}; u=${u%.git}; o=${u%/*}; slug=${o##*[/:]}/${u##*/}
 # shellcheck disable=SC2034,SC2162 # git's four fields; refs and object names hold no backslash
 while read local_ref local_sha remote_ref remote_sha; do
@@ -56,13 +74,11 @@ while read local_ref local_sha remote_ref remote_sha; do
     refs/heads/main|refs/heads/master) echo "pre-push: pushing to ${remote_ref#refs/heads/} is blocked on this box; push a box/<topic> branch and merge via PR" >&2; exit 1;;
   esac
   case "$local_sha" in *[!0]*) ;; *) continue;; esac
-  x=; case "$remote_sha" in *[!0]*) ! git cat-file -e "$remote_sha^{commit}" 2>/dev/null || x=$remote_sha;; esac
-  if r=$(git rev-list "$local_sha" --not --remotes ${x:+"$x"} 2>/dev/null); then
-    p=$(printf '%s\n' "$r" | git diff-tree --stdin -r --root -c --name-only --no-commit-id 2>/dev/null) || p=.github/
-  else p=.github/; fi
-  if printf '%s\n' "$p" | grep -q '^"\{0,1\}\.github/' && sensitive; then
-    echo "pre-push: $slug$w; sửa .github/ ở repo này cần chủ duyệt — báo fcoding, không tự đẩy." >&2; exit 1
-  fi
+  base=; case "$remote_sha" in *[!0]*) base=$remote_sha;; *) ! default_ref || base=$db;; esac
+  [ -n "$base" ] && git diff-tree --quiet -r "$base" "$local_sha" -- ':(top).github' 2>/dev/null && continue
+  sensitive_local "$slug" "$local_sha" || continue
+  guard_allow "$slug" "$local_sha" push && continue
+  echo "pre-push: $slug$why; sửa .github/ ở repo này cần chủ duyệt — báo fcoding, không tự đẩy (commit $local_sha)." >&2; exit 1
 done
 exit 0
 HOOK

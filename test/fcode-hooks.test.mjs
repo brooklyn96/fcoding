@@ -106,6 +106,20 @@ test('fcode-hooks: no hook text or an unreadable config ends with exit 2 and cha
   } finally { done(e); }
 });
 
+test('fcode-hooks [astra P2]: a relative core.hooksPath (.git/hooks) is read from the project, not from where fcode-hooks runs', { skip }, () => {
+  const e = world();
+  try {
+    const rel = e.repo('rel'); fs.writeFileSync(path.join(rel, '.git', 'hooks', 'pre-push'), OLD_HOOK, { mode: 0o755 });
+    e.git('-C', rel, 'config', '--local', 'core.hooksPath', '.git/hooks');
+    const away = e.repo('away'); e.git('-C', away, 'config', '--local', 'core.hooksPath', '../other-hooks'); // relative, but outside the clone's hooks
+    fs.writeFileSync(e.cfg, JSON.stringify({ projects: { rel, away } }));
+    const r = spawnSync('bash', [SCRIPT], { cwd: e.root, encoding: 'utf8', env: e.env }); // the cwd has no .git/hooks of its own
+    assert.deepEqual([r.status, r.stdout], [1, 'HOOK_OK rel\nHOOK_FAIL away hookspath\n'], r.stderr);
+    assert.equal(fs.readFileSync(path.join(rel, '.git', 'hooks', 'pre-push'), 'utf8'), HOOK);
+    assert.equal(e.hooksPath(rel), '.git/hooks', 'left as the project had it');
+  } finally { done(e); }
+});
+
 test('install.sh installs fcode-hooks and the gh guard, runs fcode-hooks once the config exists, and a failing run never aborts the install', { skip }, () => {
   const install = fs.readFileSync(path.join(here, '..', 'install.sh'), 'utf8');
   assert.match(install, /\n\[ ! -f "\$SRC\/box\/fcode-hooks\.sh" \] \|\| install -D -m 755 "\$SRC\/box\/fcode-hooks\.sh" "\$HOME\/\.local\/bin\/fcode-hooks"\n/);
