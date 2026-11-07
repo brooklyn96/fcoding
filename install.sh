@@ -24,8 +24,9 @@ mkdir -p "$APP"
 [ ! -f "$SRC/box/fcode-add-run.sh" ] || install -D -m 755 "$SRC/box/fcode-add-run.sh" "$HOME/.local/bin/fcode-add"
 # puts the current pre-push hook (fcode-add.sh --hook-text) into every project already added: ~/.local/bin/fcode-hooks (run below, once the config exists)
 [ ! -f "$SRC/box/fcode-hooks.sh" ] || install -D -m 755 "$SRC/box/fcode-hooks.sh" "$HOME/.local/bin/fcode-hooks"
-# the box's gh: ~/.local/bin/gh, ahead of /usr/bin/gh on PATH; refuses a self-merge of a .github change, gh api writes and graphql in repos
-# with secrets, aliases and extensions; passes every other call to /usr/bin/gh unchanged (docs/HUONG-DAN.md, "Sửa workflow từ box")
+# the box's gh: ~/.local/bin/gh, ahead of /usr/bin/gh on PATH; refuses a self-merge of a .github change in a repo not in
+# ~/.config/fcode/no-secret-repos, every non-GET gh api, graphql, aliases and extensions; passes every other call to /usr/bin/gh unchanged
+# (docs/HUONG-DAN.md, "Sửa workflow từ box")
 [ ! -f "$SRC/box/gh-guard.sh" ] || install -D -m 755 "$SRC/box/gh-guard.sh" "$HOME/.local/bin/gh"
 
 mkdir -p "$CFG"
