@@ -451,10 +451,12 @@ const HARNESS_OF = { anthropic: 'claude', 'openai-codex': 'codex' };
 const OMP_HARNESS = { anthropic: 'claude', 'claude-agent-sdk': 'claude', 'openai-codex': 'codex' };
 const PLAN_LABELS = { free: 'Free', plus: 'Plus', pro: 'Pro', max: 'Max', team: 'Team', business: 'Business', enterprise: 'Enterprise', edu: 'Edu' };
 // USD per million tokens: [input, output, cache read, cache write 5 min, cache write 1 h] (absent = input rate; 1 h absent = 2 x input).
-// Source: LiteLLM model_prices_and_context_window.json (github.com/BerriAI/litellm, main), read 2026-11-07 (gpt-6* keys: gpt-6-astra, gpt-6-sol,
-// gpt-6-luna, gpt-6.1-sol, gpt-6.1-terra; they match developers.openai.com/api/docs/pricing). gpt-6-cyber, gpt-6-rosalind and gpt-6-astra-law have
-// no cache write rate in what was read: that one is billed at the input rate. Used only for logs that carry no cost of their own (Claude Code,
-// Codex); omp logs carry their own cost. An unknown model counts tokens, never dollars.
+// Sources: Claude and gpt-5* rows: LiteLLM model_prices_and_context_window.json (github.com/BerriAI/litellm, main), read 2026-10-26. gpt-6-astra,
+// gpt-6-sol, gpt-6-luna, gpt-6.1-sol, gpt-6.1-terra: LiteLLM, read 2026-11-07, matching the OpenAI model pages (developers.openai.com/api/docs/models/<model>).
+// gpt-6-cyber, gpt-6-rosalind, gpt-6-astra-law: OpenAI pricing page (developers.openai.com/api/docs/pricing), read 2026-11-07, and for gpt-6-cyber its
+// model page (cache writes $25). The model pages of gpt-6-rosalind and gpt-6-astra-law could not be read, so their cache write rate was not read
+// and is billed at the input rate. Used only for logs that carry no cost of their own (Claude Code, Codex); omp logs carry their own cost. An
+// unknown model counts tokens, never dollars.
 export const PRICES = {
   'claude-opus-5-5': [4, 20, 0.2, 5, 8], 'claude-opus-5': [5, 25, 0.5, 6.25, 10], 'claude-opus-4-8': [5, 25, 0.5, 6.25, 10],
   'claude-opus-4-7': [5, 25, 0.5, 6.25, 10], 'claude-opus-4-6': [5, 25, 0.5, 6.25, 10], 'claude-opus-4-5': [5, 25, 0.5, 6.25, 10],
@@ -468,13 +470,18 @@ export const PRICES = {
   'gpt-5-mini': [0.25, 2, 0.025], 'gpt-5-nano': [0.05, 0.4, 0.005],
   'gpt-6-astra': [10, 50, 1, 12.5], 'gpt-6-sol': [2, 10, 0.2, 2.5], 'gpt-6-luna': [0.1, 0.5, 0.01, 0.125],
   'gpt-6.1-sol': [2, 10, 0.1, 2.5], 'gpt-6.1-terra': [1, 5, 0.05, 1.25],
-  'gpt-6-cyber': [20, 100, 2], 'gpt-6-rosalind': [15, 75, 1.5], 'gpt-6-astra-law': [10, 50, 1],
+  'gpt-6-cyber': [20, 100, 2, 25], 'gpt-6-rosalind': [15, 75, 1.5], 'gpt-6-astra-law': [10, 50, 1],
 };
-// Rates for one request of more than 272,000 input tokens (LiteLLM *_above_272k_tokens: input and output; OpenAI's model page: "2x input and
-// cache rates and 1.5x output", so cache read and write are 2 x the base rate). Only the models LiteLLM gives a tier for; gpt-6.1-sol has none
-// (no long-context surcharge on subscription usage).
+// Rates for one request of more than 272,000 input tokens. The app shows API list price (docs/HUONG-DAN.md), so the API rule applies to the
+// whole request: 2x input and cache (read and write) rates, 1.5x output. Stated on each model page: gpt-6-astra
+// (developers.openai.com/api/docs/models/gpt-6-astra), gpt-6-sol (.../gpt-6-sol), gpt-6.1-sol (.../gpt-6.1-sol), gpt-6.1-terra
+// (.../gpt-6.1-terra), gpt-6-luna (.../gpt-6-luna); LiteLLM's *_above_272k_tokens numbers (astra, sol) agree. gpt-6-cyber, gpt-6-rosalind and
+// gpt-6-astra-law: no long-context rule was read, so they keep the base rates.
 const LONG_CTX_TOKENS = 272000;
-const LONG_PRICES = { 'gpt-6-astra': [20, 75, 2, 25], 'gpt-6-sol': [4, 15, 0.4, 5] };
+const LONG_PRICES = {
+  'gpt-6-astra': [20, 75, 2, 25], 'gpt-6-sol': [4, 15, 0.4, 5], 'gpt-6.1-sol': [4, 15, 0.2, 5],
+  'gpt-6.1-terra': [2, 7.5, 0.1, 2.5], 'gpt-6-luna': [0.2, 0.75, 0.02, 0.25],
+};
 // LiteLLM bills these suffixes at the base model's rate (gpt-5.1-codex-max = gpt-5.1, gpt-5.2-chat-latest = gpt-5.2)
 const SAME_PRICE_SUFFIX = /-(?:codex-max|codex|chat-latest|chat|search-api)$/;
 // the PRICES key of a model: exact name (date suffix dropped), then the base of a same-price variant; any other variant has none
@@ -597,7 +604,7 @@ export function codexChildMeta(p) {
     || (p?.source !== null && typeof p?.source === 'object' && p.source.subagent !== undefined && p.source.subagent !== null);
 }
 const epochSec = (t) => { const ms = Date.parse(t); return Number.isFinite(ms) ? Math.floor(ms / 1000) : null; };
-// Codex (~/.codex/sessions, archived_sessions): token_count events; st carries the session, account and model of the file.
+// Codex (token_count events of the sessions and archived_sessions of every Codex home, see codexRoots); st carries the session, account and model of the file.
 // Replay gate (Pane CodexReplayGate): a child file replays its parent's history, task_started lines included (with the parent's
 // older started_at), before its own first live turn. The gate opens at the first task_started whose started_at is at or after
 // the child's session_meta timestamp (seconds); with no such timestamp, at or after that task_started line's own second.

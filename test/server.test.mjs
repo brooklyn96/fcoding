@@ -3467,8 +3467,9 @@ test('Codex prices: gpt-6 family, cache write out of plain input, long-context t
     [[10, 50, 1, 12.5], [2, 10, 0.2, 2.5], [2, 10, 0.1, 2.5], [0.1, 0.5, 0.01, 0.125], [1, 5, 0.05, 1.25], [10, 50, 1, 12.5]]);
   assert.equal(priceOf('gpt-6-nova'), null);
   // both sides of 272,000: the long rates need MORE than 272,000 input tokens
-  assert.deepEqual([priceFor('gpt-6-astra', 272000), priceFor('gpt-6-astra', 272001), priceFor('gpt-6-sol', 272001), priceFor('gpt-6.1-sol', 900000), priceFor('nope', 900000)],
-    [[10, 50, 1, 12.5], [20, 75, 2, 25], [4, 15, 0.4, 5], [2, 10, 0.1, 2.5], null]);
+  assert.deepEqual([priceFor('gpt-6-astra', 272000), priceFor('gpt-6-astra', 272001), priceFor('gpt-6-sol', 272001), priceFor('gpt-6.1-sol', 272000), priceFor('gpt-6.1-sol', 272001),
+    priceFor('gpt-6.1-terra', 272001), priceFor('gpt-6-luna', 272001), priceFor('gpt-6-cyber', 900000), priceFor('gpt-5.5', 900000), priceFor('nope', 900000)],
+    [[10, 50, 1, 12.5], [20, 75, 2, 25], [4, 15, 0.4, 5], [2, 10, 0.1, 2.5], [4, 15, 0.2, 5], [2, 7.5, 0.1, 2.5], [0.2, 0.75, 0.02, 0.25], [20, 100, 2, 25], [5, 30, 0.5], null]);
   const run = (model, last, total) => {
     const st = { file: 'f' };
     return [{ timestamp: '2026-10-25T09:00:00Z', type: 'turn_context', payload: { model } }, gptTc('2026-10-25T09:00:10Z', last, total)].map((v) => codexLine(v, st)).filter(Boolean)[0];
@@ -3480,7 +3481,16 @@ test('Codex prices: gpt-6 family, cache write out of plain input, long-context t
   near(run('gpt-6-astra', usage(300000, 200000, 50000, 2000)).usd, 2.8);
   near(run('gpt-6-astra', usage(272000, 0, 0, 0)).usd, 2.72); // at the limit: base rate
   near(run('gpt-6-astra', usage(272001, 0, 0, 0)).usd, 272001 * 20 / 1e6);
-  near(run('gpt-6.1-sol', usage(300000, 100000, 0, 1000)).usd, 0.42); // no long-context tier for gpt-6.1-sol
+  // 2x input and cache rates, 1.5x output for the whole request: 200,000 x 4 + 100,000 x 0.2 + 1,000 x 15
+  near(run('gpt-6.1-sol', usage(300000, 100000, 0, 1000)).usd, 0.835);
+  near(run('gpt-6.1-sol', usage(272000, 0, 0, 0)).usd, 272000 * 2 / 1e6); // at the limit: base rate
+  near(run('gpt-6.1-sol', usage(272001, 0, 0, 0)).usd, 272001 * 4 / 1e6);
+  near(run('gpt-6.1-terra', usage(272000, 0, 0, 0)).usd, 272000 * 1 / 1e6);
+  near(run('gpt-6.1-terra', usage(300000, 0, 0, 1000)).usd, (300000 * 2 + 1000 * 7.5) / 1e6);
+  near(run('gpt-6-luna', usage(272000, 0, 0, 0)).usd, 272000 * 0.1 / 1e6);
+  near(run('gpt-6-luna', usage(272001, 0, 0, 0)).usd, 272001 * 0.2 / 1e6);
+  near(run('gpt-5.5', usage(900000, 0, 0, 0)).usd, 900000 * 5 / 1e6); // a model with no long-context tier: base rate at any size
+  near(run('gpt-6-cyber', usage(1000, 0, 400, 0)).usd, (600 * 20 + 400 * 25) / 1e6); // gpt-6-cyber cache write $25
   // no last_token_usage: a delta of totals may span several requests, so the size is unknown and the base rates apply
   near(run('gpt-6-astra', undefined, usage(300000, 0, 0, 0)).usd, 3);
   // a cache write rate missing from the table: the input rate; a write larger than the plain input is capped to it
@@ -3523,8 +3533,8 @@ test('Codex roots: default home plus ~/.codex-* and ~/.codex-accounts/*, symlink
     const accounts = [{ id: 'openai-codex/1', harness: 'codex', resets: { target: 'openai-codex/1' }, windows: [] }, { id: 'openai-codex/2', harness: 'codex', resets: { target: 'openai-codex/2' }, windows: [] }];
     const { perAccount, totals } = spendView(events, accounts, new Map([['codex:acct-a', 'openai-codex/1'], ['codex:acct-b', 'openai-codex/2']]), T0, 'UTC');
     assert.deepEqual(perAccount.get('openai-codex/1').last30, { usd: 3.335, tokens: 403000 }); // 0.535 + 2.8, once
-    assert.deepEqual(perAccount.get('openai-codex/2').last30, { usd: 0.42, tokens: 301000 });
-    assert.deepEqual(totals.spend.last30, { usd: 3.755, tokens: 704000 });
+    assert.deepEqual(perAccount.get('openai-codex/2').last30, { usd: 0.835, tokens: 301000 }); // gpt-6.1-sol above 272,000: long-context rates
+    assert.deepEqual(totals.spend.last30, { usd: 4.17, tokens: 704000 });
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
