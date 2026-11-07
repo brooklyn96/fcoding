@@ -18,6 +18,7 @@
    - [Thêm dự án từ app](#thêm-dự-án-từ-app)
    - [Gửi ảnh trong chat](#gửi-ảnh-trong-chat)
    - [Deploy từ box (`fcode-deploy`)](#deploy-từ-box-fcode-deploy)
+   - [Sửa workflow từ box](#sửa-workflow-từ-box)
 8. [Dùng từ laptop](#8-dùng-từ-laptop)
    - [Lệnh `fcode` (tùy chọn)](#lệnh-fcode-tùy-chọn)
    - [Chép chữ và dán ảnh từ laptop](#chép-chữ-và-dán-ảnh-từ-laptop)
@@ -445,6 +446,40 @@ fcode-deploy <tên> trust off
 - Mã thoát là mã của cổng (0 xong, 1 bị từ chối hoặc rollback, 65 yêu cầu sai hoặc chưa được duyệt, 69 dịch vụ chết, 70 cần người xử lý). Riêng 65 cũng là mã khi lệnh từ chối ngay trên box (tên, sha, bản nháp sai: chưa gửi gì); 1 là lỗi công cụ (thiếu cấu hình, `gh` lỗi); 255 là ssh không nối được (kể cả khoá máy chủ chưa có trong `known_hosts`).
 - `add` từ chối (65) khi repo còn lượt Actions đang chạy hoặc đang chờ, và khi khoá deploy của repo có quyền ghi (kiểm tra cả sau khi vừa thêm). Chưa có `--yes` thì không bao giờ gửi `register`.
 - Các project cũ `deal-sync` và `vps-scraper` dùng khoá riêng của chúng, không qua lệnh này.
+
+### Sửa workflow từ box
+
+Token `gh` của box có quyền sửa workflow (`.github/workflows`). Ở repo có secret của Actions (ví dụ khoá deploy của `deal-sync`, `vps-scraper`), ai sửa được workflow là đọc được secret đó. GitHub Free không cho khoá secret theo nhánh ở repo riêng tư, và token của box không xem được repo nào có secret, nên box không đoán: chỉ repo bạn đã xác nhận **không có secret nào** mới được tự sửa `.github/`; mọi repo khác thì việc sửa `.github/` cần bạn duyệt.
+
+**Danh sách repo không có secret:** file `~/.config/fcode/no-secret-repos` trên box, mỗi dòng một tên repo trên GitHub dạng `chủ/repo` (ví dụ `brooklyn96/VPS-Tracker`, không phải tên dự án; hoa thường gì cũng được; `#` là chú thích). Quy tắc:
+
+- Chỉ ghi một repo khi trang GitHub của repo đó, mục **Settings → Secrets and variables → Actions → Repository secrets**, **trống hẳn**. Secret còn sót lại từ một workflow đã xoá vẫn tính là có secret. Chỉ bạn xem và thêm được secret, nên chỉ bạn trả lời được câu này.
+- Không có file = không repo nào được tự sửa `.github/`. File không đọc được, không phải file thường, hay có byte NUL cũng tính như không có file. Repo mới thêm bằng `fcode add` bắt đầu ở ngoài danh sách.
+- Ngày nào bạn thêm secret vào một repo trong danh sách, xoá dòng của repo đó ngay hôm đó.
+
+Box chặn ở hai chỗ:
+
+- **Khi đẩy code (hook `pre-push`):** mỗi nhánh hoặc tag được đẩy lên phải có thư mục `.github/` giống hệt bản đang có của nhánh đó trên GitHub, hoặc giống nhánh chính (`origin/main`). "Không có `.github/` nào" không bao giờ là chuẩn để so: xoá `.github/` đang có cũng là sửa `.github/`, và khi box không có cả hai chuẩn (bản clone `--single-branch` đẩy nhánh mới, repo còn rỗng, hay repo có nhánh chính khác `main`/`master` mà box chưa biết) thì mọi commit đều bị chặn, kèm dòng `pre-push: <chủ/repo>: không có nhánh nào để so .github/ …` chỉ cách sửa: `git remote set-head origin --auto` rồi đẩy lại (repo còn trống: bạn tạo nhánh chính trên GitHub trước, ví dụ thêm README). Chỉ commit thử của `fcode add` (cây hoàn toàn rỗng) luôn đẩy được. Không giống cái nào (hay không so sánh được) mà repo không có trong danh sách và bạn chưa duyệt commit đó thì bị từ chối, kèm dòng `pre-push: <chủ/repo>: .github/ của commit <mã> khác với nhánh trên remote và với nhánh chính …`. Thường đó là nhánh cũ hơn `origin/main` (bạn vừa sửa `.github/` trên main): đưa nhánh lên `origin/main` (chưa đẩy lần nào: `git rebase origin/main`; đã đẩy: `git merge origin/main`) rồi đẩy lại, không cần hỏi bạn. Đẩy lùi nhánh về commit cũ có `.github/` khác cũng bị chặn. Sửa file ngoài `.github/` vẫn đẩy bình thường; xoá nhánh vẫn được; đẩy thẳng lên `main` / `master` vẫn bị chặn như trước.
+- **Lệnh `gh` của box:** ở repo không có trong danh sách, `gh pr merge` một PR có sửa `.github/` (kể cả đổi tên file ra khỏi `.github/`, hay khi không đọc đủ danh sách file) bị từ chối (mã 65): `gh-guard: PR #<số> sửa .github/ ở repo không có trong ~/.config/fcode/no-secret-repos (head <mã>); box không merge …` — bạn merge PR đó trên GitHub. Ở repo đó `--auto` bị chặn hẳn, và mỗi lần merge được cho qua đều bị ghim vào đúng commit box đã kiểm tra (`--match-head-commit`). Ở mọi repo: `gh api` chỉ cho qua lệnh đọc (GET), mọi lệnh ghi (`-X POST/PUT/PATCH/DELETE`, hay có `-f` / `-F` / `--input`) và mọi `gh api graphql` bị chặn — dùng lệnh `gh` tương ứng (`gh pr`, `gh issue`, `gh release`, `gh workflow` …). `gh alias`, `gh extension`, alias, extension và tên tắt của `gh` bị chặn: gõ lệnh `gh` đầy đủ. Cờ lạ hay thiếu giá trị trong `gh pr merge` / `gh api` bị chặn; `--help` không làm lệnh thoát kiểm tra (xem trợ giúp bằng `gh help pr merge`). Mọi lệnh `gh` khác chạy như cũ.
+
+**Cần sửa workflow ở repo không có trong danh sách thì làm thế này:**
+
+1. Agent đưa nhánh `box/...` lên `origin/main` **trước** (`git fetch origin`, rồi rebase hoặc merge như trên), sửa và commit, rồi hỏi bạn: `fcode-notify <dự án> needs-yes "<một dòng: sửa gì, commit nào>"`. Agent không tự đẩy, không tự merge.
+2. Bạn xem thay đổi và trả lời rõ "Yes" cho đúng commit đó.
+3. Chỉ sau câu Yes của bạn, phiên chính (Architect) tạo file cho phép gắn với đúng commit: `~/.config/fcode/guard-allow/<chủ>__<repo>__<mã commit 40 ký tự>` (file thường, chữ thường; ví dụ `brooklyn96__bd-team-project__<mã>`). Agent con không bao giờ tự tạo file này.
+4. Hook cho đẩy đúng commit đó. Đẩy xong, Architect xoá file. Commit sau đó chỉ cần hỏi lại khi `.github/` của nó khác bản đã có trên GitHub (hook sẽ chặn); commit chỉ sửa code, hay merge lại `origin/main` mà `.github/` trên main không đổi, thì đẩy bình thường.
+5. Agent mở PR rồi báo `fcode-notify <dự án> merge-ready "<một dòng>" <link PR>`. **Bạn** merge PR trên GitHub; box không merge PR sửa `.github/` ở repo ngoài danh sách (file cho phép không dùng cho merge).
+
+Hai lớp này nằm trên box, chỉ chặn lỗi và lối tắt của agent, không phải hàng rào an ninh. Những đường sau box **không** chặn, đã biết và chấp nhận:
+
+- gọi thẳng `/usr/bin/gh` hay `/bin/gh`, `git push --no-verify`, đẩy lên remote khác, gọi API GitHub không qua `gh` (`curl`, `python` với token), chạy thẳng file của một extension — tức một tiến trình cầm token và cố tình lách. Chốt thật ở đây là khoá deploy trên VPS: khoá của `deal-sync` và `vps-scraper` chỉ được chạy cổng deploy;
+- lệnh viết lắt léo (đường dẫn mã hoá, YAML viết kiểu thoát ký tự): box không còn đọc nội dung để quyết định, và lệnh GET không ghi được gì (REST; GraphQL qua GET chỉ đọc được lược đồ);
+- một người khác đổi head của PR A→B→A đúng lúc giữa lần box kiểm tra và lần merge (mọi thay đổi head khác đều bị `--match-head-commit` chặn);
+- nhánh mới được so với `origin/main` đang có trên box (có thể cũ): nó chỉ đẩy lại được `.github/` mà main từng có — nên tạo nhánh từ `origin/main` vừa `git fetch`;
+- repo trong danh sách mà sau đó có secret, cho tới khi bạn xoá dòng của nó;
+- `gh secret set` / `gh variable set`: token của box không có quyền đó.
+
+Cài và cập nhật: `bash install.sh` cài `~/.local/bin/gh` (lớp chặn trước `/usr/bin/gh`) và `~/.local/bin/fcode-hooks`, rồi chạy `fcode-hooks` để đưa hook mới vào mọi dự án đã thêm (mỗi dự án một dòng `HOOK_OK`, `HOOK_EXISTS` hoặc `HOOK_FAIL <lý do>`). `HOOK_OK` / `HOOK_EXISTS` kèm `HEAD_OK` hoặc `HEAD_FAIL`: `fcode-hooks` (và `fcode add` sau khi tải repo) hỏi GitHub nhánh chính của repo (`git remote set-head origin --auto`, tối đa 20 giây) để hook có cái mà so; `HEAD_FAIL` (mạng lỗi, repo còn trống) không làm hỏng gì, chỉ là hook có thể chặn nhánh mới cho tới khi lệnh đó chạy được. Chạy lại `fcode-hooks` lúc nào cũng được. Sau đó Architect hỏi bạn từng repo (Repository secrets có trống không) và chỉ ghi vào `~/.config/fcode/no-secret-repos` những repo bạn xác nhận trống.
 
 ## 8. Dùng từ laptop
 

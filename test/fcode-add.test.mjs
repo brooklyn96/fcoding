@@ -1094,3 +1094,338 @@ test('push destination: when BOTH the https URL and the key alias are rewritten 
     tmpClean(e);
   } finally { done(e); }
 });
+
+// ---- the box pre-push hook itself (fcode-add.sh --hook-text), run by a real `git push` into a local bare o/r.git ----
+// Test groups 1a-1f and 2 are the matrix of /tmp/ai-work/fcoding/wf-guard/DECISION-r2.md, REWORK items 1 and 2.
+const GH_MSG = (sha) => `pre-push: o/r: .github/ của commit ${sha} khác với nhánh trên remote và với nhánh chính (hoặc không so sánh được). Nhánh cũ hơn origin/main? đưa nhánh lên origin/main (chưa đẩy: git rebase origin/main; đã đẩy: git merge origin/main) rồi đẩy lại. Thật sự sửa .github/? repo không có trong ~/.config/fcode/no-secret-repos nên cần chủ duyệt — báo fcoding, không tự đẩy.\n`;
+// the refusal when there is nothing to compare with (no remote ref, no default branch on the box): names set-head
+const NB_MSG = (sha) => `pre-push: o/r: không có nhánh nào để so .github/ của commit ${sha} (nhánh này chưa có trên remote, box chưa biết nhánh chính origin/HEAD). Chạy: git remote set-head origin --auto rồi đẩy lại; repo còn trống thì chủ tạo nhánh chính trên GitHub trước. Thật sự sửa .github/? repo không có trong ~/.config/fcode/no-secret-repos nên cần chủ duyệt — báo fcoding, không tự đẩy.\n`;
+const refusedNB = (r, sha) => { assert.notEqual(r.status, 0); assert.ok(r.stderr.includes(NB_MSG(sha)), r.stderr); };
+const DEPLOY_WF = 'jobs:\n  d:\n    env:\n      K: ${{ secrets.DEPLOY_SSH_KEY }}\n';
+// <root>/o/r.git with README (and .github/workflows/ci.yml = workflow, unless undefined) on main; <root>/c is a clone of it with the box hook
+function hookWorld(workflow) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pc-hk-'));
+  const e = { root, home: path.join(root, 'home'), remote: path.join(root, 'o', 'r.git'), dir: path.join(root, 'c'), seed: path.join(root, 'seed') };
+  fs.mkdirSync(e.home);
+  e.commit = (dir, file, text) => {
+    fs.mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
+    fs.writeFileSync(path.join(dir, file), text);
+    sh('git', ['-C', dir, 'add', '-A'], e);
+    sh('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-C', dir, 'commit', '-q', '-m', file], e);
+    return gitOr(e, dir, 'rev-parse', 'HEAD');
+  };
+  sh('git', ['init', '-q', '--bare', '-b', 'main', e.remote], e);
+  sh('git', ['init', '-q', '-b', 'main', e.seed], e);
+  e.commit(e.seed, 'README.md', 'hello\n');
+  if (workflow !== undefined) e.commit(e.seed, '.github/workflows/ci.yml', workflow);
+  sh('git', ['-C', e.seed, 'push', '-q', e.remote, 'main'], e);
+  sh('git', ['clone', '-q', e.remote, e.dir], e);
+  const text = spawnSync('bash', [SCRIPT, '--hook-text'], { encoding: 'utf8' });
+  assert.equal(text.status, 0);
+  fs.mkdirSync(path.join(e.dir, '.git', 'hooks'), { recursive: true });
+  fs.writeFileSync(path.join(e.dir, '.git', 'hooks', 'pre-push'), text.stdout, { mode: 0o755 });
+  e.push = (...a) => spawnSync('git', ['-C', e.dir, 'push', '-q', ...a], { encoding: 'utf8', env: { PATH: process.env.PATH, HOME: e.home, GIT_CONFIG_NOSYSTEM: '1' } });
+  e.at = (ref) => gitOr(e, e.remote, 'rev-parse', '-q', '--verify', ref);
+  e.git = (...a) => sh('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-C', e.dir, ...a], e);
+  e.list = (text) => { const f = path.join(e.home, '.config', 'fcode', 'no-secret-repos'); fs.mkdirSync(path.dirname(f), { recursive: true }); if (text === undefined) fs.rmSync(f, { force: true }); else fs.writeFileSync(f, text); };
+  e.ownerChangesMain = (text) => { e.commit(e.seed, '.github/workflows/ci.yml', text); sh('git', ['-C', e.seed, 'push', '-q', e.remote, 'main'], e); e.git('fetch', '-q', 'origin'); };
+  return e;
+}
+const pushed = (r) => assert.equal(r.status, 0, r.stderr);
+// refused with the one .github message naming that commit (a RegExp: another message)
+const refused = (r, want) => { assert.notEqual(r.status, 0); if (want instanceof RegExp) assert.match(r.stderr, want); else assert.ok(r.stderr.includes(GH_MSG(want)), r.stderr); };
+
+test('hook 1f: --hook-text prints the hook alone (exit 0, no R line), valid sh; shellcheck -s sh finds nothing (when shellcheck is installed)', { skip }, (t) => {
+  const r = spawnSync('bash', [SCRIPT, '--hook-text'], { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^#!\/bin\/sh\n# Box guard: never push directly to main\/master/);
+  assert.ok(!/^R /m.test(r.stdout));
+  assert.equal(spawnSync('sh', ['-n'], { input: r.stdout }).status, 0);
+  if (spawnSync('sh', ['-c', 'command -v shellcheck >/dev/null']).status !== 0) { t.diagnostic('shellcheck not installed: not run'); return; }
+  const sc = spawnSync('shellcheck', ['-s', 'sh', '-'], { input: r.stdout, encoding: 'utf8' });
+  assert.equal(sc.status, 0, sc.stdout + sc.stderr);
+});
+
+test('hook 1a: unlisted repo: a branch or tag whose .github/ matches neither the remote ref nor main is refused (new branch, update, force-push, tags); src-only and deletes push; main and master stay blocked', { skip }, () => {
+  const e = hookWorld(DEPLOY_WF);
+  try {
+    e.git('switch', '-q', '-c', 'box/a');
+    e.commit(e.dir, 'src.txt', 'x\n');
+    pushed(e.push('origin', 'box/a')); // new branch (zero remote sha), .github as on main
+    e.commit(e.dir, 'src.txt', 'y\n');
+    pushed(e.push('origin', 'box/a')); // update, src only
+    const before = e.at('refs/heads/box/a');
+    const sha = e.commit(e.dir, '.github/workflows/ci.yml', 'jobs: {}\n');
+    refused(e.push('origin', 'box/a'), sha); // update of an existing branch
+    refused(e.push('origin', 'HEAD:refs/heads/box/b'), sha); // the same commit on a new branch
+    refused(e.push('origin', 'HEAD:refs/tags/t1'), sha); // lightweight tag
+    e.git('tag', '-a', '-m', 'x', 't2', 'HEAD');
+    refused(e.push('origin', 'refs/tags/t2'), gitOr(e, e.dir, 'rev-parse', 'refs/tags/t2')); // annotated tag: git hands over the tag object
+    assert.deepEqual([e.at('refs/heads/box/a'), e.at('refs/heads/box/b'), e.at('refs/tags/t1'), e.at('refs/tags/t2')], [before, '', '', '']);
+    // force-push: a rewritten branch without a .github change pushes; one with it is refused
+    e.git('reset', '-q', '--hard', 'origin/main');
+    e.commit(e.dir, 'other.txt', 'y\n');
+    pushed(e.push('--force', 'origin', 'box/a'));
+    e.git('reset', '-q', '--hard', 'origin/main');
+    const dep = e.commit(e.dir, '.github/dependabot.yml', 'version: 2\n');
+    refused(e.push('--force', 'origin', 'box/a'), dep);
+    // deleting a branch is no change to .github
+    pushed(e.push('origin', ':box/a'));
+    assert.equal(e.at('refs/heads/box/a'), '');
+    // main and master stay blocked as before, whatever the commits hold, listed or not
+    e.git('reset', '-q', '--hard', 'origin/main');
+    e.commit(e.dir, 'src.txt', 'z\n');
+    for (const list of [undefined, 'o/r\n']) {
+      e.list(list);
+      refused(e.push('origin', 'HEAD:main'), /pre-push: pushing to main is blocked on this box; push a box\/<topic> branch and merge via PR/);
+      refused(e.push('origin', 'HEAD:refs/heads/master'), /pre-push: pushing to master is blocked on this box/);
+    }
+  } finally { done(e); }
+});
+
+test('hook 1a [astra 2]: the TREE under .github/ is compared, not new commits: a force-push to an older main commit, a new branch or a tag there are refused', { skip }, () => {
+  const e = hookWorld(DEPLOY_WF);
+  try {
+    const old = gitOr(e, e.dir, 'rev-parse', 'HEAD'); // main as first cloned (workflow v1)
+    e.ownerChangesMain(DEPLOY_WF + '# v2: the owner tightened the ref check\n');
+    e.git('switch', '-q', '-c', 'box/f', 'origin/main');
+    e.commit(e.dir, 'src.txt', 'x\n');
+    pushed(e.push('origin', 'box/f'));
+    const before = e.at('refs/heads/box/f');
+    refused(e.push('--force', 'origin', `${old}:refs/heads/box/f`), old); // every commit of it is already on origin/main
+    assert.equal(e.at('refs/heads/box/f'), before);
+    refused(e.push('origin', `${old}:refs/heads/box/g`), old);
+    refused(e.push('origin', `${old}:refs/tags/v0`), old);
+    e.git('tag', '-a', '-m', 'x', 'v1', old);
+    refused(e.push('origin', 'refs/tags/v1'), gitOr(e, e.dir, 'rev-parse', 'refs/tags/v1'));
+    assert.deepEqual([e.at('refs/heads/box/g'), e.at('refs/tags/v0'), e.at('refs/tags/v1')], ['', '', '']);
+    pushed(e.push('origin', 'origin/main:refs/tags/same')); // the same .github as main
+  } finally { done(e); }
+});
+
+test('hook 1a [astra r3]: removing the .github/ a base has is a change: refused (update, new branch, tags, also with no local default branch when the remote ref has it); listed or approved: pushed; a whole-empty-tree commit (fcode add\'s probe) pushes', { skip }, () => {
+  const e = hookWorld(DEPLOY_WF);
+  try {
+    e.git('switch', '-q', '-c', 'box/c');
+    e.commit(e.dir, 'src.txt', 'x\n');
+    pushed(e.push('origin', 'box/c')); // the remote branch now holds main's .github
+    const before = e.at('refs/heads/box/c');
+    e.git('rm', '-q', '-r', '.github');
+    e.git('commit', '-q', '-m', 'drop .github');
+    const sha = gitOr(e, e.dir, 'rev-parse', 'HEAD');
+    refused(e.push('origin', 'box/c'), sha); // update of a branch that has .github
+    refused(e.push('origin', 'HEAD:refs/heads/box/d'), sha); // new branch: main has .github
+    refused(e.push('origin', 'HEAD:refs/tags/c1'), sha); // lightweight tag
+    e.git('tag', '-a', '-m', 'x', 'c2', 'HEAD');
+    refused(e.push('origin', 'refs/tags/c2'), gitOr(e, e.dir, 'rev-parse', 'refs/tags/c2')); // annotated tag
+    // no origin/HEAD and no origin/main on the box: the remote branch is still a base with .github
+    e.git('remote', 'set-head', 'origin', '-d');
+    e.git('update-ref', '-d', 'refs/remotes/origin/main');
+    refused(e.push('origin', 'box/c'), sha);
+    e.git('fetch', '-q', 'origin');
+    e.git('remote', 'set-head', 'origin', 'main');
+    assert.deepEqual([e.at('refs/heads/box/c'), e.at('refs/heads/box/d'), e.at('refs/tags/c1'), e.at('refs/tags/c2')], [before, '', '', '']);
+    // fcode add's probe: a commit whose whole tree is empty pushes, as a new branch and over a branch with .github
+    const probe = e.git('commit-tree', e.git('hash-object', '-t', 'tree', '-w', '/dev/null'), '-m', 'probe');
+    pushed(e.push('origin', `${probe}:refs/heads/box/fcode-add-check-x`));
+    pushed(e.push('--force', 'origin', `${probe}:refs/heads/box/c`));
+    pushed(e.push('--force', 'origin', `${before}:refs/heads/box/c`));
+    // the owner's way: approval file for that commit, or the repo listed
+    const dir = path.join(e.home, '.config', 'fcode', 'guard-allow'); fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `o__r__${sha}`), '');
+    pushed(e.push('origin', 'box/c'));
+    fs.rmSync(path.join(dir, `o__r__${sha}`));
+    refused(e.push('origin', 'HEAD:refs/heads/box/d'), sha);
+    e.list('o/r\n');
+    pushed(e.push('origin', 'HEAD:refs/heads/box/d'));
+    assert.deepEqual([e.at('refs/heads/box/c'), e.at('refs/heads/box/d')], [sha, sha]);
+  } finally { done(e); }
+});
+
+test('hook 1b: a repo listed in ~/.config/fcode/no-secret-repos (any case, # comments) pushes .github/ changes; no file, another slug, a NUL byte, a directory or an unreadable file: refused', { skip }, () => {
+  const e = hookWorld(DEPLOY_WF);
+  try {
+    e.git('switch', '-q', '-c', 'box/l');
+    const sha = e.commit(e.dir, '.github/workflows/ci.yml', 'on: push\n');
+    refused(e.push('origin', 'box/l'), sha); // no list file: nothing is allowed
+    e.list('o/r2\nx/o/r\nother/repo # o/r\n');
+    refused(e.push('origin', 'box/l'), sha); // listed under other slugs only
+    // astra r4: a malformed list allows nothing (grep would split lines at a NUL); a list that is not a readable regular file neither
+    // The two NUL cases are the ones that guard the R6 fix; the directory and unreadable cases already failed closed before it (kept as cover).
+    const listFile = path.join(e.home, '.config', 'fcode', 'no-secret-repos');
+    const bad = [['NUL', () => e.list('other/repo\0o/r\n')], ['NUL beside a valid line', () => e.list('other/repo\0\nO/R\n')],
+      ['directory', () => { e.list(undefined); fs.mkdirSync(listFile); }]];
+    if (process.getuid?.() !== 0) bad.push(['unreadable', () => { fs.rmSync(listFile, { recursive: true, force: true }); e.list('o/r\n'); fs.chmodSync(listFile, 0); }]);
+    for (const [what, make] of bad) {
+      make();
+      const r = e.push('origin', 'box/l');
+      assert.ok(r.status !== 0 && r.stderr.includes(GH_MSG(sha)), `${what}: ${r.stderr}`);
+    }
+    fs.rmSync(listFile, { recursive: true, force: true });
+    e.list('other/repo\no/r\n'); // the same bytes without the NUL: listed
+    pushed(e.push('origin', 'HEAD:refs/heads/box/l2'));
+    e.list('# repos whose Actions secrets page the owner saw empty\nother/repo\n  O/R  # this one\n');
+    pushed(e.push('origin', 'box/l'));
+    pushed(e.push('origin', 'HEAD:refs/tags/l1'));
+    assert.equal(e.at('refs/heads/box/l'), sha);
+  } finally { done(e); }
+});
+
+test('hook 1c: syncing with origin/main: a pushed branch merges origin/main after the owner changed .github/ and pushes; a never-pushed old branch is refused until rebased; a third .github/ is refused', { skip }, () => {
+  const e = hookWorld(DEPLOY_WF);
+  try {
+    e.git('switch', '-q', '-c', 'box/p');
+    e.commit(e.dir, 'src.txt', 'x\n');
+    pushed(e.push('origin', 'box/p')); // pushed box branch, src only
+    e.git('switch', '-q', '-c', 'box/n', 'main');
+    e.commit(e.dir, 'src2.txt', 'n\n'); // never pushed, forked before the owner's change
+    e.ownerChangesMain(DEPLOY_WF + '# owner edit\n');
+    // review-r2 P2: the mandatory `git merge origin/main` of a pushed branch
+    e.git('switch', '-q', 'box/p');
+    e.git('merge', '-q', '--no-edit', 'origin/main');
+    pushed(e.push('origin', 'box/p'));
+    // O3: a never-pushed branch from before the change: git fetch does not help, git rebase origin/main does
+    e.git('switch', '-q', 'box/n');
+    e.git('fetch', '-q', 'origin');
+    refused(e.push('origin', 'box/n'), gitOr(e, e.dir, 'rev-parse', 'HEAD'));
+    e.git('rebase', '-q', 'origin/main');
+    pushed(e.push('origin', 'box/n'));
+    // .github/ equal to neither the remote branch nor main
+    e.git('switch', '-q', '-c', 'box/x', 'origin/main');
+    const third = e.commit(e.dir, '.github/workflows/ci.yml', 'on: pull_request\n');
+    refused(e.push('origin', 'box/x'), third);
+    e.git('switch', '-q', 'box/p'); // an update of a pushed branch, too
+    const other = e.commit(e.dir, '.github/workflows/other.yml', 'on: push\n');
+    refused(e.push('origin', 'box/p'), other);
+  } finally { done(e); }
+});
+
+test('hook 1d: with no origin/HEAD and no origin/main|master (a clone --single-branch, an empty repo) a new ref is compared with nothing: refused, .github/ or not, a .github/ deletion too; only a whole-empty-tree commit pushes; the remote ref stays a base; a dangling origin/HEAD is no default branch (set-head hint, or origin/main when there)', { skip }, () => {
+  const e = hookWorld(DEPLOY_WF);
+  try {
+    e.git('switch', '-q', '-c', 'box/p');
+    e.commit(e.dir, 'src.txt', 'x\n');
+    pushed(e.push('origin', 'box/p'));
+    // review-r5 P3: `git clone --single-branch -b box/p` has only refs/remotes/origin/box/p
+    const s = path.join(e.root, 'single');
+    sh('git', ['clone', '-q', '--single-branch', '-b', 'box/p', e.remote, s], e);
+    fs.copyFileSync(path.join(e.dir, '.git', 'hooks', 'pre-push'), path.join(s, '.git', 'hooks', 'pre-push'));
+    assert.deepEqual(gitOr(e, s, 'for-each-ref', '--format=%(refname)', 'refs/remotes/origin').split('\n'), ['refs/remotes/origin/box/p']);
+    const spush = (...a) => spawnSync('git', ['-C', s, 'push', '-q', ...a], { encoding: 'utf8', env: { PATH: process.env.PATH, HOME: e.home, GIT_CONFIG_NOSYSTEM: '1' } });
+    sh('git', ['-C', s, 'rm', '-q', '-r', '.github'], e);
+    sh('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-C', s, 'commit', '-q', '-m', 'drop .github'], e);
+    const del = gitOr(e, s, 'rev-parse', 'HEAD');
+    refusedNB(spush('origin', 'HEAD:refs/heads/box/q'), del); // new branch: no base, the deletion is a change
+    refusedNB(spush('origin', 'HEAD:refs/tags/q1'), del);
+    refused(spush('origin', 'HEAD:box/p'), del); // update: the remote ref has .github
+    sh('git', ['-C', s, 'reset', '-q', '--hard', 'origin/box/p'], e);
+    const src = e.commit(s, 'src2.txt', 'y\n');
+    pushed(spush('origin', 'HEAD:box/p')); // update outside .github: the remote ref is the base
+    refusedNB(spush('origin', 'HEAD:refs/heads/box/r'), src); // the same commit as a new ref: nothing to compare with
+    const probe = gitOr(e, s, 'commit-tree', gitOr(e, s, 'hash-object', '-t', 'tree', '-w', '/dev/null'), '-m', 'probe');
+    pushed(spush('origin', `${probe}:refs/heads/box/fcode-add-check-x`)); // fcode add's probe
+    assert.deepEqual([e.at('refs/heads/box/q'), e.at('refs/tags/q1'), e.at('refs/heads/box/r'), e.at('refs/heads/box/p')], ['', '', '', src]);
+    // the same with origin/HEAD and origin/main deleted from a full clone
+    e.git('remote', 'set-head', 'origin', '-d');
+    e.git('update-ref', '-d', 'refs/remotes/origin/main');
+    e.git('switch', '-q', '-c', 'box/u', 'box/p');
+    const mainGithub = e.commit(e.dir, 'src3.txt', 'x\n');
+    refusedNB(e.push('origin', 'box/u'), mainGithub); // main's .github, nothing to compare with
+  } finally { done(e); }
+  // a repo with no .github/ at all, no default branch on the box: a new ref is refused too, until listed; then its remote ref is the base
+  const x = hookWorld(undefined);
+  try {
+    x.git('remote', 'set-head', 'origin', '-d');
+    x.git('update-ref', '-d', 'refs/remotes/origin/main');
+    x.git('switch', '-q', '-c', 'box/u');
+    const first = x.commit(x.dir, 'src.txt', 'x\n');
+    refusedNB(x.push('origin', 'box/u'), first); // no base at all: "no .github/" is no base
+    const probe = x.git('commit-tree', x.git('hash-object', '-t', 'tree', '-w', '/dev/null'), '-m', 'probe');
+    pushed(x.push('origin', `${probe}:refs/heads/box/fcode-add-check-x`));
+    x.list('o/r\n');
+    pushed(x.push('origin', 'box/u'));
+    x.list(undefined);
+    x.commit(x.dir, 'src.txt', 'y\n');
+    pushed(x.push('origin', 'box/u')); // the remote ref is the base
+    const sha = x.commit(x.dir, '.github/workflows/ci.yml', 'on: push\n');
+    refused(x.push('origin', 'box/u'), sha);
+    refusedNB(x.push('origin', 'HEAD:refs/heads/box/new'), sha);
+    // review-r7: the default branch renamed, then fetch --prune: origin/HEAD dangles; it is skipped, nothing else is left -> the set-head hint
+    x.git('symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/gone');
+    refusedNB(x.push('origin', 'HEAD:refs/heads/box/new'), sha);
+    // with origin/main there, a dangling origin/HEAD falls back to it: a new branch outside .github pushes, a .github change is refused
+    x.git('fetch', '-q', 'origin');
+    assert.equal(x.git('symbolic-ref', 'refs/remotes/origin/HEAD'), 'refs/remotes/origin/gone');
+    x.git('switch', '-q', '-c', 'box/w', 'origin/main');
+    x.commit(x.dir, 'src.txt', 'w\n');
+    pushed(x.push('origin', 'box/w'));
+    refused(x.push('origin', `${sha}:refs/heads/box/new`), sha);
+  } finally { done(x); }
+});
+
+test('hook 1e: an approval file for the exact commit lets it push and stays; another commit, a link or a directory does not', { skip }, () => {
+  const e = hookWorld(DEPLOY_WF);
+  try {
+    e.git('switch', '-q', '-c', 'box/a');
+    const sha = e.commit(e.dir, '.github/workflows/ci.yml', DEPLOY_WF + '# owner-approved edit\n');
+    const dir = path.join(e.home, '.config', 'fcode', 'guard-allow'); fs.mkdirSync(dir, { recursive: true });
+    const f = path.join(dir, `o__r__${sha}`);
+    fs.writeFileSync(path.join(dir, `o__r__${'0'.repeat(40)}`), '');
+    refused(e.push('origin', 'box/a'), sha); // another commit's file
+    const target = path.join(e.root, 'target'); fs.writeFileSync(target, 'x');
+    fs.symlinkSync(target, f);
+    refused(e.push('origin', 'box/a'), sha); // a link
+    fs.rmSync(f); fs.mkdirSync(f);
+    refused(e.push('origin', 'box/a'), sha); // a directory
+    fs.rmdirSync(f); fs.writeFileSync(f, '');
+    pushed(e.push('origin', 'box/a'));
+    assert.equal(e.at('refs/heads/box/a'), sha);
+    assert.ok(fs.existsSync(f), 'the hook never removes the file');
+    // the owner flow after the push: the Architect deletes the file; later work outside .github on that branch pushes (its remote ref is the base)
+    fs.rmSync(f);
+    e.commit(e.dir, 'src.txt', 'after approval\n');
+    pushed(e.push('origin', 'box/a'));
+    const later = e.commit(e.dir, '.github/workflows/ci.yml', DEPLOY_WF + '# a later edit, not approved\n');
+    refused(e.push('origin', 'box/a'), later);
+  } finally { done(e); }
+});
+
+test('add 2: a full add against an origin whose main has a workflow reading secrets, no list file: HOOK_OK, WRITE_OK, exit 0, probe branch deleted, the installed hook is --hook-text (token and key path)', { skip }, () => {
+  for (const extra of [{}, { FCODE_NO_TOKEN: '1' }]) {
+    const e = world('true');
+    try {
+      const remote = bare(e, 'o/r'); e.map('r');
+      const w = fs.mkdtempSync(path.join(e.root, 'wf-'));
+      sh('git', ['clone', '-q', remote, w], e);
+      fs.mkdirSync(path.join(w, '.github', 'workflows'), { recursive: true });
+      fs.writeFileSync(path.join(w, '.github', 'workflows', 'deploy.yml'), DEPLOY_WF);
+      sh('git', ['-C', w, 'add', '-A'], e);
+      sh('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-C', w, 'commit', '-q', '-m', 'deploy'], e);
+      sh('git', ['-C', w, 'push', '-q', 'origin', 'main'], e);
+      const r = run(e, 'o/r', 'r', extra);
+      const head = extra.FCODE_NO_TOKEN ? ['KEY_NEW', 'ALIAS_ADDED', 'READ_OK'] : ['TOKEN_OK', 'READ_OK'];
+      assert.deepEqual([r.code, r.codes], [0, [...head, 'CLONED', 'HOOK_OK', 'WRITE_OK', 'CFG_ADDED', ...TAIL]], r.stdout + r.stderr);
+      assert.equal(r.detail('HOOK_OK'), 'HEAD_OK'); // set-head asked the origin after the clone
+      assert.equal(fs.existsSync(path.join(e.home, '.config', 'fcode', 'no-secret-repos')), false);
+      assert.deepEqual(boxRefs(e, remote), []);
+      const dir = path.join(e.ws, 'r');
+      assert.ok(fs.existsSync(path.join(dir, '.github', 'workflows', 'deploy.yml')));
+      assert.equal(fs.readFileSync(path.join(dir, '.git', 'hooks', 'pre-push'), 'utf8'), spawnSync('bash', [SCRIPT, '--hook-text'], { encoding: 'utf8' }).stdout);
+      tmpClean(e);
+    } finally { done(e); }
+  }
+});
+
+test('add 2: a full add against an origin with no commits: exit 0, V_EMPTY_REPO, probe branch deleted', { skip }, () => {
+  const e = world('true');
+  try {
+    const remote = path.join(e.gh, 'o', 'r.git');
+    fs.mkdirSync(remote, { recursive: true });
+    sh('git', ['init', '-q', '--bare', '-b', 'main', remote], e);
+    const r = run(e, 'o/r', 'r');
+    assert.deepEqual([r.code, r.codes], [0, ['TOKEN_OK', 'READ_OK', 'CLONED', 'HOOK_OK', 'WRITE_OK', 'CFG_ADDED', 'V_EMPTY_REPO', 'V_PR_OK', 'V_HOOK_OK', 'V_SERVER_OK', 'RULES_NO']], r.stdout + r.stderr);
+    assert.equal(r.detail('HOOK_OK'), 'HEAD_FAIL'); // an empty origin has no default branch to name: best effort, the add goes on
+    assert.deepEqual(boxRefs(e, remote), []);
+    tmpClean(e);
+  } finally { done(e); }
+});
