@@ -24,18 +24,19 @@
 # 23 ten khoa/alias da dung cho repo khac, 20 khong tao duoc khoa, 12 clone loi.
 # Hook pre-push chuan cua box (fcode-hooks cai lai noi dung nay vao moi project da co: "fcode-add.sh --hook-text" chi in no ra roi thoat 0).
 # 1) chan push thang len main/master. 2) .github/: moi ref day len (nhanh va tag) ma CAY .github/ khong giong ref do tren remote va khong giong
-# nhanh chinh (origin/HEAD, origin/main, origin/master) deu bi chan; "khong co .github/" chi duoc tinh khi khong co ca hai (repo rong), va commit
-# co CA CAY rong (thu cua fcode add) luon qua: xoa .github/ dang co cung la sua. Tru khi repo co trong ~/.config/fcode/no-secret-repos (chu xac
-# nhan repo khong co secret nao) hoac chu da duyet dung commit do (guard_allow). Dong no_secret giong het dong trong box/gh-guard.sh (test so sanh).
+# nhanh chinh (origin/HEAD, origin/main, origin/master) deu bi chan; "khong co .github/" khong bao gio la chuan so sanh (xoa .github/ cung la sua;
+# khong co ca hai chuan, vd. clone --single-branch hay repo rong, thi moi commit deu bi coi la khac), chi commit co CA CAY rong (thu cua fcode add)
+# luon qua. Tru khi repo co trong ~/.config/fcode/no-secret-repos (chu xac nhan repo khong co secret nao) hoac chu da duyet dung commit do
+# (guard_allow). Dong no_secret giong het dong trong box/gh-guard.sh (test so sanh).
 hook_text() {
   cat <<'HOOK'
 #!/bin/sh
 # Box guard: never push directly to main/master. Work on box/<topic>, then merge through a PR.
 # .github/ guard: every pushed ref, branch or tag, whose TREE under .github/ equals neither what the remote ref holds now nor origin's default
-# branch is refused; "no .github/ at all" counts only when neither exists (a new ref with no default branch: an empty repo), so removing the
-# .github/ a base has is a change too; a commit whose WHOLE tree is empty (fcode add's probes) always pushes. Unless the repo is listed in
-# ~/.config/fcode/no-secret-repos (the owner confirmed it has no Actions repository secret) or the owner approved that exact commit
-# (guard_allow). A tree that cannot be compared counts as different.
+# branch is refused. "No .github/ at all" is never a base: removing .github/ is a change too, and with neither base (a clone --single-branch
+# of a new ref, an empty repo) every commit counts as different; only a commit whose WHOLE tree is empty (fcode add's probes) always pushes.
+# Unless the repo is listed in ~/.config/fcode/no-secret-repos (the owner confirmed it has no Actions repository secret) or the owner approved
+# that exact commit (guard_allow). A tree that cannot be compared counts as different.
 # Deletes push. Not a security boundary (git push --no-verify skips it): it stops mistakes and shortcuts.
 # no_secret <owner/repo>: 0 = listed in ~/.config/fcode/no-secret-repos (one GitHub slug per line, any case, # comments); a list that is not a
 # regular readable file or holds a NUL byte (grep would split lines there) allows nothing; the same line is in box/gh-guard.sh
@@ -65,7 +66,7 @@ while read local_ref local_sha remote_ref remote_sha; do
   esac
   case "$local_sha" in *[!0]*) ;; *) continue;; esac
   case "$remote_sha" in *[!0]*) same "$remote_sha" && continue;; esac
-  if default_ref; then same "$db" && continue; else case "$remote_sha" in *[!0]*) ;; *) same "$et" && continue;; esac; fi
+  default_ref && same "$db" && continue
   git diff-tree --quiet "$et" "$local_sha" 2>/dev/null && continue
   no_secret "$slug" && continue
   guard_allow "$slug" "$local_sha" && continue

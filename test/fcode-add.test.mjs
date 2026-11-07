@@ -1296,24 +1296,53 @@ test('hook 1c: syncing with origin/main: a pushed branch merges origin/main afte
   } finally { done(e); }
 });
 
-test('hook 1d: with no origin/HEAD and no origin/main|master a new branch carrying .github/ is refused and one with no .github/ at all pushes; an origin/HEAD to a missing ref compares as different', { skip }, () => {
+test('hook 1d: with no origin/HEAD and no origin/main|master (a clone --single-branch, an empty repo) a new ref is compared with nothing: refused, .github/ or not, a .github/ deletion too; only a whole-empty-tree commit pushes; the remote ref stays a base; an origin/HEAD to a missing ref compares as different', { skip }, () => {
   const e = hookWorld(DEPLOY_WF);
   try {
+    e.git('switch', '-q', '-c', 'box/p');
+    e.commit(e.dir, 'src.txt', 'x\n');
+    pushed(e.push('origin', 'box/p'));
+    // review-r5 P3: `git clone --single-branch -b box/p` has only refs/remotes/origin/box/p
+    const s = path.join(e.root, 'single');
+    sh('git', ['clone', '-q', '--single-branch', '-b', 'box/p', e.remote, s], e);
+    fs.copyFileSync(path.join(e.dir, '.git', 'hooks', 'pre-push'), path.join(s, '.git', 'hooks', 'pre-push'));
+    assert.deepEqual(gitOr(e, s, 'for-each-ref', '--format=%(refname)', 'refs/remotes/origin').split('\n'), ['refs/remotes/origin/box/p']);
+    const spush = (...a) => spawnSync('git', ['-C', s, 'push', '-q', ...a], { encoding: 'utf8', env: { PATH: process.env.PATH, HOME: e.home, GIT_CONFIG_NOSYSTEM: '1' } });
+    sh('git', ['-C', s, 'rm', '-q', '-r', '.github'], e);
+    sh('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-C', s, 'commit', '-q', '-m', 'drop .github'], e);
+    const del = gitOr(e, s, 'rev-parse', 'HEAD');
+    refused(spush('origin', 'HEAD:refs/heads/box/q'), del); // new branch: no base, the deletion is a change
+    refused(spush('origin', 'HEAD:refs/tags/q1'), del);
+    refused(spush('origin', 'HEAD:box/p'), del); // update: the remote ref has .github
+    sh('git', ['-C', s, 'reset', '-q', '--hard', 'origin/box/p'], e);
+    const src = e.commit(s, 'src2.txt', 'y\n');
+    pushed(spush('origin', 'HEAD:box/p')); // update outside .github: the remote ref is the base
+    refused(spush('origin', 'HEAD:refs/heads/box/r'), src); // the same commit as a new ref: nothing to compare with
+    const probe = gitOr(e, s, 'commit-tree', gitOr(e, s, 'hash-object', '-t', 'tree', '-w', '/dev/null'), '-m', 'probe');
+    pushed(spush('origin', `${probe}:refs/heads/box/fcode-add-check-x`)); // fcode add's probe
+    assert.deepEqual([e.at('refs/heads/box/q'), e.at('refs/tags/q1'), e.at('refs/heads/box/r'), e.at('refs/heads/box/p')], ['', '', '', src]);
+    // the same with origin/HEAD and origin/main deleted from a full clone
     e.git('remote', 'set-head', 'origin', '-d');
     e.git('update-ref', '-d', 'refs/remotes/origin/main');
-    e.git('switch', '-q', '-c', 'box/u');
-    const mainGithub = e.commit(e.dir, 'src.txt', 'x\n');
+    e.git('switch', '-q', '-c', 'box/u', 'box/p');
+    const mainGithub = e.commit(e.dir, 'src3.txt', 'x\n');
     refused(e.push('origin', 'box/u'), mainGithub); // main's .github, nothing to compare with
   } finally { done(e); }
+  // a repo with no .github/ at all, no default branch on the box: a new ref is refused too, until listed; then its remote ref is the base
   const x = hookWorld(undefined);
   try {
     x.git('remote', 'set-head', 'origin', '-d');
     x.git('update-ref', '-d', 'refs/remotes/origin/main');
     x.git('switch', '-q', '-c', 'box/u');
-    x.commit(x.dir, 'src.txt', 'x\n');
-    pushed(x.push('origin', 'box/u')); // no base at all (empty repo): the empty tree counts, no .github at all
-    x.commit(x.dir, 'src.txt', 'y\n');
+    const first = x.commit(x.dir, 'src.txt', 'x\n');
+    refused(x.push('origin', 'box/u'), first); // no base at all: "no .github/" is no base
+    const probe = x.git('commit-tree', x.git('hash-object', '-t', 'tree', '-w', '/dev/null'), '-m', 'probe');
+    pushed(x.push('origin', `${probe}:refs/heads/box/fcode-add-check-x`));
+    x.list('o/r\n');
     pushed(x.push('origin', 'box/u'));
+    x.list(undefined);
+    x.commit(x.dir, 'src.txt', 'y\n');
+    pushed(x.push('origin', 'box/u')); // the remote ref is the base
     const sha = x.commit(x.dir, '.github/workflows/ci.yml', 'on: push\n');
     refused(x.push('origin', 'box/u'), sha);
     refused(x.push('origin', 'HEAD:refs/heads/box/new'), sha);
