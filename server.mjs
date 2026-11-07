@@ -451,8 +451,12 @@ const HARNESS_OF = { anthropic: 'claude', 'openai-codex': 'codex' };
 const OMP_HARNESS = { anthropic: 'claude', 'claude-agent-sdk': 'claude', 'openai-codex': 'codex' };
 const PLAN_LABELS = { free: 'Free', plus: 'Plus', pro: 'Pro', max: 'Max', team: 'Team', business: 'Business', enterprise: 'Enterprise', edu: 'Edu' };
 // USD per million tokens: [input, output, cache read, cache write 5 min, cache write 1 h] (absent = input rate; 1 h absent = 2 x input).
-// Source: LiteLLM model_prices_and_context_window.json (github.com/BerriAI/litellm, main), read 2026-10-26. Used only for logs
-// that carry no cost of their own (Claude Code, Codex); omp logs carry their own cost. An unknown model counts tokens, never dollars.
+// Sources: Claude and gpt-5* rows: LiteLLM model_prices_and_context_window.json (github.com/BerriAI/litellm, main), read 2026-10-26. gpt-6-astra,
+// gpt-6-sol, gpt-6-luna, gpt-6.1-sol, gpt-6.1-terra: LiteLLM, read 2026-11-07, matching the OpenAI model pages (developers.openai.com/api/docs/models/<model>).
+// gpt-6-cyber, gpt-6-rosalind, gpt-6-astra-law: OpenAI pricing page (developers.openai.com/api/docs/pricing), read 2026-11-07, and for gpt-6-cyber its
+// model page (cache writes $25). The model pages of gpt-6-rosalind and gpt-6-astra-law could not be read, so their cache write rate was not read
+// and is billed at the input rate. Used only for logs that carry no cost of their own (Claude Code, Codex); omp logs carry their own cost. An
+// unknown model counts tokens, never dollars.
 export const PRICES = {
   'claude-opus-5-5': [4, 20, 0.2, 5, 8], 'claude-opus-5': [5, 25, 0.5, 6.25, 10], 'claude-opus-4-8': [5, 25, 0.5, 6.25, 10],
   'claude-opus-4-7': [5, 25, 0.5, 6.25, 10], 'claude-opus-4-6': [5, 25, 0.5, 6.25, 10], 'claude-opus-4-5': [5, 25, 0.5, 6.25, 10],
@@ -464,16 +468,38 @@ export const PRICES = {
   'gpt-5.3-codex': [1.75, 14, 0.175], 'gpt-5.2': [1.75, 14, 0.175], 'gpt-5.2-pro': [21, 168], 'gpt-5.1': [1.25, 10, 0.125],
   'gpt-5.1-codex-mini': [0.25, 2, 0.025], 'gpt-5': [1.25, 10, 0.125], 'gpt-5-pro': [15, 120], 'gpt-5-codex': [1.25, 10, 0.125],
   'gpt-5-mini': [0.25, 2, 0.025], 'gpt-5-nano': [0.05, 0.4, 0.005],
+  'gpt-6-astra': [10, 50, 1, 12.5], 'gpt-6-sol': [2, 10, 0.2, 2.5], 'gpt-6-luna': [0.1, 0.5, 0.01, 0.125],
+  'gpt-6.1-sol': [2, 10, 0.1, 2.5], 'gpt-6.1-terra': [1, 5, 0.05, 1.25],
+  'gpt-6-cyber': [20, 100, 2, 25], 'gpt-6-rosalind': [15, 75, 1.5], 'gpt-6-astra-law': [10, 50, 1],
+};
+// Rates for one request of more than 272,000 input tokens. The app shows API list price (docs/HUONG-DAN.md), so the API rule applies to the
+// whole request: 2x input and cache (read and write) rates, 1.5x output. Stated on each model page: gpt-6-astra
+// (developers.openai.com/api/docs/models/gpt-6-astra), gpt-6-sol (.../gpt-6-sol), gpt-6.1-sol (.../gpt-6.1-sol), gpt-6.1-terra
+// (.../gpt-6.1-terra), gpt-6-luna (.../gpt-6-luna); LiteLLM's *_above_272k_tokens numbers (astra, sol) agree. gpt-6-cyber, gpt-6-rosalind and
+// gpt-6-astra-law: no long-context rule was read, so they keep the base rates.
+const LONG_CTX_TOKENS = 272000;
+const LONG_PRICES = {
+  'gpt-6-astra': [20, 75, 2, 25], 'gpt-6-sol': [4, 15, 0.4, 5], 'gpt-6.1-sol': [4, 15, 0.2, 5],
+  'gpt-6.1-terra': [2, 7.5, 0.1, 2.5], 'gpt-6-luna': [0.2, 0.75, 0.02, 0.25],
 };
 // LiteLLM bills these suffixes at the base model's rate (gpt-5.1-codex-max = gpt-5.1, gpt-5.2-chat-latest = gpt-5.2)
 const SAME_PRICE_SUFFIX = /-(?:codex-max|codex|chat-latest|chat|search-api)$/;
-// exact name (date suffix dropped), then the base of a same-price variant; any other variant is unpriced
-export function priceOf(model) {
+// the PRICES key of a model: exact name (date suffix dropped), then the base of a same-price variant; any other variant has none
+function priceKey(model) {
   if (typeof model !== 'string') return null;
   const m = model.toLowerCase().replace(/^.*\//, '').replace(/-\d{8}$|-\d{4}-\d{2}-\d{2}$/, '');
-  if (Object.hasOwn(PRICES, m)) return PRICES[m];
+  if (Object.hasOwn(PRICES, m)) return m;
   const base = m.replace(SAME_PRICE_SUFFIX, '');
-  return base !== m && Object.hasOwn(PRICES, base) ? PRICES[base] : null;
+  return base !== m && Object.hasOwn(PRICES, base) ? base : null;
+}
+export function priceOf(model) {
+  const k = priceKey(model);
+  return k ? PRICES[k] : null;
+}
+// the rates for a request of inputTokens: the long-context rates above 272,000 when the model has them, else the base rates
+export function priceFor(model, inputTokens) {
+  const k = priceKey(model);
+  return k ? (inputTokens > LONG_CTX_TOKENS && LONG_PRICES[k]) || PRICES[k] : null;
 }
 const costOf = (p, { input = 0, output = 0, cacheRead = 0, w5m = 0, w1h = 0 }) =>
   (input * p[0] + output * p[1] + cacheRead * (p[2] ?? p[0]) + w5m * (p[3] ?? p[0]) + w1h * (p[4] ?? p[0] * 2)) / 1e6;
@@ -578,7 +604,7 @@ export function codexChildMeta(p) {
     || (p?.source !== null && typeof p?.source === 'object' && p.source.subagent !== undefined && p.source.subagent !== null);
 }
 const epochSec = (t) => { const ms = Date.parse(t); return Number.isFinite(ms) ? Math.floor(ms / 1000) : null; };
-// Codex (~/.codex/sessions, archived_sessions): token_count events; st carries the session, account and model of the file.
+// Codex (token_count events of the sessions and archived_sessions of every Codex home, see codexRoots); st carries the session, account and model of the file.
 // Replay gate (Pane CodexReplayGate): a child file replays its parent's history, task_started lines included (with the parent's
 // older started_at), before its own first live turn. The gate opens at the first task_started whose started_at is at or after
 // the child's session_meta timestamp (seconds); with no such timestamp, at or after that task_started line's own second.
@@ -613,12 +639,39 @@ export function codexLine(v, st) {
   const u = last ?? (tot && Object.fromEntries(Object.keys(tot).map((k) => [k, Math.max(0, num(tot[k]) - num(prevTot?.[k]))])));
   const ts = Date.parse(v.timestamp);
   if (!u || !Number.isFinite(ts)) return null;
+  // input_tokens is the whole prompt (real lines: total_tokens = input + output) and cached_input_tokens is part of it; cache writes are
+  // prompt tokens too, so they come out of the plain input and are billed at the cache write rate (none: the input rate).
   const input = num(u.input_tokens), cached = Math.min(input, num(u.cached_input_tokens)), output = num(u.output_tokens);
-  const pr = priceOf(str(p.info.model) ?? st.model);
-  return { ts, harness: 'codex', who: st.account ? `codex:${st.account}` : null, usd: pr ? costOf(pr, { input: input - cached, output, cacheRead: cached }) : null,
+  const written = Math.min(input - cached, num(u.cache_write_input_tokens));
+  // the long-context tier is per request: only last_token_usage is one request; a delta of totals may span several, so it keeps the base rates
+  const model = str(p.info.model) ?? st.model;
+  const pr = last ? priceFor(model, input) : priceOf(model);
+  return { ts, harness: 'codex', who: st.account ? `codex:${st.account}` : null,
+    usd: pr ? costOf(pr, { input: input - cached - written, output, cacheRead: cached, w5m: written }) : null,
     tokens: num(u.total_tokens) || input + output, key: `x:${st.session ?? st.file}:${totKey ?? ts}` };
 }
 const PREFILTER = { omp: (l) => l.includes('"usage"'), claude: (l) => l.includes('"assistant"'), codex: (l) => /token_count|turn_context|session_meta|task_started/.test(l) };
+// The Codex session directories to scan: the default home (CODEX_HOME or ~/.codex) plus every ~/.codex-* home and every ~/.codex-accounts/*
+// home (per-account CODEX_HOME of astra-rotate.js and the like), each one's sessions and archived_sessions. Each directory is resolved to
+// its real path and listed once, so a symlinked home (~/.codex -> ~/.codex-accounts/c2, c1/sessions -> .shared/sessions) is not read twice.
+// Read at every scan: a home created later is found without a restart.
+export async function codexRoots(homeDir, env = process.env) {
+  const homes = [env.CODEX_HOME || path.join(homeDir, '.codex')];
+  const addChildren = async (dir, pick) => {
+    let ents;
+    try { ents = await fs.promises.readdir(dir); } catch { return; }
+    for (const n of ents.filter(pick).sort()) homes.push(path.join(dir, n));
+  };
+  await addChildren(homeDir, (n) => n.startsWith('.codex-'));
+  await addChildren(path.join(homeDir, '.codex-accounts'), () => true);
+  const roots = new Set();
+  for (const h of homes) {
+    for (const d of ['sessions', 'archived_sessions']) {
+      try { roots.add(await fs.promises.realpath(path.join(h, d))); } catch {} // no such directory
+    }
+  }
+  return [...roots];
+}
 // Incremental: each file is read from where the last scan stopped (whole lines only); a file that shrank or was replaced is re-read.
 // Files not modified in the last 31 days are skipped; a file that disappears is dropped. Events stay per file, deduped when summed.
 export function spendScanner(roots, nowFn = Date.now) {
@@ -663,7 +716,7 @@ export function spendScanner(roots, nowFn = Date.now) {
     const cutoff = nowFn() - SCAN_DAYS * 86400e3;
     const seen = new Set();
     for (const kind of ['omp', 'claude', 'codex']) {
-      for (const dir of roots[kind] ?? []) {
+      for (const dir of typeof roots[kind] === 'function' ? await roots[kind]() : roots[kind] ?? []) {
         const list = [];
         await listFiles(dir, list);
         for (const file of list) {
@@ -1037,7 +1090,7 @@ export function createApp(opts = {}) {
   const spendRoots = opts.spendRoots ?? {
     omp: [path.join(home, '.omp', 'agent', 'sessions')],
     claude: [path.join(process.env.CLAUDE_CONFIG_DIR || path.join(home, '.claude'), 'projects')],
-    codex: ['sessions', 'archived_sessions'].map((d) => path.join(process.env.CODEX_HOME || path.join(home, '.codex'), d)),
+    codex: () => codexRoots(home),
   };
   const updatesFile = opts.updatesFile ?? path.join(home, '.local', 'state', 'fcode-update', 'status.json');
   const gitSyncFile = opts.gitSyncFile ?? path.join(home, '.local', 'state', 'fcode', 'git-sync.json');

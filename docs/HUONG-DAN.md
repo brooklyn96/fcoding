@@ -134,7 +134,7 @@ Màn hình chính của app lấy mọi thứ từ một địa chỉ của máy
 | Phần | Lấy từ đâu | Làm mới |
 |---|---|---|
 | Hạn mức Claude / Codex | `omp usage --json` (omp đã đăng nhập các tài khoản) | mỗi 60 giây |
-| Chi phí và số token | file nhật ký trên box: `~/.omp/agent/sessions`, `~/.claude/projects`, `~/.codex/sessions` | mỗi 5 phút, chỉ đọc phần mới thêm |
+| Chi phí và số token | file nhật ký trên box: `~/.omp/agent/sessions`, `~/.claude/projects`, và Codex ở các thư mục `sessions` và `archived_sessions` của `$CODEX_HOME` (hoặc `~/.codex`), của mọi `~/.codex-*` và mọi `~/.codex-accounts/*` (mỗi thư mục thật chỉ đọc một lần, kể cả khi có liên kết tượng trưng) | mỗi 5 phút, chỉ đọc phần mới thêm |
 | Pull request, CI | `gh` theo kho GitHub của từng dự án trong `config.json` | mỗi 2 phút |
 | Phiên bản công cụ | `~/.local/state/fcode-update/status.json` (omp, claude, codex) | mỗi lần mở |
 | Dự án chậm so với GitHub, cây chưa commit | `~/.local/state/fcode/git-sync.json` (timer `fcode-git-sync` trên box ghi) | mỗi lần mở |
@@ -146,6 +146,7 @@ Màn hình chính của app lấy mọi thứ từ một địa chỉ của máy
 - Một phần bị lỗi (ví dụ `gh` chưa đăng nhập) thì phần đó trống, các phần khác vẫn hiện. Hạn mức cũ được đánh dấu "cũ" nếu không làm mới được.
 - Màn hình chính luôn trả lời nhanh: phần nào đã có thì hiện ngay và được làm mới ở nền. Lần mở đầu tiên sau khi máy chủ khởi động, phần nào chưa đọc xong trong 8 giây thì tạm trống và hiện ở lần tải sau.
 - Chi phí là giá API niêm yết (bảng giá kèm trong `server.mjs`), không phải số tiền bạn trả theo gói. Chi phí của omp và của Codex được tính vào đúng tài khoản; chi phí từ Claude Code chạy riêng chỉ cộng vào tổng. Mẫu máy (model) không có trong bảng giá thì chỉ đếm token, không đoán tiền.
+- Bảng giá: Claude và gpt-5 lấy từ LiteLLM (đọc 26/10/2026); các mẫu gpt-6 lấy từ LiteLLM và trang giá của OpenAI (đọc 07/11/2026). Với Codex, phần ghi bộ nhớ đệm (cache write) được tính theo giá ghi riêng của mẫu máy đó (không có giá riêng thì tính như giá đầu vào) và không tính trùng với phần đầu vào thường. Một yêu cầu có hơn 272.000 token đầu vào thì cả yêu cầu đó tính gấp đôi giá đầu vào và bộ nhớ đệm, gấp rưỡi giá đầu ra (áp dụng cho gpt-6-astra, gpt-6-sol, gpt-6.1-sol, gpt-6.1-terra, gpt-6-luna, đúng như trang giá từng mẫu của OpenAI); nếu nhật ký không cho biết kích thước từng yêu cầu thì tính giá thường.
 - "Ước tính cả tuần" của một tài khoản chỉ tính phần chi phí đã biết là của tài khoản đó. Claude Code chạy riêng (và vài lệnh nhỏ của omp như đặt tên phiên) cũng dùng hạn mức tuần nhưng không biết thuộc tài khoản nào, nên khi có chúng con số ước tính sẽ thấp hơn thực tế.
 - Ngày (Hôm nay, Hôm qua, 30 ngày) tính theo giờ Việt Nam, bất kể box dùng múi giờ nào. Muốn đổi, thêm `"timeZone": "<múi giờ>"` (ví dụ `"Asia/Tokyo"`) vào `~/.fcoding/config.json`; máy chủ tự đọc lại, không cần khởi động lại.
 - `gh` cần `GH_TOKEN` để đọc kho. Token lấy từ file bí mật của box, `/run/instabox/secrets/env` (trên máy Oracle đây là liên kết tới `~/.config/fcode/secrets.env`, file nằm trên ổ đĩa):
