@@ -1068,13 +1068,16 @@ T 'L.plan-tunnel-remedies: a connector whose /config cannot be read (INV refuse 
   Reset-World; $W.PlanOut = @('INV refuse unmapped what=unit path=x.service'); $W.PlanCode = 65
   [void](Do-Plan -Want 65); NoText 'kiểm tra cổng metrics của connector'; NoText 'accept not-connector'
 }
-T 'L.check-connector-unit-remedy: check prints the B77 remedy right under the `unmapped what=connector` line of a unit (path= filled), once per unit, and none for a container (its remedy stays as it is: the label only) (B77)' {
+T 'L.check-connector-unit-remedy: check prints the remedy right under the `unmapped what=connector` line: a unit gets the B77 one (path= filled, once per unit), a container the metrics-port one (once), never the other kind''s (B77, B78 P3-Y)' {
+  $cr = 'kiểm tra cổng metrics của connector rồi chạy lại'
   Add-Fault -M old -Key '^plan:check$' -Rc 65 -Out @('INV refuse unmapped what=connector path=cloudflared.service', 'INV refuse unmapped what=connector path=other.service')
   $r = Run-Move @('check'); Eq $r.Code 65 "check exit ($($r.Text))"
   $l = @(Lines -Last); $i = [Array]::IndexOf($l, (& $ConnUnitRemedy 'cloudflared.service')); Ok ($i -ge 1) "remedy of the first unit: $($l -join ' | ')"
-  Ok ([Array]::IndexOf($l, (& $ConnUnitRemedy 'other.service')) -gt $i) 'remedy of the second unit after the first'; Eq (@($l | Where-Object { $_.Contains('accept not-connector') }).Count) 2 'once per unit'
-  Reset-World; Add-Fault -M old -Key '^plan:check$' -Rc 65 -Out @('INV refuse unmapped what=connector path=container:tunnel')
-  $r = Run-Move @('check'); Eq $r.Code 65 "check exit, container ($($r.Text))"; NoText 'accept not-connector'; NoText 'kiểm tra cổng metrics của connector'
+  Ok ([Array]::IndexOf($l, (& $ConnUnitRemedy 'other.service')) -gt $i) 'remedy of the second unit after the first'; Eq (@($l | Where-Object { $_.Contains('accept not-connector') }).Count) 2 'once per unit'; Eq (@($l | Where-Object { $_ -ceq $cr }).Count) 0 'no container remedy for a unit'
+  Reset-World; Add-Fault -M old -Key '^plan:check$' -Rc 65 -Out @('INV refuse unmapped what=connector path=container:tunnel', 'INV refuse unmapped what=connector path=container:other')
+  $r = Run-Move @('check'); Eq $r.Code 65 "check exit, container ($($r.Text))"; NoText 'accept not-connector'
+  $l = @(Lines -Last); $j = [Array]::IndexOf($l, $cr); Ok ($j -ge 1) "the container remedy after its line: $($l -join ' | ')"; Eq (@($l | Where-Object { $_ -ceq $cr }).Count) 1 'once'
+  Ok ($l[$j - 1] -ceq "${ConnLabel}: what=connector path=container:other") 'right under the last container line'
 }
 T 'L.connector-refusal-label: `INV refuse unmapped what=connector path=<p>` has its own owner label (B78 P3-U), not the extra-disk one of `unmapped`: in Format-MoveLine, in check and in plan; another `unmapped` form keeps the generic label' {
   Eq (Format-MoveLine 'INV refuse unmapped what=connector path=hc.service') "${ConnLabel}: what=connector path=hc.service" 'unit path'

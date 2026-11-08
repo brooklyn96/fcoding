@@ -2497,7 +2497,7 @@ function Invoke-MoveCheckCmd {
   $new = @($now | Where-Object { $prev -cnotcontains $_ }); $same = @($now | Where-Object { $prev -ccontains $_ })
   if ($new.Count) { Write-Host 'Mới so với lần check trước:'; Write-MoveLines $new; if ($same.Count) { Write-Host 'Như lần trước:' } }
   Write-MoveLines $same
-  Write-MoveConnectorUnitRemedies $now   # B77: the check prints the unit remedy under its line (a container's stays label-only here)
+  Write-MoveConnectorRemedies $now   # B77, B78 P3-Y: the check prints the remedy of a connector line under it, a unit's and a container's
   Write-PhienText $cp (ConvertTo-Json -InputObject ([pscustomobject][ordered]@{ at = (Format-MoveTs (Get-MoveNow)); lines = @($now) }) -Depth 4)
   $refused = @($now | Where-Object { $_ -cmatch '\A(INV refuse|MOVE error) ' }).Count -gt 0 -or $r.Code -ne 0
   if ($refused) { Write-Host 'check: có điểm sẽ bị từ chối khi plan (mã 65).'; return 65 }
@@ -2690,16 +2690,16 @@ function Read-MoveAnswer([string]$Text, [string[]]$Words) {
 function Set-MoveAnswer($S, [string]$Q, $A) { Set-MoveMapVal $S.answers $Q $A }
 function Set-MoveAsk($S, [hashtable]$Asked, [string]$Q, $A) { $Asked[$Q] = $true; Set-MoveAnswer $S $Q $(if ($A) { $A } else { 'không' }) }
 # CONTRACT §8.3.2 remedies of the B.12.4 tunnel refusals, wherever a plan form prints them: plan and the D.3 re-plan, with or without a
-# manifest (move-plan.sh _mvp_finalize), and the 0c plan <id> --check-only (the same discovery)
+# manifest (move-plan.sh _mvp_finalize), and the 0c plan <id> --check-only (the same discovery); the connector ones also in `check`
 # B77: `unmapped what=connector path=<unit>` (a unit, not `container:<name>`) gets the `accept not-connector <unit>` remedy once per unit;
-# a container path keeps the metrics-port remedy (once)
-function Write-MoveConnectorUnitRemedies($Lines) {
+# a container path gets the metrics-port remedy (once). B78 P3-Y: the same in `check` (MOVE.md App. D: the label is followed by the remedy of the same line)
+function Write-MoveConnectorRemedies($Lines) {
   foreach ($l in @($Lines)) { if ("$l" -cmatch '\AINV refuse unmapped what=connector path=(?!container:)(\S+)\z') { Write-Host (Get-MoveText 'connector-unit-remedy' @{ unit = $Matches[1] }) } }
+  if (@($Lines | Where-Object { "$_" -cmatch '\AINV refuse unmapped what=connector path=container:\S+\z' }).Count) { Write-Host (Get-MoveText 'connector-remedy') }   # B.12.4 (W1-T3-GAP-18)
 }
 function Write-MoveTunnelRemedies($Lines) {
   if (@($Lines | Where-Object { "$_" -cmatch '\AINV refuse own-ip path=ingress:\S+\z' }).Count) { Write-Host (Get-MoveText 'ingress-remedy') }   # B.12.4 (W1-T3-GAP-17)
-  Write-MoveConnectorUnitRemedies $Lines
-  if (@($Lines | Where-Object { "$_" -cmatch '\AINV refuse unmapped what=connector path=container:\S+\z' }).Count) { Write-Host (Get-MoveText 'connector-remedy') }   # B.12.4 (W1-T3-GAP-18)
+  Write-MoveConnectorRemedies $Lines
 }
 # D.2 steps 3-5 (and the D.3 re-plan): plan on old with the map, the laptop checks, the questions, plan again until INV ok or a refusal the
 # owner left. @{ Code; Mf; Map }
