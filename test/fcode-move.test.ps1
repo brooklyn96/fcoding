@@ -3924,22 +3924,23 @@ function Fx-StartBudget([int[]]$ConnListen = @(), [int]$Other = 0, [string]$Extr
   $h = @($W.Mf.holds); foreach ($x in $h) { $x['listen'] = @(& $mk $Other) }
   $ids = @($W.Mf.hold_sets.start); $conn = @()
   for ($i = 0; $i -lt $ConnListen.Count; $i++) { $c = New-Hold "cloudflared$($i + 1).service" 30; $c['listen'] = @(& $mk $ConnListen[$i]); $h += $c; $ids += $c.id; $conn += [ordered]@{ id = $c.id; kind = 'unit' } }
-  if ($Extra -ceq 'container') { $c = New-Hold 'container:tunnel' 30 'container'; $c['listen'] = @(& $mk 3); $h += $c; $ids += $c.id; $conn += [ordered]@{ id = $c.id; kind = 'container' } }
+  if ($Extra -cin 'container', 'container2') { foreach ($k in 1..$(if ($Extra -ceq 'container2') { 2 } else { 1 })) { $c = New-Hold "container:tunnel$k" 30 'container'; $c['listen'] = @(& $mk 3); $h += $c; $ids += $c.id; $conn += [ordered]@{ id = $c.id; kind = 'container' } } }
   if ($Extra -ceq 'unit-off-start') { $c = New-Hold 'cf-off.service' 30; $c['listen'] = @(& $mk 3); $h += $c; $conn += [ordered]@{ id = $c.id; kind = 'unit' } }   # a unit connector the start set does not hold
   Set-Holds $h $ids @($W.Mf.hold_sets.stop); $W.Mf.connectors = @($conn)
 }
-T 'L.budget-start: x.start, x.enable.N and r.start-src --budget = Σ start_budget_s of hold_sets.start + 60, + 60 when the start set holds a unit connector (connectors[] kind unit, id in hold_sets.start) + 20 per listener after the first, the listeners of a connector = max(1, |its hold''s listen[]|); boundary 0 / 1 / 3 listeners (ruling 06/11 (30), B36): one connector with 3 listeners +100, two connectors with one each +80; a container connector, a unit connector outside hold_sets.start and the listen[] of other holds add nothing' {
+T 'L.budget-start: x.start, x.enable.N and r.start-src --budget = Σ start_budget_s of hold_sets.start + 60, + 60 when the start set holds a unit connector (connectors[] kind unit, id in hold_sets.start) + 20 per listener after the first, the listeners of a connector = max(1, |its hold''s listen[]|); boundary 0 / 1 / 3 listeners (ruling 06/11 (30), B36): one connector with 3 listeners +100, two connectors with one each +80; + 40 + 180 per container connector of hold_sets.start (B70 P3-2: chore 0 can run the container ready check too, three docker inspects bounded at 60 s each), both terms when both kinds are there; a unit connector outside hold_sets.start and the listen[] of other holds add nothing' {
   $cases = @(
     @{ C = @(); O = 0; X = ''; T = 0 }, @{ C = @(); O = 3; X = ''; T = 0 },                                   # no unit connector: no term, whatever the listeners
     @{ C = @(0); O = 0; X = ''; T = 60 }, @{ C = @(1); O = 0; X = ''; T = 60 }, @{ C = @(0); O = 3; X = ''; T = 60 },   # one listener (an unpinned connector has its metrics listener)
     @{ C = @(3); O = 0; X = ''; T = 100 },                                                                   # one connector, three listeners
     @{ C = @(0, 0); O = 0; X = ''; T = 80 }, @{ C = @(1, 1); O = 0; X = ''; T = 80 },                          # two connectors, one listener each
     @{ C = @(3, 1); O = 0; X = ''; T = 120 }, @{ C = @(0, 0, 0); O = 0; X = ''; T = 100 }, @{ C = @(1, 1, 1); O = 0; X = ''; T = 100 },
-    @{ C = @(); O = 0; X = 'container'; T = 0 }, @{ C = @(1); O = 0; X = 'container'; T = 60 },
+    @{ C = @(); O = 0; X = 'container'; T = 220 }, @{ C = @(1); O = 0; X = 'container'; T = 280 }, @{ C = @(); O = 3; X = 'container'; T = 220 },   # container connector: 40 + 180, on top of the unit term
+    @{ C = @(); O = 0; X = 'container2'; T = 400 }, @{ C = @(3, 1); O = 0; X = 'container2'; T = 520 },                                       # two container connectors: 40 + 2 × 180; both kinds: both terms
     @{ C = @(); O = 0; X = 'unit-off-start'; T = 0 }, @{ C = @(3); O = 0; X = 'unit-off-start'; T = 100 })
   foreach ($c in $cases) {
     $term = $c.T; $tag = "[connector listen[] $(@($c.C) -join ','), others $($c.O), extra '$($c.X)']"
-    $sum = (3 + @($c.C).Count + $(if ($c.X -ceq 'container') { 1 } else { 0 })) * 60   # every hold of hold_sets.start has start_budget_s 60 (a unit connector too)
+    $sum = (3 + @($c.C).Count + $(if ($c.X -ceq 'container') { 1 } elseif ($c.X -ceq 'container2') { 2 } else { 0 })) * 60   # every hold of hold_sets.start has start_budget_s 60 (a connector too)
     Reset-World; Fx-StartBudget @($c.C) $c.O $c.X; Fx-Copied; [void](Do-Cutover -1)
     Eq (Budget-Of 'new' 'fwd-1-x.start') ($sum + 60 + $term) "$tag x.start = Σ + 60 + $term"; Eq (Budget-Of 'new' 'fwd-1-x.enable.1') ($sum + 60 + $term) "$tag x.enable.1"
     Reset-World; Fx-StartBudget @($c.C) $c.O $c.X; Fx-Copied; Add-Fault -M new -Key '^fwd-1-x\.final$' -Rc 1; [void](Do-Cutover 10)
