@@ -1953,6 +1953,11 @@ T 'L.chore-ufw-lockout: an adopt warning ufw-lockout is shown at copy and repeat
   Ok (@($t.Substring($i) -split "`n")[0] -match '22' -or $t.Substring($i) -match 'ufw enable') 'detail: port 22 / ufw enable'
   Eq (Get-St).phase 'cut' 'no rollback'
 }
+T 'L.own-ip-tracked-label: INV warn own-ip-tracked is shown with its §8.3.3 label (B72 (a)) and the path word; the label equals docs/MOVE.md App. E (L.texts-match-move-md)' {
+  $lab = 'File nằm trong repo git, giữ nguyên khi chuyển, không đổi IP; nếu IP đó là cấu hình đang chạy thì sửa trong repo rồi deploy lại'
+  Eq (Format-MoveLine 'INV warn own-ip-tracked path=/srv/app/conf.yml') "${lab}: path=/srv/app/conf.yml" 'label with the path word'
+  Eq (Format-MoveLine 'INV warn own-ip-tracked') $lab 'label alone'
+}
 T 'L.pkg-extra-label: INV warn pkg-extra (c.adopt.N, x.adopt) is shown with the cautious CONTRACT 8.3.3 label per line and no 8.3.2 remedy line (R10-INT-23, B22)' {
   $rem = 'xóa file mặc định đó rồi chạy lại'
   $lab = 'Có file lạ trong thư mục được chuyển, chưa bị xóa; chỉ xóa nếu chắc đây là file mặc định của gói vừa cài (vd sites-enabled/default); KHÔNG xóa file của chính máy mới (vd sudoers.d/90-cloud-init-users, netplan/50-cloud-init.yaml) — xóa nhầm có thể mất sudo hoặc mạng'
