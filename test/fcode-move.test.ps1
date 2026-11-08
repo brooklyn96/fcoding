@@ -1054,7 +1054,7 @@ T 'L.plan-ownip-other-kinds: an `INV refuse own-ip-nat path=<file>` or `own-ip-f
   [void](Do-Plan -Want 65); $q = @(Lines | Where-Object { $_ -cmatch '\ACác file sau chứa địa chỉ của máy cũ: ' }); Eq $q.Count 1 'the own-ip refusal beside the tracked warn asks once'
   Ok ($q[0].Contains('/etc/a.conf') -and -not $q[0].Contains('/opt/x/doc.md')) "Q-ownip lists /etc/a.conf only: $($q -join ' | ')"
   Eq (@(OwnipLines | Where-Object { $_.Contains('/opt/x/doc.md') }).Count) 0 'no rewrite own-ip line for the tracked file'; Ok (@(OwnipLines | Where-Object { $_ -cmatch '\Arewrite own-ip /etc/a\.conf(\s|\z)' }).Count -ge 1) "the map keeps rewrite own-ip /etc/a.conf: $(OwnipLines)"
-  HasText 'File nằm trong repo của một project gate, giữ nguyên khi chuyển, không đổi IP; nếu IP đó là cấu hình đang chạy thì sửa trong repo rồi deploy lại: path=/opt/x/doc.md'
+  HasText 'File nằm trong repo của project gate, giữ nguyên khi chuyển, không đổi IP; nếu IP đó là cấu hình đang chạy thì sửa trong repo rồi deploy lại: path=/opt/x/doc.md'
 }
 T 'L.plan-tunnel-remedies: a connector whose /config cannot be read (INV refuse unmapped what=connector path=<hold id>) ends plan 65 with the remedy "kiểm tra cổng metrics của connector rồi chạy lại"; another unmapped form gets no such remedy (B.12.4, W1-T3-GAP-18, CONTRACT §8.3.2)' {
   $W.PlanOut = @('INV refuse unmapped what=connector path=cloudflared.service'); $W.PlanCode = 65
@@ -1959,7 +1959,7 @@ T 'L.chore-ufw-lockout: an adopt warning ufw-lockout is shown at copy and repeat
   Eq (Get-St).phase 'cut' 'no rollback'
 }
 T 'L.own-ip-tracked-label: INV warn own-ip-tracked is shown with its §8.3.3 label (B72 (a)) and the path word; the label equals docs/MOVE.md App. E (L.texts-match-move-md)' {
-  $lab = 'File nằm trong repo của một project gate, giữ nguyên khi chuyển, không đổi IP; nếu IP đó là cấu hình đang chạy thì sửa trong repo rồi deploy lại'
+  $lab = 'File nằm trong repo của project gate, giữ nguyên khi chuyển, không đổi IP; nếu IP đó là cấu hình đang chạy thì sửa trong repo rồi deploy lại'
   Eq (Format-MoveLine 'INV warn own-ip-tracked path=/srv/app/conf.yml') "${lab}: path=/srv/app/conf.yml" 'label with the path word'
   Eq (Format-MoveLine 'INV warn own-ip-tracked') $lab 'label alone'
 }

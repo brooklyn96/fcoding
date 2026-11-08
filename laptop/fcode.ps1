@@ -1452,7 +1452,7 @@ warn back-new-only | Chỉ có trên máy mới, không mang về máy cũ
 warn rsync-version | Bản rsync trên máy cũ khác bản đã ghi
 warn ufw-lockout | Tường lửa máy mới để tắt vì luật hiện tại sẽ khóa phiên ssh; cần bật lại bằng tay
 warn pkg-extra | Có file lạ trong thư mục được chuyển, chưa bị xóa; chỉ xóa nếu chắc đây là file mặc định của gói vừa cài (vd sites-enabled/default); KHÔNG xóa file của chính máy mới (vd sudoers.d/90-cloud-init-users, netplan/50-cloud-init.yaml) — xóa nhầm có thể mất sudo hoặc mạng
-warn own-ip-tracked | File nằm trong repo của một project gate, giữ nguyên khi chuyển, không đổi IP; nếu IP đó là cấu hình đang chạy thì sửa trong repo rồi deploy lại
+warn own-ip-tracked | File nằm trong repo của project gate, giữ nguyên khi chuyển, không đổi IP; nếu IP đó là cấu hình đang chạy thì sửa trong repo rồi deploy lại
 error busy | Máy đang chạy một lệnh chuyển khác
 error no-manifest | Máy chưa có danh sách chuyển
 error no-move | Máy này chưa thuộc lần chuyển nào
