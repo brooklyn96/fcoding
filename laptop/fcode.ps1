@@ -2138,13 +2138,17 @@ function Get-MoveSwitchBudget($M) {
   $c = @(@(Get-MoveProp $M 'connectors' @()) | Where-Object { $_ -and [string]$_.kind -cin 'unit', 'container' }).Count
   60 + 140 * $c + 20 * (Get-MoveTunnelCount $M)
 }
-# K1 start row (x.start, x.enable.N, r.start-src; ruling 06/11 (30), B36): Σ start_budget_s of hold_sets.start + 60, + 60 when the start set
-# holds a unit connector (a connectors[] entry of kind unit whose id is in hold_sets.start), + 20 per listener after the first. N, the listeners
-# the rollback's ready check probes (lib/move-hold.sh _mvh_conn_check), = Σ over those connector holds of max(1, |holds[].listen[]|): the
-# entries pinned in the manifest, and at least the one metrics listener each connector has when none is pinned
+# K1 start row (x.start, x.enable.N, r.start-src; ruling 06/11 (30), B36; B70 P3-2): Σ start_budget_s of hold_sets.start + 60, then the two ready
+# checks chore 0 can run (lib/move-hold.sh _mvh_conn_check, each one MVH_CONN_READY_S 20 + MVH_CONN_STABLE_S 20 window of its own):
+# unit connectors (a connectors[] entry of kind unit whose id is in hold_sets.start): + 60, + 20 per listener after the first; N, the listeners
+# the check probes, = Σ over those connector holds of max(1, |holds[].listen[]|): the entries pinned in the manifest, and at least the one
+# metrics listener each connector has when none is pinned. Container connectors (kind container, id in hold_sets.start): + 40 (the two windows)
+# + 180 each: three `docker inspect` bounded at 60 s (the "was it running" read before the start, the ready probe, the stability re-probe).
+# Both kinds in the start set: both terms (the checks run one after the other)
 function Get-MoveStartBudget($M) {
   $ids = @(Get-MoveProp (Get-MoveProp $M 'hold_sets') 'start' @())
   $cid = @(@(Get-MoveProp $M 'connectors' @()) | Where-Object { $_ -and [string]$_.kind -ceq 'unit' -and $ids -ccontains [string]$_.id } | ForEach-Object { [string]$_.id })
+  $nct = @(@(Get-MoveProp $M 'connectors' @()) | Where-Object { $_ -and [string]$_.kind -ceq 'container' -and $ids -ccontains [string]$_.id }).Count
   $t = (Get-MoveSetBudget $M 'start' 'start_budget_s') + 60
   if ($cid.Count) {
     $n = 0
@@ -2154,6 +2158,7 @@ function Get-MoveStartBudget($M) {
     }
     $t += 60 + 20 * ($n - 1)
   }
+  if ($nct) { $t += 40 + 180 * $nct }
   $t
 }
 # K1 stop row (x.stop-src, x.stop-dst, r.stop-dst): Σ stop_budget_s of hold_sets.stop + 30 + 600 per Redis hold (counted as the redis[]
