@@ -1050,6 +1050,11 @@ T 'L.plan-ownip-other-kinds: an `INV refuse own-ip-nat path=<file>` or `own-ip-f
   }
   Reset-World; $W.PlanOut = @("INV refuse own-ip-nat path=$OwnipFile", "INV refuse own-ip path=/etc/hostview-turn.conf"); $W.PlanCode = 65; Ans 'không'
   [void](Do-Plan -Want 65); $q = @(Lines | Where-Object { $_ -cmatch '\ACác file sau chứa địa chỉ của máy cũ: ' }); Eq $q.Count 1 'a real own-ip hit beside the other kind still asks'; Ok ($q[0].Contains('/etc/hostview-turn.conf') -and -not $q[0].Contains($OwnipFile)) "the list holds the own-ip hit only: $($q -join ' | ')"
+  Reset-World; $W.PlanOut = @('INV warn own-ip-tracked path=/opt/x/doc.md', 'INV refuse own-ip path=/etc/a.conf'); $W.PlanCode = 65; Ans 'có'   # B72 (a): a tracked file is a warning only, never a Q-ownip entry or a map line
+  [void](Do-Plan -Want 65); $q = @(Lines | Where-Object { $_ -cmatch '\ACác file sau chứa địa chỉ của máy cũ: ' }); Eq $q.Count 1 'the own-ip refusal beside the tracked warn asks once'
+  Ok ($q[0].Contains('/etc/a.conf') -and -not $q[0].Contains('/opt/x/doc.md')) "Q-ownip lists /etc/a.conf only: $($q -join ' | ')"
+  Eq (@(OwnipLines | Where-Object { $_.Contains('/opt/x/doc.md') }).Count) 0 'no rewrite own-ip line for the tracked file'; Ok (@(OwnipLines | Where-Object { $_ -cmatch '\Arewrite own-ip /etc/a\.conf(\s|\z)' }).Count -ge 1) "the map keeps rewrite own-ip /etc/a.conf: $(OwnipLines)"
+  HasText 'File nằm trong repo git, giữ nguyên khi chuyển, không đổi IP; nếu IP đó là cấu hình đang chạy thì sửa trong repo rồi deploy lại: path=/opt/x/doc.md'
 }
 T 'L.plan-tunnel-remedies: a connector whose /config cannot be read (INV refuse unmapped what=connector path=<hold id>) ends plan 65 with the remedy "kiểm tra cổng metrics của connector rồi chạy lại"; another unmapped form gets no such remedy (B.12.4, W1-T3-GAP-18, CONTRACT §8.3.2)' {
   $W.PlanOut = @('INV refuse unmapped what=connector path=cloudflared.service'); $W.PlanCode = 65
