@@ -195,7 +195,7 @@ FCode không có trên App Store. Bạn cài app bằng **Sideloadly** trên má
 
 File này do GitHub Actions tự dựng lại mỗi khi nhánh `main` thay đổi phần ứng dụng iOS, nên tải lại là có bản mới.
 
-Mỗi bản phát hành có sẵn file fcode.ipa để tải: các bản `vX.Y.Z` trong **Releases** cũng có file này.
+Mỗi bản phát hành có sẵn file fcode.ipa để tải: các bản `vX.Y.Z` trong **Releases** cũng có file này. Bản `latest` luôn là IPA của bản phát hành mới nhất (hoặc của `main` sau lần đổi gần nhất ở phần iOS); phát hành lại một bản cũ hơn không làm `latest` lùi lại.
 
 Số phiên bản hiện trong app luôn do GitHub Actions tự điền, không cần sửa tay file nào: bản phát hành `vX.Y.Z` hiện đúng số của tag đó, còn bản `latest` hiện số của tag `vX.Y.Z` mới nhất có trong nhánh `main` (không có tag nào thì dùng số trong `ios/project.yml`).
 

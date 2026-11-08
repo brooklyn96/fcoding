@@ -35,7 +35,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 30
     steps:
-      # Release event or dispatch with a tag: only vX.Y.Z tags may get an IPA (never `latest`); runs before the build to fail fast.
+      # Release event or dispatch with a tag: only vX.Y.Z tags may get an IPA (never a tag such as `latest`); runs before the build to fail fast.
       - name: Check release tag
         if: github.event_name == 'release' || inputs.tag != ''
         env:
@@ -168,8 +168,44 @@ jobs:
           path: ios/fcode.ipa
           if-no-files-found: error
 
+      # Attach to the release's tag first (release event, or dispatch with a tag).
+      - name: Attach fcode.ipa to the release
+        if: github.event_name == 'release' || inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: gh release upload "$TAG" ios/fcode.ipa --clobber
+
+      # Does this run move the `latest` pre-release? One rule, one place:
+      #   push to main / plain dispatch on main (no tag)  -> yes.
+      #   release event                                   -> only when its tag is the newest strict vX.Y.Z tag at publish time (tags are re-fetched here, a release made during the build counts; a failed fetch = no update), so an older release never moves `latest` backwards.
+      #   dispatch with a tag (backfill) / PR / other ref -> never.
+      - name: Decide if "latest" is updated
+        id: latest
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          INPUT_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          PUBLISH=false
+          if [ "$EVENT" = release ]; then
+            if git fetch --force --tags origin; then
+              NEWEST=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+              echo "Release tag: $RELEASE_TAG; newest version tag: ${NEWEST:-<none>}"
+              if [ "$RELEASE_TAG" = "$NEWEST" ]; then PUBLISH=true; fi
+            else
+              echo "::warning::Could not refresh tags: \`latest\` is not updated by this release run."
+            fi
+          elif [ "$EVENT" != pull_request ] && [ -z "$INPUT_TAG" ] && [ "$REF" = refs/heads/main ]; then
+            PUBLISH=true
+          fi
+          echo "Update latest: $PUBLISH"
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+
       - name: Publish pre-release "latest"
-        if: github.event_name != 'pull_request' && github.event_name != 'release' && inputs.tag == '' && github.ref == 'refs/heads/main'
+        if: steps.latest.outputs.publish == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
@@ -181,15 +217,7 @@ jobs:
           overwrite_files: true
 
       - name: Remove old fcoding.ipa asset
-        if: github.event_name != 'pull_request' && github.event_name != 'release' && inputs.tag == '' && github.ref == 'refs/heads/main'
+        if: steps.latest.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release delete-asset latest fcoding.ipa -y || true
-
-      - name: Attach fcode.ipa to the release
-        if: github.event_name == 'release' || inputs.tag != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.event.release.tag_name || inputs.tag }}
-        run: gh release upload "$TAG" ios/fcode.ipa --clobber
