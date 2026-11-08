@@ -1056,15 +1056,35 @@ T 'L.plan-ownip-other-kinds: an `INV refuse own-ip-nat path=<file>` or `own-ip-f
   Eq (@(OwnipLines | Where-Object { $_.Contains('/opt/x/doc.md') }).Count) 0 'no rewrite own-ip line for the tracked file'; Ok (@(OwnipLines | Where-Object { $_ -cmatch '\Arewrite own-ip /etc/a\.conf(\s|\z)' }).Count -ge 1) "the map keeps rewrite own-ip /etc/a.conf: $(OwnipLines)"
   HasText 'File nằm trong repo của project gate, giữ nguyên khi chuyển, không đổi IP; nếu IP đó là cấu hình đang chạy thì sửa trong repo rồi deploy lại: path=/opt/x/doc.md'
 }
-T 'L.plan-tunnel-remedies: a connector whose /config cannot be read (INV refuse unmapped what=connector path=<hold id>) ends plan 65 with the remedy "kiểm tra cổng metrics của connector rồi chạy lại"; another unmapped form gets no such remedy (B.12.4, W1-T3-GAP-18, CONTRACT §8.3.2)' {
-  $W.PlanOut = @('INV refuse unmapped what=connector path=cloudflared.service'); $W.PlanCode = 65
-  [void](Do-Plan -Want 65); HasText 'kiểm tra cổng metrics của connector rồi chạy lại'; NothingWritten
+$ConnUnitRemedy = { param($u) "nếu unit đó không phải tunnel cloudflared, thêm dòng map  accept not-connector $u ; nếu là tunnel thì bật nó lên rồi chạy lại" }   # B77, CONTRACT §8.3.2 / MOVE.md App. D (L.texts-match-move-md compares its fixed parts with the docs)
+T 'L.plan-tunnel-remedies: a connector whose /config cannot be read (INV refuse unmapped what=connector path=<hold id>) ends plan 65: a container gets the remedy "kiểm tra cổng metrics của connector rồi chạy lại", a unit the B77 `accept not-connector <unit>` remedy filled from path= (a container never gets it); another unmapped form gets neither (B.12.4, W1-T3-GAP-18, B77, CONTRACT §8.3.2)' {
+  $W.PlanOut = @('INV refuse unmapped what=connector path=container:tunnel'); $W.PlanCode = 65
+  [void](Do-Plan -Want 65); HasText 'kiểm tra cổng metrics của connector rồi chạy lại'; NoText 'accept not-connector'; NothingWritten
+  Reset-World; $W.PlanOut = @('INV refuse unmapped what=connector path=cloudflared.service'); $W.PlanCode = 65
+  [void](Do-Plan -Want 65); Ok (@(Lines -Last) -ccontains (& $ConnUnitRemedy 'cloudflared.service')) "the unit remedy line, exactly: $(Lines -Last)"; NoText 'kiểm tra cổng metrics của connector'; NothingWritten
+  Reset-World; $W.PlanOut = @('INV refuse unmapped what=connector path=alice:cf.service', 'INV refuse unmapped what=connector path=container:tunnel'); $W.PlanCode = 65
+  [void](Do-Plan -Want 65); Ok (@(Lines -Last) -ccontains (& $ConnUnitRemedy 'alice:cf.service')) 'a user unit is a unit'; HasText 'kiểm tra cổng metrics của connector rồi chạy lại'; Eq (@(Lines -Last | Where-Object { $_.Contains('accept not-connector') }).Count) 1 'the unit remedy once, none for the container'
   Reset-World; $W.PlanOut = @('INV refuse unmapped what=unit path=x.service'); $W.PlanCode = 65
-  [void](Do-Plan -Want 65); NoText 'kiểm tra cổng metrics của connector'
+  [void](Do-Plan -Want 65); NoText 'kiểm tra cổng metrics của connector'; NoText 'accept not-connector'
 }
-T 'L.plan-tunnel-remedies: old''s plan <id> refusing with no manifest (an invalid map, move-plan.sh _mvp_finalize) still prints the B.12.4 tunnel refusals; each gets its CONTRACT §8.3.2 remedy' {
+T 'L.check-connector-unit-remedy: check prints the B77 remedy right under the `unmapped what=connector` line of a unit (path= filled), once per unit, and none for a container (its remedy stays as it is: the label only) (B77)' {
+  Add-Fault -M old -Key '^plan:check$' -Rc 65 -Out @('INV refuse unmapped what=connector path=cloudflared.service', 'INV refuse unmapped what=connector path=other.service')
+  $r = Run-Move @('check'); Eq $r.Code 65 "check exit ($($r.Text))"
+  $l = @(Lines -Last); $i = [Array]::IndexOf($l, (& $ConnUnitRemedy 'cloudflared.service')); Ok ($i -ge 1) "remedy of the first unit: $($l -join ' | ')"
+  Ok ([Array]::IndexOf($l, (& $ConnUnitRemedy 'other.service')) -gt $i) 'remedy of the second unit after the first'; Eq (@($l | Where-Object { $_.Contains('accept not-connector') }).Count) 2 'once per unit'
+  Reset-World; Add-Fault -M old -Key '^plan:check$' -Rc 65 -Out @('INV refuse unmapped what=connector path=container:tunnel')
+  $r = Run-Move @('check'); Eq $r.Code 65 "check exit, container ($($r.Text))"; NoText 'accept not-connector'; NoText 'kiểm tra cổng metrics của connector'
+}
+T 'L.plan-map-accept-not-connector: a --map file holding `accept not-connector <unit>` is a map line (not map-invalid): it goes to the plan stdin as it is, after the default map, and into map.txt for the re-plans (B77, CONTRACT LIST map-forms)' {
+  $mf = Join-Path $Root ('map-' + [guid]::NewGuid().ToString('N') + '.txt'); [IO.File]::WriteAllText($mf, "accept not-connector cloudflared.service`n", $utf8)
+  try { [void](Do-Plan -Extra @('--map', $mf)) } finally { Remove-Item -LiteralPath $mf -Force }
+  $in = @($W.PlanStdin[-1]); Ok ($in -ccontains 'accept not-connector cloudflared.service') "plan stdin: $($in -join ' | ')"; NoText 'map-invalid'
+  Ok ([Array]::IndexOf($in, 'accept not-connector cloudflared.service') -gt [Array]::IndexOf($in, 'exclude unit velh-pilot-hourly.timer')) 'after the default map lines'
+  Ok (@([IO.File]::ReadAllText((Join-Path (MoveDir) 'map.txt')) -split "`r?`n") -ccontains 'accept not-connector cloudflared.service') 'kept in map.txt'
+}
+T 'L.plan-tunnel-remedies: old''s plan <id> refusing with no manifest (an invalid map, move-plan.sh _mvp_finalize) still prints the B.12.4 tunnel refusals; each gets its CONTRACT §8.3.2 remedy (the unit connector the B77 one)' {
   Add-Fault -M old -Key '^plan:full$' -Rc 65 -Out @('INV refuse own-ip path=ingress:app.example.com', 'INV refuse unmapped what=connector path=cloudflared.service', 'INV refuse map-invalid ref=include') -Mode nomanifest
-  [void](Do-Plan -Want 65); HasText 'đổi service của tên đó trong cấu hình tunnel sang 127.0.0.1 hoặc tên container'; HasText 'kiểm tra cổng metrics của connector rồi chạy lại'; NothingWritten
+  [void](Do-Plan -Want 65); HasText 'đổi service của tên đó trong cấu hình tunnel sang 127.0.0.1 hoặc tên container'; Ok (@(Lines -Last) -ccontains (& $ConnUnitRemedy 'cloudflared.service')) "the unit remedy: $(Lines -Last)"; NothingWritten
 }
 T 'L.pre-os: preflight refusing os or arch ends plan with 65, the label, and nothing written' {
   foreach ($c in @(@('os want=debian-13 have=ubuntu-24.04', 'Máy mới khác bản Debian của máy cũ'), @('arch want=x86_64 have=aarch64', 'Máy mới khác kiến trúc CPU của máy cũ'))) {
@@ -1260,8 +1280,9 @@ T 'L.pre-dst-quiet: at 0c an active hold on new ends the cutover with 65, nothin
 T 'L.pre-stale-manifest: at 0c a plan <id> --check-only refusing manifest-stale ends with 65 "chạy fcode move copy lại", nothing frozen' {
   Fx-Copied; Add-Fault -M old -Key '^plan:check-only$' -Rc 65 -Out @('MOVE error manifest-stale what=user name=bob'); [void](Do-Cutover -1); Assert-NothingFrozen 65 'chạy fcode move copy lại'
 }
-T 'L.plan-tunnel-remedies: at 0c a plan <id> --check-only refusing unmapped what=connector (the same discovery as plan) ends 65 with the remedy, nothing frozen' {
-  Fx-Copied; Add-Fault -M old -Key '^plan:check-only$' -Rc 65 -Out @('INV refuse unmapped what=connector path=cloudflared.service'); [void](Do-Cutover -1); Assert-NothingFrozen 65 'kiểm tra cổng metrics của connector rồi chạy lại'
+T 'L.plan-tunnel-remedies: at 0c a plan <id> --check-only refusing unmapped what=connector (the same discovery as plan) ends 65 with the remedy (unit: B77, container: the metrics-port one), nothing frozen' {
+  Fx-Copied; Add-Fault -M old -Key '^plan:check-only$' -Rc 65 -Out @('INV refuse unmapped what=connector path=cloudflared.service'); [void](Do-Cutover -1); Assert-NothingFrozen 65 (& $ConnUnitRemedy 'cloudflared.service')
+  Reset-World; Fx-Copied; Add-Fault -M old -Key '^plan:check-only$' -Rc 65 -Out @('INV refuse unmapped what=connector path=container:tunnel'); [void](Do-Cutover -1); Assert-NothingFrozen 65 'kiểm tra cổng metrics của connector rồi chạy lại'
 }
 T 'L.plan-tunnel-remedies: at 0c a plan <id> --check-only refusing own-ip path=ingress:<hostname> ends 65 with the remedy, nothing frozen' {
   Fx-Copied; Add-Fault -M old -Key '^plan:check-only$' -Rc 65 -Out @('INV refuse own-ip path=ingress:app.example.com'); [void](Do-Cutover -1); Assert-NothingFrozen 65 'đổi service của tên đó trong cấu hình tunnel sang 127.0.0.1 hoặc tên container'

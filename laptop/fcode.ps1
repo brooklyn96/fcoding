@@ -1371,6 +1371,7 @@ function Get-MoveText([string]$Key, [hashtable]$F = @{}) {
     'rewrites-remedy' { 'ghi rõ `<from>=<to>`' }
     'ingress-remedy' { 'đổi service của tên đó trong cấu hình tunnel sang 127.0.0.1 hoặc tên container' }
     'connector-remedy' { 'kiểm tra cổng metrics của connector rồi chạy lại' }
+    'connector-unit-remedy' { 'nếu unit đó không phải tunnel cloudflared, thêm dòng map  accept not-connector <unit> ; nếu là tunnel thì bật nó lên rồi chạy lại' }   # B77: a unit path of `unmapped what=connector`; a container keeps connector-remedy
     'return-busy' { 'Máy cũ còn đang chạy lệnh trước; chạy lại  fcode move cutover , lệnh sẽ đợi lệnh đó xong.' }   # B60 (a): a return that met a call still running on old
     'return-incomplete' { 'Máy cũ chưa chạy lại đủ: cần người xem (70). Sau khi sửa, chạy lại  fcode move cutover  để hoàn tất quay lại.' }
     'root-link' { 'Đường <đường dẫn> là symlink ngay dưới / nằm trong phần chuyển; hãy chuyển thư mục đích thay cho link, hoặc tạo lại link bằng tay trên máy mới' }   # B45 (ruling 06/11 (a)): `MOVE error bad-request why=root-link path=<p>`
@@ -2493,6 +2494,7 @@ function Invoke-MoveCheckCmd {
   $new = @($now | Where-Object { $prev -cnotcontains $_ }); $same = @($now | Where-Object { $prev -ccontains $_ })
   if ($new.Count) { Write-Host 'Mới so với lần check trước:'; Write-MoveLines $new; if ($same.Count) { Write-Host 'Như lần trước:' } }
   Write-MoveLines $same
+  Write-MoveConnectorUnitRemedies $now   # B77: the check prints the unit remedy under its line (a container's stays label-only here)
   Write-PhienText $cp (ConvertTo-Json -InputObject ([pscustomobject][ordered]@{ at = (Format-MoveTs (Get-MoveNow)); lines = @($now) }) -Depth 4)
   $refused = @($now | Where-Object { $_ -cmatch '\A(INV refuse|MOVE error) ' }).Count -gt 0 -or $r.Code -ne 0
   if ($refused) { Write-Host 'check: có điểm sẽ bị từ chối khi plan (mã 65).'; return 65 }
@@ -2686,9 +2688,15 @@ function Set-MoveAnswer($S, [string]$Q, $A) { Set-MoveMapVal $S.answers $Q $A }
 function Set-MoveAsk($S, [hashtable]$Asked, [string]$Q, $A) { $Asked[$Q] = $true; Set-MoveAnswer $S $Q $(if ($A) { $A } else { 'không' }) }
 # CONTRACT §8.3.2 remedies of the B.12.4 tunnel refusals, wherever a plan form prints them: plan and the D.3 re-plan, with or without a
 # manifest (move-plan.sh _mvp_finalize), and the 0c plan <id> --check-only (the same discovery)
+# B77: `unmapped what=connector path=<unit>` (a unit, not `container:<name>`) gets the `accept not-connector <unit>` remedy once per unit;
+# a container path keeps the metrics-port remedy (once)
+function Write-MoveConnectorUnitRemedies($Lines) {
+  foreach ($l in @($Lines)) { if ("$l" -cmatch '\AINV refuse unmapped what=connector path=(?!container:)(\S+)\z') { Write-Host (Get-MoveText 'connector-unit-remedy' @{ unit = $Matches[1] }) } }
+}
 function Write-MoveTunnelRemedies($Lines) {
   if (@($Lines | Where-Object { "$_" -cmatch '\AINV refuse own-ip path=ingress:\S+\z' }).Count) { Write-Host (Get-MoveText 'ingress-remedy') }   # B.12.4 (W1-T3-GAP-17)
-  if (@($Lines | Where-Object { "$_" -cmatch '\AINV refuse unmapped what=connector path=\S+\z' }).Count) { Write-Host (Get-MoveText 'connector-remedy') }   # B.12.4 (W1-T3-GAP-18)
+  Write-MoveConnectorUnitRemedies $Lines
+  if (@($Lines | Where-Object { "$_" -cmatch '\AINV refuse unmapped what=connector path=container:\S+\z' }).Count) { Write-Host (Get-MoveText 'connector-remedy') }   # B.12.4 (W1-T3-GAP-18)
 }
 # D.2 steps 3-5 (and the D.3 re-plan): plan on old with the map, the laptop checks, the questions, plan again until INV ok or a refusal the
 # owner left. @{ Code; Mf; Map }
