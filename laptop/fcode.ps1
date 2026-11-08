@@ -1371,10 +1371,11 @@ function Get-MoveText([string]$Key, [hashtable]$F = @{}) {
     'rewrites-remedy' { 'ghi rõ `<from>=<to>`' }
     'ingress-remedy' { 'đổi service của tên đó trong cấu hình tunnel sang 127.0.0.1 hoặc tên container' }
     'connector-remedy' { 'kiểm tra cổng metrics của connector rồi chạy lại' }
-    'connector-unit-remedy' { 'nếu unit đó không phải tunnel cloudflared, thêm dòng map  accept not-connector <unit> ; nếu là tunnel thì bật nó lên rồi chạy lại' }   # B77: a unit path of `unmapped what=connector`; a container keeps connector-remedy
+    'connector-unit-remedy' { 'nếu unit đó không phải tunnel cloudflared, thêm dòng map  accept not-connector <unit> ; nếu là tunnel thì bật nó lên (đang chạy thì kiểm tra cổng metrics) rồi chạy lại' }   # B77, B78 P3-S: a unit path of `unmapped what=connector`; a container keeps connector-remedy
     'return-busy' { 'Máy cũ còn đang chạy lệnh trước; chạy lại  fcode move cutover , lệnh sẽ đợi lệnh đó xong.' }   # B60 (a): a return that met a call still running on old
     'return-incomplete' { 'Máy cũ chưa chạy lại đủ: cần người xem (70). Sau khi sửa, chạy lại  fcode move cutover  để hoàn tất quay lại.' }
     'root-link' { 'Đường <đường dẫn> là symlink ngay dưới / nằm trong phần chuyển; hãy chuyển thư mục đích thay cho link, hoặc tạo lại link bằng tay trên máy mới' }   # B45 (ruling 06/11 (a)): `MOVE error bad-request why=root-link path=<p>`
+    'connector-label' { 'Unit hoặc container có thể là connector tunnel cloudflared nhưng không đọc được cấu hình tunnel' }   # B78 P3-U: `INV refuse unmapped what=connector path=<p>` (the `unmapped` label is the extra-disk one)
     default { throw "Get-MoveText: $Key" }
   }
   foreach ($k in $F.Keys) { $t = $t.Replace("<$k>", [string]$F[$k]) }
@@ -1488,6 +1489,8 @@ function Format-MoveLine([string]$Line) {
   $l = "$Line"
   # B45: a symlink directly under / that the plan would move is refused (the server's own `LOG remedy root-link` line is never shown): the owner label carries the remedy
   if ($l -cmatch '\AMOVE error bad-request why=root-link path=(\S+)\z') { return (Get-MoveText 'root-link' @{ 'đường dẫn' = $Matches[1] }) }
+  # B78 P3-U: an `unmapped what=connector` refusal has its own label (the generic `unmapped` one says "extra disk", which stays for what=mount); the line's keys follow it as for any label
+  if ($l -cmatch '\AINV refuse unmapped (what=connector(?:\s.*)?)\z') { return "$(Get-MoveText 'connector-label'): $($Matches[1])" }
   if ($l -cmatch '\AINV (refuse|warn) (\S+)(.*)\z' -or $l -cmatch '\AMOVE (error) (\S+)(.*)\z') {
     $lab = (Get-MoveLabels)["$($Matches[1]) $($Matches[2])"]; $rest = $Matches[3].Trim()
     if (-not $lab) { return $l }

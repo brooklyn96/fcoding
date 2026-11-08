@@ -1056,7 +1056,8 @@ T 'L.plan-ownip-other-kinds: an `INV refuse own-ip-nat path=<file>` or `own-ip-f
   Eq (@(OwnipLines | Where-Object { $_.Contains('/opt/x/doc.md') }).Count) 0 'no rewrite own-ip line for the tracked file'; Ok (@(OwnipLines | Where-Object { $_ -cmatch '\Arewrite own-ip /etc/a\.conf(\s|\z)' }).Count -ge 1) "the map keeps rewrite own-ip /etc/a.conf: $(OwnipLines)"
   HasText 'File nằm trong repo của project gate, giữ nguyên khi chuyển, không đổi IP; nếu IP đó là cấu hình đang chạy thì sửa trong repo rồi deploy lại: path=/opt/x/doc.md'
 }
-$ConnUnitRemedy = { param($u) "nếu unit đó không phải tunnel cloudflared, thêm dòng map  accept not-connector $u ; nếu là tunnel thì bật nó lên rồi chạy lại" }   # B77, CONTRACT §8.3.2 / MOVE.md App. D (L.texts-match-move-md compares its fixed parts with the docs)
+$ConnUnitRemedy = { param($u) "nếu unit đó không phải tunnel cloudflared, thêm dòng map  accept not-connector $u ; nếu là tunnel thì bật nó lên (đang chạy thì kiểm tra cổng metrics) rồi chạy lại" }   # B77, B78 P3-S, CONTRACT §8.3.2 / MOVE.md App. D (L.texts-match-move-md compares its fixed parts with the docs, both ways)
+$ConnLabel = 'Unit hoặc container có thể là connector tunnel cloudflared nhưng không đọc được cấu hình tunnel'   # B78 P3-U, CONTRACT §8.3 / MOVE.md (L.texts-match-move-md)
 T 'L.plan-tunnel-remedies: a connector whose /config cannot be read (INV refuse unmapped what=connector path=<hold id>) ends plan 65: a container gets the remedy "kiểm tra cổng metrics của connector rồi chạy lại", a unit the B77 `accept not-connector <unit>` remedy filled from path= (a container never gets it); another unmapped form gets neither (B.12.4, W1-T3-GAP-18, B77, CONTRACT §8.3.2)' {
   $W.PlanOut = @('INV refuse unmapped what=connector path=container:tunnel'); $W.PlanCode = 65
   [void](Do-Plan -Want 65); HasText 'kiểm tra cổng metrics của connector rồi chạy lại'; NoText 'accept not-connector'; NothingWritten
@@ -1074,6 +1075,23 @@ T 'L.check-connector-unit-remedy: check prints the B77 remedy right under the `u
   Ok ([Array]::IndexOf($l, (& $ConnUnitRemedy 'other.service')) -gt $i) 'remedy of the second unit after the first'; Eq (@($l | Where-Object { $_.Contains('accept not-connector') }).Count) 2 'once per unit'
   Reset-World; Add-Fault -M old -Key '^plan:check$' -Rc 65 -Out @('INV refuse unmapped what=connector path=container:tunnel')
   $r = Run-Move @('check'); Eq $r.Code 65 "check exit, container ($($r.Text))"; NoText 'accept not-connector'; NoText 'kiểm tra cổng metrics của connector'
+}
+T 'L.connector-refusal-label: `INV refuse unmapped what=connector path=<p>` has its own owner label (B78 P3-U), not the extra-disk one of `unmapped`: in Format-MoveLine, in check and in plan; another `unmapped` form keeps the generic label' {
+  Eq (Format-MoveLine 'INV refuse unmapped what=connector path=hc.service') "${ConnLabel}: what=connector path=hc.service" 'unit path'
+  Eq (Format-MoveLine 'INV refuse unmapped what=connector path=container:tunnel') "${ConnLabel}: what=connector path=container:tunnel" 'container path'
+  Eq (Format-MoveLine 'INV refuse unmapped what=mount path=/mnt/x') 'Có ổ đĩa gắn thêm chưa ghi trong map: what=mount path=/mnt/x' 'what=mount keeps the generic label'
+  Add-Fault -M old -Key '^plan:check$' -Rc 65 -Out @('INV refuse unmapped what=connector path=hc.service')
+  $r = Run-Move @('check'); Eq $r.Code 65 "check exit ($($r.Text))"; HasText "${ConnLabel}: what=connector path=hc.service"; NoText 'Có ổ đĩa gắn thêm'
+  Reset-World; $W.PlanOut = @('INV refuse unmapped what=connector path=hc.service'); $W.PlanCode = 65
+  [void](Do-Plan -Want 65); HasText "${ConnLabel}: what=connector path=hc.service"; NoText 'Có ổ đĩa gắn thêm'
+}
+T 'L.map-invalid-accept-lines: the two B77 map refusals reach the owner as readable lines (B78 P3-T): `INV refuse map-invalid ref=accept-not-connector:<u>` and `ref=exclude-accept:<u>`, in Format-MoveLine and in a plan that ends 65' {
+  $mi = 'File map có tham chiếu sai'
+  foreach ($ref in 'accept-not-connector', 'exclude-accept') {
+    Eq (Format-MoveLine "INV refuse map-invalid ref=${ref}:hc.service") "${mi}: ref=${ref}:hc.service" "[$ref] line"
+    Reset-World; $W.PlanOut = @("INV refuse map-invalid ref=${ref}:hc.service"); $W.PlanCode = 65
+    [void](Do-Plan -Want 65); HasText "${mi}: ref=${ref}:hc.service"; NothingWritten
+  }
 }
 T 'L.plan-map-accept-not-connector: a --map file holding `accept not-connector <unit>` is a map line (not map-invalid): it goes to the plan stdin as it is, after the default map, and into map.txt for the re-plans (B77, CONTRACT LIST map-forms)' {
   $mf = Join-Path $Root ('map-' + [guid]::NewGuid().ToString('N') + '.txt'); [IO.File]::WriteAllText($mf, "accept not-connector cloudflared.service`n", $utf8)
@@ -3644,6 +3662,11 @@ T 'L.texts-match-move-md: every owner text and reason label of docs/MOVE.md (CON
   foreach ($t in @($texts) + @($vi)) { foreach ($fr in @($t -split '<[^>]+>')) { $f2 = $fr.Trim(); if ($f2.Length -ge 4 -and -not $src.Contains($f2)) { $miss += $f2 } } }
   foreach ($l in $lab) { if (-not $src.Contains($l)) { $miss += $l } }
   Ok ($miss.Count -eq 0) "texts of docs/MOVE.md not in laptop/fcode.ps1 ($($miss.Count)): $(@($miss | Select-Object -First 12) -join ' || ')"
+  # laptop -> docs (B78 P2-R): every remedy text and the connector label the laptop prints is in the docs, so a laptop-only text fails
+  $own = @(); foreach ($m in [regex]::Matches($script:FcodeText, "(?m)^\s*'((?:[a-z0-9-]+-remedy)|connector-label)' \{ '((?:[^']|'')*)' \}")) { $own += , @($m.Groups[1].Value, ($m.Groups[2].Value -replace "''", "'")) }
+  Ok ($own.Count -ge 8) "laptop remedy / label texts found: $($own.Count)"
+  $lone = @(); foreach ($o in $own) { foreach ($fr in @($o[1] -split '<[^>]+>')) { $f2 = $fr.Trim(); if ($f2.Length -ge 4 -and -not $md.Contains($f2)) { $lone += "$($o[0]): $f2" } } }
+  Ok ($lone.Count -eq 0) "laptop texts not in docs/MOVE.md ($($lone.Count)): $(@($lone | Select-Object -First 12) -join ' || ')"
 }
 T 'L.suite-windows: without bash (Windows) a bash case is skipped and counted, never failed' {
   $saved = $script:BashExe; $p0 = $script:pass; $f0 = $script:fail; $s0 = $script:skip
