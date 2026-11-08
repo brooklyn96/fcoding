@@ -1050,16 +1050,62 @@ T 'L.plan-ownip-other-kinds: an `INV refuse own-ip-nat path=<file>` or `own-ip-f
   }
   Reset-World; $W.PlanOut = @("INV refuse own-ip-nat path=$OwnipFile", "INV refuse own-ip path=/etc/hostview-turn.conf"); $W.PlanCode = 65; Ans 'không'
   [void](Do-Plan -Want 65); $q = @(Lines | Where-Object { $_ -cmatch '\ACác file sau chứa địa chỉ của máy cũ: ' }); Eq $q.Count 1 'a real own-ip hit beside the other kind still asks'; Ok ($q[0].Contains('/etc/hostview-turn.conf') -and -not $q[0].Contains($OwnipFile)) "the list holds the own-ip hit only: $($q -join ' | ')"
+  Reset-World; $W.PlanOut = @('INV warn own-ip-tracked path=/opt/x/doc.md', 'INV refuse own-ip path=/etc/a.conf'); $W.PlanCode = 65; Ans 'có'   # B72 (a): a tracked file is a warning only, never a Q-ownip entry or a map line
+  [void](Do-Plan -Want 65); $q = @(Lines | Where-Object { $_ -cmatch '\ACác file sau chứa địa chỉ của máy cũ: ' }); Eq $q.Count 1 'the own-ip refusal beside the tracked warn asks once'
+  Ok ($q[0].Contains('/etc/a.conf') -and -not $q[0].Contains('/opt/x/doc.md')) "Q-ownip lists /etc/a.conf only: $($q -join ' | ')"
+  Eq (@(OwnipLines | Where-Object { $_.Contains('/opt/x/doc.md') }).Count) 0 'no rewrite own-ip line for the tracked file'; Ok (@(OwnipLines | Where-Object { $_ -cmatch '\Arewrite own-ip /etc/a\.conf(\s|\z)' }).Count -ge 1) "the map keeps rewrite own-ip /etc/a.conf: $(OwnipLines)"
+  HasText 'File nằm trong repo của project gate, giữ nguyên khi chuyển, không đổi IP; nếu IP đó là cấu hình đang chạy thì sửa trong repo rồi deploy lại: path=/opt/x/doc.md'
 }
-T 'L.plan-tunnel-remedies: a connector whose /config cannot be read (INV refuse unmapped what=connector path=<hold id>) ends plan 65 with the remedy "kiểm tra cổng metrics của connector rồi chạy lại"; another unmapped form gets no such remedy (B.12.4, W1-T3-GAP-18, CONTRACT §8.3.2)' {
-  $W.PlanOut = @('INV refuse unmapped what=connector path=cloudflared.service'); $W.PlanCode = 65
-  [void](Do-Plan -Want 65); HasText 'kiểm tra cổng metrics của connector rồi chạy lại'; NothingWritten
+$ConnUnitRemedy = { param($u) "nếu unit đó không phải tunnel cloudflared, thêm dòng map  accept not-connector $u ; nếu là tunnel thì bật nó lên (đang chạy thì kiểm tra cổng metrics) rồi chạy lại" }   # B77, B78 P3-S, CONTRACT §8.3.2 / MOVE.md App. D (L.texts-match-move-md compares its fixed parts with the docs, both ways)
+$ConnLabel = 'Unit hoặc container có thể là connector tunnel cloudflared nhưng không đọc được cấu hình tunnel'   # B78 P3-U, CONTRACT §8.3 / MOVE.md (L.texts-match-move-md)
+T 'L.plan-tunnel-remedies: a connector whose /config cannot be read (INV refuse unmapped what=connector path=<hold id>) ends plan 65: a container gets the remedy "kiểm tra cổng metrics của connector rồi chạy lại", a unit the B77 `accept not-connector <unit>` remedy filled from path= (a container never gets it); another unmapped form gets neither (B.12.4, W1-T3-GAP-18, B77, CONTRACT §8.3.2)' {
+  $W.PlanOut = @('INV refuse unmapped what=connector path=container:tunnel'); $W.PlanCode = 65
+  [void](Do-Plan -Want 65); HasText 'kiểm tra cổng metrics của connector rồi chạy lại'; NoText 'accept not-connector'; NothingWritten
+  Reset-World; $W.PlanOut = @('INV refuse unmapped what=connector path=cloudflared.service'); $W.PlanCode = 65
+  [void](Do-Plan -Want 65); Ok (@(Lines -Last) -ccontains (& $ConnUnitRemedy 'cloudflared.service')) "the unit remedy line, exactly: $(Lines -Last)"; NoText 'kiểm tra cổng metrics của connector'; NothingWritten
+  Reset-World; $W.PlanOut = @('INV refuse unmapped what=connector path=alice:cf.service', 'INV refuse unmapped what=connector path=container:tunnel'); $W.PlanCode = 65
+  [void](Do-Plan -Want 65); Ok (@(Lines -Last) -ccontains (& $ConnUnitRemedy 'alice:cf.service')) 'a user unit is a unit'; HasText 'kiểm tra cổng metrics của connector rồi chạy lại'; Eq (@(Lines -Last | Where-Object { $_.Contains('accept not-connector') }).Count) 1 'the unit remedy once, none for the container'
   Reset-World; $W.PlanOut = @('INV refuse unmapped what=unit path=x.service'); $W.PlanCode = 65
-  [void](Do-Plan -Want 65); NoText 'kiểm tra cổng metrics của connector'
+  [void](Do-Plan -Want 65); NoText 'kiểm tra cổng metrics của connector'; NoText 'accept not-connector'
 }
-T 'L.plan-tunnel-remedies: old''s plan <id> refusing with no manifest (an invalid map, move-plan.sh _mvp_finalize) still prints the B.12.4 tunnel refusals; each gets its CONTRACT §8.3.2 remedy' {
+T 'L.check-connector-unit-remedy: check prints the remedy right under the `unmapped what=connector` line: a unit gets the B77 one (path= filled, once per unit), a container the metrics-port one (once), never the other kind''s (B77, B78 P3-Y)' {
+  $cr = 'kiểm tra cổng metrics của connector rồi chạy lại'
+  Add-Fault -M old -Key '^plan:check$' -Rc 65 -Out @('INV refuse unmapped what=connector path=cloudflared.service', 'INV refuse unmapped what=connector path=other.service')
+  $r = Run-Move @('check'); Eq $r.Code 65 "check exit ($($r.Text))"
+  $l = @(Lines -Last); $i = [Array]::IndexOf($l, (& $ConnUnitRemedy 'cloudflared.service')); Ok ($i -ge 1) "remedy of the first unit: $($l -join ' | ')"
+  Ok ([Array]::IndexOf($l, (& $ConnUnitRemedy 'other.service')) -gt $i) 'remedy of the second unit after the first'; Eq (@($l | Where-Object { $_.Contains('accept not-connector') }).Count) 2 'once per unit'; Eq (@($l | Where-Object { $_ -ceq $cr }).Count) 0 'no container remedy for a unit'
+  Reset-World; Add-Fault -M old -Key '^plan:check$' -Rc 65 -Out @('INV refuse unmapped what=connector path=container:tunnel', 'INV refuse unmapped what=connector path=container:other')
+  $r = Run-Move @('check'); Eq $r.Code 65 "check exit, container ($($r.Text))"; NoText 'accept not-connector'
+  $l = @(Lines -Last); $j = [Array]::IndexOf($l, $cr); Ok ($j -ge 1) "the container remedy after its line: $($l -join ' | ')"; Eq (@($l | Where-Object { $_ -ceq $cr }).Count) 1 'once'
+  Ok ($l[$j - 1] -ceq "${ConnLabel}: what=connector path=container:other") 'right under the last container line'
+}
+T 'L.connector-refusal-label: `INV refuse unmapped what=connector path=<p>` has its own owner label (B78 P3-U), not the extra-disk one of `unmapped`: in Format-MoveLine, in check and in plan; another `unmapped` form keeps the generic label' {
+  Eq (Format-MoveLine 'INV refuse unmapped what=connector path=hc.service') "${ConnLabel}: what=connector path=hc.service" 'unit path'
+  Eq (Format-MoveLine 'INV refuse unmapped what=connector path=container:tunnel') "${ConnLabel}: what=connector path=container:tunnel" 'container path'
+  Eq (Format-MoveLine 'INV refuse unmapped what=mount path=/mnt/x') 'Có ổ đĩa gắn thêm chưa ghi trong map: what=mount path=/mnt/x' 'what=mount keeps the generic label'
+  Add-Fault -M old -Key '^plan:check$' -Rc 65 -Out @('INV refuse unmapped what=connector path=hc.service')
+  $r = Run-Move @('check'); Eq $r.Code 65 "check exit ($($r.Text))"; HasText "${ConnLabel}: what=connector path=hc.service"; NoText 'Có ổ đĩa gắn thêm'
+  Reset-World; $W.PlanOut = @('INV refuse unmapped what=connector path=hc.service'); $W.PlanCode = 65
+  [void](Do-Plan -Want 65); HasText "${ConnLabel}: what=connector path=hc.service"; NoText 'Có ổ đĩa gắn thêm'
+}
+T 'L.map-invalid-accept-lines: the two B77 map refusals reach the owner as readable lines (B78 P3-T): `INV refuse map-invalid ref=accept-not-connector:<u>` and `ref=exclude-accept:<u>`, in Format-MoveLine and in a plan that ends 65' {
+  $mi = 'File map có tham chiếu sai'
+  foreach ($ref in 'accept-not-connector', 'exclude-accept') {
+    Eq (Format-MoveLine "INV refuse map-invalid ref=${ref}:hc.service") "${mi}: ref=${ref}:hc.service" "[$ref] line"
+    Reset-World; $W.PlanOut = @("INV refuse map-invalid ref=${ref}:hc.service"); $W.PlanCode = 65
+    [void](Do-Plan -Want 65); HasText "${mi}: ref=${ref}:hc.service"; NothingWritten
+  }
+}
+T 'L.plan-map-accept-not-connector: a --map file holding `accept not-connector <unit>` is a map line (not map-invalid): it goes to the plan stdin as it is, after the default map, and into map.txt for the re-plans (B77, CONTRACT LIST map-forms)' {
+  $mf = Join-Path $Root ('map-' + [guid]::NewGuid().ToString('N') + '.txt'); [IO.File]::WriteAllText($mf, "accept not-connector cloudflared.service`n", $utf8)
+  try { [void](Do-Plan -Extra @('--map', $mf)) } finally { Remove-Item -LiteralPath $mf -Force }
+  $in = @($W.PlanStdin[-1]); Ok ($in -ccontains 'accept not-connector cloudflared.service') "plan stdin: $($in -join ' | ')"; NoText 'map-invalid'
+  Ok ([Array]::IndexOf($in, 'accept not-connector cloudflared.service') -gt [Array]::IndexOf($in, 'exclude unit velh-pilot-hourly.timer')) 'after the default map lines'
+  Ok (@([IO.File]::ReadAllText((Join-Path (MoveDir) 'map.txt')) -split "`r?`n") -ccontains 'accept not-connector cloudflared.service') 'kept in map.txt'
+}
+T 'L.plan-tunnel-remedies: old''s plan <id> refusing with no manifest (an invalid map, move-plan.sh _mvp_finalize) still prints the B.12.4 tunnel refusals; each gets its CONTRACT §8.3.2 remedy (the unit connector the B77 one)' {
   Add-Fault -M old -Key '^plan:full$' -Rc 65 -Out @('INV refuse own-ip path=ingress:app.example.com', 'INV refuse unmapped what=connector path=cloudflared.service', 'INV refuse map-invalid ref=include') -Mode nomanifest
-  [void](Do-Plan -Want 65); HasText 'đổi service của tên đó trong cấu hình tunnel sang 127.0.0.1 hoặc tên container'; HasText 'kiểm tra cổng metrics của connector rồi chạy lại'; NothingWritten
+  [void](Do-Plan -Want 65); HasText 'đổi service của tên đó trong cấu hình tunnel sang 127.0.0.1 hoặc tên container'; Ok (@(Lines -Last) -ccontains (& $ConnUnitRemedy 'cloudflared.service')) "the unit remedy: $(Lines -Last)"; NothingWritten
 }
 T 'L.pre-os: preflight refusing os or arch ends plan with 65, the label, and nothing written' {
   foreach ($c in @(@('os want=debian-13 have=ubuntu-24.04', 'Máy mới khác bản Debian của máy cũ'), @('arch want=x86_64 have=aarch64', 'Máy mới khác kiến trúc CPU của máy cũ'))) {
@@ -1255,8 +1301,9 @@ T 'L.pre-dst-quiet: at 0c an active hold on new ends the cutover with 65, nothin
 T 'L.pre-stale-manifest: at 0c a plan <id> --check-only refusing manifest-stale ends with 65 "chạy fcode move copy lại", nothing frozen' {
   Fx-Copied; Add-Fault -M old -Key '^plan:check-only$' -Rc 65 -Out @('MOVE error manifest-stale what=user name=bob'); [void](Do-Cutover -1); Assert-NothingFrozen 65 'chạy fcode move copy lại'
 }
-T 'L.plan-tunnel-remedies: at 0c a plan <id> --check-only refusing unmapped what=connector (the same discovery as plan) ends 65 with the remedy, nothing frozen' {
-  Fx-Copied; Add-Fault -M old -Key '^plan:check-only$' -Rc 65 -Out @('INV refuse unmapped what=connector path=cloudflared.service'); [void](Do-Cutover -1); Assert-NothingFrozen 65 'kiểm tra cổng metrics của connector rồi chạy lại'
+T 'L.plan-tunnel-remedies: at 0c a plan <id> --check-only refusing unmapped what=connector (the same discovery as plan) ends 65 with the remedy (unit: B77, container: the metrics-port one), nothing frozen' {
+  Fx-Copied; Add-Fault -M old -Key '^plan:check-only$' -Rc 65 -Out @('INV refuse unmapped what=connector path=cloudflared.service'); [void](Do-Cutover -1); Assert-NothingFrozen 65 (& $ConnUnitRemedy 'cloudflared.service')
+  Reset-World; Fx-Copied; Add-Fault -M old -Key '^plan:check-only$' -Rc 65 -Out @('INV refuse unmapped what=connector path=container:tunnel'); [void](Do-Cutover -1); Assert-NothingFrozen 65 'kiểm tra cổng metrics của connector rồi chạy lại'
 }
 T 'L.plan-tunnel-remedies: at 0c a plan <id> --check-only refusing own-ip path=ingress:<hostname> ends 65 with the remedy, nothing frozen' {
   Fx-Copied; Add-Fault -M old -Key '^plan:check-only$' -Rc 65 -Out @('INV refuse own-ip path=ingress:app.example.com'); [void](Do-Cutover -1); Assert-NothingFrozen 65 'đổi service của tên đó trong cấu hình tunnel sang 127.0.0.1 hoặc tên container'
@@ -1952,6 +1999,11 @@ T 'L.chore-ufw-lockout: an adopt warning ufw-lockout is shown at copy and repeat
   $t = $script:Last.Text; $i = $t.LastIndexOf('Tường lửa máy mới để tắt'); Ok ($i -ge 0) 'label in the cutover'
   Ok (@($t.Substring($i) -split "`n")[0] -match '22' -or $t.Substring($i) -match 'ufw enable') 'detail: port 22 / ufw enable'
   Eq (Get-St).phase 'cut' 'no rollback'
+}
+T 'L.own-ip-tracked-label: INV warn own-ip-tracked is shown with its §8.3.3 label (B72 (a)) and the path word; the label equals docs/MOVE.md App. E (L.texts-match-move-md)' {
+  $lab = 'File nằm trong repo của project gate, giữ nguyên khi chuyển, không đổi IP; nếu IP đó là cấu hình đang chạy thì sửa trong repo rồi deploy lại'
+  Eq (Format-MoveLine 'INV warn own-ip-tracked path=/srv/app/conf.yml') "${lab}: path=/srv/app/conf.yml" 'label with the path word'
+  Eq (Format-MoveLine 'INV warn own-ip-tracked') $lab 'label alone'
 }
 T 'L.pkg-extra-label: INV warn pkg-extra (c.adopt.N, x.adopt) is shown with the cautious CONTRACT 8.3.3 label per line and no 8.3.2 remedy line (R10-INT-23, B22)' {
   $rem = 'xóa file mặc định đó rồi chạy lại'
@@ -3613,6 +3665,11 @@ T 'L.texts-match-move-md: every owner text and reason label of docs/MOVE.md (CON
   foreach ($t in @($texts) + @($vi)) { foreach ($fr in @($t -split '<[^>]+>')) { $f2 = $fr.Trim(); if ($f2.Length -ge 4 -and -not $src.Contains($f2)) { $miss += $f2 } } }
   foreach ($l in $lab) { if (-not $src.Contains($l)) { $miss += $l } }
   Ok ($miss.Count -eq 0) "texts of docs/MOVE.md not in laptop/fcode.ps1 ($($miss.Count)): $(@($miss | Select-Object -First 12) -join ' || ')"
+  # laptop -> docs (B78 P2-R): every remedy text and the connector label the laptop prints is in the docs, so a laptop-only text fails
+  $own = @(); foreach ($m in [regex]::Matches($script:FcodeText, "(?m)^\s*'((?:[a-z0-9-]+-remedy)|connector-label)' \{ '((?:[^']|'')*)' \}")) { $own += , @($m.Groups[1].Value, ($m.Groups[2].Value -replace "''", "'")) }
+  Ok ($own.Count -ge 8) "laptop remedy / label texts found: $($own.Count)"
+  $lone = @(); foreach ($o in $own) { foreach ($fr in @($o[1] -split '<[^>]+>')) { $f2 = $fr.Trim(); if ($f2.Length -ge 4 -and -not $md.Contains($f2)) { $lone += "$($o[0]): $f2" } } }
+  Ok ($lone.Count -eq 0) "laptop texts not in docs/MOVE.md ($($lone.Count)): $(@($lone | Select-Object -First 12) -join ' || ')"
 }
 T 'L.suite-windows: without bash (Windows) a bash case is skipped and counted, never failed' {
   $saved = $script:BashExe; $p0 = $script:pass; $f0 = $script:fail; $s0 = $script:skip

@@ -1371,9 +1371,11 @@ function Get-MoveText([string]$Key, [hashtable]$F = @{}) {
     'rewrites-remedy' { 'ghi rõ `<from>=<to>`' }
     'ingress-remedy' { 'đổi service của tên đó trong cấu hình tunnel sang 127.0.0.1 hoặc tên container' }
     'connector-remedy' { 'kiểm tra cổng metrics của connector rồi chạy lại' }
+    'connector-unit-remedy' { 'nếu unit đó không phải tunnel cloudflared, thêm dòng map  accept not-connector <unit> ; nếu là tunnel thì bật nó lên (đang chạy thì kiểm tra cổng metrics) rồi chạy lại' }   # B77, B78 P3-S: a unit path of `unmapped what=connector`; a container keeps connector-remedy
     'return-busy' { 'Máy cũ còn đang chạy lệnh trước; chạy lại  fcode move cutover , lệnh sẽ đợi lệnh đó xong.' }   # B60 (a): a return that met a call still running on old
     'return-incomplete' { 'Máy cũ chưa chạy lại đủ: cần người xem (70). Sau khi sửa, chạy lại  fcode move cutover  để hoàn tất quay lại.' }
     'root-link' { 'Đường <đường dẫn> là symlink ngay dưới / nằm trong phần chuyển; hãy chuyển thư mục đích thay cho link, hoặc tạo lại link bằng tay trên máy mới' }   # B45 (ruling 06/11 (a)): `MOVE error bad-request why=root-link path=<p>`
+    'connector-label' { 'Unit hoặc container có thể là connector tunnel cloudflared nhưng không đọc được cấu hình tunnel' }   # B78 P3-U: `INV refuse unmapped what=connector path=<p>` (the `unmapped` label is the extra-disk one)
     default { throw "Get-MoveText: $Key" }
   }
   foreach ($k in $F.Keys) { $t = $t.Replace("<$k>", [string]$F[$k]) }
@@ -1452,6 +1454,7 @@ warn back-new-only | Chỉ có trên máy mới, không mang về máy cũ
 warn rsync-version | Bản rsync trên máy cũ khác bản đã ghi
 warn ufw-lockout | Tường lửa máy mới để tắt vì luật hiện tại sẽ khóa phiên ssh; cần bật lại bằng tay
 warn pkg-extra | Có file lạ trong thư mục được chuyển, chưa bị xóa; chỉ xóa nếu chắc đây là file mặc định của gói vừa cài (vd sites-enabled/default); KHÔNG xóa file của chính máy mới (vd sudoers.d/90-cloud-init-users, netplan/50-cloud-init.yaml) — xóa nhầm có thể mất sudo hoặc mạng
+warn own-ip-tracked | File nằm trong repo của project gate, giữ nguyên khi chuyển, không đổi IP; nếu IP đó là cấu hình đang chạy thì sửa trong repo rồi deploy lại
 error busy | Máy đang chạy một lệnh chuyển khác
 error no-manifest | Máy chưa có danh sách chuyển
 error no-move | Máy này chưa thuộc lần chuyển nào
@@ -1486,6 +1489,8 @@ function Format-MoveLine([string]$Line) {
   $l = "$Line"
   # B45: a symlink directly under / that the plan would move is refused (the server's own `LOG remedy root-link` line is never shown): the owner label carries the remedy
   if ($l -cmatch '\AMOVE error bad-request why=root-link path=(\S+)\z') { return (Get-MoveText 'root-link' @{ 'đường dẫn' = $Matches[1] }) }
+  # B78 P3-U: an `unmapped what=connector` refusal has its own label (the generic `unmapped` one says "extra disk", which stays for what=mount); the line's keys follow it as for any label
+  if ($l -cmatch '\AINV refuse unmapped (what=connector(?:\s.*)?)\z') { return "$(Get-MoveText 'connector-label'): $($Matches[1])" }
   if ($l -cmatch '\AINV (refuse|warn) (\S+)(.*)\z' -or $l -cmatch '\AMOVE (error) (\S+)(.*)\z') {
     $lab = (Get-MoveLabels)["$($Matches[1]) $($Matches[2])"]; $rest = $Matches[3].Trim()
     if (-not $lab) { return $l }
@@ -2492,6 +2497,7 @@ function Invoke-MoveCheckCmd {
   $new = @($now | Where-Object { $prev -cnotcontains $_ }); $same = @($now | Where-Object { $prev -ccontains $_ })
   if ($new.Count) { Write-Host 'Mới so với lần check trước:'; Write-MoveLines $new; if ($same.Count) { Write-Host 'Như lần trước:' } }
   Write-MoveLines $same
+  Write-MoveConnectorRemedies $now   # B77, B78 P3-Y: the check prints the remedy of a connector line under it, a unit's and a container's
   Write-PhienText $cp (ConvertTo-Json -InputObject ([pscustomobject][ordered]@{ at = (Format-MoveTs (Get-MoveNow)); lines = @($now) }) -Depth 4)
   $refused = @($now | Where-Object { $_ -cmatch '\A(INV refuse|MOVE error) ' }).Count -gt 0 -or $r.Code -ne 0
   if ($refused) { Write-Host 'check: có điểm sẽ bị từ chối khi plan (mã 65).'; return 65 }
@@ -2684,10 +2690,16 @@ function Read-MoveAnswer([string]$Text, [string[]]$Words) {
 function Set-MoveAnswer($S, [string]$Q, $A) { Set-MoveMapVal $S.answers $Q $A }
 function Set-MoveAsk($S, [hashtable]$Asked, [string]$Q, $A) { $Asked[$Q] = $true; Set-MoveAnswer $S $Q $(if ($A) { $A } else { 'không' }) }
 # CONTRACT §8.3.2 remedies of the B.12.4 tunnel refusals, wherever a plan form prints them: plan and the D.3 re-plan, with or without a
-# manifest (move-plan.sh _mvp_finalize), and the 0c plan <id> --check-only (the same discovery)
+# manifest (move-plan.sh _mvp_finalize), and the 0c plan <id> --check-only (the same discovery); the connector ones also in `check`
+# B77: `unmapped what=connector path=<unit>` (a unit, not `container:<name>`) gets the `accept not-connector <unit>` remedy once per unit;
+# a container path gets the metrics-port remedy (once). B78 P3-Y: the same in `check` (MOVE.md App. D: the label is followed by the remedy of the same line)
+function Write-MoveConnectorRemedies($Lines) {
+  foreach ($l in @($Lines)) { if ("$l" -cmatch '\AINV refuse unmapped what=connector path=(?!container:)(\S+)\z') { Write-Host (Get-MoveText 'connector-unit-remedy' @{ unit = $Matches[1] }) } }
+  if (@($Lines | Where-Object { "$_" -cmatch '\AINV refuse unmapped what=connector path=container:\S+\z' }).Count) { Write-Host (Get-MoveText 'connector-remedy') }   # B.12.4 (W1-T3-GAP-18)
+}
 function Write-MoveTunnelRemedies($Lines) {
   if (@($Lines | Where-Object { "$_" -cmatch '\AINV refuse own-ip path=ingress:\S+\z' }).Count) { Write-Host (Get-MoveText 'ingress-remedy') }   # B.12.4 (W1-T3-GAP-17)
-  if (@($Lines | Where-Object { "$_" -cmatch '\AINV refuse unmapped what=connector path=\S+\z' }).Count) { Write-Host (Get-MoveText 'connector-remedy') }   # B.12.4 (W1-T3-GAP-18)
+  Write-MoveConnectorRemedies $Lines
 }
 # D.2 steps 3-5 (and the D.3 re-plan): plan on old with the map, the laptop checks, the questions, plan again until INV ok or a refusal the
 # owner left. @{ Code; Mf; Map }
