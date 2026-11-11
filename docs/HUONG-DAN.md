@@ -522,7 +522,7 @@ fcode new       # mở phiên mới: chọn dự án và harness (hoặc gõ 0 t
 ```
 
 - `fcode new`: mở phiên mới ngay từ laptop, giống nút "+" trong app: chọn dự án rồi harness, phiên hiện luôn trong app. Cần box có lệnh `fcode-new` (chạy lại `bash install.sh` trên box nếu chưa có).
-- `fcode sync`: kéo code mới của các project trong `syncRepos` về laptop, chỉ cập nhật khi đang ở main và không có thay đổi chưa lưu; liệt kê nhánh box và PR chờ merge. Lệnh cũng liệt kê các project có trên box nhưng chưa có trên laptop, rồi giúp bạn thêm từng project:
+- `fcode sync`: kéo code mới của các project trong `syncRepos` về laptop, cập nhật nhánh mặc định của project (main hoặc master, theo origin) khi bạn đang ở nhánh đó và nó không có commit chưa đẩy; file chưa lưu được giữ nguyên, và nếu bản mới sẽ ghi đè lên một file của bạn thì project đó bị bỏ qua; liệt kê nhánh box và PR chờ merge. Lệnh cũng liệt kê các project có trên box nhưng chưa có trên laptop, rồi giúp bạn thêm từng project:
   - Tìm sẵn các bản clone đã có trên máy (Desktop kể cả OneDrive, Documents, `source\repos`, thư mục người dùng và thư mục cha của các thư mục trong `syncRepos`; tối đa 15 giây, in ra đã tìm ở đâu).
   - Hỏi bạn xác nhận hoặc chọn một thư mục tìm thấy, hoặc dán đường dẫn khác (mặc định `Desktop\<tên>`). Thư mục phải là git và có cùng origin GitHub với project; thư mục trống hoặc chưa có thì được clone về.
   - Thư mục được thêm vào `syncRepos` trong `%USERPROFILE%\.fcode\config.json` và đồng bộ ngay một lần.
