@@ -55,8 +55,9 @@ function Get-GitCount([string]$Repo, [string]$Range) {
 
 # nhanh mac dinh cua origin, doc tu ban da fetch (khong goi mang): origin/HEAD, neu khong co thi origin/main, roi origin/master; $null neu khong co
 function Get-SyncDefaultBranch([string]$Repo) {
-  $h = Invoke-Git $Repo @('symbolic-ref', '--short', 'refs/remotes/origin/HEAD')
-  $cand = @(); if ($h.Code -eq 0 -and $h.Out -cmatch '^origin/(.+)$') { $cand += $Matches[1] }
+  # khong dung --short: co nhanh local ten origin/<x> thi git tra ve remotes/origin/<x>
+  $h = Invoke-Git $Repo @('symbolic-ref', 'refs/remotes/origin/HEAD')
+  $cand = @(); if ($h.Code -eq 0 -and $h.Out -cmatch '^refs/remotes/origin/(.+)$') { $cand += $Matches[1] }
   foreach ($c in ($cand + 'main' + 'master')) {
     if ((Invoke-Git $Repo @('rev-parse', '-q', '--verify', "refs/remotes/origin/$c")).Code -eq 0) { return $c }
   }

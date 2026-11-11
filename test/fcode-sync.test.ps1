@@ -195,6 +195,27 @@ T 'no origin/HEAD, only origin/master: falls back to origin/master' {
   $r = Run-Sync $w.Lap
   Ok ($r.Text.Contains('master: đã cập nhật 1 commit')) "message: $($r.Text)"
 }
+T 'default branch master + branch.master.mergeOptions=--squash: really fast-forwarded (the override follows the default branch)' {
+  $w = New-World 'master'; [void](G $w.Lap @('config', 'branch.master.mergeOptions', '--squash')); Push-Up $w @{ 'b.txt' = "two`n" }
+  $r = Run-Sync $w.Lap
+  Ok ($r.Text.Contains('master: đã cập nhật 1 commit')) "message: $($r.Text)"
+  Eq (Head $w) (G $w.Lap @('rev-parse', 'origin/master')) 'HEAD at origin/master'
+  Eq (G $w.Lap @('status', '--porcelain')) '' 'clean tree, nothing staged by a squash'
+}
+T 'dangling origin/HEAD (points at a missing branch): falls back to origin/main' {
+  $w = New-World; [void](G $w.Lap @('config', 'remote.origin.followRemoteHEAD', 'never'))
+  [void](G $w.Lap @('symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/develop')); Push-Up $w @{ 'b.txt' = "two`n" }
+  $r = Run-Sync $w.Lap
+  Ok ($r.Text.Contains('main: đã cập nhật 1 commit')) "message: $($r.Text)"
+}
+T 'a local branch named origin/<default> exists: the default branch is still read from origin/HEAD' {
+  $w = New-World 'develop'
+  [void](G $w.Lap @('branch', 'origin/develop')); Push-Up $w @{ 'b.txt' = "two`n" }
+  Eq (G $w.Lap @('symbolic-ref', '--short', 'refs/remotes/origin/HEAD')) 'remotes/origin/develop' 'git prints the long form here'
+  $r = Run-Sync $w.Lap
+  Ok ($r.Text.Contains('develop: đã cập nhật 1 commit')) "message: $($r.Text)"
+  Eq (Head $w) (G $w.Lap @('rev-parse', 'refs/remotes/origin/develop')) 'HEAD at origin/develop'
+}
 T 'no default branch found: skipped with a clear message' {
   $w = New-World 'trunk'; No-Head $w; Push-Up $w @{ 'b.txt' = "two`n" }
   $h0 = Head $w
