@@ -53,6 +53,15 @@ function Get-GitCount([string]$Repo, [string]$Range) {
   if ($r.Code -eq 0 -and $r.Out -match '^\d+$') { [int]$r.Out }
 }
 
+# nhanh mac dinh cua origin, doc tu ban da fetch (khong goi mang): origin/HEAD, neu khong co thi origin/main, roi origin/master; $null neu khong co
+function Get-SyncDefaultBranch([string]$Repo) {
+  $h = Invoke-Git $Repo @('symbolic-ref', '--short', 'refs/remotes/origin/HEAD')
+  $cand = @(); if ($h.Code -eq 0 -and $h.Out -cmatch '^origin/(.+)$') { $cand += $Matches[1] }
+  foreach ($c in ($cand + 'main' + 'master')) {
+    if ((Invoke-Git $Repo @('rev-parse', '-q', '--verify', "refs/remotes/origin/$c")).Code -eq 0) { return $c }
+  }
+}
+
 # --- fcode sync: project tren box chua co tren laptop (khop theo repo GitHub cua origin, khong theo ten thu muc) ---
 # Tim ban clone da co; khong co thi hoi thu muc de tai ve. Them vao syncRepos roi cap nhat ngay trong lan chay nay.
 # Chi de thu: FCODE_DESKTOP / FCODE_DOCUMENTS thay Desktop / Documents that; FCODE_GITHUB_BASE thay https://github.com.
@@ -328,35 +337,50 @@ function Invoke-Sync {
     $b = Invoke-Git $repo @('branch', '--show-current')
     # --untracked-files=all / --ignore-submodules=none: cau hinh cua project khong the che thay doi chua luu
     $s = Invoke-Git $repo @('status', '--porcelain=v1', '--untracked-files=all', '--ignore-submodules=none')
-    $branch = $b.Out; $dirty = [bool]$s.Out
-    $LM = 'refs/heads/main'; $RM = 'refs/remotes/origin/main'
-    $behind = Get-GitCount $repo "$LM..$RM"
-    $ahead = Get-GitCount $repo "$RM..$LM"
+    $branch = $b.Out; $nLocal = @($s.Out -split "`n" | Where-Object { $_ }).Count
+    $D = Get-SyncDefaultBranch $repo
+    $LM = "refs/heads/$D"; $RM = if ($D) { "refs/remotes/origin/$D" }
+    $behind = if ($D) { Get-GitCount $repo "$LM..$RM" }
+    $ahead = if ($D) { Get-GitCount $repo "$RM..$LM" }
     if ($b.Code -ne 0 -or $s.Code -ne 0) {
       Write-Host ('  bỏ qua: không kiểm tra được trạng thái project: ' + (Get-GitError $(if ($b.Code -ne 0) { $b } else { $s })))
       $skipped++
-    } elseif ($branch -eq 'main' -and -not $dirty) {
-      if ($null -eq $behind -or $null -eq $ahead) { Write-Host '  bỏ qua: không đọc được main/origin/main'; $skipped++ }
+    } elseif (-not $D) {
+      Write-Host '  bỏ qua: không tìm thấy nhánh mặc định của origin (origin/HEAD, origin/main, origin/master)'; $skipped++
+    } elseif ($branch -ceq $D) {
+      # thay doi chua luu khong con chan viec cap nhat: merge --ff-only tu choi khi se de len mot file cua ban
+      if ($null -eq $behind -or $null -eq $ahead) { Write-Host "  bỏ qua: không đọc được $D/origin/$D"; $skipped++ }
       elseif ($behind -eq 0) {
         $note = if ($ahead -gt 0) { " ($ahead commit chưa đẩy)" } else { '' }
-        Write-Host ("  main: đã mới nhất" + $note); $current++
+        Write-Host ("  ${D}: đã mới nhất" + $note); $current++
       }
       elseif ($ahead -gt 0) {
-        Write-Host '  main trên laptop có commit chưa đẩy, bỏ qua'; $skipped++
+        Write-Host "  $D trên laptop có commit chưa đẩy, bỏ qua"; $skipped++
       }
       else {
         # --no-overwrite-ignore: khong ghi de file bi gitignore (vd .env); --no-autostash: khong stash;
         # mergeOptions rong: cau hinh nhu --squash cua project khong doi duoc ket qua
-        $mg = Invoke-Git $repo @('-c', 'branch.main.mergeOptions=', 'merge', '--ff-only', '--no-overwrite-ignore', '--no-autostash', $RM)
-        if ($mg.Code -eq 0) { Write-Host ("  main: đã cập nhật $behind commit"); $updated++ }
-        else { Write-Host ('  bỏ qua: git không cập nhật được: ' + (Get-GitError $mg)); $skipped++ }
+        $mg = Invoke-Git $repo @('-c', "branch.$D.mergeOptions=", 'merge', '--ff-only', '--no-overwrite-ignore', '--no-autostash', $RM)
+        if ($mg.Code -eq 0) {
+          $kept = if ($nLocal) { " (giữ nguyên $nLocal file chưa lưu)" } else { '' }
+          Write-Host ("  ${D}: đã cập nhật $behind commit" + $kept); $updated++
+        }
+        else {
+          $lines = @(($mg.Err + "`n" + $mg.Out) -split "`n" | Where-Object { $_.Trim() })
+          $first = $lines | Where-Object { $_ -match '^(fatal|error):' } | Select-Object -First 1
+          if (-not $first) { $first = Get-GitError $mg }
+          Write-Host ('  bỏ qua: git không cập nhật được: ' + $first.Trim())
+          # file git liet ke (dong thut vao): toi da 5
+          $files = @($lines | Where-Object { $_ -match '^\s+\S' } | ForEach-Object { $_.Trim() })
+          foreach ($fn in ($files | Select-Object -First 5)) { Write-Host "    $fn" }
+          if ($files.Count -gt 5) { Write-Host '    ...' }
+          $skipped++
+        }
       }
     } else {
-      $why = @()
-      if (-not $branch) { $why += 'không ở nhánh nào' } elseif ($branch -ne 'main') { $why += "đang ở nhánh $branch" }
-      if ($dirty) { $why += 'có thay đổi chưa lưu' }
+      $why = if (-not $branch) { 'không ở nhánh nào' } else { "đang ở nhánh $branch" }
       $n = if ($null -ne $behind) { $behind } else { '?' }
-      Write-Host ("  bỏ qua: " + ($why -join ', ') + " (origin/main hơn main trên laptop $n commit)")
+      Write-Host ("  bỏ qua: $why (origin/$D hơn $D trên laptop $n commit)")
       $skipped++
     }
 
@@ -366,10 +390,10 @@ function Invoke-Sync {
     elseif (-not $refs) { Write-Host '  nhánh box: không có' }
     foreach ($line in $(if ($r.Code -eq 0) { $refs })) {
       $name, $date = $line -split '\|', 2
-      $a = Get-GitCount $repo "$RM..$name"
+      $a = if ($D) { Get-GitCount $repo "$RM..$name" }
       if ($null -eq $a) { Write-Host "  nhánh box: $name - ? commit (không đọc được), mới nhất $date" }
       elseif ($a -gt 0) { $waiting++; Write-Host "  nhánh box: $name - $a commit chờ merge, mới nhất $date" }
-      else { Write-Host "  nhánh box: $name - đã nằm trong main, mới nhất $date" }
+      else { Write-Host "  nhánh box: $name - đã nằm trong $D, mới nhất $date" }
     }
 
     $url = (Invoke-Git $repo @('remote', 'get-url', 'origin')).Out
