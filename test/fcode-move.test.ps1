@@ -7,7 +7,7 @@
 # state, as on the rehearsal pair. USERPROFILE is a temp folder, removed at the end.
 #   FCODE_TEST_ONLY=<regex>   run only the cases whose name matches
 #   FCODE_TEST_NO_BASH=1      run as on Windows (no bash): the bash cases are skipped and counted
-#   FCODE_TEST_VERBOSE=1      on a failing case, also print the fake machines' log and the last command output
+#   FCODE_TEST_VERBOSE=1      on a failing case, also print the fake machines' log and the last `fcode move` output
 #   MV_MOVE_MD=<path>         deploy-gate docs/MOVE.md for L.texts-match-move-md, which fails when it is unset (G.2, W1-T11-DG-T11-1)
 #   MV_CONTRACT=<path>        deploy-gate docs/move/CONTRACT.md for L.plan-default-map and L.platform-lists-match-contract, which fail when it is unset
 #   MV_RUN_SH=<path>          deploy-gate lib/move-run.sh for L.target-key-server-validator (the real MVR_TJS validator of c.init-new's target key; bash cases only; fails when unset)
