@@ -127,6 +127,7 @@ Các dự án hiện trong app nằm trong `config.json`, mục `projects`. Sau 
 - Tên dự án nên gồm chữ thường, số và dấu gạch ngang (tên này được dùng để đặt tên phiên, ví dụ `web-claude`).
 - Máy chủ tự đọc lại file sau khi bạn lưu, không cần khởi động lại (riêng `port` chỉ có tác dụng sau khi khởi động lại dịch vụ). Nếu file bị lỗi cú pháp, máy chủ giữ cấu hình cũ cho tới khi bạn sửa đúng.
 - Mỗi phiên mới chạy trong thư mục của dự án đã chọn.
+- Muốn một dự án luôn khởi động `omp`, `claude` hoặc `codex` kèm cờ riêng, thêm mục `harnessArgs` vào `config.json`, ví dụ `"harnessArgs": { "fcoding": { "omp": ["--tools=read,write,edit,task,wait,todo", "--model=anthropic/claude-fable-5-2:high"] } }`. Cờ được thêm sau tên công cụ ở mọi cách mở phiên (nút "+", mở dự án, `fcode-new`, và "Tiếp tục" phiên omp: `omp -r <id>` rồi các cờ). Dự án và công cụ khác giữ nguyên. Mỗi cờ có dạng `--tên` hoặc `--tên=giá-trị` (giá trị chỉ gồm chữ, số và `_ . , : / @ + -`, không có dấu cách), tối đa 16 cờ cho mỗi công cụ. Dự án không có trong `projects`, công cụ khác `omp`/`claude`/`codex`, hoặc cờ sai thì mục đó bị bỏ qua và máy chủ ghi một dòng vào nhật ký lỗi; phần còn lại vẫn dùng. Phiên đang chạy không đổi, chỉ phiên mở sau khi lưu file mới có cờ.
 
 ### Màn hình chính: hạn mức, chi phí, dự án
 
