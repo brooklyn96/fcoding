@@ -4960,6 +4960,58 @@ test('POST resume: omp -r <id> in the project dir with the harness env, tmux nam
   assert.equal(newSessions(c).filter((x) => x.argv[3] === 'alpha-omp-r-00000005').length, 1);
 }));
 
+const CEO = ['--tools=read,write,edit,task,wait,todo', '--model=anthropic/claude-fable-5-2:high'];
+const CEO_TAIL = ` ${shq(CEO[0])} ${shq(CEO[1])}`;
+
+test('config harnessArgs: the project\'s omp flags end the command on POST /api/sessions, /api/open, fresh, fcode-new and resume; nothing else changes', () => withApp(async (c) => {
+  const { cookie } = await c.login();
+  ompTree(c);
+  assert.equal((await c.req('POST', '/api/sessions', { cookie, body: { name: 'a-omp', project: 'alpha', harness: 'omp' } })).status, 201);
+  assert.equal((await c.req('POST', '/api/open', { cookie, body: { project: 'alpha', harness: 'omp' } })).json?.created, true);
+  assert.equal((await c.req('POST', '/api/open', { cookie, body: { project: 'alpha', harness: 'omp', fresh: true } })).json?.created, true);
+  assert.equal((await adminRequest(c.configDir, { cmd: 'new', project: 'alpha', harness: 'omp' })).ok, true);
+  assert.equal((await resumeReq(c, cookie, ID.a)).status, 200);
+  // not covered by the args: another harness of the same project, the same harness of another project
+  for (const [project, harness] of [['alpha', 'claude'], ['alpha', 'codex'], ['alpha', 'shell'], ['my.proj', 'omp']]) {
+    assert.equal((await c.req('POST', '/api/sessions', { cookie, body: { name: `x-${project.replace('.', '')}-${harness}`, project, harness } })).status, 201);
+  }
+  assert.deepEqual(newSessions(c).map((x) => x.argv.at(-1)), [
+    `${LAUNCH}omp${CEO_TAIL}`, `${LAUNCH}omp${CEO_TAIL}`, `${LAUNCH}omp${CEO_TAIL}`, `${LAUNCH}omp${CEO_TAIL}`,
+    `${LAUNCH}omp -r '${ID.a}'${CEO_TAIL}`,
+    `${LAUNCH}claude`, `${LAUNCH}codex`, `${LAUNCH}bash -l`, `${LAUNCH}omp`,
+  ]);
+}, { config: { harnessArgs: { alpha: { omp: CEO } } } }));
+
+test('config harnessArgs: a bad project, harness or flag drops that entry with one stderr line; the valid rest still applies; a missing key is {}', () => {
+  const secret = Buffer.alloc(32, 7).toString('base64');
+  const projects = { alpha: ABS, beta: ABS, rel: 'not-absolute' };
+  const parse = (harnessArgs) => {
+    const lines = [];
+    const orig = console.error;
+    console.error = (l) => lines.push(String(l));
+    try { return { cfg: parseConfig(JSON.stringify({ cookieSecret: secret, projects, harnessArgs })), lines }; } finally { console.error = orig; }
+  };
+  assert.deepEqual(parseConfig(JSON.stringify({ cookieSecret: secret, projects })).harnessArgs, {});
+  const ok = ['--a', '--b-c=d_e.f,g:h/i@j+k-l', '--tools=read,write'];
+  const good = parse({ alpha: { omp: ok, claude: ['--x'], codex: [] }, beta: { omp: ['--y'] } });
+  assert.deepEqual(good.cfg.harnessArgs, { alpha: { omp: ok, claude: ['--x'] }, beta: { omp: ['--y'] } });
+  assert.deepEqual(good.lines, []);
+  const bad = parse({
+    alpha: { omp: ok, shell: ['--x'], claude: ['--has space'], codex: ['--a;b'] },
+    ghost: { omp: ['--x'] }, rel: { omp: ['--x'] }, beta: { omp: Array.from({ length: 17 }, (_, i) => `--f${i}`) },
+  });
+  assert.deepEqual(bad.cfg.harnessArgs, { alpha: { omp: ok } });
+  assert.deepEqual(bad.lines.map((l) => l.match(/project "(\w+)"(?: harness "(\w+)")?/).slice(1)), [['alpha', 'shell'], ['alpha', 'claude'], ['alpha', 'codex'], ['ghost', undefined], ['rel', undefined], ['beta', 'omp']]);
+  for (const a of ['x', '-x', '--', '--X', '--a b', '--a;b', '--a"b', "--a'b", '--a$b', '--a=', '--a=b c', '--a=$(x)', '--1a', 7, null, ['--a']]) {
+    const r = parse({ alpha: { omp: [a, '--ok'] } });
+    assert.deepEqual(r.cfg.harnessArgs, {}, String(a));
+    assert.equal(r.lines.length, 1);
+  }
+  for (const h of [[], 'x', null, 5]) assert.deepEqual(parse({ alpha: { omp: h } }).cfg.harnessArgs, {}); // not a flag list
+  assert.deepEqual(parse([]).cfg.harnessArgs, {}); // not an object: ignored, the config still loads
+  assert.deepEqual(parse({ alpha: ['--x'] }).cfg.harnessArgs, {});
+});
+
 test('POST resume: a long project name is shortened, the id part never; the name stays <= 32 characters', () => {
   const long = 'a-very-long-project-name-of-forty-chars-x';
   return withApp(async (c) => {

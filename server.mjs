@@ -42,6 +42,7 @@ const DRAIN_TIMEOUT = 30000;
 const HARNESS_CHECK_MS = 400; // after create: is the harness still running?
 const ADMIN_JOB_MS = 20000; // admin.sock: how long a request may take once it is read (fcode-new waits for a session to start)
 const FCODE_NEW_HARNESSES = ['omp', 'claude', 'codex']; // what fcode-new offers (not the plain shell)
+const HARNESS_ARG_RE = /^--[a-z][a-z0-9-]*(=[A-Za-z0-9_.,:\/@+-]+)?$/; // one config.json harnessArgs flag
 const RUNNING_MS = 8000; // overview: activity this recent = running
 const GIT_CACHE_MS = 10000; // overview: git results per project
 const NOT_FOUND_RE = /can't find|no such session|no server running|no sessions|error connecting to|no current/i;
@@ -272,10 +273,24 @@ export function parseConfig(text) {
   // timeZone: the IANA zone of the home screen's days (today, yesterday, 30 days); never the process TZ
   const timeZone = c.timeZone ?? DEFAULT_TZ;
   try { if (typeof timeZone !== 'string') throw new Error('bad'); new Intl.DateTimeFormat('en-CA', { timeZone }); } catch { throw new Error('config.json: timeZone invalid (want an IANA zone such as "Asia/Ho_Chi_Minh")'); }
-  return {
-    secret: Buffer.from(s, 'base64'), port: c.port, projects, publicUrl, publicOrigin, timeZone,
-    projectNames: Object.keys(projects).filter((k) => typeof projects[k] === 'string' && path.isAbsolute(projects[k])),
-  };
+  const projectNames = Object.keys(projects).filter((k) => typeof projects[k] === 'string' && path.isAbsolute(projects[k]));
+  // harnessArgs: {project: {omp|claude|codex: ["--flag", "--flag=value"]}}, appended to that harness's command in createSession.
+  // A bad project, harness or arg drops that one project/harness entry (one stderr line, no value quoted); never the whole config.
+  const harnessArgs = {};
+  if (c.harnessArgs !== undefined && (typeof c.harnessArgs !== 'object' || c.harnessArgs === null || Array.isArray(c.harnessArgs))) {
+    console.error('config.json: harnessArgs ignored (not an object)');
+  } else {
+    for (const [p, byHarness] of Object.entries(c.harnessArgs ?? {})) {
+      if (!projectNames.includes(p) || !byHarness || typeof byHarness !== 'object' || Array.isArray(byHarness)) { console.error(`config.json: harnessArgs for project ${JSON.stringify(p)} ignored (unknown project or not an object)`); continue; }
+      const ok = [];
+      for (const [h, args] of Object.entries(byHarness)) {
+        if (!FCODE_NEW_HARNESSES.includes(h) || !Array.isArray(args) || args.length > 16 || !args.every((a) => typeof a === 'string' && HARNESS_ARG_RE.test(a))) { console.error(`config.json: harnessArgs for project ${JSON.stringify(p)} harness ${JSON.stringify(h)} ignored (bad harness or flags)`); continue; }
+        if (args.length) ok.push([h, args]);
+      }
+      if (ok.length) harnessArgs[p] = Object.fromEntries(ok);
+    }
+  }
+  return { secret: Buffer.from(s, 'base64'), port: c.port, projects, publicUrl, publicOrigin, timeZone, projectNames, harnessArgs };
 }
 // devices.json: {secretTag, devices:[{id, name, keyHash, createdAt}]}; invalid -> throw (no content in the message)
 export function parseDevices(text) {
@@ -1375,7 +1390,8 @@ export function createApp(opts = {}) {
     // hold GH_TOKEN in its global env; an unset carries no value. Any failure (no server running yet, a gate refusal) never blocks the create.
     for (const v of TOKEN_VARS) await run(ctx, ['set-environment', '-g', '-u', v]).catch(() => {});
     try {
-      await run(ctx, ['new-session', '-d', '-s', name, '-c', cfg.projects[project], harnessLaunch + command]);
+      const flags = (cfg.harnessArgs[project]?.[harness] ?? []).map((a) => ` ${shq(a)}`).join(''); // config.json harnessArgs
+      await run(ctx, ['new-session', '-d', '-s', name, '-c', cfg.projects[project], harnessLaunch + command + flags]);
     } catch (e) {
       if (/duplicate session/i.test(e.stderr || '')) throw new HttpErr(409, 'exists');
       throw e;
